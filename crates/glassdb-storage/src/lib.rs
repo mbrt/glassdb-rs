@@ -1,0 +1,24 @@
+//! Storage and caching layers. Ported from the Go `internal/storage` and
+//! `internal/cache` packages: a byte-weighted LRU cache, version tracking, a
+//! staleness-aware local cache, read/write-through global storage, lock-state
+//! encoding with the pure lock-transition logic, and transaction-log
+//! persistence.
+
+pub mod cache;
+mod error;
+mod global;
+mod local;
+mod locker;
+mod tlogger;
+mod version;
+
+pub use cache::{Cache, Weighable};
+pub use error::StorageError;
+pub use global::{Global, GlobalRead};
+pub use local::{Local, LocalMetadata, LocalRead, MAX_STALENESS};
+pub use locker::{
+    compute_lock_update, last_writer_from_tags, tags_lock_info, LockInfo, LockOps, LockRequest,
+    LockType, LockUpdate, Locker, TValue, TxPathState,
+};
+pub use tlogger::{PathLock, TLogger, TxCommitStatus, TxLog, TxStatus, TxWrite};
+pub use version::{version_from_meta, Version};

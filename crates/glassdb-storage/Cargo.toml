@@ -1,0 +1,20 @@
+[package]
+name = "glassdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22.1"
+glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
+glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
+glassdb-data = { version = "0.1.0", path = "../glassdb-data" }
+glassdb-proto = { version = "0.1.0", path = "../glassdb-proto" }
+prost = "0.14.3"
+prost-types = "0.14.3"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util"] }

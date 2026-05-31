@@ -1,0 +1,15 @@
+[package]
+name = "glassdb-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util"] }

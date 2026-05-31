@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package glassdb;
+
+import "google/protobuf/timestamp.proto";
+
+message TransactionLog {
+    enum Status {
+        DEFAULT = 0;
+        COMMITTED = 1;
+        ABORTED = 2;
+        PENDING = 3;
+    }
+
+    google.protobuf.Timestamp timestamp = 1;
+    Status status = 2;
+    repeated CollectionWrites writes = 3;
+}
+
+message CollectionWrites {
+    string prefix = 1;
+    repeated Write writes = 2;
+    CollectionLocks locks = 3;
+}
+
+message Write {
+    string suffix = 1;
+    // The ID of the last transaction writing to this key.
+    bytes prev_tid = 3;
+
+    oneof val_delete {
+        bytes value = 2;
+        bool deleted = 4;
+    }
+}
+
+message CollectionLocks {
+    Lock.LockType collection_lock = 2;
+    repeated Lock locks = 3;
+}
+
+message Lock {
+    enum LockType {
+        UNKNOWN = 0;
+        NONE = 1;
+        READ = 2;
+        WRITE = 3;
+        CREATE = 4;
+    }
+
+    string suffix = 1;
+    LockType lock_type = 2;
+}

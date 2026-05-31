@@ -1,0 +1,83 @@
+//! The public error type for the GlassDB API.
+
+use glassdb_backend::BackendError;
+use glassdb_storage::StorageError;
+use glassdb_trans::TransError;
+
+/// Errors returned by the GlassDB public API.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum Error {
+    /// The requested object does not exist.
+    #[error("object not found")]
+    NotFound,
+    /// The transaction was explicitly aborted by the user.
+    #[error("aborted transaction")]
+    Aborted,
+    /// A conditional operation's precondition failed.
+    #[error("precondition failed")]
+    Precondition,
+    /// The context was cancelled.
+    #[error("context canceled")]
+    Cancelled,
+    /// The transaction was already committed or aborted remotely.
+    #[error("transaction was already finalized")]
+    AlreadyFinalized,
+    /// Any other error.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl Error {
+    /// Reports whether this is a not-found error (mirrors `backend.ErrNotFound`).
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::NotFound)
+    }
+
+    /// Reports whether this is a precondition-failed error.
+    pub fn is_precondition(&self) -> bool {
+        matches!(self, Error::Precondition)
+    }
+
+    /// Reports whether the transaction was aborted.
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, Error::Aborted)
+    }
+
+    /// Reports whether the context was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Cancelled)
+    }
+}
+
+impl From<BackendError> for Error {
+    fn from(e: BackendError) -> Self {
+        match e {
+            BackendError::NotFound => Error::NotFound,
+            BackendError::Precondition => Error::Precondition,
+            BackendError::Cancelled => Error::Cancelled,
+            BackendError::Other(s) => Error::Other(s),
+        }
+    }
+}
+
+impl From<StorageError> for Error {
+    fn from(e: StorageError) -> Self {
+        match e {
+            StorageError::Backend(b) => b.into(),
+            StorageError::KeyNotFound => Error::NotFound,
+            StorageError::Other(s) => Error::Other(s),
+        }
+    }
+}
+
+impl From<TransError> for Error {
+    fn from(e: TransError) -> Self {
+        match e {
+            TransError::Storage(s) => s.into(),
+            TransError::Cancelled => Error::Cancelled,
+            TransError::AlreadyFinalized => Error::AlreadyFinalized,
+            TransError::Retry => Error::Other("retry transaction".into()),
+            other => Error::Other(other.to_string()),
+        }
+    }
+}

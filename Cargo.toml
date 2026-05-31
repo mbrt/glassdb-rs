@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/glassdb-data",
+    "crates/glassdb-proto",
+    "crates/glassdb-concurr",
+    "crates/glassdb-backend",
+    "crates/glassdb-storage",
+    "crates/glassdb-trans",
+    "crates/glassdb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+glassdb-data = { path = "crates/glassdb-data" }
+glassdb-proto = { path = "crates/glassdb-proto" }
+glassdb-concurr = { path = "crates/glassdb-concurr" }
+glassdb-backend = { path = "crates/glassdb-backend" }
+glassdb-storage = { path = "crates/glassdb-storage" }
+glassdb-trans = { path = "crates/glassdb-trans" }
+
+[profile.release]
+opt-level = 3

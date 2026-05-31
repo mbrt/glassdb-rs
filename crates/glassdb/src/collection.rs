@@ -1,0 +1,129 @@
+//! A named group of key-value pairs. Ported from the Go `collection.go`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use glassdb_backend::{Backend, Tags};
+use glassdb_concurr::Ctx;
+use glassdb_data::paths;
+use glassdb_trans::Reader;
+
+use crate::db::DbInner;
+use crate::error::Error;
+use crate::iter::{CollectionsIter, KeysIter};
+
+const COLL_INFO_CONTENTS: &[u8] = b"__collection__";
+
+/// A named group of key-value pairs within a database.
+#[derive(Clone)]
+pub struct Collection {
+    prefix: String,
+    db: Arc<DbInner>,
+}
+
+impl Collection {
+    pub(crate) fn new(prefix: String, db: Arc<DbInner>) -> Self {
+        Collection { prefix, db }
+    }
+
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Reads the value for `key` with strong (serializable) consistency.
+    pub async fn read_strong(&self, ctx: &Ctx, key: &[u8]) -> Result<Vec<u8>, Error> {
+        let res: Option<Vec<u8>> = self
+            .db
+            .tx(ctx, async |tx| match tx.read(self, key).await {
+                Ok(v) => Ok(Some(v)),
+                // We must still validate the transaction even when not found.
+                Err(e) if e.is_not_found() => Ok(None),
+                Err(e) => Err(e),
+            })
+            .await?;
+        res.ok_or(Error::NotFound)
+    }
+
+    /// Reads the value for `key` allowing stale results up to `max_staleness`.
+    pub async fn read_weak(
+        &self,
+        ctx: &Ctx,
+        key: &[u8],
+        max_staleness: Duration,
+    ) -> Result<Vec<u8>, Error> {
+        let p = paths::from_key(&self.prefix, key);
+        let r = Reader::new(
+            self.db.local.clone(),
+            self.db.global.clone(),
+            self.db.tmon.clone(),
+        );
+        let rv = r.read(ctx, &p, max_staleness).await?;
+        Ok(rv.value)
+    }
+
+    /// Writes `value` for `key` within a transaction.
+    pub async fn write(&self, ctx: &Ctx, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.db.tx(ctx, async |tx| tx.write(self, key, value)).await
+    }
+
+    /// Removes `key` within a transaction.
+    pub async fn delete(&self, ctx: &Ctx, key: &[u8]) -> Result<(), Error> {
+        self.db.tx(ctx, async |tx| tx.delete(self, key)).await
+    }
+
+    /// Atomically reads `key`, applies `f`, and writes the result back.
+    pub async fn update<F>(&self, ctx: &Ctx, key: &[u8], mut f: F) -> Result<Vec<u8>, Error>
+    where
+        F: FnMut(Vec<u8>) -> Result<Vec<u8>, Error>,
+    {
+        self.db
+            .tx(ctx, async |tx| {
+                let old = tx.read(self, key).await?;
+                let newb = f(old)?;
+                tx.write(self, key, &newb)?;
+                Ok(newb)
+            })
+            .await
+    }
+
+    /// Returns a sub-collection with the given name.
+    pub fn collection(&self, name: &[u8]) -> Collection {
+        let p = paths::from_collection(&self.prefix, name);
+        self.db.open_collection(p)
+    }
+
+    /// Ensures the collection exists in the backend, creating it if necessary.
+    pub async fn create(&self, ctx: &Ctx) -> Result<(), Error> {
+        let p = paths::collection_info(&self.prefix);
+        match self.db.global.get_metadata(ctx, &p).await {
+            Ok(_) => return Ok(()),
+            Err(e) if !e.is_not_found() => return Err(e.into()),
+            Err(_) => {}
+        }
+        match self
+            .db
+            .global
+            .write_if_not_exists(ctx, &p, COLL_INFO_CONTENTS.to_vec(), Tags::new())
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Created concurrently; assume it's there.
+            Err(e) if e.is_precondition() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Returns an iterator over the keys in the collection.
+    pub async fn keys(&self, ctx: &Ctx) -> Result<KeysIter, Error> {
+        let keys_prefix = paths::keys_prefix(&self.prefix);
+        let items = self.db.backend.list(ctx, &keys_prefix).await?;
+        Ok(KeysIter::new(items))
+    }
+
+    /// Returns an iterator over the sub-collections in this collection.
+    pub async fn collections(&self, ctx: &Ctx) -> Result<CollectionsIter, Error> {
+        let cprefix = paths::collections_prefix(&self.prefix);
+        let items = self.db.backend.list(ctx, &cprefix).await?;
+        Ok(CollectionsIter::new(items))
+    }
+}

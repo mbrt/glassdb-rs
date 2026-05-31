@@ -1,0 +1,20 @@
+[package]
+name = "glassdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+glassdb-data = { workspace = true }
+glassdb-backend = { workspace = true }
+glassdb-storage = { workspace = true }
+glassdb-trans = { workspace = true }
+glassdb-concurr = { workspace = true }
+futures = "0.3.32"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
+proptest = "1.9.0"
