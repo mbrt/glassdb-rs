@@ -46,6 +46,29 @@ fn is_writer_type(lt: LockType) -> bool {
     matches!(lt, LockType::Create | LockType::Write)
 }
 
+/// Splits the (pending) holders of a lock into those the requesters must wait
+/// for and those they may wound, following the wound-wait rule. A holder is
+/// wounded when at least one requester is older (has higher priority);
+/// otherwise the requesters must wait for it. A holder that is also one of the
+/// requesters is never wounded.
+fn partition_wound_wait(holders: &[TxId], requesters: &[TxId]) -> LockOps {
+    let mut ops = LockOps::default();
+    for h in holders {
+        if !requesters.contains(h) && any_older(requesters, h) {
+            ops.wound.push(h.clone());
+        } else {
+            ops.wait_for.push(h.clone());
+        }
+    }
+    ops
+}
+
+/// Reports whether any of the requesters has higher priority (is older) than the
+/// holder.
+fn any_older(requesters: &[TxId], holder: &TxId) -> bool {
+    requesters.iter().any(|r| r.older(holder))
+}
+
 /// A value written by a transaction, including whether it was a deletion or was
 /// not written at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -89,7 +112,12 @@ pub struct TxPathState {
 pub struct LockOps {
     pub update: LockUpdate,
     pub has_update: bool,
+    /// Higher-priority (older) holders the requester must wait for under the
+    /// wound-wait rule.
     pub wait_for: Vec<TxId>,
+    /// Lower-priority (younger) holders the requester is allowed to abort, so it
+    /// can take the lock without waiting.
+    pub wound: Vec<TxId>,
     pub locked_for: Vec<TxId>,
     pub unlocked_for: Vec<TxId>,
 }
@@ -158,13 +186,17 @@ pub fn compute_lock_update(
         curr.locked_by = unlock_ops.update.lockers.clone();
     }
     let lock_ops = compute_lock_update_inner(&curr, req.typ, &req.lockers)?;
-    if !lock_ops.wait_for.is_empty() && !lock_ops.unlocked_for.is_empty() {
+    if (!lock_ops.wait_for.is_empty() || !lock_ops.wound.is_empty())
+        && !lock_ops.unlocked_for.is_empty()
+    {
+        // Instead of waiting (or wounding), apply the pending unlock first.
         return Ok(handle_no_ops(&curr, unlock_ops));
     }
     let mut ops = LockOps {
         update: unlock_ops.update,
         has_update: unlock_ops.has_update || lock_ops.has_update,
         wait_for: lock_ops.wait_for,
+        wound: lock_ops.wound,
         locked_for: lock_ops.locked_for,
         unlocked_for: unlock_ops.unlocked_for,
     };
@@ -277,11 +309,11 @@ fn compute_lock_update_inner(
         });
     }
 
+    // Check whether we conflict with the current lockers. Under the wound-wait
+    // rule, the requester waits for higher-priority (older) holders and wounds
+    // lower-priority (younger) ones.
     if is_writer_type(curr.typ) || (curr.typ == LockType::Read && is_writer_type(lt)) {
-        return Ok(LockOps {
-            wait_for: curr.locked_by.clone(),
-            ..Default::default()
-        });
+        return Ok(partition_wound_wait(&curr.locked_by, lockers));
     }
 
     let mut new_lockers = curr.locked_by.clone();
@@ -635,5 +667,145 @@ mod tests {
         assert_eq!(info.typ, LockType::Read);
         assert_eq!(info.locked_by, vec![tx(1), tx(2)]);
         assert_eq!(info.last_writer, tx(3));
+    }
+
+    // Builds a deterministic TxId whose priority follows `secs`: a smaller
+    // `secs` is older (higher priority).
+    fn mk_tid(secs: u64, name: &[u8]) -> TxId {
+        TxId::with_priority(secs * 1_000_000_000, name)
+    }
+
+    fn pending(ids: &[TxId]) -> Vec<TxPathState> {
+        ids.iter()
+            .map(|id| TxPathState {
+                tx: id.clone(),
+                status: TxCommitStatus::Pending,
+                value: TValue::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compute_lock_update_wound_wait() {
+        let older = mk_tid(100, b"old");
+        let younger = mk_tid(200, b"new");
+        let holder = mk_tid(150, b"hold");
+
+        struct Case {
+            name: &'static str,
+            curr: LockInfo,
+            req: LockRequest,
+            txs: Vec<TxPathState>,
+            want_wound: Vec<TxId>,
+            want_wait_for: Vec<TxId>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "write requester older than write holder wounds it",
+                curr: LockInfo {
+                    typ: LockType::Write,
+                    locked_by: vec![younger.clone()],
+                    ..Default::default()
+                },
+                req: LockRequest {
+                    typ: LockType::Write,
+                    lockers: vec![older.clone()],
+                    unlockers: vec![],
+                },
+                txs: pending(std::slice::from_ref(&younger)),
+                want_wound: vec![younger.clone()],
+                want_wait_for: vec![],
+            },
+            Case {
+                name: "write requester younger than write holder waits",
+                curr: LockInfo {
+                    typ: LockType::Write,
+                    locked_by: vec![older.clone()],
+                    ..Default::default()
+                },
+                req: LockRequest {
+                    typ: LockType::Write,
+                    lockers: vec![younger.clone()],
+                    unlockers: vec![],
+                },
+                txs: pending(std::slice::from_ref(&older)),
+                want_wound: vec![],
+                want_wait_for: vec![older.clone()],
+            },
+            Case {
+                name: "read requester older than write holder wounds it",
+                curr: LockInfo {
+                    typ: LockType::Write,
+                    locked_by: vec![younger.clone()],
+                    ..Default::default()
+                },
+                req: LockRequest {
+                    typ: LockType::Read,
+                    lockers: vec![older.clone()],
+                    unlockers: vec![],
+                },
+                txs: pending(std::slice::from_ref(&younger)),
+                want_wound: vec![younger.clone()],
+                want_wait_for: vec![],
+            },
+            Case {
+                name: "read requester younger than write holder waits",
+                curr: LockInfo {
+                    typ: LockType::Write,
+                    locked_by: vec![older.clone()],
+                    ..Default::default()
+                },
+                req: LockRequest {
+                    typ: LockType::Read,
+                    lockers: vec![younger.clone()],
+                    unlockers: vec![],
+                },
+                txs: pending(std::slice::from_ref(&older)),
+                want_wound: vec![],
+                want_wait_for: vec![older.clone()],
+            },
+            Case {
+                name: "write requester partitions mixed read holders",
+                curr: LockInfo {
+                    typ: LockType::Read,
+                    locked_by: vec![older.clone(), younger.clone()],
+                    ..Default::default()
+                },
+                req: LockRequest {
+                    typ: LockType::Write,
+                    lockers: vec![holder.clone()],
+                    unlockers: vec![],
+                },
+                txs: pending(&[older.clone(), younger.clone()]),
+                want_wound: vec![younger.clone()],
+                want_wait_for: vec![older.clone()],
+            },
+            Case {
+                name: "requester does not wound itself among readers",
+                curr: LockInfo {
+                    typ: LockType::Read,
+                    locked_by: vec![older.clone(), younger.clone()],
+                    ..Default::default()
+                },
+                req: LockRequest {
+                    typ: LockType::Write,
+                    lockers: vec![younger.clone()],
+                    unlockers: vec![],
+                },
+                txs: pending(&[older.clone(), younger.clone()]),
+                want_wound: vec![],
+                want_wait_for: vec![older.clone(), younger.clone()],
+            },
+        ];
+
+        for c in cases {
+            let ops = compute_lock_update(c.curr, &c.req, &c.txs).unwrap();
+            assert_eq!(ops.wound, c.want_wound, "{}: wound", c.name);
+            assert_eq!(ops.wait_for, c.want_wait_for, "{}: wait_for", c.name);
+            // Conflicts never produce a storage update.
+            assert!(!ops.has_update, "{}: has_update", c.name);
+            assert!(ops.locked_for.is_empty(), "{}: locked_for", c.name);
+        }
     }
 }

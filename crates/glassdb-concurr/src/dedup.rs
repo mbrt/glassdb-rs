@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::{oneshot, Semaphore};
 
 use crate::ctx::Ctx;
+use crate::shard::Sharded;
 
 /// A unit of work that may merge with another request for the same key.
 pub trait MergeRequest: Clone + Send + Sync + 'static {
@@ -311,9 +312,12 @@ pub async fn await_signal(sem: &Semaphore) {
 }
 
 /// Deduplicates and merges concurrent requests for the same key using `W`.
+///
+/// Requests are partitioned across independent controllers by key hash to
+/// reduce lock contention.
 pub struct Dedup<R, E, W> {
     worker: W,
-    contr: Controller<R, E>,
+    contr: Sharded<Controller<R, E>>,
 }
 
 impl<R, E, W> Dedup<R, E, W>
@@ -326,13 +330,16 @@ where
     pub fn new(worker: W) -> Self {
         Dedup {
             worker,
-            contr: Controller::new(),
+            contr: Sharded::new(|_| Controller::new()),
         }
     }
 
     /// Submits a request for `key`, merging with any in-flight work if possible.
     pub async fn run(&self, ctx: &Ctx, key: &str, r: R) -> Result<(), DedupError<E>> {
-        self.contr.run(ctx, key, r, &self.worker).await
+        self.contr
+            .for_key(key.as_bytes())
+            .run(ctx, key, r, &self.worker)
+            .await
     }
 }
 

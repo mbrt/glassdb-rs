@@ -275,6 +275,83 @@ async fn concurrent_multiple_rmw() {
     assert_eq!(read_int(&val), 60);
 }
 
+// Builds the 16-byte priority-encoded transaction id used to pin a
+// transaction's wound-wait priority: `[8-byte name prefix][8-byte BE unix-nanos]`.
+// A smaller `secs` is older (higher priority).
+fn mk_tid_bytes(secs: u64, name: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; 16];
+    let n = name.len().min(8);
+    b[..n].copy_from_slice(&name[..n]);
+    b[8..].copy_from_slice(&(secs * 1_000_000_000).to_be_bytes());
+    b
+}
+
+async fn wound_incr(
+    db: &DB,
+    ctx: &Ctx,
+    coll: &Collection,
+    first: &[u8],
+    second: &[u8],
+) -> Result<(), Error> {
+    db.tx(ctx, async |tx| {
+        let a = read_int_from_tx(tx, coll, first).await?;
+        let b = read_int_from_tx(tx, coll, second).await?;
+        // Under paused time the clock only advances once every task is blocked,
+        // so sleeping here parks both transactions after their reads and before
+        // any write: they both observe the initial values and then commit
+        // concurrently, forcing the conflict the rule must resolve.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        tx.write(coll, first, &write_int(a + 1))?;
+        tx.write(coll, second, &write_int(b + 1))
+    })
+    .await
+}
+
+// Exercises the classic deadlock setup: two concurrent transactions touch the
+// same two keys in opposite orders. Under the wound-wait rule the older
+// transaction wins and the younger one restarts, rather than both stalling
+// until the deadlock-timeout fallback fires.
+#[tokio::test(start_paused = true)]
+async fn wound_wait_reverse_contention() {
+    use std::time::Duration;
+
+    let ctx = Ctx::background();
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"wound-wait-c");
+    let key1 = b"key1";
+    let key2 = b"key2";
+    coll.create(&ctx).await.unwrap();
+
+    // Deterministic priorities so the conflict has a well-defined winner: the
+    // "older" transaction has higher priority than the "younger" one.
+    let ctx_old = ctx.with_tx_id(mk_tid_bytes(1, b"older"));
+    let ctx_young = ctx.with_tx_id(mk_tid_bytes(2, b"younger"));
+
+    let start = tokio::time::Instant::now();
+    let (r1, r2) = tokio::join!(
+        wound_incr(&db, &ctx_old, &coll, key1, key2),
+        wound_incr(&db, &ctx_young, &coll, key2, key1),
+    );
+    r1.unwrap();
+    r2.unwrap();
+    let elapsed = start.elapsed();
+
+    // Both increments landed exactly once on top of each other.
+    let v1 = coll.read_strong(&ctx, key1).await.unwrap();
+    assert_eq!(read_int(&v1), 2);
+    let v2 = coll.read_strong(&ctx, key2).await.unwrap();
+    assert_eq!(read_int(&v2), 2);
+
+    // The contention forced one transaction to restart...
+    assert!(db.stats().tx_retries >= 1, "expected at least one retry");
+    // ...but wound-wait resolved it promptly instead of waiting out the
+    // multi-second deadlock-timeout fallback (MAX_DEADLOCK_TIMEOUT = 5s).
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "took too long: {elapsed:?}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn read_multi() {
     use glassdb::FqKey;

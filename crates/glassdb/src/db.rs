@@ -208,9 +208,25 @@ impl DbInner {
             };
 
             // Try to commit.
-            let h = handle.as_mut().unwrap();
-            match self.algo.commit(ctx, h).await {
+            let commit_res = {
+                let h = handle.as_mut().unwrap();
+                self.algo.commit(ctx, h).await
+            };
+            match commit_res {
                 Ok(()) => break Ok(value),
+                Err(e) if e.is_wounded() => {
+                    // A higher-priority transaction aborted us. Release whatever
+                    // we were holding and restart with a fresh ID that preserves
+                    // our priority, so we are not starved on the retry.
+                    if let Some(h) = handle.as_mut() {
+                        let _ = self.algo.end(ctx, h).await;
+                    }
+                    let old = handle.take().unwrap();
+                    handle = Some(self.algo.rebegin(&old, access));
+                    tx.reset();
+                    stats.tx_retries += 1;
+                    continue;
+                }
                 Err(e) if e.is_retry() => {
                     tx.reset();
                     stats.tx_retries += 1;

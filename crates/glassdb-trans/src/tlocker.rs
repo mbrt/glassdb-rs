@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_backend::{self as backend, BackendError};
 use glassdb_concurr::{
-    await_signal, Controller, Ctx, Dedup, DedupError, DedupWorker, MergeRequest,
+    await_signal, shard::Sharded, Controller, Ctx, Dedup, DedupError, DedupWorker, MergeRequest,
 };
 use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
 use glassdb_storage::{
@@ -102,6 +102,7 @@ struct LockOpResult {
     locked_for: Vec<TxId>,
     unlocked_for: Vec<TxId>,
     wait_for_tx: Vec<TxId>,
+    wound_tx: Vec<TxId>,
 }
 
 struct LockData {
@@ -131,6 +132,13 @@ impl LockerCore {
         let ldata = self.fetch_lock_info(ctx, key).await?;
         let txs = self.fetch_lockers_state(ctx, key, &ldata.info).await?;
         let ops = compute_lock_update(ldata.info, req, &txs)?;
+        if !ops.wound.is_empty() {
+            // Lower-priority holders are in the way. Abort them and retry.
+            return Ok(LockOpResult {
+                wound_tx: ops.wound,
+                ..Default::default()
+            });
+        }
         if !ops.wait_for.is_empty() {
             return Ok(LockOpResult {
                 wait_for_tx: ops.wait_for,
@@ -146,7 +154,7 @@ impl LockerCore {
         Ok(LockOpResult {
             locked_for: ops.locked_for,
             unlocked_for: ops.unlocked_for,
-            wait_for_tx: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -248,6 +256,13 @@ impl DedupWorker<LockReq, StorageError> for LockerWorker {
                     break Err(e);
                 }
             };
+            if !lock_res.wound_tx.is_empty() {
+                if let Err(e) = self.wound_txs(ctx, &lock_res.wound_tx).await {
+                    break Err(e);
+                }
+                // Retry now that the lower-priority holders are aborted.
+                continue;
+            }
             if !lock_res.wait_for_tx.is_empty() {
                 if let Err(e) = self
                     .wait_for_tx(ctx, key, &lock_res.wait_for_tx, &mut wait_sem, contr)
@@ -273,6 +288,19 @@ impl DedupWorker<LockReq, StorageError> for LockerWorker {
 }
 
 impl LockerWorker {
+    /// Aborts the given lower-priority holders so the requester can take over
+    /// their locks under the wound-wait rule.
+    async fn wound_txs(&self, ctx: &Ctx, txs: &[TxId]) -> Result<(), StorageError> {
+        for tx in txs {
+            self.core
+                .tmon
+                .wound_tx(ctx, tx)
+                .await
+                .map_err(trans_to_storage)?;
+        }
+        Ok(())
+    }
+
     async fn wait_for_tx(
         &self,
         ctx: &Ctx,
@@ -332,9 +360,12 @@ pub struct Locker {
     inner: Arc<LockerState>,
 }
 
+/// One independent partition of the per-transaction locks, keyed by tid bytes.
+type LockerShard = Mutex<HashMap<Vec<u8>, HashMap<String, LockType>>>;
+
 struct LockerState {
     tmon: Monitor,
-    tlocks: Mutex<HashMap<Vec<u8>, HashMap<String, LockType>>>,
+    tlocks: Sharded<LockerShard>,
     stats: Arc<Stats>,
     dedup: Dedup<LockReq, StorageError, LockerWorker>,
 }
@@ -356,7 +387,7 @@ impl Locker {
         Locker {
             inner: Arc::new(LockerState {
                 tmon,
-                tlocks: Mutex::new(HashMap::new()),
+                tlocks: Sharded::new(|_| Mutex::new(HashMap::new())),
                 stats,
                 dedup,
             }),
@@ -385,7 +416,7 @@ impl Locker {
 
     /// Returns the lock type currently held by `tid` on `key`.
     pub fn lock_type(&self, key: &str, tid: &TxId) -> LockType {
-        let tlocks = self.inner.tlocks.lock().unwrap();
+        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         tlocks
             .get(tid.as_bytes())
             .and_then(|m| m.get(key))
@@ -395,7 +426,7 @@ impl Locker {
 
     /// Returns all paths currently locked by `tid`.
     pub fn locked_paths(&self, tid: &TxId) -> Vec<PathLock> {
-        let tlocks = self.inner.tlocks.lock().unwrap();
+        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         match tlocks.get(tid.as_bytes()) {
             None => Vec::new(),
             Some(m) => m
@@ -472,7 +503,7 @@ impl Locker {
     }
 
     fn needs_processing(&self, key: &str, tid: &TxId, lt: LockType) -> (TxState, bool) {
-        let tlocks = self.inner.tlocks.lock().unwrap();
+        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         let txl = tlocks.get(tid.as_bytes());
         let st = if txl.is_some() {
             TxState::Existing
@@ -491,7 +522,7 @@ impl Locker {
     }
 
     fn update_tx_locks(&self, key: &str, tid: &TxId, lt: LockType) {
-        let mut tlocks = self.inner.tlocks.lock().unwrap();
+        let mut tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         if lt == LockType::None {
             if let Some(m) = tlocks.get_mut(tid.as_bytes()) {
                 m.remove(key);
@@ -542,6 +573,13 @@ mod tests {
 
     fn init_tl_test() -> (Locker, TlCtx) {
         new_test_locker(Arc::new(MemoryBackend::new()))
+    }
+
+    // Builds a deterministic, valid transaction ID. A smaller `order` yields an
+    // older (higher-priority) transaction under the wound-wait rule; the name
+    // only affects the prefix, never the priority.
+    fn mk_tid(order: u64, name: &str) -> TxId {
+        TxId::with_priority(order * 1_000_000_000, name.as_bytes())
     }
 
     async fn assert_lock_info(g: &Global, key: &str, typ: LockType, mut locked_by: Vec<TxId>) {
@@ -865,8 +903,10 @@ mod tests {
         let (locker, tctx) = init_tl_test();
         let locker = Arc::new(locker);
         let key = paths::from_key("example", b"key");
-        let tx = TxId::new_random();
-        let txr = TxId::new_random();
+        // Equal priority so the write upgrade waits for the other reader to
+        // release instead of wounding it.
+        let tx = mk_tid(1, "tx");
+        let txr = mk_tid(1, "txr");
         tctx.monitor.begin_tx(&tx);
         tctx.monitor.begin_tx(&txr);
 
@@ -950,7 +990,9 @@ mod tests {
             .await
             .unwrap();
 
-        let tx2 = TxId::new_random();
+        // Equal priority so the second writer waits for the holder to release
+        // instead of wounding it.
+        let tx2 = mk_tid(1, "tx2");
         tctx2.monitor.begin_tx(&tx2);
         locker2.lock_write(&ctx, &key, &tx2).await.unwrap();
         assert_lock_info(&tctx2.global, &key, LockType::Write, vec![tx2.clone()]).await;
@@ -966,7 +1008,7 @@ mod tests {
             });
         }
 
-        let tx1 = TxId::new_random();
+        let tx1 = mk_tid(1, "tx1");
         tctx1.monitor.begin_tx(&tx1);
         locker1.lock_write(&ctx, &key, &tx1).await.unwrap();
         assert_lock_info(&tctx1.global, &key, LockType::Write, vec![tx1.clone()]).await;
@@ -992,5 +1034,35 @@ mod tests {
 
         locker1.lock_write(&ctx, &key, &tx1).await.unwrap();
         assert_lock_info(&tctx1.global, &key, LockType::Write, vec![tx1.clone()]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wound_younger_holder() {
+        let ctx = Ctx::background();
+        let (locker, tctx) = init_tl_test();
+        let key = paths::from_key("example", b"key");
+
+        tctx.global
+            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .await
+            .unwrap();
+
+        // A younger transaction holds the write lock.
+        let tx_young = mk_tid(2, "young");
+        tctx.monitor.begin_tx(&tx_young);
+        locker.lock_write(&ctx, &key, &tx_young).await.unwrap();
+
+        // An older (higher-priority) transaction wants the same lock. Under the
+        // wound-wait rule it aborts the younger holder and takes the lock
+        // without waiting.
+        let tx_old = mk_tid(1, "old");
+        tctx.monitor.begin_tx(&tx_old);
+        locker.lock_write(&ctx, &key, &tx_old).await.unwrap();
+
+        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx_old.clone()]).await;
+
+        // The younger transaction was wounded (aborted).
+        let status = tctx.monitor.tx_status(&ctx, &tx_young).await.unwrap();
+        assert_eq!(status, TxCommitStatus::Aborted);
     }
 }

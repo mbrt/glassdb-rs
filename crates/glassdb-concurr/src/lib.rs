@@ -10,6 +10,7 @@ pub mod ctx;
 mod dedup;
 mod fanout;
 mod retry;
+pub mod shard;
 
 pub use background::Background;
 pub use channel::make_chan_inf_cap;
@@ -18,3 +19,4 @@ pub use ctx::{Cancelled, Ctx};
 pub use dedup::{await_signal, Controller, Dedup, DedupError, DedupWorker, MergeRequest};
 pub use fanout::Fanout;
 pub use retry::{retry, retry_with_backoff, RetryErr};
+pub use shard::Sharded;

@@ -2,19 +2,93 @@ use std::fmt;
 
 use rand::Rng;
 
+/// Total length, in bytes, of a freshly generated transaction ID.
+const TX_ID_LEN: usize = 16;
+/// Offset of the big-endian UnixNano timestamp within the ID.
+const TX_ID_TS_OFF: usize = 8;
+
 /// A transaction identifier. Ported from the Go `data.TxID` (`[]byte`).
 ///
-/// Freshly generated IDs are 128-bit random values, but a `TxId` can hold an
-/// arbitrary byte sequence (e.g. when decoded from a storage tag).
+/// The layout is `[8 bytes random][8 bytes big-endian UnixNano timestamp]`. The
+/// random bytes come first so that transaction-log keys keep a high-entropy
+/// prefix, spreading writes across object-storage partitions instead of
+/// clustering sequential commits into a single hot partition. The timestamp
+/// suffix encodes the transaction priority used by the wound-wait rule: an
+/// earlier timestamp means an older, higher-priority transaction.
+///
+/// A `TxId` can also hold an arbitrary byte sequence (e.g. when decoded from a
+/// storage tag).
 #[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TxId(Vec<u8>);
 
 impl TxId {
     /// Generates a new random 128-bit transaction ID.
+    ///
+    /// The timestamp suffix is random rather than clock-derived: this keeps the
+    /// `data` crate free of any clock dependency. Production code mints IDs via
+    /// [`TxId::new_at`] with a clock-sourced timestamp; this constructor is for
+    /// callers (mostly tests) that only need a unique identifier.
     pub fn new_random() -> Self {
-        let mut b = vec![0u8; 16];
+        let mut b = vec![0u8; TX_ID_LEN];
         rand::rng().fill_bytes(&mut b);
         TxId(b)
+    }
+
+    /// Builds a transaction ID from a random prefix and an explicit UnixNano
+    /// timestamp, which determines its wound-wait priority.
+    pub fn new_at(unix_nanos: u64) -> Self {
+        let mut b = vec![0u8; TX_ID_LEN];
+        rand::rng().fill_bytes(&mut b[..TX_ID_TS_OFF]);
+        b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
+        TxId(b)
+    }
+
+    /// Builds a transaction ID from an explicit timestamp and random prefix.
+    /// Meant for tests that need deterministic priorities. At most the first 8
+    /// bytes of `prefix` are used.
+    pub fn with_priority(unix_nanos: u64, prefix: &[u8]) -> Self {
+        let mut b = vec![0u8; TX_ID_LEN];
+        let n = prefix.len().min(TX_ID_TS_OFF);
+        b[..n].copy_from_slice(&prefix[..n]);
+        b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
+        TxId(b)
+    }
+
+    /// Returns a transaction ID that preserves the priority (timestamp) of
+    /// `self` but uses a fresh random prefix. A wounded transaction reuses its
+    /// priority on restart to avoid starvation, while the new prefix gives it a
+    /// distinct log object that lands in a different storage partition.
+    pub fn renew(&self) -> Self {
+        let mut b = vec![0u8; TX_ID_LEN];
+        rand::rng().fill_bytes(&mut b[..TX_ID_TS_OFF]);
+        b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
+        TxId(b)
+    }
+
+    /// Reports whether `self` has strictly higher priority than `other`, i.e. it
+    /// carries an earlier timestamp.
+    ///
+    /// Priority depends only on the timestamp, never on the random prefix. This
+    /// is essential for the wound-wait rule: [`TxId::renew`] preserves the
+    /// timestamp but mints a fresh prefix on every restart, so a prefix-based
+    /// tiebreak would let two equal-timestamp transactions flip their relative
+    /// order on each wound and livelock by wounding each other forever.
+    /// Transactions sharing a timestamp are therefore never ordered against each
+    /// other; that rare tie is left to the serial-locking deadlock safety net.
+    pub fn older(&self, other: &TxId) -> bool {
+        self.priority() < other.priority()
+    }
+
+    /// Returns the wound-wait priority (the big-endian UnixNano timestamp
+    /// suffix). Defensive on short IDs, which have no timestamp and thus the
+    /// highest priority (zero).
+    fn priority(&self) -> u64 {
+        if self.0.len() < TX_ID_LEN {
+            return 0;
+        }
+        let mut ts = [0u8; 8];
+        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..TX_ID_LEN]);
+        u64::from_be_bytes(ts)
     }
 
     /// Wraps raw bytes as a transaction ID.
@@ -185,6 +259,73 @@ mod tests {
         let id = TxId::new_random();
         assert_eq!(id.len(), 16);
         assert_eq!(id.to_string().len(), 32);
+    }
+
+    #[test]
+    fn new_at_layout() {
+        let nanos = 1_700_000_000_000_000_000u64;
+        let id = TxId::new_at(nanos);
+        assert_eq!(id.len(), 16);
+        assert_eq!(id.priority(), nanos);
+    }
+
+    #[test]
+    fn older_timestamp_wins_over_prefix() {
+        let base = 1000u64 * 1_000_000_000;
+        let older = TxId::with_priority(base, b"zzzzzzzz");
+        let younger = TxId::with_priority(base + 1_000_000_000, b"aaaaaaaa");
+        assert!(older.older(&younger));
+        assert!(!younger.older(&older));
+    }
+
+    #[test]
+    fn older_timestamp_dominates_prefix() {
+        let older = TxId::with_priority(1_000_000_000, &[0xff; 8]);
+        let younger = TxId::with_priority(2_000_000_000, &[0x00; 8]);
+        assert!(older.older(&younger));
+    }
+
+    #[test]
+    fn older_equal_timestamp_not_ordered() {
+        let ts = 42u64 * 1_000_000_000;
+        let a = TxId::with_priority(ts, &[0, 0, 0, 0, 0, 0, 0, 1]);
+        let b = TxId::with_priority(ts, &[0, 0, 0, 0, 0, 0, 0, 2]);
+        // Same timestamp: neither is older, regardless of the random prefix.
+        assert!(!a.older(&b));
+        assert!(!b.older(&a));
+    }
+
+    #[test]
+    fn renew_does_not_flip_ordering() {
+        let ts = 42u64 * 1_000_000_000;
+        let mut a = TxId::with_priority(ts, &[0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut b = TxId::with_priority(ts, &[0, 0, 0, 0, 0, 0, 0, 2]);
+        for _ in 0..100 {
+            a = a.renew();
+            b = b.renew();
+            assert!(!a.older(&b));
+            assert!(!b.older(&a));
+        }
+    }
+
+    #[test]
+    fn renew_preserves_priority() {
+        let orig = TxId::new_at(123_456_789_000u64);
+        let renewed = orig.renew();
+        assert_eq!(renewed.len(), 16);
+        assert_eq!(orig.priority(), renewed.priority());
+        assert_ne!(orig, renewed);
+        // The fresh random prefix differs from the original.
+        assert_ne!(orig.as_bytes()[..8], renewed.as_bytes()[..8]);
+    }
+
+    #[test]
+    fn new_random_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = TxId::new_random();
+            assert!(seen.insert(id.into_bytes()), "duplicate TxID generated");
+        }
     }
 
     #[test]

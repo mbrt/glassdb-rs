@@ -18,6 +18,11 @@ pub enum TransError {
     /// The remote transaction log was already committed or aborted.
     #[error("transaction was already finalized")]
     AlreadyFinalized,
+    /// The transaction was aborted by a higher-priority transaction under the
+    /// wound-wait rule (Go `ErrWounded`). It must be retried from the beginning
+    /// with a fresh attempt that preserves the original priority.
+    #[error("transaction was wounded")]
+    Wounded,
     /// The context was cancelled.
     #[error("context canceled")]
     Cancelled,
@@ -51,6 +56,11 @@ impl TransError {
     /// Reports whether this is the retry sentinel.
     pub fn is_retry(&self) -> bool {
         matches!(self, TransError::Retry)
+    }
+
+    /// Reports whether the transaction was wounded under the wound-wait rule.
+    pub fn is_wounded(&self) -> bool {
+        matches!(self, TransError::Wounded)
     }
 
     /// Reports whether the underlying cause is a not-found error.

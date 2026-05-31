@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use glassdb_backend as backend;
-use glassdb_concurr::{Background, Clock, Ctx};
+use glassdb_concurr::{shard::Sharded, Background, Clock, Ctx};
 use glassdb_data::TxId;
 use glassdb_storage::{Local, TLogger, TValue, TxCommitStatus, TxLog, Version, MAX_STALENESS};
 use tokio::sync::oneshot;
@@ -62,7 +62,11 @@ struct Inner {
     tl: TLogger,
     background: Arc<Background>,
     clock: Clock,
-    state: Mutex<State>,
+    // The transaction-tracking maps are partitioned into independent shards
+    // keyed by tid. Grouping the three maps under one lock per shard keeps
+    // their cross-map updates (e.g. removing a tx and notifying its waiters)
+    // atomic for a given transaction.
+    shards: Sharded<Mutex<State>>,
 }
 
 /// Tracks the lifecycle of transactions: commit, abort, status queries, and
@@ -106,14 +110,25 @@ impl Monitor {
                 tl,
                 background,
                 clock,
-                state: Mutex::new(State::default()),
+                shards: Sharded::new(|_| Mutex::new(State::default())),
             }),
         }
     }
 
+    /// Returns the shard lock responsible for `tid`.
+    fn shard_for(&self, tid: &TxId) -> &Mutex<State> {
+        self.inner.shards.for_key(tid.as_bytes())
+    }
+
+    /// Returns the current wall-clock time according to the monitor's clock.
+    /// Used by the transaction engine to derive a transaction's priority.
+    pub(crate) fn clock_now(&self) -> SystemTime {
+        self.inner.clock.now()
+    }
+
     /// Registers a new pending local transaction.
     pub fn begin_tx(&self, tid: &TxId) {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.insert(
             tid.as_bytes().to_vec(),
             TxStatusEntry {
@@ -128,7 +143,7 @@ impl Monitor {
     /// the transaction is not considered expired.
     pub fn start_refresh_tx(&self, ctx: &Ctx, tid: &TxId) {
         let need_start = {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = self.shard_for(tid).lock().unwrap();
             match st.local_tx.get_mut(tid.as_bytes()) {
                 Some(e) if e.refresh_state == RefreshState::NotStarted => {
                     e.refresh_state = RefreshState::Running;
@@ -156,9 +171,14 @@ impl Monitor {
         // the transaction log.
         if !tl.locks.is_empty() {
             tl.status = TxCommitStatus::Ok;
-            self.set_final_log(ctx, tl.clone())
-                .await
-                .map_err(|e| TransError::Other(format!("writing tx log: {e}")))?;
+            self.set_final_log(ctx, tl.clone()).await.map_err(|e| {
+                // Preserve AlreadyFinalized so the commit path can recognize a
+                // wound (the log was already aborted out from under us).
+                match e {
+                    TransError::AlreadyFinalized => TransError::AlreadyFinalized,
+                    other => TransError::Other(format!("writing tx log: {other}")),
+                }
+            })?;
         } else if tl.writes.len() > 1 {
             return Err(TransError::Other(format!(
                 "got {} writes with no locks; this is a bug",
@@ -180,7 +200,7 @@ impl Monitor {
             }
         }
 
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.shard_for(&tl.id).lock().unwrap();
         st.local_tx.remove(tl.id.as_bytes());
         notify_waiters(
             &mut st,
@@ -202,7 +222,7 @@ impl Monitor {
             .set_final_log(ctx, TxLog::new(tid.clone(), TxCommitStatus::Aborted))
             .await;
 
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid.as_bytes());
         notify_waiters(
             &mut st,
@@ -215,10 +235,57 @@ impl Monitor {
         res
     }
 
+    /// Forces the given transaction into the aborted state so that a
+    /// higher-priority transaction can take over its locks under the wound-wait
+    /// rule. It is idempotent and safe on transactions that already finished: a
+    /// committed transaction is left untouched (its locks are released through
+    /// the normal flow), and an already-aborted one is a no-op.
+    ///
+    /// The abort is made durable via a conditional write on the transaction log,
+    /// so it is observed both by the local victim (its commit will fail) and by
+    /// other clients holding the same lock.
+    pub async fn wound_tx(&self, ctx: &Ctx, tid: &TxId) -> Result<(), TransError> {
+        let cs =
+            self.inner.tl.commit_status(ctx, tid).await.map_err(|e| {
+                TransError::Other(format!("reading status of wound target {tid}: {e}"))
+            })?;
+        if cs.status.is_final() {
+            // Already committed or aborted: nothing left to wound.
+            self.mark_local_aborted(tid, cs.status);
+            return Ok(());
+        }
+
+        // Force the transaction to aborted, CAS-ing over its current log version
+        // (or creating an aborted log if it has none yet).
+        let status = self.try_abort_remote_tx(ctx, tid, &cs.version).await?;
+        self.mark_local_aborted(tid, status);
+        Ok(())
+    }
+
+    /// Reflects a durable abort in the in-memory state when the wounded
+    /// transaction is local, so the victim and any waiters unwind promptly.
+    fn mark_local_aborted(&self, tid: &TxId, status: TxCommitStatus) {
+        if status != TxCommitStatus::Aborted {
+            return;
+        }
+        self.stop_tx_refresh(tid);
+
+        let mut st = self.shard_for(tid).lock().unwrap();
+        st.local_tx.remove(tid.as_bytes());
+        notify_waiters(
+            &mut st,
+            tid,
+            WaitTxResult {
+                status: TxCommitStatus::Aborted,
+                err: None,
+            },
+        );
+    }
+
     /// Returns the commit status, checking locally first then remote storage.
     pub async fn tx_status(&self, ctx: &Ctx, tid: &TxId) -> Result<TxCommitStatus, TransError> {
         {
-            let st = self.inner.state.lock().unwrap();
+            let st = self.shard_for(tid).lock().unwrap();
             if let Some(e) = st.local_tx.get(tid.as_bytes()) {
                 return Ok(e.status);
             }
@@ -231,7 +298,7 @@ impl Monitor {
     pub fn wait_for_tx(&self, ctx: &Ctx, tid: &TxId) -> oneshot::Receiver<WaitTxResult> {
         let (tx, rx) = oneshot::channel();
 
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.shard_for(tid).lock().unwrap();
         let entry = st.local_tx.get(tid.as_bytes());
         let is_local = entry.is_some();
         let status = entry.map(|e| e.status).unwrap_or(TxCommitStatus::Unknown);
@@ -277,7 +344,7 @@ impl Monitor {
                 if err.is_none() || !cur_ctx.is_cancelled() {
                     let res = WaitTxResult { status, err };
                     {
-                        let mut st = m.inner.state.lock().unwrap();
+                        let mut st = m.shard_for(&tid).lock().unwrap();
                         notify_waiters(&mut st, &tid, res.clone());
                     }
                     let _ = tx.send(res);
@@ -285,7 +352,7 @@ impl Monitor {
                 }
                 // The context expired. See whether somebody else is interested.
                 let next = {
-                    let mut st = m.inner.state.lock().unwrap();
+                    let mut st = m.shard_for(&tid).lock().unwrap();
                     next_waiter(&mut st, &tid)
                 };
                 match next {
@@ -376,7 +443,7 @@ impl Monitor {
     async fn handle_unknown_tx(&self, ctx: &Ctx, tid: &TxId) -> Result<TxCommitStatus, TransError> {
         let now = self.inner.clock.now();
         let first_check = {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = self.shard_for(tid).lock().unwrap();
             match st.unknown_tx.get(tid.as_bytes()) {
                 Some(fc) => *fc,
                 None => {
@@ -391,8 +458,7 @@ impl Monitor {
                 .try_abort_remote_tx(ctx, tid, &backend::Version::default())
                 .await;
             if res.is_ok() {
-                self.inner
-                    .state
+                self.shard_for(tid)
                     .lock()
                     .unwrap()
                     .unknown_tx
@@ -451,7 +517,7 @@ impl Monitor {
             return Err(TransError::Other("missing required tlog ID".into()));
         }
         let mut last_v = {
-            let st = self.inner.state.lock().unwrap();
+            let st = self.shard_for(&tid).lock().unwrap();
             st.local_tx
                 .get(tid.as_bytes())
                 .map(|e| e.last_version.clone())
@@ -486,7 +552,7 @@ impl Monitor {
     }
 
     fn should_refresh(&self, tid: &TxId) -> bool {
-        let st = self.inner.state.lock().unwrap();
+        let st = self.shard_for(tid).lock().unwrap();
         matches!(
             st.local_tx.get(tid.as_bytes()),
             Some(e) if e.refresh_state == RefreshState::Running
@@ -494,7 +560,7 @@ impl Monitor {
     }
 
     fn stop_tx_refresh(&self, tid: &TxId) -> bool {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.shard_for(tid).lock().unwrap();
         match st.local_tx.get_mut(tid.as_bytes()) {
             Some(e) if e.refresh_state == RefreshState::Running => {
                 e.refresh_state = RefreshState::Stopped;
@@ -531,7 +597,7 @@ impl Monitor {
             match r {
                 Ok(v) => {
                     last_version = v;
-                    let mut st = self.inner.state.lock().unwrap();
+                    let mut st = self.shard_for(&tid).lock().unwrap();
                     if let Some(e) = st.local_tx.get_mut(tid.as_bytes()) {
                         e.last_version = last_version.clone();
                     }

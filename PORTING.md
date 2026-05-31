@@ -105,8 +105,10 @@ layer, and preserves the exact matching semantics via `is_*` predicates:
 - `StorageError`: wraps `BackendError`, plus `KeyNotFound`; `is_not_found` /
   `is_precondition` delegate to the backend.
 - `TransError`: the engine's control-flow errors — `Retry` (Go `ErrRetry`),
-  `AlreadyFinalized`, `Cancelled`, and the **internal** `ValidateRetry`
-  (Go `errValidateRetry`) and `LockTimeout` / `NoSingleWrite`.
+  `AlreadyFinalized`, `Wounded` (Go `ErrWounded`; a wound-wait abort, consumed by
+  the DB retry loop which restarts the victim with a renewed ID), `Cancelled`,
+  and the **internal** `ValidateRetry` (Go `errValidateRetry`) and
+  `LockTimeout` / `NoSingleWrite`.
 - `glassdb::Error`: the public surface — `NotFound`, `Aborted`, `Precondition`,
   `Cancelled`, `AlreadyFinalized`, `Other`.
 
@@ -125,7 +127,11 @@ the Go code:
 - **Paths**: a custom order-preserving base64 alphabet with type markers, ported
   in `glassdb-data::paths`. Go's `path.Clean`/`path.Join` are reimplemented
   faithfully in `glassdb-data::gopath` so storage keys match exactly.
-- **`TxId`**: 16 random bytes, lower-hex `Display`.
+- **`TxId`**: `[8 random bytes][8 bytes big-endian UnixNano timestamp]`, lower-hex
+  `Display`. The random prefix leads so transaction-log keys keep a
+  high-entropy prefix (object stores partition by key prefix), while the
+  timestamp suffix encodes the wound-wait priority (see
+  [ADR-002](docs/adr/002-wound-wait-locking.md)).
 - **Transaction log protobuf**: `prost`-generated from a copy of
   `transaction.proto`, keeping identical field numbers and the `oneof val_delete`
   layout, so logs written by either implementation are mutually readable.

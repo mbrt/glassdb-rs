@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use glassdb_backend::{self as backend, Metadata};
@@ -29,6 +29,16 @@ const BACKGROUND_CONCURRENCY: usize = 3;
 const LOCK_LATENCY: Duration = Duration::from_millis(90);
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Converts a wall-clock instant to UnixNano, used to derive a transaction's
+/// wound-wait priority. The `SystemTime`->`u64` conversion lives here in `trans`
+/// (rather than in the pure `data` crate) so the priority can be sourced from
+/// the monitor's clock, which is anchored to tokio's virtual time in tests.
+fn now_unix_nanos(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -307,12 +317,26 @@ impl Algo {
     pub fn begin(&self, ctx: &Ctx, d: Data) -> Handle {
         let id = match ctx.tx_id() {
             Some(b) => TxId::from_bytes(b.to_vec()),
-            None => TxId::new_random(),
+            None => TxId::new_at(now_unix_nanos(self.mon.clock_now())),
         };
         Handle {
             data: d,
             status: Status::New,
             id,
+            require_locks: false,
+            serial_locking: false,
+        }
+    }
+
+    /// Restarts a wounded or retried transaction, preserving its priority
+    /// (timestamp) while minting a fresh log identity. Reusing the original
+    /// priority prevents a restarted transaction from being starved by an
+    /// endless stream of younger peers.
+    pub fn rebegin(&self, old: &Handle, d: Data) -> Handle {
+        Handle {
+            data: d,
+            status: Status::New,
+            id: old.id.renew(),
             require_locks: false,
             serial_locking: false,
         }
@@ -328,6 +352,12 @@ impl Algo {
         let mut vstate = init_validation(tx);
 
         loop {
+            // Stop early if a higher-priority transaction wounded us while we
+            // were validating: there's no point acquiring more locks.
+            if self.was_wounded(ctx, tx).await {
+                self.update_local_cache(&vstate);
+                return Err(TransError::Wounded);
+            }
             match self.validate_round(ctx, &mut vstate, tx).await {
                 Ok(()) => break,
                 Err(TransError::ValidateRetry) => continue,
@@ -339,12 +369,29 @@ impl Algo {
         }
 
         let writes = tx.data.writes.clone();
-        self.commit_writes(ctx, &writes, &tx.id)
-            .await
-            .map_err(|e| TransError::Other(format!("committing writes for tx {}: {e}", tx.id)))?;
+        if let Err(e) = self.commit_writes(ctx, &writes, &tx.id).await {
+            if matches!(e, TransError::AlreadyFinalized) {
+                // The log was already finalized as aborted: we were wounded (or
+                // reclaimed as expired) between validation and commit.
+                return Err(TransError::Wounded);
+            }
+            return Err(TransError::Other(format!(
+                "committing writes for tx {}: {e}",
+                tx.id
+            )));
+        }
         tx.status = Status::Committed;
         self.async_cleanup(ctx, tx);
         Ok(())
+    }
+
+    /// Reports whether the transaction was already aborted by a higher-priority
+    /// transaction. Best-effort: a status read error is not treated as a wound.
+    async fn was_wounded(&self, ctx: &Ctx, tx: &Handle) -> bool {
+        matches!(
+            self.mon.tx_status(ctx, &tx.id).await,
+            Ok(glassdb_storage::TxCommitStatus::Aborted)
+        )
     }
 
     /// Validates the reads of a read-only transaction, returning
@@ -1022,10 +1069,11 @@ impl Algo {
     ) -> Result<(), TransError> {
         let mut tl = to_log(id.clone(), writes);
         tl.locks = self.locker.locked_paths(id);
-        self.mon
-            .commit_tx(ctx, tl)
-            .await
-            .map_err(|e| TransError::Other(format!("creating transaction object: {e}")))
+        self.mon.commit_tx(ctx, tl).await.map_err(|e| match e {
+            // Preserve AlreadyFinalized so the commit path can map it to a wound.
+            TransError::AlreadyFinalized => TransError::AlreadyFinalized,
+            other => TransError::Other(format!("creating transaction object: {other}")),
+        })
     }
 
     fn update_local(&self, w: &WriteAccess, tid: &TxId) {
