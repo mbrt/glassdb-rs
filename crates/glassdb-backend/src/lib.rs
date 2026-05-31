@@ -11,6 +11,7 @@ use base64::Engine;
 use glassdb_concurr::Ctx;
 
 pub mod memory;
+pub mod middleware;
 mod stats;
 
 pub use stats::{BackendStats, StatsBackend};

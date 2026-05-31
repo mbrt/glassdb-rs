@@ -8,12 +8,21 @@ publish = false
 [dependencies]
 glassdb-data = { workspace = true }
 glassdb-backend = { workspace = true }
+glassdb-backend-s3 = { workspace = true, optional = true }
+glassdb-backend-gcs = { workspace = true, optional = true }
 glassdb-storage = { workspace = true }
 glassdb-trans = { workspace = true }
 glassdb-concurr = { workspace = true }
 futures = "0.3.32"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time"] }
+
+[features]
+default = []
+# Pull in the Amazon S3 backend (heavy AWS SDK dependency).
+s3 = ["dep:glassdb-backend-s3"]
+# Pull in the Google Cloud Storage backend (reqwest/gcp_auth dependency).
+gcs = ["dep:glassdb-backend-gcs"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }

@@ -5,6 +5,8 @@ members = [
     "crates/glassdb-proto",
     "crates/glassdb-concurr",
     "crates/glassdb-backend",
+    "crates/glassdb-backend-s3",
+    "crates/glassdb-backend-gcs",
     "crates/glassdb-storage",
     "crates/glassdb-trans",
     "crates/glassdb",
@@ -21,6 +23,8 @@ glassdb-data = { path = "crates/glassdb-data" }
 glassdb-proto = { path = "crates/glassdb-proto" }
 glassdb-concurr = { path = "crates/glassdb-concurr" }
 glassdb-backend = { path = "crates/glassdb-backend" }
+glassdb-backend-s3 = { path = "crates/glassdb-backend-s3" }
+glassdb-backend-gcs = { path = "crates/glassdb-backend-gcs" }
 glassdb-storage = { path = "crates/glassdb-storage" }
 glassdb-trans = { path = "crates/glassdb-trans" }
 

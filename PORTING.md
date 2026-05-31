@@ -12,19 +12,21 @@ standalone Rust port.
   control flow), the Rust port reproduces it exactly. Where Go choices are
   incidental (mutex granularity, goroutine plumbing), the port uses idiomatic
   Rust.
-- **Memory backend only.** Cloud backends (S3/GCS) and their fake-cloud test
-  harness are out of scope for now (see [below](#out-of-scope)).
+- **In-memory, S3, and GCS backends.** All three backends are ported, each
+  tested against a pure-Rust in-process fake of its API (see
+  [Cloud backends](#cloud-backends-and-in-process-fakes)).
 - **Async on tokio.** The whole stack is `async`, built on tokio.
 
 ## Workspace structure
 
-The port is a Cargo workspace of seven internal crates (`publish = false`) that
-mirror Go's `internal/` package boundaries:
+The port is a Cargo workspace of nine internal crates (`publish = false`) that
+mirror Go's `internal/` and `backend/` package boundaries:
 
 ```
 glassdb-data → glassdb-backend → glassdb-storage → glassdb-trans → glassdb
 glassdb-proto ─┘                  ↑                      ↑
 glassdb-concurr ──────────────────┴──────────────────────┘
+glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 ```
 
 Rationale:
@@ -128,6 +130,57 @@ the Go code:
   `transaction.proto`, keeping identical field numbers and the `oneof val_delete`
   layout, so logs written by either implementation are mutually readable.
 
+## Cloud backends and in-process fakes
+
+Both cloud backends implement the same `Backend` trait and live in their own
+feature-gated crates so the AWS SDK / reqwest dependencies are opt-in.
+
+- **S3** (`glassdb-backend-s3`, `aws-sdk-s3`). The opaque `Version` token is the
+  object ETag (quotes included). Because an ETag is the MD5 of the content, an
+  8-byte random nonce is prepended to every object body so that re-uploading
+  identical bytes still yields a fresh ETag — restoring real compare-and-swap
+  for metadata-only updates. Lock/last-writer tags are stored as `x-amz-meta-*`
+  user metadata; conditional writes use `If-Match` / `If-None-Match`. Two retry
+  layers compose: the SDK retryer rides out `503 SlowDown` within each
+  `PutObject` (the default is the adaptive retryer with a raised attempt count),
+  while a small outer loop re-issues on the `409 ConditionalRequestConflict`
+  that S3 returns when concurrent conditional writes race.
+- **GCS** (`glassdb-backend-gcs`, JSON API over `reqwest`). GCS has native
+  preconditions, so the token encodes `"{generation}/{metageneration}"` and maps
+  directly onto `ifGenerationMatch` / `ifMetagenerationMatch` (with
+  `ifGenerationMatch=0` for create-if-absent). Values are uploaded with a
+  `multipart/related` insert; tags are object custom metadata. One subtlety: a
+  metadata patch *replaces* the whole metadata map, but the locker calls
+  `set_tags_if` with only the lock tags, so the backend reads the current
+  metadata and overlays the new tags to preserve `last-writer` — matching the
+  merge semantics of the memory and S3 backends. Authentication uses
+  Application Default Credentials via `gcp_auth`, resolved lazily on first
+  request; an injectable `TokenProvider` and an unauthenticated `with_endpoint`
+  constructor support emulators and tests.
+
+### In-process fakes instead of Docker
+
+The Go tests use `gofakes3` and `fake-gcs-server`. The Rust port keeps the
+"no external services" property by compiling a minimal `hyper` server of the
+relevant REST subset into each crate under `#[cfg(test)]`, so the real SDK /
+HTTP client talks to a loopback socket. This exercises the actual request
+encoding, conditional headers, and error mapping without Docker or live
+credentials. The S3 fake can also inject a bounded run of `503 SlowDown`
+responses (the analog of the Go `SlowDownTransport`) to drive the retry tests
+deterministically.
+
+## Middleware decorators
+
+The latency, scheduler, and logger decorators wrap any `Backend`:
+
+- `DelayBackend` injects per-operation latency from a lognormal distribution
+  plus an optional per-object token-bucket rate limiter, driven by
+  `tokio::time` so tests stay deterministic under paused time (presets mirror
+  the Go GCS/S3 latency profiles).
+- `ScheduledBackend` / `Scheduler` inject byte-sequence-driven delays, the
+  building block needed to replay `FuzzConcurrentTx` interleavings.
+- `BackendLogger` traces every operation via the `tracing` crate.
+
 ## Public API choices
 
 - **`DB::tx` takes an `AsyncFnMut` closure.** The transaction body is
@@ -141,7 +194,8 @@ the Go code:
   expose a terminal `err()` accessor (rather than Go's `Next() (v, ok)` plus
   `Err()` pattern, adapted to Rust's `Iterator`).
 - **Re-exports for ergonomics.** `glassdb` re-exports `Backend`, the `memory`
-  backend, and `Ctx`, so callers need only depend on the one crate.
+  backend, `middleware`, and `Ctx`, so callers need only depend on the one
+  crate; the `s3` / `gcs` backends are re-exported under their cargo features.
 
 ## Testing strategy
 
@@ -168,12 +222,13 @@ the Go code:
   crate; the implementation uses a small exponential-backoff helper
   (`retry_with_backoff`) with `Transient`/`Permanent` error classification,
   avoiding an extra dependency for a few dozen lines.
-- **No scheduler/delay/logger middleware yet.** Only the memory backend and the
-  stats decorator were ported. The deterministic scheduler middleware (needed to
-  fully reproduce `FuzzConcurrentTx`) is deferred; the proptest above covers the
-  invariant in the meantime.
+- **GCS rate-limit retry simplified.** The Go GCS backend retries a `429`
+  by rechunking the upload; the Rust port surfaces `429` as a generic error for
+  now, since the transaction engine already retries at a higher level.
 
 ## Out of scope
 
-- S3/GCS backends and the fake-cloud test harness (`gofakes3`, fake-GCS).
 - Benchmark tooling and demos from the original repository.
+- Wiring the deterministic `ScheduledBackend` into a byte-driven port of
+  `FuzzConcurrentTx` (the middleware exists; the fuzz harness is still a
+  `proptest`).

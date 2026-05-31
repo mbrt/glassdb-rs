@@ -1,0 +1,22 @@
+[package]
+name = "glassdb-backend-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+aws-config = "1.8.17"
+aws-sdk-s3 = "1.134.0"
+glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
+glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
+rand = "0.10.1"
+tokio = { version = "1.52.3", features = ["rt", "macros", "time"] }
+
+[dev-dependencies]
+bytes = "1.11.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.10.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util"] }
