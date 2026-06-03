@@ -191,10 +191,18 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
 
 ## Public API choices
 
-- **`DB::tx` takes an `AsyncFnMut` closure.** The transaction body is
-  `async |tx| -> Result<T, Error>`; the framework owns the retry loop and reruns
-  the closure on conflict. This mirrors Go's `db.Tx(ctx, func(tx) error)` while
-  letting the body `.await` reads.
+- **`DB::tx` takes the body by value: `FnMut(Tx) -> impl Future + Send`.** Write
+  it as `|tx| async move { ... }`. `Tx` is a cheap, `Send` handle over
+  interior-mutable state, passed by value rather than `&mut`, so the transaction
+  future is `Send` and can be `tokio::spawn`-ed for true multiplexing. (An
+  `async |tx|` closure cannot: bounding its returned future as `Send` is not
+  expressible for `AsyncFn*` on stable Rust.) The framework owns the retry loop
+  and reruns the closure on conflict, mirroring Go's `db.Tx(ctx, func(tx) error)`
+  while letting the body `.await` reads.
+- **One read primitive: `Tx::read`.** Because `read` takes `&self`, several
+  reads can be polled concurrently for parallel fetches
+  (`futures::future::join_all(keys.iter().map(|k| tx.read(coll, k)))`), so the
+  old batched `read_multi` (and its `FqKey`/`ReadResult` types) was dropped.
 - **`Collection` helpers** (`read_strong`, `write`, `delete`, `update`, …) each
   run a one-shot transaction via the same retry loop, matching the original.
 - **Iterators return in-memory snapshots.** The memory backend returns the full
@@ -210,11 +218,11 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
 - **Determinism via paused time.** Integration tests use
   `#[tokio::test(start_paused = true)]`; contended paths resolve via virtual time
   with no real sleeps.
-- **`join!` instead of `spawn` for concurrency tests.** Async closures captured
-  into `tokio::spawn` hit "implementation of `Send` is not general enough" (a
-  higher-ranked-lifetime limitation). Running concurrent workloads with
-  `tokio::join!` on the current-thread paused runtime gives real interleaving
-  (tasks yield at `.await` points under contention) without the `Send` bound.
+- **`join!` instead of `spawn` for concurrency tests.** Transaction futures are
+  `Send` and could be spawned, but the integration/property tests run on a
+  current-thread `start_paused` runtime where `tokio::join!` keeps every workload
+  on one task — giving real interleaving (tasks yield at `.await` points under
+  contention) while keeping virtual-time control simple and deterministic.
 - **Deterministic simulation fuzzer (madsim).** The original `FuzzConcurrentTx`
   uses a byte-driven backend-delay scheduler. The Rust port goes further with a
   madsim-based DST in which scheduling, time, and randomness are all functions of
@@ -272,13 +280,12 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
 
 Two parts deviate from the Go original by necessity:
 
-- **Worker concurrency uses OS threads, not goroutines.** A `db.tx(async |tx|
-  …)` future is not `Send` (the higher-ranked-lifetime limitation noted under
-  [Testing strategy](#testing-strategy)), so it cannot be `tokio::spawn`-ed onto
-  a multi-thread runtime. `rtbench` runs each worker on its own OS thread that
-  calls `Handle::block_on` on a single shared runtime — all I/O is therefore
-  registered with one reactor, so a single shared S3 client works across all
-  workers, matching the Go design.
+- **Worker concurrency uses `tokio::spawn`, like goroutines.** Because the
+  `db.tx` future is `Send` (the body is taken by value, see [Public API
+  choices](#public-api-choices)), `rtbench` spawns each worker as a task on a
+  shared multi-thread runtime, which multiplexes them over its worker threads.
+  All I/O is registered with one reactor, so a single shared S3 client serves
+  every worker — matching the Go design where all goroutines share one client.
 - **Two `client-stats.csv` columns are best-effort.** `new-conns` is always `0`
   (the aws-sdk HTTP stack does not surface TLS handshakes) and `max-goroutines`
   holds the peak OS-thread count (sampled from `/proc/self/status`). The CSV

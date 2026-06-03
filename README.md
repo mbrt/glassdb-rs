@@ -59,14 +59,16 @@ async fn main() -> Result<(), glassdb::Error> {
     assert_eq!(v, b"hello");
 
     // Multi-key serializable transaction with automatic conflict retries.
-    db.tx(&ctx, async |tx| {
-        let cur = match tx.read(&users, b"counter").await {
+    // `tx` is an owned handle; write the body as `|tx| async move { ... }`.
+    let users = &users;
+    db.tx(&ctx, |tx| async move {
+        let cur = match tx.read(users, b"counter").await {
             Ok(v) => v,
             Err(e) if e.is_not_found() => b"0".to_vec(),
             Err(e) => return Err(e),
         };
         let next = String::from_utf8_lossy(&cur).parse::<i64>().unwrap_or(0) + 1;
-        tx.write(&users, b"counter", next.to_string().as_bytes())
+        tx.write(users, b"counter", next.to_string().as_bytes())
     })
     .await?;
 

@@ -23,6 +23,7 @@ aws-config = "1.8.17"
 aws-sdk-s3 = "1.134.0"
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
+futures = "0.3.32"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

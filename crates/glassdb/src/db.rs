@@ -1,8 +1,8 @@
 //! The database entry point. Ported from the Go `db.go`: opening a database,
 //! the transaction retry loop, collections, and stats.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
-
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
@@ -135,9 +135,16 @@ impl DB {
     /// Executes `f` within a serializable transaction, retrying on conflicts.
     /// The value returned by `f` on a successful commit is returned to the
     /// caller.
-    pub async fn tx<T, F>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
+    ///
+    /// `f` receives the [`Tx`] handle by value and returns a future, so the
+    /// transaction future is `Send` and can be `tokio::spawn`-ed. Write the body
+    /// as `|tx| async move { ... }`. The framework owns the retry loop and may
+    /// invoke `f` multiple times, so `f` must be `FnMut`.
+    pub async fn tx<T, F, Fut>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
     where
-        F: AsyncFnMut(&mut Tx) -> Result<T, Error>,
+        F: FnMut(Tx) -> Fut + Send,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        T: Send,
     {
         self.inner.tx(ctx, f).await
     }
@@ -162,9 +169,11 @@ impl DbInner {
         stats.add(s);
     }
 
-    pub(crate) async fn tx<T, F>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
+    pub(crate) async fn tx<T, F, Fut>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
     where
-        F: AsyncFnMut(&mut Tx) -> Result<T, Error>,
+        F: FnMut(Tx) -> Fut + Send,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        T: Send,
     {
         let mut stats = Stats {
             tx_n: 1,
@@ -177,11 +186,13 @@ impl DbInner {
         res
     }
 
-    async fn tx_impl<T, F>(&self, ctx: &Ctx, mut f: F, stats: &mut Stats) -> Result<T, Error>
+    async fn tx_impl<T, F, Fut>(&self, ctx: &Ctx, mut f: F, stats: &mut Stats) -> Result<T, Error>
     where
-        F: AsyncFnMut(&mut Tx) -> Result<T, Error>,
+        F: FnMut(Tx) -> Fut + Send,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        T: Send,
     {
-        let mut tx = Tx::new(
+        let tx = Tx::new(
             ctx.clone(),
             self.global.clone(),
             self.local.clone(),
@@ -193,7 +204,10 @@ impl DbInner {
             if ctx.is_cancelled() {
                 break Err(Error::Cancelled);
             }
-            let fn_res = f(&mut tx).await;
+            // Hand a fresh handle to the user closure (which consumes it); `tx`
+            // retains access to the same shared state to collect accesses and
+            // reset between retries.
+            let fn_res = f(tx.handle()).await;
             if tx.aborted() {
                 break Err(Error::Aborted);
             }

@@ -26,7 +26,7 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_from_tx(tx: &mut glassdb::Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(tx: &glassdb::Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         Err(e) if e.is_not_found() => Ok(0),
@@ -36,8 +36,8 @@ async fn read_int_from_tx(tx: &mut glassdb::Tx, c: &Collection, k: &[u8]) -> Res
 
 async fn rmw(ctx: &Ctx, db: &DB, coll: &Collection, key: &[u8], n: u32) -> Result<(), Error> {
     for _ in 0..n {
-        db.tx(ctx, async |tx| {
-            let cur = read_int_from_tx(tx, coll, key).await?;
+        db.tx(ctx, |tx| async move {
+            let cur = read_int_from_tx(&tx, coll, key).await?;
             tx.write(coll, key, &write_int(cur + 1))
         })
         .await?;
@@ -54,9 +54,9 @@ async fn multi_rmw(
     n: u32,
 ) -> Result<(), Error> {
     for _ in 0..n {
-        db.tx(ctx, async |tx| {
-            let va = read_int_from_tx(tx, coll, a).await?;
-            let vb = read_int_from_tx(tx, coll, b).await?;
+        db.tx(ctx, |tx| async move {
+            let va = read_int_from_tx(&tx, coll, a).await?;
+            let vb = read_int_from_tx(&tx, coll, b).await?;
             tx.write(coll, a, &write_int(va + 1))?;
             tx.write(coll, b, &write_int(vb + 1))
         })
@@ -66,7 +66,7 @@ async fn multi_rmw(
 }
 
 async fn read_only(ctx: &Ctx, db: &DB, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
-    db.tx(ctx, async |tx| {
+    db.tx(ctx, |tx| async move {
         for k in keys {
             match tx.read(coll, k).await {
                 Ok(v) => assert!(read_int(&v) >= 0, "negative value for {k:?}"),
@@ -91,9 +91,10 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     let (k1, k2, k3): (&[u8], &[u8], &[u8]) = (b"k1", b"k2", b"k3");
 
     coll1.create(&ctx).await.unwrap();
-    db1.tx(&ctx, async |tx| {
+    let seed_coll = &coll1;
+    db1.tx(&ctx, |tx| async move {
         for k in [k1, k2, k3] {
-            tx.write(&coll1, k, &write_int(0))?;
+            tx.write(seed_coll, k, &write_int(0))?;
         }
         Ok(())
     })

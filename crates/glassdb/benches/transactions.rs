@@ -19,7 +19,7 @@ use tokio::runtime::Runtime;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{gcs_delays, s3_delays, DelayBackend, DelayOptions};
-use glassdb::{Backend, Collection, Ctx, Error, FqKey, Tx, DB};
+use glassdb::{Backend, Collection, Ctx, Error, Tx, DB};
 
 // Number of iterations used for the one-off stats summary printed per backend.
 const STATS_ITERS: i64 = 30;
@@ -62,7 +62,7 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_or_zero(tx: &mut Tx, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
+async fn read_int_or_zero(tx: &Tx, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
     match tx.read(coll, key).await {
         Ok(v) => Ok(read_int(&v)),
         Err(e) if e.is_not_found() => Ok(0),
@@ -83,13 +83,8 @@ async fn open_coll(backend: Arc<dyn Backend>, name: &[u8]) -> (DB, Collection) {
     (db, coll)
 }
 
-fn make_keys(coll: &Collection, n: usize) -> Vec<FqKey> {
-    (0..n)
-        .map(|i| FqKey {
-            collection: coll.clone(),
-            key: format!("key{i}").into_bytes(),
-        })
-        .collect()
+fn make_keys(n: usize) -> Vec<Vec<u8>> {
+    (0..n).map(|i| format!("key{i}").into_bytes()).collect()
 }
 
 /// Runs `body` `STATS_ITERS` times and prints the per-op backend counters,
@@ -114,20 +109,25 @@ async fn report_stats<F: AsyncFnMut()>(label: &str, db: &DB, mut body: F) {
 // --- Workload bodies (one transaction each) -------------------------------
 
 async fn single_rmw(db: &DB, coll: &Collection) {
-    db.tx(&Ctx::background(), async |tx| {
-        let num = read_int_or_zero(tx, coll, b"key").await?;
+    db.tx(&Ctx::background(), |tx| async move {
+        let num = read_int_or_zero(&tx, coll, b"key").await?;
         tx.write(coll, b"key", &write_int(num + 1))
     })
     .await
     .expect("single rmw");
 }
 
-async fn multi_rmw(db: &DB, coll: &Collection, keys: &[FqKey]) {
-    db.tx(&Ctx::background(), async |tx| {
-        let res = tx.read_multi(keys).await;
-        for (i, rv) in res.iter().enumerate() {
-            let val = read_int(&rv.value);
-            tx.write(coll, keys[i].key.as_slice(), &write_int(val + 1))?;
+async fn multi_rmw(db: &DB, coll: &Collection, keys: &[Vec<u8>]) {
+    db.tx(&Ctx::background(), |tx| async move {
+        // Read every key in parallel, then write each incremented value.
+        let vals = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
+        for (k, rv) in keys.iter().zip(vals) {
+            let val = match rv {
+                Ok(v) => read_int(&v),
+                Err(e) if e.is_not_found() => 0,
+                Err(e) => return Err(e),
+            };
+            tx.write(coll, k, &write_int(val + 1))?;
         }
         Ok(())
     })
@@ -135,17 +135,17 @@ async fn multi_rmw(db: &DB, coll: &Collection, keys: &[FqKey]) {
     .expect("multi rmw");
 }
 
-async fn multi_read(db: &DB, keys: &[FqKey]) {
+async fn multi_read(db: &DB, coll: &Collection, keys: &[Vec<u8>]) {
     let _ = db
-        .tx(&Ctx::background(), async |tx| {
-            let _ = tx.read_multi(keys).await;
+        .tx(&Ctx::background(), |tx| async move {
+            let _ = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             Ok::<(), Error>(())
         })
         .await;
 }
 
 async fn hundred_writes(db: &DB, coll: &Collection, base: usize) {
-    db.tx(&Ctx::background(), async |tx| {
+    db.tx(&Ctx::background(), |tx| async move {
         for j in 0..100 {
             let k = format!("k{}", base * 100 + j);
             tx.write(coll, k.as_bytes(), &write_int(j as i64))?;
@@ -157,18 +157,18 @@ async fn hundred_writes(db: &DB, coll: &Collection, base: usize) {
 }
 
 async fn update_two_keys(db: &DB, coll: &Collection, ctx: &Ctx) -> Result<(), Error> {
-    db.tx(ctx, async |tx| {
-        let n1 = read_int_or_zero(tx, coll, b"key1").await?;
+    db.tx(ctx, |tx| async move {
+        let n1 = read_int_or_zero(&tx, coll, b"key1").await?;
         tx.write(coll, b"key1", &write_int(n1 + 1))?;
-        let n2 = read_int_or_zero(tx, coll, b"key2").await?;
+        let n2 = read_int_or_zero(&tx, coll, b"key2").await?;
         tx.write(coll, b"key2", &write_int(n2 + 1))
     })
     .await
 }
 
 async fn update_shared(db: &DB, coll: &Collection, key_w: &[u8], ctx: &Ctx) -> Result<(), Error> {
-    db.tx(ctx, async |tx| {
-        let num = read_int_or_zero(tx, coll, b"key-r").await?;
+    db.tx(ctx, |tx| async move {
+        let num = read_int_or_zero(&tx, coll, b"key-r").await?;
         tx.write(coll, key_w, &write_int(num + 1))
     })
     .await
@@ -197,7 +197,7 @@ fn bench_multi_rmw(c: &mut Criterion, rt: &Runtime) {
     group.sample_size(10);
     for (name, backend) in backends() {
         let (db, coll) = rt.block_on(open_coll(backend, b"rmw-mb"));
-        let keys = make_keys(&coll, 10);
+        let keys = make_keys(10);
         rt.block_on(report_stats(&format!("multi_rmw_10/{name}"), &db, || {
             multi_rmw(&db, &coll, &keys)
         }));
@@ -214,12 +214,14 @@ fn bench_multi_read(c: &mut Criterion, rt: &Runtime) {
     group.sample_size(10);
     for (name, backend) in backends() {
         let (db, coll) = rt.block_on(open_coll(backend, b"rmw-mb"));
-        let keys = make_keys(&coll, 10);
+        let keys = make_keys(10);
         // Pre-write the values once.
         rt.block_on(async {
-            db.tx(&Ctx::background(), async |tx| {
-                for (i, k) in keys.iter().enumerate() {
-                    tx.write(&coll, k.key.as_slice(), &write_int(i as i64))?;
+            let coll_ref = &coll;
+            let keys_ref = &keys;
+            db.tx(&Ctx::background(), |tx| async move {
+                for (i, k) in keys_ref.iter().enumerate() {
+                    tx.write(coll_ref, k, &write_int(i as i64))?;
                 }
                 Ok(())
             })
@@ -227,10 +229,10 @@ fn bench_multi_read(c: &mut Criterion, rt: &Runtime) {
             .expect("seed values");
         });
         rt.block_on(report_stats(&format!("multi_read_10/{name}"), &db, || {
-            multi_read(&db, &keys)
+            multi_read(&db, &coll, &keys)
         }));
         group.bench_function(name, |bch| {
-            bch.iter(|| rt.block_on(multi_read(&db, &keys)));
+            bch.iter(|| rt.block_on(multi_read(&db, &coll, &keys)));
         });
         rt.block_on(db.close());
     }
@@ -267,23 +269,16 @@ fn bench_concurr_multi_rmw(c: &mut Criterion, rt: &Runtime) {
         let db2 = rt.block_on(open_db(backend));
         let coll2 = db2.collection(b"rmw-b");
 
-        // The contender runs on its own OS thread but drives its futures with
-        // `Handle::block_on` on the *shared* measured runtime (like `rtbench`),
-        // so it time-slices the same worker pool as the measured workload
-        // instead of saturating a dedicated core. (`tokio::spawn` is not an
-        // option: the `db.tx(async |tx| ...)` future trips the higher-ranked-
-        // lifetime `Send` limitation noted in PORTING.md; `block_on` has no
-        // `Send` bound.)
+        // The contender is a spawned task on the *shared* measured runtime, so
+        // it multiplexes over the same worker pool as the measured workload
+        // (the `db.tx` future is `Send`, so no dedicated OS thread is needed).
         let (cctx, cancel) = Ctx::with_cancel();
         let cdb = db1.clone();
         let ccoll = coll1.clone();
-        let chandle = rt.handle().clone();
-        let handle = std::thread::spawn(move || {
-            chandle.block_on(async {
-                while !cctx.is_cancelled() {
-                    let _ = update_two_keys(&cdb, &ccoll, &cctx).await;
-                }
-            });
+        let handle = rt.spawn(async move {
+            while !cctx.is_cancelled() {
+                let _ = update_two_keys(&cdb, &ccoll, &cctx).await;
+            }
         });
 
         rt.block_on(report_stats(
@@ -302,7 +297,7 @@ fn bench_concurr_multi_rmw(c: &mut Criterion, rt: &Runtime) {
         });
 
         cancel.cancel();
-        let _ = handle.join();
+        let _ = rt.block_on(handle);
         rt.block_on(db1.close());
         rt.block_on(db2.close());
     }
@@ -315,27 +310,25 @@ fn bench_shared_read(c: &mut Criterion, rt: &Runtime) {
     for (name, backend) in backends() {
         let (db, coll) = rt.block_on(open_coll(backend, b"shr-b"));
         rt.block_on(async {
-            db.tx(&Ctx::background(), async |tx| {
-                tx.write(&coll, b"key-r", &write_int(1))?;
-                tx.write(&coll, b"key-w1", &write_int(0))?;
-                tx.write(&coll, b"key-w2", &write_int(0))
+            let coll_ref = &coll;
+            db.tx(&Ctx::background(), |tx| async move {
+                tx.write(coll_ref, b"key-r", &write_int(1))?;
+                tx.write(coll_ref, b"key-w1", &write_int(0))?;
+                tx.write(coll_ref, b"key-w2", &write_int(0))
             })
             .await
             .expect("seed shared keys");
         });
 
-        // Background contender on its own thread, sharing the measured runtime
-        // (see `bench_concurr_multi_rmw` for why).
+        // Background contender spawned on the shared measured runtime (see
+        // `bench_concurr_multi_rmw`).
         let (cctx, cancel) = Ctx::with_cancel();
         let cdb = db.clone();
         let ccoll = coll.clone();
-        let chandle = rt.handle().clone();
-        let handle = std::thread::spawn(move || {
-            chandle.block_on(async {
-                while !cctx.is_cancelled() {
-                    let _ = update_shared(&cdb, &ccoll, b"key-w2", &cctx).await;
-                }
-            });
+        let handle = rt.spawn(async move {
+            while !cctx.is_cancelled() {
+                let _ = update_shared(&cdb, &ccoll, b"key-w2", &cctx).await;
+            }
         });
 
         rt.block_on(report_stats(
@@ -354,7 +347,7 @@ fn bench_shared_read(c: &mut Criterion, rt: &Runtime) {
         });
 
         cancel.cancel();
-        let _ = handle.join();
+        let _ = rt.block_on(handle);
         rt.block_on(db.close());
     }
     group.finish();

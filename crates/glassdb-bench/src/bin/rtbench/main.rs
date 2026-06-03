@@ -11,13 +11,12 @@
 //!
 //! ## Concurrency model
 //!
-//! GlassDB transaction futures are not `Send` (the `db.tx(async |tx| ...)`
-//! closure trips a higher-ranked-lifetime limitation, see PORTING.md), so they
-//! cannot be `tokio::spawn`-ed onto a multi-thread runtime. Instead every
-//! worker runs on its own OS thread that calls [`Handle::block_on`] (which has
-//! no `Send` bound) on a single shared runtime. All I/O is therefore registered
-//! with one reactor, so a single shared S3 client works across all workers —
-//! matching the Go design where all goroutines share one client.
+//! `DB::tx` takes the transaction body by value (`|tx| async move { ... }`), so
+//! its future is `Send` and every worker is a `tokio::spawn`-ed task on a shared
+//! multi-thread runtime. The runtime multiplexes all workers over its worker
+//! threads (rather than one OS thread per worker), so a single shared S3 client
+//! and reactor serve everyone — matching the Go design where all goroutines
+//! share one client.
 
 mod clientmetrics;
 mod cpu;
@@ -35,7 +34,7 @@ use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{gcs_delays, s3_delays, DelayBackend, DelayOptions};
-use glassdb::{Collection, Ctx, Error as GError, FqKey, Stats, DB};
+use glassdb::{Collection, Ctx, Error as GError, Stats, DB};
 use glassdb_backend::Backend;
 use glassdb_bench::bench::{Bench, Results};
 
@@ -209,7 +208,7 @@ fn shuffle<T>(rng: &mut StdRng, v: &mut [T]) {
 // ---------------------------------------------------------------------------
 
 struct Benchmarker {
-    bench: Bench,
+    bench: Arc<Bench>,
     num_keys: usize,
     num_workers: usize,
     num_keys_per_worker: usize,
@@ -220,7 +219,7 @@ struct Benchmarker {
 impl Benchmarker {
     fn new(duration: Duration) -> Self {
         Benchmarker {
-            bench: Bench::new(duration),
+            bench: Arc::new(Bench::new(duration)),
             num_keys: 0,
             num_workers: 0,
             num_keys_per_worker: 0,
@@ -375,37 +374,35 @@ fn independent_single_rmw(
     nwriters: usize,
 ) -> Result<(), GError> {
     b.start(db, nwriters, nwriters, 1);
-    let result = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nwriters)
-            .map(|i| {
-                let db = db.clone();
-                let bench = &b.bench;
-                scope.spawn(move || -> Result<(), GError> {
-                    handle.block_on(async move {
-                        let coll = db.collection(format!("c{i}").as_bytes());
-                        coll.create(&Ctx::background()).await?;
-                        while !bench.is_finished() {
-                            bench
-                                .measure(|| async {
-                                    db.tx(&Ctx::background(), async |tx| {
-                                        let v = match tx.read(&coll, b"key").await {
-                                            Ok(v) => v,
-                                            Err(e) if e.is_not_found() => Vec::new(),
-                                            Err(e) => return Err(e),
-                                        };
-                                        tx.write(&coll, b"key", &v)
-                                    })
-                                    .await
-                                })
-                                .await?;
-                        }
-                        Ok(())
-                    })
-                })
+    let handles: Vec<_> = (0..nwriters)
+        .map(|i| {
+            let db = db.clone();
+            let bench = b.bench.clone();
+            handle.spawn(async move {
+                let coll = db.collection(format!("c{i}").as_bytes());
+                coll.create(&Ctx::background()).await?;
+                let coll = &coll;
+                let db = &db;
+                while !bench.is_finished() {
+                    bench
+                        .measure(|| async move {
+                            db.tx(&Ctx::background(), |tx| async move {
+                                let v = match tx.read(coll, b"key").await {
+                                    Ok(v) => v,
+                                    Err(e) if e.is_not_found() => Vec::new(),
+                                    Err(e) => return Err(e),
+                                };
+                                tx.write(coll, b"key", &v)
+                            })
+                            .await
+                        })
+                        .await?;
+                }
+                Ok::<(), GError>(())
             })
-            .collect();
-        join_workers(handles)
-    });
+        })
+        .collect();
+    let result = handle.block_on(join_tasks(handles));
     b.end(db);
     result
 }
@@ -418,47 +415,47 @@ fn independent_multi_rmw(
     numkeys: usize,
 ) -> Result<(), GError> {
     b.start(db, numkeys * nwriters, nwriters, numkeys);
-    let result = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nwriters)
-            .map(|i| {
-                let db = db.clone();
-                let bench = &b.bench;
-                scope.spawn(move || -> Result<(), GError> {
-                    handle.block_on(async move {
-                        let coll = db.collection(format!("c{i}").as_bytes());
-                        coll.create(&Ctx::background()).await?;
-                        let keys: Vec<FqKey> = (0..numkeys)
-                            .map(|j| FqKey {
-                                collection: coll.clone(),
-                                key: format!("key{j}").into_bytes(),
+    let handles: Vec<_> = (0..nwriters)
+        .map(|i| {
+            let db = db.clone();
+            let bench = b.bench.clone();
+            handle.spawn(async move {
+                let coll = db.collection(format!("c{i}").as_bytes());
+                coll.create(&Ctx::background()).await?;
+                let keys: Vec<Vec<u8>> = (0..numkeys)
+                    .map(|j| format!("key{j}").into_bytes())
+                    .collect();
+                let coll = &coll;
+                let db = &db;
+                let keys = &keys;
+                while !bench.is_finished() {
+                    bench
+                        .measure(|| async move {
+                            db.tx(&Ctx::background(), |tx| async move {
+                                // Read all keys in parallel, then write each back.
+                                let vals = futures::future::join_all(
+                                    keys.iter().map(|k| tx.read(coll, k)),
+                                )
+                                .await;
+                                for (k, rv) in keys.iter().zip(vals) {
+                                    let v = match rv {
+                                        Ok(v) => v,
+                                        Err(e) if e.is_not_found() => Vec::new(),
+                                        Err(e) => return Err(e),
+                                    };
+                                    tx.write(coll, k, &v)?;
+                                }
+                                Ok(())
                             })
-                            .collect();
-                        while !bench.is_finished() {
-                            bench
-                                .measure(|| async {
-                                    db.tx(&Ctx::background(), async |tx| {
-                                        let res = tx.read_multi(&keys).await;
-                                        for (idx, rv) in res.iter().enumerate() {
-                                            if let Some(e) = &rv.err {
-                                                if !e.is_not_found() {
-                                                    return Err(e.clone());
-                                                }
-                                            }
-                                            tx.write(&coll, keys[idx].key.as_slice(), &rv.value)?;
-                                        }
-                                        Ok(())
-                                    })
-                                    .await
-                                })
-                                .await?;
-                        }
-                        Ok(())
-                    })
-                })
+                            .await
+                        })
+                        .await?;
+                }
+                Ok::<(), GError>(())
             })
-            .collect();
-        join_workers(handles)
-    });
+        })
+        .collect();
+    let result = handle.block_on(join_tasks(handles));
     b.end(db);
     result
 }
@@ -482,9 +479,11 @@ fn overlapping_multi_rmw(
         .collect();
     // Initialize all keys beforehand.
     handle.block_on(async {
-        db.tx(&Ctx::background(), async |tx| {
-            for k in &all_keys {
-                tx.write(&coll, k.as_slice(), &rand_1k())?;
+        let coll = &coll;
+        let all_keys = &all_keys;
+        db.tx(&Ctx::background(), |tx| async move {
+            for k in all_keys {
+                tx.write(coll, k.as_slice(), &rand_1k())?;
             }
             Ok(())
         })
@@ -493,67 +492,58 @@ fn overlapping_multi_rmw(
 
     b.start(db, n_keys, n_writers, n_keys_per_writer);
     let n_unique = n_keys_per_writer - n_overlap;
-    let result = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..n_writers)
-            .map(|i| {
-                // Overlapping keys first, then this worker's unique slice.
-                let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n_keys_per_writer);
-                keys.extend_from_slice(&all_keys[..n_overlap]);
-                let start = n_overlap + i * n_unique;
-                keys.extend_from_slice(&all_keys[start..start + n_unique]);
-                let db = db.clone();
-                let coll = coll.clone();
-                let bench = &b.bench;
-                scope.spawn(move || -> Result<(), GError> {
-                    let fqkeys: Vec<FqKey> = keys
-                        .into_iter()
-                        .map(|key| FqKey {
-                            collection: coll.clone(),
-                            key,
+    let handles: Vec<_> = (0..n_writers)
+        .map(|i| {
+            // Overlapping keys first, then this worker's unique slice.
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n_keys_per_writer);
+            keys.extend_from_slice(&all_keys[..n_overlap]);
+            let start = n_overlap + i * n_unique;
+            keys.extend_from_slice(&all_keys[start..start + n_unique]);
+            let db = db.clone();
+            let coll = coll.clone();
+            let bench = b.bench.clone();
+            handle.spawn(async move {
+                let coll = &coll;
+                let db = &db;
+                let keys = &keys;
+                while !bench.is_finished() {
+                    bench
+                        .measure(|| async move {
+                            db.tx(&Ctx::background(), |tx| async move {
+                                let vals = futures::future::join_all(
+                                    keys.iter().map(|k| tx.read(coll, k)),
+                                )
+                                .await;
+                                for (k, rv) in keys.iter().zip(vals) {
+                                    let v = rv?;
+                                    tx.write(coll, k, &v)?;
+                                }
+                                Ok(())
+                            })
+                            .await
                         })
-                        .collect();
-                    handle.block_on(async move {
-                        while !bench.is_finished() {
-                            bench
-                                .measure(|| async {
-                                    db.tx(&Ctx::background(), async |tx| {
-                                        let res = tx.read_multi(&fqkeys).await;
-                                        for (idx, rv) in res.iter().enumerate() {
-                                            if let Some(e) = &rv.err {
-                                                return Err(e.clone());
-                                            }
-                                            tx.write(&coll, fqkeys[idx].key.as_slice(), &rv.value)?;
-                                        }
-                                        Ok(())
-                                    })
-                                    .await
-                                })
-                                .await?;
-                        }
-                        Ok(())
-                    })
-                })
+                        .await?;
+                }
+                Ok::<(), GError>(())
             })
-            .collect();
-        join_workers(handles)
-    });
+        })
+        .collect();
+    let result = handle.block_on(join_tasks(handles));
     b.end(db);
     result
 }
 
-/// Joins scoped worker threads, returning the first error encountered.
-fn join_workers(
-    handles: Vec<std::thread::ScopedJoinHandle<'_, Result<(), GError>>>,
+/// Awaits spawned worker tasks, returning the first error encountered.
+async fn join_tasks(
+    handles: Vec<tokio::task::JoinHandle<Result<(), GError>>>,
 ) -> Result<(), GError> {
     let mut result = Ok(());
     for h in handles {
-        match h.join() {
+        match h.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) if result.is_ok() => result = Err(e),
             Ok(Err(_)) => {}
-            Err(_) if result.is_ok() => {
-                result = Err(GError::Other("worker thread panicked".into()))
-            }
+            Err(_) if result.is_ok() => result = Err(GError::Other("worker task panicked".into())),
             Err(_) => {}
         }
     }
@@ -724,29 +714,30 @@ fn read_write_9010_all_dbs(
     let dbs: Vec<DB> = (0..numdb)
         .map(|_| open_db(handle, backend.clone()))
         .collect();
-    let benches: Vec<DbBench> = (0..numdb).map(|_| DbBench::new(args.duration)).collect();
+    let benches: Vec<Arc<DbBench>> = (0..numdb)
+        .map(|_| Arc::new(DbBench::new(args.duration)))
+        .collect();
     for db_bench in &benches {
         db_bench.start();
     }
+    let keys: Arc<[Vec<u8>]> = Arc::from(keys);
 
-    // Run every worker of every DB concurrently.
-    let run = std::thread::scope(|scope| {
-        let mut worker_handles = Vec::new();
-        for (di, db) in dbs.iter().enumerate() {
-            let db_bench = &benches[di];
-            let mut db_rng = StdRng::seed_from_u64(seeds[di]);
-            let wseeds: Vec<u64> = (0..READ_WRITE_9010_NUM_CONCURR_TX)
-                .map(|_| db_rng.random())
-                .collect();
-            for &wseed in &wseeds {
-                let db = db.clone();
-                worker_handles.push(scope.spawn(move || -> Result<(), GError> {
-                    handle.block_on(read_write_9010_worker(db, db_bench, keys, wseed))
-                }));
-            }
+    // Run every worker of every DB concurrently as spawned tasks, so the shared
+    // runtime multiplexes them over its worker threads.
+    let mut worker_handles = Vec::new();
+    for (di, db) in dbs.iter().enumerate() {
+        let mut db_rng = StdRng::seed_from_u64(seeds[di]);
+        let wseeds: Vec<u64> = (0..READ_WRITE_9010_NUM_CONCURR_TX)
+            .map(|_| db_rng.random())
+            .collect();
+        for &wseed in &wseeds {
+            let db = db.clone();
+            let db_bench = benches[di].clone();
+            let keys = keys.clone();
+            worker_handles.push(handle.spawn(read_write_9010_worker(db, db_bench, keys, wseed)));
         }
-        join_workers(worker_handles)
-    });
+    }
+    let run = handle.block_on(join_tasks(worker_handles));
 
     for db_bench in &benches {
         db_bench.end();
@@ -770,8 +761,8 @@ fn read_write_9010_all_dbs(
 
 async fn read_write_9010_worker(
     db: DB,
-    db_bench: &DbBench,
-    keys: &[Vec<u8>],
+    db_bench: Arc<DbBench>,
+    keys: Arc<[Vec<u8>]>,
     seed: u64,
 ) -> Result<(), GError> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -812,48 +803,23 @@ async fn read_write_9010_worker(
 }
 
 async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
-    db.tx(&Ctx::background(), async |tx| {
-        let ks = vec![
-            FqKey {
-                collection: coll.clone(),
-                key: k0.to_vec(),
-            },
-            FqKey {
-                collection: coll.clone(),
-                key: k1.to_vec(),
-            },
-        ];
-        let res = tx.read_multi(&ks).await;
-        for rv in &res {
-            if let Some(e) = &rv.err {
-                return Err(e.clone());
-            }
-        }
-        tx.write(coll, k0, &res[1].value)?;
-        tx.write(coll, k1, &res[0].value)?;
+    db.tx(&Ctx::background(), |tx| async move {
+        // Read both keys in parallel, then swap their values.
+        let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
+        let v0 = r0?;
+        let v1 = r1?;
+        tx.write(coll, k0, &v1)?;
+        tx.write(coll, k1, &v0)?;
         Ok(())
     })
     .await
 }
 
 async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
-    db.tx(&Ctx::background(), async |tx| {
-        let ks = vec![
-            FqKey {
-                collection: coll.clone(),
-                key: k0.to_vec(),
-            },
-            FqKey {
-                collection: coll.clone(),
-                key: k1.to_vec(),
-            },
-        ];
-        let res = tx.read_multi(&ks).await;
-        for rv in &res {
-            if let Some(e) = &rv.err {
-                return Err(e.clone());
-            }
-        }
+    db.tx(&Ctx::background(), |tx| async move {
+        let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
+        r0?;
+        r1?;
         Ok(())
     })
     .await
@@ -882,15 +848,23 @@ fn init_keys(
         let mut i = 0;
         while i < num {
             eprintln!("keys {i} - {}", i + 100);
-            db.tx(&Ctx::background(), async |tx| {
-                for j in 0..100 {
-                    let k = format!("key{}", i + j).into_bytes();
-                    keys[i + j] = k.clone();
-                    tx.write(&coll, &k, &rand_1k())?;
+            // Build the batch up front so the (rerun-on-conflict) tx closure
+            // only borrows it, rather than mutating a captured vector.
+            let batch: Vec<Vec<u8>> = (0..100)
+                .map(|j| format!("key{}", i + j).into_bytes())
+                .collect();
+            let batch_ref = &batch;
+            let coll_ref = &coll;
+            db.tx(&Ctx::background(), |tx| async move {
+                for k in batch_ref {
+                    tx.write(coll_ref, k, &rand_1k())?;
                 }
                 Ok(())
             })
             .await?;
+            for (j, k) in batch.into_iter().enumerate() {
+                keys[i + j] = k;
+            }
             i += 100;
         }
         Ok::<Vec<Vec<u8>>, GError>(keys)

@@ -1,6 +1,6 @@
 //! A named group of key-value pairs. Ported from the Go `collection.go`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_backend::{Backend, Tags};
@@ -34,11 +34,13 @@ impl Collection {
     pub async fn read_strong(&self, ctx: &Ctx, key: &[u8]) -> Result<Vec<u8>, Error> {
         let res: Option<Vec<u8>> = self
             .db
-            .tx(ctx, async |tx| match tx.read(self, key).await {
-                Ok(v) => Ok(Some(v)),
-                // We must still validate the transaction even when not found.
-                Err(e) if e.is_not_found() => Ok(None),
-                Err(e) => Err(e),
+            .tx(ctx, |tx| async move {
+                match tx.read(self, key).await {
+                    Ok(v) => Ok(Some(v)),
+                    // We must still validate the transaction even when not found.
+                    Err(e) if e.is_not_found() => Ok(None),
+                    Err(e) => Err(e),
+                }
             })
             .await?;
         res.ok_or(Error::NotFound)
@@ -63,25 +65,38 @@ impl Collection {
 
     /// Writes `value` for `key` within a transaction.
     pub async fn write(&self, ctx: &Ctx, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        self.db.tx(ctx, async |tx| tx.write(self, key, value)).await
+        self.db
+            .tx(ctx, |tx| async move { tx.write(self, key, value) })
+            .await
     }
 
     /// Removes `key` within a transaction.
     pub async fn delete(&self, ctx: &Ctx, key: &[u8]) -> Result<(), Error> {
-        self.db.tx(ctx, async |tx| tx.delete(self, key)).await
+        self.db
+            .tx(ctx, |tx| async move { tx.delete(self, key) })
+            .await
     }
 
     /// Atomically reads `key`, applies `f`, and writes the result back.
-    pub async fn update<F>(&self, ctx: &Ctx, key: &[u8], mut f: F) -> Result<Vec<u8>, Error>
+    pub async fn update<F>(&self, ctx: &Ctx, key: &[u8], f: F) -> Result<Vec<u8>, Error>
     where
-        F: FnMut(Vec<u8>) -> Result<Vec<u8>, Error>,
+        F: FnMut(Vec<u8>) -> Result<Vec<u8>, Error> + Send,
     {
+        // The transaction body is rerun on conflict, so it must be `FnMut`. An
+        // `async move` block would move `f` into the future (making the closure
+        // `FnOnce`), so share it through an `Arc<Mutex<_>>` cloned per attempt.
+        // The user callback is synchronous, so the guard is never held across an
+        // `.await`.
+        let f = Arc::new(Mutex::new(f));
         self.db
-            .tx(ctx, async |tx| {
-                let old = tx.read(self, key).await?;
-                let newb = f(old)?;
-                tx.write(self, key, &newb)?;
-                Ok(newb)
+            .tx(ctx, move |tx| {
+                let f = f.clone();
+                async move {
+                    let old = tx.read(self, key).await?;
+                    let newb = (f.lock().unwrap())(old)?;
+                    tx.write(self, key, &newb)?;
+                    Ok(newb)
+                }
             })
             .await
     }

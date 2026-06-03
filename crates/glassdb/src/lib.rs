@@ -19,7 +19,7 @@ pub use db::{Options, DB};
 pub use error::Error;
 pub use iter::{CollectionsIter, KeysIter};
 pub use stats::Stats;
-pub use tx::{FqKey, ReadResult, Tx};
+pub use tx::Tx;
 
 // Re-export the backend abstraction so callers can construct a DB without
 // depending on the backend crate directly.

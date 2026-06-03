@@ -24,7 +24,7 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_from_tx(tx: &mut Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(tx: &Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         // Treat a missing value as zero (i.e. initialize it).
@@ -35,8 +35,8 @@ async fn read_int_from_tx(tx: &mut Tx, c: &Collection, k: &[u8]) -> Result<i64, 
 
 async fn rmw(ctx: &Ctx, db: &DB, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
     for _ in 0..iters {
-        db.tx(ctx, async |tx| {
-            let num = read_int_from_tx(tx, coll, key).await?;
+        db.tx(ctx, |tx| async move {
+            let num = read_int_from_tx(&tx, coll, key).await?;
             tx.write(coll, key, &write_int(num + 1))
         })
         .await?;
@@ -119,25 +119,26 @@ async fn read_deleted_from_another() {
 
     let db1coll = db1.collection(coll);
     db1coll.create(&ctx).await.unwrap();
-    db1.tx(&ctx, async |tx| {
-        tx.write(&db1coll, key1, val)?;
-        tx.write(&db1coll, key2, val)
+    let db1coll = &db1coll;
+    db1.tx(&ctx, |tx| async move {
+        tx.write(db1coll, key1, val)?;
+        tx.write(db1coll, key2, val)
     })
     .await
     .unwrap();
 
-    let db2coll = db2.collection(coll);
-    db2.tx(&ctx, async |tx| {
-        tx.write(&db2coll, key1, newval)?;
-        tx.delete(&db2coll, key2)
+    let db2coll = &db2.collection(coll);
+    db2.tx(&ctx, |tx| async move {
+        tx.write(db2coll, key1, newval)?;
+        tx.delete(db2coll, key2)
     })
     .await
     .unwrap();
 
     let (key1_read, key2_found) = db1
-        .tx(&ctx, async |tx| {
-            let k1 = tx.read(&db1coll, key1).await?;
-            let found = match tx.read(&db1coll, key2).await {
+        .tx(&ctx, |tx| async move {
+            let k1 = tx.read(db1coll, key1).await?;
+            let found = match tx.read(db1coll, key2).await {
                 Ok(_) => true,
                 Err(e) if e.is_not_found() => false,
                 Err(e) => return Err(e),
@@ -180,10 +181,10 @@ async fn multiple_rmw(
     iters: usize,
 ) -> Result<(), Error> {
     for _ in 0..iters {
-        db.tx(ctx, async |tx| {
-            let n1 = read_int_from_tx(tx, coll, key1).await?;
+        db.tx(ctx, |tx| async move {
+            let n1 = read_int_from_tx(&tx, coll, key1).await?;
             tx.write(coll, key1, &write_int(n1 + 1))?;
-            let n2 = read_int_from_tx(tx, coll, key2).await?;
+            let n2 = read_int_from_tx(&tx, coll, key2).await?;
             tx.write(coll, key2, &write_int(n2 + 1))
         })
         .await?;
@@ -293,9 +294,9 @@ async fn wound_incr(
     first: &[u8],
     second: &[u8],
 ) -> Result<(), Error> {
-    db.tx(ctx, async |tx| {
-        let a = read_int_from_tx(tx, coll, first).await?;
-        let b = read_int_from_tx(tx, coll, second).await?;
+    db.tx(ctx, |tx| async move {
+        let a = read_int_from_tx(&tx, coll, first).await?;
+        let b = read_int_from_tx(&tx, coll, second).await?;
         // Under paused time the clock only advances once every task is blocked,
         // so sleeping here parks both transactions after their reads and before
         // any write: they both observe the initial values and then commit
@@ -352,45 +353,37 @@ async fn wound_wait_reverse_contention() {
     );
 }
 
+// Reads many keys concurrently within a single transaction (the parallelism
+// `read_multi` used to provide), now via `join_all` over `Tx::read`.
 #[tokio::test(start_paused = true)]
-async fn read_multi() {
-    use glassdb::FqKey;
+async fn concurrent_reads() {
+    use futures::future::join_all;
 
     let ctx = Ctx::background();
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
+    let coll = &db.collection(b"demo-coll");
     coll.create(&ctx).await.unwrap();
 
-    let keys: Vec<FqKey> = (0..15)
-        .map(|i| FqKey {
-            collection: coll.clone(),
-            key: format!("key{i}").into_bytes(),
-        })
-        .collect();
+    let keys: Vec<Vec<u8>> = (0..15).map(|i| format!("key{i}").into_bytes()).collect();
+    let keys = &keys;
 
     // Initialize the values.
-    db.tx(&ctx, async |tx| {
-        for k in &keys {
-            tx.write(&coll, &k.key, &write_int(0))?;
+    db.tx(&ctx, |tx| async move {
+        for k in keys {
+            tx.write(coll, k, &write_int(0))?;
         }
         Ok(())
     })
     .await
     .unwrap();
 
-    // Read all and increment.
+    // Read all (in parallel) and increment.
     for _ in 0..30 {
-        db.tx(&ctx, async |tx| {
-            let res = tx.read_multi(&keys).await;
-            for (i, r) in res.into_iter().enumerate() {
-                if let Some(e) = r.err {
-                    return Err(e);
-                }
-                tx.write(
-                    &keys[i].collection,
-                    &keys[i].key,
-                    &write_int(read_int(&r.value) + 1),
-                )?;
+        db.tx(&ctx, |tx| async move {
+            let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
+            for (k, r) in keys.iter().zip(vals) {
+                let cur = read_int(&r?);
+                tx.write(coll, k, &write_int(cur + 1))?;
             }
             Ok(())
         })
@@ -402,8 +395,8 @@ async fn read_multi() {
     assert_eq!(stats.tx_n, 31);
     assert_eq!(stats.tx_retries, 0);
 
-    for k in &keys {
-        let b = coll.read_strong(&ctx, &k.key).await.unwrap();
+    for k in keys {
+        let b = coll.read_strong(&ctx, k).await.unwrap();
         assert_eq!(read_int(&b), 30);
     }
 }
@@ -422,11 +415,12 @@ async fn read_weak() {
     let sleep_time = Duration::from_millis(100);
     let max_behind = (staleness.as_millis() / sleep_time.as_millis()) as i64 + 1;
 
+    let coll = &coll;
     for i in 0..30i64 {
         // Increment the value. The read avoids making this a blind write.
-        db.tx(&ctx, async |tx| {
-            let _ = read_int_from_tx(tx, &coll, key).await?;
-            tx.write(&coll, key, &write_int(i))
+        db.tx(&ctx, |tx| async move {
+            let _ = read_int_from_tx(&tx, coll, key).await?;
+            tx.write(coll, key, &write_int(i))
         })
         .await
         .unwrap();
@@ -455,9 +449,11 @@ async fn list_keys() {
 
     let keys: Vec<Vec<u8>> = (0u32..100).map(|i| i.to_be_bytes().to_vec()).collect();
     let test_val = b"val";
-    db.tx(&ctx, async |tx| {
-        for k in &keys {
-            tx.write(&coll, k, test_val)?;
+    let coll_ref = &coll;
+    let keys_ref = &keys;
+    db.tx(&ctx, |tx| async move {
+        for k in keys_ref {
+            tx.write(coll_ref, k, test_val)?;
         }
         Ok(())
     })

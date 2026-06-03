@@ -104,7 +104,7 @@ fn key_name(k: usize) -> Vec<u8> {
     format!("k{k}").into_bytes()
 }
 
-async fn read_int_from_tx(tx: &mut crate::Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(tx: &crate::Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         Err(e) if e.is_not_found() => Ok(0),
@@ -116,29 +116,33 @@ async fn run_client(ctx: &Ctx, db: &DB, coll: &Collection, ops: &[Op]) -> Result
     for op in ops {
         match op {
             Op::Rmw(k) => {
-                let kn = key_name(*k);
-                db.tx(ctx, async |tx| {
-                    let cur = read_int_from_tx(tx, coll, &kn).await?;
-                    tx.write(coll, &kn, &write_int(cur + 1))
+                // Bind a reference so the `async move` body captures `&Vec`
+                // (`Copy`) instead of moving the key, keeping the closure
+                // `FnMut` for retries.
+                let kn = &key_name(*k);
+                db.tx(ctx, |tx| async move {
+                    let cur = read_int_from_tx(&tx, coll, kn).await?;
+                    tx.write(coll, kn, &write_int(cur + 1))
                 })
                 .await?;
             }
             Op::MultiRmw(a, b) => {
-                let ka = key_name(*a);
-                let kb = key_name(*b);
-                db.tx(ctx, async |tx| {
-                    let va = read_int_from_tx(tx, coll, &ka).await?;
-                    let vb = read_int_from_tx(tx, coll, &kb).await?;
-                    tx.write(coll, &ka, &write_int(va + 1))?;
-                    tx.write(coll, &kb, &write_int(vb + 1))
+                let ka = &key_name(*a);
+                let kb = &key_name(*b);
+                db.tx(ctx, |tx| async move {
+                    let va = read_int_from_tx(&tx, coll, ka).await?;
+                    let vb = read_int_from_tx(&tx, coll, kb).await?;
+                    tx.write(coll, ka, &write_int(va + 1))?;
+                    tx.write(coll, kb, &write_int(vb + 1))
                 })
                 .await?;
             }
             Op::ReadOnly(keys) => {
                 let names: Vec<Vec<u8>> = keys.iter().map(|k| key_name(*k)).collect();
-                db.tx(ctx, async |tx| {
-                    for kn in &names {
-                        let v = read_int_from_tx(tx, coll, kn).await?;
+                let names = &names;
+                db.tx(ctx, |tx| async move {
+                    for kn in names {
+                        let v = read_int_from_tx(&tx, coll, kn).await?;
                         assert!(v >= 0, "observed negative value {v} for key {kn:?}");
                     }
                     Ok(())
@@ -188,10 +192,11 @@ async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
         .expect("open init db");
     let init_coll = init_db.collection(COLLECTION);
     init_coll.create(&ctx).await.expect("create collection");
+    let seed_coll = &init_coll;
     init_db
-        .tx(&ctx, async |tx| {
+        .tx(&ctx, |tx| async move {
             for k in 0..KEY_COUNT {
-                tx.write(&init_coll, &key_name(k), &write_int(0))?;
+                tx.write(seed_coll, &key_name(k), &write_int(0))?;
             }
             Ok(())
         })
@@ -201,9 +206,8 @@ async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
     let expected = expected_increments(workload);
 
     // Run each client on its own DB instance sharing the backend, concurrently.
-    // (`join_all` rather than `task::spawn` because the per-op `AsyncFnMut`
-    // closures borrow locals, which does not satisfy spawn's `for<'a>` Send
-    // bound; the interleaving is still driven deterministically by madsim.)
+    // (`join_all` rather than `task::spawn` keeps every client on a single
+    // madsim task so the interleaving is purely a function of the seed.)
     let mut futs = Vec::with_capacity(workload.clients.len());
     for ops in &workload.clients {
         let db = DB::open_with(&ctx, DB_NAME, backend.clone(), opts.clone())

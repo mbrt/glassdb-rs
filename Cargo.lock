@@ -1575,6 +1575,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "clap",
+ "futures",
  "glassdb",
  "glassdb-backend",
  "glassdb-concurr",
