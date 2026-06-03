@@ -1,0 +1,5 @@
+# Downloaded / generated benchmark artifacts (not committed).
+out/
+out-fake/
+*.png
+__pycache__/

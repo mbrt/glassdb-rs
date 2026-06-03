@@ -180,9 +180,11 @@ deterministically.
 The latency, scheduler, and logger decorators wrap any `Backend`:
 
 - `DelayBackend` injects per-operation latency from a lognormal distribution
-  plus an optional per-object token-bucket rate limiter, driven by
-  `tokio::time` so tests stay deterministic under paused time (presets mirror
-  the Go GCS/S3 latency profiles).
+  plus an optional per-object token-bucket rate limiter and an optional
+  per-prefix request-rate limiter (modeling S3's documented 5,500 GET / 3,500
+  PUT-per-prefix ceiling), all driven by `tokio::time` so tests stay
+  deterministic under paused time (presets mirror the Go GCS/S3 latency
+  profiles).
 - `ScheduledBackend` / `Scheduler` inject byte-sequence-driven delays, the
   building block needed to replay `FuzzConcurrentTx` interleavings.
 - `BackendLogger` traces every operation via the `tracing` crate.
@@ -241,10 +243,56 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   by rechunking the upload; the Rust port surfaces `429` as a generic error for
   now, since the transaction engine already retries at a higher level.
 
+## Benchmarks
+
+The Go benchmark surface is ported so performance work is reproducible on both
+a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
+
+- **Criterion microbenchmarks** (`crates/glassdb/benches/transactions.rs`, run
+  with `make bench`). Port the six `bench_test.go` workloads — single-key RMW,
+  10-key RMW, 10-key read, 100-key write, and two contended workloads (a
+  background-contender multi-RMW and a shared-read) — over `{memory, sim-gcs,
+  sim-s3}`. The simulated profiles compress latency 1000× (`scale = 1/1000`),
+  matching the Go bench scaling. Each pairing also prints the per-operation
+  backend counters (`retries/op`, `w/op`, `r/op`, …) derived from
+  `DB::stats()`, the analog of Go's `benchStats` custom metrics.
+- **`glassdb-bench` crate** with two standalone binaries, ported from
+  `hack/rtbench` and `hack/backendbench`:
+  - `rtbench` — the `simple`, `rw9010`, and `deadlock` scenarios, with the same
+    flags and CSV schema as the Go tool (so the plotting scripts are shared),
+    deterministic per-DB/per-worker seeds, and a real-S3 client wired up via
+    `aws_config` + a `BUCKET` env var (faithful to the Go tooling), or real GCS
+    via Application Default Credentials.
+  - `backendbench` — raw backend-operation latencies (`WriteSame`,
+    `WriteFailPre`, `Read`, `ReadUnchanged`, `SetMetaSame`, `GetMeta`).
+- **`hack/aws-bench/`** — the real-S3 harness: `cloudformation.yaml` (private
+  VPC + SSM + S3 gateway endpoint), `deploy.sh` (now cross-compiles a static
+  `x86_64-unknown-linux-musl` `rtbench` instead of a Go binary), and the
+  unchanged `plot.py` / `compare.py` (the CSV schema is preserved).
+
+Two parts deviate from the Go original by necessity:
+
+- **Worker concurrency uses OS threads, not goroutines.** A `db.tx(async |tx|
+  …)` future is not `Send` (the higher-ranked-lifetime limitation noted under
+  [Testing strategy](#testing-strategy)), so it cannot be `tokio::spawn`-ed onto
+  a multi-thread runtime. `rtbench` runs each worker on its own OS thread that
+  calls `Handle::block_on` on a single shared runtime — all I/O is therefore
+  registered with one reactor, so a single shared S3 client works across all
+  workers, matching the Go design.
+- **Two `client-stats.csv` columns are best-effort.** `new-conns` is always `0`
+  (the aws-sdk HTTP stack does not surface TLS handshakes) and `max-goroutines`
+  holds the peak OS-thread count (sampled from `/proc/self/status`). The CSV
+  schema and headers are otherwise byte-identical to the Go tool. HTTP request /
+  throttle / 5xx / 2xx counts come from an aws-smithy `Intercept`, and CPU time
+  from `getrusage(RUSAGE_SELF)`.
+
+The simulated S3 path tracks real S3 because `DelayBackend` now also models the
+per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorators)).
+
 ## Out of scope
 
-- Benchmark tooling and demos from the original repository.
-- Autoresearch perf experiments from upstream (`9b00d94` … `6bd75ea`).
+- Autoresearch perf experiments from upstream (`9b00d94` … `6bd75ea`), including
+  their `hack/autoresearch/bench` tooling.
 
 ## Upstream sync log
 

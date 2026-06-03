@@ -36,8 +36,17 @@ sim = ["dep:arbitrary"]
 [dev-dependencies]
 tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
 proptest = "1.9.0"
+criterion = "0.8.2"
 
 # Under `--cfg madsim` the deterministic simulator drives the integration tests
 # (determinism self-check). madsim is only compiled in that configuration.
 [target.'cfg(madsim)'.dev-dependencies]
 madsim = "0.2"
+
+# Transaction microbenchmarks ported from the Go `bench_test.go`. `harness =
+# false` lets criterion own `main`; `test = false` keeps `cargo test` (and the
+# madsim sim-test run) from executing it — run it with `cargo bench`.
+[[bench]]
+name = "transactions"
+harness = false
+test = false

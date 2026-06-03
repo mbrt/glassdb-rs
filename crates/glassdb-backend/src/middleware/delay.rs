@@ -21,25 +21,40 @@ pub fn gcs_delays() -> DelayOptions {
         obj_write: Latency::new(70, 15),
         list: Latency::new(10, 3),
         same_obj_write_ps: 1,
+        // GCS has no documented per-prefix request-rate limit, so the prefix
+        // limiter is disabled.
+        prefix_read_ps: 0,
+        prefix_write_ps: 0,
+        prefix_depth: 0,
         scale: 0.0,
     }
 }
 
-/// Typical latency values for Amazon S3 Standard accessed in-region.
+/// Typical latency values for Amazon S3 Standard accessed in-region, derived
+/// from AWS guidance and public benchmarks (p50 GET ~30 ms, p50 PUT ~70 ms,
+/// with a long right tail captured by the lognormal model).
 ///
 /// `meta_write` is higher than the other backends because S3 has no
 /// metadata-only update: `set_tags_if` re-uploads the object (a GET followed by
-/// a PUT). Unlike GCS, S3 has no per-object write limit; throughput scales per
-/// prefix, so `same_obj_write_ps` is set to the documented per-prefix PUT rate
-/// rather than 1, which effectively removes the per-object write bottleneck.
+/// a PUT), so its latency is roughly the sum of the two.
+///
+/// Unlike GCS, S3 has no per-object write limit; throughput scales per prefix.
+/// `same_obj_write_ps` is therefore set high so the per-object limiter never
+/// binds, and the per-prefix request-rate limit is modeled separately via
+/// `prefix_read_ps` / `prefix_write_ps` / `prefix_depth` (S3 sustains at least
+/// 5,500 GET/HEAD and 3,500 PUT/COPY/POST/DELETE requests per second per
+/// partitioned prefix before returning `503 SlowDown`).
 pub fn s3_delays() -> DelayOptions {
     DelayOptions {
-        meta_read: Latency::new(28, 12),
-        meta_write: Latency::new(100, 25),
-        obj_read: Latency::new(30, 12),
-        obj_write: Latency::new(74, 25),
-        list: Latency::new(30, 10),
+        meta_read: Latency::new(21, 9),
+        meta_write: Latency::new(75, 19),
+        obj_read: Latency::new(22, 9),
+        obj_write: Latency::new(55, 18),
+        list: Latency::new(22, 8),
         same_obj_write_ps: 3500,
+        prefix_read_ps: 5500,
+        prefix_write_ps: 3500,
+        prefix_depth: 2,
         scale: 0.0,
     }
 }
@@ -71,13 +86,29 @@ pub struct DelayOptions {
     pub list: Latency,
     /// How many writes per second to the same object before being rate limited.
     pub same_obj_write_ps: i64,
+    /// Caps the GET/HEAD request rate against a shared key prefix, modeling
+    /// S3's documented per-prefix request-rate limit. A request that would
+    /// exceed the rate is delayed (not failed) until the bucket refills, so the
+    /// cap bounds throughput without inflating transaction-retry counts. Zero
+    /// disables the limit.
+    pub prefix_read_ps: i64,
+    /// Caps the PUT/POST/DELETE request rate against a shared key prefix (the
+    /// write analog of [`Self::prefix_read_ps`]). Zero disables the limit.
+    pub prefix_write_ps: i64,
+    /// Selects how many leading `/`-separated path segments form a throttled
+    /// prefix, i.e. the partition granularity (depth 1 groups every object
+    /// under the database root into a single hot partition; depth 2 throttles
+    /// each immediate subtree independently). Ignored when both prefix rates
+    /// are zero.
+    pub prefix_depth: usize,
     /// Multiplies all delay durations. A value of `0.0` is treated as `1.0`.
     /// Use values `< 1` to compress delays (e.g. `0.001` for a 1000x speedup).
     pub scale: f64,
 }
 
-/// A [`Backend`] decorator that injects simulated network latency and
-/// per-object write rate limiting before delegating to the inner backend.
+/// A [`Backend`] decorator that injects simulated network latency, per-object
+/// write rate limiting, and per-prefix request-rate ceilings before delegating
+/// to the inner backend.
 pub struct DelayBackend {
     inner: Arc<dyn Backend>,
     scale: f64,
@@ -87,6 +118,8 @@ pub struct DelayBackend {
     obj_write: Lognormal,
     list: Lognormal,
     rlimit: RateLimiter,
+    prefix_reads: Option<PrefixLimiter>,
+    prefix_writes: Option<PrefixLimiter>,
     retry_delay: Duration,
 }
 
@@ -103,6 +136,8 @@ impl DelayBackend {
             obj_write: Lognormal::from_latency(opts.obj_write),
             list: Lognormal::from_latency(opts.list),
             rlimit: RateLimiter::new(opts.same_obj_write_ps, scale),
+            prefix_reads: PrefixLimiter::new(opts.prefix_read_ps, opts.prefix_depth, scale),
+            prefix_writes: PrefixLimiter::new(opts.prefix_write_ps, opts.prefix_depth, scale),
             retry_delay: secs_f64_or_zero(opts.obj_write.mean.as_secs_f64() * 2.0 * scale),
         }
     }
@@ -110,6 +145,22 @@ impl DelayBackend {
     async fn delay(&self, ln: &Lognormal) {
         let ms = ln.rand();
         tokio::time::sleep(secs_f64_or_zero(ms * self.scale / 1_000.0)).await;
+    }
+
+    /// Blocks on the read prefix limiter (a no-op when it is disabled).
+    async fn prefix_read_wait(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+        match &self.prefix_reads {
+            Some(l) => l.wait(ctx, path).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Blocks on the write prefix limiter (a no-op when it is disabled).
+    async fn prefix_write_wait(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+        match &self.prefix_writes {
+            Some(l) => l.wait(ctx, path).await,
+            None => Ok(()),
+        }
     }
 
     /// Blocks until a write token is available for `path`, retrying with
@@ -138,6 +189,7 @@ impl Backend for DelayBackend {
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
+        self.prefix_read_wait(ctx, path).await?;
         self.delay(&self.obj_read).await;
         self.inner
             .read_if_modified(ctx, path, expected_writer)
@@ -145,11 +197,13 @@ impl Backend for DelayBackend {
     }
 
     async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
+        self.prefix_read_wait(ctx, path).await?;
         self.delay(&self.obj_read).await;
         self.inner.read(ctx, path).await
     }
 
     async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
+        self.prefix_read_wait(ctx, path).await?;
         self.delay(&self.meta_read).await;
         self.inner.get_metadata(ctx, path).await
     }
@@ -161,6 +215,7 @@ impl Backend for DelayBackend {
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
+        self.prefix_write_wait(ctx, path).await?;
         self.backoff(ctx, path).await?;
         self.delay(&self.meta_write).await;
         self.inner.set_tags_if(ctx, path, expected, tags).await
@@ -173,6 +228,7 @@ impl Backend for DelayBackend {
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
+        self.prefix_write_wait(ctx, path).await?;
         self.backoff(ctx, path).await?;
         self.delay(&self.obj_write).await;
         self.inner.write(ctx, path, value, tags).await
@@ -186,6 +242,7 @@ impl Backend for DelayBackend {
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
+        self.prefix_write_wait(ctx, path).await?;
         self.backoff(ctx, path).await?;
         self.delay(&self.obj_write).await;
         self.inner.write_if(ctx, path, value, expected, tags).await
@@ -198,12 +255,14 @@ impl Backend for DelayBackend {
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
+        self.prefix_write_wait(ctx, path).await?;
         self.backoff(ctx, path).await?;
         self.delay(&self.obj_write).await;
         self.inner.write_if_not_exists(ctx, path, value, tags).await
     }
 
     async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+        self.prefix_write_wait(ctx, path).await?;
         self.backoff(ctx, path).await?;
         self.delay(&self.obj_write).await;
         self.inner.delete(ctx, path).await
@@ -215,12 +274,14 @@ impl Backend for DelayBackend {
         path: &str,
         expected: &Version,
     ) -> Result<(), BackendError> {
+        self.prefix_write_wait(ctx, path).await?;
         self.backoff(ctx, path).await?;
         self.delay(&self.obj_write).await;
         self.inner.delete_if(ctx, path, expected).await
     }
 
     async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        self.prefix_read_wait(ctx, dir_path).await?;
         self.delay(&self.list).await;
         self.inner.list(ctx, dir_path).await
     }
@@ -330,6 +391,96 @@ impl RateLimiter {
     }
 }
 
+/// A per-prefix request-rate limiter using a continuous token bucket per
+/// prefix. Mirrors the Go `prefixLimiter`. Unlike [`RateLimiter`] (tuned for
+/// infrequent per-object writes), it behaves correctly under thousands of
+/// concurrent acquisitions per second: callers that exceed the rate are told
+/// how long to wait, and that debt accumulates so the long-run rate converges
+/// to the cap. Timekeeping uses `tokio::time::Instant`, so it stays
+/// deterministic under paused time.
+struct PrefixLimiter {
+    /// Tokens added per wall-clock second.
+    rate: f64,
+    /// Bucket capacity, in tokens.
+    burst: f64,
+    depth: usize,
+    buckets: Mutex<HashMap<String, TokenBucket>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    tokens: f64,
+    last_fill: Instant,
+}
+
+impl PrefixLimiter {
+    /// Builds a per-prefix limiter, or `None` (no throttling) when
+    /// `rate_per_sec` is non-positive. `depth` selects how many leading path
+    /// segments form the throttled prefix.
+    fn new(rate_per_sec: i64, depth: usize, scale: f64) -> Option<PrefixLimiter> {
+        if rate_per_sec <= 0 {
+            return None;
+        }
+        // Delays are sleep-scaled by `scale` (see `delay`), so a sub-unit scale
+        // compresses wall-clock time; the request rate must grow by the same
+        // factor to keep the simulated rate constant.
+        Some(PrefixLimiter {
+            rate: rate_per_sec as f64 / scale,
+            burst: rate_per_sec as f64,
+            depth: depth.max(1),
+            buckets: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Blocks until a request token for `path`'s prefix is available, or until
+    /// `ctx` is cancelled.
+    async fn wait(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+        let d = self.reserve(prefix_key(path, self.depth), Instant::now());
+        if d.is_zero() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = ctx.cancelled() => Err(BackendError::Cancelled),
+            _ = tokio::time::sleep(d) => Ok(()),
+        }
+    }
+
+    /// Takes a token for `key` and returns how long the caller must wait before
+    /// the request may proceed (zero if a token was immediately available).
+    fn reserve(&self, key: &str, now: Instant) -> Duration {
+        let mut buckets = self.buckets.lock().unwrap();
+        let b = buckets.entry(key.to_string()).or_insert(TokenBucket {
+            tokens: self.burst,
+            last_fill: now,
+        });
+        let elapsed = now.saturating_duration_since(b.last_fill).as_secs_f64();
+        if elapsed > 0.0 {
+            b.tokens = self.burst.min(b.tokens + elapsed * self.rate);
+            b.last_fill = now;
+        }
+        b.tokens -= 1.0;
+        if b.tokens >= 0.0 {
+            return Duration::ZERO;
+        }
+        // Negative tokens represent queued demand: wait for them to refill.
+        secs_f64_or_zero(-b.tokens / self.rate)
+    }
+}
+
+/// Returns the first `depth` `/`-separated segments of `path`, which defines
+/// the granularity at which the request-rate ceiling is applied.
+fn prefix_key(path: &str, depth: usize) -> &str {
+    let bytes = path.as_bytes();
+    let mut idx = 0;
+    for _ in 0..depth {
+        match bytes[idx..].iter().position(|&c| c == b'/') {
+            Some(rel) => idx += rel + 1,
+            None => return path,
+        }
+    }
+    &path[..idx - 1]
+}
+
 /// Builds a [`Duration`] from a fractional number of seconds, clamping
 /// non-finite or negative inputs to zero (so a degenerate latency never
 /// panics `Duration::from_secs_f64`).
@@ -402,5 +553,39 @@ mod tests {
     async fn rate_limiter_disabled_when_zero() {
         let rl = RateLimiter::new(0, 1.0);
         assert!(!rl.try_acquire_token("k"));
+    }
+
+    // Ports the Go middleware `TestPrefixLimiterScale`. Compressing time by
+    // 1000x must raise the wall-clock rate by 1000x so the simulated rate is
+    // unchanged: the post-burst wait shrinks from 10ms to 10us.
+    #[tokio::test(start_paused = true)]
+    async fn prefix_limiter_scale() {
+        let l = PrefixLimiter::new(100, 1, 1.0 / 1000.0).expect("limiter enabled");
+        let now = Instant::now();
+        for _ in 0..100 {
+            l.reserve("bench", now);
+        }
+        assert_eq!(l.reserve("bench", now), Duration::from_micros(10));
+    }
+
+    #[test]
+    fn prefix_limiter_disabled_when_non_positive() {
+        assert!(PrefixLimiter::new(0, 2, 1.0).is_none());
+        assert!(PrefixLimiter::new(-1, 2, 1.0).is_none());
+    }
+
+    // Ports the Go middleware `TestPrefixKey`.
+    #[test]
+    fn prefix_key_segments() {
+        let cases = [
+            ("bench/_c/abc/_k/def", 1, "bench"),
+            ("bench/_c/abc/_k/def", 2, "bench/_c"),
+            ("bench/_t/xyz", 3, "bench/_t/xyz"),
+            ("bench", 2, "bench"),
+            ("a/b", 2, "a/b"),
+        ];
+        for (path, depth, want) in cases {
+            assert_eq!(prefix_key(path, depth), want, "path={path} depth={depth}");
+        }
     }
 }

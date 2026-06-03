@@ -1,4 +1,4 @@
-.PHONY: test lint format build sim-test fuzz
+.PHONY: test lint format build sim-test fuzz bench
 
 build:
 	cargo build --workspace
@@ -12,6 +12,15 @@ lint:
 
 format:
 	cargo fmt --all
+
+# Run the Criterion transaction microbenchmarks (memory + simulated S3/GCS).
+# The standalone runtime/backend benchmarks live in the `glassdb-bench` crate;
+# run them directly, e.g.:
+#   cargo run --release -p glassdb-bench --bin rtbench -- --backend memory --test-name simple
+#   cargo run --release -p glassdb-bench --bin backendbench -- --backend memory
+# See hack/aws-bench/README.md for the real-S3 (EC2 + CloudFormation) harness.
+bench:
+	cargo bench -p glassdb
 
 # Run the test suite under the madsim deterministic simulator (ADR-008). The
 # cloud backend crates (s3/gcs) use real tokio/reqwest/aws-sdk and cannot build
