@@ -429,13 +429,20 @@ impl Locker {
         let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         match tlocks.get(tid.as_bytes()) {
             None => Vec::new(),
-            Some(m) => m
-                .iter()
-                .map(|(p, t)| PathLock {
-                    path: p.clone(),
-                    typ: *t,
-                })
-                .collect(),
+            Some(m) => {
+                let mut out: Vec<PathLock> = m
+                    .iter()
+                    .map(|(p, t)| PathLock {
+                        path: p.clone(),
+                        typ: *t,
+                    })
+                    .collect();
+                // Stable order so the transaction log's lock list is
+                // independent of `HashMap` iteration (needed for byte-for-byte
+                // deterministic replays; harmless in production).
+                out.sort_by(|a, b| a.path.cmp(&b.path));
+                out
+            }
         }
     }
 

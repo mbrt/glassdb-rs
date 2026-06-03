@@ -4,6 +4,7 @@
 //! channel.
 
 mod background;
+mod cancel;
 mod channel;
 mod clock;
 pub mod ctx;
@@ -13,6 +14,7 @@ mod retry;
 pub mod shard;
 
 pub use background::Background;
+pub use cancel::CancelToken;
 pub use channel::make_chan_inf_cap;
 pub use clock::Clock;
 pub use ctx::{Cancelled, Ctx};

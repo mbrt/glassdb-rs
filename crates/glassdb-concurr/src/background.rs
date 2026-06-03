@@ -4,15 +4,15 @@
 use std::future::Future;
 use std::sync::Mutex;
 
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio::task::JoinHandle;
 
+use crate::cancel::CancelToken;
 use crate::ctx::Ctx;
 
 /// Manages a set of background tasks cancelled together on close.
 pub struct Background {
-    token: CancellationToken,
-    tracker: TaskTracker,
+    token: CancelToken,
+    handles: Mutex<Vec<JoinHandle<()>>>,
     closed: Mutex<bool>,
 }
 
@@ -20,8 +20,8 @@ impl Background {
     /// Creates a new background task manager.
     pub fn new() -> Self {
         Self {
-            token: CancellationToken::new(),
-            tracker: TaskTracker::new(),
+            token: CancelToken::new(),
+            handles: Mutex::new(Vec::new()),
             closed: Mutex::new(false),
         }
     }
@@ -39,9 +39,10 @@ impl Background {
             return false;
         }
         let child = ctx.with_new_cancel(self.token.clone());
-        self.tracker.spawn(async move {
+        let handle = tokio::spawn(async move {
             f(child).await;
         });
+        self.handles.lock().unwrap().push(handle);
         true
     }
 
@@ -55,8 +56,10 @@ impl Background {
             *c = true;
         }
         self.token.cancel();
-        self.tracker.close();
-        self.tracker.wait().await;
+        let handles = std::mem::take(&mut *self.handles.lock().unwrap());
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 }
 

@@ -1,6 +1,22 @@
 use std::fmt;
 
-use rand::Rng;
+/// Fills `b` with random bytes.
+///
+/// In normal builds this draws from the OS via `rand`. Under the madsim
+/// deterministic simulator (`--cfg madsim`) it draws from the runtime's seeded
+/// RNG instead, so transaction-log object keys (which embed this prefix) are a
+/// deterministic function of the simulation seed and replays are byte-identical.
+#[cfg(not(madsim))]
+fn fill_random(b: &mut [u8]) {
+    use rand::Rng;
+    rand::rng().fill_bytes(b);
+}
+
+#[cfg(madsim)]
+fn fill_random(b: &mut [u8]) {
+    use madsim::rand::RngCore;
+    madsim::rand::thread_rng().fill_bytes(b);
+}
 
 /// Total length, in bytes, of a freshly generated transaction ID.
 const TX_ID_LEN: usize = 16;
@@ -30,7 +46,7 @@ impl TxId {
     /// callers (mostly tests) that only need a unique identifier.
     pub fn new_random() -> Self {
         let mut b = vec![0u8; TX_ID_LEN];
-        rand::rng().fill_bytes(&mut b);
+        fill_random(&mut b);
         TxId(b)
     }
 
@@ -38,7 +54,7 @@ impl TxId {
     /// timestamp, which determines its wound-wait priority.
     pub fn new_at(unix_nanos: u64) -> Self {
         let mut b = vec![0u8; TX_ID_LEN];
-        rand::rng().fill_bytes(&mut b[..TX_ID_TS_OFF]);
+        fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
         TxId(b)
     }
@@ -60,7 +76,7 @@ impl TxId {
     /// distinct log object that lands in a different storage partition.
     pub fn renew(&self) -> Self {
         let mut b = vec![0u8; TX_ID_LEN];
-        rand::rng().fill_bytes(&mut b[..TX_ID_TS_OFF]);
+        fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
         TxId(b)
     }
@@ -254,15 +270,17 @@ pub fn set_union(a: &TxIdSet, b: &TxIdSet) -> TxIdSet {
 mod tests {
     use super::*;
 
-    #[test]
-    fn random_is_16_bytes_and_hex() {
+    // Tests that mint random prefixes run on a runtime so the madsim simulator's
+    // seeded RNG has a reactor (a no-op for the OS RNG in normal builds).
+    #[tokio::test]
+    async fn random_is_16_bytes_and_hex() {
         let id = TxId::new_random();
         assert_eq!(id.len(), 16);
         assert_eq!(id.to_string().len(), 32);
     }
 
-    #[test]
-    fn new_at_layout() {
+    #[tokio::test]
+    async fn new_at_layout() {
         let nanos = 1_700_000_000_000_000_000u64;
         let id = TxId::new_at(nanos);
         assert_eq!(id.len(), 16);
@@ -295,8 +313,8 @@ mod tests {
         assert!(!b.older(&a));
     }
 
-    #[test]
-    fn renew_does_not_flip_ordering() {
+    #[tokio::test]
+    async fn renew_does_not_flip_ordering() {
         let ts = 42u64 * 1_000_000_000;
         let mut a = TxId::with_priority(ts, &[0, 0, 0, 0, 0, 0, 0, 1]);
         let mut b = TxId::with_priority(ts, &[0, 0, 0, 0, 0, 0, 0, 2]);
@@ -308,8 +326,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn renew_preserves_priority() {
+    #[tokio::test]
+    async fn renew_preserves_priority() {
         let orig = TxId::new_at(123_456_789_000u64);
         let renewed = orig.renew();
         assert_eq!(renewed.len(), 16);
@@ -319,8 +337,8 @@ mod tests {
         assert_ne!(orig.as_bytes()[..8], renewed.as_bytes()[..8]);
     }
 
-    #[test]
-    fn new_random_unique() {
+    #[tokio::test]
+    async fn new_random_unique() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
             let id = TxId::new_random();

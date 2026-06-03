@@ -33,8 +33,18 @@ impl Clock {
     /// with tokio's clock, so `tokio::time::pause`/`advance` control it. Must be
     /// created inside a tokio runtime.
     pub fn anchored() -> Self {
+        Self::anchored_at(SystemTime::now())
+    }
+
+    /// Like [`Clock::anchored`] but with an explicit base wall-clock time
+    /// instead of `SystemTime::now()`. Under the madsim simulator both the base
+    /// instant (the runtime's deterministic start) and the elapsed tokio time
+    /// are deterministic, so a fixed `base_sys` makes `now()` — and therefore
+    /// the transaction-id timestamps derived from it — a pure function of the
+    /// simulation seed. Must be created inside a tokio runtime.
+    pub fn anchored_at(base_sys: SystemTime) -> Self {
         Clock(Kind::Anchored {
-            base_sys: SystemTime::now(),
+            base_sys,
             base_instant: tokio::time::Instant::now(),
         })
     }

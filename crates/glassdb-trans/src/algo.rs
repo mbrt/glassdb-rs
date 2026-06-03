@@ -11,12 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use glassdb_backend::{self as backend, Metadata};
-use glassdb_concurr::{Background, Ctx};
+use glassdb_concurr::{Background, CancelToken, Ctx};
 use glassdb_data::{paths, TxId};
 use glassdb_storage::{
     tags_lock_info, Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::error::TransError;
 use crate::gc::Gc;
@@ -210,9 +209,13 @@ fn init_validation(h: &Handle) -> ValidationState {
         e.write = true;
         e.delete = w.delete;
     }
-    ValidationState {
-        paths: m.into_values().collect(),
-    }
+    // Sort by path so the validation order is independent of `HashMap`'s
+    // randomized iteration order. Under the madsim simulator this makes the
+    // sequence of backend operations a deterministic function of the seed (and
+    // is harmless in production).
+    let mut paths: Vec<PathState> = m.into_values().collect();
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    ValidationState { paths }
 }
 
 fn is_single_rw(data: &Data) -> bool {
@@ -270,13 +273,17 @@ fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransErr
         locks.insert(pr.prefix.clone(), LockType::Read);
     }
 
-    Ok(locks
+    // Sort by collection path for the same determinism reason as
+    // `init_validation`: a stable lock order independent of `HashMap` iteration.
+    let mut out: Vec<PathLock> = locks
         .into_iter()
         .map(|(p, t)| PathLock {
             path: paths::collection_info(&p),
             typ: t,
         })
-        .collect())
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
 }
 
 /// Coordinates transactions: read validation, locking, and write application.
@@ -1300,7 +1307,7 @@ impl Algo {
 const MAX_STALE: Duration = glassdb_storage::MAX_STALENESS;
 
 struct DeadlockGuard {
-    token: Option<CancellationToken>,
+    token: Option<CancelToken>,
 }
 
 impl Drop for DeadlockGuard {

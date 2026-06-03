@@ -1,0 +1,27 @@
+[package]
+name = "glassdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+madsim = "0.2"
+# The simulation harness (Workload + run_and_assert). The `sim` feature pulls in
+# `arbitrary`; the madsim-tokio alias is brought in transitively by glassdb.
+glassdb = { path = "../crates/glassdb", features = ["sim"] }
+
+[[bin]]
+name = "concurrent_tx"
+path = "fuzz_targets/concurrent_tx.rs"
+test = false
+doc = false
+bench = false
+
+# Make this its own workspace so the cargo-fuzz crate (which needs nightly and a
+# sanitizer) stays out of the main workspace's normal build/test graph.
+[workspace]

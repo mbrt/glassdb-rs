@@ -1,0 +1,145 @@
+//! A hierarchical cancellation token built on `tokio::sync::watch`.
+//!
+//! This replaces `tokio_util::sync::CancellationToken`. `tokio_util` depends on
+//! the real `tokio` crate, so under the madsim deterministic simulator (which
+//! aliases `tokio` to `madsim-tokio`) it would not be redirected. `watch` is
+//! part of `tokio::sync`, which madsim keeps as the real, runtime-agnostic
+//! primitive, so a token built on it works identically in production and under
+//! simulation.
+//!
+//! Semantics mirror the subset of `CancellationToken` the codebase uses: a
+//! token is cancelled when it, or any of its ancestors, is cancelled.
+
+use std::sync::Arc;
+
+use tokio::sync::watch;
+
+/// A clonable cancellation signal with parent/child propagation.
+#[derive(Clone)]
+pub struct CancelToken {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    tx: watch::Sender<bool>,
+    rx: watch::Receiver<bool>,
+    parent: Option<CancelToken>,
+}
+
+impl CancelToken {
+    /// Creates a fresh, uncancelled root token.
+    pub fn new() -> Self {
+        let (tx, rx) = watch::channel(false);
+        CancelToken {
+            inner: Arc::new(Inner {
+                tx,
+                rx,
+                parent: None,
+            }),
+        }
+    }
+
+    /// Creates a child token. The child is cancelled when it is cancelled
+    /// directly or when any ancestor is cancelled.
+    pub fn child_token(&self) -> CancelToken {
+        let (tx, rx) = watch::channel(false);
+        CancelToken {
+            inner: Arc::new(Inner {
+                tx,
+                rx,
+                parent: Some(self.clone()),
+            }),
+        }
+    }
+
+    /// Cancels this token (and, transitively, anything that observes it as an
+    /// ancestor). Idempotent.
+    pub fn cancel(&self) {
+        let _ = self.inner.tx.send(true);
+    }
+
+    /// Reports whether this token or any ancestor has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        if *self.inner.rx.borrow() {
+            return true;
+        }
+        match &self.inner.parent {
+            Some(p) => p.is_cancelled(),
+            None => false,
+        }
+    }
+
+    /// Resolves once this token or any ancestor is cancelled. Returns
+    /// immediately if already cancelled.
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        // Watch every token along the ancestor chain; the first one to flip
+        // wins. Receiver clones keep the underlying watch channels alive for the
+        // duration of the wait.
+        let mut receivers: Vec<watch::Receiver<bool>> = Vec::new();
+        let mut cur = Some(self);
+        while let Some(t) = cur {
+            receivers.push(t.inner.rx.clone());
+            cur = t.inner.parent.as_ref();
+        }
+        let futs = receivers.iter_mut().map(|rx| {
+            Box::pin(async move {
+                let _ = rx.wait_for(|v| *v).await;
+            })
+        });
+        let _ = futures::future::select_all(futs).await;
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancel_sets_flag_and_wakes() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+        let t2 = t.clone();
+        t2.cancel();
+        assert!(t.is_cancelled());
+        // Already cancelled: returns immediately.
+        t.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn child_observes_parent_cancel() {
+        let parent = CancelToken::new();
+        let child = parent.child_token();
+        assert!(!child.is_cancelled());
+        parent.cancel();
+        assert!(child.is_cancelled());
+        child.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn child_cancel_does_not_affect_parent() {
+        let parent = CancelToken::new();
+        let child = parent.child_token();
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_awaits_until_signal() {
+        let t = CancelToken::new();
+        let t2 = t.clone();
+        let waiter = tokio::spawn(async move { t2.cancelled().await });
+        tokio::task::yield_now().await;
+        t.cancel();
+        waiter.await.unwrap();
+    }
+}

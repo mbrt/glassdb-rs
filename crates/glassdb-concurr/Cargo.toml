@@ -5,10 +5,17 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = "0.1.89"
 futures = "0.3.32"
-tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
+tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
+
+# Under `--cfg madsim` the deterministic simulator replaces tokio. madsim is
+# only compiled in that configuration, so normal builds are unaffected.
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
 
 [dev-dependencies]

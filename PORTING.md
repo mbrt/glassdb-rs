@@ -48,9 +48,9 @@ Go's runtime primitives map onto tokio as follows.
 
 | Go | Rust |
 | --- | --- |
-| `context.Context` (cancellation + values) | `glassdb_concurr::Ctx` wrapping `tokio_util::sync::CancellationToken`, plus an optional tx-id value |
+| `context.Context` (cancellation + values) | `glassdb_concurr::Ctx` wrapping an in-house `CancelToken` (hierarchical, over `tokio::sync::watch`), plus an optional tx-id value |
 | goroutine | `tokio::spawn` |
-| `concurr.Background` (managed goroutines, cancelled together) | `Background` over `CancellationToken` + `TaskTracker` |
+| `concurr.Background` (managed goroutines, cancelled together) | `Background` over `CancelToken` + tracked `JoinHandle`s |
 | `errgroup` / bounded fan-out | `Fanout` (a `Semaphore`-bounded join of futures) and, in tests, `tokio::join!` |
 | `sync.Mutex` over small state | `std::sync::Mutex`, **never held across `.await`** |
 | channels | `tokio::sync` channels; `make_chan_inf_cap` for the unbounded case |
@@ -213,13 +213,20 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   higher-ranked-lifetime limitation). Running concurrent workloads with
   `tokio::join!` on the current-thread paused runtime gives real interleaving
   (tasks yield at `.await` points under contention) without the `Send` bound.
-- **Property test in place of fuzzing (interim).** The original `FuzzConcurrentTx`
-  uses a byte-driven scheduler middleware to replay interleavings. Until a Rust
-  DST + fuzzer is built, the mirror is a `proptest` that randomizes per-key
-  increment counts across two concurrent DBs and asserts the serializability
-  invariant (each key's final value equals the total successful increments).
-  Go's fuzz determinism infrastructure (seeded TxIds, sorted commit-path slices,
-  outcome regression tests) is deferred — use it as inspiration only.
+- **Deterministic simulation fuzzer (madsim).** The original `FuzzConcurrentTx`
+  uses a byte-driven backend-delay scheduler. The Rust port goes further with a
+  madsim-based DST in which scheduling, time, and randomness are all functions of
+  a single seed: see [ADR-008](docs/adr/008-deterministic-simulation-fuzzer.md).
+  A `cargo-fuzz` target (`fuzz/`) turns libFuzzer bytes into `(seed, Workload)`,
+  runs an N-client RMW mix on a shared `MemoryBackend`, and asserts the
+  serializability invariant. The self-check additionally asserts that two
+  same-seed runs issue a **byte-for-byte identical backend-call stream**
+  (`RecordingBackend` + `tests/concurrent_sim.rs`), which required the
+  previously-deferred commit-path ordering (now justified) and a fixed-base
+  deterministic clock. Run with `make sim-test` / `make fuzz`. The
+  `proptest_concurrent` test is kept as a fast non-madsim sanity check.
+  Go's byte-schedule approach was inspiration only; the Rust design is
+  madsim-native.
 - **Behavioral tests, ported wholesale.** The unit tests of the hard pieces
   (`dedup`, `algo`, `tlocker`, `monitor`, `gc`, `cache`) were ported from their
   Go counterparts to lock in equivalent behavior.
@@ -237,9 +244,6 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
 ## Out of scope
 
 - Benchmark tooling and demos from the original repository.
-- Go's byte-schedule fuzz harness (`FuzzConcurrentTx`,
-  `TestConcurrentTxDeterministicOutcome`). A Rust DST + fuzzer will be built
-  separately; `ScheduledBackend` exists but is not wired into a fuzz target yet.
 - Autoresearch perf experiments from upstream (`9b00d94` … `6bd75ea`).
 
 ## Upstream sync log
@@ -250,7 +254,7 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
 | Last ported commit | `ed5ec47` (partial) + `fe03218` test (partial) |
 | Ported on | 2026-06-03 |
 | Deferred — autoresearch | `9b00d94` … `6bd75ea` |
-| Deferred — determinism/fuzz | `790c1a7`, `0b2c609`, determinism parts of `ed5ec47`/`fe03218`; Rust DST+fuzzer TBD |
+| Determinism/fuzz | Rust-native madsim DST + cargo-fuzz built (ADR-008); Go determinism commits `790c1a7`/`0b2c609` were inspiration only |
 | Next port | autoresearch batch, or next non-autoresearch commit after HEAD |
 
 ### What was ported (`c1471c3`..`62dab6f`, autoresearch excluded)
@@ -259,13 +263,21 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   ([docs/adr/007-single-rw-cache-lost-update.md](docs/adr/007-single-rw-cache-lost-update.md))
 - `single_rw_lost_update` regression test in `glassdb-trans`
 
+### Determinism work (built Rust-native, see ADR-008)
+
+- Stable path ordering of commit-path slices (`Tx::collect_accesses`,
+  `init_validation`, `collections_locks`, `Locker::locked_paths`)
+- madsim deterministic runtime (seeded scheduling/time/randomness); `TxId`
+  prefix from `madsim::rand`; `Options::deterministic_time` fixed-base clock
+- `RecordingBackend` op-stream self-check + cargo-fuzz `concurrent_tx` target
+
 ### What was not ported (use as inspiration only)
 
-- Stable sorting of map-derived commit-path slices
-- Injectable TxId prefix source / DB `Rand` option
+- Injectable TxId prefix source / DB `Rand` option (madsim shim supersedes)
 - Configurable retry + jitter / `DisableJitter`
 - `Monitor` Retrier refactor
-- Go fuzz workload, `TestConcurrentTxDeterministicOutcome`, ADR-008
+- Go fuzz workload + `TestConcurrentTxDeterministicOutcome` (replaced by the
+  madsim DST)
 - Autoresearch perf experiments
 
 ### How to port the next batch

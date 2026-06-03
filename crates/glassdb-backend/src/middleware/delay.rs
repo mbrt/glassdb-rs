@@ -345,6 +345,16 @@ fn secs_f64_or_zero(secs: f64) -> Duration {
 mod tests {
     use super::*;
 
+    // Advances the virtual clock. Real tokio's `time::advance` is async; under
+    // the madsim simulator it is synchronous. This helper hides the difference
+    // so the test body reads the same in both configurations.
+    async fn advance(d: Duration) {
+        #[cfg(madsim)]
+        tokio::time::advance(d);
+        #[cfg(not(madsim))]
+        tokio::time::advance(d).await;
+    }
+
     // Ports the Go middleware `TestRateLimiter`, driving the limiter with
     // paused tokio time. Because the limiter reads `tokio::time::Instant`,
     // advancing the runtime clock moves its refill window.
@@ -355,20 +365,20 @@ mod tests {
         // Four requests sneak through within the first second (tokens go
         // negative because the window has not elapsed).
         assert!(rl.try_acquire_token("k"));
-        tokio::time::advance(Duration::from_millis(100)).await;
+        advance(Duration::from_millis(100)).await;
         assert!(rl.try_acquire_token("k"));
-        tokio::time::advance(Duration::from_millis(100)).await;
+        advance(Duration::from_millis(100)).await;
         assert!(rl.try_acquire_token("k"));
-        tokio::time::advance(Duration::from_millis(700)).await;
+        advance(Duration::from_millis(700)).await;
         assert!(rl.try_acquire_token("k"));
-        tokio::time::advance(Duration::from_millis(150)).await;
+        advance(Duration::from_millis(150)).await;
 
         // ~1050ms elapsed with 3 extra sneaked in, so we are rejected for
         // roughly the next 4 seconds.
         let mut elapsed = Duration::from_millis(1050);
         while elapsed < Duration::from_secs(4) {
             assert!(!rl.try_acquire_token("k"), "elapsed: {elapsed:?}");
-            tokio::time::advance(Duration::from_millis(250)).await;
+            advance(Duration::from_millis(250)).await;
             elapsed += Duration::from_millis(250);
         }
 
@@ -377,12 +387,12 @@ mod tests {
             assert!(rl.try_acquire_token("k"), "i: {i}");
         }
 
-        tokio::time::advance(Duration::from_secs(1)).await;
+        advance(Duration::from_secs(1)).await;
         // And now we are blocked again for the next few seconds.
         let mut elapsed = Duration::ZERO;
         while elapsed < Duration::from_secs(4) {
             assert!(!rl.try_acquire_token("k"), "elapsed: {elapsed:?}");
-            tokio::time::advance(Duration::from_millis(250)).await;
+            advance(Duration::from_millis(250)).await;
             elapsed += Duration::from_millis(250);
         }
         assert!(rl.try_acquire_token("k"));

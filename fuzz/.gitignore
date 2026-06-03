@@ -1,0 +1,8 @@
+# cargo-fuzz build output and crash artifacts.
+/target
+/artifacts
+/coverage
+
+# The curated starter seeds under corpus/concurrent_tx/ are committed. libFuzzer
+# also appends its own discovered inputs there at runtime; those show up as
+# untracked and should not be committed.

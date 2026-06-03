@@ -11,12 +11,21 @@ members = [
     "crates/glassdb-trans",
     "crates/glassdb",
 ]
+# The cargo-fuzz crate is its own workspace (needs nightly + a sanitizer); keep
+# it out of the main build/test graph.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
+
+# `--cfg madsim` activates the deterministic simulator (see ADR-008). Declaring
+# it here keeps `#[cfg(madsim)]` attributes from tripping the `unexpected_cfgs`
+# lint in normal builds (where the cfg is simply never set).
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
 
 [workspace.dependencies]
 glassdb-data = { path = "crates/glassdb-data" }

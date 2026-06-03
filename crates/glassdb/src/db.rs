@@ -3,8 +3,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use std::time::{Duration, UNIX_EPOCH};
+
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Ctx};
+use glassdb_concurr::{Background, Clock, Ctx};
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor};
@@ -21,6 +23,13 @@ pub struct Options {
     /// Number of bytes dedicated to caching objects and metadata. Setting this
     /// too small may impact performance, as more backend calls are necessary.
     pub cache_size: usize,
+    /// When true, wall-clock reads are anchored to a fixed base plus tokio's
+    /// (mockable) elapsed time instead of the real system clock. Combined with
+    /// the madsim simulator this makes transaction-id timestamps — and thus the
+    /// transaction-log object keys derived from them — a deterministic function
+    /// of the simulation seed. Intended for the deterministic fuzzer; leave
+    /// false in production.
+    pub deterministic_time: bool,
 }
 
 impl Default for Options {
@@ -28,9 +37,15 @@ impl Default for Options {
         // 512 MiB, a reasonable middle ground for production.
         Options {
             cache_size: 512 * 1024 * 1024,
+            deterministic_time: false,
         }
     }
 }
+
+/// Fixed wall-clock anchor used when `deterministic_time` is set: 2023-11-14
+/// 22:13:20 UTC. The exact value is irrelevant; it only needs to be constant so
+/// replays are byte-identical.
+const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
 
 pub(crate) struct DbInner {
     pub(crate) name: String,
@@ -75,7 +90,12 @@ impl DB {
         let global = Global::new(dyn_backend, local.clone());
         let tl = TLogger::new(global.clone(), local.clone(), name);
         let bg = Arc::new(Background::new());
-        let tmon = Monitor::new(local.clone(), tl.clone(), bg.clone());
+        let clock = if opts.deterministic_time {
+            Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
+        } else {
+            Clock::real()
+        };
+        let tmon = Monitor::with_clock(local.clone(), tl.clone(), bg.clone(), clock);
         let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
         let gc = Gc::new(bg.clone(), tl);
         gc.start(ctx);

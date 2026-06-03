@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 glassdb-data = { workspace = true }
 glassdb-backend = { workspace = true }
@@ -15,7 +18,10 @@ glassdb-trans = { workspace = true }
 glassdb-concurr = { workspace = true }
 futures = "0.3.32"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time"] }
+tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros", "sync", "time"] }
+# Only used by the `sim` feature (deterministic fuzz harness); kept optional so
+# production builds don't pull it in.
+arbitrary = { version = "1", optional = true }
 
 [features]
 default = []
@@ -23,7 +29,15 @@ default = []
 s3 = ["dep:glassdb-backend-s3"]
 # Pull in the Google Cloud Storage backend (reqwest/gcp_auth dependency).
 gcs = ["dep:glassdb-backend-gcs"]
+# Expose the deterministic-simulation workload harness (`glassdb::sim`) used by
+# the `fuzz/` crate and the madsim op-stream self-check. See ADR-008.
+sim = ["dep:arbitrary"]
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
+tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
 proptest = "1.9.0"
+
+# Under `--cfg madsim` the deterministic simulator drives the integration tests
+# (determinism self-check). madsim is only compiled in that configuration.
+[target.'cfg(madsim)'.dev-dependencies]
+madsim = "0.2"

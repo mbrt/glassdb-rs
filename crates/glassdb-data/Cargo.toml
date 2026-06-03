@@ -5,7 +5,18 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 rand = "0.10.1"
 
+# Under `--cfg madsim` transaction-id prefixes are drawn from the simulator's
+# deterministic RNG instead of the OS, so per-seed replays are byte-identical.
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+
 [dev-dependencies]
+# Tests that mint random IDs run inside a runtime so that, under `--cfg madsim`,
+# the simulator's seeded RNG has a reactor to draw from.
+tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros"] }

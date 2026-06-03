@@ -240,6 +240,12 @@ impl Tx {
                 found: v.found,
             });
         }
+        // Emit accesses in a stable path order so the commit path (transaction
+        // log contents, lock acquisition order, validation order) is
+        // independent of `HashMap`'s randomized iteration. This makes a madsim
+        // replay byte-for-byte identical and is harmless in production.
+        writes.sort_by(|a, b| a.path.cmp(&b.path));
+        reads.sort_by(|a, b| a.path.cmp(&b.path));
         Data { reads, writes }
     }
 }

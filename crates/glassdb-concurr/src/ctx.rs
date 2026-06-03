@@ -1,16 +1,16 @@
 //! A lightweight cancellation/value context analogous to Go's
-//! `context.Context`. It carries an optional [`CancellationToken`] and an
+//! `context.Context`. It carries an optional [`CancelToken`] and an
 //! optional transaction-id override (used by the transaction engine for
 //! deterministic testing, mirroring Go's `CtxWithTxID`).
 
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
+use crate::cancel::CancelToken;
 
 /// A cancellation context that also propagates a few values.
 #[derive(Clone, Default)]
 pub struct Ctx {
-    token: Option<CancellationToken>,
+    token: Option<CancelToken>,
     tx_id: Option<Arc<Vec<u8>>>,
 }
 
@@ -33,7 +33,7 @@ impl Ctx {
     }
 
     /// Wraps an existing cancellation token.
-    pub fn from_token(token: CancellationToken) -> Self {
+    pub fn from_token(token: CancelToken) -> Self {
         Self {
             token: Some(token),
             tx_id: None,
@@ -41,17 +41,17 @@ impl Ctx {
     }
 
     /// Creates a cancellable context, returning the context and its token.
-    pub fn with_cancel() -> (Self, CancellationToken) {
-        let t = CancellationToken::new();
+    pub fn with_cancel() -> (Self, CancelToken) {
+        let t = CancelToken::new();
         (Self::from_token(t.clone()), t)
     }
 
     /// Creates a child context whose token is cancelled when the parent's is
     /// (or when the returned token is cancelled). Values are preserved.
-    pub fn child_cancel(&self) -> (Self, CancellationToken) {
+    pub fn child_cancel(&self) -> (Self, CancelToken) {
         let t = match &self.token {
             Some(p) => p.child_token(),
-            None => CancellationToken::new(),
+            None => CancelToken::new(),
         };
         (
             Self {
@@ -64,7 +64,7 @@ impl Ctx {
 
     /// Replaces the cancellation source with `token`, preserving values.
     /// Mirrors Go's `ContextWithNewCancel`.
-    pub fn with_new_cancel(&self, token: CancellationToken) -> Self {
+    pub fn with_new_cancel(&self, token: CancelToken) -> Self {
         Self {
             token: Some(token),
             tx_id: self.tx_id.clone(),

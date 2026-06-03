@@ -8,6 +8,8 @@ mod collection;
 mod db;
 mod error;
 mod iter;
+#[cfg(feature = "sim")]
+pub mod sim;
 mod stats;
 mod tx;
 mod version;
