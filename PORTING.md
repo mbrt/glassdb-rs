@@ -213,11 +213,13 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   higher-ranked-lifetime limitation). Running concurrent workloads with
   `tokio::join!` on the current-thread paused runtime gives real interleaving
   (tasks yield at `.await` points under contention) without the `Send` bound.
-- **Property test in place of fuzzing.** The original `FuzzConcurrentTx` uses a
-  byte-driven scheduler middleware to replay interleavings. That middleware is
-  not yet ported, so the Rust mirror is a `proptest` that randomizes per-key
+- **Property test in place of fuzzing (interim).** The original `FuzzConcurrentTx`
+  uses a byte-driven scheduler middleware to replay interleavings. Until a Rust
+  DST + fuzzer is built, the mirror is a `proptest` that randomizes per-key
   increment counts across two concurrent DBs and asserts the serializability
   invariant (each key's final value equals the total successful increments).
+  Go's fuzz determinism infrastructure (seeded TxIds, sorted commit-path slices,
+  outcome regression tests) is deferred — use it as inspiration only.
 - **Behavioral tests, ported wholesale.** The unit tests of the hard pieces
   (`dedup`, `algo`, `tlocker`, `monitor`, `gc`, `cache`) were ported from their
   Go counterparts to lock in equivalent behavior.
@@ -235,6 +237,40 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
 ## Out of scope
 
 - Benchmark tooling and demos from the original repository.
-- Wiring the deterministic `ScheduledBackend` into a byte-driven port of
-  `FuzzConcurrentTx` (the middleware exists; the fuzz harness is still a
-  `proptest`).
+- Go's byte-schedule fuzz harness (`FuzzConcurrentTx`,
+  `TestConcurrentTxDeterministicOutcome`). A Rust DST + fuzzer will be built
+  separately; `ScheduledBackend` exists but is not wired into a fuzz target yet.
+- Autoresearch perf experiments from upstream (`9b00d94` … `6bd75ea`).
+
+## Upstream sync log
+
+| Field | Value |
+| --- | --- |
+| Upstream repo | `~/priv/glassdb` |
+| Last ported commit | `ed5ec47` (partial) + `fe03218` test (partial) |
+| Ported on | 2026-06-03 |
+| Deferred — autoresearch | `9b00d94` … `6bd75ea` |
+| Deferred — determinism/fuzz | `790c1a7`, `0b2c609`, determinism parts of `ed5ec47`/`fe03218`; Rust DST+fuzzer TBD |
+| Next port | autoresearch batch, or next non-autoresearch commit after HEAD |
+
+### What was ported (`c1471c3`..`62dab6f`, autoresearch excluded)
+
+- ADR-007 lost-update fix in `validate_locked_read` / `validate_read_not_found`
+  ([docs/adr/007-single-rw-cache-lost-update.md](docs/adr/007-single-rw-cache-lost-update.md))
+- `single_rw_lost_update` regression test in `glassdb-trans`
+
+### What was not ported (use as inspiration only)
+
+- Stable sorting of map-derived commit-path slices
+- Injectable TxId prefix source / DB `Rand` option
+- Configurable retry + jitter / `DisableJitter`
+- `Monitor` Retrier refactor
+- Go fuzz workload, `TestConcurrentTxDeterministicOutcome`, ADR-008
+- Autoresearch perf experiments
+
+### How to port the next batch
+
+1. In the upstream repo: `git log <last-ported>..HEAD --oneline`
+2. Skip commits whose subject starts with `autoresearch:`
+3. Map Go packages to Rust crates using the workspace table above
+4. Run `make test` before committing

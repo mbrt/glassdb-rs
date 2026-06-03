@@ -658,17 +658,53 @@ impl Algo {
 
         // We read from an old value: update our local copy and retry.
         item.result = VResult::Retry;
-        let ev = match expected_val {
+
+        let mut ev = match expected_val {
             Some(v) => v,
             None => match self
                 .mon
                 .committed_value(ctx, &item.path, &expected_writer)
                 .await
             {
-                Ok(v) if !v.value.not_written => v,
-                _ => return Ok(()),
+                Ok(v) => v,
+                Err(_) => {
+                    self.local
+                        .mark_value_outdated(&item.path, item.read_version.clone());
+                    return Ok(());
+                }
             },
         };
+
+        if ev.status != glassdb_storage::TxCommitStatus::Ok {
+            ev = match self
+                .mon
+                .committed_value(ctx, &item.path, &expected_writer)
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    self.local
+                        .mark_value_outdated(&item.path, item.read_version.clone());
+                    return Ok(());
+                }
+            };
+        }
+
+        if ev.status != glassdb_storage::TxCommitStatus::Ok || ev.value.not_written {
+            // We cannot authoritatively resolve expected_writer's value. This
+            // happens when expected_writer committed through the single-RW fast
+            // path, which writes no transaction log, so its log-based status is
+            // unknown/aborted even though it did commit. Caching a guessed value
+            // here would be corrupting: it would pair value bytes with a writer
+            // that did not produce them, and a later read could trust that
+            // (writer matches the live last-writer) and overwrite a newer value,
+            // losing an update. Instead, invalidate the stale cached value so the
+            // retry re-reads the authoritative one straight from storage.
+            self.local
+                .mark_value_outdated(&item.path, item.read_version.clone());
+            return Ok(());
+        }
+
         self.update_local(
             &WriteAccess {
                 path: item.path.clone(),
@@ -726,14 +762,23 @@ impl Algo {
             item.result = VResult::Ok;
             return Ok(());
         }
-        self.update_local(
-            &WriteAccess {
-                path: item.path.clone(),
-                val: v.value.value,
-                delete: v.value.deleted,
-            },
-            &last_writer,
-        );
+
+        // Was written to: retry. Only refresh the local cache when we could
+        // authoritatively resolve the value. If last_writer committed via the
+        // single-RW fast path it has no transaction log, so the value is
+        // unresolvable here; caching a guessed value would corrupt the entry, so we
+        // just retry and let the next read fetch the authoritative value.
+        if v.status == glassdb_storage::TxCommitStatus::Ok && !v.value.not_written {
+            self.update_local(
+                &WriteAccess {
+                    path: item.path.clone(),
+                    val: v.value.value,
+                    delete: v.value.deleted,
+                },
+                &last_writer,
+            );
+        }
+
         item.result = VResult::Retry;
         Ok(())
     }
@@ -1270,7 +1315,8 @@ impl Drop for DeadlockGuard {
 mod tests {
     use super::*;
     use glassdb_backend::{memory::MemoryBackend, Backend, Tags};
-    use glassdb_storage::{TLogger, TxCommitStatus, MAX_STALENESS};
+    use glassdb_data::TxId;
+    use glassdb_storage::{LockType, TLogger, TxCommitStatus, MAX_STALENESS};
 
     const TEST_COLL: &str = "testp";
     const COLL_INFO: &[u8] = b"__foo__";
@@ -1728,6 +1774,83 @@ mod tests {
         );
         tm.commit(&ctx, &mut h).await.unwrap();
         tm.end(&ctx, &mut h).await.unwrap();
+    }
+
+    /// Regression test for ADR-007: a single-RW writer leaves no transaction log,
+    /// so validation must not cache an unresolvable value tagged with that writer.
+    #[tokio::test]
+    async fn single_rw_lost_update() {
+        let ctx = Ctx::background();
+        let (tm_writer, tctx_w) = new_algo().await;
+        let (tm_victim, tctx_v) = new_algo_from_backend(tctx_w.backend.clone()).await;
+        let (_, tctx_l) = new_algo_from_backend(tctx_w.backend.clone()).await;
+        let key = paths::from_key(TEST_COLL, b"k");
+        let v0 = b"v0";
+        let v1 = b"v1";
+
+        // 1. Create k=v0 through a normal (logged) commit and flush it.
+        let h0 = commit_writes(&tm_writer, vec![wa(&key, v0)]).await;
+        flush_writes(&tm_writer, &h0).await;
+
+        // 2. The victim reads k, caching v0@W0 in its local storage.
+        let ra0 = do_read(&tctx_v, &key).await;
+        assert!(ra0.found);
+
+        // 3. The writer overwrites k=v1 through the single-RW fast path.
+        let ra_w = do_read(&tctx_w, &key).await;
+        let h_w1 = commit_access(
+            &tm_writer,
+            Data {
+                reads: vec![ra_w],
+                writes: vec![wa(&key, v1)],
+            },
+        )
+        .await;
+        let w1 = h_w1.id.clone();
+        let st = tctx_w.tlogger.commit_status(&ctx, &w1).await.unwrap();
+        assert_eq!(st.status, TxCommitStatus::Unknown);
+        let gr = tctx_w.global.read(&ctx, &key).await.unwrap();
+        assert_eq!(gr.value, v1);
+        assert_eq!(gr.writer(), w1);
+
+        // 4. A third client write-locks k and stays pending.
+        let w2 = TxId::with_priority(5 * 1_000_000_000, b"w2");
+        tctx_l.tmon.begin_tx(&w2);
+        tctx_l.locker.lock_write(&ctx, &key, &w2).await.unwrap();
+        let info = lock_info(&tctx_l, &key).await;
+        assert_eq!(info.typ, LockType::Write);
+        assert_eq!(info.locked_by.len(), 1);
+        assert_eq!(info.locked_by[0], w2);
+        assert_eq!(info.last_writer, w1);
+
+        // 5. The victim validates its now-stale read of k.
+        let mut hv = tm_victim.begin(
+            &ctx,
+            Data {
+                reads: vec![ra0],
+                writes: Vec::new(),
+            },
+        );
+        let err = tm_victim.commit(&ctx, &mut hv).await.unwrap_err();
+        assert!(err.is_retry(), "expected retry, got {err:?}");
+        tm_victim.end(&ctx, &mut hv).await.unwrap();
+
+        // 6. The third client releases its lock; k is unlocked at v1@W1.
+        tctx_l.locker.unlock(&ctx, &key, &w2).await.unwrap();
+        let info = lock_info(&tctx_l, &key).await;
+        assert_eq!(info.typ, LockType::None);
+        assert_eq!(info.last_writer, w1);
+        tctx_l.tmon.abort_tx(&ctx, &w2).await.unwrap();
+
+        // 7. Reading k must return the authoritative committed value v1.
+        let reader = Reader::new(
+            tctx_v.local.clone(),
+            tctx_v.global.clone(),
+            tctx_v.tmon.clone(),
+        );
+        let rv = reader.read(&ctx, &key, MAX_STALENESS).await.unwrap();
+        assert_eq!(rv.value, v1);
+        assert_eq!(rv.version.writer, w1);
     }
 
     #[tokio::test]
