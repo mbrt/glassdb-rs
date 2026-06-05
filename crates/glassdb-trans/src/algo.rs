@@ -57,7 +57,7 @@ enum VResult {
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
-    pub path: String,
+    pub path: Arc<str>,
     pub version: ReadVersion,
     pub found: bool,
 }
@@ -81,7 +81,7 @@ impl ReadVersion {
 /// A single key write within a transaction.
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
-    pub path: String,
+    pub path: Arc<str>,
     pub val: Vec<u8>,
     pub delete: bool,
 }
@@ -111,7 +111,7 @@ impl Handle {
 
 #[derive(Clone)]
 struct PathState {
-    path: String,
+    path: Arc<str>,
     read: bool,
     write: bool,
     not_found: bool,
@@ -130,7 +130,7 @@ impl PathState {
             return Ok(Vec::new());
         };
         let mut res = vec![PathLock {
-            path: self.path.clone(),
+            path: self.path.to_string(),
             typ: lt,
         }];
         if !self.not_found {
@@ -181,7 +181,7 @@ impl ValidationState {
 }
 
 fn init_validation(h: &Handle) -> ValidationState {
-    let mut m: HashMap<String, PathState> = HashMap::new();
+    let mut m: HashMap<Arc<str>, PathState> = HashMap::new();
     for r in &h.data.reads {
         let e = m.entry(r.path.clone()).or_insert_with(|| PathState {
             path: r.path.clone(),
@@ -236,7 +236,7 @@ fn to_log(id: TxId, writes: &[WriteAccess]) -> TxLog {
     let mut tl = TxLog::new(id, glassdb_storage::TxCommitStatus::Ok);
     for w in writes {
         tl.writes.push(TxWrite {
-            path: w.path.clone(),
+            path: w.path.to_string(),
             value: w.val.clone(),
             deleted: w.delete,
             prev_writer: TxId::default(),
@@ -1424,7 +1424,7 @@ mod tests {
 
     fn wa(path: &str, val: &[u8]) -> WriteAccess {
         WriteAccess {
-            path: path.to_string(),
+            path: path.into(),
             val: val.to_vec(),
             delete: false,
         }
@@ -1432,7 +1432,7 @@ mod tests {
 
     fn wdel(path: &str) -> WriteAccess {
         WriteAccess {
-            path: path.to_string(),
+            path: path.into(),
             val: Vec::new(),
             delete: true,
         }
@@ -1443,14 +1443,14 @@ mod tests {
         let ctx = Ctx::background();
         match reader.read(&ctx, path, MAX_STALENESS).await {
             Ok(rv) => ReadAccess {
-                path: path.to_string(),
+                path: path.into(),
                 version: ReadVersion {
                     last_writer: rv.version.writer,
                 },
                 found: true,
             },
             Err(e) if e.is_not_found() => ReadAccess {
-                path: path.to_string(),
+                path: path.into(),
                 version: ReadVersion::default(),
                 found: false,
             },
@@ -1549,7 +1549,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion::default(),
                     found: false,
                 }],
@@ -1581,7 +1581,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
@@ -1614,7 +1614,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
@@ -1631,7 +1631,7 @@ mod tests {
             &mut h,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
@@ -1668,7 +1668,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
