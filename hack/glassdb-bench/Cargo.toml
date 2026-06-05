@@ -12,7 +12,7 @@ workspace = true
 # `hack/backendbench`. It runs against real AWS S3 / GCS or a simulated
 # (in-memory + DelayBackend) backend, so the cloud SDK features are always on.
 [dependencies]
-glassdb = { path = "../glassdb", features = ["s3", "gcs"] }
+glassdb = { path = "../../crates/glassdb", features = ["s3", "gcs"] }
 glassdb-backend = { workspace = true }
 glassdb-concurr = { workspace = true }
 # A real (non-madsim) tokio runtime drives the binaries.
