@@ -104,3 +104,12 @@ Each entry looks like:
 - Outcome & why: primary within noise + a large, stable, deterministic alloc-count drop on every workload -> easily meets the secondary keep rule. Kept. Same lesson as exp5: a type cloned on nearly every op is a high-leverage target for Arc sharing; the atomic-refcount cost is far cheaper than the per-clone heap alloc it replaces (ns/cpu also fell).
 - Commit: e9299a6
 
+## 9. Store transaction access paths as Arc<str> - KEPT
+- Hypothesis: `ReadAccess`/`WriteAccess`/`PathState` hold the key path as `String`, so each path is deep-copied through the commit pipeline: `collect_accesses` (staged -> access), `init_validation`'s dedup `HashMap` (clones path for the map key AND the PathState - twice per new key), and the per-item clone in parallel validation/locking. Storing paths as `Arc<str>` turns those into refcount bumps. The `String` sinks (`PathLock`, `TxWrite` protobuf field) materialize a String at the boundary as today, so their cost is unchanged - the win is purely the eliminated intermediate copies, biggest on read-heavy txns (batchRead10 dedups 10 paths twice each).
+- Change: `glassdb-trans/algo.rs` - `path: String` -> `Arc<str>` on the three structs; `init_validation` map keyed by `Arc<str>` (cheap entry/clone); `needs_locks`/`to_log` use `self.path.to_string()`/`w.path.to_string()` at the String sinks; in-file test helpers build paths via `.into()`. `glassdb/tx.rs` - `collect_accesses` builds `path: k.as_str().into()` (same single alloc as the previous `String` clone). All `&item.path` borrows work unchanged via `Arc<str>` deref.
+- Correctness: fast gate PASS; judge APPROVED; full gate PASS (make test + sim-test + 120s fuzz, 8742 runs, no crash). Logical no-op: paths carry identical bytes; only intermediate copies are shared.
+- Primary: 403.92 -> 403.60 (-0.08%, flat/noise; op counts unchanged).
+- Secondary (stable across 4 measurements): allocsPerTx 489.4 -> ~471 (-4%; deterministic per-workload batchRead10 -9.7%, singleRMW -6.3%, batchWrite100 -2.0%, multiRMW -2.0%), allocBytesPerTx -2.6%, nsPerTx flat, cpuNsPerTx flat (one run spiked +3.7%/cpu=50k but 3 re-runs sat at ~42k; readRepeat first read +1.9% was also noise - re-runs 40-42, flat). No axis regressed.
+- Outcome & why: primary within noise + stable deterministic alloc/allocBytes reduction, no regression -> kept. The String sinks cap the upside (still materialized for locks/log), but eliminating the dedup-map double clone is a clean structural win on read paths.
+- Commit: c9154fd
+

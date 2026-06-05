@@ -181,40 +181,56 @@ impl ValidationState {
 }
 
 fn init_validation(h: &Handle) -> ValidationState {
-    let mut m: HashMap<Arc<str>, PathState> = HashMap::new();
-    for r in &h.data.reads {
-        let e = m.entry(r.path.clone()).or_insert_with(|| PathState {
-            path: r.path.clone(),
+    // `collect_accesses` emits reads and writes already sorted and unique by
+    // path (see ADR-008), so merge the two sorted runs directly into a
+    // path-sorted `PathState` list. This avoids a per-transaction `HashMap`
+    // allocation (plus its hashing and the separate final sort) while keeping
+    // the same deterministic, deduplicated validation order: a key that is both
+    // read and written yields a single merged entry.
+    let reads = &h.data.reads;
+    let writes = &h.data.writes;
+    let mut paths: Vec<PathState> = Vec::with_capacity(reads.len() + writes.len());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let (take_read, take_write) = match (reads.get(i), writes.get(j)) {
+            (Some(r), Some(w)) => match r.path.cmp(&w.path) {
+                std::cmp::Ordering::Less => (true, false),
+                std::cmp::Ordering::Greater => (false, true),
+                std::cmp::Ordering::Equal => (true, true),
+            },
+            (Some(_), None) => (true, false),
+            (None, Some(_)) => (false, true),
+            (None, None) => break,
+        };
+        let path = if take_read {
+            reads[i].path.clone()
+        } else {
+            writes[j].path.clone()
+        };
+        let mut ps = PathState {
+            path,
             read: false,
             write: false,
             not_found: false,
             delete: false,
             read_version: Version::default(),
             result: VResult::Unknown,
-        });
-        e.read = true;
-        e.read_version = r.version.to_storage_version();
-        e.not_found = !r.found;
+        };
+        if take_read {
+            let r = &reads[i];
+            ps.read = true;
+            ps.read_version = r.version.to_storage_version();
+            ps.not_found = !r.found;
+            i += 1;
+        }
+        if take_write {
+            let w = &writes[j];
+            ps.write = true;
+            ps.delete = w.delete;
+            j += 1;
+        }
+        paths.push(ps);
     }
-    for w in &h.data.writes {
-        let e = m.entry(w.path.clone()).or_insert_with(|| PathState {
-            path: w.path.clone(),
-            read: false,
-            write: false,
-            not_found: false,
-            delete: false,
-            read_version: Version::default(),
-            result: VResult::Unknown,
-        });
-        e.write = true;
-        e.delete = w.delete;
-    }
-    // Sort by path so the validation order is independent of `HashMap`'s
-    // randomized iteration order. Under the madsim simulator this makes the
-    // sequence of backend operations a deterministic function of the seed (and
-    // is harmless in production).
-    let mut paths: Vec<PathState> = m.into_values().collect();
-    paths.sort_by(|a, b| a.path.cmp(&b.path));
     ValidationState { paths }
 }
 
