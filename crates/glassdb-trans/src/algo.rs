@@ -249,8 +249,16 @@ fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransErr
     let mut locks: HashMap<String, LockType> = HashMap::new();
 
     for info in &vstate.paths {
-        if !info.not_found && !info.delete && info.result != VResult::NeedsCLock {
-            // Only not-found and deleted items require collection locks.
+        // A blind write (write without a prior read) has unknown existence: it
+        // may need to create the key, which requires the collection lock for
+        // phantom prevention. Acquire it up front so the key can take the
+        // create-or-write path directly, instead of first attempting a write
+        // lock (a wasted metadata read that returns not-found for a new key)
+        // and only then retrying under a collection lock.
+        let blind_write = info.write && !info.read;
+        if !info.not_found && !info.delete && info.result != VResult::NeedsCLock && !blind_write {
+            // Only not-found, deleted, and blind-write items require collection
+            // locks.
             continue;
         }
         let pr = paths::parse(&info.path).map_err(|e| TransError::Other(e.to_string()))?;
@@ -979,6 +987,16 @@ impl Algo {
             return Ok(());
         }
         if item.not_found {
+            return self.lock_validate_not_found_key(ctx, item, tx).await;
+        }
+        // A blind write (write with no prior read) has unknown existence. Take
+        // the create-or-write path: try a conditional create first (cheap for a
+        // new key, no metadata read), falling back to a write lock if the key
+        // already exists. The collection lock it relies on was acquired up
+        // front by `collections_locks`. This avoids the wasted write-lock
+        // attempt (and its not-found metadata read) on keys that must be
+        // created.
+        if item.write && !item.read {
             return self.lock_validate_not_found_key(ctx, item, tx).await;
         }
         self.lock_validate_found_key(ctx, item, tx).await
