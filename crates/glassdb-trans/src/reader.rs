@@ -3,6 +3,7 @@
 //! Reads from local then global storage, and resolves keys that may be locked
 //! in "create" (i.e. uncommitted) by consulting the transaction monitor.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{BackendError, Metadata};
@@ -71,7 +72,7 @@ impl Reader {
         ctx: &Ctx,
         key: &str,
         max_stale: Duration,
-    ) -> Result<Metadata, StorageError> {
+    ) -> Result<Arc<Metadata>, StorageError> {
         if let Some(lm) = self.local.get_meta(key, max_stale) {
             if !lm.outdated {
                 return Ok(lm.m);

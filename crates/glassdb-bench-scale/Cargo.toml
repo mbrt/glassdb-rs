@@ -1,5 +1,5 @@
 [package]
-name = "glassdb-bench"
+name = "glassdb-bench-scale"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,16 @@ publish = false
 [lints]
 workspace = true
 
-# Standalone benchmark tooling ported from the Go `hack/rtbench` and
-# `hack/backendbench`. It runs against real AWS S3 / GCS or a simulated
-# (in-memory + DelayBackend) backend, so the cloud SDK features are always on.
+# Concurrency / throughput "scale" benchmarks for glassdb, run against real or
+# simulated cloud backends. This crate pulls in the AWS / GCS SDKs; the
+# lightweight, in-memory autoresearch scorer lives in the separate
+# `glassdb-bench-score` crate instead.
+#
+# Binaries:
+#   rtbench       transaction throughput & latency under concurrency scaling
+#                 (ported from Go `hack/rtbench`).
+#   backendbench  raw backend storage-op latencies (ported from Go
+#                 `hack/backendbench`).
 [dependencies]
 glassdb = { path = "../glassdb", features = ["s3", "gcs"] }
 glassdb-backend = { workspace = true }
@@ -18,12 +25,12 @@ glassdb-concurr = { workspace = true }
 # A real tokio runtime drives the binaries.
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }
+futures = "0.3.32"
 rand = "0.10.1"
 aws-config = "1.8.17"
 aws-sdk-s3 = "1.134.0"
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
-futures = "0.3.32"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

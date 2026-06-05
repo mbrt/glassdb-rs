@@ -57,7 +57,7 @@ enum VResult {
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
-    pub path: String,
+    pub path: Arc<str>,
     pub version: ReadVersion,
     pub found: bool,
 }
@@ -81,7 +81,7 @@ impl ReadVersion {
 /// A single key write within a transaction.
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
-    pub path: String,
+    pub path: Arc<str>,
     pub val: Vec<u8>,
     pub delete: bool,
 }
@@ -111,7 +111,7 @@ impl Handle {
 
 #[derive(Clone)]
 struct PathState {
-    path: String,
+    path: Arc<str>,
     read: bool,
     write: bool,
     not_found: bool,
@@ -130,7 +130,7 @@ impl PathState {
             return Ok(Vec::new());
         };
         let mut res = vec![PathLock {
-            path: self.path.clone(),
+            path: self.path.to_string(),
             typ: lt,
         }];
         if !self.not_found {
@@ -181,40 +181,56 @@ impl ValidationState {
 }
 
 fn init_validation(h: &Handle) -> ValidationState {
-    let mut m: HashMap<String, PathState> = HashMap::new();
-    for r in &h.data.reads {
-        let e = m.entry(r.path.clone()).or_insert_with(|| PathState {
-            path: r.path.clone(),
+    // `collect_accesses` emits reads and writes already sorted and unique by
+    // path (see ADR-008), so merge the two sorted runs directly into a
+    // path-sorted `PathState` list. This avoids a per-transaction `HashMap`
+    // allocation (plus its hashing and the separate final sort) while keeping
+    // the same deterministic, deduplicated validation order: a key that is both
+    // read and written yields a single merged entry.
+    let reads = &h.data.reads;
+    let writes = &h.data.writes;
+    let mut paths: Vec<PathState> = Vec::with_capacity(reads.len() + writes.len());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let (take_read, take_write) = match (reads.get(i), writes.get(j)) {
+            (Some(r), Some(w)) => match r.path.cmp(&w.path) {
+                std::cmp::Ordering::Less => (true, false),
+                std::cmp::Ordering::Greater => (false, true),
+                std::cmp::Ordering::Equal => (true, true),
+            },
+            (Some(_), None) => (true, false),
+            (None, Some(_)) => (false, true),
+            (None, None) => break,
+        };
+        let path = if take_read {
+            reads[i].path.clone()
+        } else {
+            writes[j].path.clone()
+        };
+        let mut ps = PathState {
+            path,
             read: false,
             write: false,
             not_found: false,
             delete: false,
             read_version: Version::default(),
             result: VResult::Unknown,
-        });
-        e.read = true;
-        e.read_version = r.version.to_storage_version();
-        e.not_found = !r.found;
+        };
+        if take_read {
+            let r = &reads[i];
+            ps.read = true;
+            ps.read_version = r.version.to_storage_version();
+            ps.not_found = !r.found;
+            i += 1;
+        }
+        if take_write {
+            let w = &writes[j];
+            ps.write = true;
+            ps.delete = w.delete;
+            j += 1;
+        }
+        paths.push(ps);
     }
-    for w in &h.data.writes {
-        let e = m.entry(w.path.clone()).or_insert_with(|| PathState {
-            path: w.path.clone(),
-            read: false,
-            write: false,
-            not_found: false,
-            delete: false,
-            read_version: Version::default(),
-            result: VResult::Unknown,
-        });
-        e.write = true;
-        e.delete = w.delete;
-    }
-    // Sort by path so the validation order is independent of `HashMap`'s
-    // randomized iteration order. Under the simulation executor this makes the
-    // sequence of backend operations a deterministic function of the seed (and
-    // is harmless in production).
-    let mut paths: Vec<PathState> = m.into_values().collect();
-    paths.sort_by(|a, b| a.path.cmp(&b.path));
     ValidationState { paths }
 }
 
@@ -236,7 +252,7 @@ fn to_log(id: TxId, writes: &[WriteAccess]) -> TxLog {
     let mut tl = TxLog::new(id, glassdb_storage::TxCommitStatus::Ok);
     for w in writes {
         tl.writes.push(TxWrite {
-            path: w.path.clone(),
+            path: w.path.to_string(),
             value: w.val.clone(),
             deleted: w.delete,
             prev_writer: TxId::default(),
@@ -249,8 +265,16 @@ fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransErr
     let mut locks: HashMap<String, LockType> = HashMap::new();
 
     for info in &vstate.paths {
-        if !info.not_found && !info.delete && info.result != VResult::NeedsCLock {
-            // Only not-found and deleted items require collection locks.
+        // A blind write (write without a prior read) has unknown existence: it
+        // may need to create the key, which requires the collection lock for
+        // phantom prevention. Acquire it up front so the key can take the
+        // create-or-write path directly, instead of first attempting a write
+        // lock (a wasted metadata read that returns not-found for a new key)
+        // and only then retrying under a collection lock.
+        let blind_write = info.write && !info.read;
+        if !info.not_found && !info.delete && info.result != VResult::NeedsCLock && !blind_write {
+            // Only not-found, deleted, and blind-write items require collection
+            // locks.
             continue;
         }
         let pr = paths::parse(&info.path).map_err(|e| TransError::Other(e.to_string()))?;
@@ -339,11 +363,11 @@ impl Algo {
     /// (timestamp) while minting a fresh log identity. Reusing the original
     /// priority prevents a restarted transaction from being starved by an
     /// endless stream of younger peers.
-    pub fn rebegin(&self, old: &Handle, d: Data) -> Handle {
+    pub fn rebegin(&self, old: Handle) -> Handle {
         Handle {
-            data: d,
-            status: Status::New,
             id: old.id.renew(),
+            data: old.data,
+            status: Status::New,
             require_locks: false,
             serial_locking: false,
         }
@@ -375,8 +399,7 @@ impl Algo {
             }
         }
 
-        let writes = tx.data.writes.clone();
-        if let Err(e) = self.commit_writes(ctx, &writes, &tx.id).await {
+        if let Err(e) = self.commit_writes(ctx, &tx.data.writes, &tx.id).await {
             if matches!(e, TransError::AlreadyFinalized) {
                 // The log was already finalized as aborted: we were wounded (or
                 // reclaimed as expired) between validation and commit.
@@ -572,11 +595,11 @@ impl Algo {
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
-        let inputs = vstate.paths.clone();
-        let n = inputs.len();
+        let paths = &vstate.paths;
+        let n = paths.len();
         let (outs, err) = self
             .run_indexed(ctx, n, |ctx, i| {
-                let mut item = inputs[i].clone();
+                let mut item = paths[i].clone();
                 async move {
                     if item.not_found {
                         self.validate_read_not_found(&ctx, &mut item).await?;
@@ -950,11 +973,11 @@ impl Algo {
         vstate: &mut ValidationState,
         tx: &Handle,
     ) -> Result<(), TransError> {
-        let inputs = vstate.paths.clone();
-        let n = inputs.len();
+        let paths = &vstate.paths;
+        let n = paths.len();
         let (outs, err) = self
             .run_indexed(ctx, n, |ctx, i| {
-                let mut item = inputs[i].clone();
+                let mut item = paths[i].clone();
                 async move {
                     self.lock_validate_key(&ctx, &mut item, tx).await?;
                     Ok(item)
@@ -979,6 +1002,16 @@ impl Algo {
             return Ok(());
         }
         if item.not_found {
+            return self.lock_validate_not_found_key(ctx, item, tx).await;
+        }
+        // A blind write (write with no prior read) has unknown existence. Take
+        // the create-or-write path: try a conditional create first (cheap for a
+        // new key, no metadata read), falling back to a write lock if the key
+        // already exists. The collection lock it relies on was acquired up
+        // front by `collections_locks`. This avoids the wasted write-lock
+        // attempt (and its not-found metadata read) on keys that must be
+        // created.
+        if item.write && !item.read {
             return self.lock_validate_not_found_key(ctx, item, tx).await;
         }
         self.lock_validate_found_key(ctx, item, tx).await
@@ -1407,7 +1440,7 @@ mod tests {
 
     fn wa(path: &str, val: &[u8]) -> WriteAccess {
         WriteAccess {
-            path: path.to_string(),
+            path: path.into(),
             val: val.to_vec(),
             delete: false,
         }
@@ -1415,7 +1448,7 @@ mod tests {
 
     fn wdel(path: &str) -> WriteAccess {
         WriteAccess {
-            path: path.to_string(),
+            path: path.into(),
             val: Vec::new(),
             delete: true,
         }
@@ -1426,14 +1459,14 @@ mod tests {
         let ctx = Ctx::background();
         match reader.read(&ctx, path, MAX_STALENESS).await {
             Ok(rv) => ReadAccess {
-                path: path.to_string(),
+                path: path.into(),
                 version: ReadVersion {
                     last_writer: rv.version.writer,
                 },
                 found: true,
             },
             Err(e) if e.is_not_found() => ReadAccess {
-                path: path.to_string(),
+                path: path.into(),
                 version: ReadVersion::default(),
                 found: false,
             },
@@ -1532,7 +1565,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion::default(),
                     found: false,
                 }],
@@ -1564,7 +1597,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
@@ -1597,7 +1630,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
@@ -1614,7 +1647,7 @@ mod tests {
             &mut h,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },
@@ -1651,7 +1684,7 @@ mod tests {
             &ctx,
             Data {
                 reads: vec![ReadAccess {
-                    path: keyp.clone(),
+                    path: keyp.as_str().into(),
                     version: ReadVersion {
                         last_writer: gr.version.writer,
                     },

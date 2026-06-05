@@ -216,20 +216,28 @@ impl DbInner {
             let access = tx.collect_accesses();
             stats.tx_reads += access.reads.len() as i64;
             stats.tx_writes += access.writes.len() as i64;
-            match handle.as_mut() {
-                None => handle = Some(self.algo.begin(ctx, access.clone())),
-                Some(h) => self.algo.reset(h, access.clone()),
-            }
 
             let value = match fn_res {
-                Ok(v) => v,
+                Ok(v) => {
+                    // Hand the full access (reads and writes) to the handle. The
+                    // handle owns the data from here on; the wound path below
+                    // recovers it from the handle, so no separate clone is kept.
+                    match handle.as_mut() {
+                        None => handle = Some(self.algo.begin(ctx, access)),
+                        Some(h) => self.algo.reset(h, access),
+                    }
+                    v
+                }
                 Err(ferr) => {
                     // The user function returned an error. It might be the
                     // result of a spurious read, so validate only the reads.
                     let mut ro = access;
                     ro.writes.clear();
+                    match handle.as_mut() {
+                        None => handle = Some(self.algo.begin(ctx, ro)),
+                        Some(h) => self.algo.reset(h, ro),
+                    }
                     let h = handle.as_mut().unwrap();
-                    self.algo.reset(h, ro);
                     match self.algo.validate_reads(ctx, h).await {
                         Err(e) if e.is_retry() => {
                             tx.reset();
@@ -256,7 +264,7 @@ impl DbInner {
                         let _ = self.algo.end(ctx, h).await;
                     }
                     let old = handle.take().unwrap();
-                    handle = Some(self.algo.rebegin(&old, access));
+                    handle = Some(self.algo.rebegin(old));
                     tx.reset();
                     stats.tx_retries += 1;
                     continue;
