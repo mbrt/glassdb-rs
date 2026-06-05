@@ -103,7 +103,7 @@ cmd_teardown() {
   bucket="$(bucket_name)"
   if [[ -n "$bucket" && "$bucket" != "None" ]]; then
     echo ">> emptying s3://$bucket"
-    aws s3 rm "${region_args[@]}" "s3://$bucket" --recursive || true
+    aws s3 rm "${region_args[@]}" "s3://$bucket" --recursive --only-show-errors || true
   fi
   echo ">> deleting stack $STACK_NAME"
   aws cloudformation delete-stack "${region_args[@]}" --stack-name "$STACK_NAME"

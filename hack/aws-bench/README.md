@@ -59,6 +59,14 @@ shared-library or glibc-version dependencies) and uploads it to the bucket; the
 instance pulls it over the gateway endpoint, runs the benchmarks, uploads the
 CSVs to `results/<timestamp>/`, and then stops itself.
 
+The musl build links **mimalloc** as its global allocator (see
+`crates/glassdb-bench/src/bin/rtbench/main.rs`). musl's default allocator
+serializes multi-threaded allocation on a coarse lock, which—under the
+hundreds of concurrent workers here, each churning HTTP/TLS buffers per S3
+op—collapses into a `futex`/system-CPU storm (observed as `sys` dwarfing
+`user` in `clientmetrics`, throughput dropping as concurrency rises). mimalloc's
+per-thread caches remove that contention, bringing musl on par with glibc/Go.
+
 ```mermaid
 flowchart LR
   dev["deploy.sh (your machine)"] -->|"1. create stack"| cfn[CloudFormation]

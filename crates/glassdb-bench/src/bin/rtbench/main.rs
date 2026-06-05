@@ -21,6 +21,14 @@
 mod clientmetrics;
 mod cpu;
 
+// musl's default allocator serializes multi-threaded allocation on a coarse
+// lock, which collapses into a futex/`sys`-CPU storm under the benchmark's
+// hundreds of concurrent workers (each S3 op churns HTTP/TLS buffers). mimalloc
+// uses per-thread caches and removes that contention, matching glibc/Go.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
