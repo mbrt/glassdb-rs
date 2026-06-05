@@ -181,7 +181,7 @@ impl TLogger {
                 tags,
             )
             .await?;
-        Ok(m.version)
+        Ok(m.version.clone())
     }
 
     /// Updates the log only if its current version matches `expected`.
@@ -206,7 +206,7 @@ impl TLogger {
                 tags,
             )
             .await?;
-        Ok(m.version)
+        Ok(m.version.clone())
     }
 
     /// Removes the log for `id`, ignoring not-found errors.
@@ -243,7 +243,7 @@ impl TLogger {
         let p = paths::from_transaction(&self.prefix, id);
         if let Some(lm) = self.local.get_meta(&p, MAX_STALENESS) {
             let mut ts = parse_log_tags(&lm.m.tags)?;
-            ts.version = lm.m.version;
+            ts.version = lm.m.version.clone();
             if ts.status != TxCommitStatus::Pending {
                 return Ok(ts);
             }
@@ -251,7 +251,7 @@ impl TLogger {
         }
         let gm = self.global.get_metadata(ctx, &p).await?;
         let mut ts = parse_log_tags(&gm.tags)?;
-        ts.version = gm.version;
+        ts.version = gm.version.clone();
         Ok(ts)
     }
 }

@@ -59,10 +59,10 @@ impl Global {
                     }
                 }
                 if modified {
-                    let meta = Metadata {
+                    let meta = Arc::new(Metadata {
                         tags: reply.tags,
                         version: reply.version,
-                    };
+                    });
                     self.local
                         .write_with_meta(key, reply.contents.clone(), meta.clone());
                     return Ok(GlobalRead {
@@ -78,10 +78,10 @@ impl Global {
         }
 
         let r = self.backend.read(ctx, key).await?;
-        let meta = Metadata {
+        let meta = Arc::new(Metadata {
             tags: r.tags,
             version: r.version,
-        };
+        });
         self.local
             .write_with_meta(key, r.contents.clone(), meta.clone());
         Ok(GlobalRead {
@@ -90,9 +90,11 @@ impl Global {
         })
     }
 
-    /// Fetches metadata from the backend and updates the cache.
-    pub async fn get_metadata(&self, ctx: &Ctx, key: &str) -> Result<Metadata, StorageError> {
-        let meta = self.backend.get_metadata(ctx, key).await?;
+    /// Fetches metadata from the backend and updates the cache. The returned
+    /// metadata is shared (`Arc`) with the cache entry, so neither the cache
+    /// update nor the caller deep-copies the tag map.
+    pub async fn get_metadata(&self, ctx: &Ctx, key: &str) -> Result<Arc<Metadata>, StorageError> {
+        let meta = Arc::new(self.backend.get_metadata(ctx, key).await?);
         self.local.set_meta(key, meta.clone());
         Ok(meta)
     }
@@ -104,8 +106,8 @@ impl Global {
         key: &str,
         expected: &backend::Version,
         t: Tags,
-    ) -> Result<Metadata, StorageError> {
-        let meta = self.backend.set_tags_if(ctx, key, expected, t).await?;
+    ) -> Result<Arc<Metadata>, StorageError> {
+        let meta = Arc::new(self.backend.set_tags_if(ctx, key, expected, t).await?);
         self.local.set_meta(key, meta.clone());
         Ok(meta)
     }
@@ -117,8 +119,8 @@ impl Global {
         key: &str,
         value: Vec<u8>,
         t: Tags,
-    ) -> Result<Metadata, StorageError> {
-        let meta = self.backend.write(ctx, key, value.clone(), t).await?;
+    ) -> Result<Arc<Metadata>, StorageError> {
+        let meta = Arc::new(self.backend.write(ctx, key, value.clone(), t).await?);
         self.local.write_with_meta(key, value, meta.clone());
         Ok(meta)
     }
@@ -131,11 +133,12 @@ impl Global {
         value: Vec<u8>,
         expected: &backend::Version,
         t: Tags,
-    ) -> Result<Metadata, StorageError> {
-        let meta = self
-            .backend
-            .write_if(ctx, key, value.clone(), expected, t)
-            .await?;
+    ) -> Result<Arc<Metadata>, StorageError> {
+        let meta = Arc::new(
+            self.backend
+                .write_if(ctx, key, value.clone(), expected, t)
+                .await?,
+        );
         self.local.write_with_meta(key, value, meta.clone());
         Ok(meta)
     }
@@ -147,11 +150,12 @@ impl Global {
         key: &str,
         value: Vec<u8>,
         t: Tags,
-    ) -> Result<Metadata, StorageError> {
-        let meta = self
-            .backend
-            .write_if_not_exists(ctx, key, value.clone(), t)
-            .await?;
+    ) -> Result<Arc<Metadata>, StorageError> {
+        let meta = Arc::new(
+            self.backend
+                .write_if_not_exists(ctx, key, value.clone(), t)
+                .await?,
+        );
         self.local.write_with_meta(key, value, meta.clone());
         Ok(meta)
     }
