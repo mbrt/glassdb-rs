@@ -30,7 +30,9 @@ struct CacheValue {
 
 #[derive(Clone)]
 struct CacheMeta {
-    meta: Metadata,
+    /// Shared so cache reads and write-throughs hand out the metadata without
+    /// deep-copying the tag map on every backend operation.
+    meta: Arc<Metadata>,
     /// Last-writer decoded from `meta.tags`, cached to avoid re-parsing.
     writer: TxId,
     updated: Instant,
@@ -109,7 +111,7 @@ pub struct LocalRead {
 /// Cached metadata along with its freshness status.
 #[derive(Debug, Clone)]
 pub struct LocalMetadata {
-    pub m: Metadata,
+    pub m: Arc<Metadata>,
     /// True if the metadata is certainly outdated.
     pub outdated: bool,
 }
@@ -158,7 +160,7 @@ impl Local {
     }
 
     /// Stores both the value and its metadata atomically.
-    pub fn write_with_meta(&self, key: &str, value: Vec<u8>, meta: Metadata) {
+    pub fn write_with_meta(&self, key: &str, value: Vec<u8>, meta: Arc<Metadata>) {
         let updated = Instant::now();
         let writer = last_writer_from_tags(&meta.tags);
         let entry = CacheEntry {
@@ -203,7 +205,7 @@ impl Local {
     }
 
     /// Updates only the metadata for `key`.
-    pub fn set_meta(&self, key: &str, meta: Metadata) {
+    pub fn set_meta(&self, key: &str, meta: Arc<Metadata>) {
         let writer = last_writer_from_tags(&meta.tags);
         let new_meta = CacheMeta {
             meta,

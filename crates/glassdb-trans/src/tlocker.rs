@@ -204,7 +204,7 @@ impl LockerCore {
         info.valid()?;
         Ok(LockData {
             info,
-            version: meta.version,
+            version: meta.version.clone(),
         })
     }
 
