@@ -133,29 +133,33 @@ impl Local {
 
     /// Reads the cached value, if present and not staler than `max_stale`.
     pub fn read(&self, key: &str, max_stale: Duration) -> Option<LocalRead> {
+        // `cache.get` already hands back an owned (cloned) entry, so move the
+        // value and version out of it instead of cloning them a second time.
         let e = self.cache.get(key)?;
-        let v = e.v.as_ref()?;
+        let outdated = e.is_value_outdated();
+        let v = e.v?;
         if is_stale(v.updated, max_stale) {
             return None;
         }
         Some(LocalRead {
-            value: v.value.clone(),
-            version: v.version.clone(),
+            value: v.value,
+            version: v.version,
             deleted: v.deleted,
-            outdated: e.is_value_outdated(),
+            outdated,
         })
     }
 
     /// Reads the cached metadata, if present and not staler than `max_stale`.
     pub fn get_meta(&self, key: &str, max_stale: Duration) -> Option<LocalMetadata> {
         let e = self.cache.get(key)?;
-        let m = e.m.as_ref()?;
+        let outdated = e.is_meta_outdated();
+        let m = e.m?;
         if is_stale(m.updated, max_stale) {
             return None;
         }
         Some(LocalMetadata {
-            m: m.meta.clone(),
-            outdated: e.is_meta_outdated(),
+            m: m.meta,
+            outdated,
         })
     }
 
