@@ -5,10 +5,12 @@
 //! task over a shared in-process [`MemoryBackend`]; under the deterministic
 //! simulation executor (`--cfg sim`) the executor's scheduler controls how those
 //! tasks interleave, so the whole run is a pure function of the schedule tape and
-//! the seed and a failing run reproduces exactly. A seeded [`FaultConfig`] wraps
-//! the store in a [`FaultBackend`] that injects latency, transient failures, and
-//! lost acknowledgements, and a small crash nemesis cancels client contexts
-//! mid-flight (modelling an abrupt client stop).
+//! the seed and a failing run reproduces exactly. A seeded [`FaultConfig`] gives
+//! each client its own [`FaultBackend`] *transport* to the shared store, which
+//! injects latency and faults the client's ops on either side (dropped request /
+//! lost ack) including sustained per-client outages; a crash nemesis cancels
+//! client contexts mid-flight (modelling an abrupt client stop), after which the
+//! client restarts on the same backend.
 //!
 //! The correctness check is per key `acked <= final <= started`, where `started`
 //! counts increments that entered a transaction and `acked` counts those whose
@@ -177,67 +179,103 @@ impl Acct {
     }
 }
 
-/// Runs a client's op sequence, updating `acct` as each increment is attempted
-/// and acknowledged. Returns on the first transaction error, leaving that op
+/// Attempts a single op in its own transaction, updating `acct`: `started` is
+/// bumped before the attempt, `acked` only on success. A failure leaves the op
 /// counted in `started` but not `acked` (i.e. in-doubt).
+async fn run_one(
+    ctx: &Ctx,
+    db: &DB,
+    coll: &Collection,
+    op: &Op,
+    acct: &Mutex<Acct>,
+) -> Result<(), Error> {
+    match op {
+        Op::Rmw(k) => {
+            acct.lock().unwrap().started[*k] += 1;
+            // Bind a reference so the `async move` body captures `&Vec`
+            // (`Copy`) instead of moving the key, keeping the closure
+            // `FnMut` for retries.
+            let kn = &key_name(*k);
+            db.tx(ctx, |tx| async move {
+                let cur = read_int_from_tx(&tx, coll, kn).await?;
+                tx.write(coll, kn, &write_int(cur + 1))
+            })
+            .await?;
+            acct.lock().unwrap().acked[*k] += 1;
+        }
+        Op::MultiRmw(a, b) => {
+            {
+                let mut g = acct.lock().unwrap();
+                g.started[*a] += 1;
+                g.started[*b] += 1;
+            }
+            let ka = &key_name(*a);
+            let kb = &key_name(*b);
+            db.tx(ctx, |tx| async move {
+                let va = read_int_from_tx(&tx, coll, ka).await?;
+                let vb = read_int_from_tx(&tx, coll, kb).await?;
+                tx.write(coll, ka, &write_int(va + 1))?;
+                tx.write(coll, kb, &write_int(vb + 1))
+            })
+            .await?;
+            {
+                let mut g = acct.lock().unwrap();
+                g.acked[*a] += 1;
+                g.acked[*b] += 1;
+            }
+        }
+        Op::ReadOnly(keys) => {
+            let names: Vec<Vec<u8>> = keys.iter().map(|k| key_name(*k)).collect();
+            let names = &names;
+            db.tx(ctx, |tx| async move {
+                for kn in names {
+                    let v = read_int_from_tx(&tx, coll, kn).await?;
+                    assert!(v >= 0, "observed negative value {v} for key {kn:?}");
+                }
+                Ok(())
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs a client's op sequence in order. Returns the number of ops *consumed*:
+/// `ops.len()` if all succeeded, or `i + 1` if op `i` failed (that op is left
+/// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
+/// RMW would double-apply).
 async fn run_client(
     ctx: &Ctx,
     db: &DB,
     coll: &Collection,
     ops: &[Op],
     acct: &Mutex<Acct>,
-) -> Result<(), Error> {
-    for op in ops {
-        match op {
-            Op::Rmw(k) => {
-                acct.lock().unwrap().started[*k] += 1;
-                // Bind a reference so the `async move` body captures `&Vec`
-                // (`Copy`) instead of moving the key, keeping the closure
-                // `FnMut` for retries.
-                let kn = &key_name(*k);
-                db.tx(ctx, |tx| async move {
-                    let cur = read_int_from_tx(&tx, coll, kn).await?;
-                    tx.write(coll, kn, &write_int(cur + 1))
-                })
-                .await?;
-                acct.lock().unwrap().acked[*k] += 1;
-            }
-            Op::MultiRmw(a, b) => {
-                {
-                    let mut g = acct.lock().unwrap();
-                    g.started[*a] += 1;
-                    g.started[*b] += 1;
-                }
-                let ka = &key_name(*a);
-                let kb = &key_name(*b);
-                db.tx(ctx, |tx| async move {
-                    let va = read_int_from_tx(&tx, coll, ka).await?;
-                    let vb = read_int_from_tx(&tx, coll, kb).await?;
-                    tx.write(coll, ka, &write_int(va + 1))?;
-                    tx.write(coll, kb, &write_int(vb + 1))
-                })
-                .await?;
-                {
-                    let mut g = acct.lock().unwrap();
-                    g.acked[*a] += 1;
-                    g.acked[*b] += 1;
-                }
-            }
-            Op::ReadOnly(keys) => {
-                let names: Vec<Vec<u8>> = keys.iter().map(|k| key_name(*k)).collect();
-                let names = &names;
-                db.tx(ctx, |tx| async move {
-                    for kn in names {
-                        let v = read_int_from_tx(&tx, coll, kn).await?;
-                        assert!(v >= 0, "observed negative value {v} for key {kn:?}");
-                    }
-                    Ok(())
-                })
-                .await?;
-            }
+) -> usize {
+    for (i, op) in ops.iter().enumerate() {
+        if run_one(ctx, db, coll, op, acct).await.is_err() {
+            return i + 1;
         }
     }
-    Ok(())
+    ops.len()
+}
+
+/// Opens the DB on `backend`, runs `ops`, and closes it. Returns ops consumed
+/// (see [`run_client`]); `0` if the open itself failed (e.g. a crash during
+/// startup).
+async fn open_and_run(
+    ctx: &Ctx,
+    backend: &Arc<dyn Backend>,
+    opts: &Options,
+    ops: &[Op],
+    acct: &Mutex<Acct>,
+) -> usize {
+    let Ok(db) = DB::open_with(ctx, DB_NAME, backend.clone(), opts.clone()).await else {
+        return 0;
+    };
+    let coll = db.collection(COLLECTION);
+    let consumed = run_client(ctx, &db, &coll, ops, acct).await;
+    db.close().await;
+    consumed
 }
 
 /// Total increments each key should receive, derived from the workload.
@@ -304,14 +342,61 @@ async fn crash_nemesis(tokens: Vec<CancelToken>, intensity: u8, mut tape: Tape) 
     }
 }
 
-/// Splits a fault tape into two independent byte streams — one for the
-/// [`FaultBackend`], one for the [`crash_nemesis`] — by deinterleaving even and
-/// odd bytes. Keeping them disjoint means a single mutated byte maps to exactly
-/// one fault decision, which is what makes the fault schedule coverage-guidable.
-fn split_fault_tape(tape: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let backend = tape.iter().step_by(2).copied().collect();
-    let nemesis = tape.iter().skip(1).step_by(2).copied().collect();
-    (backend, nemesis)
+/// Number of sustained outage windows the outage nemesis opens at `intensity`.
+fn outage_count(intensity: u8) -> usize {
+    match intensity {
+        0..=47 => 0,
+        48..=127 => 1,
+        _ => 2,
+    }
+}
+
+/// The outage nemesis: takes a whole client's transport down for a sustained
+/// span and then heals it, modelling a node that disconnects/clogs and later
+/// recovers. While one client is down its peers keep reaching storage and can
+/// recover its orphaned locks via lease expiry — the path coincident i.i.d.
+/// rolls reach only by luck. The target client, start gap, and duration are
+/// drawn from `tape` (the fuzzer-guided fault schedule).
+async fn outage_nemesis(transports: Vec<Arc<FaultBackend>>, intensity: u8, mut tape: Tape) {
+    if transports.is_empty() {
+        return;
+    }
+    for _ in 0..outage_count(intensity) {
+        let gap = tape.below(30) + 1;
+        rt::sleep(Duration::from_millis(gap)).await;
+        let idx = tape.below(transports.len() as u64) as usize;
+        transports[idx].down();
+        // Sustained: long enough that retries during the window keep failing,
+        // so recovery happens via lease expiry rather than a lucky retry.
+        let span = tape.below(80) + 20;
+        rt::sleep(Duration::from_millis(span)).await;
+        transports[idx].heal();
+    }
+}
+
+/// Deinterleaves a fault tape into `N` independent byte streams (byte `i` goes to
+/// stream `i % N`). Keeping the streams disjoint means a single mutated byte maps
+/// to exactly one fault decision, which is what makes the fault schedule
+/// coverage-guidable.
+fn deinterleave<const N: usize>(tape: &[u8]) -> [Vec<u8>; N] {
+    let mut out: [Vec<u8>; N] = std::array::from_fn(|_| Vec::new());
+    for (i, &b) in tape.iter().enumerate() {
+        out[i % N].push(b);
+    }
+    out
+}
+
+// Fault-tape stream layout: one stream for each nemesis, plus one per client
+// transport (so each client's faults are guided by its own disjoint bytes).
+const CRASH_STREAM: usize = 0;
+const OUTAGE_STREAM: usize = 1;
+const CLIENT_STREAM_BASE: usize = 2;
+const FAULT_STREAMS: usize = CLIENT_STREAM_BASE + MAX_CLIENTS;
+
+/// Distinct PRNG-fallback seed for client `i`'s transport, so an exhausted tape
+/// does not make every client fault in lockstep.
+fn client_seed(seed: u64, i: usize) -> u64 {
+    seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1)
 }
 
 /// Core harness: seed the store, run the clients as interleaved tasks under the
@@ -326,32 +411,22 @@ async fn run_inner(
     let ctx = Ctx::background();
     let opts = deterministic_options();
 
-    // The fault tape guides backend faults and crash timing; with an empty tape
-    // both fall back to the seed (PCT/seed-breadth runs).
-    let (backend_tape, nemesis_tape) = split_fault_tape(&fault_tape);
+    // The fault tape guides each client's transport faults, crash timing, and
+    // outage windows; with an empty tape all fall back to the seed
+    // (PCT/seed-breadth runs).
+    let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
 
+    // The store and a shared recorder form a faultless backbone; each client gets
+    // its own transport (`FaultBackend`) over it. Init and verification use the
+    // backbone directly (a perfect connection).
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let fault = if faults.enabled {
-        Some(FaultBackend::with_tape(
-            mem.clone(),
-            backend_tape,
-            seed,
-            FaultOptions::from_intensity(faults.intensity),
-        ))
-    } else {
-        None
-    };
-    let faulted: Arc<dyn Backend> = match &fault {
-        Some(f) => f.clone(),
-        None => mem.clone(),
-    };
-    let rec = Arc::new(RecordingBackend::new(faulted));
+    let rec = Arc::new(RecordingBackend::new(mem));
     let log = rec.log();
-    let backend: Arc<dyn Backend> = rec;
+    let backbone: Arc<dyn Backend> = rec;
 
-    // Initialize the collection and seed every key to zero up front (faults are
-    // still inactive, so this cannot fail spuriously).
-    let init_db = DB::open_with(&ctx, DB_NAME, backend.clone(), opts.clone())
+    // Initialize the collection and seed every key to zero up front (over the
+    // faultless backbone, so this cannot fail spuriously).
+    let init_db = DB::open_with(&ctx, DB_NAME, backbone.clone(), opts.clone())
         .await
         .expect("open init db");
     let init_coll = init_db.collection(COLLECTION);
@@ -370,37 +445,66 @@ async fn run_inner(
     let expected = expected_increments(&workload);
     let acct = Arc::new(Mutex::new(Acct::new()));
 
-    // Faults are live only while the clients run.
-    if let Some(f) = &fault {
-        f.set_active(true);
+    // One transport per client over the shared backbone. Faults are live only
+    // while the clients run.
+    let nclients = workload.clients.len();
+    let mut transports: Vec<Arc<FaultBackend>> = Vec::new();
+    let mut client_backends: Vec<Arc<dyn Backend>> = Vec::with_capacity(nclients);
+    if faults.enabled {
+        let fopts = FaultOptions::from_intensity(faults.intensity);
+        for i in 0..nclients {
+            let tape = streams[CLIENT_STREAM_BASE + i % MAX_CLIENTS].clone();
+            let t = FaultBackend::with_tape(backbone.clone(), tape, client_seed(seed, i), fopts);
+            t.set_active(true);
+            transports.push(t.clone());
+            client_backends.push(t);
+        }
+    } else {
+        for _ in 0..nclients {
+            client_backends.push(backbone.clone());
+        }
     }
 
-    // Each client runs as its own task so the scheduler can interleave them.
-    let mut handles = Vec::with_capacity(workload.clients.len());
-    let mut tokens = Vec::with_capacity(workload.clients.len());
-    for ops in workload.clients {
+    // Each client runs as its own task over its own transport so the scheduler
+    // can interleave them.
+    let mut handles = Vec::with_capacity(nclients);
+    let mut tokens = Vec::with_capacity(nclients);
+    for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
         let (cctx, token) = Ctx::with_cancel();
         tokens.push(token);
-        let backend = backend.clone();
         let opts = opts.clone();
         let acct = acct.clone();
         handles.push(rt::spawn(async move {
-            // A crashed/faulted open simply does no work, which the bound
-            // tolerates (no increments started for that client).
-            let Ok(db) = DB::open_with(&cctx, DB_NAME, backend, opts).await else {
-                return;
-            };
-            let coll = db.collection(COLLECTION);
-            let _ = run_client(&cctx, &db, &coll, &ops, &acct).await;
-            db.close().await;
+            let consumed = open_and_run(&cctx, &backend, &opts, &ops, &acct).await;
+            // Crash-and-restart: a cancelled (crashed) client reopens the DB on
+            // the same backend and finishes its remaining ops, recovering its own
+            // orphaned locks via lease expiry. The in-doubt op it died on is left
+            // for recovery rather than replayed (which would double-apply a
+            // non-idempotent RMW). The restart is uncancellable so it runs to
+            // completion.
+            if consumed < ops.len() && cctx.is_cancelled() {
+                let rctx = Ctx::background();
+                let _ = open_and_run(&rctx, &backend, &opts, &ops[consumed..], &acct).await;
+            }
         }));
     }
 
-    // The crash nemesis runs concurrently with the clients.
-    let nemesis = if faults.enabled {
-        let tape = Tape::new(nemesis_tape, seed ^ 0x00C0_FFEE_C0DE_BEEF);
+    // The crash and outage nemeses run concurrently with the clients, each on its
+    // own slice of the fault tape (and a distinct fallback seed).
+    let crash = if faults.enabled {
+        let tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
         Some(rt::spawn(crash_nemesis(
             tokens.clone(),
+            faults.intensity,
+            tape,
+        )))
+    } else {
+        None
+    };
+    let outage = if faults.enabled {
+        let tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
+        Some(rt::spawn(outage_nemesis(
+            transports.clone(),
             faults.intensity,
             tape,
         )))
@@ -411,13 +515,17 @@ async fn run_inner(
     for h in handles {
         let _ = h.await;
     }
-    if let Some(h) = nemesis {
+    if let Some(h) = crash {
+        let _ = h.await;
+    }
+    if let Some(h) = outage {
         let _ = h.await;
     }
 
-    // Heal faults before verifying so recovery reads cannot themselves fail.
-    if let Some(f) = &fault {
-        f.set_active(false);
+    // Heal every transport before verifying so recovery reads cannot themselves
+    // fail.
+    for t in &transports {
+        t.set_active(false);
     }
 
     // Read every key's final value (driving recovery of any crashed client's

@@ -122,20 +122,32 @@ flowchart TD
   virtual time under the executor, so persisted transaction-log timestamps are a
   pure function of the seed; `Clock::anchored_at` reads `rt::Instant` so the
   monitor's clock follows the same virtual time.
-- **Fault injection at the `Backend` trait** (replaces the madsim network nemesis).
-  [`FaultBackend`](../../crates/glassdb-backend/src/middleware/fault.rs) is a
-  reusable middleware that injects delay / fail-before / lost-ack, all preserving
-  `acked <= final <= started`; a client "crash" is a `Ctx` cancel at an await
-  point. The [`RecordingBackend`](../../crates/glassdb-backend/src/middleware/recording.rs)
+- **Per-client transport fault injection** (replaces the madsim network nemesis).
+  Faults belong to the *link* between one client and the store, not to the store
+  itself, so each client gets its own
+  [`FaultBackend`](../../crates/glassdb-backend/src/middleware/fault.rs) over a
+  shared `MemoryBackend`+`RecordingBackend` backbone. Every op can fault on
+  **either side** — a dropped request (never lands) or a lost ack (lands, outcome
+  unknown / in-doubt) — plus a **sustained, all-or-nothing outage** per client
+  ([`down`](../../crates/glassdb-backend/src/middleware/fault.rs)/`heal`):
+  one decision makes a whole correlated outage deterministically reachable rather
+  than needing coincident i.i.d. rolls. All preserve `acked <= final <= started`.
+  A client "crash" is a `Ctx` cancel at an await point, after which the client
+  **restarts on the same backend** to finish its remaining ops. Because outages
+  are per-client, a downed client's peers keep reaching storage and recover its
+  orphaned locks via lease expiry — exactly the lease-expiry / lock-lease-recovery
+  paths the per-op rolls reached only by luck. The shared
+  [`RecordingBackend`](../../crates/glassdb-backend/src/middleware/recording.rs)
   op-stream self-check is unchanged.
 - **Tape-guided fault schedule.** Fault decisions are drawn from a
   [`Tape`](../../crates/glassdb-concurr/src/tape.rs) — a byte cursor that consumes
   fuzzer bytes and falls back to a seeded PRNG once they run out — so the *fault*
-  schedule (which backend ops are delayed/dropped, when clients crash) is
-  coverage-guidable the same way interleavings are, instead of merely
-  seed-sampled (the residual ADR-010 gap). The fuzzer supplies a dedicated fault
-  tape, split disjointly between the backend and the crash nemesis; an empty tape
-  reduces to pure seed-breadth sampling (PCT runs).
+  schedule (which ops are delayed/dropped/lost, when clients crash, when/which
+  client outages open) is coverage-guidable the same way interleavings are,
+  instead of merely seed-sampled (the residual ADR-010 gap). The fuzzer supplies a
+  dedicated fault tape, deinterleaved into disjoint streams for the crash nemesis,
+  the outage nemesis, and each client transport; an empty tape reduces to pure
+  seed-breadth sampling (PCT runs).
 - **Harness** ([`sim.rs`](../../crates/glassdb/src/sim.rs)). Clients run as
   executor-spawned tasks over a shared in-process `MemoryBackend` wrapped in
   `FaultBackend`/`RecordingBackend`; the acked-bounds invariant (ADR-008) is kept.
