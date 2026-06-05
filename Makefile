@@ -40,5 +40,13 @@ sim-test:
 # environment (cargo-fuzz appends its flags to it). With madsim active, any
 # crash reproduces exactly:
 #   cd fuzz && RUSTFLAGS="--cfg madsim" cargo +nightly fuzz run concurrent_tx <crash-file>
+#
+# Each madsim run is single-threaded (for deterministic, reproducible crashes),
+# so parallelism comes from libFuzzer's `-fork` mode, which runs FUZZ_JOBS child
+# processes that share the corpus. Defaults to all cores; override with e.g.
+# `make fuzz FUZZ_JOBS=4`. Fork mode ignores OOMs/timeouts by default but stops
+# on the first crash (saving it to fuzz/artifacts/) so bugs surface immediately.
+FUZZ_JOBS ?= $(shell nproc)
 fuzz:
-	cd fuzz && RUSTFLAGS="--cfg madsim" cargo +nightly fuzz run concurrent_tx
+	cd fuzz && RUSTFLAGS="--cfg madsim" cargo +nightly fuzz run concurrent_tx -- \
+		-fork=$(FUZZ_JOBS)
