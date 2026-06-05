@@ -173,7 +173,7 @@ impl Tx {
                 continue;
             }
             writes.push(WriteAccess {
-                path: k.clone(),
+                path: k.as_str().into(),
                 val: v.val.clone(),
                 delete: v.deleted,
             });
@@ -181,7 +181,7 @@ impl Tx {
         let mut reads = Vec::new();
         for (k, v) in &inner.reads {
             reads.push(ReadAccess {
-                path: k.clone(),
+                path: k.as_str().into(),
                 version: v.version.clone(),
                 found: v.found,
             });

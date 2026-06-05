@@ -1434,7 +1434,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "glassdb-bench"
+name = "glassdb-bench-scale"
 version = "0.1.0"
 dependencies = [
  "aws-config",
@@ -1449,6 +1449,19 @@ dependencies = [
  "libc",
  "mimalloc",
  "rand 0.10.1",
+ "tokio",
+]
+
+[[package]]
+name = "glassdb-bench-score"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "glassdb",
+ "libc",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -31,7 +31,9 @@ struct CacheValue {
 
 #[derive(Clone)]
 struct CacheMeta {
-    meta: Metadata,
+    /// Shared so cache reads and write-throughs hand out the metadata without
+    /// deep-copying the tag map on every backend operation.
+    meta: Arc<Metadata>,
     /// Last-writer decoded from `meta.tags`, cached to avoid re-parsing.
     writer: TxId,
     updated: Instant,
@@ -110,7 +112,7 @@ pub struct LocalRead {
 /// Cached metadata along with its freshness status.
 #[derive(Debug, Clone)]
 pub struct LocalMetadata {
-    pub m: Metadata,
+    pub m: Arc<Metadata>,
     /// True if the metadata is certainly outdated.
     pub outdated: bool,
 }
@@ -132,34 +134,38 @@ impl Local {
 
     /// Reads the cached value, if present and not staler than `max_stale`.
     pub fn read(&self, key: &str, max_stale: Duration) -> Option<LocalRead> {
+        // `cache.get` already hands back an owned (cloned) entry, so move the
+        // value and version out of it instead of cloning them a second time.
         let e = self.cache.get(key)?;
-        let v = e.v.as_ref()?;
+        let outdated = e.is_value_outdated();
+        let v = e.v?;
         if is_stale(v.updated, max_stale) {
             return None;
         }
         Some(LocalRead {
-            value: v.value.clone(),
-            version: v.version.clone(),
+            value: v.value,
+            version: v.version,
             deleted: v.deleted,
-            outdated: e.is_value_outdated(),
+            outdated,
         })
     }
 
     /// Reads the cached metadata, if present and not staler than `max_stale`.
     pub fn get_meta(&self, key: &str, max_stale: Duration) -> Option<LocalMetadata> {
         let e = self.cache.get(key)?;
-        let m = e.m.as_ref()?;
+        let outdated = e.is_meta_outdated();
+        let m = e.m?;
         if is_stale(m.updated, max_stale) {
             return None;
         }
         Some(LocalMetadata {
-            m: m.meta.clone(),
-            outdated: e.is_meta_outdated(),
+            m: m.meta,
+            outdated,
         })
     }
 
     /// Stores both the value and its metadata atomically.
-    pub fn write_with_meta(&self, key: &str, value: Vec<u8>, meta: Metadata) {
+    pub fn write_with_meta(&self, key: &str, value: Vec<u8>, meta: Arc<Metadata>) {
         let updated = Instant::now();
         let writer = last_writer_from_tags(&meta.tags);
         let entry = CacheEntry {
@@ -204,7 +210,7 @@ impl Local {
     }
 
     /// Updates only the metadata for `key`.
-    pub fn set_meta(&self, key: &str, meta: Metadata) {
+    pub fn set_meta(&self, key: &str, meta: Arc<Metadata>) {
         let writer = last_writer_from_tags(&meta.tags);
         let new_meta = CacheMeta {
             meta,

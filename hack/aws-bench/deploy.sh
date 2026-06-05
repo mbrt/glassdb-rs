@@ -67,7 +67,7 @@ cmd_deploy() {
   local bin
   bin="$(mktemp)"
   echo ">> building static rtbench binary for $TARGET"
-  (cd "$REPO_ROOT" && cargo build --release -p glassdb-bench --bin rtbench \
+  (cd "$REPO_ROOT" && cargo build --release -p glassdb-bench-scale --bin rtbench \
     --target "$TARGET")
   cp "$REPO_ROOT/target/$TARGET/release/rtbench" "$bin"
 
