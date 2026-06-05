@@ -95,3 +95,12 @@ Each entry looks like:
 - Outcome & why: primary within noise + stable deterministic alloc-count reduction, no regression -> kept. Lesson: ns/cpu are noisy enough to spike ~15% on a single run; always re-measure a surprising secondary regression before discarding (or keeping).
 - Commit: a5efe31
 
+## 8. Back TxId with Arc<[u8]> so clones are refcount bumps - KEPT
+- Hypothesis: `TxId(Vec<u8>)` heap-allocates and copies its 16 bytes on every clone, and ids are cloned pervasively - lockers, last-writer of every version, cache entries, wound-wait partitioning, locked_paths, every commit/validation. Storing the bytes as `Arc<[u8]>` makes clones refcount bumps. Construction (new_at/renew/from_bytes) costs slightly more (Vec -> Arc), but clones vastly outnumber constructions, so net allocs should drop. Eq/Ord/Hash on Arc<[u8]> compare contents, so value semantics are preserved.
+- Change: `glassdb-data/txid.rs` - `TxId(Vec<u8>)` -> `TxId(Arc<[u8]>)`; constructors wrap the filled `Vec` via `.into()`; `into_bytes` (test-only) returns `self.0.to_vec()`; `Display` iterates `self.0.iter()`. Public API and all derives unchanged.
+- Correctness: fast gate PASS; judge APPROVED; full gate PASS (make test + sim-test + 120s fuzz, 8817 runs, no crash). Pure representation change; bytes and comparison semantics identical.
+- Primary: 404.26 -> 403.92 (-0.08%, flat/noise; op counts unchanged).
+- Secondary (stable across 3 measurements): allocsPerTx 570.7 -> 489.4 (-14.3%; per-workload singleRMW -14%, multiRMW -17%, batchRead10 -16%, batchWrite100 -9%, readRepeat -15%), allocBytesPerTx -5.8%, nsPerTx -9%, cpuNsPerTx ~-8% (noisy). No axis regressed.
+- Outcome & why: primary within noise + a large, stable, deterministic alloc-count drop on every workload -> easily meets the secondary keep rule. Kept. Same lesson as exp5: a type cloned on nearly every op is a high-leverage target for Arc sharing; the atomic-refcount cost is far cheaper than the per-clone heap alloc it replaces (ns/cpu also fell).
+- Commit: e9299a6
+
