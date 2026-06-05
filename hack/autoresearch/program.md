@@ -25,7 +25,8 @@ Fair game (this is your `train.py`):
   (`crates/glassdb/src/{db,tx,collection,iter,stats,version}.rs`) and the
   internal crates (`glassdb-data`, `glassdb-proto`, `glassdb-concurr`,
   `glassdb-backend`, `glassdb-storage`, `glassdb-trans`) - **except** the frozen
-  files listed below (the `glassdb-bench` crate and `crates/glassdb/src/sim.rs`).
+  files listed below (the `glassdb-bench-score`/`glassdb-bench-scale` benchmark crates
+  and `crates/glassdb/src/sim.rs`).
   Changes may be **large and span multiple files** - you may rework whole
   algorithms (locking, validation, the commit protocol, recovery, caching) - as
   long as each experiment pursues a single, clearly stated hypothesis.
@@ -42,8 +43,9 @@ Fair game (this is your `train.py`):
 Off-limits - never modify these (they define the metric, the rules, and the
 correctness contract; changing them invalidates the experiment):
 
-- `crates/glassdb-bench/**` (the entire benchmark crate: the `autoresearch`
-  scoring harness plus the `rtbench`/`backendbench` tools)
+- `crates/glassdb-bench-score/**` (the `autoresearch` scoring harness - this
+  defines the metric) and `crates/glassdb-bench-scale/**` (the `rtbench`/`backendbench`
+  scale tools)
 - `hack/autoresearch/check.sh` (the correctness gate)
 - `hack/autoresearch/evaluate.sh` and `hack/autoresearch/evaluator.md` (the
   judge)
@@ -74,7 +76,7 @@ not the frozen files.
 Run the harness from the repo root:
 
 ```bash
-cargo run --release -p glassdb-bench --bin autoresearch -- --json --count 3
+cargo run --release -p glassdb-bench-score --bin autoresearch -- --json --count 3
 ```
 
 - **Primary** `score`: geometric mean across a fixed suite of single-client
@@ -97,7 +99,7 @@ are only meaningful on an optimized build.
 
    ```bash
    hack/autoresearch/check.sh --full          # must pass
-   cargo run --release -p glassdb-bench --bin autoresearch -- --json --count 3 \
+   cargo run --release -p glassdb-bench-score --bin autoresearch -- --json --count 3 \
      > hack/autoresearch/baseline.json
    cp hack/autoresearch/baseline.json hack/autoresearch/best.json
    ```
@@ -146,7 +148,7 @@ For each experiment:
 6. **Measure:**
 
    ```bash
-   cargo run --release -p glassdb-bench --bin autoresearch -- --json --count 3
+   cargo run --release -p glassdb-bench-score --bin autoresearch -- --json --count 3
    ```
 
    Compare `score` against `best.json`.

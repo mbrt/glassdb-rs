@@ -5,8 +5,8 @@
 //! real cloud bucket:
 //!
 //! ```text
-//! cargo run -p glassdb-bench --bin rtbench -- --backend memory --test-name simple
-//! BUCKET=my-bucket cargo run -p glassdb-bench --bin rtbench -- --backend s3 --test-name rw9010
+//! cargo run -p glassdb-bench-scale --bin rtbench -- --backend memory --test-name simple
+//! BUCKET=my-bucket cargo run -p glassdb-bench-scale --bin rtbench -- --backend s3 --test-name rw9010
 //! ```
 //!
 //! ## Concurrency model
@@ -44,7 +44,7 @@ use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{gcs_delays, s3_delays, DelayBackend, DelayOptions};
 use glassdb::{Collection, Ctx, Error as GError, Stats, DB};
 use glassdb_backend::Backend;
-use glassdb_bench::bench::{Bench, Results};
+use glassdb_bench_scale::bench::{Bench, Results};
 
 use clientmetrics::{HttpCounter, HttpMetrics, HttpSnapshot, ThreadSampler};
 
@@ -99,7 +99,7 @@ struct Args {
     #[arg(long, default_value_t = 50000)]
     num_keys: usize,
     /// Duration of each rw9010 / deadlock step.
-    #[arg(long, default_value = "60s", value_parser = glassdb_bench::parse_duration)]
+    #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
 }
 

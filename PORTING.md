@@ -264,9 +264,9 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
   matching the Go bench scaling. Each pairing also prints the per-operation
   backend counters (`retries/op`, `w/op`, `r/op`, …) derived from
   `DB::stats()`, the analog of Go's `benchStats` custom metrics.
-- **`glassdb-bench` crate** with three binaries — the `rtbench`/`backendbench`
-  tools ported from `hack/rtbench` and `hack/backendbench`, plus the autoresearch
-  scorer:
+- **`glassdb-bench-scale` crate** — concurrency / throughput benchmarks against
+  real or simulated cloud backends (the AWS / GCS SDKs live here), ported from
+  `hack/rtbench` and `hack/backendbench`:
   - `rtbench` — the `simple`, `rw9010`, and `deadlock` scenarios, with the same
     flags and CSV schema as the Go tool (so the plotting scripts are shared),
     deterministic per-DB/per-worker seeds, and a real-S3 client wired up via
@@ -274,8 +274,11 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
     via Application Default Credentials.
   - `backendbench` — raw backend-operation latencies (`WriteSame`,
     `WriteFailPre`, `Read`, `ReadUnchanged`, `SetMetaSame`, `GetMeta`).
-  - `autoresearch` — the autoresearch scoring harness (in-memory backend only);
-    see [`hack/autoresearch/`](hack/autoresearch).
+- **`glassdb-bench-score` crate** — lightweight, in-memory local benchmarks (no
+  cloud SDKs, so it builds fast); backs the autoresearch loop and CI
+  perf-regression checks (`make bench-score`):
+  - `autoresearch` — the autoresearch scoring harness (single-client,
+    deterministic); see [`hack/autoresearch/`](hack/autoresearch).
 - **`hack/aws-bench/`** — the real-S3 harness: `cloudformation.yaml` (private
   VPC + SSM + S3 gateway endpoint), `deploy.sh` (now cross-compiles a static
   `x86_64-unknown-linux-musl` `rtbench` instead of a Go binary), and the
