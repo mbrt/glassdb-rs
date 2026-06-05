@@ -10,24 +10,29 @@
 //! errors a *bounded* number of times and then surface an error (the AWS SDK's
 //! adaptive retryer, for instance, gives up after a fixed attempt budget). We
 //! model that here: [`NetBackend`] retries each call up to [`MAX_ATTEMPTS`]
-//! times and then returns a transient error, while [`serve_backend`] applies
-//! each logical request *at most once* via a per-`(client, seq)` response cache.
-//! So a retry after a dropped request re-runs the op, a retry after a dropped
-//! *response* replays the cached result instead of double-applying it, and a
-//! give-up never double-applies either (the op ran at most once server-side).
+//! times and then returns a transient error.
+//!
+//! Deliberately, there is *no* client-request dedup: [`serve_backend`] applies
+//! every request it receives. Real object storage has no at-most-once request
+//! id either, so a retry after a dropped *request* re-runs an op that never
+//! landed, while a retry after a dropped *response* re-runs one that did. That
+//! is sound because GlassDB's writes are conditional (CAS): re-running a write
+//! whose first attempt already landed simply observes a `Precondition` failure
+//! for its own write — exactly what S3 returns when the SDK retries a
+//! conditional `PUT` whose first attempt succeeded but whose ack was lost. The
+//! engine must resolve that ambiguity itself ("did my commit actually land?"),
+//! and the simulator exposes it rather than papering over it.
 //!
 //! The net effect: a transient fault shorter than the retry budget appears as
 //! latency (the call eventually lands), while a sustained outage surfaces as a
 //! backend error that fails the transaction, leaving its write *in-doubt* —
-//! counted as attempted but not acknowledged, exactly like a node crash. The
-//! harness's `acked <= final <= started` invariant already tolerates in-doubt
-//! ops, and the dedup cache guarantees each one applied zero or one times, never
-//! twice.
+//! counted as attempted but not acknowledged, like a node crash. The harness's
+//! `acked <= final <= started` invariant tolerates in-doubt ops, and conditional
+//! writes keep each one applied at most once (a re-delivered CAS write fails its
+//! precondition).
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,8 +56,9 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// transient error. The resulting budget (~`MAX_ATTEMPTS * (CALL_TIMEOUT +
 /// RETRY_BACKOFF)`, a few seconds of virtual time) comfortably outlasts a brief
 /// fault so it appears as latency, while a longer outage surfaces as an error.
-/// All retries reuse the same sequence number, so they are deduplicated
-/// server-side and the op runs at most once regardless of how many we send.
+/// Each retry re-sends the same op and the server re-applies it; that is safe
+/// because the engine's writes are conditional (a re-delivered CAS write fails
+/// its precondition rather than applying twice).
 const MAX_ATTEMPTS: u32 = 8;
 
 /// The object-store operation carried by an RPC request. Mirrors the [`Backend`]
@@ -103,17 +109,10 @@ enum Op {
     },
 }
 
-/// An RPC request: a logical [`Op`] tagged with the originating client and a
-/// per-client monotonic sequence number, which together identify a retry of the
-/// same logical operation for at-most-once dedup.
-#[derive(Clone, Serialize, Deserialize)]
-struct Req {
-    client_id: u64,
-    seq: u64,
-    op: Op,
-}
-
-impl Request for Req {
+/// An [`Op`] is itself the RPC request: every retry re-sends the same op, and
+/// the server applies whatever it receives (no client-request dedup), so a
+/// re-delivered op is re-run — see the module docs for why that is sound.
+impl Request for Op {
     type Response = Resp;
     const ID: u64 = 0x_61DB_BE_C0DE;
 }
@@ -129,26 +128,6 @@ enum RespBody {
 
 /// A response is the backend result of applying the request's [`Op`].
 type Resp = Result<RespBody, BackendError>;
-
-/// Per-`(client, seq)` cache of completed responses, giving at-most-once
-/// semantics: a retried request whose original already completed replays the
-/// stored response instead of re-applying the operation.
-#[derive(Default)]
-struct DoneCache {
-    done: Mutex<HashMap<(u64, u64), Resp>>,
-}
-
-impl DoneCache {
-    async fn run(&self, inner: &dyn Backend, req: Req) -> Resp {
-        let key = (req.client_id, req.seq);
-        if let Some(cached) = self.done.lock().unwrap().get(&key).cloned() {
-            return cached;
-        }
-        let resp = dispatch(inner, req.op).await;
-        self.done.lock().unwrap().insert(key, resp.clone());
-        resp
-    }
-}
 
 /// Applies a single [`Op`] to `inner`, wrapping the result into a [`Resp`].
 async fn dispatch(inner: &dyn Backend, op: Op) -> Resp {
@@ -194,15 +173,15 @@ async fn dispatch(inner: &dyn Backend, op: Op) -> Resp {
     }
 }
 
-/// Registers an RPC handler on `ep` that serves backend operations from `inner`
-/// with at-most-once semantics. The endpoint must already be bound, and must be
-/// kept alive for as long as the server should accept requests.
+/// Registers an RPC handler on `ep` that applies each received backend operation
+/// to `inner`. There is no dedup: every request (including a client's retry) is
+/// applied, mirroring object storage with no at-most-once request id. The
+/// endpoint must already be bound, and must be kept alive for as long as the
+/// server should accept requests.
 pub fn serve_backend(ep: &Endpoint, inner: Arc<dyn Backend>) {
-    let cache = Arc::new(DoneCache::default());
-    ep.add_rpc_handler(move |req: Req| {
+    ep.add_rpc_handler(move |op: Op| {
         let inner = inner.clone();
-        let cache = cache.clone();
-        async move { cache.run(inner.as_ref(), req).await }
+        async move { dispatch(inner.as_ref(), op).await }
     });
 }
 
@@ -213,33 +192,20 @@ pub fn serve_backend(ep: &Endpoint, inner: Arc<dyn Backend>) {
 pub struct NetBackend {
     ep: Arc<Endpoint>,
     server: SocketAddr,
-    client_id: u64,
-    seq: AtomicU64,
 }
 
 impl NetBackend {
     /// Creates a client targeting the `serve_backend` instance at `server`.
-    /// `client_id` must be unique across all clients sharing that server (so the
-    /// server's dedup cache never conflates two clients' sequence numbers).
-    pub fn new(ep: Arc<Endpoint>, server: SocketAddr, client_id: u64) -> Self {
-        NetBackend {
-            ep,
-            server,
-            client_id,
-            seq: AtomicU64::new(0),
-        }
+    pub fn new(ep: Arc<Endpoint>, server: SocketAddr) -> Self {
+        NetBackend { ep, server }
     }
 
     /// Sends `op` and returns its response body, retrying dropped/timed-out
     /// calls up to [`MAX_ATTEMPTS`] times before giving up with a transient
-    /// error (or returning early if `ctx` is cancelled). The sequence number is
-    /// fixed for the whole call so all retries are deduplicated server-side.
+    /// error (or returning early if `ctx` is cancelled). A retry re-sends the
+    /// same op; the server has no dedup, so a retry after a dropped response
+    /// re-runs it (safe because the engine's writes are conditional).
     async fn call(&self, ctx: &Ctx, op: Op) -> Result<RespBody, BackendError> {
-        let req = Req {
-            client_id: self.client_id,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
-            op,
-        };
         for attempt in 0..MAX_ATTEMPTS {
             if ctx.is_cancelled() {
                 return Err(BackendError::Cancelled);
@@ -249,13 +215,12 @@ impl NetBackend {
             tokio::select! {
                 biased;
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                res = self.ep.call_timeout(self.server, req.clone(), CALL_TIMEOUT) => {
+                res = self.ep.call_timeout(self.server, op.clone(), CALL_TIMEOUT) => {
                     if let Ok(resp) = res {
                         return resp;
                     }
                     // Dropped or timed out. If this was the last attempt, fall
-                    // through to give up; otherwise back off and retry the same
-                    // seq (deduplicated server-side, so at most one applies).
+                    // through to give up; otherwise back off and retry.
                     if attempt + 1 < MAX_ATTEMPTS {
                         tokio::select! {
                             biased;
@@ -485,7 +450,7 @@ mod tests {
     use crate::memory::MemoryBackend;
     use crate::LAST_WRITER_TAG;
     use std::net::Ipv4Addr;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use madsim::net::NetSim;
     use madsim::runtime::Runtime;
@@ -526,7 +491,7 @@ mod tests {
         let f = client.spawn(async move {
             wait_ready(&ready).await;
             let ep = Arc::new(Endpoint::bind((CLIENT_IP, 0)).await.unwrap());
-            let be = NetBackend::new(ep, STORAGE.parse().unwrap(), 1);
+            let be = NetBackend::new(ep, STORAGE.parse().unwrap());
             let ctx = Ctx::background();
 
             assert!(matches!(
@@ -601,7 +566,7 @@ mod tests {
         let handle = client.spawn(async move {
             wait_ready(&ready).await;
             let ep = Arc::new(Endpoint::bind((CLIENT_IP, 0)).await.unwrap());
-            let be = NetBackend::new(ep, STORAGE.parse().unwrap(), 1);
+            let be = NetBackend::new(ep, STORAGE.parse().unwrap());
             let ctx = Ctx::background();
             be.write(&ctx, "k", b"v".to_vec(), Tags::new())
                 .await
@@ -635,7 +600,7 @@ mod tests {
         let handle = client.spawn(async move {
             wait_ready(&ready).await;
             let ep = Arc::new(Endpoint::bind((CLIENT_IP, 0)).await.unwrap());
-            let be = NetBackend::new(ep, STORAGE.parse().unwrap(), 1);
+            let be = NetBackend::new(ep, STORAGE.parse().unwrap());
             let ctx = Ctx::background();
             be.write(&ctx, "k", b"v".to_vec(), Tags::new()).await
         });

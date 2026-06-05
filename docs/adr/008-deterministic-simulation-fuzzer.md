@@ -63,12 +63,16 @@ builds without madsim):
   every node fault (madsim nodes share process memory);
 - each **client node** opens its own `DB` over a `NetBackend` — a `Backend`
   implementation that forwards each call as an RPC. madsim's network *drops*
-  clogged/partitioned packets, so `NetBackend` retries with a fixed sequence
-  number and `serve_backend` deduplicates by `(client_id, seq)`, giving
-  at-most-once semantics (a retried call is applied once). Retries are *bounded*
-  (`MAX_ATTEMPTS`, mirroring a real object-store client's adaptive retryer): a
-  brief fault appears as latency, but a sustained outage exhausts the budget and
-  surfaces a transient error that fails the transaction in-doubt;
+  clogged/partitioned packets, so `NetBackend` retries (bounded by `MAX_ATTEMPTS`,
+  mirroring a real object-store client's adaptive retryer): a brief fault appears
+  as latency, but a sustained outage exhausts the budget and surfaces a transient
+  error that fails the transaction in-doubt. There is deliberately **no** dedup —
+  `serve_backend` applies every request, like real object storage with no
+  at-most-once request id, so a retry after a dropped *response* re-runs the op.
+  That is sound because the engine's writes are conditional (CAS): a re-delivered
+  write observes a `Precondition` for its own already-applied write, exactly as S3
+  returns when the SDK retries a conditional `PUT` whose ack was lost — exposing
+  the engine's "did my commit land?" handling rather than masking it;
 - a **nemesis node** drives a seeded sequence of faults via `NetSim`/`Handle`
   (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), eventually
   healing every network fault (some long enough to outlast the retry budget) and
@@ -88,10 +92,10 @@ acked commit is durable (`acked <= final`); every committed increment came from
 some started op committing at most once (`final <= started`). The harness never
 retries an op itself, so an increment is left in-doubt (counted in `started`, not
 `acked`) when a client crashes mid-commit or a sustained outage exhausts
-`NetBackend`'s retry budget and fails the transaction; the dedup cache still
-guarantees each in-doubt op applied zero or one times. With `FaultConfig`
-disabled, `started == acked == final == expected`, so the original exact check is
-also asserted.
+`NetBackend`'s retry budget and fails the transaction; conditional writes (CAS)
+keep each in-doubt op applied at most once even when a retry re-delivers it. With
+`FaultConfig` disabled, `started == acked == final == expected`, so the original
+exact check is also asserted.
 
 ### Integration
 
@@ -178,7 +182,8 @@ the workload result.
   `run_and_assert[_with_faults]` / `run_and_record[_with_faults]` node harness
   and nemesis (feature `sim`).
 - `crates/glassdb-backend/src/net.rs` — the RPC transport: `serve_backend`
-  (server, with at-most-once dedup) and `NetBackend` (client). `#[cfg(madsim)]`.
+  (server, applies every request) and `NetBackend` (client, bounded retry).
+  `#[cfg(madsim)]`.
 - `crates/glassdb-backend/src/middleware/recording.rs` — `RecordingBackend`.
 - `crates/glassdb-concurr/src/cancel.rs` — `CancelToken` (over `tokio::sync::Notify`).
 - `crates/glassdb/tests/concurrent_sim.rs` — the op-stream self-checks (with and
