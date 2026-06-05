@@ -1,25 +1,26 @@
-//! Deterministic-simulation self-checks for the concurrency fuzzer (ADR-008).
+//! Deterministic-simulation self-checks for the concurrency fuzzer
+//! (ADR-010/011).
 //!
-//! These only build under the madsim simulator with the `sim` harness feature:
+//! These only build under the in-repo simulation executor with the `sim`
+//! harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg madsim" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim" cargo test -p glassdb --features sim
 //! ```
 //!
-//! The central guarantee is that, for a fixed workload and seed, the engine
-//! issues a **byte-for-byte identical stream of backend operations** on every
-//! run. Two interleavings can reach the same final state while issuing
+//! The central guarantee is that, for a fixed workload, schedule tape, and seed,
+//! the engine issues a **byte-for-byte identical stream of backend operations**
+//! on every run. Two interleavings can reach the same final state while issuing
 //! different operations, so an identical op stream — not just a matching final
 //! result — is what proves the schedule itself replayed deterministically.
-#![cfg(all(madsim, feature = "sim"))]
+#![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::first_divergence;
+use glassdb::middleware::{first_divergence, OpRecord};
+use glassdb::rt::{block_on_with, TapeScheduler};
 use glassdb::sim::{
-    run_and_assert, run_and_assert_with_faults, run_and_record, run_and_record_with_faults,
-    FaultConfig, Op, Workload,
+    pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults, run_and_record,
+    run_and_record_with_faults, FaultConfig, Op, Workload,
 };
-use madsim::runtime::Runtime;
-use madsim::Config;
 
 /// A contended workload: every client hammers overlapping keys with single- and
 /// multi-key increments interleaved with read-only transactions.
@@ -48,18 +49,55 @@ fn contended_workload() -> Workload {
     }
 }
 
-/// Runs the contended workload; used as the fixed function for
-/// `Runtime::check_determinism` (which requires a plain `fn` pointer).
-async fn run_contended() {
-    run_and_assert(contended_workload()).await;
+/// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
+/// long enough to cover every scheduling decision a run makes.
+fn tape(seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    (0..8192)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) as u8
+        })
+        .collect()
 }
 
-/// The op stream recorded for `workload` under `seed`.
-fn record_once(seed: u64, workload: &Workload) -> Vec<glassdb::middleware::OpRecord> {
-    let log =
-        Runtime::with_seed_and_config(seed, Config::default()).block_on(run_and_record(workload));
+/// The op stream recorded for `workload` under `tape`/`seed`.
+fn record_once(seed: u64, workload: &Workload) -> Vec<OpRecord> {
+    let w = workload.clone();
+    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+        run_and_record(&w).await
+    });
     let recorded = log.lock().unwrap();
     recorded.clone()
+}
+
+/// A deterministic fault tape derived from `seed`, distinct from the schedule
+/// tape so the interleaving and the fault schedule vary independently.
+fn fault_tape(seed: u64) -> Vec<u8> {
+    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
+}
+
+/// The op stream recorded for `workload` under the schedule `tape(seed)`/`seed`
+/// with faults active and guided by `ft`.
+fn record_faults_with_tape(
+    seed: u64,
+    workload: &Workload,
+    faults: FaultConfig,
+    ft: Vec<u8>,
+) -> Vec<OpRecord> {
+    let w = workload.clone();
+    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+        run_and_record_with_faults(&w, faults, seed, ft).await
+    });
+    let recorded = log.lock().unwrap();
+    recorded.clone()
+}
+
+/// The op stream recorded for `workload` under `tape`/`seed` with faults active.
+fn record_once_faults(seed: u64, workload: &Workload, faults: FaultConfig) -> Vec<OpRecord> {
+    record_faults_with_tape(seed, workload, faults, fault_tape(seed))
 }
 
 #[test]
@@ -86,52 +124,36 @@ fn op_stream_is_byte_identical_across_runs() {
 }
 
 #[test]
-fn distinct_seeds_can_produce_distinct_schedules() {
-    // Not a correctness requirement, but if every seed produced the identical
-    // op stream the scheduler would not be exploring anything. We only require
-    // that *some* pair differs across a spread of seeds.
+fn distinct_tapes_can_produce_distinct_schedules() {
+    // Not a correctness requirement, but if every tape produced the identical op
+    // stream the scheduler would not be exploring anything. We only require that
+    // *some* tape differs across a spread of seeds.
     let workload = contended_workload();
     let baseline = record_once(0, &workload);
     let differs = (1u64..16).any(|seed| record_once(seed, &workload) != baseline);
     assert!(
         differs,
-        "no seed in 1..16 changed the schedule; the simulator may not be \
+        "no tape in 1..16 changed the schedule; the scheduler may not be \
          varying interleavings"
     );
 }
 
 #[test]
-fn check_determinism_on_result() {
-    // A second, cheaper guard: madsim reruns the future with the same seed and
-    // verifies its internal randomness/scheduling log matches.
-    for seed in [0u64, 3, 99] {
-        Runtime::check_determinism(seed, Config::default(), run_contended);
+fn serializability_holds_under_contention() {
+    // run_and_assert panics on any violation; reaching the end means the
+    // invariant held for this tape.
+    for seed in [0u64, 3, 99, 2024] {
+        let workload = contended_workload();
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert(workload).await
+        });
     }
 }
 
 #[test]
-fn serializability_holds_under_contention() {
-    // run_and_assert panics on any violation; reaching the end means the
-    // invariant held for this seed.
-    Runtime::with_seed_and_config(2024, Config::default()).block_on(run_contended());
-}
-
-/// The op stream recorded for `workload` under `seed` with the nemesis active.
-fn record_once_faults(
-    seed: u64,
-    workload: &Workload,
-    faults: FaultConfig,
-) -> Vec<glassdb::middleware::OpRecord> {
-    let log = Runtime::with_seed_and_config(seed, Config::default())
-        .block_on(run_and_record_with_faults(workload, faults));
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-#[test]
 fn op_stream_is_byte_identical_with_faults() {
-    // Determinism must hold even with the fault nemesis running: scheduling,
-    // time, randomness, and the fault schedule are all functions of the seed.
+    // Determinism must hold even with faults active: scheduling, time,
+    // randomness, and the fault schedule are all functions of the tape and seed.
     let workload = contended_workload();
     let faults = FaultConfig::enabled(7);
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
@@ -154,8 +176,62 @@ fn serializability_holds_under_faults() {
     // violation (lost or fabricated write) panics inside run_and_assert.
     let workload = contended_workload();
     for seed in [0u64, 3, 99, 2024] {
-        Runtime::with_seed_and_config(seed, Config::default()).block_on(
-            run_and_assert_with_faults(workload.clone(), FaultConfig::enabled(9)),
-        );
+        let w = workload.clone();
+        let ft = fault_tape(seed);
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert_with_faults(w, FaultConfig::enabled(9), seed, ft).await
+        });
     }
+}
+
+#[test]
+fn fault_tape_guides_the_fault_schedule() {
+    // Same schedule tape and seed but different *fault* tapes must be able to
+    // change the recorded op stream; otherwise the fault schedule would only be
+    // seed-sampled, not coverage-guidable. An all-low tape fires every fault; an
+    // all-high tape fires none. The intensity must be high enough that the
+    // impactful faults (fail-before / lost-ack) have non-zero probability.
+    let workload = contended_workload();
+    let faults = FaultConfig::enabled(128);
+    let differs = [0u64, 1, 7, 42, 1234].iter().any(|&seed| {
+        let all_on = record_faults_with_tape(seed, &workload, faults, vec![0u8; 4096]);
+        let all_off = record_faults_with_tape(seed, &workload, faults, vec![0xffu8; 4096]);
+        all_on != all_off
+    });
+    assert!(
+        differs,
+        "the fault tape changed no op stream; the fault schedule may not be \
+         tape-guided"
+    );
+}
+
+#[test]
+fn pct_schedule_is_byte_identical_per_seed() {
+    // The PCT policy must be just as reproducible as the tape policy: a fixed
+    // seed yields a byte-for-byte identical op stream across runs.
+    let workload = contended_workload();
+    let faults = FaultConfig::enabled(5);
+    for seed in [0u64, 1, 7, 42, 1234] {
+        let first = pct_record(&workload, faults, seed);
+        let second = pct_record(&workload, faults, seed);
+        let first = first.lock().unwrap().clone();
+        let second = second.lock().unwrap().clone();
+        if let Some((idx, a, b)) = first_divergence(&first, &second) {
+            panic!(
+                "seed {seed}: PCT op stream diverged at index {idx}\n  \
+                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+                first.len(),
+                second.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn pct_seed_breadth_holds_serializability() {
+    // Seed-breadth sweep: many PCT schedules over the contended workload, with
+    // and without faults. Any invariant violation panics inside the sweep.
+    let workload = contended_workload();
+    pct_sweep(&workload, FaultConfig::enabled(7), 0..32);
+    pct_sweep(&workload, FaultConfig::none(), 0..16);
 }

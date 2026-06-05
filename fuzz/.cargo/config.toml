@@ -1,6 +1,6 @@
-# The fuzzer always builds against the madsim deterministic simulator, so a
-# crash reproduces exactly from its input. `--cfg madsim` swaps the tokio alias
-# for the simulator and routes randomness/time through the seeded runtime.
+# The fuzzer always builds against the in-repo deterministic simulation executor
+# (ADR-011), so a crash reproduces exactly from its input. `--cfg sim` routes
+# spawn/time/randomness through the seeded executor driven by the schedule tape.
 [build]
-rustflags = ["--cfg", "madsim"]
-rustdocflags = ["--cfg", "madsim"]
+rustflags = ["--cfg", "sim"]
+rustdocflags = ["--cfg", "sim"]

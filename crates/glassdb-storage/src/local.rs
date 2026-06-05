@@ -4,9 +4,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-// Use tokio's `Instant` so cache staleness honors `tokio::time::pause`/`advance`
-// in tests; outside a paused runtime it behaves like a real monotonic clock.
-use tokio::time::Instant;
+// Use the runtime `Instant` so cache staleness honors `tokio::time::pause`/
+// `advance` in tests and the deterministic executor's virtual clock under
+// `--cfg sim`; outside either it behaves like a real monotonic clock.
+use glassdb_concurr::rt::Instant;
 
 use glassdb_backend::Metadata;
 use glassdb_data::TxId;

@@ -18,7 +18,7 @@ glassdb-trans = { workspace = true }
 glassdb-concurr = { workspace = true }
 futures = "0.3.32"
 thiserror = "2.0.18"
-tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 # Only used by the `sim` feature (deterministic fuzz harness); kept optional so
 # production builds don't pull it in.
 arbitrary = { version = "1", optional = true }
@@ -30,26 +30,18 @@ s3 = ["dep:glassdb-backend-s3"]
 # Pull in the Google Cloud Storage backend (reqwest/gcp_auth dependency).
 gcs = ["dep:glassdb-backend-gcs"]
 # Expose the deterministic-simulation workload harness (`glassdb::sim`) used by
-# the `fuzz/` crate and the madsim op-stream self-check. See ADR-008.
+# the `fuzz/` crate and the op-stream self-check. See ADR-008 and ADR-011.
 sim = ["dep:arbitrary"]
 
 [dev-dependencies]
-tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
 proptest = "1.9.0"
 criterion = "0.8.2"
 async-trait = "0.1.89"
 
-# Under `--cfg madsim` the deterministic simulator drives the `sim` harness:
-# each DB runs on its own node, reaching the storage node over the network, and
-# a nemesis injects network/node faults. The harness lives in the library
-# (`sim.rs`), so madsim is a regular dependency in that configuration (it is only
-# ever compiled under `--cfg madsim`).
-[target.'cfg(madsim)'.dependencies]
-madsim = "0.2"
-
 # Transaction microbenchmarks ported from the Go `bench_test.go`. `harness =
 # false` lets criterion own `main`; `test = false` keeps `cargo test` (and the
-# madsim sim-test run) from executing it — run it with `cargo bench`.
+# sim-test run) from executing it — run it with `cargo bench`.
 [[bench]]
 name = "transactions"
 harness = false

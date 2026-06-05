@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use glassdb_concurr::rt::{self, Instant};
 use glassdb_concurr::Ctx;
 use rand_distr::{Distribution, StandardNormal};
-use tokio::time::Instant;
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
 
@@ -144,7 +144,7 @@ impl DelayBackend {
 
     async fn delay(&self, ln: &Lognormal) {
         let ms = ln.rand();
-        tokio::time::sleep(secs_f64_or_zero(ms * self.scale / 1_000.0)).await;
+        rt::sleep(secs_f64_or_zero(ms * self.scale / 1_000.0)).await;
     }
 
     /// Blocks on the read prefix limiter (a no-op when it is disabled).
@@ -174,7 +174,7 @@ impl DelayBackend {
             }
             tokio::select! {
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                _ = tokio::time::sleep(interval) => {}
+                _ = rt::sleep(interval) => {}
             }
             interval = std::cmp::min(interval.mul_f64(1.5), max);
         }
@@ -441,7 +441,7 @@ impl PrefixLimiter {
         }
         tokio::select! {
             _ = ctx.cancelled() => Err(BackendError::Cancelled),
-            _ = tokio::time::sleep(d) => Ok(()),
+            _ = rt::sleep(d) => Ok(()),
         }
     }
 
@@ -496,13 +496,8 @@ fn secs_f64_or_zero(secs: f64) -> Duration {
 mod tests {
     use super::*;
 
-    // Advances the virtual clock. Real tokio's `time::advance` is async; under
-    // the madsim simulator it is synchronous. This helper hides the difference
-    // so the test body reads the same in both configurations.
+    // Advances tokio's (paused) virtual clock.
     async fn advance(d: Duration) {
-        #[cfg(madsim)]
-        tokio::time::advance(d);
-        #[cfg(not(madsim))]
         tokio::time::advance(d).await;
     }
 
