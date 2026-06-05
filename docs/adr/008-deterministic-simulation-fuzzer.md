@@ -30,22 +30,63 @@ deterministic simulator for `tokio`, and drive it from
 [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz).
 
 ```
-libFuzzer bytes ──arbitrary──▶ (u64 seed, Workload)
+libFuzzer bytes ──arbitrary──▶ (u64 seed, Workload, FaultConfig)
                                    │
-        seed ─▶ Runtime::with_seed_and_config ──▶ block_on(run_and_assert(workload))
+        seed ─▶ Runtime::with_seed_and_config ──▶ block_on(
+                    run_and_assert_with_faults(workload, faults))
                                    │
-                 N clients (RMW / multi-RMW / read-only) over one shared
-                 MemoryBackend, run concurrently; assert each key's final
-                 value == total committed increments. Violation ⇒ panic ⇒
-                 libFuzzer crash + reproducing input.
+        A storage node serves a MemoryBackend over the simulated network;
+        each client opens its own DB on its own node and reaches the store
+        via a NetBackend RPC client; a seeded nemesis injects network and
+        node faults. Assert each key's acked <= final <= started (exact
+        equality with faults off). Violation ⇒ panic ⇒ libFuzzer crash +
+        reproducing input.
 ```
 
 Why madsim over a hand-rolled scheduler: it deterministically controls
-`tokio::spawn`, `tokio::time`, and `tokio::sync`, across the existing tokio
-surface (`select!`, `oneshot`/`Semaphore`/`mpsc`, `buffer_unordered`) with no
-custom executor. It activates only under `RUSTFLAGS="--cfg madsim"`; in normal
-builds the `madsim-tokio` alias re-exports real tokio, so production behavior is
-unchanged.
+`tokio::spawn`, `tokio::time`, and `tokio::sync`, plus a real simulated network
+(`madsim::net` with an RPC layer) and node lifecycle (`Handle::kill`/`restart`/
+`pause`), with no custom executor. It activates only under
+`RUSTFLAGS="--cfg madsim"`; in normal builds the `madsim-tokio` alias re-exports
+real tokio, so production behavior is unchanged.
+
+### Topology: one DB per node over a simulated network
+
+Clients only ever coordinate through the object store, so faults are meaningful
+only if the backend path crosses the simulated network. The harness therefore
+builds a small cluster (all `#[cfg(madsim)]`, with the original single-process
+shared-`Arc` path kept as the `#[cfg(not(madsim))]` fallback so the lib still
+builds without madsim):
+
+- a **storage node** binds an `Endpoint` and runs `serve_backend` over a
+  harness-owned `MemoryBackend` (or `RecordingBackend`) whose state survives
+  every node fault (madsim nodes share process memory);
+- each **client node** opens its own `DB` over a `NetBackend` — a `Backend`
+  implementation that forwards each call as an RPC. madsim's network *drops*
+  clogged/partitioned packets, so `NetBackend` retries with a fixed sequence
+  number and `serve_backend` deduplicates by `(client_id, seq)`, giving
+  at-most-once semantics (a retried call is applied once);
+- a **nemesis node** drives a seeded sequence of faults via `NetSim`/`Handle`
+  (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), always
+  healing transient faults and leaving the storage node up (it models durable
+  cloud storage); and
+- a **verifier node** reads every key with `read_strong` (which drives recovery
+  of any crashed client's locks via virtual-time lease expiry) and checks the
+  invariant.
+
+### Correctness under faults: the acked-bounds invariant
+
+Node kills make the exact `final == sum of increments` check invalid: an
+in-flight transaction may or may not have committed. The harness tracks two
+per-key counters in shared state: `started[k]` (increments that entered a
+`db.tx`) and `acked[k]` (those whose commit returned `Ok`). The invariant is
+`acked[k] <= final[k] <= started[k]` (plus the read-only `v >= 0` checks). An
+acked commit is durable (`acked <= final`); every committed increment came from
+some started op committing at most once (`final <= started`). The harness never
+retries an op itself, so a crash leaves its in-flight increment in-doubt
+(counted in `started`, not `acked`). With `FaultConfig` disabled,
+`started == acked == final == expected`, so the original exact check is also
+asserted.
 
 ### Integration
 
@@ -67,7 +108,7 @@ of the seed:
    `Background`, and the deadlock guard) and `TaskTracker` (in `Background`).
    Both were replaced with in-house equivalents built on `tokio::sync`, which
    *is* madsim-mapped: `CancelToken` (a hierarchical token over
-   `tokio::sync::watch`) and a `JoinHandle` vector in `Background`. The public
+   `tokio::sync::Notify`) and a `JoinHandle` vector in `Background`. The public
    API is unchanged, so call sites were untouched.
 2. **Randomness.** `rand 0.10` pulls `getrandom 0.4`, which madsim's `getrandom`
    patch does not cover, so we do not rely on it. Instead `TxId` prefixes are
@@ -83,6 +124,17 @@ of the seed:
    (writes/reads), `init_validation`, `collections_locks`, and
    `Locker::locked_paths`. This is harmless in production and is what makes the
    op stream below byte-identical.
+5. **`tokio`'s own select/watch RNG.** madsim re-exports the real `select!`
+   macro and `tokio::sync::watch`. Both randomize with `tokio`'s *thread-local*
+   `FastRand` (`select!` picks a starting branch; `watch` picks a notifier
+   shard), which madsim does not seed and which persists across runs on the same
+   thread. That made scheduling depend on a hidden, run-position-dependent RNG —
+   the dominant source of non-determinism once clients talked over the network.
+   Two fixes remove the dependence: every long-lived `select!` in the engine
+   uses `biased;` (a fixed poll order — also slightly better for prompt
+   cancellation), and `CancelToken` is built on `tokio::sync::Notify` (which
+   draws no randomness) rather than `watch` (whose sharded notifier does). After
+   this, behavior is independent of `tokio`'s thread-local RNG.
 
 ### The self-check asserts a byte-identical backend-call stream
 
@@ -94,11 +146,14 @@ replayed deterministically.
 `RecordingBackend` (a new `Backend` middleware) appends a canonical binary
 encoding of every forwarded call — method tag plus all argument bytes (path,
 value, sorted tags, expected version, writer id) — to a shared ordered log, in
-call-issue order. The `concurrent_sim` integration test runs the same
-`(workload, seed)` twice, each on its own `RecordingBackend(MemoryBackend)`, and
-asserts the two logs are equal, reporting the first diverging index and both
-records on mismatch. `Runtime::check_determinism` is kept as a second, cheaper
-guard on the workload result.
+call-issue order. On the storage node it records every call that crosses the
+network. The `concurrent_sim` integration test runs the same `(workload, seed)`
+twice, each on its own `RecordingBackend(MemoryBackend)`, and asserts the two
+logs are equal, reporting the first diverging index and both records on
+mismatch. It checks this both with faults off and with the nemesis active
+(`op_stream_is_byte_identical_with_faults`), since determinism must survive fault
+injection. `Runtime::check_determinism` is kept as a second, cheaper guard on
+the workload result.
 
 ## Consequences
 
@@ -114,11 +169,15 @@ guard on the workload result.
 
 ### Layout
 
-- `crates/glassdb/src/sim.rs` — the `Workload`/`Op` model and the
-  `run_and_assert` / `run_and_record` harness (feature `sim`).
+- `crates/glassdb/src/sim.rs` — the `Workload`/`Op`/`FaultConfig` model and the
+  `run_and_assert[_with_faults]` / `run_and_record[_with_faults]` node harness
+  and nemesis (feature `sim`).
+- `crates/glassdb-backend/src/net.rs` — the RPC transport: `serve_backend`
+  (server, with at-most-once dedup) and `NetBackend` (client). `#[cfg(madsim)]`.
 - `crates/glassdb-backend/src/middleware/recording.rs` — `RecordingBackend`.
-- `crates/glassdb/tests/concurrent_sim.rs` — the op-stream self-check (only
-  under `--cfg madsim` + `--features sim`).
+- `crates/glassdb-concurr/src/cancel.rs` — `CancelToken` (over `tokio::sync::Notify`).
+- `crates/glassdb/tests/concurrent_sim.rs` — the op-stream self-checks (with and
+  without faults), only under `--cfg madsim` + `--features sim`.
 - `fuzz/` — the cargo-fuzz crate (its own workspace), target `concurrent_tx`,
   with a starter corpus.
 

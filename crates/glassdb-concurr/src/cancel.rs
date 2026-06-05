@@ -1,18 +1,26 @@
-//! A hierarchical cancellation token built on `tokio::sync::watch`.
+//! A hierarchical cancellation token built on `tokio::sync::Notify`.
 //!
 //! This replaces `tokio_util::sync::CancellationToken`. `tokio_util` depends on
 //! the real `tokio` crate, so under the madsim deterministic simulator (which
-//! aliases `tokio` to `madsim-tokio`) it would not be redirected. `watch` is
+//! aliases `tokio` to `madsim-tokio`) it would not be redirected. `Notify` is
 //! part of `tokio::sync`, which madsim keeps as the real, runtime-agnostic
 //! primitive, so a token built on it works identically in production and under
 //! simulation.
 //!
+//! It is deliberately *not* built on `tokio::sync::watch`: `watch` shards its
+//! internal notifier and picks a shard with `tokio`'s thread-local RNG, which
+//! madsim does not seed. That RNG persists across simulator runs on the same
+//! thread, so a watch-based token would make scheduling non-reproducible (see
+//! ADR-008). `Notify` draws no randomness, keeping every `cancelled()` await
+//! deterministic.
+//!
 //! Semantics mirror the subset of `CancellationToken` the codebase uses: a
 //! token is cancelled when it, or any of its ancestors, is cancelled.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::watch;
+use tokio::sync::Notify;
 
 /// A clonable cancellation signal with parent/child propagation.
 #[derive(Clone)]
@@ -21,46 +29,49 @@ pub struct CancelToken {
 }
 
 struct Inner {
-    tx: watch::Sender<bool>,
-    rx: watch::Receiver<bool>,
+    cancelled: AtomicBool,
+    notify: Notify,
     parent: Option<CancelToken>,
+}
+
+impl Inner {
+    fn root(parent: Option<CancelToken>) -> Arc<Self> {
+        Arc::new(Inner {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+            parent,
+        })
+    }
 }
 
 impl CancelToken {
     /// Creates a fresh, uncancelled root token.
     pub fn new() -> Self {
-        let (tx, rx) = watch::channel(false);
         CancelToken {
-            inner: Arc::new(Inner {
-                tx,
-                rx,
-                parent: None,
-            }),
+            inner: Inner::root(None),
         }
     }
 
     /// Creates a child token. The child is cancelled when it is cancelled
     /// directly or when any ancestor is cancelled.
     pub fn child_token(&self) -> CancelToken {
-        let (tx, rx) = watch::channel(false);
         CancelToken {
-            inner: Arc::new(Inner {
-                tx,
-                rx,
-                parent: Some(self.clone()),
-            }),
+            inner: Inner::root(Some(self.clone())),
         }
     }
 
     /// Cancels this token (and, transitively, anything that observes it as an
     /// ancestor). Idempotent.
     pub fn cancel(&self) {
-        let _ = self.inner.tx.send(true);
+        // Wake waiters only on the first transition to cancelled.
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
     }
 
     /// Reports whether this token or any ancestor has been cancelled.
     pub fn is_cancelled(&self) -> bool {
-        if *self.inner.rx.borrow() {
+        if self.inner.cancelled.load(Ordering::SeqCst) {
             return true;
         }
         match &self.inner.parent {
@@ -75,18 +86,25 @@ impl CancelToken {
         if self.is_cancelled() {
             return;
         }
-        // Watch every token along the ancestor chain; the first one to flip
-        // wins. Receiver clones keep the underlying watch channels alive for the
-        // duration of the wait.
-        let mut receivers: Vec<watch::Receiver<bool>> = Vec::new();
+        // Race a notification from this token and every ancestor; the first to
+        // flip wins. `notify_waiters` only wakes waiters registered before the
+        // send, so each branch *enables* its waiter and only then re-checks the
+        // flag, closing the gap against a concurrent `cancel`.
+        let mut tokens: Vec<&CancelToken> = Vec::new();
         let mut cur = Some(self);
         while let Some(t) = cur {
-            receivers.push(t.inner.rx.clone());
+            tokens.push(t);
             cur = t.inner.parent.as_ref();
         }
-        let futs = receivers.iter_mut().map(|rx| {
+        let futs = tokens.into_iter().map(|t| {
             Box::pin(async move {
-                let _ = rx.wait_for(|v| *v).await;
+                let notified = t.inner.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if t.inner.cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
             })
         });
         let _ = futures::future::select_all(futs).await;

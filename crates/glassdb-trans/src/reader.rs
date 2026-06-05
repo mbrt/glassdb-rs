@@ -80,6 +80,15 @@ impl Reader {
         self.global.get_metadata(ctx, key).await
     }
 
+    /// Resolves a possibly-empty read. An empty value can be a lock placeholder
+    /// rather than a genuinely-empty committed value: acquiring a create lock
+    /// writes an empty object, and a write/read lock can leave the object empty
+    /// while the locker holds it. In every locked case the authoritative value
+    /// lives in the transaction log, so we resolve it through the monitor,
+    /// mirroring the commit-time logic in `algo::validate_locked_read`. When the
+    /// value cannot be authoritatively resolved we report `NotFound` rather than
+    /// the misleading empty bytes, which makes the surrounding transaction retry
+    /// and re-read the committed value.
     async fn handle_lock_create(
         &self,
         ctx: &Ctx,
@@ -87,42 +96,84 @@ impl Reader {
         rv: ReadValue,
     ) -> Result<ReadValue, StorageError> {
         if !rv.value.is_empty() {
-            // Safe to return: it wasn't locked in create.
+            // A non-empty value is never a lock placeholder.
             return Ok(rv);
         }
-        // We might have read a value locked in create (not yet committed).
-        // Check with an extra metadata read.
         let meta = self.global.get_metadata(ctx, key).await?;
         let info = tags_lock_info(&meta.tags)?;
-        if info.typ != LockType::Create {
-            // A genuinely committed empty value.
-            return Ok(rv);
-        }
-        if info.locked_by.len() != 1 {
-            return Err(BackendError::NotFound.into());
-        }
-        let locker_id = info.locked_by[0].clone();
 
-        let cv = match self.tmon.committed_value(ctx, key, &locker_id).await {
-            Ok(cv) => cv,
-            Err(_) => return Err(BackendError::NotFound.into()),
+        // Determine whose committed value is authoritative for this empty object.
+        let writer = if info.typ == LockType::None {
+            // Unlocked but empty: a committed writer can release its lock before
+            // its value reaches the object (the value still lives in its log).
+            // Resolve through the recorded last writer; with none recorded the
+            // empty value is genuinely committed.
+            if info.last_writer.is_empty() {
+                return Ok(rv);
+            }
+            info.last_writer.clone()
+        } else if info.locked_by.len() == 1 {
+            let locker = info.locked_by[0].clone();
+            // The locker if it has committed and wrote this key, otherwise the
+            // previous last writer.
+            match self.tmon.tx_status(ctx, &locker).await {
+                Ok(TxCommitStatus::Ok) => {
+                    match self.tmon.committed_value(ctx, key, &locker).await {
+                        Ok(cv) if cv.status == TxCommitStatus::Ok && !cv.value.not_written => {
+                            // The locker's own committed write is authoritative.
+                            return self.materialize(key, locker, cv.value);
+                        }
+                        // Committed but did not write this key: fall back to the
+                        // previous writer.
+                        Ok(_) => info.last_writer.clone(),
+                        Err(_) => return Err(BackendError::NotFound.into()),
+                    }
+                }
+                Ok(TxCommitStatus::Aborted) | Ok(TxCommitStatus::Pending) => {
+                    info.last_writer.clone()
+                }
+                Ok(TxCommitStatus::Unknown) => {
+                    return Err(StorageError::Other("unknown tx commit status".into()))
+                }
+                Err(_) => return Err(BackendError::NotFound.into()),
+            }
+        } else {
+            return Err(BackendError::NotFound.into());
         };
-        if cv.status != TxCommitStatus::Ok || cv.value.not_written {
+
+        if writer.is_empty() {
+            // No prior committed value (e.g. a pending create): not found.
             return Err(BackendError::NotFound.into());
         }
+        match self.tmon.committed_value(ctx, key, &writer).await {
+            Ok(cv) if cv.status == TxCommitStatus::Ok && !cv.value.not_written => {
+                self.materialize(key, writer, cv.value)
+            }
+            // Unresolvable (e.g. the writer committed via the single-RW fast
+            // path, which writes no log): retry rather than trust empty bytes.
+            _ => Err(BackendError::NotFound.into()),
+        }
+    }
 
+    /// Caches and returns a resolved committed value, or reports `NotFound` for a
+    /// tombstone.
+    fn materialize(
+        &self,
+        key: &str,
+        writer: glassdb_data::TxId,
+        value: glassdb_storage::TValue,
+    ) -> Result<ReadValue, StorageError> {
         let version = Version {
             b: glassdb_backend::Version::default(),
-            writer: locker_id,
+            writer,
         };
-        if cv.value.deleted {
+        if value.deleted {
             self.local.mark_deleted(key, version);
             return Err(BackendError::NotFound.into());
         }
-        self.local
-            .write(key, cv.value.value.clone(), version.clone());
+        self.local.write(key, value.value.clone(), version.clone());
         Ok(ReadValue {
-            value: cv.value.value,
+            value: value.value,
             version,
         })
     }

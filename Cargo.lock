@@ -1522,9 +1522,11 @@ dependencies = [
  "async-trait",
  "base64",
  "glassdb-concurr",
+ "madsim",
  "madsim-tokio",
  "rand 0.10.1",
  "rand_distr",
+ "serde",
  "thiserror",
  "tracing",
 ]

@@ -38,9 +38,12 @@ tokio = { package = "madsim-tokio", version = "0.2", features = ["rt", "macros",
 proptest = "1.9.0"
 criterion = "0.8.2"
 
-# Under `--cfg madsim` the deterministic simulator drives the integration tests
-# (determinism self-check). madsim is only compiled in that configuration.
-[target.'cfg(madsim)'.dev-dependencies]
+# Under `--cfg madsim` the deterministic simulator drives the `sim` harness:
+# each DB runs on its own node, reaching the storage node over the network, and
+# a nemesis injects network/node faults. The harness lives in the library
+# (`sim.rs`), so madsim is a regular dependency in that configuration (it is only
+# ever compiled under `--cfg madsim`).
+[target.'cfg(madsim)'.dependencies]
 madsim = "0.2"
 
 # Transaction microbenchmarks ported from the Go `bench_test.go`. `harness =

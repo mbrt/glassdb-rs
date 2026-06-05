@@ -1,0 +1,594 @@
+//! A [`Backend`] transport over madsim's simulated network (`--cfg madsim`
+//! only). It lets the deterministic-simulation harness place the object store on
+//! its own node and reach it from each DB node over the network, so madsim's
+//! network and node fault injection (clog/disconnect/kill) actually exercises
+//! the storage path. See ADR-008.
+//!
+//! madsim's RPC is datagram-based: a clogged or disconnected link *drops*
+//! packets rather than queuing them. Real object storage (S3/GCS) is instead a
+//! reliable, highly-available service whose clients retry on transient network
+//! errors. We model that here: [`NetBackend`] retries each call until it gets a
+//! response (or the context is cancelled), and [`serve_backend`] applies each
+//! logical request *at most once* via a per-`(client, seq)` response cache. So a
+//! retry after a dropped request re-runs the op, while a retry after a dropped
+//! *response* replays the cached result instead of double-applying it. The net
+//! effect: network faults appear as latency/unavailability (never lost or
+//! duplicated writes), and the only source of in-doubt operations is a node
+//! crash, which is exactly the property the harness's invariant relies on.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use glassdb_concurr::Ctx;
+use madsim::net::rpc::Request;
+use madsim::net::Endpoint;
+use serde::{Deserialize, Serialize};
+
+use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+
+/// How long a single RPC attempt waits for a response before retrying. It only
+/// matters under faults; it must comfortably exceed the worst-case round-trip so
+/// that a retry never races a still-in-flight first attempt (which would let two
+/// copies of the same op run concurrently). madsim's per-hop delay tops out at a
+/// few seconds, so 30s of (virtual, free) time is ample.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Backoff between retries after a dropped/timed-out call.
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The object-store operation carried by an RPC request. Mirrors the [`Backend`]
+/// method set; versions are carried as their opaque token string and writer ids
+/// as raw bytes to keep the wire types self-contained.
+#[derive(Clone, Serialize, Deserialize)]
+enum Op {
+    ReadIfModified {
+        path: String,
+        writer: Vec<u8>,
+    },
+    Read {
+        path: String,
+    },
+    GetMetadata {
+        path: String,
+    },
+    SetTagsIf {
+        path: String,
+        expected: String,
+        tags: Tags,
+    },
+    Write {
+        path: String,
+        value: Vec<u8>,
+        tags: Tags,
+    },
+    WriteIf {
+        path: String,
+        value: Vec<u8>,
+        expected: String,
+        tags: Tags,
+    },
+    WriteIfNotExists {
+        path: String,
+        value: Vec<u8>,
+        tags: Tags,
+    },
+    Delete {
+        path: String,
+    },
+    DeleteIf {
+        path: String,
+        expected: String,
+    },
+    List {
+        dir_path: String,
+    },
+}
+
+/// An RPC request: a logical [`Op`] tagged with the originating client and a
+/// per-client monotonic sequence number, which together identify a retry of the
+/// same logical operation for at-most-once dedup.
+#[derive(Clone, Serialize, Deserialize)]
+struct Req {
+    client_id: u64,
+    seq: u64,
+    op: Op,
+}
+
+impl Request for Req {
+    type Response = Resp;
+    const ID: u64 = 0x_61DB_BE_C0DE;
+}
+
+/// The successful payload of a response, one variant per return shape.
+#[derive(Clone, Serialize, Deserialize)]
+enum RespBody {
+    Read(ReadReply),
+    Meta(Metadata),
+    List(Vec<String>),
+    Unit,
+}
+
+/// A response is the backend result of applying the request's [`Op`].
+type Resp = Result<RespBody, BackendError>;
+
+/// Per-`(client, seq)` cache of completed responses, giving at-most-once
+/// semantics: a retried request whose original already completed replays the
+/// stored response instead of re-applying the operation.
+#[derive(Default)]
+struct DoneCache {
+    done: Mutex<HashMap<(u64, u64), Resp>>,
+}
+
+impl DoneCache {
+    async fn run(&self, inner: &dyn Backend, req: Req) -> Resp {
+        let key = (req.client_id, req.seq);
+        if let Some(cached) = self.done.lock().unwrap().get(&key).cloned() {
+            return cached;
+        }
+        let resp = dispatch(inner, req.op).await;
+        self.done.lock().unwrap().insert(key, resp.clone());
+        resp
+    }
+}
+
+/// Applies a single [`Op`] to `inner`, wrapping the result into a [`Resp`].
+async fn dispatch(inner: &dyn Backend, op: Op) -> Resp {
+    let ctx = Ctx::background();
+    match op {
+        Op::ReadIfModified { path, writer } => inner
+            .read_if_modified(&ctx, &path, &WriterId::new(writer))
+            .await
+            .map(RespBody::Read),
+        Op::Read { path } => inner.read(&ctx, &path).await.map(RespBody::Read),
+        Op::GetMetadata { path } => inner.get_metadata(&ctx, &path).await.map(RespBody::Meta),
+        Op::SetTagsIf {
+            path,
+            expected,
+            tags,
+        } => inner
+            .set_tags_if(&ctx, &path, &Version::new(expected), tags)
+            .await
+            .map(RespBody::Meta),
+        Op::Write { path, value, tags } => inner
+            .write(&ctx, &path, value, tags)
+            .await
+            .map(RespBody::Meta),
+        Op::WriteIf {
+            path,
+            value,
+            expected,
+            tags,
+        } => inner
+            .write_if(&ctx, &path, value, &Version::new(expected), tags)
+            .await
+            .map(RespBody::Meta),
+        Op::WriteIfNotExists { path, value, tags } => inner
+            .write_if_not_exists(&ctx, &path, value, tags)
+            .await
+            .map(RespBody::Meta),
+        Op::Delete { path } => inner.delete(&ctx, &path).await.map(|()| RespBody::Unit),
+        Op::DeleteIf { path, expected } => inner
+            .delete_if(&ctx, &path, &Version::new(expected))
+            .await
+            .map(|()| RespBody::Unit),
+        Op::List { dir_path } => inner.list(&ctx, &dir_path).await.map(RespBody::List),
+    }
+}
+
+/// Registers an RPC handler on `ep` that serves backend operations from `inner`
+/// with at-most-once semantics. The endpoint must already be bound, and must be
+/// kept alive for as long as the server should accept requests.
+pub fn serve_backend(ep: &Endpoint, inner: Arc<dyn Backend>) {
+    let cache = Arc::new(DoneCache::default());
+    ep.add_rpc_handler(move |req: Req| {
+        let inner = inner.clone();
+        let cache = cache.clone();
+        async move { cache.run(inner.as_ref(), req).await }
+    });
+}
+
+/// A [`Backend`] that forwards every call to a remote [`serve_backend`] over
+/// madsim's network, retrying transient failures so transient network faults
+/// surface as latency rather than errors.
+pub struct NetBackend {
+    ep: Arc<Endpoint>,
+    server: SocketAddr,
+    client_id: u64,
+    seq: AtomicU64,
+}
+
+impl NetBackend {
+    /// Creates a client targeting the `serve_backend` instance at `server`.
+    /// `client_id` must be unique across all clients sharing that server (so the
+    /// server's dedup cache never conflates two clients' sequence numbers).
+    pub fn new(ep: Arc<Endpoint>, server: SocketAddr, client_id: u64) -> Self {
+        NetBackend {
+            ep,
+            server,
+            client_id,
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Sends `op` and returns its response body, retrying dropped/timed-out
+    /// calls until one succeeds or `ctx` is cancelled. The sequence number is
+    /// fixed for the whole call so all retries are deduplicated server-side.
+    async fn call(&self, ctx: &Ctx, op: Op) -> Result<RespBody, BackendError> {
+        let req = Req {
+            client_id: self.client_id,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            op,
+        };
+        loop {
+            if ctx.is_cancelled() {
+                return Err(BackendError::Cancelled);
+            }
+            // `biased` keeps the poll order fixed; the default random order would
+            // draw from a non-seeded RNG and break madsim's determinism.
+            tokio::select! {
+                biased;
+                _ = ctx.cancelled() => return Err(BackendError::Cancelled),
+                res = self.ep.call_timeout(self.server, req.clone(), CALL_TIMEOUT) => {
+                    if let Ok(resp) = res {
+                        return resp;
+                    }
+                    // Dropped or timed out: back off and retry the same seq.
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancelled() => return Err(BackendError::Cancelled),
+                        _ = tokio::time::sleep(RETRY_BACKOFF) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn unexpected() -> BackendError {
+    BackendError::Other("unexpected RPC response shape".into())
+}
+
+#[async_trait]
+impl Backend for NetBackend {
+    async fn read_if_modified(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        expected_writer: &WriterId,
+    ) -> Result<ReadReply, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::ReadIfModified {
+                    path: path.to_string(),
+                    writer: expected_writer.as_bytes().to_vec(),
+                },
+            )
+            .await?
+        {
+            RespBody::Read(r) => Ok(r),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::Read {
+                    path: path.to_string(),
+                },
+            )
+            .await?
+        {
+            RespBody::Read(r) => Ok(r),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::GetMetadata {
+                    path: path.to_string(),
+                },
+            )
+            .await?
+        {
+            RespBody::Meta(m) => Ok(m),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn set_tags_if(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::SetTagsIf {
+                    path: path.to_string(),
+                    expected: expected.token.clone(),
+                    tags,
+                },
+            )
+            .await?
+        {
+            RespBody::Meta(m) => Ok(m),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn write(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::Write {
+                    path: path.to_string(),
+                    value,
+                    tags,
+                },
+            )
+            .await?
+        {
+            RespBody::Meta(m) => Ok(m),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn write_if(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        value: Vec<u8>,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::WriteIf {
+                    path: path.to_string(),
+                    value,
+                    expected: expected.token.clone(),
+                    tags,
+                },
+            )
+            .await?
+        {
+            RespBody::Meta(m) => Ok(m),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn write_if_not_exists(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::WriteIfNotExists {
+                    path: path.to_string(),
+                    value,
+                    tags,
+                },
+            )
+            .await?
+        {
+            RespBody::Meta(m) => Ok(m),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::Delete {
+                    path: path.to_string(),
+                },
+            )
+            .await?
+        {
+            RespBody::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn delete_if(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        expected: &Version,
+    ) -> Result<(), BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::DeleteIf {
+                    path: path.to_string(),
+                    expected: expected.token.clone(),
+                },
+            )
+            .await?
+        {
+            RespBody::Unit => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        match self
+            .call(
+                ctx,
+                Op::List {
+                    dir_path: dir_path.to_string(),
+                },
+            )
+            .await?
+        {
+            RespBody::List(v) => Ok(v),
+            _ => Err(unexpected()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryBackend;
+    use crate::LAST_WRITER_TAG;
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicBool;
+
+    use madsim::net::NetSim;
+    use madsim::runtime::Runtime;
+
+    const STORAGE: &str = "10.0.0.1:9000";
+    const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+    // Spawns a storage server on its own node, returning the node and a flag
+    // that flips once the server is bound and ready to accept requests.
+    fn spawn_server(
+        rt: &Runtime,
+        inner: Arc<dyn Backend>,
+    ) -> (madsim::runtime::NodeHandle, Arc<AtomicBool>) {
+        let ready = Arc::new(AtomicBool::new(false));
+        let node = rt.create_node().ip("10.0.0.1".parse().unwrap()).build();
+        let r = ready.clone();
+        node.spawn(async move {
+            let ep = Endpoint::bind(STORAGE).await.unwrap();
+            serve_backend(&ep, inner);
+            r.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        (node, ready)
+    }
+
+    async fn wait_ready(ready: &AtomicBool) {
+        while !ready.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[test]
+    fn round_trips_every_op() {
+        let rt = Runtime::new();
+        let (_storage, ready) = spawn_server(&rt, Arc::new(MemoryBackend::new()));
+        let client = rt.create_node().ip(CLIENT_IP.into()).build();
+
+        let f = client.spawn(async move {
+            wait_ready(&ready).await;
+            let ep = Arc::new(Endpoint::bind((CLIENT_IP, 0)).await.unwrap());
+            let be = NetBackend::new(ep, STORAGE.parse().unwrap(), 1);
+            let ctx = Ctx::background();
+
+            assert!(matches!(
+                be.read(&ctx, "a").await,
+                Err(BackendError::NotFound)
+            ));
+            let m = be
+                .write(&ctx, "a", b"hello".to_vec(), Tags::new())
+                .await
+                .unwrap();
+            let r = be.read(&ctx, "a").await.unwrap();
+            assert_eq!(r.contents, b"hello");
+            assert_eq!(r.version, m.version);
+
+            // Conditional write on the wrong version fails; on the right one
+            // succeeds.
+            assert!(matches!(
+                be.write_if(&ctx, "a", b"x".to_vec(), &Version::new("9/9"), Tags::new())
+                    .await,
+                Err(BackendError::Precondition)
+            ));
+            let m2 = be
+                .write_if(&ctx, "a", b"world".to_vec(), &m.version, Tags::new())
+                .await
+                .unwrap();
+            assert_ne!(m.version, m2.version);
+
+            // Metadata, tags, and read_if_modified.
+            let writer = WriterId::new(vec![1, 2, 3]);
+            let mut tags = Tags::new();
+            tags.insert(
+                LAST_WRITER_TAG.to_string(),
+                crate::encode_writer_tag(&writer),
+            );
+            let m3 = be.set_tags_if(&ctx, "a", &m2.version, tags).await.unwrap();
+            assert!(be.get_metadata(&ctx, "a").await.unwrap().version == m3.version);
+            assert!(matches!(
+                be.read_if_modified(&ctx, "a", &writer).await,
+                Err(BackendError::Precondition)
+            ));
+
+            // Listing and deletion.
+            be.write(&ctx, "d/x", b"1".to_vec(), Tags::new())
+                .await
+                .unwrap();
+            be.write(&ctx, "d/y", b"2".to_vec(), Tags::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                be.list(&ctx, "d").await.unwrap(),
+                vec!["d/x".to_string(), "d/y".to_string()]
+            );
+            be.delete(&ctx, "a").await.unwrap();
+            assert!(matches!(
+                be.delete(&ctx, "a").await,
+                Err(BackendError::NotFound)
+            ));
+        });
+        rt.block_on(f).unwrap();
+    }
+
+    #[test]
+    fn clogged_link_recovers_after_unclog() {
+        let rt = Runtime::new();
+        let (storage, ready) = spawn_server(&rt, Arc::new(MemoryBackend::new()));
+        let client = rt.create_node().ip(CLIENT_IP.into()).build();
+        let storage_id = storage.id();
+        let client_id = client.id();
+
+        // Drive the fault from the main task: clog client->storage, kick off a
+        // write that must keep retrying, then unclog and confirm it lands.
+        let handle = client.spawn(async move {
+            wait_ready(&ready).await;
+            let ep = Arc::new(Endpoint::bind((CLIENT_IP, 0)).await.unwrap());
+            let be = NetBackend::new(ep, STORAGE.parse().unwrap(), 1);
+            let ctx = Ctx::background();
+            be.write(&ctx, "k", b"v".to_vec(), Tags::new())
+                .await
+                .unwrap();
+            be.read(&ctx, "k").await.unwrap().contents
+        });
+
+        let got = rt.block_on(async move {
+            let net = NetSim::current();
+            net.clog_link(client_id, storage_id);
+            // Let virtual time pass while the client retries against the clog.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert!(!handle.is_finished(), "write should still be retrying");
+            net.unclog_link(client_id, storage_id);
+            handle.await.unwrap()
+        });
+        assert_eq!(got, b"v");
+    }
+}

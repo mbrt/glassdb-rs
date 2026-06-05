@@ -61,6 +61,7 @@ where
             Err(RetryErr::Permanent(e)) => return Err(e),
             Err(RetryErr::Transient(e)) => {
                 tokio::select! {
+                    biased;
                     _ = ctx.cancelled() => return Err(e),
                     _ = tokio::time::sleep(interval) => {}
                 }

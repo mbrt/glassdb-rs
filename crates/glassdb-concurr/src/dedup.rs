@@ -428,6 +428,7 @@ mod tests {
                 }
                 let sem = contr.on_next_do(key);
                 tokio::select! {
+                    biased;
                     _ = ctx.cancelled() => return Err(()),
                     _ = await_signal(&sem) => {}
                 }

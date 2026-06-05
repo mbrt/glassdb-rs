@@ -18,5 +18,12 @@ thiserror = "2.0.18"
 tokio = { package = "madsim-tokio", version = "0.2", default-features = false, features = ["time"] }
 tracing = "0.1.44"
 
+# Under `--cfg madsim` the network transport (`net` module) puts the storage
+# backend on its own simulated node, reached over madsim's RPC. madsim and serde
+# are only needed in that configuration; production builds never pull them in.
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+serde = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 tokio = { package = "madsim-tokio", version = "0.2", features = ["macros", "rt", "time", "test-util"] }

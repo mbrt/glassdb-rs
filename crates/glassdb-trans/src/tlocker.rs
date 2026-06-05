@@ -326,6 +326,7 @@ impl LockerWorker {
             let wait_rx = self.core.tmon.wait_for_tx(ctx, tx);
 
             tokio::select! {
+                biased;
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled.into()),
                 _ = wait_rx => {}
                 _ = await_signal(&sem) => {}
