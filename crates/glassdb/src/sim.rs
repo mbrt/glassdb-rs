@@ -12,10 +12,13 @@
 //!
 //! The correctness check is per key `acked <= final <= started`, where `started`
 //! counts increments that entered a transaction and `acked` counts those whose
-//! commit returned `Ok`. A crashed client leaves its in-flight increment
-//! in-doubt (counted in `started`, not `acked`), so the bound tolerates it while
-//! still catching lost or fabricated writes. With faults disabled the three are
-//! equal, recovering the original exact invariant. [`run_and_record`] also
+//! commit returned `Ok`. An increment is left in-doubt (counted in `started`,
+//! not `acked`) when a client crashes mid-commit or a sustained network outage
+//! exhausts NetBackend's retry budget and fails the transaction; the bound
+//! tolerates both while still catching lost or fabricated writes (the dedup
+//! cache guarantees each in-doubt op applied zero or one times). With faults
+//! disabled the three are equal, recovering the original exact invariant.
+//! [`run_and_record`] also
 //! captures the ordered stream of backend operations so two same-seed runs can
 //! be compared byte-for-byte (see the `concurrent_sim` self-check and ADR-008).
 
@@ -369,9 +372,11 @@ const SERVER_ADDR: &str = "10.0.0.1:9000";
 
 /// Opens a [`DB`] backed by a fresh network client bound to `ip`, talking to the
 /// storage node. `client_id` must be unique so the server's at-most-once dedup
-/// never conflates two clients.
+/// never conflates two clients. Open performs backend I/O, so it can fail if a
+/// sustained network fault is active; callers that run while the nemesis is live
+/// must tolerate the error.
 #[cfg(madsim)]
-async fn open_net_db(ip: IpAddr, client_id: u64) -> (DB, Ctx) {
+async fn open_net_db(ip: IpAddr, client_id: u64) -> Result<(DB, Ctx), Error> {
     let ep = Arc::new(
         Endpoint::bind(format!("{ip}:0"))
             .await
@@ -380,16 +385,15 @@ async fn open_net_db(ip: IpAddr, client_id: u64) -> (DB, Ctx) {
     let server: SocketAddr = SERVER_ADDR.parse().unwrap();
     let backend: Arc<dyn Backend> = Arc::new(NetBackend::new(ep, server, client_id));
     let ctx = Ctx::background();
-    let db = DB::open_with(&ctx, DB_NAME, backend, deterministic_options())
-        .await
-        .expect("open db");
-    (db, ctx)
+    let db = DB::open_with(&ctx, DB_NAME, backend, deterministic_options()).await?;
+    Ok((db, ctx))
 }
 
 #[cfg(madsim)]
 async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: FaultConfig) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     let handle = Handle::current();
     let server: SocketAddr = SERVER_ADDR.parse().unwrap();
@@ -398,28 +402,41 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
     // harness-owned `storage` Arc, so it is durable independent of any node.
     let storage_node = handle.create_node().ip("10.0.0.1".parse().unwrap()).build();
     let ready = Arc::new(AtomicBool::new(false));
-    {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let storage_task = {
         let storage = storage.clone();
         let ready = ready.clone();
         storage_node.spawn(async move {
             let ep = Endpoint::bind(server).await.expect("bind storage");
             serve_backend(&ep, storage);
             ready.store(true, Ordering::SeqCst);
-            // Keep the endpoint (and thus the bound socket) alive forever.
-            std::future::pending::<()>().await;
-        });
-    }
+            // Keep the endpoint (and the bound socket) alive until the harness
+            // signals shutdown, then drop it so the RPC handler, the backend,
+            // and the dedup cache are released. Parking it forever would leak
+            // those allocations (the fuzzer runs under a leak sanitizer).
+            let _ = shutdown_rx.await;
+        })
+    };
     while !ready.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
+    // Every node we create is torn down at the end of the run. madsim's
+    // `block_on` returns as soon as this (main) task finishes, so any
+    // background task still parked on a timer or lock wait would otherwise be
+    // abandoned and leaked on runtime drop.
+    let mut all_nodes: Vec<NodeId> = vec![storage_node.id()];
+
     // Init node: create the collection and seed every key to zero.
-    handle
-        .create_node()
-        .ip("10.0.0.2".parse().unwrap())
-        .build()
+    let init_node = handle.create_node().ip("10.0.0.2".parse().unwrap()).build();
+    all_nodes.push(init_node.id());
+    init_node
         .spawn(async move {
-            let (db, ctx) = open_net_db("10.0.0.2".parse().unwrap(), 0).await;
+            // The nemesis has not started yet, so open and seed cannot hit a
+            // fault; treat any failure here as a harness bug.
+            let (db, ctx) = open_net_db("10.0.0.2".parse().unwrap(), 0)
+                .await
+                .expect("open init db");
             let coll = db.collection(COLLECTION);
             coll.create(&ctx).await.expect("create collection");
             let seed = &coll;
@@ -446,11 +463,16 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
         let ip: IpAddr = format!("10.0.1.{}", i + 1).parse().unwrap();
         let node = handle.create_node().ip(ip).build();
         client_ids.push(node.id());
+        all_nodes.push(node.id());
         let ops = ops.clone();
         let acct = acct.clone();
         let client_id = (i + 1) as u64;
         client_handles.push(node.spawn(async move {
-            let (db, ctx) = open_net_db(ip, client_id).await;
+            // A sustained outage can make open itself fail; that client simply
+            // does no work (no increments started), which the bound tolerates.
+            let Ok((db, ctx)) = open_net_db(ip, client_id).await else {
+                return;
+            };
             let coll = db.collection(COLLECTION);
             let _ = run_client(&ctx, &db, &coll, &ops, &acct).await;
             db.close().await;
@@ -465,12 +487,9 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
         let storage_id = storage_node.id();
         let stop = stop.clone();
         let intensity = faults.intensity;
-        Some(
-            handle
-                .create_node()
-                .build()
-                .spawn(async move { nemesis(h, ids, storage_id, intensity, stop).await }),
-        )
+        let nemesis_node = handle.create_node().build();
+        all_nodes.push(nemesis_node.id());
+        Some(nemesis_node.spawn(async move { nemesis(h, ids, storage_id, intensity, stop).await }))
     } else {
         None
     };
@@ -497,12 +516,14 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
     // Verifier node: read every key's final value (driving recovery of any
     // crashed client's locks via lease expiry) and check the invariant.
     let verifier_id = (workload.clients.len() + 1) as u64;
-    let finals = handle
-        .create_node()
-        .ip("10.0.0.3".parse().unwrap())
-        .build()
+    let verifier_node = handle.create_node().ip("10.0.0.3".parse().unwrap()).build();
+    all_nodes.push(verifier_node.id());
+    let finals = verifier_node
         .spawn(async move {
-            let (db, ctx) = open_net_db("10.0.0.3".parse().unwrap(), verifier_id).await;
+            // All faults are healed before the verifier runs, so open is safe.
+            let (db, ctx) = open_net_db("10.0.0.3".parse().unwrap(), verifier_id)
+                .await
+                .expect("open verifier db");
             let coll = db.collection(COLLECTION);
             let mut finals = vec![0i64; KEY_COUNT];
             for (k, slot) in finals.iter_mut().enumerate() {
@@ -519,16 +540,36 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
         .await
         .expect("verifier task");
 
+    // Shut the storage server down and join it so its endpoint, RPC handler,
+    // backend, and dedup cache are all released before the run ends.
+    let _ = shutdown_tx.send(());
+    let _ = storage_task.await;
+
+    // Tear down every node so madsim drops any background task still parked on
+    // a timer or lock wait (locker/monitor/gc helpers spawned detached). In a
+    // real tokio runtime these are reclaimed when the runtime shuts down; under
+    // madsim they must be killed explicitly or they leak. Killing wakes the
+    // tasks; yielding lets the executor pull and drop them before we return.
+    for &id in &all_nodes {
+        handle.kill(id);
+    }
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
     let acct = acct.lock().unwrap();
     assert_bounds(&acct, &finals, &expected, faults.enabled);
 }
 
 /// The fault nemesis. Drives a seeded sequence of network and node faults
-/// against the client nodes while they run, always healing transient faults so
-/// the run can make progress. Crashes (`kill`) are permanent; their recovery is
-/// left to GlassDB's lock-lease expiry. Randomness comes from the runtime's
-/// seeded RNG and all timing from virtual sleeps, so the schedule is a
-/// deterministic function of the seed.
+/// against the client nodes while they run, eventually healing every network
+/// fault so the run can make progress. A short fault appears to the client as
+/// latency; a long one outlasts NetBackend's retry budget, so the in-flight call
+/// gives up and the transaction fails in-doubt (recovered later via lock-lease
+/// expiry, just like a crash). Crashes (`kill`) are permanent; their recovery is
+/// likewise left to lease expiry. Randomness comes from the runtime's seeded RNG
+/// and all timing from virtual sleeps, so the schedule is a deterministic
+/// function of the seed.
 #[cfg(madsim)]
 async fn nemesis(
     handle: Handle,
@@ -549,12 +590,16 @@ async fn nemesis(
             break;
         }
         // Draw all randomness up front so no RNG guard is held across an await.
+        // `hold_ms`'s upper bound exceeds NetBackend's retry budget (a few
+        // seconds) on purpose: most faults heal within the budget and surface as
+        // latency, but the longest ones outlast it so the client gives up and
+        // the transaction fails in-doubt, exercising the backend-error path.
         let (idx, kind, hold_ms, gap_ms) = {
             let mut rng = madsim::rand::thread_rng();
             (
                 rng.gen_range(0..alive.len()),
                 rng.gen_range(0u32..10),
-                rng.gen_range(50u64..2000),
+                rng.gen_range(50u64..6000),
                 rng.gen_range(10u64..400),
             )
         };

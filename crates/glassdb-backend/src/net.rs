@@ -6,15 +6,23 @@
 //!
 //! madsim's RPC is datagram-based: a clogged or disconnected link *drops*
 //! packets rather than queuing them. Real object storage (S3/GCS) is instead a
-//! reliable, highly-available service whose clients retry on transient network
-//! errors. We model that here: [`NetBackend`] retries each call until it gets a
-//! response (or the context is cancelled), and [`serve_backend`] applies each
-//! logical request *at most once* via a per-`(client, seq)` response cache. So a
-//! retry after a dropped request re-runs the op, while a retry after a dropped
-//! *response* replays the cached result instead of double-applying it. The net
-//! effect: network faults appear as latency/unavailability (never lost or
-//! duplicated writes), and the only source of in-doubt operations is a node
-//! crash, which is exactly the property the harness's invariant relies on.
+//! reliable, highly-available service whose clients retry transient network
+//! errors a *bounded* number of times and then surface an error (the AWS SDK's
+//! adaptive retryer, for instance, gives up after a fixed attempt budget). We
+//! model that here: [`NetBackend`] retries each call up to [`MAX_ATTEMPTS`]
+//! times and then returns a transient error, while [`serve_backend`] applies
+//! each logical request *at most once* via a per-`(client, seq)` response cache.
+//! So a retry after a dropped request re-runs the op, a retry after a dropped
+//! *response* replays the cached result instead of double-applying it, and a
+//! give-up never double-applies either (the op ran at most once server-side).
+//!
+//! The net effect: a transient fault shorter than the retry budget appears as
+//! latency (the call eventually lands), while a sustained outage surfaces as a
+//! backend error that fails the transaction, leaving its write *in-doubt* —
+//! counted as attempted but not acknowledged, exactly like a node crash. The
+//! harness's `acked <= final <= started` invariant already tolerates in-doubt
+//! ops, and the dedup cache guarantees each one applied zero or one times, never
+//! twice.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -33,11 +41,19 @@ use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId}
 /// How long a single RPC attempt waits for a response before retrying. It only
 /// matters under faults; it must comfortably exceed the worst-case round-trip so
 /// that a retry never races a still-in-flight first attempt (which would let two
-/// copies of the same op run concurrently). madsim's per-hop delay tops out at a
-/// few seconds, so 30s of (virtual, free) time is ample.
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// copies of the same op run concurrently). madsim's default per-hop latency is
+/// 1-10ms (round-trip ~20ms), so 500ms of (virtual, free) time is a 25x margin
+/// while still keeping the give-up budget short enough to be exercised.
+const CALL_TIMEOUT: Duration = Duration::from_millis(500);
 /// Backoff between retries after a dropped/timed-out call.
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// Maximum attempts for a single logical operation before giving up with a
+/// transient error. The resulting budget (~`MAX_ATTEMPTS * (CALL_TIMEOUT +
+/// RETRY_BACKOFF)`, a few seconds of virtual time) comfortably outlasts a brief
+/// fault so it appears as latency, while a longer outage surfaces as an error.
+/// All retries reuse the same sequence number, so they are deduplicated
+/// server-side and the op runs at most once regardless of how many we send.
+const MAX_ATTEMPTS: u32 = 8;
 
 /// The object-store operation carried by an RPC request. Mirrors the [`Backend`]
 /// method set; versions are carried as their opaque token string and writer ids
@@ -191,8 +207,9 @@ pub fn serve_backend(ep: &Endpoint, inner: Arc<dyn Backend>) {
 }
 
 /// A [`Backend`] that forwards every call to a remote [`serve_backend`] over
-/// madsim's network, retrying transient failures so transient network faults
-/// surface as latency rather than errors.
+/// madsim's network, retrying transient failures up to [`MAX_ATTEMPTS`] times so
+/// brief network faults surface as latency, and returning a transient error once
+/// the budget is exhausted (a sustained outage).
 pub struct NetBackend {
     ep: Arc<Endpoint>,
     server: SocketAddr,
@@ -214,7 +231,8 @@ impl NetBackend {
     }
 
     /// Sends `op` and returns its response body, retrying dropped/timed-out
-    /// calls until one succeeds or `ctx` is cancelled. The sequence number is
+    /// calls up to [`MAX_ATTEMPTS`] times before giving up with a transient
+    /// error (or returning early if `ctx` is cancelled). The sequence number is
     /// fixed for the whole call so all retries are deduplicated server-side.
     async fn call(&self, ctx: &Ctx, op: Op) -> Result<RespBody, BackendError> {
         let req = Req {
@@ -222,7 +240,7 @@ impl NetBackend {
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
             op,
         };
-        loop {
+        for attempt in 0..MAX_ATTEMPTS {
             if ctx.is_cancelled() {
                 return Err(BackendError::Cancelled);
             }
@@ -235,15 +253,26 @@ impl NetBackend {
                     if let Ok(resp) = res {
                         return resp;
                     }
-                    // Dropped or timed out: back off and retry the same seq.
-                    tokio::select! {
-                        biased;
-                        _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                        _ = tokio::time::sleep(RETRY_BACKOFF) => {}
+                    // Dropped or timed out. If this was the last attempt, fall
+                    // through to give up; otherwise back off and retry the same
+                    // seq (deduplicated server-side, so at most one applies).
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::select! {
+                            biased;
+                            _ = ctx.cancelled() => return Err(BackendError::Cancelled),
+                            _ = tokio::time::sleep(RETRY_BACKOFF) => {}
+                        }
                     }
                 }
             }
         }
+        // Exhausted the attempt budget: the link is clogged or the peer is gone
+        // for longer than a transient blip. Surface a non-precondition,
+        // non-cancellation error so the transaction engine treats it as a real
+        // (in-doubt) failure rather than a conflict to retry.
+        Err(BackendError::Other(format!(
+            "storage unavailable: no response after {MAX_ATTEMPTS} attempts"
+        )))
     }
 }
 
@@ -583,12 +612,41 @@ mod tests {
         let got = rt.block_on(async move {
             let net = NetSim::current();
             net.clog_link(client_id, storage_id);
-            // Let virtual time pass while the client retries against the clog.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Let virtual time pass (but stay within the retry budget) while the
+            // client retries against the clog, then heal it before it gives up.
+            tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(!handle.is_finished(), "write should still be retrying");
             net.unclog_link(client_id, storage_id);
             handle.await.unwrap()
         });
         assert_eq!(got, b"v");
+    }
+
+    #[test]
+    fn permanent_clog_gives_up() {
+        let rt = Runtime::new();
+        let (storage, ready) = spawn_server(&rt, Arc::new(MemoryBackend::new()));
+        let client = rt.create_node().ip(CLIENT_IP.into()).build();
+        let storage_id = storage.id();
+        let client_id = client.id();
+
+        // A link that never heals: the client should exhaust its attempt budget
+        // and surface a transient error rather than retry forever.
+        let handle = client.spawn(async move {
+            wait_ready(&ready).await;
+            let ep = Arc::new(Endpoint::bind((CLIENT_IP, 0)).await.unwrap());
+            let be = NetBackend::new(ep, STORAGE.parse().unwrap(), 1);
+            let ctx = Ctx::background();
+            be.write(&ctx, "k", b"v".to_vec(), Tags::new()).await
+        });
+
+        let err = rt.block_on(async move {
+            NetSim::current().clog_link(client_id, storage_id);
+            handle.await.unwrap()
+        });
+        assert!(
+            matches!(err, Err(BackendError::Other(_))),
+            "expected a transient give-up error, got {err:?}"
+        );
     }
 }

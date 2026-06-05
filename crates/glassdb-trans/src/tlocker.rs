@@ -425,6 +425,12 @@ impl Locker {
             .unwrap_or(LockType::None)
     }
 
+    /// Reports whether `tid` currently holds any lock.
+    pub fn has_locks(&self, tid: &TxId) -> bool {
+        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
+        tlocks.get(tid.as_bytes()).is_some_and(|m| !m.is_empty())
+    }
+
     /// Returns all paths currently locked by `tid`.
     pub fn locked_paths(&self, tid: &TxId) -> Vec<PathLock> {
         let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
