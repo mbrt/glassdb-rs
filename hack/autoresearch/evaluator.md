@@ -35,15 +35,17 @@ permitted, not even a "mechanical" one):
    - `crates/glassdb/benches/transactions.rs`
    - anything under `fuzz/**` (the `concurrent_tx` fuzz target and its config)
 2. Autoresearch fixed infrastructure:
-   - anything under `hack/autoresearch/bench/**` (the scoring harness)
+   - anything under `crates/glassdb-bench/**` (the entire benchmark crate: the
+     `autoresearch` scoring harness plus the `rtbench`/`backendbench` tools)
    - `hack/autoresearch/check.sh`
    - `hack/autoresearch/evaluate.sh`
    - `hack/autoresearch/evaluator.md`
    - `hack/autoresearch/program.md`
 
 Everything else under `crates/**/src/**` (including `crates/glassdb/src/stats.rs`
-and `crates/glassdb-backend/src/stats.rs`, which define the counters) and the
-non-frozen `crates/**/tests/` files are editable, subject to section B.
+and `crates/glassdb-backend/src/stats.rs`, which define the counters, but
+excluding the frozen `crates/glassdb-bench/**` crate above) and the non-frozen
+`crates/**/tests/` files are editable, subject to section B.
 
 Classify changed files by exact path against the list above. Fail closed only
 for this frozen set: if you cannot tell whether a changed file is one of the

@@ -18,15 +18,16 @@ and the `madsim` serializability fuzzer.
 | File | Role | Editable by the agent? |
 |------|------|------------------------|
 | [`program.md`](program.md) | The instructions the agent follows (the "brain") | No - the human edits this |
-| [`bench/`](bench) | Scoring harness crate (`autoresearch-bench`); defines the primary + secondary metrics | No (off-limits) |
+| [`crates/glassdb-bench`](../../crates/glassdb-bench) | Benchmark crate; the `autoresearch` binary is the scoring harness that defines the primary + secondary metrics | No (whole crate off-limits) |
 | [`check.sh`](check.sh) | Correctness gate (workspace tests + serializability fuzzer) | No (off-limits) |
 | [`evaluate.sh`](evaluate.sh) + [`evaluator.md`](evaluator.md) | Read-only judge sub-agent enforcing the off-limits set | No (off-limits) |
 | Verification/oracle tests (`crates/glassdb/src/sim.rs`, `crates/glassdb/tests/{concurrent_sim,proptest_concurrent,integration}.rs`, `crates/glassdb/benches/transactions.rs`, `fuzz/**`) | The correctness contract | No (off-limits) |
 | `log.md` | The running experiment log (the "morning log") | Yes - appended every experiment (kept or discarded) |
 | `baseline.json`, `best.json` | Baseline and best-kept scores (gitignored) | Yes - bookkeeping |
 
-The implementation files (everything under `crates/**/src/**`) are what the
-agent actually optimizes; changes may be large and span multiple files. The
+The implementation files (everything under `crates/**/src/**`, except the frozen
+`glassdb-bench` crate) are what the agent actually optimizes; changes may be
+large and span multiple files. The
 agent may also rewrite the **unit tests** that live alongside that code (inline
 `#[cfg(test)]` modules and non-frozen `crates/**/tests/` files) to match. Only
 the verification/oracle tests and the infrastructure above are frozen.
@@ -40,8 +41,8 @@ driver - object-storage round-trips. Secondary axes (memory, CPU/runtime) are
 tie-breakers. Lower is better.
 
 ```bash
-cargo run --release -p autoresearch-bench -- --json --count 3   # machine-readable median
-cargo run --release -p autoresearch-bench                       # human-readable table
+cargo run --release -p glassdb-bench --bin autoresearch -- --json --count 3   # machine-readable median
+cargo run --release -p glassdb-bench --bin autoresearch                       # human-readable table
 ```
 
 (Go's `mutexWaitNsPerTx` axis is dropped: Rust's std exposes no portable
