@@ -1,18 +1,28 @@
-//! A [`Backend`] decorator that injects deterministic, seeded faults for the
-//! deterministic-simulation harness, in place of network/node fault injection.
+//! A [`Backend`] decorator modelling a single client's faulty **transport** to
+//! the store, in place of network/node fault injection. Faults belong to the
+//! link between *one* client and the (shared) backend — not to the backend
+//! itself — so the harness wraps the shared store in one `FaultBackend` *per
+//! client*; one client's outage leaves the others able to reach storage and
+//! recover, exactly as a real node disconnect would.
 //!
-//! Three fault kinds are modeled, all preserving the harness invariant
-//! `acked <= final <= started`:
+//! Every operation can fault on **either side**, all preserving the harness
+//! invariant `acked <= final <= started`:
 //!
 //! - **delay**: a virtual latency before the operation (harmless to the bound);
-//! - **fail-before** (drop / transient error): the operation fails *without*
-//!   landing, so the engine surfaces an error and the op is left in-doubt;
-//! - **lost-ack**: a conditional write *lands* but its outcome is reported as
-//!   [`BackendError::Unavailable`] (unknown), modelling a lost acknowledgement.
+//! - **dropped request** (before landing): the request never reaches the store,
+//!   so the op fails without landing and the engine retries / leaves it in-doubt;
+//! - **lost ack** (after landing): the op *lands* at the store but the response
+//!   is lost, reported as [`BackendError::Unavailable`] (outcome unknown) — the
+//!   in-doubt case that drives commit-status / redrive recovery;
+//! - **outage**: a sustained, all-or-nothing window ([`down`](FaultBackend::down)
+//!   / [`heal`](FaultBackend::heal)) during which *every* op on this client's
+//!   transport faults (either side). One down/heal pair makes a whole correlated
+//!   outage deterministically reachable — the thing that drives lease expiry and
+//!   lock-lease recovery, which coincident independent rolls cannot do reliably.
 //!
-//! All randomness comes from a seed and all timing from [`rt::sleep`], so under
-//! the deterministic executor the whole fault schedule is a pure function of the
-//! seed and the task schedule, and a failing run reproduces exactly.
+//! All randomness comes from a seed/tape and all timing from [`rt::sleep`], so
+//! under the deterministic executor the whole fault schedule is a pure function
+//! of the input and the task schedule, and a failing run reproduces exactly.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,28 +34,33 @@ use glassdb_concurr::{Ctx, Tape};
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
 
-/// Probabilities (out of 256) of each fault kind, plus the maximum injected
-/// delay. A probability of zero disables that fault.
+/// Probabilities (out of 256) governing transport faults, plus the maximum
+/// injected delay. A probability of zero disables that behaviour.
 #[derive(Debug, Clone, Copy)]
 pub struct FaultOptions {
     /// Chance an operation is delayed before running.
     pub delay_prob: u8,
-    /// Chance an operation fails before landing (drop / transient error).
-    pub fail_before_prob: u8,
-    /// Chance a conditional write lands but reports its ack as lost.
+    /// Chance the transport faults an operation (drops it on one side or the
+    /// other).
+    pub fault_prob: u8,
+    /// Given a fault, the chance it happens *after* landing (the op reaches the
+    /// store but the ack is lost) rather than before. The remainder are dropped
+    /// requests that never land.
     pub lost_ack_prob: u8,
     /// Upper bound on an injected delay.
     pub max_delay: Duration,
 }
 
 impl FaultOptions {
-    /// Scales the fault probabilities by `intensity` (0 = none, 255 = max).
+    /// Scales the fault probabilities by `intensity` (0 = none, 255 = max). The
+    /// before/after split (`lost_ack_prob`) is intensity-independent: a dropped
+    /// link is roughly as likely to lose the request as the ack.
     pub fn from_intensity(intensity: u8) -> Self {
         let scale = |max: u8| ((max as u16 * intensity as u16) / 255) as u8;
         FaultOptions {
             delay_prob: scale(64),
-            fail_before_prob: scale(24),
-            lost_ack_prob: scale(24),
+            fault_prob: scale(24),
+            lost_ack_prob: 128,
             max_delay: Duration::from_millis(200),
         }
     }
@@ -57,9 +72,18 @@ impl Default for FaultOptions {
     }
 }
 
-/// A [`Backend`] decorator injecting faults while [active](Self::set_active).
-/// Faults are off until `set_active(true)`, so the harness can seed and verify
-/// without interference and inject faults only while the clients run.
+/// Where in an operation's lifecycle the transport drops it.
+enum Fault {
+    /// The request never reached the store (nothing landed).
+    Dropped,
+    /// The op landed at the store but its ack was lost (outcome unknown).
+    LostAck,
+}
+
+/// A per-client transport [`Backend`] decorator injecting faults while
+/// [active](Self::set_active). Faults are off until `set_active(true)`, so the
+/// harness can seed and verify over a perfect connection and inject faults only
+/// while the clients run.
 ///
 /// Fault decisions come from a [`Tape`]: the fuzzer can guide the *fault
 /// schedule* byte-for-byte, and with an empty tape the decisions fall back to a
@@ -69,6 +93,9 @@ pub struct FaultBackend {
     opts: FaultOptions,
     tape: Mutex<Tape>,
     active: AtomicBool,
+    /// Whether this client's transport is currently in a sustained outage
+    /// (all-or-nothing: every op faults until healed).
+    down: AtomicBool,
 }
 
 impl FaultBackend {
@@ -92,6 +119,7 @@ impl FaultBackend {
             opts,
             tape: Mutex::new(Tape::new(tape, seed)),
             active: AtomicBool::new(false),
+            down: AtomicBool::new(false),
         })
     }
 
@@ -105,21 +133,51 @@ impl FaultBackend {
         self.active.load(Ordering::SeqCst)
     }
 
-    /// Applies the pre-operation faults (delay then fail-before). Returns an
-    /// error if the operation should fail without landing.
-    async fn before(&self, ctx: &Ctx) -> Result<(), BackendError> {
+    /// Opens a sustained outage on this client's transport: every operation
+    /// faults (on either side) until [`heal`](Self::heal).
+    pub fn down(&self) {
+        self.down.store(true, Ordering::SeqCst);
+    }
+
+    /// Heals a previously [downed](Self::down) transport.
+    pub fn heal(&self) {
+        self.down.store(false, Ordering::SeqCst);
+    }
+
+    /// Runs `op` through the faulty transport: an optional delay, then either the
+    /// real call, a dropped request (no landing), or a landed call whose ack is
+    /// lost. During an outage every op faults.
+    async fn transport<T, Fut>(
+        &self,
+        ctx: &Ctx,
+        op: impl FnOnce() -> Fut,
+    ) -> Result<T, BackendError>
+    where
+        Fut: std::future::Future<Output = Result<T, BackendError>>,
+    {
         if !self.is_active() {
-            return Ok(());
+            return op().await;
         }
-        let delay = {
+        // Draw delay and the fault decision from the tape in one shot, so tape
+        // consumption is grouped per operation. An outage forces a fault.
+        let (delay, fault) = {
             let mut t = self.tape.lock().unwrap();
-            if t.roll(self.opts.delay_prob) {
+            let delay = if t.roll(self.opts.delay_prob) {
                 Some(Duration::from_nanos(
                     t.below(self.opts.max_delay.as_nanos() as u64 + 1),
                 ))
             } else {
                 None
-            }
+            };
+            let faulted = self.down.load(Ordering::SeqCst) || t.roll(self.opts.fault_prob);
+            let fault = faulted.then(|| {
+                if t.roll(self.opts.lost_ack_prob) {
+                    Fault::LostAck
+                } else {
+                    Fault::Dropped
+                }
+            });
+            (delay, fault)
         };
         if let Some(d) = delay {
             tokio::select! {
@@ -127,22 +185,21 @@ impl FaultBackend {
                 _ = rt::sleep(d) => {}
             }
         }
-        if self.tape.lock().unwrap().roll(self.opts.fail_before_prob) {
-            return Err(BackendError::Unavailable(
-                "injected transient backend fault".into(),
-            ));
+        match fault {
+            None => op().await,
+            Some(Fault::Dropped) => Err(BackendError::Unavailable(
+                "injected dropped request (lost before landing)".into(),
+            )),
+            // The op reaches the store; only a *successful* landing is reported
+            // as an in-doubt lost ack. A genuine error is returned as-is.
+            Some(Fault::LostAck) => match op().await {
+                Ok(_) => Err(BackendError::Unavailable(
+                    "injected lost ack (landed, ack lost)".into(),
+                )),
+                Err(e) => Err(e),
+            },
         }
-        Ok(())
     }
-
-    /// Decides whether a just-landed conditional write should report a lost ack.
-    fn lost_ack(&self) -> bool {
-        self.is_active() && self.tape.lock().unwrap().roll(self.opts.lost_ack_prob)
-    }
-}
-
-fn lost_ack_err(op: &str) -> BackendError {
-    BackendError::Unavailable(format!("injected lost ack on a landed {op}"))
 }
 
 #[async_trait]
@@ -153,20 +210,19 @@ impl Backend for FaultBackend {
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
-        self.before(ctx).await?;
-        self.inner
-            .read_if_modified(ctx, path, expected_writer)
-            .await
+        self.transport(ctx, || {
+            self.inner.read_if_modified(ctx, path, expected_writer)
+        })
+        .await
     }
 
     async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
-        self.before(ctx).await?;
-        self.inner.read(ctx, path).await
+        self.transport(ctx, || self.inner.read(ctx, path)).await
     }
 
     async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
-        self.before(ctx).await?;
-        self.inner.get_metadata(ctx, path).await
+        self.transport(ctx, || self.inner.get_metadata(ctx, path))
+            .await
     }
 
     async fn set_tags_if(
@@ -176,11 +232,8 @@ impl Backend for FaultBackend {
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.before(ctx).await?;
-        match self.inner.set_tags_if(ctx, path, expected, tags).await {
-            Ok(_) if self.lost_ack() => Err(lost_ack_err("set_tags_if")),
-            other => other,
-        }
+        self.transport(ctx, || self.inner.set_tags_if(ctx, path, expected, tags))
+            .await
     }
 
     async fn write(
@@ -190,9 +243,8 @@ impl Backend for FaultBackend {
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        // Unconditional overwrite: idempotent, so only delay/fail-before apply.
-        self.before(ctx).await?;
-        self.inner.write(ctx, path, value, tags).await
+        self.transport(ctx, || self.inner.write(ctx, path, value, tags))
+            .await
     }
 
     async fn write_if(
@@ -203,11 +255,10 @@ impl Backend for FaultBackend {
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.before(ctx).await?;
-        match self.inner.write_if(ctx, path, value, expected, tags).await {
-            Ok(_) if self.lost_ack() => Err(lost_ack_err("write_if")),
-            other => other,
-        }
+        self.transport(ctx, || {
+            self.inner.write_if(ctx, path, value, expected, tags)
+        })
+        .await
     }
 
     async fn write_if_not_exists(
@@ -217,16 +268,14 @@ impl Backend for FaultBackend {
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.before(ctx).await?;
-        match self.inner.write_if_not_exists(ctx, path, value, tags).await {
-            Ok(_) if self.lost_ack() => Err(lost_ack_err("write_if_not_exists")),
-            other => other,
-        }
+        self.transport(ctx, || {
+            self.inner.write_if_not_exists(ctx, path, value, tags)
+        })
+        .await
     }
 
     async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        self.before(ctx).await?;
-        self.inner.delete(ctx, path).await
+        self.transport(ctx, || self.inner.delete(ctx, path)).await
     }
 
     async fn delete_if(
@@ -235,16 +284,12 @@ impl Backend for FaultBackend {
         path: &str,
         expected: &Version,
     ) -> Result<(), BackendError> {
-        self.before(ctx).await?;
-        match self.inner.delete_if(ctx, path, expected).await {
-            Ok(()) if self.lost_ack() => Err(lost_ack_err("delete_if")),
-            other => other,
-        }
+        self.transport(ctx, || self.inner.delete_if(ctx, path, expected))
+            .await
     }
 
     async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.before(ctx).await?;
-        self.inner.list(ctx, dir_path).await
+        self.transport(ctx, || self.inner.list(ctx, dir_path)).await
     }
 }
 
@@ -289,6 +334,47 @@ mod tests {
         // A tape of low bytes keeps every roll under the threshold, so faults fire.
         let faults = run(vec![0u8; 64]).await.iter().filter(|ok| !**ok).count();
         assert!(faults > 0, "expected the low-byte tape to inject faults");
+    }
+
+    #[tokio::test]
+    async fn outage_downs_whole_transport_then_heals() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // Isolate the outage: disable the i.i.d. rolls, and force any fault to be
+        // a dropped request so the empty store is never written.
+        let opts = FaultOptions {
+            delay_prob: 0,
+            fault_prob: 0,
+            lost_ack_prob: 0,
+            max_delay: Duration::from_millis(0),
+        };
+        let fb = FaultBackend::new(mem, 1, opts);
+        let ctx = Ctx::background();
+        fb.set_active(true);
+
+        // While down, the transport is all-or-nothing: every op fails, whatever
+        // its path.
+        fb.down();
+        for i in 0..32 {
+            assert!(
+                matches!(
+                    fb.read(&ctx, &format!("p{i}")).await,
+                    Err(BackendError::Unavailable(_))
+                ),
+                "op {i} should fail during a transport outage"
+            );
+        }
+
+        // Healing restores the transport: reads now reach the (empty) store.
+        fb.heal();
+        for i in 0..32 {
+            assert!(
+                !matches!(
+                    fb.read(&ctx, &format!("p{i}")).await,
+                    Err(BackendError::Unavailable(_))
+                ),
+                "op {i} still outaged after heal"
+            );
+        }
     }
 
     #[tokio::test]

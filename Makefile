@@ -1,4 +1,4 @@
-.PHONY: test lint format build sim-test fuzz bench bench-score
+.PHONY: test lint format build sim-test fuzz fuzz-min bench bench-score
 
 build:
 	cargo build --workspace
@@ -57,3 +57,10 @@ FUZZ_JOBS ?= $(shell nproc)
 fuzz:
 	cd fuzz && RUSTFLAGS="--cfg sim" cargo +nightly fuzz run concurrent_tx -- \
 		-fork=$(FUZZ_JOBS)
+
+# Minimize the fuzz corpus: drop inputs that add no coverage, keeping the
+# smallest set that preserves the same reachable behavior. Run after a fuzzing
+# session (or before committing the corpus) to keep it small and fast to replay.
+# Same `--cfg sim` requirement as `fuzz` (see above).
+fuzz-min:
+	cd fuzz && RUSTFLAGS="--cfg sim" cargo +nightly fuzz cmin concurrent_tx

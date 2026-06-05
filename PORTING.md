@@ -236,9 +236,11 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   [ADR-010](docs/adr/010-fuzzer-coverage-guidance.md) for why guidance needs a
   tape). A `cargo-fuzz` target (`fuzz/`) turns libFuzzer bytes into
   `(seed, Workload, FaultConfig, schedule_tape, fault_tape)` — a second tape that
-  makes the fault schedule (delays/drops, crash timing) coverage-guidable too —
-  runs an N-client RMW mix on a shared `MemoryBackend`, and asserts the
-  serializability invariant. The
+  makes the fault schedule coverage-guidable too — runs an N-client RMW mix on a
+  shared `MemoryBackend`, where each client reaches the store over its own faulty
+  *transport* (delays, dropped-request / lost-ack faults on either side, and
+  sustained per-client outages) and crashed clients restart on the same backend,
+  and asserts the serializability invariant. The
   self-check additionally asserts that two same-tape/seed runs issue a
   **byte-for-byte identical backend-call stream** (`RecordingBackend` +
   `tests/concurrent_sim.rs`), which required the previously-deferred commit-path
