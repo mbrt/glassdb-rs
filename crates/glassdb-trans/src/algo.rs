@@ -455,7 +455,16 @@ impl Algo {
         if tx.data.writes.is_empty() {
             return self.validate_readonly(ctx, vstate, tx).await;
         }
-        if is_single_rw(&tx.data) {
+        // The single-RW fast path writes the value straight to the object,
+        // which *is* its commit point; it bypasses the lock/transaction-log
+        // protocol. That is only sound when this transaction holds no locks. A
+        // previous attempt retried with the same id (via `tx.reset`) may still
+        // hold locks it deliberately preserved; taking the fast path then would
+        // make the value durable and *then* have `commit_writes` try to
+        // finalize a log for those leftover locks, fail with `AlreadyFinalized`,
+        // and trigger a retry that applies the write a second time. Commit
+        // through the lock-based path instead.
+        if is_single_rw(&tx.data) && !self.locker.has_locks(&tx.id) {
             match self.commit_single_rw(ctx, tx).await {
                 Err(TransError::NoSingleWrite) | Err(TransError::Retry) => {
                     // Fall back to regular validation, acquiring locks early.

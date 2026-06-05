@@ -65,11 +65,14 @@ builds without madsim):
   implementation that forwards each call as an RPC. madsim's network *drops*
   clogged/partitioned packets, so `NetBackend` retries with a fixed sequence
   number and `serve_backend` deduplicates by `(client_id, seq)`, giving
-  at-most-once semantics (a retried call is applied once);
+  at-most-once semantics (a retried call is applied once). Retries are *bounded*
+  (`MAX_ATTEMPTS`, mirroring a real object-store client's adaptive retryer): a
+  brief fault appears as latency, but a sustained outage exhausts the budget and
+  surfaces a transient error that fails the transaction in-doubt;
 - a **nemesis node** drives a seeded sequence of faults via `NetSim`/`Handle`
-  (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), always
-  healing transient faults and leaving the storage node up (it models durable
-  cloud storage); and
+  (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), eventually
+  healing every network fault (some long enough to outlast the retry budget) and
+  leaving the storage node up (it models durable cloud storage); and
 - a **verifier node** reads every key with `read_strong` (which drives recovery
   of any crashed client's locks via virtual-time lease expiry) and checks the
   invariant.
@@ -83,10 +86,12 @@ per-key counters in shared state: `started[k]` (increments that entered a
 `acked[k] <= final[k] <= started[k]` (plus the read-only `v >= 0` checks). An
 acked commit is durable (`acked <= final`); every committed increment came from
 some started op committing at most once (`final <= started`). The harness never
-retries an op itself, so a crash leaves its in-flight increment in-doubt
-(counted in `started`, not `acked`). With `FaultConfig` disabled,
-`started == acked == final == expected`, so the original exact check is also
-asserted.
+retries an op itself, so an increment is left in-doubt (counted in `started`, not
+`acked`) when a client crashes mid-commit or a sustained outage exhausts
+`NetBackend`'s retry budget and fails the transaction; the dedup cache still
+guarantees each in-doubt op applied zero or one times. With `FaultConfig`
+disabled, `started == acked == final == expected`, so the original exact check is
+also asserted.
 
 ### Integration
 
