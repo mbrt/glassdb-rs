@@ -113,3 +113,69 @@ Each entry looks like:
 - Outcome & why: primary within noise + stable deterministic alloc/allocBytes reduction, no regression -> kept. The String sinks cap the upside (still materialized for locks/log), but eliminating the dedup-map double clone is a clean structural win on read paths.
 - Commit: c9154fd
 
+## 10. Build validation state by merging sorted accesses (no HashMap) - KEPT
+- Hypothesis: `init_validation` allocates a per-transaction `HashMap<Arc<str>, PathState>` and then re-sorts its values. But `collect_accesses` already emits reads and writes sorted and unique by path (ADR-008), so the two runs can be merged directly into a path-sorted `PathState` list - dropping the HashMap's backing allocation (sizeable for batchWrite100's 100-key map), its hashing, and the separate sort. Cross-cutting: every transaction builds a validation state.
+- Change: `glassdb-trans/algo.rs` - replace the HashMap build + sort in `init_validation` with a two-pointer merge of `h.data.reads`/`h.data.writes`; equal paths merge into one entry (read+write), preserving the exact deduplicated, path-sorted order.
+- Correctness: fast gate PASS; judge APPROVED; full gate PASS (make test + sim-test + 120s fuzz, 8920 runs, no crash). Output order/content identical to the HashMap+sort version given sorted, unique inputs (guaranteed by collect_accesses / ADR-008); the deterministic sim-test would catch any order drift.
+- Primary: 403.66 -> 403.97 (+0.07%, flat/noise; op counts unchanged).
+- Secondary (stable across 3 runs; ns/cpu medianed over extra samples to filter spikes): allocBytesPerTx 48278 -> ~45600 (-5.5%; the HashMap backing array is a big byte allocation), allocsPerTx -1.1% (multiRMW -3.0%), nsPerTx ~-4%, cpuNsPerTx flat-to-down. No axis regressed.
+- Outcome & why: primary within noise + a clear, stable allocBytes drop (-5.5%) plus lower allocs/ns and flat cpu -> meets the secondary keep rule. Kept. Lesson: allocation *bytes* can move far more than allocation *count* when the eliminated allocation is one large buffer (a HashMap's bucket array) rather than many small ones.
+- Commit: 4f56e36
+
+## 11. Re-attempt encode_lockers (build locked-by in one allocation) - DISCARDED
+- Hypothesis: exp4's `encode_lockers` (avoid the intermediate `Vec<String>` + `join` for the `locked-by` tag) was discarded at the old baseline as sub-noise. With the baseline now ~2x lower (allocs 846 -> 461 after exp5-10), the same fixed per-op saving is a larger fraction, so re-test whether it now clearly registers.
+- Change: same as exp4 - `glassdb-storage/locker.rs` `apply_lock_tags` builds the `locked-by` value via a single-pass `encode_lockers(&update.lockers)` instead of `iter().map(tid_to_tag).collect::<Vec<_>>().join(",")`.
+- Correctness: fast gate PASS (full gate not run; discarded on measurement).
+- Primary: 403.94 -> 403.68 (flat/noise).
+- Secondary (median of 3, plus 5 extra ns/cpu samples): allocsPerTx -0.54% (only batchWrite100 -1.4%, because unlock ops have an empty locker list and already produced an empty string), allocBytesPerTx flat (-0.07%), nsPerTx/cpuNsPerTx medians lower (~-5 to -8%) but fully within the baseline's own run-to-run variance (ns seen 26-36k, cpu 37-53k on the *unchanged* code too).
+- Outcome & why: no axis *clearly* improves beyond noise - allocs/allocBytes are flat-ish and the ns/cpu medians overlap baseline variance, so the apparent ns/cpu win cannot be attributed to the change. Same conclusion as exp4. Discarded (correct, but below the noise floor). Confirms the standing lesson: single-allocation lock-tag tweaks don't register; only structural per-op clone elimination (exp5/8/9) or removing a large buffer (exp10) does.
+- Commit: n/a (reverted)
+
+---
+
+## Final summary
+
+Budget: ran until the 3-hour wall clock; 11 experiments total (9 kept, 2 discarded).
+Every kept change passed the full correctness gate (`check.sh --full`: build +
+`make test` + sim-test + 120s `concurrent_tx` fuzz) and the test-integrity judge,
+and only edited allowed implementation files. Strict serializability was never
+weakened: every kept change is either a backend-op-count reduction proven safe by
+the existing oracle/fuzzer (exp1-2) or a pure representation/allocation refactor
+that leaves the protocol, op stream, and value semantics identical (exp3, 5-10).
+
+Cumulative results vs the recorded baseline (median of runs):
+
+| Metric            | Baseline | Final  | Change  |
+|-------------------|---------:|-------:|--------:|
+| Primary score     |   434.95 | 404.18 |  -7.1%  |
+| allocsPerTx       |    907.2 |  461.5 | -49.1%  |
+| allocBytesPerTx   |    80409 |  45624 | -43.3%  |
+| nsPerTx           |    41129 |  29554 | -28.1%  |
+| cpuNsPerTx        |    62559 |  46871 | -25.1%  |
+
+Kept experiments:
+1. Skip redundant metadata read on the create-lock path (primary -3.4%).
+2. Route blind writes through create-or-write under a collection lock (primary -3.9%).
+3. Drop redundant per-transaction `Data` clones on the commit path (secondary allocs).
+5. Share cached metadata via `Arc<Metadata>` (allocs -28%).
+6. Move value/version out of the owned cache entry on read (allocs -3%).
+7. Avoid cloning the whole `paths` vector in parallel validation (allocs -3%).
+8. Back `TxId` with `Arc<[u8]>` so clones are refcount bumps (allocs -14%).
+9. Store transaction access paths as `Arc<str>` (allocs -4%).
+10. Build validation state by merging sorted accesses, no per-tx `HashMap` (allocBytes -5.5%).
+
+Discarded: exp4 and exp11 (the same `encode_lockers` lock-tag tweak, both times
+below the geomean noise floor).
+
+What worked and why: the primary score hit a protocol floor after exp1-2 - further
+backend-op reductions would need create-value or log-elision changes whose
+serializability the current fuzzer/oracle can't adequately certify, so they were
+deliberately not attempted (correctness-first). The large, durable wins all came
+from one pattern: find a value that is *cloned on nearly every operation* and make
+the clone cheap. `Metadata` tag maps (exp5), `TxId` bytes (exp8), and access paths
+(exp9) each clear the measurement noise easily; removing one large per-tx buffer -
+the validation `HashMap` (exp10) - moved allocation *bytes* the most. Conversely,
+shaving a single small allocation per op (exp4/11) never rose above noise. ns/cpu
+proved noisy enough (±10-15%) to spike on single runs, so every surprising
+secondary delta was re-measured before deciding.
+
