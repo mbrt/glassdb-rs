@@ -124,10 +124,18 @@ flowchart TD
   monitor's clock follows the same virtual time.
 - **Fault injection at the `Backend` trait** (replaces the madsim network nemesis).
   [`FaultBackend`](../../crates/glassdb-backend/src/middleware/fault.rs) is a
-  reusable middleware that injects seeded delay / fail-before / lost-ack, all
-  preserving `acked <= final <= started`; a client "crash" is a `Ctx` cancel at an
-  await point. The [`RecordingBackend`](../../crates/glassdb-backend/src/middleware/recording.rs)
+  reusable middleware that injects delay / fail-before / lost-ack, all preserving
+  `acked <= final <= started`; a client "crash" is a `Ctx` cancel at an await
+  point. The [`RecordingBackend`](../../crates/glassdb-backend/src/middleware/recording.rs)
   op-stream self-check is unchanged.
+- **Tape-guided fault schedule.** Fault decisions are drawn from a
+  [`Tape`](../../crates/glassdb-concurr/src/tape.rs) — a byte cursor that consumes
+  fuzzer bytes and falls back to a seeded PRNG once they run out — so the *fault*
+  schedule (which backend ops are delayed/dropped, when clients crash) is
+  coverage-guidable the same way interleavings are, instead of merely
+  seed-sampled (the residual ADR-010 gap). The fuzzer supplies a dedicated fault
+  tape, split disjointly between the backend and the crash nemesis; an empty tape
+  reduces to pure seed-breadth sampling (PCT runs).
 - **Harness** ([`sim.rs`](../../crates/glassdb/src/sim.rs)). Clients run as
   executor-spawned tasks over a shared in-process `MemoryBackend` wrapped in
   `FaultBackend`/`RecordingBackend`; the acked-bounds invariant (ADR-008) is kept.
@@ -136,8 +144,9 @@ flowchart TD
   seed-breadth run mode (`pct_assert` / `pct_record` / `pct_sweep`) lives behind
   `#[cfg(sim)]`.
 - **Fuzz target** ([`fuzz/fuzz_targets/concurrent_tx.rs`](../../fuzz/fuzz_targets/concurrent_tx.rs)).
-  Input bytes → `(rng_seed, Workload, FaultConfig, schedule_tape)`; runs on the
-  executor under a `TapeScheduler`. No `madsim`; crash-file reproduction unchanged.
+  Input bytes → `(rng_seed, Workload, FaultConfig, schedule_tape, fault_tape)`
+  (the trailing bytes are halved into the two tapes); runs on the executor under a
+  `TapeScheduler`. No `madsim`; crash-file reproduction unchanged.
 
 ### Build / cleanup
 
@@ -153,8 +162,9 @@ flowchart TD
   the deliberate trade for zero external runtime deps. `tokio` is unchanged in
   production and the swap is entirely behind `--cfg sim`, so library users are
   unaffected.
-- **Interleavings are now guidable and smartly sampled.** The schedule-tape gives
-  libFuzzer a local gradient over orderings (the ADR-010 gap); PCT adds a
+- **Interleavings and faults are now guidable and smartly sampled.** The
+  schedule-tape gives libFuzzer a local gradient over orderings, and the fault
+  tape extends that gradient to the fault schedule (both ADR-010 gaps); PCT adds a
   principled seed-breadth sweep. Both replay byte-for-byte from their input.
 - **Faults are simpler and more portable.** Fault injection is a `Backend`
   middleware that also runs under plain `tokio` tests, instead of a madsim-only

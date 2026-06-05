@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::rt;
-use glassdb_concurr::{Ctx, Rng};
+use glassdb_concurr::{Ctx, Tape};
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
 
@@ -57,31 +57,40 @@ impl Default for FaultOptions {
     }
 }
 
-/// Returns true with probability `prob/256` (a fault-injection coin flip),
-/// drawing one value from `rng`. Kept local because the `& 0xff < prob`
-/// convention is specific to this middleware's `FaultOptions`.
-fn roll(rng: &mut Rng, prob: u8) -> bool {
-    prob != 0 && (rng.next_u64() & 0xff) < prob as u64
-}
-
-/// A [`Backend`] decorator injecting seeded faults while [active](Self::set_active).
+/// A [`Backend`] decorator injecting faults while [active](Self::set_active).
 /// Faults are off until `set_active(true)`, so the harness can seed and verify
 /// without interference and inject faults only while the clients run.
+///
+/// Fault decisions come from a [`Tape`]: the fuzzer can guide the *fault
+/// schedule* byte-for-byte, and with an empty tape the decisions fall back to a
+/// seeded PRNG (pure seed-breadth sampling, e.g. PCT runs).
 pub struct FaultBackend {
     inner: Arc<dyn Backend>,
     opts: FaultOptions,
-    rng: Mutex<Rng>,
+    tape: Mutex<Tape>,
     active: AtomicBool,
 }
 
 impl FaultBackend {
-    /// Wraps `inner` with a fault injector seeded by `seed`. Faults start
-    /// disabled.
+    /// Wraps `inner` with a fault injector whose decisions are a pure function of
+    /// `seed`. Faults start disabled.
     pub fn new(inner: Arc<dyn Backend>, seed: u64, opts: FaultOptions) -> Arc<Self> {
+        Self::with_tape(inner, Vec::new(), seed, opts)
+    }
+
+    /// Wraps `inner` with a fault injector that draws decisions from `tape`
+    /// first, then from a PRNG seeded by `seed` once the tape is exhausted.
+    /// Faults start disabled.
+    pub fn with_tape(
+        inner: Arc<dyn Backend>,
+        tape: Vec<u8>,
+        seed: u64,
+        opts: FaultOptions,
+    ) -> Arc<Self> {
         Arc::new(FaultBackend {
             inner,
             opts,
-            rng: Mutex::new(Rng::new(seed)),
+            tape: Mutex::new(Tape::new(tape, seed)),
             active: AtomicBool::new(false),
         })
     }
@@ -103,10 +112,10 @@ impl FaultBackend {
             return Ok(());
         }
         let delay = {
-            let mut r = self.rng.lock().unwrap();
-            if roll(&mut r, self.opts.delay_prob) {
+            let mut t = self.tape.lock().unwrap();
+            if t.roll(self.opts.delay_prob) {
                 Some(Duration::from_nanos(
-                    r.below(self.opts.max_delay.as_nanos() as u64 + 1),
+                    t.below(self.opts.max_delay.as_nanos() as u64 + 1),
                 ))
             } else {
                 None
@@ -118,7 +127,7 @@ impl FaultBackend {
                 _ = rt::sleep(d) => {}
             }
         }
-        if roll(&mut self.rng.lock().unwrap(), self.opts.fail_before_prob) {
+        if self.tape.lock().unwrap().roll(self.opts.fail_before_prob) {
             return Err(BackendError::Unavailable(
                 "injected transient backend fault".into(),
             ));
@@ -128,7 +137,7 @@ impl FaultBackend {
 
     /// Decides whether a just-landed conditional write should report a lost ack.
     fn lost_ack(&self) -> bool {
-        self.is_active() && roll(&mut self.rng.lock().unwrap(), self.opts.lost_ack_prob)
+        self.is_active() && self.tape.lock().unwrap().roll(self.opts.lost_ack_prob)
     }
 }
 
@@ -258,13 +267,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_seed_same_fault_sequence() {
-        fn decisions(seed: u64) -> Vec<bool> {
-            let mut r = Rng::new(seed);
-            (0..32).map(|_| roll(&mut r, 128)).collect()
+    async fn fault_tape_guides_injection() {
+        async fn run(tape: Vec<u8>) -> Vec<bool> {
+            let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let fb = FaultBackend::with_tape(mem, tape, 7, FaultOptions::from_intensity(255));
+            let ctx = Ctx::background();
+            fb.set_active(true);
+            let mut outcomes = Vec::new();
+            for i in 0..32 {
+                let ok = fb
+                    .write_if_not_exists(&ctx, &format!("k{i}"), b"v".to_vec(), Tags::new())
+                    .await
+                    .is_ok();
+                outcomes.push(ok);
+            }
+            outcomes
         }
-        assert_eq!(decisions(42), decisions(42));
-        assert_ne!(decisions(42), decisions(43));
+        // A given fault tape yields a byte-for-byte reproducible outcome.
+        let tape: Vec<u8> = (0..64u16).map(|b| b as u8).collect();
+        assert_eq!(run(tape.clone()).await, run(tape).await);
+        // A tape of low bytes keeps every roll under the threshold, so faults fire.
+        let faults = run(vec![0u8; 64]).await.iter().filter(|ok| !**ok).count();
+        assert!(faults > 0, "expected the low-byte tape to inject faults");
     }
 
     #[tokio::test]
