@@ -86,3 +86,12 @@ Each entry looks like:
 - Outcome & why: primary within noise + a stable, deterministic alloc-count drop on the read workloads plus lower ns/cpu, no regression -> meets the secondary keep rule. Kept. allocBytes staying flat confirms the win is allocation *count* (small objects), which still lowers allocator/CPU pressure.
 - Commit: 9be594b
 
+## 7. Avoid cloning the whole paths vector in parallel validation - KEPT
+- Hypothesis: `validate_readonly` and `lock_validate` do `let inputs = vstate.paths.clone()` (clones the whole `Vec<PathState>`) and then `inputs[i].clone()` inside `run_indexed`, copying every PathState (path String + read_version) twice per transaction. The first clone exists only to satisfy borrowing; the closure can borrow `vstate.paths` directly and clone each item once (still needed to own the mutable item in each concurrent future). Halves PathState clones; hits every validating/locking tx (batchRead10 10 paths, multiRMW 10, batchWrite100 100).
+- Change: `glassdb-trans/algo.rs` - both functions now `let paths = &vstate.paths;` and clone `paths[i]` in the closure; the write-back loop afterwards still mutates `vstate.paths` (NLL ends the borrow when `run_indexed` returns).
+- Correctness: fast gate PASS; judge APPROVED; full gate PASS (make test + sim-test + 120s fuzz, 8369 runs, no crash). Identical processing: each item is cloned, validated/locked, and written back exactly as before; only the redundant whole-vector copy is removed.
+- Primary: 404.29 -> ~404 (-0.07%, flat/noise; op counts unchanged).
+- Secondary: allocsPerTx 586.3 -> ~571 (-2.6%; deterministic per-workload batchRead10 -5.2%, readRepeat -6.1%, multiRMW -2.6%, batchWrite100 -0.6%), allocBytesPerTx -1.3%, ns/cpu flat (one initial measurement spiked +14% on ns/cpu but 3 re-measurements showed flat-to-down; transient machine noise, not the change - removing a clone cannot add CPU work). No axis regressed.
+- Outcome & why: primary within noise + stable deterministic alloc-count reduction, no regression -> kept. Lesson: ns/cpu are noisy enough to spike ~15% on a single run; always re-measure a surprising secondary regression before discarding (or keeping).
+- Commit: a5efe31
+

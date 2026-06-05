@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 /// Fills `b` with random bytes.
 ///
@@ -34,8 +35,12 @@ const TX_ID_TS_OFF: usize = 8;
 ///
 /// A `TxId` can also hold an arbitrary byte sequence (e.g. when decoded from a
 /// storage tag).
+///
+/// The bytes are stored behind an `Arc` so that cloning an id - which happens
+/// pervasively (lockers, last-writer versions, cache entries, every commit) -
+/// is a refcount bump rather than a heap allocation and copy.
 #[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TxId(Vec<u8>);
+pub struct TxId(Arc<[u8]>);
 
 impl TxId {
     /// Generates a new random 128-bit transaction ID.
@@ -47,7 +52,7 @@ impl TxId {
     pub fn new_random() -> Self {
         let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b);
-        TxId(b)
+        TxId(b.into())
     }
 
     /// Builds a transaction ID from a random prefix and an explicit UnixNano
@@ -56,7 +61,7 @@ impl TxId {
         let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
-        TxId(b)
+        TxId(b.into())
     }
 
     /// Builds a transaction ID from an explicit timestamp and random prefix.
@@ -67,7 +72,7 @@ impl TxId {
         let n = prefix.len().min(TX_ID_TS_OFF);
         b[..n].copy_from_slice(&prefix[..n]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
-        TxId(b)
+        TxId(b.into())
     }
 
     /// Returns a transaction ID that preserves the priority (timestamp) of
@@ -78,7 +83,7 @@ impl TxId {
         let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
-        TxId(b)
+        TxId(b.into())
     }
 
     /// Reports whether `self` has strictly higher priority than `other`, i.e. it
@@ -109,7 +114,8 @@ impl TxId {
 
     /// Wraps raw bytes as a transaction ID.
     pub fn from_bytes(b: impl Into<Vec<u8>>) -> Self {
-        TxId(b.into())
+        let v: Vec<u8> = b.into();
+        TxId(v.into())
     }
 
     /// Returns the raw bytes of the ID.
@@ -119,7 +125,7 @@ impl TxId {
 
     /// Consumes the ID and returns the owned bytes.
     pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        self.0.to_vec()
     }
 
     /// Reports whether the ID is empty (the nil transaction).
@@ -135,7 +141,7 @@ impl TxId {
 
 impl fmt::Display for TxId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in &self.0 {
+        for b in self.0.iter() {
             write!(f, "{b:02x}")?;
         }
         Ok(())
@@ -150,7 +156,7 @@ impl fmt::Debug for TxId {
 
 impl From<Vec<u8>> for TxId {
     fn from(b: Vec<u8>) -> Self {
-        TxId(b)
+        TxId(b.into())
     }
 }
 
