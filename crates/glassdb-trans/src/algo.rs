@@ -579,11 +579,11 @@ impl Algo {
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
-        let inputs = vstate.paths.clone();
-        let n = inputs.len();
+        let paths = &vstate.paths;
+        let n = paths.len();
         let (outs, err) = self
             .run_indexed(ctx, n, |ctx, i| {
-                let mut item = inputs[i].clone();
+                let mut item = paths[i].clone();
                 async move {
                     if item.not_found {
                         self.validate_read_not_found(&ctx, &mut item).await?;
@@ -957,11 +957,11 @@ impl Algo {
         vstate: &mut ValidationState,
         tx: &Handle,
     ) -> Result<(), TransError> {
-        let inputs = vstate.paths.clone();
-        let n = inputs.len();
+        let paths = &vstate.paths;
+        let n = paths.len();
         let (outs, err) = self
             .run_indexed(ctx, n, |ctx, i| {
-                let mut item = inputs[i].clone();
+                let mut item = paths[i].clone();
                 async move {
                     self.lock_validate_key(&ctx, &mut item, tx).await?;
                     Ok(item)

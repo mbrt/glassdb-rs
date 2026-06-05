@@ -77,3 +77,12 @@ Each entry looks like:
 - Outcome & why: primary within noise + a large, stable, deterministic drop on every secondary axis and every workload -> easily meets the secondary keep rule. Kept. The win was far bigger than estimated because the Arc also removes deep clones on cache reads (`get_meta`) and on the cache's internal `CacheEntry` clones, not just the write-through path. Lesson vs exp4: structural changes that hit a clone on every op clear the noise floor; per-call micro-tweaks do not.
 - Commit: 76da079
 
+## 6. Move value/version out of the owned cache entry on read - KEPT
+- Hypothesis: `Cache::get` already returns an owned (cloned) `CacheEntry`, yet `Local::read` then re-clones the value and version (`v.value.clone()`, `v.version.clone()`) and `get_meta` re-clones the metadata. The version clone is itself 2 allocs (token String + writer). Moving the fields out of the owned entry instead removes ~3 allocs per cached read - hits batchRead10 (10 reads/tx) and readRepeat (1/tx).
+- Change: `glassdb-storage/local.rs` - in `read`/`get_meta`, compute the `outdated` flag first (it borrows the entry), then move `e.v`/`e.m` out (`let v = e.v?;`) and move the fields into the result instead of cloning.
+- Correctness: fast gate PASS; judge APPROVED; full gate PASS (make test + sim-test + 120s fuzz, 8687 runs, no crash). Semantically identical: same value/version/outdated returned; only copies elided on an owned temporary.
+- Primary: 403.92 -> 404.29 (+0.09%, flat/noise; op counts unchanged).
+- Secondary (stable across 3 measurements): allocsPerTx 605.5 -> 586.3 (-3.2%; deterministic per-workload batchRead10 430->400 = -7.1%, readRepeat 56.7->53.9 = -4.9%), nsPerTx -5.6%, cpuNsPerTx -8.2%, allocBytesPerTx flat (-0.1%; the elided value/version are small in these workloads, so byte count barely moves). No axis regressed.
+- Outcome & why: primary within noise + a stable, deterministic alloc-count drop on the read workloads plus lower ns/cpu, no regression -> meets the secondary keep rule. Kept. allocBytes staying flat confirms the win is allocation *count* (small objects), which still lowers allocator/CPU pressure.
+- Commit: 9be594b
+
