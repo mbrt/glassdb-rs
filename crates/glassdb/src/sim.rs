@@ -15,10 +15,10 @@
 //! commit returned `Ok`. An increment is left in-doubt (counted in `started`,
 //! not `acked`) when a client crashes mid-commit or a sustained network outage
 //! exhausts NetBackend's retry budget and fails the transaction; the bound
-//! tolerates both while still catching lost or fabricated writes (the dedup
-//! cache guarantees each in-doubt op applied zero or one times). With faults
-//! disabled the three are equal, recovering the original exact invariant.
-//! [`run_and_record`] also
+//! tolerates both while still catching lost or fabricated writes (conditional
+//! writes keep each in-doubt op applied at most once, even when a retry
+//! re-delivers it). With faults disabled the three are equal, recovering the
+//! original exact invariant. [`run_and_record`] also
 //! captures the ordered stream of backend operations so two same-seed runs can
 //! be compared byte-for-byte (see the `concurrent_sim` self-check and ADR-008).
 
@@ -371,19 +371,18 @@ async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
 const SERVER_ADDR: &str = "10.0.0.1:9000";
 
 /// Opens a [`DB`] backed by a fresh network client bound to `ip`, talking to the
-/// storage node. `client_id` must be unique so the server's at-most-once dedup
-/// never conflates two clients. Open performs backend I/O, so it can fail if a
-/// sustained network fault is active; callers that run while the nemesis is live
-/// must tolerate the error.
+/// storage node. Open performs backend I/O, so it can fail if a sustained
+/// network fault is active; callers that run while the nemesis is live must
+/// tolerate the error.
 #[cfg(madsim)]
-async fn open_net_db(ip: IpAddr, client_id: u64) -> Result<(DB, Ctx), Error> {
+async fn open_net_db(ip: IpAddr) -> Result<(DB, Ctx), Error> {
     let ep = Arc::new(
         Endpoint::bind(format!("{ip}:0"))
             .await
             .expect("bind client endpoint"),
     );
     let server: SocketAddr = SERVER_ADDR.parse().unwrap();
-    let backend: Arc<dyn Backend> = Arc::new(NetBackend::new(ep, server, client_id));
+    let backend: Arc<dyn Backend> = Arc::new(NetBackend::new(ep, server));
     let ctx = Ctx::background();
     let db = DB::open_with(&ctx, DB_NAME, backend, deterministic_options()).await?;
     Ok((db, ctx))
@@ -411,9 +410,9 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
             serve_backend(&ep, storage);
             ready.store(true, Ordering::SeqCst);
             // Keep the endpoint (and the bound socket) alive until the harness
-            // signals shutdown, then drop it so the RPC handler, the backend,
-            // and the dedup cache are released. Parking it forever would leak
-            // those allocations (the fuzzer runs under a leak sanitizer).
+            // signals shutdown, then drop it so the RPC handler and the backend
+            // are released. Parking it forever would leak those allocations (the
+            // fuzzer runs under a leak sanitizer).
             let _ = shutdown_rx.await;
         })
     };
@@ -434,7 +433,7 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
         .spawn(async move {
             // The nemesis has not started yet, so open and seed cannot hit a
             // fault; treat any failure here as a harness bug.
-            let (db, ctx) = open_net_db("10.0.0.2".parse().unwrap(), 0)
+            let (db, ctx) = open_net_db("10.0.0.2".parse().unwrap())
                 .await
                 .expect("open init db");
             let coll = db.collection(COLLECTION);
@@ -466,11 +465,10 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
         all_nodes.push(node.id());
         let ops = ops.clone();
         let acct = acct.clone();
-        let client_id = (i + 1) as u64;
         client_handles.push(node.spawn(async move {
             // A sustained outage can make open itself fail; that client simply
             // does no work (no increments started), which the bound tolerates.
-            let Ok((db, ctx)) = open_net_db(ip, client_id).await else {
+            let Ok((db, ctx)) = open_net_db(ip).await else {
                 return;
             };
             let coll = db.collection(COLLECTION);
@@ -515,13 +513,12 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
 
     // Verifier node: read every key's final value (driving recovery of any
     // crashed client's locks via lease expiry) and check the invariant.
-    let verifier_id = (workload.clients.len() + 1) as u64;
     let verifier_node = handle.create_node().ip("10.0.0.3".parse().unwrap()).build();
     all_nodes.push(verifier_node.id());
     let finals = verifier_node
         .spawn(async move {
             // All faults are healed before the verifier runs, so open is safe.
-            let (db, ctx) = open_net_db("10.0.0.3".parse().unwrap(), verifier_id)
+            let (db, ctx) = open_net_db("10.0.0.3".parse().unwrap())
                 .await
                 .expect("open verifier db");
             let coll = db.collection(COLLECTION);
@@ -541,7 +538,7 @@ async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: Fault
         .expect("verifier task");
 
     // Shut the storage server down and join it so its endpoint, RPC handler,
-    // backend, and dedup cache are all released before the run ends.
+    // and backend are all released before the run ends.
     let _ = shutdown_tx.send(());
     let _ = storage_task.await;
 
