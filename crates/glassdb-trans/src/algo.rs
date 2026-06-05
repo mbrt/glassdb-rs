@@ -347,11 +347,11 @@ impl Algo {
     /// (timestamp) while minting a fresh log identity. Reusing the original
     /// priority prevents a restarted transaction from being starved by an
     /// endless stream of younger peers.
-    pub fn rebegin(&self, old: &Handle, d: Data) -> Handle {
+    pub fn rebegin(&self, old: Handle) -> Handle {
         Handle {
-            data: d,
-            status: Status::New,
             id: old.id.renew(),
+            data: old.data,
+            status: Status::New,
             require_locks: false,
             serial_locking: false,
         }
@@ -383,8 +383,7 @@ impl Algo {
             }
         }
 
-        let writes = tx.data.writes.clone();
-        if let Err(e) = self.commit_writes(ctx, &writes, &tx.id).await {
+        if let Err(e) = self.commit_writes(ctx, &tx.data.writes, &tx.id).await {
             if matches!(e, TransError::AlreadyFinalized) {
                 // The log was already finalized as aborted: we were wounded (or
                 // reclaimed as expired) between validation and commit.
