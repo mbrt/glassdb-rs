@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use glassdb_backend::{
@@ -124,6 +125,41 @@ impl S3Backend {
         }
     }
 
+    /// Issues a single PutObject with the given retryer, returning the new
+    /// version on success or the raw SDK error to be classified by the caller.
+    async fn send_put(
+        &self,
+        ctx: &Ctx,
+        path: &str,
+        payload: &[u8],
+        metadata: &Option<HashMap<String, String>>,
+        conds: &PutConds,
+        retry: RetryConfig,
+    ) -> PutAttempt {
+        let mut op = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .body(ByteStream::from(payload.to_vec()))
+            .set_metadata(metadata.clone());
+        if let Some(m) = &conds.if_match {
+            op = op.if_match(m);
+        }
+        if conds.if_none_match {
+            op = op.if_none_match("*");
+        }
+        let cfg = aws_sdk_s3::config::Builder::default().retry_config(retry);
+        let send = op.customize().config_override(cfg).send();
+        tokio::select! {
+            _ = ctx.cancelled() => PutAttempt::Cancelled,
+            r = send => match r {
+                Ok(out) => PutAttempt::Ok(version_from_etag(out.e_tag())),
+                Err(e) => PutAttempt::Err(Box::new(e)),
+            },
+        }
+    }
+
     async fn put(
         &self,
         ctx: &Ctx,
@@ -146,51 +182,91 @@ impl S3Backend {
         } else {
             Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         };
+        let conditional = conds.if_match.is_some() || conds.if_none_match;
 
-        // Two retry layers compose: the SDK retryer rides out throttling/5xx
-        // within each PutObject, while this loop re-issues on 409
-        // ConditionalRequestConflict (which the SDK does not retry).
+        if !conditional {
+            // An unconditional overwrite is idempotent (the nonce only changes
+            // the ETag), so the SDK's adaptive retryer may ride out
+            // throttling/transient failures transparently: re-applying is
+            // harmless.
+            return match self
+                .send_put(ctx, path, &payload, &metadata, &conds, self.retry.clone())
+                .await
+            {
+                PutAttempt::Ok(version) => Ok(Metadata { tags, version }),
+                PutAttempt::Cancelled => Err(BackendError::Cancelled),
+                PutAttempt::Err(e) => Err(annotate("Write", path, *e)),
+            };
+        }
+
+        // A conditional write is NOT idempotent under retry: if an attempt lands
+        // but its acknowledgement is lost, a re-send sees its own write and
+        // returns a precondition failure indistinguishable from a real conflict.
+        // We therefore disable the SDK retryer and own the loop, so we can taint
+        // such a precondition as in-doubt instead of reporting a confident
+        // conflict (which the engine would retry into a double-apply). See
+        // ADR-009.
+        let mut lost = false;
         let mut attempt: u32 = 0;
         loop {
-            let mut op = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .body(ByteStream::from(payload.clone()))
-                .set_metadata(metadata.clone());
-            if let Some(m) = &conds.if_match {
-                op = op.if_match(m);
-            }
-            if conds.if_none_match {
-                op = op.if_none_match("*");
-            }
-            let send = op.customize().config_override(self.overrides()).send();
-            let res = tokio::select! {
-                _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                r = send => r,
+            let e = match self
+                .send_put(
+                    ctx,
+                    path,
+                    &payload,
+                    &metadata,
+                    &conds,
+                    RetryConfig::disabled(),
+                )
+                .await
+            {
+                PutAttempt::Ok(version) => return Ok(Metadata { tags, version }),
+                PutAttempt::Cancelled => return Err(BackendError::Cancelled),
+                PutAttempt::Err(e) => *e,
             };
-            match res {
-                Ok(out) => {
-                    return Ok(Metadata {
-                        tags,
-                        version: version_from_etag(out.e_tag()),
-                    })
-                }
-                Err(e) => {
-                    if is_conflict(&e) && attempt < MAX_CONFLICT_RETRIES {
-                        tokio::select! {
-                            _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                            _ = tokio::time::sleep(conflict_backoff(attempt)) => {}
-                        }
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(annotate("Write", path, e));
-                }
+
+            if is_precondition(&e) {
+                // If an earlier attempt may have applied, this precondition could
+                // be our own landed write rather than a competitor's: in doubt.
+                return Err(if lost {
+                    in_doubt("Write", path)
+                } else {
+                    BackendError::Precondition
+                });
             }
+            // 409 ConditionalRequestConflict: concurrent conditional writes
+            // raced; this one was not applied, so retrying it is safe and does
+            // not taint a later precondition.
+            if is_conflict(&e) && attempt < MAX_CONFLICT_RETRIES {
+                backoff(ctx, conflict_backoff(attempt)).await?;
+                attempt += 1;
+                continue;
+            }
+            let ambiguous = is_ambiguous(&e);
+            if (ambiguous || is_throttle(&e)) && attempt < DEFAULT_MAX_ATTEMPTS {
+                // An ambiguous attempt (timeout/dispatch/5xx) may have applied;
+                // a throttle (503/429) was rejected before applying and is safe.
+                lost = lost || ambiguous;
+                backoff(ctx, conflict_backoff(attempt)).await?;
+                attempt += 1;
+                continue;
+            }
+            // Terminal error, or the retry budget is exhausted. If any attempt
+            // may have applied, the final outcome is unknown.
+            return Err(if lost {
+                in_doubt("Write", path)
+            } else {
+                annotate("Write", path, e)
+            });
         }
     }
+}
+
+/// The outcome of a single PutObject attempt.
+enum PutAttempt {
+    Ok(Version),
+    Cancelled,
+    Err(Box<SdkError<PutObjectError>>),
 }
 
 /// The optional conditional headers for a PutObject.
@@ -554,6 +630,63 @@ where
         return true;
     }
     e.raw_response().map(|r| r.status().as_u16()) == Some(409)
+}
+
+/// Reports whether `e` is a 412 precondition failure (an `If-Match`/
+/// `If-None-Match` that did not hold). Kept distinct from a 409 conflict.
+fn is_precondition<E>(e: &SdkError<E>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    if e.code() == Some("PreconditionFailed") {
+        return true;
+    }
+    e.raw_response().map(|r| r.status().as_u16()) == Some(412)
+}
+
+/// Reports whether `e` is a throttle (`503 SlowDown` / `429`). The request was
+/// rejected *before* being applied, so retrying it does not risk a double-apply.
+fn is_throttle<E>(e: &SdkError<E>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    if matches!(e.code(), Some("SlowDown") | Some("ThrottlingException")) {
+        return true;
+    }
+    matches!(
+        e.raw_response().map(|r| r.status().as_u16()),
+        Some(503) | Some(429)
+    )
+}
+
+/// Reports whether `e`'s outcome is ambiguous: the request may have reached S3
+/// and been applied before the failure. Covers transport timeouts, dispatch
+/// failures, and server errors that are not a throttle (`500`/`502`/`504`).
+fn is_ambiguous<E>(e: &SdkError<E>) -> bool {
+    if matches!(e, SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)) {
+        return true;
+    }
+    matches!(
+        e.raw_response().map(|r| r.status().as_u16()),
+        Some(500) | Some(502) | Some(504)
+    )
+}
+
+/// Builds the in-doubt error returned when a conditional write's outcome cannot
+/// be confirmed (a possibly-applied attempt followed by a precondition, or an
+/// exhausted retry budget).
+fn in_doubt(op: &str, path: &str) -> BackendError {
+    BackendError::Unavailable(format!(
+        "{op}({path}): conditional write outcome unknown after a lost or ambiguous attempt"
+    ))
+}
+
+/// Sleeps for `delay`, returning `Cancelled` if `ctx` is cancelled first.
+async fn backoff(ctx: &Ctx, delay: Duration) -> Result<(), BackendError> {
+    tokio::select! {
+        _ = ctx.cancelled() => Err(BackendError::Cancelled),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
 }
 
 /// The delay before the given (zero-based) conflict retry: an exponential ramp

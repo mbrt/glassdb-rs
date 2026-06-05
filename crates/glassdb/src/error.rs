@@ -22,6 +22,14 @@ pub enum Error {
     /// The transaction was already committed or aborted remotely.
     #[error("transaction was already finalized")]
     AlreadyFinalized,
+    /// The transaction's outcome is unknown (in doubt): a storage operation
+    /// could not be confirmed, so it may or may not have been applied. The
+    /// engine deliberately does *not* retry such a transaction transparently,
+    /// because a retry could double-apply a write that actually landed. The
+    /// caller decides whether to retry (with its own idempotency) or accept the
+    /// uncertainty.
+    #[error("transaction outcome unknown (in doubt): {0}")]
+    Unavailable(String),
     /// Any other error.
     #[error("{0}")]
     Other(String),
@@ -47,6 +55,13 @@ impl Error {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Error::Cancelled)
     }
+
+    /// Reports whether the transaction's outcome is unknown (in doubt). Such a
+    /// transaction may or may not have committed; the engine does not retry it
+    /// transparently, leaving the decision to the caller.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Error::Unavailable(_))
+    }
 }
 
 impl From<BackendError> for Error {
@@ -55,6 +70,7 @@ impl From<BackendError> for Error {
             BackendError::NotFound => Error::NotFound,
             BackendError::Precondition => Error::Precondition,
             BackendError::Cancelled => Error::Cancelled,
+            BackendError::Unavailable(s) => Error::Unavailable(s),
             BackendError::Other(s) => Error::Other(s),
         }
     }

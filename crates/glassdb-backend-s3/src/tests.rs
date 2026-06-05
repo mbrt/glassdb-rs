@@ -45,10 +45,19 @@ struct SlowDown {
     method: Option<Method>,
 }
 
+/// Models a lost acknowledgement: the next `remaining` PUTs are *applied*
+/// normally but then answered with a `500 InternalError` instead of success, so
+/// the client cannot tell whether the write landed.
+#[derive(Default)]
+struct LostAck {
+    remaining: i64,
+}
+
 struct FakeState {
     objects: Mutex<HashMap<String, StoredObject>>,
     etag_ctr: Mutex<u64>,
     slow: Mutex<SlowDown>,
+    lost_ack: Mutex<LostAck>,
 }
 
 /// A minimal in-process S3 server implementing just the REST subset the backend
@@ -64,6 +73,7 @@ impl FakeS3 {
             objects: Mutex::new(HashMap::new()),
             etag_ctr: Mutex::new(1),
             slow: Mutex::new(SlowDown::default()),
+            lost_ack: Mutex::new(LostAck::default()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -108,6 +118,11 @@ impl FakeS3 {
 
     fn slowdown_remaining(&self) -> i64 {
         self.state.slow.lock().unwrap().remaining
+    }
+
+    /// Apply the next `n` PUTs but answer them with `500` (a lost ack).
+    fn set_lost_ack(&self, n: i64) {
+        self.state.lost_ack.lock().unwrap().remaining = n;
     }
 }
 
@@ -237,6 +252,23 @@ fn put_object(
             etag: etag.clone(),
         },
     );
+    drop(objs);
+
+    // Lost-ack injection: the write above is durable, but the client is told the
+    // request failed (500), so it cannot know the write landed.
+    {
+        let mut la = state.lost_ack.lock().unwrap();
+        if la.remaining > 0 {
+            la.remaining -= 1;
+            drop(la);
+            return xml_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "we encountered an internal error",
+            );
+        }
+    }
+
     Response::builder()
         .status(StatusCode::OK)
         .header("ETag", etag)
@@ -694,4 +726,77 @@ async fn nop_retryer_surfaces_slow_down() {
         .unwrap_err();
     let msg = format!("{err:?}");
     assert!(msg.contains("SlowDown"), "got: {msg}");
+}
+
+// In-doubt contract (ADR-009): a conditional write whose ack is lost must NOT be
+// reported as a confident `Precondition`. Object storage has no at-most-once
+// request id, so when the SDK (or any layer) re-sends a conditional PUT whose
+// first attempt landed, the retry observes a precondition failure for its own
+// write that is indistinguishable from a real conflict. The S3 backend therefore
+// owns the conditional-write retry loop and surfaces such an outcome as
+// `Unavailable`; the engine then fails the transaction in-doubt rather than
+// retrying it into a double-apply. These tests would see `Precondition` against
+// the pre-fix code (which let the SDK retryer mask the lost ack).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_if_not_exists_lost_ack_is_in_doubt() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+
+    // The create lands, but its ack is lost; the re-send sees the object exists
+    // and gets 412.
+    fake.set_lost_ack(1);
+    let err = b
+        .write_if_not_exists(&ctx(), "k", b"v".to_vec(), Tags::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unavailable(_)),
+        "expected Unavailable (in-doubt), got {err:?}"
+    );
+
+    // The first attempt really did persist the object.
+    let r = b.read(&ctx(), "k").await.unwrap();
+    assert_eq!(r.contents, b"v");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_if_lost_ack_is_in_doubt() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+    let m0 = b
+        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
+        .await
+        .unwrap();
+
+    // The CAS write lands (changing the ETag), but its ack is lost; the re-send's
+    // If-Match no longer matches and gets 412.
+    fake.set_lost_ack(1);
+    let err = b
+        .write_if(&ctx(), "k", b"b".to_vec(), &m0.version, Tags::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unavailable(_)),
+        "expected Unavailable (in-doubt), got {err:?}"
+    );
+
+    let r = b.read(&ctx(), "k").await.unwrap();
+    assert_eq!(r.contents, b"b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_conflict_still_precondition() {
+    // Guard against over-eagerly tainting: a genuine conflict with no lost ack
+    // must still be a retryable `Precondition`, not in-doubt.
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+    b.write_if_not_exists(&ctx(), "k", b"a".to_vec(), Tags::new())
+        .await
+        .unwrap();
+    let err = b
+        .write_if_not_exists(&ctx(), "k", b"b".to_vec(), Tags::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BackendError::Precondition), "got {err:?}");
 }

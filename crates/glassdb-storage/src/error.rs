@@ -26,4 +26,10 @@ impl StorageError {
     pub fn is_precondition(&self) -> bool {
         matches!(self, StorageError::Backend(b) if b.is_precondition())
     }
+
+    /// Reports whether the underlying cause is an in-doubt (unknown-outcome)
+    /// error: the operation may or may not have been applied.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, StorageError::Backend(b) if b.is_unavailable())
+    }
 }

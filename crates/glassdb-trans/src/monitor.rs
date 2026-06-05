@@ -173,9 +173,12 @@ impl Monitor {
             tl.status = TxCommitStatus::Ok;
             self.set_final_log(ctx, tl.clone()).await.map_err(|e| {
                 // Preserve AlreadyFinalized so the commit path can recognize a
-                // wound (the log was already aborted out from under us).
+                // wound (the log was already aborted out from under us), and an
+                // in-doubt outcome so the caller sees it and we never retry it
+                // transparently (which could double-apply the writes).
                 match e {
                     TransError::AlreadyFinalized => TransError::AlreadyFinalized,
+                    e if e.is_unavailable() => e,
                     other => TransError::Other(format!("writing tx log: {other}")),
                 }
             })?;

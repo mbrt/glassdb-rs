@@ -43,10 +43,13 @@ struct Store {
 
 struct FakeState {
     store: Mutex<Store>,
+    /// Number of inserts to apply but answer with `500` (a lost ack).
+    lost_ack: Mutex<i64>,
 }
 
 struct FakeGcs {
     base_url: String,
+    state: Arc<FakeState>,
 }
 
 impl FakeGcs {
@@ -56,10 +59,13 @@ impl FakeGcs {
                 objects: HashMap::new(),
                 gen_ctr: 1,
             }),
+            lost_ack: Mutex::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let st = state.clone();
         tokio::spawn(async move {
+            let state = st;
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
@@ -81,11 +87,17 @@ impl FakeGcs {
         });
         FakeGcs {
             base_url: format!("http://{addr}"),
+            state,
         }
     }
 
     fn url(&self) -> String {
         self.base_url.clone()
+    }
+
+    /// Apply the next `n` inserts but answer them with `500` (a lost ack).
+    fn set_lost_ack(&self, n: i64) {
+        *self.state.lost_ack.lock().unwrap() = n;
     }
 }
 
@@ -181,7 +193,20 @@ fn insert(
         metageneration: 1,
     };
     store.objects.insert(name.clone(), obj.clone());
-    json_response(StatusCode::OK, resource_json(&name, &obj))
+    let body = resource_json(&name, &obj);
+    drop(store);
+
+    // Lost-ack injection: the insert above is durable, but the client is told the
+    // request failed (500), so it cannot know the write landed.
+    {
+        let mut la = state.lost_ack.lock().unwrap();
+        if *la > 0 {
+            *la -= 1;
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "backendError");
+        }
+    }
+
+    json_response(StatusCode::OK, body)
 }
 
 fn get_attrs(state: &FakeState, name: &str) -> Response<Full<Bytes>> {
@@ -716,4 +741,72 @@ async fn list_with_subdirs() {
     assert_eq!(got, vec!["d/a/", "d/c/", "d/root"]);
     let got = b.list(&ctx(), "d/a").await.unwrap();
     assert_eq!(got, vec!["d/a/1", "d/a/2", "d/a/b/"]);
+}
+
+// In-doubt contract (ADR-009): a conditional write whose outcome is uncertain
+// must NOT be reported as a confident error the engine would retry into a
+// double-apply. GCS applies conditional writes atomically and this backend does
+// not retry them, so a clean precondition is a genuine conflict; but a `5xx`
+// (or a transport error) leaves the write in doubt — it may have landed before
+// the failure — and must surface as `Unavailable`. These tests would see
+// `Other` against the pre-fix code, which mapped any non-precondition status to
+// a generic error.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_if_not_exists_lost_ack_is_in_doubt() {
+    let fake = FakeGcs::start().await;
+    let b = backend(&fake);
+
+    // The create lands, but the server answers 500, hiding that it landed.
+    fake.set_lost_ack(1);
+    let err = b
+        .write_if_not_exists(&ctx(), "k", b"v".to_vec(), Tags::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unavailable(_)),
+        "expected Unavailable (in-doubt), got {err:?}"
+    );
+
+    // The write really did persist.
+    let r = b.read(&ctx(), "k").await.unwrap();
+    assert_eq!(r.contents, b"v");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_if_lost_ack_is_in_doubt() {
+    let fake = FakeGcs::start().await;
+    let b = backend(&fake);
+    let m0 = b
+        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
+        .await
+        .unwrap();
+
+    fake.set_lost_ack(1);
+    let err = b
+        .write_if(&ctx(), "k", b"b".to_vec(), &m0.version, Tags::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unavailable(_)),
+        "expected Unavailable (in-doubt), got {err:?}"
+    );
+
+    let r = b.read(&ctx(), "k").await.unwrap();
+    assert_eq!(r.contents, b"b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_conflict_still_precondition() {
+    // A genuine conflict with no lost ack must stay a retryable `Precondition`.
+    let fake = FakeGcs::start().await;
+    let b = backend(&fake);
+    b.write_if_not_exists(&ctx(), "k", b"a".to_vec(), Tags::new())
+        .await
+        .unwrap();
+    let err = b
+        .write_if_not_exists(&ctx(), "k", b"b".to_vec(), Tags::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BackendError::Precondition), "got {err:?}");
 }

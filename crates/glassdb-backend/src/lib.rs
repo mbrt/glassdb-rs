@@ -34,6 +34,15 @@ pub enum BackendError {
     /// The operation's context was cancelled.
     #[error("context canceled")]
     Cancelled,
+    /// The operation's outcome is unknown: the request may or may not have been
+    /// applied. Returned when a call cannot be completed with a definitive
+    /// answer — e.g. a conditional write whose acknowledgement was lost and
+    /// whose retry then observed a precondition failure (so it cannot be told
+    /// apart from a genuine conflict), or a sustained outage that exhausts the
+    /// retry budget. Because the outcome is in doubt, a non-idempotent operation
+    /// must *not* be blindly retried; the caller decides how to proceed.
+    #[error("storage outcome unknown (in doubt): {0}")]
+    Unavailable(String),
     /// Any other backend error.
     #[error("{0}")]
     Other(String),
@@ -48,6 +57,13 @@ impl BackendError {
     /// Reports whether this is a precondition-failed error.
     pub fn is_precondition(&self) -> bool {
         matches!(self, BackendError::Precondition)
+    }
+
+    /// Reports whether the operation's outcome is unknown (in doubt). Such an
+    /// operation may or may not have taken effect and must not be blindly
+    /// retried if it is not idempotent.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, BackendError::Unavailable(_))
     }
 }
 
