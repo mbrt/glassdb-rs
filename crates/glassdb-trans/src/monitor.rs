@@ -502,6 +502,7 @@ impl Monitor {
                 return (s, None);
             }
             tokio::select! {
+                biased;
                 _ = ctx.cancelled() => {
                     return (s, Some(TransError::Other("retry polling tx status".into())));
                 }
@@ -544,6 +545,7 @@ impl Monitor {
                 Err(e) => return Err(e.into()),
             }
             tokio::select! {
+                biased;
                 _ = ctx.cancelled() => return Err(TransError::Cancelled),
                 _ = tokio::time::sleep(interval) => {}
             }
@@ -578,6 +580,7 @@ impl Monitor {
 
         loop {
             tokio::select! {
+                biased;
                 _ = ctx.cancelled() => return,
                 _ = tokio::time::sleep(refresh_timeout()) => {}
             }

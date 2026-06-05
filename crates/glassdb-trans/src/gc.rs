@@ -52,6 +52,7 @@ impl Gc {
             interval.tick().await;
             loop {
                 tokio::select! {
+                    biased;
                     _ = ctx.cancelled() => return,
                     _ = interval.tick() => g.cleanup_round(&ctx).await,
                 }

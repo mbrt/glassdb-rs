@@ -1,18 +1,25 @@
 //! Deterministic-simulation workload harness for the concurrency fuzzer.
 //!
 //! A [`Workload`] is a set of clients, each a sequence of [`Op`]s, generated
-//! from fuzzer bytes via [`arbitrary`]. [`run_and_assert`] opens one [`DB`] per
-//! client over a single shared in-memory backend, runs every client
-//! concurrently, and checks the serializability invariant: each key's final
-//! value equals the total number of read-modify-write increments applied to it.
+//! from fuzzer bytes via [`arbitrary`]. Under the madsim simulator (`--cfg
+//! madsim`) the harness builds a small cluster: the object store runs on its own
+//! node, and each client opens a [`DB`] on its own node that reaches the store
+//! over the simulated network (see [`glassdb_backend::net`]). A seeded
+//! [`FaultConfig`]-driven nemesis then injects network faults (clog/partition)
+//! and node faults (pause/crash) while the clients run. Scheduling, time,
+//! randomness, and the fault schedule are all functions of a single seed, so a
+//! failing run reproduces exactly from its input.
 //!
-//! Under the madsim simulator (`--cfg madsim`) task scheduling, time, and
-//! randomness are all functions of a single seed, so a failing run reproduces
-//! exactly from its input. [`run_and_record`] additionally captures the ordered
-//! stream of backend operations so two same-seed runs can be compared
-//! byte-for-byte (see the `concurrent_sim` self-check and ADR-008).
+//! The correctness check is per key `acked <= final <= started`, where `started`
+//! counts increments that entered a transaction and `acked` counts those whose
+//! commit returned `Ok`. A crashed client leaves its in-flight increment
+//! in-doubt (counted in `started`, not `acked`), so the bound tolerates it while
+//! still catching lost or fabricated writes. With faults disabled the three are
+//! equal, recovering the original exact invariant. [`run_and_record`] also
+//! captures the ordered stream of backend operations so two same-seed runs can
+//! be compared byte-for-byte (see the `concurrent_sim` self-check and ADR-008).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::memory::MemoryBackend;
@@ -20,6 +27,17 @@ use glassdb_backend::middleware::{OpLog, RecordingBackend};
 use glassdb_backend::Backend;
 
 use crate::{Collection, Ctx, Error, Options, DB};
+
+#[cfg(madsim)]
+use glassdb_backend::net::{serve_backend, NetBackend};
+#[cfg(madsim)]
+use madsim::net::{Endpoint, NetSim};
+#[cfg(madsim)]
+use madsim::runtime::Handle;
+#[cfg(madsim)]
+use madsim::task::NodeId;
+#[cfg(madsim)]
+use std::net::{IpAddr, SocketAddr};
 
 /// Number of distinct keys the workload operates on.
 pub const KEY_COUNT: usize = 4;
@@ -45,6 +63,41 @@ pub enum Op {
 pub struct Workload {
     /// Per-client op sequences.
     pub clients: Vec<Vec<Op>>,
+}
+
+/// Controls the fault nemesis. With `enabled` false the harness still places
+/// each DB on its own node but injects no faults (so the exact-count invariant
+/// holds); `intensity` scales how many fault rounds the nemesis performs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FaultConfig {
+    /// Whether the nemesis injects network and node faults.
+    pub enabled: bool,
+    /// How aggressive the nemesis is (number of fault rounds scales with this).
+    pub intensity: u8,
+}
+
+impl FaultConfig {
+    /// No fault injection (each DB still runs on its own node).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Fault injection enabled at the given intensity.
+    pub fn enabled(intensity: u8) -> Self {
+        FaultConfig {
+            enabled: true,
+            intensity,
+        }
+    }
+}
+
+impl<'a> Arbitrary<'a> for FaultConfig {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(FaultConfig {
+            enabled: u.arbitrary()?,
+            intensity: u.arbitrary()?,
+        })
+    }
 }
 
 impl<'a> Arbitrary<'a> for Op {
@@ -112,10 +165,37 @@ async fn read_int_from_tx(tx: &crate::Tx, c: &Collection, k: &[u8]) -> Result<i6
     }
 }
 
-async fn run_client(ctx: &Ctx, db: &DB, coll: &Collection, ops: &[Op]) -> Result<(), Error> {
+/// Per-key accounting shared across client tasks (and surviving node crashes via
+/// the harness-owned `Arc`). `started` counts increments that entered a
+/// transaction; `acked` counts those whose commit returned `Ok`.
+struct Acct {
+    started: Vec<i64>,
+    acked: Vec<i64>,
+}
+
+impl Acct {
+    fn new() -> Self {
+        Acct {
+            started: vec![0; KEY_COUNT],
+            acked: vec![0; KEY_COUNT],
+        }
+    }
+}
+
+/// Runs a client's op sequence, updating `acct` as each increment is attempted
+/// and acknowledged. Returns on the first transaction error, leaving that op
+/// counted in `started` but not `acked` (i.e. in-doubt).
+async fn run_client(
+    ctx: &Ctx,
+    db: &DB,
+    coll: &Collection,
+    ops: &[Op],
+    acct: &Mutex<Acct>,
+) -> Result<(), Error> {
     for op in ops {
         match op {
             Op::Rmw(k) => {
+                acct.lock().unwrap().started[*k] += 1;
                 // Bind a reference so the `async move` body captures `&Vec`
                 // (`Copy`) instead of moving the key, keeping the closure
                 // `FnMut` for retries.
@@ -125,8 +205,14 @@ async fn run_client(ctx: &Ctx, db: &DB, coll: &Collection, ops: &[Op]) -> Result
                     tx.write(coll, kn, &write_int(cur + 1))
                 })
                 .await?;
+                acct.lock().unwrap().acked[*k] += 1;
             }
             Op::MultiRmw(a, b) => {
+                {
+                    let mut g = acct.lock().unwrap();
+                    g.started[*a] += 1;
+                    g.started[*b] += 1;
+                }
                 let ka = &key_name(*a);
                 let kb = &key_name(*b);
                 db.tx(ctx, |tx| async move {
@@ -136,6 +222,11 @@ async fn run_client(ctx: &Ctx, db: &DB, coll: &Collection, ops: &[Op]) -> Result
                     tx.write(coll, kb, &write_int(vb + 1))
                 })
                 .await?;
+                {
+                    let mut g = acct.lock().unwrap();
+                    g.acked[*a] += 1;
+                    g.acked[*b] += 1;
+                }
             }
             Op::ReadOnly(keys) => {
                 let names: Vec<Vec<u8>> = keys.iter().map(|k| key_name(*k)).collect();
@@ -179,9 +270,37 @@ fn deterministic_options() -> Options {
     }
 }
 
-/// Opens one DB per client over `backend`, runs all clients concurrently, then
-/// asserts the serializability invariant. Panics (the fuzzer's failure signal)
-/// on any transaction error or invariant violation.
+/// Asserts the serializability invariant for every key: an acknowledged commit
+/// must be durable (`acked <= final`) and the store cannot show more than what
+/// was attempted (`final <= started`). With faults disabled, `final` must equal
+/// the workload's total increments exactly.
+fn assert_bounds(acct: &Acct, finals: &[i64], expected: &[i64], faults_enabled: bool) {
+    for k in 0..KEY_COUNT {
+        let a = acct.acked[k];
+        let s = acct.started[k];
+        let f = finals[k];
+        assert!(
+            a <= f && f <= s,
+            "key k{k}: violated acked({a}) <= final({f}) <= started({s})"
+        );
+        if !faults_enabled {
+            assert_eq!(
+                f, expected[k],
+                "key k{k}: final {f} != expected {} (no faults)",
+                expected[k]
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-madsim path: a single shared in-process backend, clients on one task. The
+// network/node fault machinery requires the simulator, so this path runs
+// fault-free and keeps the exact invariant. It exists so the `sim` harness still
+// compiles and runs in a normal build.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(madsim))]
 async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
     let ctx = Ctx::background();
     let opts = deterministic_options();
@@ -204,10 +323,8 @@ async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
         .expect("seed keys");
 
     let expected = expected_increments(workload);
+    let acct = Arc::new(Mutex::new(Acct::new()));
 
-    // Run each client on its own DB instance sharing the backend, concurrently.
-    // (`join_all` rather than `task::spawn` keeps every client on a single
-    // madsim task so the interleaving is purely a function of the seed.)
     let mut futs = Vec::with_capacity(workload.clients.len());
     for ops in &workload.clients {
         let db = DB::open_with(&ctx, DB_NAME, backend.clone(), opts.clone())
@@ -215,9 +332,10 @@ async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
             .expect("open client db");
         let ops = ops.clone();
         let cctx = ctx.clone();
+        let acct = acct.clone();
         futs.push(async move {
             let coll = db.collection(COLLECTION);
-            let res = run_client(&cctx, &db, &coll, &ops).await;
+            let res = run_client(&cctx, &db, &coll, &ops, &acct).await;
             db.close().await;
             res
         });
@@ -226,35 +344,299 @@ async fn run_on(workload: &Workload, backend: Arc<dyn Backend>) {
         res.expect("client tx failed");
     }
 
-    // Each key's final value must equal the increments applied to it.
-    for (k, &want) in expected.iter().enumerate() {
-        let got = read_int(
+    let mut finals = vec![0i64; KEY_COUNT];
+    for (k, slot) in finals.iter_mut().enumerate() {
+        *slot = read_int(
             &init_coll
                 .read_strong(&ctx, &key_name(k))
                 .await
                 .expect("final read"),
         );
-        assert_eq!(
-            got, want,
-            "serializability violation on key k{k}: final {got}, expected {want}"
-        );
     }
     init_db.close().await;
+
+    let acct = acct.lock().unwrap();
+    assert_bounds(&acct, &finals, &expected, false);
 }
 
-/// Runs `workload` over a fresh in-memory backend and asserts serializability.
+// ---------------------------------------------------------------------------
+// madsim path: a storage node serving the backend over the network, one DB per
+// client node, and a seeded fault nemesis.
+// ---------------------------------------------------------------------------
+
+#[cfg(madsim)]
+const SERVER_ADDR: &str = "10.0.0.1:9000";
+
+/// Opens a [`DB`] backed by a fresh network client bound to `ip`, talking to the
+/// storage node. `client_id` must be unique so the server's at-most-once dedup
+/// never conflates two clients.
+#[cfg(madsim)]
+async fn open_net_db(ip: IpAddr, client_id: u64) -> (DB, Ctx) {
+    let ep = Arc::new(
+        Endpoint::bind(format!("{ip}:0"))
+            .await
+            .expect("bind client endpoint"),
+    );
+    let server: SocketAddr = SERVER_ADDR.parse().unwrap();
+    let backend: Arc<dyn Backend> = Arc::new(NetBackend::new(ep, server, client_id));
+    let ctx = Ctx::background();
+    let db = DB::open_with(&ctx, DB_NAME, backend, deterministic_options())
+        .await
+        .expect("open db");
+    (db, ctx)
+}
+
+#[cfg(madsim)]
+async fn run_nodes(workload: &Workload, storage: Arc<dyn Backend>, faults: FaultConfig) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let handle = Handle::current();
+    let server: SocketAddr = SERVER_ADDR.parse().unwrap();
+
+    // Storage node: serves the backend for the whole run. Its state lives in the
+    // harness-owned `storage` Arc, so it is durable independent of any node.
+    let storage_node = handle.create_node().ip("10.0.0.1".parse().unwrap()).build();
+    let ready = Arc::new(AtomicBool::new(false));
+    {
+        let storage = storage.clone();
+        let ready = ready.clone();
+        storage_node.spawn(async move {
+            let ep = Endpoint::bind(server).await.expect("bind storage");
+            serve_backend(&ep, storage);
+            ready.store(true, Ordering::SeqCst);
+            // Keep the endpoint (and thus the bound socket) alive forever.
+            std::future::pending::<()>().await;
+        });
+    }
+    while !ready.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Init node: create the collection and seed every key to zero.
+    handle
+        .create_node()
+        .ip("10.0.0.2".parse().unwrap())
+        .build()
+        .spawn(async move {
+            let (db, ctx) = open_net_db("10.0.0.2".parse().unwrap(), 0).await;
+            let coll = db.collection(COLLECTION);
+            coll.create(&ctx).await.expect("create collection");
+            let seed = &coll;
+            db.tx(&ctx, |tx| async move {
+                for k in 0..KEY_COUNT {
+                    tx.write(seed, &key_name(k), &write_int(0))?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed keys");
+            db.close().await;
+        })
+        .await
+        .expect("init task");
+
+    let expected = expected_increments(workload);
+    let acct = Arc::new(Mutex::new(Acct::new()));
+
+    // Client nodes: one DB per client, each on its own node.
+    let mut client_ids: Vec<NodeId> = Vec::new();
+    let mut client_handles = Vec::new();
+    for (i, ops) in workload.clients.iter().enumerate() {
+        let ip: IpAddr = format!("10.0.1.{}", i + 1).parse().unwrap();
+        let node = handle.create_node().ip(ip).build();
+        client_ids.push(node.id());
+        let ops = ops.clone();
+        let acct = acct.clone();
+        let client_id = (i + 1) as u64;
+        client_handles.push(node.spawn(async move {
+            let (db, ctx) = open_net_db(ip, client_id).await;
+            let coll = db.collection(COLLECTION);
+            let _ = run_client(&ctx, &db, &coll, &ops, &acct).await;
+            db.close().await;
+        }));
+    }
+
+    // Nemesis: inject faults concurrently while the clients run.
+    let stop = Arc::new(AtomicBool::new(false));
+    let nemesis_handle = if faults.enabled {
+        let h = handle.clone();
+        let ids = client_ids.clone();
+        let storage_id = storage_node.id();
+        let stop = stop.clone();
+        let intensity = faults.intensity;
+        Some(
+            handle
+                .create_node()
+                .build()
+                .spawn(async move { nemesis(h, ids, storage_id, intensity, stop).await }),
+        )
+    } else {
+        None
+    };
+
+    // Wait for the clients. A killed node yields a `JoinError`; that is an
+    // expected crash, not a failure.
+    for h in client_handles {
+        let _ = h.await;
+    }
+    stop.store(true, Ordering::SeqCst);
+    if let Some(h) = nemesis_handle {
+        let _ = h.await;
+    }
+
+    // Defensive: ensure no network fault outlives the workload before verifying.
+    let net = NetSim::current();
+    let storage_id = storage_node.id();
+    for &c in &client_ids {
+        net.unclog_node(c);
+        net.unclog_link(c, storage_id);
+        net.unclog_link(storage_id, c);
+    }
+
+    // Verifier node: read every key's final value (driving recovery of any
+    // crashed client's locks via lease expiry) and check the invariant.
+    let verifier_id = (workload.clients.len() + 1) as u64;
+    let finals = handle
+        .create_node()
+        .ip("10.0.0.3".parse().unwrap())
+        .build()
+        .spawn(async move {
+            let (db, ctx) = open_net_db("10.0.0.3".parse().unwrap(), verifier_id).await;
+            let coll = db.collection(COLLECTION);
+            let mut finals = vec![0i64; KEY_COUNT];
+            for (k, slot) in finals.iter_mut().enumerate() {
+                *slot = read_int(
+                    &coll
+                        .read_strong(&ctx, &key_name(k))
+                        .await
+                        .expect("final read"),
+                );
+            }
+            db.close().await;
+            finals
+        })
+        .await
+        .expect("verifier task");
+
+    let acct = acct.lock().unwrap();
+    assert_bounds(&acct, &finals, &expected, faults.enabled);
+}
+
+/// The fault nemesis. Drives a seeded sequence of network and node faults
+/// against the client nodes while they run, always healing transient faults so
+/// the run can make progress. Crashes (`kill`) are permanent; their recovery is
+/// left to GlassDB's lock-lease expiry. Randomness comes from the runtime's
+/// seeded RNG and all timing from virtual sleeps, so the schedule is a
+/// deterministic function of the seed.
+#[cfg(madsim)]
+async fn nemesis(
+    handle: Handle,
+    clients: Vec<NodeId>,
+    storage: NodeId,
+    intensity: u8,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use madsim::rand::Rng;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let net = NetSim::current();
+    let mut alive = clients;
+    let rounds = 1 + (intensity as usize % 6);
+    for _ in 0..rounds {
+        if stop.load(Ordering::SeqCst) || alive.is_empty() {
+            break;
+        }
+        // Draw all randomness up front so no RNG guard is held across an await.
+        let (idx, kind, hold_ms, gap_ms) = {
+            let mut rng = madsim::rand::thread_rng();
+            (
+                rng.gen_range(0..alive.len()),
+                rng.gen_range(0u32..10),
+                rng.gen_range(50u64..2000),
+                rng.gen_range(10u64..400),
+            )
+        };
+        let target = alive[idx];
+        match kind {
+            0..=3 => {
+                // Partition the client from storage (both directions).
+                net.clog_link(target, storage);
+                net.clog_link(storage, target);
+                tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                net.unclog_link(target, storage);
+                net.unclog_link(storage, target);
+            }
+            4..=5 => {
+                // Fully clog the node's traffic, then restore it.
+                net.clog_node(target);
+                tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                net.unclog_node(target);
+            }
+            6..=7 => {
+                // Stall the node's execution, then resume it.
+                handle.pause(target);
+                tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                handle.resume(target);
+            }
+            _ => {
+                // Crash the node (no restart): its in-flight work is in-doubt.
+                handle.kill(target);
+                alive.swap_remove(idx);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points. Under madsim these run the node cluster; otherwise the
+// single-process fallback.
+// ---------------------------------------------------------------------------
+
+/// Runs `workload` over a fresh in-memory store and asserts serializability,
+/// without injecting faults.
 pub async fn run_and_assert(workload: Workload) {
+    run_and_assert_with_faults(workload, FaultConfig::none()).await;
+}
+
+/// Like [`run_and_assert`] but injects the network and node faults described by
+/// `faults`. Outside the madsim simulator `faults` is ignored (the fault
+/// machinery needs the simulator).
+pub async fn run_and_assert_with_faults(workload: Workload, faults: FaultConfig) {
     let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    run_on(&workload, backend).await;
+    #[cfg(madsim)]
+    {
+        run_nodes(&workload, backend, faults).await;
+    }
+    #[cfg(not(madsim))]
+    {
+        let _ = faults;
+        run_on(&workload, backend).await;
+    }
 }
 
 /// Like [`run_and_assert`] but records the ordered stream of backend operations
 /// and returns the log, for byte-for-byte determinism comparison across runs.
 pub async fn run_and_record(workload: &Workload) -> OpLog {
+    run_and_record_with_faults(workload, FaultConfig::none()).await
+}
+
+/// Like [`run_and_record`] but with fault injection enabled per `faults`.
+pub async fn run_and_record_with_faults(workload: &Workload, faults: FaultConfig) -> OpLog {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let rec = Arc::new(RecordingBackend::new(mem));
     let log = rec.log();
     let backend: Arc<dyn Backend> = rec;
-    run_on(workload, backend).await;
+    #[cfg(madsim)]
+    {
+        run_nodes(workload, backend, faults).await;
+    }
+    #[cfg(not(madsim))]
+    {
+        let _ = faults;
+        run_on(workload, backend).await;
+    }
     log
 }

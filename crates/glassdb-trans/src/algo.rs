@@ -1186,6 +1186,7 @@ impl Algo {
             let t2 = token.clone();
             tokio::spawn(async move {
                 tokio::select! {
+                    biased;
                     _ = tokio::time::sleep(BG_CLEANUP_TIMEOUT) => t2.cancel(),
                     _ = t2.cancelled() => {}
                 }
@@ -1296,6 +1297,7 @@ impl Algo {
         let t2 = token.clone();
         tokio::spawn(async move {
             tokio::select! {
+                biased;
                 _ = tokio::time::sleep(timeout) => t2.cancel(),
                 _ = t2.cancelled() => {}
             }
