@@ -71,8 +71,13 @@ builds without madsim):
   at-most-once request id, so a retry after a dropped *response* re-runs the op.
   That is sound because the engine's writes are conditional (CAS): a re-delivered
   write observes a `Precondition` for its own already-applied write, exactly as S3
-  returns when the SDK retries a conditional `PUT` whose ack was lost — exposing
-  the engine's "did my commit land?" handling rather than masking it;
+  returns when the SDK retries a conditional `PUT` whose ack was lost. Crucially,
+  `NetBackend` does *not* pass that ambiguous `Precondition` up as a confident
+  conflict: once a response has been lost, a `Precondition` on a *conditional
+  write* is indistinguishable from "my own write landed", so it is converted to
+  the in-doubt `BackendError::Unavailable` (the in-doubt backend contract is
+  [ADR-009](009-in-doubt-conditional-writes.md)). This exposes the engine's
+  "did my commit land?" handling rather than masking it;
 - a **nemesis node** drives a seeded sequence of faults via `NetSim`/`Handle`
   (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), eventually
   healing every network fault (some long enough to outlast the retry budget) and
@@ -96,6 +101,11 @@ retries an op itself, so an increment is left in-doubt (counted in `started`, no
 keep each in-doubt op applied at most once even when a retry re-delivers it. With
 `FaultConfig` disabled, `started == acked == final == expected`, so the original
 exact check is also asserted.
+
+The in-doubt outcome that `NetBackend` surfaces (and the at-most-once contract it
+exercises) is a backend-wide decision documented separately in
+[ADR-009](009-in-doubt-conditional-writes.md); this ADR only covers how the
+simulator provokes and observes it.
 
 ### Integration
 
@@ -182,7 +192,8 @@ the workload result.
   `run_and_assert[_with_faults]` / `run_and_record[_with_faults]` node harness
   and nemesis (feature `sim`).
 - `crates/glassdb-backend/src/net.rs` — the RPC transport: `serve_backend`
-  (server, applies every request) and `NetBackend` (client, bounded retry).
+  (server, applies every request) and `NetBackend` (client, bounded retry +
+  in-doubt conversion for ambiguous conditional writes, see ADR-009).
   `#[cfg(madsim)]`.
 - `crates/glassdb-backend/src/middleware/recording.rs` — `RecordingBackend`.
 - `crates/glassdb-concurr/src/cancel.rs` — `CancelToken` (over `tokio::sync::Notify`).

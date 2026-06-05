@@ -160,6 +160,40 @@ impl GcsBackend {
         }
     }
 
+    /// Sends a *conditional* request and maps its outcome with the in-doubt
+    /// contract (ADR-009). GCS applies conditional writes atomically and this
+    /// backend does not retry them, so a clean `412`/`409` means the write did
+    /// not take effect (a genuine `Precondition`). But a transport error or a
+    /// `5xx` leaves the outcome unknown — the write may have landed before the
+    /// failure — so it is reported as `Unavailable` rather than a confident error
+    /// or a generic `Other`, ensuring the engine never retries it into a
+    /// double-apply. An authentication failure happens before the request is
+    /// sent, so it is not in-doubt.
+    async fn send_conditional(
+        &self,
+        ctx: &Ctx,
+        rb: RequestBuilder,
+        op: &str,
+        path: &str,
+    ) -> Result<reqwest::Response, BackendError> {
+        let rb = self.authorize(rb).await?;
+        let resp = tokio::select! {
+            _ = ctx.cancelled() => return Err(BackendError::Cancelled),
+            r = rb.send() => match r {
+                Ok(resp) => resp,
+                // No response at all: the request may or may not have been applied.
+                Err(e) => return Err(BackendError::Unavailable(format!(
+                    "{op}({path}): request failed, outcome unknown: {e}"
+                ))),
+            },
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        Err(check_conditional_status(status, op, path))
+    }
+
     /// Fetches an object's metadata resource.
     async fn attrs(&self, ctx: &Ctx, path: &str) -> Result<ObjectResource, BackendError> {
         let rb = self
@@ -219,6 +253,8 @@ impl GcsBackend {
         tags: Tags,
         conds: WriteConds,
     ) -> Result<Metadata, BackendError> {
+        let conditional =
+            conds.if_generation_match.is_some() || conds.if_metageneration_match.is_some();
         let body = multipart_body(&object_metadata_json(path, &tags), &value);
         let mut query: Vec<(&str, String)> = vec![("uploadType", "multipart".to_string())];
         conds.apply(&mut query);
@@ -231,8 +267,13 @@ impl GcsBackend {
                 format!("multipart/related; boundary={BOUNDARY}"),
             )
             .body(body);
-        let resp = self.send(ctx, rb).await?;
-        check_status(resp.status(), "Write", path)?;
+        let resp = if conditional {
+            self.send_conditional(ctx, rb, "Write", path).await?
+        } else {
+            let resp = self.send(ctx, rb).await?;
+            check_status(resp.status(), "Write", path)?;
+            resp
+        };
         let obj: ObjectResource = parse_json(resp, "Write", path).await?;
         Ok(Metadata {
             tags,
@@ -313,8 +354,7 @@ impl Backend for GcsBackend {
             ])
             .header(CONTENT_TYPE, "application/json")
             .body(metadata_patch_json(&merged));
-        let resp = self.send(ctx, rb).await?;
-        check_status(resp.status(), "SetTagsIf", path)?;
+        let resp = self.send_conditional(ctx, rb, "SetTagsIf", path).await?;
         let obj: ObjectResource = parse_json(resp, "SetTagsIf", path).await?;
         Ok(obj.metadata())
     }
@@ -390,8 +430,7 @@ impl Backend for GcsBackend {
             ("ifGenerationMatch", generation.as_str()),
             ("ifMetagenerationMatch", metageneration.as_str()),
         ]);
-        let resp = self.send(ctx, rb).await?;
-        check_status(resp.status(), "DeleteIf", path)?;
+        self.send_conditional(ctx, rb, "DeleteIf", path).await?;
         Ok(())
     }
 
@@ -489,6 +528,22 @@ fn check_status(status: StatusCode, op: &str, path: &str) -> Result<(), BackendE
             "{op}({path}): gcs status {}",
             s.as_u16()
         ))),
+    }
+}
+
+/// Maps a non-success status from a *conditional* request (ADR-009). A `412`/
+/// `409` is a genuine precondition (the atomic write did not take effect); a
+/// `5xx` leaves the write in doubt, since GCS may have applied it before
+/// failing, so it is reported as `Unavailable`.
+fn check_conditional_status(status: StatusCode, op: &str, path: &str) -> BackendError {
+    match status {
+        StatusCode::NOT_FOUND => BackendError::NotFound,
+        StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => BackendError::Precondition,
+        s if s.is_server_error() => BackendError::Unavailable(format!(
+            "{op}({path}): conditional write outcome unknown (gcs status {})",
+            s.as_u16()
+        )),
+        s => BackendError::Other(format!("{op}({path}): gcs status {}", s.as_u16())),
     }
 }
 

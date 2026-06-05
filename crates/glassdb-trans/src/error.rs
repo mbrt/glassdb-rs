@@ -73,6 +73,13 @@ impl TransError {
         matches!(self, TransError::Storage(s) if s.is_precondition())
     }
 
+    /// Reports whether the underlying cause is an in-doubt (unknown-outcome)
+    /// error: the operation may or may not have been applied, so the
+    /// transaction must not be retried transparently.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, TransError::Storage(s) if s.is_unavailable())
+    }
+
     /// Reports whether the context was cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, TransError::Cancelled)

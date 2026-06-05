@@ -13,14 +13,16 @@
 //! The correctness check is per key `acked <= final <= started`, where `started`
 //! counts increments that entered a transaction and `acked` counts those whose
 //! commit returned `Ok`. An increment is left in-doubt (counted in `started`,
-//! not `acked`) when a client crashes mid-commit or a sustained network outage
-//! exhausts NetBackend's retry budget and fails the transaction; the bound
-//! tolerates both while still catching lost or fabricated writes (conditional
-//! writes keep each in-doubt op applied at most once, even when a retry
-//! re-delivers it). With faults disabled the three are equal, recovering the
-//! original exact invariant. [`run_and_record`] also
-//! captures the ordered stream of backend operations so two same-seed runs can
-//! be compared byte-for-byte (see the `concurrent_sim` self-check and ADR-008).
+//! not `acked`) when a client crashes mid-commit, a sustained network outage
+//! exhausts NetBackend's retry budget, or a conditional write's outcome cannot
+//! be confirmed (its acknowledgement was lost). In every case the engine
+//! surfaces the failure to the caller and does *not* retry the transaction
+//! transparently, so each op is applied at most once; the bound tolerates the
+//! in-doubt op while still catching lost or fabricated writes. With faults
+//! disabled the three are equal, recovering the original exact invariant.
+//! [`run_and_record`] also captures the ordered stream of backend operations so
+//! two same-seed runs can be compared byte-for-byte (see the `concurrent_sim`
+//! self-check and ADR-008).
 
 use std::sync::{Arc, Mutex};
 
