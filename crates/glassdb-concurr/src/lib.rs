@@ -16,6 +16,7 @@ mod retry;
 mod rng;
 pub mod rt;
 pub mod shard;
+mod tape;
 
 pub use background::Background;
 pub use cancel::CancelToken;
@@ -27,3 +28,4 @@ pub use fanout::Fanout;
 pub use retry::{retry, retry_with_backoff, RetryErr};
 pub use rng::Rng;
 pub use shard::Sharded;
+pub use tape::Tape;

@@ -30,7 +30,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
 use glassdb_backend::Backend;
-use glassdb_concurr::{rt, CancelToken, Rng};
+use glassdb_concurr::{rt, CancelToken, Tape};
 
 use crate::{Collection, Ctx, Error, Options, DB};
 
@@ -291,30 +291,50 @@ fn assert_bounds(acct: &Acct, finals: &[i64], expected: &[i64], faults_enabled: 
 /// The crash nemesis: cancels a few clients' contexts at deterministic virtual
 /// times, modelling an abrupt client stop mid-transaction. Each cancelled client
 /// closes its `DB` (releasing background refreshers), so its in-flight locks are
-/// recovered later via lease expiry during the final reads. The number of
-/// crashes and their timing are pure functions of `seed`.
-async fn crash_nemesis(tokens: Vec<CancelToken>, intensity: u8, seed: u64) {
-    let mut rng = Rng::new(seed ^ 0x00C0_FFEE_C0DE_BEEF);
+/// recovered later via lease expiry during the final reads. Crash timing and
+/// targets are drawn from `tape` (the fuzzer-guided fault schedule), falling back
+/// to the tape's seeded PRNG once its bytes run out.
+async fn crash_nemesis(tokens: Vec<CancelToken>, intensity: u8, mut tape: Tape) {
     let crashes = (intensity as usize % 3).min(tokens.len());
     for _ in 0..crashes {
-        let gap = rng.below(40) + 1;
+        let gap = tape.below(40) + 1;
         rt::sleep(Duration::from_millis(gap)).await;
-        let idx = rng.below(tokens.len() as u64) as usize;
+        let idx = tape.below(tokens.len() as u64) as usize;
         tokens[idx].cancel();
     }
+}
+
+/// Splits a fault tape into two independent byte streams — one for the
+/// [`FaultBackend`], one for the [`crash_nemesis`] — by deinterleaving even and
+/// odd bytes. Keeping them disjoint means a single mutated byte maps to exactly
+/// one fault decision, which is what makes the fault schedule coverage-guidable.
+fn split_fault_tape(tape: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let backend = tape.iter().step_by(2).copied().collect();
+    let nemesis = tape.iter().skip(1).step_by(2).copied().collect();
+    (backend, nemesis)
 }
 
 /// Core harness: seed the store, run the clients as interleaved tasks under the
 /// (optional) fault nemesis, then verify the per-key bound. Always records the
 /// backend op stream and returns it for byte-for-byte determinism comparison.
-async fn run_inner(workload: Workload, faults: FaultConfig, seed: u64) -> OpLog {
+async fn run_inner(
+    workload: Workload,
+    faults: FaultConfig,
+    seed: u64,
+    fault_tape: Vec<u8>,
+) -> OpLog {
     let ctx = Ctx::background();
     let opts = deterministic_options();
 
+    // The fault tape guides backend faults and crash timing; with an empty tape
+    // both fall back to the seed (PCT/seed-breadth runs).
+    let (backend_tape, nemesis_tape) = split_fault_tape(&fault_tape);
+
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let fault = if faults.enabled {
-        Some(FaultBackend::new(
+        Some(FaultBackend::with_tape(
             mem.clone(),
+            backend_tape,
             seed,
             FaultOptions::from_intensity(faults.intensity),
         ))
@@ -378,10 +398,11 @@ async fn run_inner(workload: Workload, faults: FaultConfig, seed: u64) -> OpLog 
 
     // The crash nemesis runs concurrently with the clients.
     let nemesis = if faults.enabled {
+        let tape = Tape::new(nemesis_tape, seed ^ 0x00C0_FFEE_C0DE_BEEF);
         Some(rt::spawn(crash_nemesis(
             tokens.clone(),
             faults.intensity,
-            seed,
+            tape,
         )))
     } else {
         None
@@ -426,29 +447,36 @@ async fn run_inner(workload: Workload, faults: FaultConfig, seed: u64) -> OpLog 
 /// Runs `workload` over a fresh in-memory store and asserts serializability,
 /// without injecting faults.
 pub async fn run_and_assert(workload: Workload) {
-    run_inner(workload, FaultConfig::none(), 0).await;
+    run_inner(workload, FaultConfig::none(), 0, Vec::new()).await;
 }
 
 /// Like [`run_and_assert`] but injects backend faults and client crashes per
-/// `faults`, seeded by `seed`.
-pub async fn run_and_assert_with_faults(workload: Workload, faults: FaultConfig, seed: u64) {
-    run_inner(workload, faults, seed).await;
+/// `faults`. `fault_tape` guides the fault schedule (the fuzzer's secondary
+/// tape); once it is exhausted, decisions fall back to `seed`.
+pub async fn run_and_assert_with_faults(
+    workload: Workload,
+    faults: FaultConfig,
+    seed: u64,
+    fault_tape: Vec<u8>,
+) {
+    run_inner(workload, faults, seed, fault_tape).await;
 }
 
 /// Like [`run_and_assert`] but records the ordered stream of backend operations
 /// and returns the log, for byte-for-byte determinism comparison across runs.
 pub async fn run_and_record(workload: &Workload) -> OpLog {
-    run_inner(workload.clone(), FaultConfig::none(), 0).await
+    run_inner(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
 }
 
-/// Like [`run_and_record`] but with fault injection enabled per `faults`,
-/// seeded by `seed`.
+/// Like [`run_and_record`] but with fault injection enabled per `faults`.
+/// `fault_tape` guides the fault schedule; it falls back to `seed` once spent.
 pub async fn run_and_record_with_faults(
     workload: &Workload,
     faults: FaultConfig,
     seed: u64,
+    fault_tape: Vec<u8>,
 ) -> OpLog {
-    run_inner(workload.clone(), faults, seed).await
+    run_inner(workload.clone(), faults, seed, fault_tape).await
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +504,8 @@ pub fn pct_assert(workload: &Workload, faults: FaultConfig, seed: u64) {
     rt::block_on_with(
         rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
         seed,
-        async move { run_and_assert_with_faults(w, faults, seed).await },
+        // Empty fault tape: PCT explores the seed-breadth fault space.
+        async move { run_and_assert_with_faults(w, faults, seed, Vec::new()).await },
     );
 }
 
@@ -488,7 +517,7 @@ pub fn pct_record(workload: &Workload, faults: FaultConfig, seed: u64) -> OpLog 
     rt::block_on_with(
         rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
         seed,
-        async move { run_and_record_with_faults(&w, faults, seed).await },
+        async move { run_and_record_with_faults(&w, faults, seed, Vec::new()).await },
     )
 }
 

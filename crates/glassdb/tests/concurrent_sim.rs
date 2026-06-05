@@ -73,14 +73,31 @@ fn record_once(seed: u64, workload: &Workload) -> Vec<OpRecord> {
     recorded.clone()
 }
 
-/// The op stream recorded for `workload` under `tape`/`seed` with faults active.
-fn record_once_faults(seed: u64, workload: &Workload, faults: FaultConfig) -> Vec<OpRecord> {
+/// A deterministic fault tape derived from `seed`, distinct from the schedule
+/// tape so the interleaving and the fault schedule vary independently.
+fn fault_tape(seed: u64) -> Vec<u8> {
+    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
+}
+
+/// The op stream recorded for `workload` under the schedule `tape(seed)`/`seed`
+/// with faults active and guided by `ft`.
+fn record_faults_with_tape(
+    seed: u64,
+    workload: &Workload,
+    faults: FaultConfig,
+    ft: Vec<u8>,
+) -> Vec<OpRecord> {
     let w = workload.clone();
     let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record_with_faults(&w, faults, seed).await
+        run_and_record_with_faults(&w, faults, seed, ft).await
     });
     let recorded = log.lock().unwrap();
     recorded.clone()
+}
+
+/// The op stream recorded for `workload` under `tape`/`seed` with faults active.
+fn record_once_faults(seed: u64, workload: &Workload, faults: FaultConfig) -> Vec<OpRecord> {
+    record_faults_with_tape(seed, workload, faults, fault_tape(seed))
 }
 
 #[test]
@@ -160,10 +177,32 @@ fn serializability_holds_under_faults() {
     let workload = contended_workload();
     for seed in [0u64, 3, 99, 2024] {
         let w = workload.clone();
+        let ft = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(w, FaultConfig::enabled(9), seed).await
+            run_and_assert_with_faults(w, FaultConfig::enabled(9), seed, ft).await
         });
     }
+}
+
+#[test]
+fn fault_tape_guides_the_fault_schedule() {
+    // Same schedule tape and seed but different *fault* tapes must be able to
+    // change the recorded op stream; otherwise the fault schedule would only be
+    // seed-sampled, not coverage-guidable. An all-low tape fires every fault; an
+    // all-high tape fires none. The intensity must be high enough that the
+    // impactful faults (fail-before / lost-ack) have non-zero probability.
+    let workload = contended_workload();
+    let faults = FaultConfig::enabled(128);
+    let differs = [0u64, 1, 7, 42, 1234].iter().any(|&seed| {
+        let all_on = record_faults_with_tape(seed, &workload, faults, vec![0u8; 4096]);
+        let all_off = record_faults_with_tape(seed, &workload, faults, vec![0xffu8; 4096]);
+        all_on != all_off
+    });
+    assert!(
+        differs,
+        "the fault tape changed no op stream; the fault schedule may not be \
+         tape-guided"
+    );
 }
 
 #[test]
