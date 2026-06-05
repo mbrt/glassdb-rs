@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use glassdb_concurr::rt;
 use glassdb_concurr::Ctx;
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
@@ -66,7 +67,7 @@ impl ScheduledBackend {
         }
         let dur = self.sched.tick * u32::from(d);
         tokio::select! {
-            _ = tokio::time::sleep(dur) => {}
+            _ = rt::sleep(dur) => {}
             _ = ctx.cancelled() => {}
         }
     }

@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Accepted. The `madsim` runtime and the simulated-network topology described here
+are **superseded by [ADR-011](011-guided-interleaving-executor.md)** for the
+engine DST (a minimal in-repo deterministic executor + `Backend`-level fault
+injection). The acked-bounds invariant, the in-doubt reasoning, and the
+`RecordingBackend` op-stream self-check below still apply.
 
 ## Context
 

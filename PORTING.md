@@ -223,20 +223,26 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   current-thread `start_paused` runtime where `tokio::join!` keeps every workload
   on one task — giving real interleaving (tasks yield at `.await` points under
   contention) while keeping virtual-time control simple and deterministic.
-- **Deterministic simulation fuzzer (madsim).** The original `FuzzConcurrentTx`
-  uses a byte-driven backend-delay scheduler. The Rust port goes further with a
-  madsim-based DST in which scheduling, time, and randomness are all functions of
-  a single seed: see [ADR-008](docs/adr/008-deterministic-simulation-fuzzer.md).
-  A `cargo-fuzz` target (`fuzz/`) turns libFuzzer bytes into `(seed, Workload)`,
-  runs an N-client RMW mix on a shared `MemoryBackend`, and asserts the
-  serializability invariant. The self-check additionally asserts that two
-  same-seed runs issue a **byte-for-byte identical backend-call stream**
-  (`RecordingBackend` + `tests/concurrent_sim.rs`), which required the
-  previously-deferred commit-path ordering (now justified) and a fixed-base
-  deterministic clock. Run with `make sim-test` / `make fuzz`. The
-  `proptest_concurrent` test is kept as a fast non-madsim sanity check.
-  Go's byte-schedule approach was inspiration only; the Rust design is
-  madsim-native.
+- **Deterministic simulation fuzzer (in-repo executor).** The original
+  `FuzzConcurrentTx` uses a byte-driven backend-delay scheduler. The Rust port
+  goes further with a DST in which scheduling, time, and randomness are all
+  functions of the input. The runtime started on `madsim`
+  ([ADR-008](docs/adr/008-deterministic-simulation-fuzzer.md)) but now runs on a
+  minimal in-repo deterministic executor that controls task poll order via a
+  pluggable scheduler — a **schedule-tape** (the libFuzzer-guidable primary) and
+  **PCT** (seed-breadth) — with faults injected at the `Backend` trait
+  (`FaultBackend`) rather than a simulated network: see
+  [ADR-011](docs/adr/011-guided-interleaving-executor.md) (and
+  [ADR-010](docs/adr/010-fuzzer-coverage-guidance.md) for why guidance needs a
+  tape). A `cargo-fuzz` target (`fuzz/`) turns libFuzzer bytes into
+  `(seed, Workload, FaultConfig, schedule_tape)`, runs an N-client RMW mix on a
+  shared `MemoryBackend`, and asserts the serializability invariant. The
+  self-check additionally asserts that two same-tape/seed runs issue a
+  **byte-for-byte identical backend-call stream** (`RecordingBackend` +
+  `tests/concurrent_sim.rs`), which required the previously-deferred commit-path
+  ordering (now justified) and a fixed-base deterministic clock. Run with
+  `make sim-test` / `make fuzz`. The `proptest_concurrent` test is kept as a fast
+  non-sim sanity check. Go's byte-schedule approach was inspiration only.
 - **Behavioral tests, ported wholesale.** The unit tests of the hard pieces
   (`dedup`, `algo`, `tlocker`, `monitor`, `gc`, `cache`) were ported from their
   Go counterparts to lock in equivalent behavior.
@@ -309,7 +315,7 @@ per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorat
 | Last ported commit | `ed5ec47` (partial) + `fe03218` test (partial) |
 | Ported on | 2026-06-03 |
 | Deferred — autoresearch | `9b00d94` … `6bd75ea` |
-| Determinism/fuzz | Rust-native madsim DST + cargo-fuzz built (ADR-008); Go determinism commits `790c1a7`/`0b2c609` were inspiration only |
+| Determinism/fuzz | Rust-native DST on an in-repo deterministic executor (schedule-tape + PCT) + cargo-fuzz built (ADR-011, superseding the madsim runtime of ADR-008); Go determinism commits `790c1a7`/`0b2c609` were inspiration only |
 | Next port | autoresearch batch, or next non-autoresearch commit after HEAD |
 
 ### What was ported (`c1471c3`..`62dab6f`, autoresearch excluded)
@@ -318,21 +324,25 @@ per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorat
   ([docs/adr/007-single-rw-cache-lost-update.md](docs/adr/007-single-rw-cache-lost-update.md))
 - `single_rw_lost_update` regression test in `glassdb-trans`
 
-### Determinism work (built Rust-native, see ADR-008)
+### Determinism work (built Rust-native, see ADR-008 and ADR-011)
 
 - Stable path ordering of commit-path slices (`Tx::collect_accesses`,
   `init_validation`, `collections_locks`, `Locker::locked_paths`)
-- madsim deterministic runtime (seeded scheduling/time/randomness); `TxId`
-  prefix from `madsim::rand`; `Options::deterministic_time` fixed-base clock
-- `RecordingBackend` op-stream self-check + cargo-fuzz `concurrent_tx` target
+- In-repo deterministic executor (`glassdb-concurr` `rt`/`exec`) with schedule-tape
+  and PCT schedulers; seeded scheduling/time/randomness; `TxId` prefix from the
+  run's seeded RNG (`#[cfg(sim)]`); `Options::deterministic_time` fixed-base clock
+  and `rt::system_now` for persisted timestamps
+- `FaultBackend` (Backend-level fault injection) + `RecordingBackend` op-stream
+  self-check + cargo-fuzz `concurrent_tx` target (schedule-tape)
 
 ### What was not ported (use as inspiration only)
 
-- Injectable TxId prefix source / DB `Rand` option (madsim shim supersedes)
+- Injectable TxId prefix source / DB `Rand` option (the `#[cfg(sim)]` seeded-RNG
+  shim supersedes)
 - Configurable retry + jitter / `DisableJitter`
 - `Monitor` Retrier refactor
 - Go fuzz workload + `TestConcurrentTxDeterministicOutcome` (replaced by the
-  madsim DST)
+  in-repo-executor DST)
 - Autoresearch perf experiments
 
 ### How to port the next batch

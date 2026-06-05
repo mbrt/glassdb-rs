@@ -22,11 +22,11 @@ edition = "2021"
 license = "Apache-2.0"
 publish = false
 
-# `--cfg madsim` activates the deterministic simulator (see ADR-008). Declaring
-# it here keeps `#[cfg(madsim)]` attributes from tripping the `unexpected_cfgs`
-# lint in normal builds (where the cfg is simply never set).
+# `--cfg sim` activates the in-repo deterministic simulation executor (see
+# ADR-011). Declaring it here keeps `#[cfg(sim)]` attributes from tripping the
+# `unexpected_cfgs` lint in normal builds (where the cfg is simply never set).
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sim)'] }
 
 [workspace.dependencies]
 glassdb-data = { path = "crates/glassdb-data" }

@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_backend::{self as backend, BackendError};
 use glassdb_concurr::{
-    await_signal, shard::Sharded, Controller, Ctx, Dedup, DedupError, DedupWorker, MergeRequest,
+    await_signal, rt, shard::Sharded, Controller, Ctx, Dedup, DedupError, DedupWorker, MergeRequest,
 };
 use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
 use glassdb_storage::{
@@ -330,7 +330,7 @@ impl LockerWorker {
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled.into()),
                 _ = wait_rx => {}
                 _ = await_signal(&sem) => {}
-                _ = tokio::time::sleep(WAIT_POLL_DURATION) => {}
+                _ = rt::sleep(WAIT_POLL_DURATION) => {}
             }
             break;
         }

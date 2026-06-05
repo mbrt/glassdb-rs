@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use glassdb_backend as backend;
-use glassdb_concurr::{shard::Sharded, Background, Clock, Ctx};
+use glassdb_concurr::{rt, shard::Sharded, Background, Clock, Ctx};
 use glassdb_data::TxId;
 use glassdb_storage::{Local, TLogger, TValue, TxCommitStatus, TxLog, Version, MAX_STALENESS};
 use tokio::sync::oneshot;
@@ -340,7 +340,7 @@ impl Monitor {
         let m = self.clone();
         let tid = tid.clone();
         let ctx0 = ctx.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let mut cur_ctx = ctx0;
             loop {
                 let (status, err) = m.poll_tx_status(&cur_ctx, &tid).await;
@@ -509,7 +509,7 @@ impl Monitor {
                 _ = ctx.cancelled() => {
                     return (s, Some(TransError::Other("retry polling tx status".into())));
                 }
-                _ = tokio::time::sleep(interval) => {}
+                _ = rt::sleep(interval) => {}
             }
             interval = std::cmp::min(interval.mul_f64(1.5), Duration::from_secs(5));
         }
@@ -550,7 +550,7 @@ impl Monitor {
             tokio::select! {
                 biased;
                 _ = ctx.cancelled() => return Err(TransError::Cancelled),
-                _ = tokio::time::sleep(interval) => {}
+                _ = rt::sleep(interval) => {}
             }
             interval = std::cmp::min(interval.mul_f64(1.5), Duration::from_secs(5));
         }
@@ -585,7 +585,7 @@ impl Monitor {
             tokio::select! {
                 biased;
                 _ = ctx.cancelled() => return,
-                _ = tokio::time::sleep(refresh_timeout()) => {}
+                _ = rt::sleep(refresh_timeout()) => {}
             }
             if !self.should_refresh(&tid) {
                 return;

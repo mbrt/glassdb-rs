@@ -63,7 +63,7 @@ where
                 tokio::select! {
                     biased;
                     _ = ctx.cancelled() => return Err(e),
-                    _ = tokio::time::sleep(interval) => {}
+                    _ = crate::rt::sleep(interval) => {}
                 }
                 interval = std::cmp::min(interval.mul_f64(MULTIPLIER), max);
             }

@@ -17,7 +17,7 @@ glassdb-proto = { version = "0.1.0", path = "../glassdb-proto" }
 prost = "0.14.3"
 prost-types = "0.14.3"
 thiserror = "2.0.18"
-tokio = { package = "madsim-tokio", version = "0.2", features = ["time"] }
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
-tokio = { package = "madsim-tokio", version = "0.2", features = ["macros", "rt", "time", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }

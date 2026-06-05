@@ -4,11 +4,11 @@
 //! serializability invariant: each key's final value equals the total number of
 //! successful increments applied to it.
 //!
-//! This is the fast, normal-build sanity check. The deterministic simulator
-//! drives the same invariant under `--cfg madsim` (see the `fuzz/` crate and
+//! This is the fast, normal-build sanity check. The deterministic executor
+//! drives the same invariant under `--cfg sim` (see the `fuzz/` crate and
 //! `concurrent_sim` integration test), where it controls its own clock, so this
 //! file (which builds a `start_paused` tokio runtime directly) is compiled out.
-#![cfg(not(madsim))]
+#![cfg(not(sim))]
 
 use std::sync::Arc;
 
