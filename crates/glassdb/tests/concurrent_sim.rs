@@ -206,6 +206,31 @@ fn fault_tape_guides_the_fault_schedule() {
 }
 
 #[test]
+fn recovery_holds_under_crash_restart_and_outages() {
+    // High intensity drives multiple client crashes (→ crash-and-restart on the
+    // same backend) and sustained, all-or-nothing per-client transport outages.
+    // Each run must stay byte-for-byte deterministic per (tape, seed), and the
+    // acked-bounds invariant (asserted inside the harness) must survive the
+    // recovery paths those faults exercise: lease expiry, lock-lease recovery,
+    // and a restarted client reclaiming its own orphaned locks.
+    let workload = contended_workload();
+    let faults = FaultConfig::enabled(200);
+    for seed in [0u64, 1, 7, 42, 99, 1234] {
+        let ft = fault_tape(seed);
+        let first = record_faults_with_tape(seed, &workload, faults, ft.clone());
+        let second = record_faults_with_tape(seed, &workload, faults, ft);
+        if let Some((idx, a, b)) = first_divergence(&first, &second) {
+            panic!(
+                "seed {seed}: recovery op stream diverged at index {idx}\n  \
+                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+                first.len(),
+                second.len(),
+            );
+        }
+    }
+}
+
+#[test]
 fn pct_schedule_is_byte_identical_per_seed() {
     // The PCT policy must be just as reproducible as the tape policy: a fixed
     // seed yields a byte-for-byte identical op stream across runs.
