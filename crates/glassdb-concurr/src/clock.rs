@@ -4,10 +4,13 @@
 //! object tags) against "now" to decide whether a pending transaction has
 //! expired. In production this is just `SystemTime::now`. In tests we want this
 //! to advance together with `tokio::time::pause`/`advance`, so the [`Clock`]
-//! can instead anchor a base wall-clock time to a base tokio `Instant` and
-//! derive "now" from the (mocked) elapsed tokio time.
+//! can instead anchor a base wall-clock time to a base `rt::Instant` and
+//! derive "now" from the (mocked) elapsed time. Under `--cfg sim` the same anchor
+//! follows the deterministic executor's virtual clock instead.
 
 use std::time::SystemTime;
+
+use crate::rt::Instant;
 
 /// A source of wall-clock time.
 #[derive(Clone)]
@@ -16,10 +19,10 @@ pub struct Clock(Kind);
 #[derive(Clone)]
 enum Kind {
     Real,
-    /// Anchored to tokio's clock: `now = base_sys + (tokio::now - base_instant)`.
+    /// Anchored to the runtime clock: `now = base_sys + (rt::now - base_instant)`.
     Anchored {
         base_sys: SystemTime,
-        base_instant: tokio::time::Instant,
+        base_instant: Instant,
     },
 }
 
@@ -37,15 +40,16 @@ impl Clock {
     }
 
     /// Like [`Clock::anchored`] but with an explicit base wall-clock time
-    /// instead of `SystemTime::now()`. Under the madsim simulator both the base
-    /// instant (the runtime's deterministic start) and the elapsed tokio time
-    /// are deterministic, so a fixed `base_sys` makes `now()` — and therefore
-    /// the transaction-id timestamps derived from it — a pure function of the
-    /// simulation seed. Must be created inside a tokio runtime.
+    /// instead of `SystemTime::now()`. Under the deterministic simulation
+    /// executor (`--cfg sim`) both the base instant (virtual time zero) and the
+    /// elapsed time are deterministic, so a fixed `base_sys` makes `now()` — and
+    /// therefore the transaction-id timestamps derived from it — a pure function
+    /// of the simulation seed. Must be created inside a runtime (tokio or the
+    /// simulation executor).
     pub fn anchored_at(base_sys: SystemTime) -> Self {
         Clock(Kind::Anchored {
             base_sys,
-            base_instant: tokio::time::Instant::now(),
+            base_instant: Instant::now(),
         })
     }
 

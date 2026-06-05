@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use glassdb_backend::{self as backend, Metadata};
-use glassdb_concurr::{Background, CancelToken, Ctx};
+use glassdb_concurr::{rt, Background, CancelToken, Ctx};
 use glassdb_data::{paths, TxId};
 use glassdb_storage::{
     tags_lock_info, Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version,
@@ -1237,10 +1237,10 @@ impl Algo {
             // Bound the cleanup with a timeout.
             let (cctx, token) = ctx.child_cancel();
             let t2 = token.clone();
-            tokio::spawn(async move {
+            rt::spawn(async move {
                 tokio::select! {
                     biased;
-                    _ = tokio::time::sleep(BG_CLEANUP_TIMEOUT) => t2.cancel(),
+                    _ = rt::sleep(BG_CLEANUP_TIMEOUT) => t2.cancel(),
                     _ = t2.cancelled() => {}
                 }
             });
@@ -1348,10 +1348,10 @@ impl Algo {
         );
         let (child, token) = ctx.child_cancel();
         let t2 = token.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep(timeout) => t2.cancel(),
+                _ = rt::sleep(timeout) => t2.cancel(),
                 _ = t2.cancelled() => {}
             }
         });

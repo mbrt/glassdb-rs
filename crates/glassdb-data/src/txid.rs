@@ -3,20 +3,26 @@ use std::sync::Arc;
 
 /// Fills `b` with random bytes.
 ///
-/// In normal builds this draws from the OS via `rand`. Under the madsim
-/// deterministic simulator (`--cfg madsim`) it draws from the runtime's seeded
-/// RNG instead, so transaction-log object keys (which embed this prefix) are a
-/// deterministic function of the simulation seed and replays are byte-identical.
-#[cfg(not(madsim))]
+/// In normal builds this draws from the OS via `rand`. Under the deterministic
+/// simulation executor (`--cfg sim`) it draws from the run's seeded RNG instead,
+/// so transaction-log object keys (which embed this prefix) are a deterministic
+/// function of the simulation seed and replays are byte-identical.
+#[cfg(not(sim))]
 fn fill_random(b: &mut [u8]) {
     use rand::Rng;
     rand::rng().fill_bytes(b);
 }
 
-#[cfg(madsim)]
+#[cfg(sim)]
 fn fill_random(b: &mut [u8]) {
-    use madsim::rand::RngCore;
-    madsim::rand::thread_rng().fill_bytes(b);
+    // Inside the executor, draw from its seeded entropy. Outside it (e.g.
+    // ordinary tokio tests built with `--cfg sim`), fall back to the OS RNG.
+    if glassdb_concurr::rt::in_sim() {
+        glassdb_concurr::rt::fill_random(b);
+    } else {
+        use rand::Rng;
+        rand::rng().fill_bytes(b);
+    }
 }
 
 /// Total length, in bytes, of a freshly generated transaction ID.
@@ -276,8 +282,8 @@ pub fn set_union(a: &TxIdSet, b: &TxIdSet) -> TxIdSet {
 mod tests {
     use super::*;
 
-    // Tests that mint random prefixes run on a runtime so the madsim simulator's
-    // seeded RNG has a reactor (a no-op for the OS RNG in normal builds).
+    // These run on a runtime so prefix minting works under any build; outside
+    // the simulation executor `fill_random` simply draws from the OS RNG.
     #[tokio::test]
     async fn random_is_16_bytes_and_hex() {
         let id = TxId::new_random();

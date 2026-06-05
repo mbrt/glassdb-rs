@@ -190,7 +190,7 @@ impl Tx {
         // log contents, lock acquisition order, validation order) is
         // independent of `HashMap`'s randomized iteration, and of the order in
         // which concurrent reads happened to insert their entries. This makes a
-        // madsim replay byte-for-byte identical and is harmless in production.
+        // simulation replay byte-for-byte identical and is harmless in production.
         writes.sort_by(|a, b| a.path.cmp(&b.path));
         reads.sort_by(|a, b| a.path.cmp(&b.path));
         Data { reads, writes }

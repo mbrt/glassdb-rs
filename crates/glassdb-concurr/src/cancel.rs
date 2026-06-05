@@ -1,17 +1,16 @@
 //! A hierarchical cancellation token built on `tokio::sync::Notify`.
 //!
-//! This replaces `tokio_util::sync::CancellationToken`. `tokio_util` depends on
-//! the real `tokio` crate, so under the madsim deterministic simulator (which
-//! aliases `tokio` to `madsim-tokio`) it would not be redirected. `Notify` is
-//! part of `tokio::sync`, which madsim keeps as the real, runtime-agnostic
-//! primitive, so a token built on it works identically in production and under
-//! simulation.
+//! This replaces `tokio_util::sync::CancellationToken`. `tokio_util` brings in
+//! machinery tied to tokio's own runtime, whereas `Notify` is part of
+//! `tokio::sync`, which is runtime-agnostic and runs unchanged on the in-repo
+//! deterministic executor (`--cfg sim`, ADR-011), so a token built on it works
+//! identically in production and under simulation.
 //!
 //! It is deliberately *not* built on `tokio::sync::watch`: `watch` shards its
 //! internal notifier and picks a shard with `tokio`'s thread-local RNG, which
-//! madsim does not seed. That RNG persists across simulator runs on the same
-//! thread, so a watch-based token would make scheduling non-reproducible (see
-//! ADR-008). `Notify` draws no randomness, keeping every `cancelled()` await
+//! the simulation executor does not control. That RNG persists across runs on
+//! the same thread, so a watch-based token would make scheduling non-reproducible
+//! (see ADR-008). `Notify` draws no randomness, keeping every `cancelled()` await
 //! deterministic.
 //!
 //! Semantics mirror the subset of `CancellationToken` the codebase uses: a

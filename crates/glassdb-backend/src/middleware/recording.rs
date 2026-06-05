@@ -1,18 +1,18 @@
 //! A [`Backend`] decorator that records every operation it forwards into an
 //! ordered, shared in-memory log.
 //!
-//! This underpins the deterministic-simulation self-check (see ADR-008): two
-//! runs of the same madsim seed must issue a *byte-for-byte identical* sequence
-//! of backend operations. Two different interleavings can reach the same final
-//! state while issuing different operations, so comparing only the final result
-//! is not enough — an identical operation stream is what proves the schedule
-//! itself replayed deterministically.
+//! This underpins the deterministic-simulation self-check (see ADR-010/011):
+//! two runs of the same schedule tape and seed must issue a *byte-for-byte
+//! identical* sequence of backend operations. Two different interleavings can
+//! reach the same final state while issuing different operations, so comparing
+//! only the final result is not enough — an identical operation stream is what
+//! proves the schedule itself replayed deterministically.
 //!
 //! Each record captures the method tag and a canonical encoding of every
 //! argument that crosses the boundary (path, value, tags, expected version, and
 //! writer id). The recording order is the call-issue order; under a
-//! deterministic madsim schedule that order is itself deterministic, which is
-//! exactly the property under test.
+//! deterministic schedule that order is itself deterministic, which is exactly
+//! the property under test.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};

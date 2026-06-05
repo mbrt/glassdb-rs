@@ -34,3 +34,9 @@ pub use glassdb_backend_s3 as s3;
 
 // Re-export the cancellation context, required by every public entry point.
 pub use glassdb_concurr::Ctx;
+
+// The deterministic simulation runtime (only under `--cfg sim`). Used by the
+// concurrency fuzzer and the `concurrent_sim` self-check to drive the harness on
+// the in-repo executor with a `TapeScheduler`/seed.
+#[cfg(sim)]
+pub use glassdb_concurr::rt;

@@ -12,8 +12,6 @@ use glassdb_concurr::Ctx;
 
 pub mod memory;
 pub mod middleware;
-#[cfg(madsim)]
-pub mod net;
 mod stats;
 
 pub use stats::{BackendStats, StatsBackend};
@@ -23,7 +21,6 @@ pub const LAST_WRITER_TAG: &str = "last-writer";
 
 /// Errors returned by backend operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(madsim, derive(serde::Serialize, serde::Deserialize))]
 pub enum BackendError {
     /// The object does not exist.
     #[error("object not found")]
@@ -73,7 +70,6 @@ pub type Tags = BTreeMap<String, String>;
 
 /// An opaque CAS token identifying a generation of an object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(madsim, derive(serde::Serialize, serde::Deserialize))]
 pub struct Version {
     pub token: String,
 }
@@ -96,7 +92,6 @@ impl Version {
 /// the Go `WriterID`; kept distinct from `data::TxId` so this crate stays
 /// independent of internal types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(madsim, derive(serde::Serialize, serde::Deserialize))]
 pub struct WriterId(Vec<u8>);
 
 impl WriterId {
@@ -128,7 +123,6 @@ pub fn encode_writer_tag(w: &WriterId) -> String {
 
 /// The contents, version, and tags of a read object.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(madsim, derive(serde::Serialize, serde::Deserialize))]
 pub struct ReadReply {
     pub contents: Vec<u8>,
     pub version: Version,
@@ -137,7 +131,6 @@ pub struct ReadReply {
 
 /// The tags and version of an object (no contents).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(madsim, derive(serde::Serialize, serde::Deserialize))]
 pub struct Metadata {
     pub tags: Tags,
     pub version: Version,

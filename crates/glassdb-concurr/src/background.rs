@@ -4,10 +4,9 @@
 use std::future::Future;
 use std::sync::Mutex;
 
-use tokio::task::JoinHandle;
-
 use crate::cancel::CancelToken;
 use crate::ctx::Ctx;
+use crate::rt::{self, JoinHandle};
 
 /// Manages a set of background tasks cancelled together on close.
 pub struct Background {
@@ -39,7 +38,7 @@ impl Background {
             return false;
         }
         let child = ctx.with_new_cancel(self.token.clone());
-        let handle = tokio::spawn(async move {
+        let handle = rt::spawn(async move {
             f(child).await;
         });
         self.handles.lock().unwrap().push(handle);

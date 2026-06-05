@@ -9,9 +9,14 @@ mod channel;
 mod clock;
 pub mod ctx;
 mod dedup;
+#[cfg(sim)]
+mod exec;
 mod fanout;
 mod retry;
+mod rng;
+pub mod rt;
 pub mod shard;
+mod tape;
 
 pub use background::Background;
 pub use cancel::CancelToken;
@@ -21,4 +26,6 @@ pub use ctx::{Cancelled, Ctx};
 pub use dedup::{await_signal, Controller, Dedup, DedupError, DedupWorker, MergeRequest};
 pub use fanout::Fanout;
 pub use retry::{retry, retry_with_backoff, RetryErr};
+pub use rng::Rng;
 pub use shard::Sharded;
+pub use tape::Tape;
