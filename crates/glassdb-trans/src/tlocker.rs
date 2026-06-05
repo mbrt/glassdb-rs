@@ -19,7 +19,7 @@ use glassdb_concurr::{
 use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
 use glassdb_storage::{
     compute_lock_update, tags_lock_info, Global, Local, LockInfo, LockRequest, LockType,
-    Locker as StorageLocker, PathLock, StorageError, TValue, TxPathState,
+    LockUpdate, Locker as StorageLocker, PathLock, StorageError, TValue, TxPathState,
 };
 use tokio::sync::Semaphore;
 
@@ -129,6 +129,30 @@ impl LockerCore {
         key: &str,
         req: &LockRequest,
     ) -> Result<LockOpResult, StorageError> {
+        // A pure create request is self-checking: `write_if_not_exists` fails
+        // with a precondition error if the object already exists, so the
+        // preliminary metadata read (and lockers-state fetch) that the general
+        // path performs is redundant. `compute_lock_update` ignores the current
+        // lock state for a create anyway (it never waits or wounds), so go
+        // straight to the conditional create and save a metadata round-trip per
+        // created key. On a precondition error the caller falls back to a write
+        // lock, exactly as it would have with the metadata read.
+        if req.typ == LockType::Create && req.unlockers.is_empty() {
+            let locker = StorageLocker::new(self.global.clone());
+            let update = LockUpdate {
+                typ: LockType::Create,
+                lockers: req.lockers.clone(),
+                ..Default::default()
+            };
+            locker
+                .update_lock(ctx, key, &backend::Version::default(), &update)
+                .await?;
+            return Ok(LockOpResult {
+                locked_for: req.lockers.clone(),
+                ..Default::default()
+            });
+        }
+
         let ldata = self.fetch_lock_info(ctx, key).await?;
         let txs = self.fetch_lockers_state(ctx, key, &ldata.info).await?;
         let ops = compute_lock_update(ldata.info, req, &txs)?;
