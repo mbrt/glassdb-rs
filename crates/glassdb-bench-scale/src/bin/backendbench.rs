@@ -5,8 +5,8 @@
 //! cloud bucket:
 //!
 //! ```text
-//! cargo run -p glassdb-bench --bin backendbench -- --backend memory
-//! BUCKET=my-bucket cargo run -p glassdb-bench --bin backendbench -- --backend s3
+//! cargo run -p glassdb-bench-scale --bin backendbench -- --backend memory
+//! BUCKET=my-bucket cargo run -p glassdb-bench-scale --bin backendbench -- --backend s3
 //! ```
 
 // See the note in `rtbench`: musl's default allocator contends badly under the
@@ -28,7 +28,7 @@ use glassdb::middleware::{gcs_delays, DelayBackend};
 use glassdb_backend::{
     encode_writer_tag, Backend, BackendError, Metadata, Tags, Version, WriterId, LAST_WRITER_TAG,
 };
-use glassdb_bench::bench::Bench;
+use glassdb_bench_scale::bench::Bench;
 use glassdb_concurr::Ctx;
 
 const TEST_ROOT: &str = "backend-bench";
@@ -40,7 +40,7 @@ struct Args {
     #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3"])]
     backend: String,
     /// How long to run each operation benchmark.
-    #[arg(long, default_value = "20s", value_parser = glassdb_bench::parse_duration)]
+    #[arg(long, default_value = "20s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
 }
 

@@ -15,7 +15,7 @@ Plus `client-stats.csv` (no figure): per-step client CPU / HTTP / connection
 diagnostics, described under [Client-side diagnostics](#client-side-diagnostics-client-statscsv).
 
 `rtbench` and the shared sample-collection code live in the
-[`glassdb-bench`](../../crates/glassdb-bench) crate. The rw9010 workload: 50k
+[`glassdb-bench-scale`](../../crates/glassdb-bench-scale) crate. The rw9010 workload: 50k
 keys, 1..50 concurrent DBs, each running 10 transactions in parallel (10%
 writes, 60% strong reads, 30% weak reads). The deadlock workload runs 5 workers
 contending on 1..6 shared keys at up to 100% overlap.
@@ -60,7 +60,7 @@ instance pulls it over the gateway endpoint, runs the benchmarks, uploads the
 CSVs to `results/<timestamp>/`, and then stops itself.
 
 The musl build links **mimalloc** as its global allocator (see
-`crates/glassdb-bench/src/bin/rtbench/main.rs`). musl's default allocator
+`crates/glassdb-bench-scale/src/bin/rtbench/main.rs`). musl's default allocator
 serializes multi-threaded allocation on a coarse lock, which—under the
 hundreds of concurrent workers here, each churning HTTP/TLS buffers per S3
 op—collapses into a `futex`/system-CPU storm (observed as `sys` dwarfing
@@ -191,13 +191,13 @@ point. No AWS access is required:
 
 ```bash
 # rw9010 + deadlock at the same scale as the real run, into out-fake/.
-cargo run --release -p glassdb-bench --bin rtbench -- \
+cargo run --release -p glassdb-bench-scale --bin rtbench -- \
   --backend=memory --delays=s3 --test-name=rw9010 \
   --max-dbs=50 --num-keys=50000 --duration=60s \
   --samples-out=hack/aws-bench/out-fake/samples.csv \
   --stats-out=hack/aws-bench/out-fake/stats.csv \
   --throughput-out=hack/aws-bench/out-fake/throughput.csv
-cargo run --release -p glassdb-bench --bin rtbench -- \
+cargo run --release -p glassdb-bench-scale --bin rtbench -- \
   --backend=memory --delays=s3 --test-name=deadlock \
   --duration=20s --deadlock-out=hack/aws-bench/out-fake/deadlock.csv
 
