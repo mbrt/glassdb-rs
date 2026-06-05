@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend::{self as backend, Tags};
-use glassdb_concurr::Ctx;
+use glassdb_concurr::{rt, Ctx};
 use glassdb_data::{gopath, paths, TxId};
 use glassdb_proto as pb;
 use prost::Message;
@@ -168,7 +168,7 @@ impl TLogger {
     /// Creates a new transaction log entry, failing if one already exists.
     pub async fn set(&self, ctx: &Ctx, mut l: TxLog) -> Result<backend::Version, StorageError> {
         if l.timestamp.is_none() {
-            l.timestamp = Some(SystemTime::now());
+            l.timestamp = Some(rt::system_now());
         }
         let buf = marshal_log(&l)?;
         let tags = log_tags(&l);
@@ -192,7 +192,7 @@ impl TLogger {
         expected: &backend::Version,
     ) -> Result<backend::Version, StorageError> {
         if l.timestamp.is_none() {
-            l.timestamp = Some(SystemTime::now());
+            l.timestamp = Some(rt::system_now());
         }
         let buf = marshal_log(&l)?;
         let tags = log_tags(&l);
@@ -296,7 +296,7 @@ fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
 
     let tr = pb::TransactionLog {
         timestamp: Some(system_to_proto_ts(
-            l.timestamp.unwrap_or_else(SystemTime::now),
+            l.timestamp.unwrap_or_else(rt::system_now),
         )),
         status: status as i32,
         writes: coll_writes.into_values().collect(),
@@ -391,7 +391,7 @@ fn log_tags(l: &TxLog) -> Tags {
     };
     let ts = l
         .timestamp
-        .unwrap_or_else(SystemTime::now)
+        .unwrap_or_else(rt::system_now)
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);

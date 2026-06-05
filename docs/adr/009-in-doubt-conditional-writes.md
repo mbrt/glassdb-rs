@@ -84,7 +84,7 @@ instead of being retried into a double-apply.
 | Backend | Conditional-write retry | Ambiguous outcome → |
 |---------|-------------------------|---------------------|
 | Memory  | n/a (local, atomic)     | cannot occur |
-| Net (madsim) | bounded retry | `Precondition` after a lost response, or budget exhaustion → `Unavailable` |
+| `FaultBackend` (sim) | lost-ack injection | a landed conditional write reported as `Unavailable` (modelling a lost acknowledgement) |
 | S3 | SDK retryer **disabled** for conditional `PutObject`; backend owns the loop | ambiguous attempt (timeout/dispatch/`5xx`) then `412` → `Unavailable`; budget exhaustion → `Unavailable` |
 | GCS | none (single attempt) | transport error or `5xx` on a conditional request → `Unavailable`; a clean `412`/`409` is a genuine conflict (GCS applies conditional writes atomically and we never retry, so it did not take effect) → `Precondition` |
 
@@ -118,16 +118,17 @@ log, so GC does not widen the in-doubt window.
 
 ### Regression tests for the contract
 
-- `crates/glassdb/tests/in_doubt.rs` — DB/engine level. A `FaultBackend`
-  decorator injects a lost ack on a landed conditional write and asserts
+- `crates/glassdb/tests/in_doubt.rs` — DB/engine level. The `FaultBackend`
+  middleware injects a lost ack on a landed conditional write and asserts
   at-most-once application for both the single-RW and logged paths, and that a
   *clean* conflict still retries transparently.
-- `crates/glassdb-backend/src/net.rs` — `conditional_write_with_lost_ack_is_in_doubt`.
+- `crates/glassdb-backend/src/middleware/fault.rs` — the `FaultBackend` lost-ack
+  path (`active_eventually_injects_faults`, `same_seed_same_fault_sequence`).
 - `crates/glassdb-backend-s3/src/tests.rs` — the in-process fake injects
   "apply-then-`500`" on a conditional `PutObject`; the backend must surface
   `Unavailable` (it would surface `Precondition` against the pre-fix code).
 - `crates/glassdb-backend-gcs/src/tests.rs` — same fault on the GCS JSON insert;
   the backend must surface `Unavailable`.
-- The deterministic fuzzer (ADR-008) is the system-level guard: with the
-  no-dedup `NetBackend` it asserts `acked <= final <= started` under injected
-  network/node faults.
+- The deterministic fuzzer (ADR-011, on the in-repo executor) is the system-level
+  guard: with the `FaultBackend` lost-ack/fault injection it asserts
+  `acked <= final <= started` under injected faults and client crashes.

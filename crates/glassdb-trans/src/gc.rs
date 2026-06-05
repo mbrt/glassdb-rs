@@ -4,10 +4,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use glassdb_concurr::rt::{self, Instant};
 use glassdb_concurr::{Background, Ctx};
 use glassdb_data::TxId;
 use glassdb_storage::TLogger;
-use tokio::time::Instant;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const SIZE_LIMIT: usize = 1024;
@@ -46,15 +46,13 @@ impl Gc {
     pub fn start(&self, ctx: &Ctx) {
         let g = self.clone();
         self.inner.bg.go(ctx, move |ctx| async move {
-            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-            // The first tick fires immediately; skip it so the first cleanup
-            // happens only after one full interval (matching Go's ticker).
-            interval.tick().await;
+            // First cleanup happens only after one full interval (matching Go's
+            // ticker, whose immediate first tick is skipped).
             loop {
                 tokio::select! {
                     biased;
                     _ = ctx.cancelled() => return,
-                    _ = interval.tick() => g.cleanup_round(&ctx).await,
+                    _ = rt::sleep(CLEANUP_INTERVAL) => g.cleanup_round(&ctx).await,
                 }
             }
         });

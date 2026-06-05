@@ -23,12 +23,12 @@ pub struct Options {
     /// Number of bytes dedicated to caching objects and metadata. Setting this
     /// too small may impact performance, as more backend calls are necessary.
     pub cache_size: usize,
-    /// When true, wall-clock reads are anchored to a fixed base plus tokio's
-    /// (mockable) elapsed time instead of the real system clock. Combined with
-    /// the madsim simulator this makes transaction-id timestamps — and thus the
-    /// transaction-log object keys derived from them — a deterministic function
-    /// of the simulation seed. Intended for the deterministic fuzzer; leave
-    /// false in production.
+    /// When true, wall-clock reads are anchored to a fixed base plus the
+    /// runtime's (mockable/virtual) elapsed time instead of the real system
+    /// clock. Combined with the simulation executor this makes transaction-id
+    /// timestamps — and thus the transaction-log object keys derived from them —
+    /// a deterministic function of the simulation seed. Intended for the
+    /// deterministic fuzzer; leave false in production.
     pub deterministic_time: bool,
 }
 

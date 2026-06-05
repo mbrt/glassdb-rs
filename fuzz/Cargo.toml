@@ -10,9 +10,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-madsim = "0.2"
-# The simulation harness (Workload + run_and_assert). The `sim` feature pulls in
-# `arbitrary`; the madsim-tokio alias is brought in transitively by glassdb.
+# The simulation harness (Workload + run_and_assert) and the in-repo
+# deterministic executor (`glassdb::rt`, under `--cfg sim`). The `sim` feature
+# pulls in `arbitrary`; no external simulation runtime is needed.
 glassdb = { path = "../crates/glassdb", features = ["sim"] }
 
 [[bin]]
