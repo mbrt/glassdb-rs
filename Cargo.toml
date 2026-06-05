@@ -10,7 +10,8 @@ members = [
     "crates/glassdb-storage",
     "crates/glassdb-trans",
     "crates/glassdb",
-    "crates/glassdb-bench",
+    "hack/glassdb-bench",
+    "hack/autoresearch/bench",
 ]
 # The cargo-fuzz crate is its own workspace (needs nightly + a sanitizer); keep
 # it out of the main build/test graph.

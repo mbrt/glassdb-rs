@@ -305,7 +305,7 @@ per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorat
 
 | Field | Value |
 | --- | --- |
-| Upstream repo | `~/priv/glassdb` |
+| Upstream repo | `github.com/mbrt/glassdb` |
 | Last ported commit | `ed5ec47` (partial) + `fe03218` test (partial) |
 | Ported on | 2026-06-03 |
 | Deferred — autoresearch | `9b00d94` … `6bd75ea` |

@@ -1,0 +1,5 @@
+# Bookkeeping written by the loop; regenerated at setup, never committed so that
+# the discard revert (`git clean -fd`, which leaves ignored files alone) keeps
+# them across experiments.
+baseline.json
+best.json
