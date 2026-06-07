@@ -21,7 +21,10 @@ pub const MAX_STALENESS: Duration = Duration::MAX;
 
 #[derive(Clone)]
 struct CacheValue {
-    value: Vec<u8>,
+    // The value bytes are shared via `Arc` so handing a cached value to a reader
+    // (and the reader staging it in the transaction's read set) is a refcount
+    // bump rather than a fresh copy of the bytes on every hop.
+    value: Arc<[u8]>,
     deleted: bool,
     /// Marks the value as outdated for sure. When false, the status is unknown.
     outdated: bool,
@@ -102,7 +105,7 @@ impl CacheEntry {
 /// The result of reading a value from the local cache.
 #[derive(Debug, Clone)]
 pub struct LocalRead {
-    pub value: Vec<u8>,
+    pub value: Arc<[u8]>,
     pub version: Version,
     pub deleted: bool,
     /// True if the value is certainly outdated.
@@ -172,7 +175,7 @@ impl Local {
     }
 
     /// Stores both the value and its metadata atomically.
-    pub fn write_with_meta(&self, key: &str, value: Vec<u8>, meta: Arc<Metadata>) {
+    pub fn write_with_meta(&self, key: &str, value: Arc<[u8]>, meta: Arc<Metadata>) {
         let updated = Instant::now();
         let writer = last_writer_from_tags(&meta.tags);
         let entry = CacheEntry {
@@ -196,7 +199,7 @@ impl Local {
     }
 
     /// Updates only the value for `key`.
-    pub fn write(&self, key: &str, value: Vec<u8>, v: Version) {
+    pub fn write(&self, key: &str, value: Arc<[u8]>, v: Version) {
         let new_value = CacheValue {
             value,
             deleted: false,
@@ -240,7 +243,7 @@ impl Local {
     /// Marks `key` as deleted at version `v`.
     pub fn mark_deleted(&self, key: &str, v: Version) {
         let new_value = CacheValue {
-            value: Vec::new(),
+            value: Arc::from(&[] as &[u8]),
             deleted: true,
             outdated: false,
             version: v,

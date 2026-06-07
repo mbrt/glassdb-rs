@@ -713,7 +713,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
 
         t1.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, std::sync::Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -729,11 +729,11 @@ mod tests {
 
         let cs = mon1.committed_value(&ctx, &key, &tx).await.unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
-        assert_eq!(cs.value.value, b"val1");
+        assert_eq!(&*cs.value.value, b"val1");
         // From a remote monitor.
         let cs = mon2.committed_value(&ctx, &key, &tx).await.unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
-        assert_eq!(cs.value.value, b"val1");
+        assert_eq!(&*cs.value.value, b"val1");
 
         // A key the transaction didn't write.
         let key2 = paths::from_key("example", b"key2");
@@ -810,7 +810,7 @@ mod tests {
         fn w(path: &str, value: &[u8]) -> TxWrite {
             TxWrite {
                 path: path.to_string(),
-                value: value.to_vec(),
+                value: std::sync::Arc::from(value),
                 deleted: false,
                 prev_writer: TxId::default(),
             }

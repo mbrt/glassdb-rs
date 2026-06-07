@@ -84,7 +84,7 @@ impl Tx {
             let inner = self.inner.lock().unwrap();
             if let Some(e) = inner.entries.get(&p) {
                 if let Some(tv) = &e.staged {
-                    return Ok(tv.val.clone());
+                    return Ok(tv.val.to_vec());
                 }
                 if let Some(info) = &e.read {
                     if !info.found {
@@ -108,6 +108,8 @@ impl Tx {
             Ok(rv) => {
                 let mut inner = self.inner.lock().unwrap();
                 let e = inner.entries.entry(p).or_default();
+                // Stage the shared value (refcount bump) for repeatable reads and
+                // hand the caller an owned copy; only this final copy allocates.
                 e.staged = Some(Tvalue {
                     val: rv.value.clone(),
                     modified: false,
@@ -119,7 +121,7 @@ impl Tx {
                     },
                     found: true,
                 });
-                Ok(rv.value)
+                Ok(rv.value.to_vec())
             }
         }
     }
@@ -134,7 +136,7 @@ impl Tx {
             .entry(p)
             .or_default()
             .staged = Some(Tvalue {
-            val: value.to_vec(),
+            val: Arc::from(value),
             modified: true,
             deleted: false,
         });
@@ -151,7 +153,7 @@ impl Tx {
             .entry(p)
             .or_default()
             .staged = Some(Tvalue {
-            val: Vec::new(),
+            val: Arc::from(&[] as &[u8]),
             modified: false,
             deleted: true,
         });
@@ -229,7 +231,7 @@ impl Tx {
 }
 
 struct Tvalue {
-    val: Vec<u8>,
+    val: Arc<[u8]>,
     modified: bool,
     deleted: bool,
 }

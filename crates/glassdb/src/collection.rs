@@ -60,7 +60,7 @@ impl Collection {
             self.db.tmon.clone(),
         );
         let rv = r.read(ctx, &p, max_staleness).await?;
-        Ok(rv.value)
+        Ok(rv.value.to_vec())
     }
 
     /// Writes `value` for `key` within a transaction.
@@ -118,7 +118,12 @@ impl Collection {
         match self
             .db
             .global
-            .write_if_not_exists(ctx, &p, COLL_INFO_CONTENTS.to_vec(), Tags::new())
+            .write_if_not_exists(
+                ctx,
+                &p,
+                std::sync::Arc::from(COLL_INFO_CONTENTS),
+                Tags::new(),
+            )
             .await
         {
             Ok(_) => Ok(()),

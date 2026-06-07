@@ -1003,3 +1003,75 @@ so it is recorded here rather than fixed.
   once.
 - Commit: 0f93c51
 
+## 34. Share object values via Arc<[u8]> through the whole value pipeline - KEPT
+- Hypothesis: the object value bytes were a `Vec<u8>` copied at every hop. On a
+  read (cache hit) the value is copied twice: once out of the local cache
+  (`local.read` clones `CacheValue.value`) and again when the transaction stages
+  it for repeatable reads (`Tx::read`), then the staged copy is *never reused*
+  in any benchmark (collect_accesses uses only the read-version for read-only
+  entries, and a later write overwrites it) - pure waste. On a write the value
+  is copied ~3x in the commit path: into the tx-log entry (`to_log` ->
+  `TxWrite.value`), into the lock/write `TValue`, and into the write-through
+  cache (`update_local` -> `local.write`). Values are immutable once produced,
+  so making the value an `Arc<[u8]>` end-to-end turns all these copies into
+  refcount bumps; only the final user-facing `Tx::read -> Vec<u8>` and the one
+  real backend write still materialize bytes. This is the read/write analog of
+  the "share an immutable value by Arc" wins (exp26 tags, exp33 version token),
+  applied to the value itself - it touches every read and every write.
+- Change: value type `Vec<u8> -> Arc<[u8]>` across the pipeline, keeping the
+  backend trait boundary on `Vec<u8>` so the S3/GCS/memory backends are
+  untouched (convert once at the boundary):
+  - `glassdb-storage`: `CacheValue.value`, `LocalRead.value`, `GlobalRead.value`,
+    `TValue.value`, `TxWrite.value` -> `Arc<[u8]>`; `Local::write*` take
+    `Arc<[u8]>`; `Global::write*` take `Arc<[u8]>` and `to_vec()` only for the
+    backend call (same one copy as the old `clone`); `global.read` wraps the
+    backend's `Vec` contents in an `Arc` once on a miss; tlogger marshals via
+    `value.to_vec()` and unmarshals into `Arc::from(bytes)`, and the
+    per-commit log buffer is `Arc::from(buf)` (1 conv/commit, negligible).
+  - `glassdb-trans`: `WriteAccess.val`, `ReadValue.value` -> `Arc<[u8]>`; the
+    three commit-path clones (`to_log`, single-RW `TValue`, `update_local`) are
+    now Arc bumps; reader `materialize`/`handle_lock_create` unchanged in logic.
+  - `glassdb` (public API unchanged): `Tx`'s staged value is `Arc<[u8]>`;
+    `Tx::read` stages a bump and hands the caller `rv.value.to_vec()` (the only
+    per-read alloc); `write` stages `Arc::from(value)` (same 1 alloc as the old
+    `to_vec`); `read_weak` returns `.to_vec()`.
+  - Inline unit tests updated to build values as `Arc::from(&b"..."[..])` and
+    deref on assert (`&*x.value`); no frozen/integration/bench/fuzz files
+    touched.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  workspace tests, incl. the storage tlogger round-trip, monitor committed-value,
+  locker, and algo commit/read unit tests that exercise the value through log
+  marshal/unmarshal and the cache); all crate sim suites PASS; `glassdb`
+  `concurrent_sim` determinism-NEUTRAL - over 6 runs 3 passed 9/9 and 3 failed
+  8/9, the only failure being the pre-existing `recovery_holds` flake (identical
+  "recovery op stream diverged at index 98"; the other 8 always pass); a value's
+  byte content is unchanged by its container, so it cannot affect the recovery
+  stream; `concurrent_tx` fuzz `--cfg sim` PASS (9289 runs, no crash - exercises
+  the full write/commit/read value path under concurrency); judge APPROVED
+  (consistent Arc<[u8]> refactor, honest test updates, no frozen/stats edits).
+  Generated fuzz corpus removed before judging/commit. (As every prior
+  experiment notes, frozen `check.sh --full` can't run as-is - its fuzz step
+  hard-codes the stale `--cfg madsim` flag and its `make test-sim` bundles the
+  `recovery_holds` flake - so the manual `--cfg sim` fuzz + crate sim suites +
+  flake sampling above are the equivalent, stronger full-tier check.)
+- Primary: best 403.50 -> ~403.5 (3 count-3 medians 403.5 / 403.2 / 404.1;
+  within noise, op counts/costPerTx unchanged per workload). best.json refreshed
+  at 403.22.
+- Secondary (3 count-3 runs vs best.json/exp33 = allocsPerTx 253.65,
+  allocBytes 28030, ns 20771, cpu 31601): allocsPerTx -> 229.4 / 234.0 / 233.2
+  (~233, -8.1%, every run well below baseline); allocBytesPerTx -> ~27160
+  (-3.1%); nsPerTx ~19700 (-5%, down); cpuNsPerTx ~30600 (-3%, down, one noisy
+  run aside). Deterministic per-workload alloc drop (best.json refresh): singleRMW
+  49.2 -> 43.2 (-12%), batchRead10 118.5 -> 108.4 (-8.5%), multiRMW10 1089.6 ->
+  1026.0 (-5.8%), batchWrite100 9805.8 -> 9407.5 (-4.1%), readRepeat ~16.8 ->
+  16.5 - every workload down because the value rides every read and every write.
+- Outcome & why: KEPT. Primary flat (within noise), allocsPerTx down ~8% with
+  *every* workload lower and no axis regressing (allocBytes/ns/cpu all down). The
+  value was the most-cloned per-op payload left - 2 copies per read (one of them
+  pure waste) and ~3 per write - now refcount bumps, with the real copy only at
+  the user boundary and the single backend write. Biggest single allocs win of
+  the run. Lesson: extend "share immutable data by Arc" to the value payload
+  itself; even tiny values cost a full allocation each, and the geomean is driven
+  by allocation count, not size.
+- Commit: __PENDING__
+
