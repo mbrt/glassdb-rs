@@ -113,6 +113,8 @@ Equivalent `Makefile` targets are also available:
 
 ```bash
 make test     # fmt --check + clippy -D warnings + cargo test
+make test-sim # tests under the deterministic simulation executor (+ fuzz-corpus replay)
+make test-all # test + test-sim
 make format   # cargo fmt --all
 make lint     # fmt --check + clippy -D warnings
 ```

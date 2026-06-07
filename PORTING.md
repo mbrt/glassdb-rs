@@ -245,7 +245,7 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   **byte-for-byte identical backend-call stream** (`RecordingBackend` +
   `tests/concurrent_sim.rs`), which required the previously-deferred commit-path
   ordering (now justified) and a fixed-base deterministic clock. Run with
-  `make sim-test` / `make fuzz`. The `proptest_concurrent` test is kept as a fast
+  `make test-sim` / `make fuzz`. The `proptest_concurrent` test is kept as a fast
   non-sim sanity check. Go's byte-schedule approach was inspiration only.
 - **Behavioral tests, ported wholesale.** The unit tests of the hard pieces
   (`dedup`, `algo`, `tlocker`, `monitor`, `gc`, `cache`) were ported from their

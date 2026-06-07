@@ -1,10 +1,13 @@
-.PHONY: test lint format build sim-test fuzz fuzz-min bench bench-score flamegraph profile
+.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score flamegraph profile
 
 build:
 	cargo build --workspace
 
 test: lint
 	cargo test --workspace
+
+# Run both the normal and deterministic-simulation suites.
+test-all: test test-sim
 
 lint:
 	cargo fmt --all -- --check
@@ -40,8 +43,9 @@ flamegraph profile:
 # (ADR-011, `--cfg sim`). The cloud backend crates (s3/gcs) use real
 # tokio/reqwest/aws-sdk and are excluded. The `glassdb` run enables the `sim`
 # harness feature, which also pulls in the byte-for-byte op-stream determinism
-# self-check (tests/concurrent_sim.rs).
-sim-test:
+# self-check (tests/concurrent_sim.rs) and the committed fuzz-corpus replay
+# (tests/fuzz_corpus.rs).
+test-sim:
 	RUSTFLAGS="--cfg sim" cargo test \
 		-p glassdb-data -p glassdb-concurr -p glassdb-backend \
 		-p glassdb-storage -p glassdb-trans

@@ -164,7 +164,7 @@ flowchart TD
 
 - The `madsim-tokio` alias and every `[target.'cfg(madsim)'.dependencies] madsim`
   block are dropped; crates depend on plain `tokio`. The workspace `check-cfg`
-  lint and `Makefile` (`sim-test`/`fuzz`) move from `--cfg madsim` to `--cfg sim`.
+  lint and `Makefile` (`test-sim`/`fuzz`) move from `--cfg madsim` to `--cfg sim`.
   `net.rs` (the RPC transport) is deleted.
 
 ## Consequences
