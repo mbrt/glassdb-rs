@@ -15,7 +15,7 @@ mod tx;
 mod version;
 
 pub use collection::Collection;
-pub use db::{Options, DB};
+pub use db::{DbBuilder, DB};
 pub use error::Error;
 pub use iter::{CollectionsIter, KeysIter};
 pub use stats::Stats;

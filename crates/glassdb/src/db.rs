@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Clock, Ctx};
+use glassdb_concurr::{Background, Clock, Ctx, RetryConfig};
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor};
@@ -17,35 +17,129 @@ use crate::stats::Stats;
 use crate::tx::Tx;
 use crate::version::check_or_create_db_meta;
 
-/// Tweakable options for a [`DB`].
-#[derive(Debug, Clone)]
-pub struct Options {
-    /// Number of bytes dedicated to caching objects and metadata. Setting this
-    /// too small may impact performance, as more backend calls are necessary.
-    pub cache_size: usize,
+/// Default cache size: 512 MiB, a reasonable middle ground for production.
+const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
+
+/// Fixed wall-clock anchor used when `deterministic_time` is set: 2023-11-14
+/// 22:13:20 UTC. The exact value is irrelevant; it only needs to be constant so
+/// replays are byte-identical.
+const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
+
+/// Builds and opens a [`DB`], tweaking optional settings before opening.
+///
+/// Start from [`DB::builder`], chain any setters, then call
+/// [`DbBuilder::open`]. For the default configuration, [`DB::open`] is a
+/// shorthand.
+#[derive(Clone)]
+pub struct DbBuilder {
+    name: String,
+    backend: Arc<dyn Backend>,
+    cache_size: usize,
+    deterministic_time: bool,
+    retry: RetryConfig,
+}
+
+impl DbBuilder {
+    fn new(name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
+        DbBuilder {
+            name: name.into(),
+            backend,
+            cache_size: DEFAULT_CACHE_SIZE,
+            deterministic_time: false,
+            retry: RetryConfig::default(),
+        }
+    }
+
+    /// Sets the number of bytes dedicated to caching objects and metadata.
+    /// Setting this too small may impact performance, as more backend calls are
+    /// necessary.
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = bytes;
+        self
+    }
+
+    /// Sets the delay before the first retry of a transient
+    /// transaction-coordination operation (polling a peer transaction's commit
+    /// status, or writing a transaction's final log). The delay grows
+    /// exponentially up to [`DbBuilder::retry_max_interval`].
+    pub fn retry_initial_interval(mut self, interval: Duration) -> Self {
+        self.retry.initial_interval = interval;
+        self
+    }
+
+    /// Sets the upper bound on the per-retry delay for transient
+    /// transaction-coordination operations.
+    pub fn retry_max_interval(mut self, interval: Duration) -> Self {
+        self.retry.max_interval = interval;
+        self
+    }
+
     /// When true, wall-clock reads are anchored to a fixed base plus the
     /// runtime's (mockable/virtual) elapsed time instead of the real system
     /// clock. Combined with the simulation executor this makes transaction-id
     /// timestamps — and thus the transaction-log object keys derived from them —
     /// a deterministic function of the simulation seed. Intended for the
     /// deterministic fuzzer; leave false in production.
-    pub deterministic_time: bool,
-}
+    pub fn deterministic_time(mut self, enabled: bool) -> Self {
+        self.deterministic_time = enabled;
+        self
+    }
 
-impl Default for Options {
-    fn default() -> Self {
-        // 512 MiB, a reasonable middle ground for production.
-        Options {
-            cache_size: 512 * 1024 * 1024,
-            deterministic_time: false,
+    /// Opens the database, validating the name and creating its metadata if
+    /// needed.
+    pub async fn open(self, ctx: &Ctx) -> Result<DB, Error> {
+        let DbBuilder {
+            name,
+            backend: b,
+            cache_size,
+            deterministic_time,
+            retry,
+        } = self;
+
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::Other(format!(
+                "name must be alphanumeric, got {name:?}"
+            )));
         }
+        check_or_create_db_meta(ctx, &b, &name).await?;
+
+        let backend = Arc::new(StatsBackend::new(b));
+        let dyn_backend: Arc<dyn Backend> = backend.clone();
+        let local = Local::new(cache_size);
+        let global = Global::new(dyn_backend, local.clone());
+        let tl = TLogger::new(global.clone(), local.clone(), &name);
+        let bg = Arc::new(Background::new());
+        let clock = if deterministic_time {
+            Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
+        } else {
+            Clock::real()
+        };
+        let tmon = Monitor::with_config(local.clone(), tl.clone(), bg.clone(), clock, retry);
+        let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
+        let gc = Gc::new(bg.clone(), tl);
+        gc.start(ctx);
+        let algo = Algo::new(
+            global.clone(),
+            local.clone(),
+            locker,
+            tmon.clone(),
+            gc,
+            Some(bg.clone()),
+        );
+
+        let inner = Arc::new(DbInner {
+            name,
+            backend,
+            local,
+            global,
+            background: bg,
+            tmon,
+            algo,
+            stats: Mutex::new(Stats::default()),
+        });
+        Ok(DB { inner })
     }
 }
-
-/// Fixed wall-clock anchor used when `deterministic_time` is set: 2023-11-14
-/// 22:13:20 UTC. The exact value is irrelevant; it only needs to be constant so
-/// replays are byte-identical.
-const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
 
 pub(crate) struct DbInner {
     pub(crate) name: String,
@@ -65,60 +159,16 @@ pub struct DB {
 }
 
 impl DB {
-    /// Opens a database with the given name using default options.
-    pub async fn open(ctx: &Ctx, name: &str, b: Arc<dyn Backend>) -> Result<DB, Error> {
-        DB::open_with(ctx, name, b, Options::default()).await
+    /// Starts building a database with the given name and backend. Chain setters
+    /// on the returned [`DbBuilder`], then call [`DbBuilder::open`].
+    pub fn builder(name: impl Into<String>, b: Arc<dyn Backend>) -> DbBuilder {
+        DbBuilder::new(name, b)
     }
 
-    /// Opens a database with the given name and custom options.
-    pub async fn open_with(
-        ctx: &Ctx,
-        name: &str,
-        b: Arc<dyn Backend>,
-        opts: Options,
-    ) -> Result<DB, Error> {
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(Error::Other(format!(
-                "name must be alphanumeric, got {name:?}"
-            )));
-        }
-        check_or_create_db_meta(ctx, &b, name).await?;
-
-        let backend = Arc::new(StatsBackend::new(b));
-        let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let local = Local::new(opts.cache_size);
-        let global = Global::new(dyn_backend, local.clone());
-        let tl = TLogger::new(global.clone(), local.clone(), name);
-        let bg = Arc::new(Background::new());
-        let clock = if opts.deterministic_time {
-            Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
-        } else {
-            Clock::real()
-        };
-        let tmon = Monitor::with_clock(local.clone(), tl.clone(), bg.clone(), clock);
-        let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
-        let gc = Gc::new(bg.clone(), tl);
-        gc.start(ctx);
-        let algo = Algo::new(
-            global.clone(),
-            local.clone(),
-            locker,
-            tmon.clone(),
-            gc,
-            Some(bg.clone()),
-        );
-
-        let inner = Arc::new(DbInner {
-            name: name.to_string(),
-            backend,
-            local,
-            global,
-            background: bg,
-            tmon,
-            algo,
-            stats: Mutex::new(Stats::default()),
-        });
-        Ok(DB { inner })
+    /// Opens a database with the given name using default options. Shorthand for
+    /// `DB::builder(name, b).open(ctx)`.
+    pub async fn open(ctx: &Ctx, name: &str, b: Arc<dyn Backend>) -> Result<DB, Error> {
+        DB::builder(name, b).open(ctx).await
     }
 
     /// Releases resources associated with the database.

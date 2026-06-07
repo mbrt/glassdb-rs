@@ -34,7 +34,7 @@ use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBa
 use glassdb_backend::Backend;
 use glassdb_concurr::{rt, CancelToken, Tape};
 
-use crate::{Collection, Ctx, Error, Options, DB};
+use crate::{Collection, Ctx, Error, DB};
 
 /// Number of distinct keys the workload operates on.
 pub const KEY_COUNT: usize = 4;
@@ -265,17 +265,25 @@ async fn run_client(
 async fn open_and_run(
     ctx: &Ctx,
     backend: &Arc<dyn Backend>,
-    opts: &Options,
     ops: &[Op],
     acct: &Mutex<Acct>,
 ) -> usize {
-    let Ok(db) = DB::open_with(ctx, DB_NAME, backend.clone(), opts.clone()).await else {
+    let Ok(db) = open_det_db(ctx, backend).await else {
         return 0;
     };
     let coll = db.collection(COLLECTION);
     let consumed = run_client(ctx, &db, &coll, ops, acct).await;
     db.close().await;
     consumed
+}
+
+/// Opens the simulation DB with the deterministic clock the fuzzer relies on
+/// for byte-identical replays.
+async fn open_det_db(ctx: &Ctx, backend: &Arc<dyn Backend>) -> Result<DB, Error> {
+    DB::builder(DB_NAME, backend.clone())
+        .deterministic_time(true)
+        .open(ctx)
+        .await
 }
 
 /// Total increments each key should receive, derived from the workload.
@@ -294,13 +302,6 @@ fn expected_increments(workload: &Workload) -> Vec<i64> {
         }
     }
     expected
-}
-
-fn deterministic_options() -> Options {
-    Options {
-        deterministic_time: true,
-        ..Default::default()
-    }
 }
 
 /// Asserts the serializability invariant for every key: an acknowledged commit
@@ -409,7 +410,6 @@ async fn run_inner(
     fault_tape: Vec<u8>,
 ) -> OpLog {
     let ctx = Ctx::background();
-    let opts = deterministic_options();
 
     // The fault tape guides each client's transport faults, crash timing, and
     // outage windows; with an empty tape all fall back to the seed
@@ -426,9 +426,7 @@ async fn run_inner(
 
     // Initialize the collection and seed every key to zero up front (over the
     // faultless backbone, so this cannot fail spuriously).
-    let init_db = DB::open_with(&ctx, DB_NAME, backbone.clone(), opts.clone())
-        .await
-        .expect("open init db");
+    let init_db = open_det_db(&ctx, &backbone).await.expect("open init db");
     let init_coll = init_db.collection(COLLECTION);
     init_coll.create(&ctx).await.expect("create collection");
     let seed_coll = &init_coll;
@@ -472,10 +470,9 @@ async fn run_inner(
     for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
         let (cctx, token) = Ctx::with_cancel();
         tokens.push(token);
-        let opts = opts.clone();
         let acct = acct.clone();
         handles.push(rt::spawn(async move {
-            let consumed = open_and_run(&cctx, &backend, &opts, &ops, &acct).await;
+            let consumed = open_and_run(&cctx, &backend, &ops, &acct).await;
             // Crash-and-restart: a cancelled (crashed) client reopens the DB on
             // the same backend and finishes its remaining ops, recovering its own
             // orphaned locks via lease expiry. The in-doubt op it died on is left
@@ -484,7 +481,7 @@ async fn run_inner(
             // completion.
             if consumed < ops.len() && cctx.is_cancelled() {
                 let rctx = Ctx::background();
-                let _ = open_and_run(&rctx, &backend, &opts, &ops[consumed..], &acct).await;
+                let _ = open_and_run(&rctx, &backend, &ops[consumed..], &acct).await;
             }
         }));
     }

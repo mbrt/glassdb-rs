@@ -340,7 +340,7 @@ per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorat
   `init_validation`, `collections_locks`, `Locker::locked_paths`)
 - In-repo deterministic executor (`glassdb-concurr` `rt`/`exec`) with schedule-tape
   and PCT schedulers; seeded scheduling/time/randomness; `TxId` prefix from the
-  run's seeded RNG (`#[cfg(sim)]`); `Options::deterministic_time` fixed-base clock
+  run's seeded RNG (`#[cfg(sim)]`); `DbBuilder::deterministic_time` fixed-base clock
   and `rt::system_now` for persisted timestamps
 - `FaultBackend` (Backend-level fault injection) + `RecordingBackend` op-stream
   self-check + cargo-fuzz `concurrent_tx` target (schedule-tape)

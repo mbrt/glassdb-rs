@@ -137,7 +137,7 @@ of the seed:
    patch does not cover, so we do not rely on it. Instead `TxId` prefixes are
    drawn from `madsim::rand` under `#[cfg(madsim)]` (a one-line shim in
    `txid.rs`), which is seeded by the runtime.
-3. **Time.** `Options::deterministic_time` makes the monitor's `Clock` anchor a
+3. **Time.** `DbBuilder::deterministic_time` makes the monitor's `Clock` anchor a
    *fixed* wall-clock base to `tokio::time::Instant` (`Clock::anchored_at`).
    Since `TxId` timestamps come from this clock, transaction-log object keys
    become deterministic. (Default stays `Clock::real()` in production.)
