@@ -16,7 +16,7 @@ use glassdb_backend::{self as backend, BackendError};
 use glassdb_concurr::{
     await_signal, rt, shard::Sharded, Controller, Ctx, Dedup, DedupError, DedupWorker, MergeRequest,
 };
-use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
+use glassdb_data::{set_union, TxId, TxIdSet};
 use glassdb_storage::{
     compute_lock_update, tags_lock_info, Global, Local, LockInfo, LockRequest, LockType,
     LockUpdate, Locker as StorageLocker, PathLock, StorageError, TValue, TxPathState,
@@ -371,11 +371,13 @@ fn trans_to_storage(e: TransError) -> StorageError {
 }
 
 fn is_complete(req: &LockRequest, res: &LockOpResult) -> bool {
-    let to_lock = TxIdSet::from_ids(req.lockers.clone());
-    let to_unlock = TxIdSet::from_ids(req.unlockers.clone());
-    let locked = TxIdSet::from_ids(res.locked_for.clone());
-    let unlocked = TxIdSet::from_ids(res.unlocked_for.clone());
-    set_diff(&to_lock, &locked).is_empty() && set_diff(&to_unlock, &unlocked).is_empty()
+    // Complete when every requested locker ended up locked and every requested
+    // unlocker ended up unlocked. Checked by direct containment over these
+    // (typically single-element) slices: deduplicating into `TxIdSet`s first
+    // would only add allocations without changing the result, and this runs on
+    // every lock/unlock worker iteration.
+    req.lockers.iter().all(|t| res.locked_for.contains(t))
+        && req.unlockers.iter().all(|t| res.unlocked_for.contains(t))
 }
 
 /// Acquires and releases distributed locks on storage objects, hiding waits and
