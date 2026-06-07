@@ -746,5 +746,82 @@ so it is recorded here rather than fixed.
   the data (exp26), look at the *consumer* - it was parsing more than it needed
   on the hot path, and specializing the common case (unlocked/read-locked) avoids
   the work entirely.
+- Commit: f7de9b8
+
+## 28. Single-String `locked-by` tag build (no intermediate Vec) - DISCARDED
+- Hypothesis: `apply_lock_tags` (runs per lock op on every write key) builds the
+  `locked-by` value as `update.lockers.iter().map(tid_to_tag).collect::<Vec<_>>()
+  .join(",")` - a `Vec<String>` plus one base64 `String` per locker plus the
+  joined `String`. For the common single-locker case that is 3 allocs to produce
+  one tag value. Encoding straight into one `String` via `encode_string` removes
+  the Vec and the per-id intermediate, leaving a single allocation. batchWrite100
+  (100 create+commit keys) and multiRMW10 should pay less.
+- Change (reverted): `crates/glassdb-storage/src/locker.rs` - added
+  `join_tids(&[TxId]) -> String` (pre-sized `String`, `encode_string` per id with
+  a `,` separator; output byte-identical to the old map/collect/join) and used it
+  in `apply_lock_tags` in place of the `Vec<String>` + `join`.
+- Correctness: `cargo test -p glassdb-storage` PASS (the lock-info round-trip
+  tests confirm the encoded tag is identical). Not taken to the full gate - the
+  perf result below decided it.
+- Primary: ~402.92 -> ~403.4 (within noise; op counts unchanged).
+- Secondary (3 runs vs best.json/exp27): batchWrite100 allocs 10216.5 -> ~10009
+  (-2.0%, deterministic) and multiRMW10 1172.9 -> ~1153 (-1.7%), but the
+  *aggregate* axes are flat: allocsPerTx 279.28 -> 278.45/278.8/279.89 (~279.0,
+  -0.1%) and allocBytesPerTx 28722 -> ~28829 (+0.4%). readRepeat/batchRead10/
+  singleRMW unchanged (reads never call `apply_lock_tags`; the readRepeat 20.4->
+  ~21.0 wiggle is run noise).
+- Outcome & why: DISCARDED. The change is strictly-better and zero-risk, but the
+  secondary scores are 5-workload geometric means, so a -2% on the single biggest
+  workload only moves the geomean ~-0.4% - inside the run-to-run noise. The
+  remaining per-key lock-tag allocations (the three constant `*_TAG.to_string()`
+  keys, `ltype.to_string()`, and the `value.clone()` the backend must own) are all
+  mandated by the `BTreeMap<String,String>` tag representation and the write API,
+  so the write path cannot be cut further without a large, risky `Tags`-type
+  refactor across every backend.   This is the exp24 lesson again: a real but
+  single-workload sub-floor saving does not clear the geomean noise, so it is not
+  kept.
+
+## 29. Cache projection: don't deep-clone the entry on metadata reads - KEPT
+- Hypothesis: `Local::read`/`get_meta` both call `Cache::get`, which clones the
+  *entire* `CacheEntry` (its value `Vec<u8>` *and* its metadata) and then keeps
+  only one half. `get_meta` therefore copies the cached value bytes on every
+  call just to drop them and return the metadata `Arc`. Metadata reads happen on
+  every read validation (`get_metadata` in `validate_read`, the create-lock
+  resolver, etc.), so this is a wasted value-sized allocation per validated read
+  across every workload. Projecting the entry under the lock - cloning only the
+  field the caller needs - removes it.
+- Change: `crates/glassdb-storage/src/cache.rs` - added
+  `Cache::get_with(key, |&V| -> R)` (and the shard method), which does the same
+  `contains_key` + `move_to_front` as `get` but hands the entry to a closure
+  instead of cloning it, so the caller clones only what it needs.
+  `crates/glassdb-storage/src/local.rs` - `read` now projects just the value half
+  (`CacheValue` -> `LocalRead`), `get_meta` projects just the metadata half
+  (an `Arc` bump, no value copy). Staleness/outdated logic is computed inside the
+  closure on the full entry exactly as before, so behavior is identical; only the
+  cross-field clone is dropped.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  tests incl. the cache unit tests); all crate sim suites + 8/9 `glassdb`
+  `concurrent_sim` cases PASS (9th is the pre-existing `recovery_holds` flake;
+  determinism-NEUTRAL); `concurrent_tx` fuzz `--cfg sim` PASS (6522 runs, no
+  crash - exercises the read/validation cache path under concurrency); judge
+  APPROVED (honest projection API, no frozen files, no Stats tampering).
+  Generated fuzz corpus removed before judging/commit.
+- Primary: 402.92 -> ~403.2 (3 runs 403.08/403.22/403.36; within noise, op
+  counts unchanged - the cache returns the same data, only fewer copies).
+- Secondary (3 runs vs best.json/exp27): allocsPerTx 279.28 -> 272.28/274.25/
+  275.99 (~-1.8%, every run below baseline); allocBytesPerTx 28722 -> ~28592
+  (-0.45%; the avoided clones are the small per-key values, so the count moves
+  more than the bytes). Deterministic per-workload allocs: multiRMW10 1172.9 ->
+  ~1127 (-3.9%), singleRMW 53.2 -> 52.2 (-1.9%), readRepeat 20.4 -> ~19.8 (-3%),
+  batchWrite100 10216.5 -> ~10111 (-1.0%); batchRead10 flat (its first reads miss
+  the local cache, so they take the global path that builds metadata fresh).
+- Outcome & why: KEPT. Primary flat, allocsPerTx clearly down 1.8% with the
+  validation-heavy RMW workloads dropping the most and no axis regressing. The
+  win is structural: `Cache::get` had a single deep-clone shape forced on every
+  reader, and the metadata readers paid for a value copy they never used.
+  Splitting the read into a projection lets each caller pay only for what it
+  takes. Lesson: a "clone the whole thing" cache accessor hides per-caller waste;
+  a projection closure under the lock removes it without changing semantics or
+  lock duration.
 - Commit: <pending>
 
