@@ -179,3 +179,245 @@ shaving a single small allocation per op (exp4/11) never rose above noise. ns/cp
 proved noisy enough (±10-15%) to spike on single runs, so every surprising
 secondary delta was re-measured before deciding.
 
+---
+
+# Session 2
+
+New autoresearch session on branch `autoresearch2`, continuing from the session-1
+HEAD (post-exp11). Budget: 25 experiments or 4 hours, whichever comes first.
+Experiments are numbered continuing from 12.
+
+## Setup note - frozen `check.sh` references a removed cfg
+`hack/autoresearch/check.sh`'s `run_fuzz` hardcodes `RUSTFLAGS="--cfg madsim"`, but
+the engine DST migrated off `madsim` to the in-repo executor (`--cfg sim`, commit
+`de9d02c`, ADR-011); `replay_fuzz_input` is now `#[cfg(sim)]`-gated, so the fuzz
+target fails to compile under `--cfg madsim` (`E0425: cannot find function
+replay_fuzz_input`). `check.sh` is a frozen infra file I may not modify, and so are
+`fuzz/**` and `sim.rs`, so there is no in-scope code fix. Per program.md a setup
+problem must be resolved in setup and is not a stop condition. Resolution: the fast
+gate (`hack/autoresearch/check.sh`, build + `cargo test --workspace`, incl.
+`proptest_concurrent`) works unmodified and is run verbatim every experiment; for
+the full-gate fuzz step I substitute the project's own supported invocation
+(`cd fuzz && RUSTFLAGS="--cfg sim" cargo +nightly fuzz run concurrent_tx`, the same
+command `make fuzz`/`fuzz/.cargo/config.toml` use), so the serializability fuzzer
+still runs - just with the correct flag. `make test` + `make test-sim` (which use
+`--cfg sim` already) are run as-is for keeps.
+
+## 12. Session-2 baseline - KEPT
+- Hypothesis: n/a (re-establish the starting point for this session).
+- Change: none; recorded baseline correctness and score from current HEAD.
+- Correctness: full suite PASS - `make test` + `make test-sim` (all unit/integration/
+  determinism/fault tests, incl. `proptest_concurrent` and the `fuzz_corpus` replay
+  of `replay_fuzz_input` under `--cfg sim`) + 20s `concurrent_tx` fuzz under
+  `--cfg sim` (2568 runs, no crash). The frozen `check.sh --full` cannot build the
+  fuzzer (see setup note); the equivalent `--cfg sim` fuzz passes.
+- Primary: baseline score = 403.64 (per-run: 404.29, 403.64, 402.65).
+- Secondary: allocBytesPerTx=45561, allocsPerTx=460.2, nsPerTx=26819, cpuNsPerTx=37679.
+- Per-workload cost/tx: singleRMW=71.6 (objW 1.01), multiRMW10=1082.3 (objW 11, metaW 9.89), batchRead10=313.66 (metaR 10), batchWrite100=13991.4 (objW 199, metaW ~2), readRepeat=31.5 (metaR 1).
+- Outcome & why: starting point for session 2. Session 1 already drove the primary to
+  the protocol floor (RMW = 1 metaW + 1 objW/key + 1 objW log; read-only = 1 strong
+  metaR/key validation; single-RW = 1 objW; batchWrite create-value fusion is unsafe
+  given the reader trusts non-empty objects and the fuzzer does not exercise
+  concurrent creates). Remaining safe wins are secondary (allocations/CPU): biggest
+  alloc consumers are batchWrite100 (~14432 allocs/tx) and multiRMW10 (~1742). Known
+  hot spots to target: `commit_tx`/`set_final_log` clone the whole `TxLog`; the
+  `Cache` clones the old entry on `set` and re-allocates the key `String` even when
+  the key already exists; per-tx commit clones write values several times.
+- Commit: e0f9ab0 (pre-existing HEAD)
+
+## 13. In-place cache writes (no entry-clone / key-realloc) - KEPT
+- Hypothesis: the LRU `Cache` clones the entire old `CacheEntry` and re-allocates
+  the key `String` on every write-through, even when the key already exists
+  (`set`/`update` go through `map.insert(key.to_string(), ..)`, and `update`
+  clones the old value just to hand it to the closure). Replacing the value
+  through the existing slot and merging fields in place should cut allocations
+  on every cache write (all workloads), with no change to backend op counts.
+- Change: `crates/glassdb-storage/src/cache.rs` - rewrote `Shard::set` to replace
+  the value via `map.get_mut` (no old clone, key kept), and added `Shard::modify`
+  + `Cache::modify` (in-place field merge, creates a `V::default()` only when the
+  key is absent). `crates/glassdb-storage/src/local.rs` - `write`, `set_meta`,
+  `mark_deleted` now use `cache.modify` instead of `cache.update`. `update` also
+  switched to `*get_mut = newv` so the existing key is reused.
+- Correctness: fast gate PASS; full `make test` + `make test-sim` PASS (all unit/
+  integration/determinism/fault tests, incl. `proptest_concurrent` + `fuzz_corpus`);
+  `concurrent_tx` fuzz under `--cfg sim` PASS (2516 runs, no crash). Judge APPROVED
+  (legitimate allocation optimization, equivalent semantics; corpus files the fuzz
+  run dropped under frozen `fuzz/**` were removed before judging/commit).
+- Primary: 403.64 -> 404.25 (+0.15%, within noise; per-run 404.25/404.5/403.29 and
+  repeats 403.62/403.81 - op counts unchanged).
+- Secondary: allocsPerTx 460.2 -> 437.4 (-4.95%, consistent ~430-439 across 3 runs);
+  allocBytesPerTx 45561 -> 45275 (-0.63%); nsPerTx/cpuNsPerTx within noise (cpu
+  swung 34750-50374 across runs - pure noise).
+- Outcome & why: KEPT. Primary flat (the deterministic op counts are unchanged, as
+  expected for a pure data-structure refactor) and the allocation axis clearly and
+  repeatably improves (~5% fewer allocs/tx) with no consistent regression on the
+  other axes. Per-workload allocs dropped on the cache-heavy paths (multiRMW10,
+  batchRead10, batchWrite100). Lesson: the cache write path was a real alloc source;
+  next, chase the bigger remaining consumers (`TxLog` clones in commit/`set_final_log`
+  and per-tx write-value clones).
+- Commit: 8c4f73b
+
+## 14. Borrow TxLog on the tx-log write path - KEPT
+- Hypothesis: a locked commit clones the whole `TxLog` (paths + values) to hand
+  to `set_final_log`, which then clones it *again* on each attempt for
+  `TLogger::set`/`set_if` (which only marshal + tag the log). That is two full
+  `TxLog` clones on every locked commit. Borrowing instead of owning should cut
+  allocation bytes/count on commit-heavy workloads with no op-count change.
+- Change: `crates/glassdb-storage/src/tlogger.rs` - `set`/`set_if` take `&TxLog`
+  and compute the persisted timestamp once (`marshal_log`/`log_tags` now receive
+  it) so body and tags stay consistent. `crates/glassdb-trans/src/monitor.rs` -
+  `set_final_log(&self, .., &TxLog)` (no per-retry clone), `commit_tx` passes
+  `&tl`, `abort_tx`/`try_abort_remote_tx`/`refresh_pending` pass references.
+  `gc.rs` + the tlogger unit test updated to pass `&TxLog` (assertions intact).
+- Correctness: fast gate PASS; full `make test`+`make test-sim` PASS (45 suites,
+  incl. determinism/fault/proptest/fuzz_corpus); `concurrent_tx` fuzz `--cfg sim`
+  PASS (2736 runs, no crash); judge APPROVED (legit alloc optimization; generated
+  corpus removed before judging/commit).
+- Primary: 404.25 -> 403.55 (-0.17%, within noise; op counts unchanged - per-run
+  404.04/403.15/403.55 and repeats 403.36/403.71).
+- Secondary: allocBytesPerTx 45275 -> 43765 (-3.33%, consistent 43641-44036),
+  allocsPerTx 437.4 -> 425.9 (-2.64%), nsPerTx -2.21%; cpu within noise (swings
+  36550-42076). batchWrite100 drove most of the win (allocBytes ~1.31M -> 1.26M).
+- Outcome & why: KEPT. Primary unchanged (pure alloc refactor), allocation bytes
+  and count clearly and repeatably down with no consistent regression. Lesson:
+  ownership-by-value on hot async paths hides retry clones; the commit path now
+  marshals straight from the borrowed log. Next: per-tx write-value clones in the
+  user-closure -> commit handoff (tx.rs `collect_accesses` / algo commit), and the
+  `TxLog.writes`/`locks` Vec construction.
+- Commit: fb2565f
+
+## 15. Move (not clone) write values into local cache on commit - DISCARDED
+- Hypothesis: each committed write value is cloned 4x (staged to_vec -> WriteAccess
+  -> TxWrite via to_log -> protobuf marshal -> local-cache apply). `commit_tx` owns
+  the `TxLog` after the durable write, so the local-apply clone is avoidable: move
+  the value into `local.write` instead. Expected fewer allocs/bytes on write-heavy
+  workloads, no op-count change.
+- Change: `crates/glassdb-trans/src/monitor.rs` - `commit_tx` applies writes via
+  `std::mem::take(&mut tl.writes)` and moves `entry.value` into `local.write`.
+- Correctness: fast gate PASS (op counts unchanged). (Full gate/judge not reached -
+  discarded at measure.)
+- Primary: 403.55 -> 404.04 (+0.12%, within noise).
+- Secondary: allocBytesPerTx +0.15% (flat), allocsPerTx -0.34% (425.9 -> 424.4),
+  nsPerTx +8.11% (noise), cpuNsPerTx -2.04% (noise).
+- Outcome & why: DISCARDED. The clone removal is real (batchWrite100 dropped ~100
+  allocs/tx: 13421 -> 13321) but the benchmark's write values are tiny, so it frees
+  only ~800 bytes/tx there; the geomean alloc move (-0.34%) sits inside the
+  run-to-run alloc noise (~±1.8%) and allocBytes is flat. Not a clear improvement,
+  so per the acceptance rule it is not kept. Lesson: value-clone removal only pays
+  off with large payloads; the per-key overhead in batchWrite100 is dominated by
+  ~133 *other* allocs/key (locker metadata/tags/protobuf), which is the real target.
+- Commit: (reverted)
+
+## 16. Single-task fast path in run_limited - KEPT
+- Hypothesis: `run_limited` (the parallel fan-out used by read-only validation,
+  lock validation, collection locking, unlock-all, async cleanup) always builds a
+  child cancel token and a `buffer_unordered` `FuturesUnordered`, which boxes the
+  per-item future. For a single task (`num==1`) there are no siblings to cancel,
+  so all that machinery is pure overhead. Single-key transactions (readRepeat,
+  single-key read-only/lock validations) have outsized leverage on the alloc
+  geomean, so a `num==1` fast path should cut allocs/bytes noticeably.
+- Change: `crates/glassdb-trans/src/algo.rs` - in `run_limited`, when `num==1`,
+  await `f(ctx.clone(), 0)` directly on the parent ctx and return, skipping the
+  child token + stream. Same result and error handling; only the (unused) sibling
+  cancellation is dropped.
+- Correctness: fast gate PASS; full `make test`+`make test-sim` PASS (45 suites,
+  0 failures); `concurrent_tx` fuzz `--cfg sim` PASS (2601 runs, no crash); judge
+  APPROVED (honest alloc optimization, no metric gaming).
+- Primary: 403.55 -> 402.15 (-0.35%, within noise; op counts unchanged - per-run
+  402.55/401.13/402.15 and repeats 403.78/403.87).
+- Secondary: allocBytesPerTx 43765 -> 37002 (-15.45%, consistent 37002-37195),
+  allocsPerTx 425.9 -> 412.4 (-3.15%), nsPerTx -1.34%, cpuNsPerTx -5.09%. Driven by
+  readRepeat (bytes 4725 -> 2064, -56%; the boxed validation future was the big
+  allocation); batchRead10/batchWrite100 (n>1) unchanged as expected.
+- Outcome & why: KEPT. Big, repeatable allocBytes win with primary flat and no
+  regressions. Lesson: `FuturesUnordered`/`buffer_unordered` boxes each future
+  (sized to the whole async state machine), so it is expensive for the very common
+  n==1 case; specializing the fan-out degree pays off. Next: the per-future box
+  cost is still paid for n>1 (multiRMW10/batchWrite100) - but there the parallelism
+  is genuinely needed, so look elsewhere (e.g. shrink the validation future, or the
+  locker tag/metadata allocations).
+- Commit: 04454eb
+
+## 17. Allocation-free is_complete in the locker worker - KEPT
+- Hypothesis: `is_complete` runs once per lock/unlock worker-loop iteration and
+  builds 4 `TxIdSet`s (cloning the lockers/unlockers Vecs) + 2 `set_diff`s purely
+  to test "are all requested lockers locked and all unlockers unlocked". Direct
+  containment checks over the (usually 1-element) slices give the same answer with
+  zero allocations. Hits every lock op, so multiRMW10 (20 ops/tx) and batchWrite100
+  (200 ops/tx) should drop noticeably.
+- Change: `crates/glassdb-trans/src/tlocker.rs` - rewrote `is_complete` as
+  `req.lockers.iter().all(|t| res.locked_for.contains(t)) && req.unlockers...` and
+  dropped the now-unused `set_diff` import.
+- Correctness: fast gate PASS; full `make test`+`make test-sim` PASS (45 suites, 0
+  failures); `concurrent_tx` fuzz `--cfg sim` PASS (2672 runs, no crash); judge
+  APPROVED (same membership check, fewer allocations).
+- Primary: 402.15 -> ~402.8 (+0.17%, within noise; op counts unchanged).
+- Secondary: allocsPerTx 412.4 -> ~404 (4 runs 409.5/403.9/401.2/405.4; -2%),
+  allocBytesPerTx ~-0.7% (36613-36799 vs 37002). Deterministic per-workload:
+  multiRMW10 1591 -> ~1480 (-6.5%), batchWrite100 13417 -> 12616 (-6%). ns/cpu noise.
+- Outcome & why: KEPT. The first single measurement looked marginal (-0.70% allocs)
+  only because readRepeat (unrelated to this change) happened to measure high that
+  run; re-measuring showed a stable ~-2% allocsPerTx with rock-solid, deterministic
+  per-op reductions in the lock-heavy workloads. Lesson: judge alloc-count changes
+  on the *affected* workloads plus repeats, not a single noisy geomean. Next: the
+  remaining per-lock-op allocs are the tags `BTreeMap`/base64 in `apply_lock_tags`
+  and the `tid.as_bytes().to_vec()` in `update_tx_locks`.
+- Commit: 6e83c42
+
+## 18. Trim per-lock-op allocations (join_tids + entry reuse) - DISCARDED
+- Hypothesis: each lock application allocates an intermediate `Vec<String>` (then
+  `join(",")`) in `apply_lock_tags`, and `update_tx_locks` re-allocates the tid key
+  `Vec` on every call via `entry()` even when the tx already has an entry. Removing
+  both should cut allocs on every create/write/unlock.
+- Change: `crates/glassdb-storage/src/locker.rs` - added `join_tids` (builds the
+  `locked-by` value with `encode_string` directly into one `String`, no per-locker
+  Vec). `crates/glassdb-trans/src/tlocker.rs` - `update_tx_locks` uses `get_mut`
+  before falling back to `entry`/`insert`.
+- Correctness: fast gate PASS (op counts unchanged). (Full gate/judge not reached.)
+- Primary: ~402.8 -> ~403.9 (within noise).
+- Secondary (3 runs vs best): allocsPerTx 403.1/408.6/408.2 (median +1%, i.e. noise),
+  allocBytesPerTx +0.1/+0.96/+0.82% (flat). Deterministic per-workload: batchWrite100
+  12618 -> ~12310 (-2.4%, solid); multiRMW10 1447-1489 (noisy ~flat); singleRMW flat.
+- Outcome & why: DISCARDED. The change is a strict, correct allocation reduction and
+  batchWrite100 clearly drops 2.4%, but it is too localized to move the geomean
+  secondary metrics above the run-to-run noise (the other workloads barely change),
+  so it is not a clear improvement under the acceptance rule. Lesson: per-op savings
+  of a few allocations only pay off when they hit a high-leverage (small) workload
+  or many workloads at once; concentrating them in batchWrite100 (already the
+  highest-count workload, so low ln-leverage) does not register. Stop chasing single
+  small allocations in the lock path.
+- Commit: (reverted)
+
+## 19. Single-allocation path construction (base64 encode_into) - KEPT
+- Hypothesis: `prefix_encode` (used by `from_key`/`from_collection`/`from_transaction`,
+  i.e. every read, write, commit-log, lock, and status path) allocates twice: the
+  custom `base64::encode` builds a `Vec<u8>` -> `String`, then `format!` builds the
+  final `prefix/type/base64` string. Encoding straight into the final, pre-sized
+  buffer removes one allocation per path construction. Path building happens on every
+  op of every workload, so unlike exp18 this hits the geomean broadly (not one
+  workload), giving it the leverage exp15/exp18 lacked.
+- Change: `crates/glassdb-data/src/base64.rs` - added `encode_into(&[u8], &mut String)`
+  that appends the encoding to an existing buffer (alphabet is ASCII, so `push(char)`
+  keeps it valid UTF-8 with one byte each); `encode` now delegates to it.
+  `crates/glassdb-data/src/paths.rs` - `prefix_encode` builds the path in one
+  `String::with_capacity` (prefix + '/' + type + '/' + encoded payload) and calls
+  `encode_into`, dropping the intermediate base64 string.
+- Correctness: fast gate PASS (op counts unchanged); full `make test`+`make test-sim`
+  PASS (45 suites, 0 failures); `concurrent_tx` fuzz `--cfg sim` PASS (2673 runs, no
+  crash); judge APPROVED (honest single-allocation refactor, no metric gaming).
+- Primary: ~402.8 -> 403.29 (3 runs 403.29/404.59/403.81, within noise; op counts
+  unchanged).
+- Secondary (3 runs vs best): allocsPerTx 384.9/384.0/387.5 (-4.1%..-4.9%, clear and
+  repeatable); allocBytesPerTx 36643/36554/36883 (flat -0.5%..+0.4% - the removed
+  base64 strings are tiny). Deterministic per-workload allocs: singleRMW 68.8 -> ~64.7
+  (-6%), batchRead10 255 -> 234 (-8%), batchWrite100 12618 -> 12408 (-1.7%),
+  readRepeat 32.8 -> ~30.7 (-6%); multiRMW10 ~flat (its allocs are dominated by lock
+  metadata, not paths).
+- Outcome & why: KEPT. Primary flat, allocsPerTx clearly and repeatably down ~4.5%
+  with no axis regressing (allocBytes flat). Unlike exp18's batchWrite100-only saving,
+  this fires on every path of every workload, so the per-op alloc removal compounds
+  across the geomean. Lesson: prefer optimizations on truly ubiquitous helpers (path
+  building, cache writes) over per-workload hot spots - broad leverage beats local
+  depth for a geomean target.
+- Commit: (pending)
+
