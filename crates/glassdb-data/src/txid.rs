@@ -124,6 +124,17 @@ impl TxId {
         TxId(v.into())
     }
 
+    /// Wraps a byte slice as a transaction ID in a single allocation.
+    ///
+    /// Unlike [`TxId::from_bytes`] (which takes an owned `Vec` and so cannot
+    /// reuse it - `Vec<u8> -> Arc<[u8]>` must copy into a freshly refcounted
+    /// allocation), this copies the slice straight into the `Arc`. Callers that
+    /// already hold a borrowed buffer (e.g. a base64 decode into a stack array)
+    /// avoid the intermediate `Vec` allocation.
+    pub fn from_slice(b: &[u8]) -> Self {
+        TxId(Arc::from(b))
+    }
+
     /// Returns the raw bytes of the ID.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
