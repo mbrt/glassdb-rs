@@ -457,5 +457,30 @@ still runs - just with the correct flag. `make test` + `make test-sim` (which us
   alloc sources. Next: the remaining per-lock-op allocs in `apply_lock_tags`
   (tag-key Strings + value clone) and the per-write value clones on the commit
   path.
-- Commit: (pending)
+- Commit: ad811ca
+
+## 21. parse_ref on the commit lock-planning path - DISCARDED
+- Hypothesis: the lock-planning helpers `collections_locks`, `needs_locks`, and
+  `is_key_collection_locked` call `paths::parse` (2 String allocs) but only need
+  the borrowed prefix/typ; and `collections_locks` clones the prefix into its
+  `HashMap` on every entry. Switching to `parse_ref` (exp20) plus a get/contains
+  guard should cut commit-path allocs for the lock-heavy workloads.
+- Change: `crates/glassdb-trans/src/algo.rs` - those three callsites use
+  `parse_ref`; `collections_locks` upgrades/inserts via `get_mut`/`contains_key`
+  so the collection prefix is cloned only when first inserted.
+- Correctness: fast gate PASS (op counts unchanged). (Full gate/judge not reached.)
+- Primary: ~403.4 (flat).
+- Secondary (3 runs vs best): allocsPerTx 371.8/372.0/368.2 (median +0.34%, i.e.
+  noise); allocBytesPerTx +0.9/+0.9/-0.1% (flat). Deterministic per-workload:
+  batchWrite100 11409 -> ~11097 (-2.7%, solid); multiRMW10 ~flat; reads flat.
+- Outcome & why: DISCARDED. Same shape as exp18: a real, deterministic cut but
+  concentrated in batchWrite100, the highest-count (so lowest ln-leverage)
+  workload. multiRMW10 didn't move because `collections_locks` only acts on
+  blind-write / not-found / delete keys, and multiRMW10's keys are read-then-write
+  (found), so they're skipped. With only one low-leverage workload moving, the
+  geomean stays inside the run-to-run noise, so it's not a clear improvement.
+  Lesson (reconfirms exp18): `collections_locks` is a blind-write-only path;
+  optimizing it can never help RMW workloads, and batchWrite100 alone is too
+  ln-compressed to register. Stop optimizing the blind-write lock path.
+- Commit: (reverted)
 
