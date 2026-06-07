@@ -92,7 +92,52 @@ impl<V: Weighable + Clone> CacheShard<V> {
     }
 
     fn set(&self, key: &str, val: V) {
-        self.update(key, |_| Some(val));
+        let mut inner = self.inner.lock().unwrap();
+        let new_size = val.size_b();
+        if inner.map.contains_key(key) {
+            // Replace the value in place: no need to clone the old entry (it is
+            // fully overwritten) nor to re-allocate the key string (the map keeps
+            // its existing key on a value update).
+            inner.move_to_front(key);
+            let slot = inner.map.get_mut(key).unwrap();
+            let old_size = slot.size_b();
+            *slot = val;
+            inner.curr_size_b =
+                (inner.curr_size_b as i64 + new_size as i64 - old_size as i64) as usize;
+        } else {
+            inner.curr_size_b += new_size;
+            inner.order.insert(0, key.to_string());
+            inner.map.insert(key.to_string(), val);
+        }
+        inner.remove_oldest();
+    }
+
+    /// Mutates the entry for `key` in place (creating a default one if absent),
+    /// without cloning the previous entry or re-allocating the key string for an
+    /// existing entry. Use this for the common "merge a field into the cached
+    /// entry" path; the entry is always kept.
+    fn modify<F>(&self, key: &str, f: F)
+    where
+        F: FnOnce(&mut V),
+        V: Default,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.map.contains_key(key) {
+            inner.move_to_front(key);
+            let slot = inner.map.get_mut(key).unwrap();
+            let old_size = slot.size_b();
+            f(slot);
+            let new_size = slot.size_b();
+            inner.curr_size_b =
+                (inner.curr_size_b as i64 + new_size as i64 - old_size as i64) as usize;
+        } else {
+            let mut v = V::default();
+            f(&mut v);
+            inner.curr_size_b += v.size_b();
+            inner.order.insert(0, key.to_string());
+            inner.map.insert(key.to_string(), v);
+        }
+        inner.remove_oldest();
     }
 
     fn update<F>(&self, key: &str, f: F)
@@ -113,7 +158,10 @@ impl<V: Weighable + Clone> CacheShard<V> {
                     let new_size = newv.size_b();
                     inner.curr_size_b =
                         (inner.curr_size_b as i64 + new_size as i64 - old_size as i64) as usize;
-                    inner.map.insert(key.to_string(), newv);
+                    // Update the value through the existing slot so the key
+                    // string is not re-allocated (HashMap::insert would keep the
+                    // old key and drop the freshly allocated one).
+                    *inner.map.get_mut(key).unwrap() = newv;
                 }
             }
         } else {
@@ -174,6 +222,18 @@ impl<V: Weighable + Clone> Cache<V> {
         F: FnOnce(Option<V>) -> Option<V>,
     {
         self.sh.for_key(key.as_bytes()).update(key, f);
+    }
+
+    /// Mutates the entry for `key` in place, creating a default entry if absent.
+    /// Avoids cloning the previous entry and re-allocating the key string for an
+    /// existing entry (unlike [`Cache::update`], which must clone the old value
+    /// to hand it to the closure). Use it for "merge a field into the entry".
+    pub fn modify<F>(&self, key: &str, f: F)
+    where
+        F: FnOnce(&mut V),
+        V: Default,
+    {
+        self.sh.for_key(key.as_bytes()).modify(key, f);
     }
 
     /// Removes the entry for `key`.
