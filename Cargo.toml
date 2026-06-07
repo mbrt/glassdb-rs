@@ -41,3 +41,10 @@ glassdb-trans = { path = "crates/glassdb-trans" }
 
 [profile.release]
 opt-level = 3
+
+# Release-grade code with debug symbols retained, for readable profiler stacks
+# (see hack/perf). Kept separate from `[profile.release]` so the benchmark/metric
+# builds are unaffected.
+[profile.profiling]
+inherits = "release"
+debug = true

@@ -1,0 +1,4 @@
+# Generated profiling artifacts (see profile.sh); never committed.
+flamegraph.svg
+flamegraph.folded
+perf.data*
