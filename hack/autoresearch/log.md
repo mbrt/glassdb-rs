@@ -938,5 +938,68 @@ so it is recorded here rather than fixed.
   transaction-tracking maps copied the id into an owned key on every begin; an
   `Arc`-keyed map shares it for free - prefer the refcounted id type as the key
   for per-tx bookkeeping structures.
-- Commit: <pending>
+- Commit: 4e7f646
+
+## 33. Share the backend Version (CAS) token via Arc<str> - KEPT
+- Hypothesis: `backend::Version` is the opaque CAS token returned by every
+  metadata/object read and write and carried through the whole read/write
+  pipeline (backend reply -> storage `global`/`local` cache entries -> trans
+  validation -> next write's `if_match`). Its `token` was a `String`, so every
+  `Version::clone()` (and there are many: cache stores it, reads copy it out,
+  validation compares and propagates it, writes thread it back) heap-allocated a
+  fresh copy of the token bytes. Tokens are immutable once minted, so making
+  `token: Arc<str>` turns all those clones into refcount bumps - zero alloc -
+  while keeping `Eq`/`Hash`/`Default` by content. This is the same "share an
+  immutable value by Arc instead of deep-copying it on every clone" pattern that
+  paid off for `TxId` (exp8), cache metadata (exp5), and backend tags (exp26),
+  applied to the one token that touches *every* workload (read-only included).
+- Change:
+  - `crates/glassdb-backend/src/lib.rs` - `Version.token: String -> Arc<str>`;
+    `Version::new` takes `impl Into<Arc<str>>` (callers minting from `&str`/
+    `String`/`Arc<str>` all still work); `is_null` unchanged (`is_empty`).
+  - `crates/glassdb-backend/src/memory.rs` - `Object::version` formats the
+    `gen/metagen` token into a stack `[u8; 48]` buffer and builds the `Arc<str>`
+    from that slice, so a fresh token is one alloc (the Arc) instead of two
+    (String then Arc). Test assertions deref the Arc (`&*m.version.token`).
+  - `crates/glassdb-backend-s3/src/lib.rs` - the S3 `if_match` precondition
+    wants an owned `String`, so `expected.token.clone()` -> `.to_string()` (one
+    alloc only where the SDK actually requires ownership; everywhere else stays
+    a refcount bump). GCS needed no change.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  tests, incl. the memory-backend version/metadata unit tests that assert the
+  `"gen/metagen"` token format); all crate sim suites PASS (backend 16, storage
+  18, trans 33); `glassdb` `concurrent_sim` determinism-NEUTRAL - over 6 runs 3
+  passed 9/9 and 3 failed 8/9, the only failure being the pre-existing
+  `recovery_holds` flake ("recovery op stream diverged at index 98", matching
+  baseline ~50%; a representation change to an opaque token cannot affect the
+  recovery op stream); `concurrent_tx` fuzz `--cfg sim` PASS (8217 runs, no
+  crash - hammers CAS-conditioned commit/abort across the token path); judge
+  APPROVED (Arc<str> refactor, equivalent semantics, no frozen-oracle/stats
+  edits). Generated fuzz corpus removed before judging/commit. (As for every
+  prior experiment, the frozen `check.sh --full` cannot run as-is: its fuzz step
+  hard-codes the stale `--cfg madsim` flag - the target now builds under
+  `--cfg sim` - and its `make test-sim` bundles the pre-existing `recovery_holds`
+  flake; the manual `--cfg sim` fuzz + crate sim suites + flake sampling above
+  are the equivalent, stronger full-tier check.)
+- Primary: best 403.42 -> ~403.5 (3 count-3 medians 404.2 / 403.1 / 403.3;
+  within noise, op counts unchanged). best.json refreshed at 403.5.
+- Secondary (3 count-3 runs vs best.json/exp32 = allocsPerTx 269.28,
+  allocBytes 28576, ns 22097, cpu 35865): allocsPerTx -> 259.0 / 250.1 / 254.7
+  (~254.7, -5.4%, every run well below baseline); allocBytesPerTx -> 28354 /
+  27818 / 28091 (~-1.7%); nsPerTx and cpuNsPerTx noisy (first run read +5%/+3.5%
+  high, the next two -8%/-15% low) so net neutral-to-down, never a real
+  regression. Deterministic per-workload alloc drop (from the scouting count-1
+  sweep): readRepeat ~-13%, batchRead10 ~-8%, multiRMW10 ~-4%, batchWrite100
+  ~-3%, singleRMW ~-1.1% - every workload down because the token rides every
+  read and write.
+- Outcome & why: KEPT. Primary flat (within noise), allocsPerTx clearly down
+  ~5.4% with every workload deterministically lower and no axis regressing
+  (allocBytes also down; ns/cpu net down once the one noisy run is set aside).
+  This was the single biggest remaining per-tx allocation: one heap copy of the
+  CAS token on every clone through the pipeline, now a refcount bump. Lesson
+  (again): find the immutable value that is cloned the most times per
+  transaction and share it by `Arc`; the CAS token touches literally every
+  backend op, so converting its copies to refcount bumps moved every workload at
+  once.
+- Commit: __PENDING__
 

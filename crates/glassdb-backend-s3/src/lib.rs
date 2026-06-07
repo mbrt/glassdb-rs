@@ -407,7 +407,7 @@ impl Backend for S3Backend {
             value,
             merged,
             PutConds {
-                if_match: Some(expected.token.clone()),
+                if_match: Some(expected.token.to_string()),
                 if_none_match: false,
             },
         )
@@ -438,7 +438,7 @@ impl Backend for S3Backend {
             value,
             tags,
             PutConds {
-                if_match: Some(expected.token.clone()),
+                if_match: Some(expected.token.to_string()),
                 if_none_match: false,
             },
         )
