@@ -484,3 +484,39 @@ still runs - just with the correct flag. `make test` + `make test-sim` (which us
   ln-compressed to register. Stop optimizing the blind-write lock path.
 - Commit: (reverted)
 
+## 22. Unify the per-tx staged/reads maps - KEPT
+- Hypothesis: `Tx` kept two `HashMap`s keyed by path (`staged` for values,
+  `reads` for read versions), so every *found* read inserted the same path into
+  both -> 2 path-String allocs per read; and `collect_accesses` cloned every
+  staged value into the `WriteAccess` list. A found read happens in every
+  read/RMW workload, so unifying the maps (one path key per read) and draining
+  at commit (move values, build each path's `Arc<str>` once) should cut allocs
+  broadly - the high-ln-leverage read/RMW workloads, not just batchWrite100.
+- Change: `crates/glassdb/src/tx.rs` - replaced `staged`/`reads` with a single
+  `entries: HashMap<String, Entry>` where `Entry { staged: Option<Tvalue>,
+  read: Option<ReadInfo> }`. `read`/`write`/`delete` use `entry(p).or_default()`
+  (one key alloc). `collect_accesses` drains via `mem::take`, moves staged values
+  into `WriteAccess` (no clone), and reuses one `Arc<str>` for a key that is both
+  read and written. Same reads/writes sets and sort order, so the `Data` handed
+  to the commit algo is byte-identical.
+- Correctness: fast gate PASS; full `make test`+`make test-sim` PASS (45 suites,
+  0 failures); `concurrent_tx` fuzz `--cfg sim` PASS (3533 runs, no crash); judge
+  APPROVED (honest refactor; identical access set; no test/stats changes).
+- Primary: flat. Controlled A/B at --count 5: exp22 403.49/403.11 vs reverted
+  best 403.41/404.10 - identical within noise (op counts unchanged; this only
+  changes in-process bookkeeping, not backend ops).
+- Secondary (3 runs vs best): allocsPerTx 356.0/357.9/354.3 (-3.4%..-4.4%);
+  allocBytesPerTx 34991/35291/34940 (-2.7%..-3.7%) - BOTH axes clearly down.
+  Per-workload (deterministic): singleRMW 64.4->~60.9 (-5.4%), batchRead10
+  234->221 (-5.6%), readRepeat 29.9->~28 (-5%), multiRMW10 1362->~1324 (-2.8%),
+  batchWrite100 11409->11311 (-0.9%, value move only).
+- Outcome & why: KEPT. The first all-workloads win since exp19: every workload
+  drops because the duplicate read-key alloc (and the value clone) were on the
+  universal read/commit path, not a single workload. Both alloc axes improve with
+  primary flat. Lesson: collapsing redundant per-key data structures (two maps ->
+  one) is higher-leverage than shaving a single alloc, because it removes a cost
+  paid by every key in every transaction. Next: the per-lock-op `apply_lock_tags`
+  allocations (Tags BTreeMap keys + value clone) remain the largest untouched
+  per-key cost on the write/commit path.
+- Commit: (pending)
+

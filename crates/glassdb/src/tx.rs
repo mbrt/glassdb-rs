@@ -31,9 +31,18 @@ pub struct Tx {
 
 #[derive(Default)]
 struct TxInner {
-    staged: HashMap<String, Tvalue>,
-    reads: HashMap<String, ReadInfo>,
+    // Reads and writes for a path share one entry, so a found read allocates the
+    // path key once instead of inserting it into two maps. `staged` holds a
+    // read-cached value, a write, or a delete; `read` records the version read
+    // (for validation / repeatable reads).
+    entries: HashMap<String, Entry>,
     aborted: bool,
+}
+
+#[derive(Default)]
+struct Entry {
+    staged: Option<Tvalue>,
+    read: Option<ReadInfo>,
 }
 
 impl Tx {
@@ -73,13 +82,15 @@ impl Tx {
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
-            if let Some(tv) = inner.staged.get(&p) {
-                return Ok(tv.val.clone());
-            }
-            if let Some(info) = inner.reads.get(&p) {
-                if !info.found {
-                    // Be consistent with values not found the first time.
-                    return Err(Error::NotFound);
+            if let Some(e) = inner.entries.get(&p) {
+                if let Some(tv) = &e.staged {
+                    return Ok(tv.val.clone());
+                }
+                if let Some(info) = &e.read {
+                    if !info.found {
+                        // Be consistent with values not found the first time.
+                        return Err(Error::NotFound);
+                    }
                 }
             }
         }
@@ -87,35 +98,27 @@ impl Tx {
         match self.reader.read(&self.ctx, &p, MAX_STALENESS).await {
             Err(e) if e.is_not_found() => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.reads.insert(
-                    p,
-                    ReadInfo {
-                        version: ReadVersion::default(),
-                        found: false,
-                    },
-                );
+                inner.entries.entry(p).or_default().read = Some(ReadInfo {
+                    version: ReadVersion::default(),
+                    found: false,
+                });
                 Err(Error::NotFound)
             }
             Err(e) => Err(Error::Other(format!("reading from storage: {e}"))),
             Ok(rv) => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.staged.insert(
-                    p.clone(),
-                    Tvalue {
-                        val: rv.value.clone(),
-                        modified: false,
-                        deleted: false,
+                let e = inner.entries.entry(p).or_default();
+                e.staged = Some(Tvalue {
+                    val: rv.value.clone(),
+                    modified: false,
+                    deleted: false,
+                });
+                e.read = Some(ReadInfo {
+                    version: ReadVersion {
+                        last_writer: rv.version.writer,
                     },
-                );
-                inner.reads.insert(
-                    p,
-                    ReadInfo {
-                        version: ReadVersion {
-                            last_writer: rv.version.writer,
-                        },
-                        found: true,
-                    },
-                );
+                    found: true,
+                });
                 Ok(rv.value)
             }
         }
@@ -124,28 +127,34 @@ impl Tx {
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let p = paths::from_key(c.prefix(), key);
-        self.inner.lock().unwrap().staged.insert(
-            p,
-            Tvalue {
-                val: value.to_vec(),
-                modified: true,
-                deleted: false,
-            },
-        );
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .entry(p)
+            .or_default()
+            .staged = Some(Tvalue {
+            val: value.to_vec(),
+            modified: true,
+            deleted: false,
+        });
         Ok(())
     }
 
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
         let p = paths::from_key(c.prefix(), key);
-        self.inner.lock().unwrap().staged.insert(
-            p,
-            Tvalue {
-                val: Vec::new(),
-                modified: false,
-                deleted: true,
-            },
-        );
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .entry(p)
+            .or_default()
+            .staged = Some(Tvalue {
+            val: Vec::new(),
+            modified: false,
+            deleted: true,
+        });
         Ok(())
     }
 
@@ -160,31 +169,53 @@ impl Tx {
     }
 
     pub(crate) fn reset(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.staged.clear();
-        inner.reads.clear();
+        self.inner.lock().unwrap().entries.clear();
     }
 
     pub(crate) fn collect_accesses(&self) -> Data {
-        let inner = self.inner.lock().unwrap();
+        // Drain the entries: this is called once per attempt and the map is reset
+        // (or dropped) afterwards, so move out the staged values instead of
+        // cloning them, and build each path's `Arc<str>` once even when a key is
+        // both read and written.
+        let entries = std::mem::take(&mut self.inner.lock().unwrap().entries);
         let mut writes = Vec::new();
-        for (k, v) in &inner.staged {
-            if !v.modified && !v.deleted {
-                continue;
-            }
-            writes.push(WriteAccess {
-                path: k.as_str().into(),
-                val: v.val.clone(),
-                delete: v.deleted,
-            });
-        }
         let mut reads = Vec::new();
-        for (k, v) in &inner.reads {
-            reads.push(ReadAccess {
-                path: k.as_str().into(),
-                version: v.version.clone(),
-                found: v.found,
-            });
+        for (k, e) in entries {
+            let has_write = e.staged.as_ref().is_some_and(|v| v.modified || v.deleted);
+            match (has_write, e.read.is_some()) {
+                (false, false) => {}
+                (true, false) => {
+                    let v = e.staged.unwrap();
+                    writes.push(WriteAccess {
+                        path: k.as_str().into(),
+                        val: v.val,
+                        delete: v.deleted,
+                    });
+                }
+                (false, true) => {
+                    let r = e.read.unwrap();
+                    reads.push(ReadAccess {
+                        path: k.as_str().into(),
+                        version: r.version,
+                        found: r.found,
+                    });
+                }
+                (true, true) => {
+                    let path: Arc<str> = k.as_str().into();
+                    let v = e.staged.unwrap();
+                    writes.push(WriteAccess {
+                        path: path.clone(),
+                        val: v.val,
+                        delete: v.deleted,
+                    });
+                    let r = e.read.unwrap();
+                    reads.push(ReadAccess {
+                        path,
+                        version: r.version,
+                        found: r.found,
+                    });
+                }
+            }
         }
         // Emit accesses in a stable path order so the commit path (transaction
         // log contents, lock acquisition order, validation order) is
