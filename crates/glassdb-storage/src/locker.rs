@@ -448,6 +448,18 @@ fn tid_to_tag(t: &TxId) -> String {
     base64::engine::general_purpose::URL_SAFE.encode(t.as_bytes())
 }
 
+/// Encodes the `locked-by` tag value (comma-joined base64 ids). The common
+/// single-locker case (a transaction taking a lock) produces the one base64
+/// string directly, and the empty case (an unlock) produces an empty string,
+/// both without the intermediate `Vec<String>` and `join` allocations.
+fn encode_lockers(lockers: &[TxId]) -> String {
+    match lockers {
+        [] => String::new(),
+        [one] => tid_to_tag(one),
+        many => many.iter().map(tid_to_tag).collect::<Vec<_>>().join(","),
+    }
+}
+
 /// Applies lock updates to storage objects via conditional writes.
 #[derive(Clone)]
 pub struct Locker {
@@ -517,11 +529,10 @@ impl Locker {
         update: &LockUpdate,
     ) -> Result<(), StorageError> {
         let ltype = update.typ.to_tag()?;
-        let lockers: Vec<String> = update.lockers.iter().map(tid_to_tag).collect();
 
         let mut new_tags = Tags::new();
         new_tags.insert(LOCK_TYPE_TAG.to_string(), ltype.to_string());
-        new_tags.insert(LOCKED_BY_TAG.to_string(), lockers.join(","));
+        new_tags.insert(LOCKED_BY_TAG.to_string(), encode_lockers(&update.lockers));
 
         if update.typ == LockType::Create {
             self.global
