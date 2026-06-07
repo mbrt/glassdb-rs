@@ -1178,3 +1178,78 @@ so it is recorded here rather than fixed.
   decode.
 - Commit: 9e2193d
 
+## 37. Encode the `locked-by` tag without a Vec/join in the common cases - KEPT
+- Hypothesis: every lock acquisition (`apply_lock_tags`) builds the `locked-by`
+  tag by mapping the lockers to base64 `String`s, collecting them into a
+  `Vec<String>`, and `join(",")`-ing that vector - two heap allocations (the Vec
+  plus the joined String) on top of the per-id base64. But a write lock is taken
+  by a single transaction (one locker) and an unlock clears it (zero lockers);
+  the multi-locker case is only shared read locks. For the dominant single-locker
+  case the base64 string *is* the final tag value, so the Vec and the join are
+  pure overhead. Write-lock-heavy workloads acquire a lock per write
+  (batchWrite100: 100 writes/txn; multiRMW10: 10), so this fires on every write.
+- Change: `crates/glassdb-storage/src/locker.rs` - new `encode_lockers(&[TxId])`
+  helper: `[]` -> empty `String`, `[one]` -> `tid_to_tag(one)` directly,
+  `many` -> the previous map/collect/join. `apply_lock_tags` calls it instead of
+  building the intermediate `Vec<String>`. Byte-for-byte identical tag output for
+  every arity (the `tags_round_trip` test still asserts the multi-locker join),
+  so no behaviour change - purely fewer allocations on the lock path.
+- Correctness: locker unit tests PASS (incl. `tags_round_trip`); `make test` PASS
+  (fmt + clippy -D warnings + all workspace tests); `make test-sim` PASS (all
+  crate sim suites + `glassdb --features sim`); `glassdb` `concurrent_sim`
+  determinism-NEUTRAL (8 runs of `recovery_holds`: 4 pass / 4 fail on the
+  pre-existing flake, identical rate/signature); `concurrent_tx` fuzz `--cfg sim`
+  PASS (10399 runs, no crash - exercises read locks with multiple lockers as well
+  as single-locker writes, so all three `encode_lockers` arms are covered); judge
+  APPROVED (honest allocation refactor on a non-frozen file, identical output, no
+  test/stats/benchmark gaming). Generated fuzz corpus removed before
+  judging/commit. (Frozen `check.sh --full` not runnable as-is for the usual
+  stale `--cfg madsim` fuzz-flag / `recovery_holds` flake reasons; the manual
+  `--cfg sim` fuzz + crate sim suites + flake sampling are the equivalent
+  full-tier check.)
+- Primary: ~403.5 -> ~403.5 (flat within noise; 8 medians spanning 403.1-404.3;
+  op counts unchanged). best.json refreshed at 403.50.
+- Secondary (9 count-3 runs vs exp36 median ~218): allocsPerTx -> 214.0 / 211.6 /
+  212.2 / 217.1 / 212.3 / 216.4 / 213.9 / 212.2 / 214.6 (~213.5, every run below
+  the exp36 range 215.5-221.3); allocBytesPerTx ~26684 (-2.4%); ns/cpu flat. The
+  one deterministic, attributable mover is batchWrite100 9409.6 -> ~9205 (-2.1%,
+  rock-steady across runs: 9178/9206/9210/9210); multiRMW10 ~973 -> ~970 is a
+  marginal write-lock win buried in its own noise; the read-only workloads
+  (batchRead10/readRepeat/singleRMW) are unchanged in mechanism and their
+  run-to-run wobble accounts for the rest of the aggregate delta.
+- Outcome & why: KEPT under the secondary rule - primary flat, allocsPerTx
+  consistently lower with a clean deterministic -2.1% on the write-lock workload
+  and no axis regressing. The lock path always paid for a Vec+join even though
+  the overwhelmingly common case is a single locker whose base64 is already the
+  answer. Lesson: collection+join helpers are convenient but allocate twice;
+  special-casing the 0/1-element arities (the hot ones here) keeps the readable
+  fallback while removing the steady-state cost.
+- Commit: <pending>
+
+## Summary
+
+Budget complete: 25 experiments run (the full budget), all logged above.
+
+- Baseline primary score: 403.64 -> best kept: ~403.50 (flat; the primary's
+  weighted backend-op cost per txn is set by the protocol's op counts, which the
+  kept changes deliberately did not alter - so the primary stays at the noise
+  floor throughout and strict serializability is preserved).
+- Where the wins landed: the secondary tie-breakers, overwhelmingly
+  `allocsPerTx`, which fell from the ~236 best.json baseline (exp34 era) to
+  ~213, roughly -10% end to end, with `allocBytesPerTx` down in step (~28030 ->
+  ~26684). Every kept change was a pure allocation reduction on the hot
+  read/commit/lock paths with byte-identical behaviour.
+- Kept experiments (this session's tail): 33 (`Version` token `String` ->
+  `Arc<str>`), 34 (object values `Vec<u8>` -> `Arc<[u8]>` end to end), 35 (cache
+  the memory backend's CAS token on the object), 36 (skip the last-writer decode
+  when the version is unchanged), 37 (encode `locked-by` without a Vec/join in
+  the 0/1-locker cases).
+- Recurring theme / lessons: the biggest savings came from turning *clones into
+  refcount bumps* (`Arc` sharing for immutable-after-creation data) and from
+  *caching values derived from a cheap version token* and only recomputing them
+  when that token changes. Discarded attempts were the ones whose mechanism only
+  touched a cold path or whose deterministic geomean contribution sat under the
+  ~1% noise floor (e.g. lone-join micro-opts measured in isolation) - the lesson
+  being to attribute an aggregate delta to a specific deterministic per-workload
+  mechanism before trusting it over run-to-run noise.
+
