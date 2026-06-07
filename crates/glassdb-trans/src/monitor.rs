@@ -52,9 +52,12 @@ struct WaitRequest {
 
 #[derive(Default)]
 struct State {
-    local_tx: HashMap<Vec<u8>, TxStatusEntry>,
-    waiters: HashMap<Vec<u8>, Vec<WaitRequest>>,
-    unknown_tx: HashMap<Vec<u8>, SystemTime>,
+    // Keyed by `TxId` (an `Arc<[u8]>` that hashes/compares by byte content), so
+    // registering a transaction is a refcount bump rather than a `Vec<u8>` copy
+    // of the id on every `begin_tx` (i.e. every committed transaction).
+    local_tx: HashMap<TxId, TxStatusEntry>,
+    waiters: HashMap<TxId, Vec<WaitRequest>>,
+    unknown_tx: HashMap<TxId, SystemTime>,
 }
 
 struct Inner {
@@ -135,7 +138,7 @@ impl Monitor {
     pub fn begin_tx(&self, tid: &TxId) {
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.insert(
-            tid.as_bytes().to_vec(),
+            tid.clone(),
             TxStatusEntry {
                 status: TxCommitStatus::Pending,
                 last_version: backend::Version::default(),
@@ -149,7 +152,7 @@ impl Monitor {
     pub fn start_refresh_tx(&self, ctx: &Ctx, tid: &TxId) {
         let need_start = {
             let mut st = self.shard_for(tid).lock().unwrap();
-            match st.local_tx.get_mut(tid.as_bytes()) {
+            match st.local_tx.get_mut(tid) {
                 Some(e) if e.refresh_state == RefreshState::NotStarted => {
                     e.refresh_state = RefreshState::Running;
                     true
@@ -209,7 +212,7 @@ impl Monitor {
         }
 
         let mut st = self.shard_for(&tl.id).lock().unwrap();
-        st.local_tx.remove(tl.id.as_bytes());
+        st.local_tx.remove(&tl.id);
         notify_waiters(
             &mut st,
             &tl.id,
@@ -231,7 +234,7 @@ impl Monitor {
             .await;
 
         let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.remove(tid.as_bytes());
+        st.local_tx.remove(tid);
         notify_waiters(
             &mut st,
             tid,
@@ -279,7 +282,7 @@ impl Monitor {
         self.stop_tx_refresh(tid);
 
         let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.remove(tid.as_bytes());
+        st.local_tx.remove(tid);
         notify_waiters(
             &mut st,
             tid,
@@ -294,7 +297,7 @@ impl Monitor {
     pub async fn tx_status(&self, ctx: &Ctx, tid: &TxId) -> Result<TxCommitStatus, TransError> {
         {
             let st = self.shard_for(tid).lock().unwrap();
-            if let Some(e) = st.local_tx.get(tid.as_bytes()) {
+            if let Some(e) = st.local_tx.get(tid) {
                 return Ok(e.status);
             }
         }
@@ -307,7 +310,7 @@ impl Monitor {
         let (tx, rx) = oneshot::channel();
 
         let mut st = self.shard_for(tid).lock().unwrap();
-        let entry = st.local_tx.get(tid.as_bytes());
+        let entry = st.local_tx.get(tid);
         let is_local = entry.is_some();
         let status = entry.map(|e| e.status).unwrap_or(TxCommitStatus::Unknown);
 
@@ -317,7 +320,7 @@ impl Monitor {
             return rx;
         }
 
-        if let Some(ws) = st.waiters.get_mut(tid.as_bytes()) {
+        if let Some(ws) = st.waiters.get_mut(tid) {
             ws.push(WaitRequest {
                 ctx: ctx.clone(),
                 tx,
@@ -329,7 +332,7 @@ impl Monitor {
             // Local transition: no worker needed; we'll be notified by
             // commit_tx/abort_tx.
             st.waiters.insert(
-                tid.as_bytes().to_vec(),
+                tid.clone(),
                 vec![WaitRequest {
                     ctx: ctx.clone(),
                     tx,
@@ -339,7 +342,7 @@ impl Monitor {
         }
 
         // Remote transaction: spawn a poller.
-        st.waiters.insert(tid.as_bytes().to_vec(), Vec::new());
+        st.waiters.insert(tid.clone(), Vec::new());
         drop(st);
 
         let m = self.clone();
@@ -452,10 +455,10 @@ impl Monitor {
         let now = self.inner.clock.now();
         let first_check = {
             let mut st = self.shard_for(tid).lock().unwrap();
-            match st.unknown_tx.get(tid.as_bytes()) {
+            match st.unknown_tx.get(tid) {
                 Some(fc) => *fc,
                 None => {
-                    st.unknown_tx.insert(tid.as_bytes().to_vec(), now);
+                    st.unknown_tx.insert(tid.clone(), now);
                     return Ok(TxCommitStatus::Pending);
                 }
             }
@@ -466,11 +469,7 @@ impl Monitor {
                 .try_abort_remote_tx(ctx, tid, &backend::Version::default())
                 .await;
             if res.is_ok() {
-                self.shard_for(tid)
-                    .lock()
-                    .unwrap()
-                    .unknown_tx
-                    .remove(tid.as_bytes());
+                self.shard_for(tid).lock().unwrap().unknown_tx.remove(tid);
             }
             return res;
         }
@@ -527,7 +526,7 @@ impl Monitor {
         let mut last_v = {
             let st = self.shard_for(tid).lock().unwrap();
             st.local_tx
-                .get(tid.as_bytes())
+                .get(tid)
                 .map(|e| e.last_version.clone())
                 .unwrap_or_default()
         };
@@ -562,14 +561,14 @@ impl Monitor {
     fn should_refresh(&self, tid: &TxId) -> bool {
         let st = self.shard_for(tid).lock().unwrap();
         matches!(
-            st.local_tx.get(tid.as_bytes()),
+            st.local_tx.get(tid),
             Some(e) if e.refresh_state == RefreshState::Running
         )
     }
 
     fn stop_tx_refresh(&self, tid: &TxId) -> bool {
         let mut st = self.shard_for(tid).lock().unwrap();
-        match st.local_tx.get_mut(tid.as_bytes()) {
+        match st.local_tx.get_mut(tid) {
             Some(e) if e.refresh_state == RefreshState::Running => {
                 e.refresh_state = RefreshState::Stopped;
                 true
@@ -607,7 +606,7 @@ impl Monitor {
                 Ok(v) => {
                     last_version = v;
                     let mut st = self.shard_for(&tid).lock().unwrap();
-                    if let Some(e) = st.local_tx.get_mut(tid.as_bytes()) {
+                    if let Some(e) = st.local_tx.get_mut(&tid) {
                         e.last_version = last_version.clone();
                     }
                 }
@@ -618,7 +617,7 @@ impl Monitor {
 }
 
 fn notify_waiters(st: &mut State, tid: &TxId, res: WaitTxResult) {
-    if let Some(ws) = st.waiters.remove(tid.as_bytes()) {
+    if let Some(ws) = st.waiters.remove(tid) {
         for w in ws {
             if !w.ctx.is_cancelled() {
                 let _ = w.tx.send(res.clone());
@@ -628,7 +627,7 @@ fn notify_waiters(st: &mut State, tid: &TxId, res: WaitTxResult) {
 }
 
 fn next_waiter(st: &mut State, tid: &TxId) -> Option<Ctx> {
-    let ws = st.waiters.get_mut(tid.as_bytes())?;
+    let ws = st.waiters.get_mut(tid)?;
     let i = ws
         .iter()
         .position(|w| !w.ctx.is_cancelled())
