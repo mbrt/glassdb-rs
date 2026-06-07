@@ -347,22 +347,57 @@ fn handle_no_ops(curr: &LockInfo, mut ops: LockOps) -> LockOps {
     ops
 }
 
+/// Parses just the lock-type tag, without decoding the lockers/last-writer.
+///
+/// Read validation usually only needs the lock type (and, for unlocked/read
+/// state, a single last-writer equality check via [`tag_matches_tid`]), so this
+/// avoids building the full [`LockInfo`] - which would decode the last-writer
+/// tag into a freshly allocated [`TxId`] on every validated read.
+pub fn tags_lock_type(tags: &Tags) -> Result<LockType, StorageError> {
+    match tags.get(LOCK_TYPE_TAG) {
+        None => Ok(LockType::None),
+        Some(v) => match v.as_str() {
+            LOCK_TAG_READ => Ok(LockType::Read),
+            LOCK_TAG_WRITE => Ok(LockType::Write),
+            LOCK_TAG_CREATE => Ok(LockType::Create),
+            LOCK_TAG_NONE | "" => Ok(LockType::None),
+            other => Err(StorageError::Other(format!("unknown lock type {other:?}"))),
+        },
+    }
+}
+
+/// Reports whether `tag` decodes to the same bytes as `tid`, without allocating
+/// a [`TxId`]. A missing or malformed tag is treated as the empty id (matching
+/// [`last_writer_from_tags`], which yields the default id in those cases), so it
+/// matches an empty `tid`.
+pub fn tag_matches_tid(tag: Option<&str>, tid: &TxId) -> bool {
+    match tag {
+        None => tid.is_empty(),
+        Some(s) => {
+            let eng = base64::engine::general_purpose::URL_SAFE;
+            let mut buf = [0u8; 64];
+            if s.len() / 4 * 3 + 3 <= buf.len() {
+                if let Ok(n) = eng.decode_slice(s, &mut buf) {
+                    return buf[..n] == *tid.as_bytes();
+                }
+            }
+            // Long or malformed tag: fall back to the allocating decode so the
+            // comparison stays exact for any id length.
+            match eng.decode(s) {
+                Ok(bytes) => bytes == *tid.as_bytes(),
+                Err(_) => tid.is_empty(),
+            }
+        }
+    }
+}
+
 /// Parses lock-managing tags into a [`LockInfo`].
 pub fn tags_lock_info(tags: &Tags) -> Result<LockInfo, StorageError> {
     let mut res = LockInfo {
-        typ: LockType::None,
+        typ: tags_lock_type(tags)?,
         ..Default::default()
     };
 
-    if let Some(v) = tags.get(LOCK_TYPE_TAG) {
-        res.typ = match v.as_str() {
-            LOCK_TAG_READ => LockType::Read,
-            LOCK_TAG_WRITE => LockType::Write,
-            LOCK_TAG_CREATE => LockType::Create,
-            LOCK_TAG_NONE | "" => LockType::None,
-            other => return Err(StorageError::Other(format!("unknown lock type {other:?}"))),
-        };
-    }
     if let Some(v) = tags.get(LOCKED_BY_TAG) {
         if !v.is_empty() {
             for lt in v.split(',') {
