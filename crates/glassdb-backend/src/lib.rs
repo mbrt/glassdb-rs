@@ -70,14 +70,19 @@ impl BackendError {
 pub type Tags = BTreeMap<String, String>;
 
 /// An opaque CAS token identifying a generation of an object.
+///
+/// The token is held behind an `Arc<str>` so propagating a version - which
+/// happens on every read as it flows backend -> cache -> `ReadValue` -> the
+/// transaction's read set - is a refcount bump rather than a fresh `String`
+/// copy of the token each hop.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Version {
-    pub token: String,
+    pub token: Arc<str>,
 }
 
 impl Version {
     /// Wraps a token string.
-    pub fn new(token: impl Into<String>) -> Self {
+    pub fn new(token: impl Into<Arc<str>>) -> Self {
         Version {
             token: token.into(),
         }

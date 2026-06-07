@@ -25,7 +25,19 @@ struct Object {
 
 impl Object {
     fn version(&self) -> Version {
-        Version::new(format!("{}/{}", self.gen, self.metagen))
+        // Format the `gen/metagen` token straight into the `Arc<str>` via a stack
+        // buffer, so minting a version is one allocation (the Arc) rather than a
+        // `String` followed by an `Arc` copy. Two i64s plus a separator never
+        // exceed this buffer.
+        use std::io::Write;
+        let mut buf = [0u8; 48];
+        let n = {
+            let mut cur = &mut buf[..];
+            let _ = write!(cur, "{}/{}", self.gen, self.metagen);
+            48 - cur.len()
+        };
+        let s = std::str::from_utf8(&buf[..n]).expect("ascii token");
+        Version::new(s)
     }
 }
 
@@ -301,7 +313,7 @@ mod tests {
             .write(&ctx(), "a", b"hello".to_vec(), Tags::new())
             .await
             .unwrap();
-        assert_eq!(m.version.token, "1/1");
+        assert_eq!(&*m.version.token, "1/1");
         let r = b.read(&ctx(), "a").await.unwrap();
         assert_eq!(r.contents, b"hello");
         b.delete(&ctx(), "a").await.unwrap();
@@ -349,7 +361,7 @@ mod tests {
         let writer = WriterId::new(vec![1, 2, 3]);
         tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
         let m = b.write(&ctx(), "a", b"v".to_vec(), tags).await.unwrap();
-        assert_eq!(m.version.token, "1/1");
+        assert_eq!(&*m.version.token, "1/1");
 
         // ReadIfModified with the same writer => precondition (unchanged).
         assert!(matches!(
@@ -364,7 +376,7 @@ mod tests {
         let mut t2 = Tags::new();
         t2.insert("k".to_string(), "v".to_string());
         let m2 = b.set_tags_if(&ctx(), "a", &m.version, t2).await.unwrap();
-        assert_eq!(m2.version.token, "1/2");
+        assert_eq!(&*m2.version.token, "1/2");
     }
 
     #[tokio::test]
