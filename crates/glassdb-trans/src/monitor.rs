@@ -176,7 +176,7 @@ impl Monitor {
         // the transaction log.
         if !tl.locks.is_empty() {
             tl.status = TxCommitStatus::Ok;
-            self.set_final_log(ctx, tl.clone()).await.map_err(|e| {
+            self.set_final_log(ctx, &tl).await.map_err(|e| {
                 // Preserve AlreadyFinalized so the commit path can recognize a
                 // wound (the log was already aborted out from under us), and an
                 // in-doubt outcome so the caller sees it and we never retry it
@@ -227,7 +227,7 @@ impl Monitor {
         self.stop_tx_refresh(tid);
 
         let res = self
-            .set_final_log(ctx, TxLog::new(tid.clone(), TxCommitStatus::Aborted))
+            .set_final_log(ctx, &TxLog::new(tid.clone(), TxCommitStatus::Aborted))
             .await;
 
         let mut st = self.shard_for(tid).lock().unwrap();
@@ -485,9 +485,9 @@ impl Monitor {
     ) -> Result<TxCommitStatus, TransError> {
         let tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         let r = if expected.is_null() {
-            self.inner.tl.set(ctx, tlog).await
+            self.inner.tl.set(ctx, &tlog).await
         } else {
-            self.inner.tl.set_if(ctx, tlog, expected).await
+            self.inner.tl.set_if(ctx, &tlog, expected).await
         };
         match r {
             Ok(_) => Ok(TxCommitStatus::Aborted),
@@ -519,13 +519,13 @@ impl Monitor {
         }
     }
 
-    async fn set_final_log(&self, ctx: &Ctx, tlog: TxLog) -> Result<(), TransError> {
-        let tid = tlog.id.clone();
+    async fn set_final_log(&self, ctx: &Ctx, tlog: &TxLog) -> Result<(), TransError> {
+        let tid = &tlog.id;
         if tid.is_empty() {
             return Err(TransError::Other("missing required tlog ID".into()));
         }
         let mut last_v = {
-            let st = self.shard_for(&tid).lock().unwrap();
+            let st = self.shard_for(tid).lock().unwrap();
             st.local_tx
                 .get(tid.as_bytes())
                 .map(|e| e.last_version.clone())
@@ -535,15 +535,15 @@ impl Monitor {
         let mut backoff = self.inner.retry.backoff();
         loop {
             let r = if last_v.is_null() {
-                self.inner.tl.set(ctx, tlog.clone()).await
+                self.inner.tl.set(ctx, tlog).await
             } else {
-                self.inner.tl.set_if(ctx, tlog.clone(), &last_v).await
+                self.inner.tl.set_if(ctx, tlog, &last_v).await
             };
             match r {
                 Ok(_) => return Ok(()),
                 Err(e) if e.is_precondition() => {
                     // Possible race on set; refresh the last version and retry.
-                    let st = self.inner.tl.commit_status(ctx, &tid).await?;
+                    let st = self.inner.tl.commit_status(ctx, tid).await?;
                     if st.status.is_final() {
                         return Err(TransError::AlreadyFinalized);
                     }
@@ -599,9 +599,9 @@ impl Monitor {
             tl.timestamp = Some(start);
 
             let r = if last_version.is_null() {
-                self.inner.tl.set(&ctx, tl).await
+                self.inner.tl.set(&ctx, &tl).await
             } else {
-                self.inner.tl.set_if(&ctx, tl, &last_version).await
+                self.inner.tl.set_if(&ctx, &tl, &last_version).await
             };
             match r {
                 Ok(v) => {
