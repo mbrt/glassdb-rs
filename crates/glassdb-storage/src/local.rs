@@ -215,14 +215,25 @@ impl Local {
 
     /// Updates only the metadata for `key`.
     pub fn set_meta(&self, key: &str, meta: Arc<Metadata>) {
-        let writer = last_writer_from_tags(&meta.tags);
-        let new_meta = CacheMeta {
-            meta,
-            writer,
-            updated: Instant::now(),
-        };
-        self.cache
-            .modify(key, move |entry| entry.m = Some(new_meta));
+        let updated = Instant::now();
+        self.cache.modify(key, move |entry| {
+            // Reuse the previously decoded last-writer when the object's CAS
+            // version is unchanged. The version changes on every tag mutation,
+            // so an equal version implies identical tags and thus the same
+            // last-writer; this skips a base64 `TxId` decode on every
+            // read-validation metaRead of an unchanged object (the common case
+            // for read-heavy workloads, where the same keys are validated each
+            // transaction).
+            let writer = match &entry.m {
+                Some(old) if old.meta.version == meta.version => old.writer.clone(),
+                _ => last_writer_from_tags(&meta.tags),
+            };
+            entry.m = Some(CacheMeta {
+                meta,
+                writer,
+                updated,
+            });
+        });
     }
 
     /// Marks the value at `key` as outdated, only if it is at version `v`.
