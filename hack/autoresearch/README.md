@@ -48,6 +48,16 @@ cargo run --release -p glassdb-bench-score --bin autoresearch                   
 (Go's `mutexWaitNsPerTx` axis is dropped: Rust's std exposes no portable
 mutex-contention metric.)
 
+## Profiling (optional diagnostic)
+
+To guide the CPU/allocation secondary axes, [`hack/perf`](../perf) has a
+standalone flamegraph recipe (`hack/perf/profile.sh`, or `make flamegraph`). It
+is a diagnostic aid only - it lives outside this loop's frozen metric and gate,
+changes no source, and is not part of `check.sh`. Note the in-memory caveat
+documented there: an `autoresearch`-target profile reflects CPU/alloc cost, not
+the object-storage round-trips that dominate in production. Wiring it into the
+loop would be a human edit to `program.md`.
+
 ## Correctness
 
 Every experiment must pass the gate before it can be kept; this is what protects

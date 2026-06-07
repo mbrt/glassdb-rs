@@ -1,4 +1,4 @@
-.PHONY: test lint format build sim-test fuzz fuzz-min bench bench-score
+.PHONY: test lint format build sim-test fuzz fuzz-min bench bench-score flamegraph profile
 
 build:
 	cargo build --workspace
@@ -28,6 +28,13 @@ bench:
 # CI perf-regression check. Append `-- --json` args for machine-readable output.
 bench-score:
 	@cargo run --release -p glassdb-bench-score --bin autoresearch -- --count 3
+
+# Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
+# excluded from `test`, `bench-score`, and the autoresearch gate; it changes no
+# source and is not part of any metric). Tunable via TARGET/COUNT/OUT; see
+# hack/perf/README.md.
+flamegraph profile:
+	hack/perf/profile.sh
 
 # Run the test suite under the in-repo deterministic simulation executor
 # (ADR-011, `--cfg sim`). The cloud backend crates (s3/gcs) use real

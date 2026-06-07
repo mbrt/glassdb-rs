@@ -1,1 +1,3 @@
 /target
+# cargo-flamegraph drops raw perf data in the repo root (see hack/perf).
+/perf.data*
