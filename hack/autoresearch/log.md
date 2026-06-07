@@ -1131,3 +1131,50 @@ so it is recorded here rather than fixed.
   invalidate on the (rare) mutation, but refresh it exactly once per op.
 - Commit: f086683
 
+## 36. Skip re-decoding the cached last-writer when the version is unchanged - KEPT
+- Hypothesis: read validation (`validate_read` -> `global.get_metadata` ->
+  `local.set_meta`) runs one backend metaRead per read, and `set_meta` decoded
+  the `last-writer` tag into a fresh `TxId` (a base64 decode + alloc) *every*
+  time, even when the cached metadata already held that exact writer. The CAS
+  version changes on every tag mutation, so an unchanged version implies
+  identical tags and therefore the same last-writer; reusing the previously
+  decoded `TxId` when the version matches skips the decode on every revalidation
+  of an unchanged object. Read-heavy workloads revalidate the same keys each
+  transaction (batchRead10: same 10 keys x 200 txns; readRepeat: same key x 200),
+  so almost every metaRead can reuse the cached writer.
+- Change: `crates/glassdb-storage/src/local.rs` - `set_meta` now runs inside the
+  cache `modify` closure and compares the incoming `meta.version` to the existing
+  entry's `m.meta.version`; on a match it clones the already-decoded
+  `old.writer` (a refcount bump) instead of calling `last_writer_from_tags`.
+  Same `CacheMeta` written either way; only the decode is skipped. Safe because
+  the backend guarantees the version token changes on any tag change, so equal
+  version <=> identical tags <=> identical last-writer.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  workspace tests, incl. the storage cache/local and trans read-validation unit
+  tests); all crate sim suites PASS; `glassdb` `concurrent_sim`
+  determinism-NEUTRAL (6 runs: 4 passed 9/9, 2 failed 8/9 on the pre-existing
+  `recovery_holds` flake, identical "diverged at index 98"); `concurrent_tx`
+  fuzz `--cfg sim` PASS (9602 runs, no crash - exercises writers changing under
+  concurrency, so the version-equality shortcut is stressed); judge APPROVED
+  (legitimate cache optimization, no test/stats/benchmark gaming). Generated
+  fuzz corpus removed before judging/commit. (Frozen `check.sh --full` not
+  runnable as-is for the usual stale-flag/flake reasons; the manual `--cfg sim`
+  fuzz + crate sim suites + flake sampling are the equivalent full-tier check.)
+- Primary: ~403.5 (flat within noise; 4 medians 402.3 / 403.5 / 403.6 / 403.1;
+  op counts unchanged). best.json refreshed at 403.55.
+- Secondary (5 count-3 runs vs exp35 median ~224): allocsPerTx -> 219.5 / 216.6 /
+  221.3 / 215.5 / 218.1 (~218, -2.7%, every run below the exp35 range);
+  allocBytesPerTx ~flat-to-down (~26970). Per-workload: batchRead10 ~98.5 -> ~88
+  (-10.6%, one decode skipped per metaRead, 10/tx), multiRMW10 1004 -> ~973
+  (-3.1%), singleRMW/readRepeat/batchWrite100 ~flat (their metaReads are fewer or
+  on changing versions).
+- Outcome & why: KEPT. Primary flat, allocsPerTx down ~2.7% driven by a
+  deterministic -10.6% on batchRead10, no axis regressing. The last-writer was
+  re-derived from tags on every revalidation though it only changes with the
+  version; gating the decode on a version change removes it from the steady-state
+  read path. Lesson: a value cached *next to* the data it is derived from
+  (here the decoded writer alongside the version) can be reused whenever the
+  source's version is unchanged - compare the cheap version before redoing the
+  decode.
+- Commit: __PENDING__
+
