@@ -652,7 +652,7 @@ mod tests {
 
         // Lock, commit, unlock writes the value.
         locker.lock_create(&ctx, &key, &tx).await.unwrap();
-        let value = b"val".to_vec();
+        let value: Arc<[u8]> = Arc::from(&b"val"[..]);
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
             path: key.clone(),
@@ -676,7 +676,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -712,7 +712,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -740,7 +740,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx2);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -778,7 +778,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -788,7 +788,7 @@ mod tests {
         let mut tl = TxLog::new(txw.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
             path: key.clone(),
-            value: Vec::new(),
+            value: Arc::from(&[] as &[u8]),
             deleted: true,
             prev_writer: TxId::default(),
         }];
@@ -809,7 +809,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -832,7 +832,7 @@ mod tests {
         tctx.monitor.begin_tx(&txw);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -882,7 +882,7 @@ mod tests {
         tctx.monitor.begin_tx(&txw);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -951,7 +951,7 @@ mod tests {
         tctx.monitor.begin_tx(&txr);
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -988,7 +988,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
         tctx1
             .global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1026,7 +1026,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
         tctx1
             .global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1064,7 +1064,7 @@ mod tests {
                 let mut tl = TxLog::new(t.clone(), TxCommitStatus::Ok);
                 tl.writes = vec![TxWrite {
                     path: k,
-                    value: b"foo".to_vec(),
+                    value: Arc::from(&b"foo"[..]),
                     deleted: false,
                     prev_writer: TxId::default(),
                 }];
@@ -1083,7 +1083,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
 
         tctx.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&ctx, &key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 

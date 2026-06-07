@@ -83,7 +83,7 @@ impl ReadVersion {
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
     pub path: Arc<str>,
-    pub val: Vec<u8>,
+    pub val: Arc<[u8]>,
     pub delete: bool,
 }
 
@@ -1434,7 +1434,7 @@ mod tests {
             .write(
                 &ctx,
                 &paths::collection_info(TEST_COLL),
-                COLL_INFO.to_vec(),
+                Arc::from(COLL_INFO),
                 Tags::new(),
             )
             .await
@@ -1465,7 +1465,7 @@ mod tests {
     fn wa(path: &str, val: &[u8]) -> WriteAccess {
         WriteAccess {
             path: path.into(),
-            val: val.to_vec(),
+            val: Arc::from(val),
             delete: false,
         }
     }
@@ -1473,7 +1473,7 @@ mod tests {
     fn wdel(path: &str) -> WriteAccess {
         WriteAccess {
             path: path.into(),
-            val: Vec::new(),
+            val: Arc::from(&[] as &[u8]),
             delete: true,
         }
     }
@@ -1561,7 +1561,7 @@ mod tests {
         assert!(txlog.timestamp.is_some());
         assert_eq!(txlog.writes.len(), 1);
         assert_eq!(txlog.writes[0].path, keyp);
-        assert_eq!(txlog.writes[0].value, val);
+        assert_eq!(&*txlog.writes[0].value, val);
         let mut locks = txlog.locks.clone();
         locks.sort_by(|a, b| a.path.cmp(&b.path));
         let mut expected = vec![
@@ -1634,7 +1634,7 @@ mod tests {
         tm.end(&ctx, &mut h).await.unwrap();
 
         let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
-        assert_eq!(gr.value, val);
+        assert_eq!(&*gr.value, val);
     }
 
     #[tokio::test]
@@ -1684,12 +1684,12 @@ mod tests {
         tm.end(&ctx, &mut h).await.unwrap();
 
         let lr = tctx.local.read(&keyp, MAX_STALENESS).unwrap();
-        assert_eq!(lr.value, val);
+        assert_eq!(&*lr.value, val);
         assert_eq!(lr.version.writer, *h.id());
 
         tm.unlock_all(&ctx, &h).await.unwrap();
         let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
-        assert_eq!(gr.value, val);
+        assert_eq!(&*gr.value, val);
     }
 
     #[tokio::test]
@@ -1721,7 +1721,7 @@ mod tests {
         tm.end(&ctx, &mut h).await.unwrap();
 
         let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
-        assert_eq!(gr.value, val);
+        assert_eq!(&*gr.value, val);
     }
 
     #[tokio::test]
@@ -1896,7 +1896,7 @@ mod tests {
         let st = tctx_w.tlogger.commit_status(&ctx, &w1).await.unwrap();
         assert_eq!(st.status, TxCommitStatus::Unknown);
         let gr = tctx_w.global.read(&ctx, &key).await.unwrap();
-        assert_eq!(gr.value, v1);
+        assert_eq!(&*gr.value, v1);
         assert_eq!(gr.writer(), w1);
 
         // 4. A third client write-locks k and stays pending.
@@ -1935,7 +1935,7 @@ mod tests {
             tctx_v.tmon.clone(),
         );
         let rv = reader.read(&ctx, &key, MAX_STALENESS).await.unwrap();
-        assert_eq!(rv.value, v1);
+        assert_eq!(&*rv.value, v1);
         assert_eq!(rv.version.writer, w1);
     }
 

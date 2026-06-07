@@ -3,6 +3,7 @@
 //! and timestamp tags.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend::{self as backend, Tags};
@@ -67,7 +68,7 @@ impl TxLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxWrite {
     pub path: String,
-    pub value: Vec<u8>,
+    pub value: Arc<[u8]>,
     pub deleted: bool,
     pub prev_writer: TxId,
 }
@@ -178,7 +179,7 @@ impl TLogger {
             .write_if_not_exists(
                 ctx,
                 &paths::from_transaction(&self.prefix, &l.id),
-                buf,
+                Arc::from(buf),
                 tags,
             )
             .await?;
@@ -200,7 +201,7 @@ impl TLogger {
             .write_if(
                 ctx,
                 &paths::from_transaction(&self.prefix, &l.id),
-                buf,
+                Arc::from(buf),
                 expected,
                 tags,
             )
@@ -255,10 +256,10 @@ impl TLogger {
     }
 }
 
-fn write_value(w: &pb::Write) -> Vec<u8> {
+fn write_value(w: &pb::Write) -> Arc<[u8]> {
     match &w.val_delete {
-        Some(pb::write::ValDelete::Value(v)) => v.clone(),
-        _ => Vec::new(),
+        Some(pb::write::ValDelete::Value(v)) => Arc::from(v.as_slice()),
+        _ => Arc::from(&[] as &[u8]),
     }
 }
 
@@ -336,7 +337,7 @@ fn marshal_write(
     let val_delete = if e.deleted {
         pb::write::ValDelete::Deleted(true)
     } else {
-        pb::write::ValDelete::Value(e.value.clone())
+        pb::write::ValDelete::Value(e.value.to_vec())
     };
     let write = pb::Write {
         // `pr.suffix` is already the protobuf suffix (`_k/<b64>`); no re-join.
@@ -482,7 +483,7 @@ mod tests {
             status: TxCommitStatus::Ok,
             writes: vec![TxWrite {
                 path: key_path.clone(),
-                value: b"world".to_vec(),
+                value: Arc::from(&b"world"[..]),
                 deleted: false,
                 prev_writer: TxId::from_bytes(vec![9]),
             }],

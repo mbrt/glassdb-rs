@@ -1,6 +1,8 @@
 //! Lock state encoding and the pure lock-transition logic. Ported from the Go
 //! `internal/storage/locker.go`.
 
+use std::sync::Arc;
+
 use base64::Engine;
 use glassdb_backend::Tags;
 use glassdb_concurr::Ctx;
@@ -73,7 +75,7 @@ fn any_older(requesters: &[TxId], holder: &TxId) -> bool {
 /// not written at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TValue {
-    pub value: Vec<u8>,
+    pub value: Arc<[u8]>,
     pub deleted: bool,
     /// True when the transaction committed but did not write this value (e.g.
     /// read-only lock).
@@ -523,7 +525,7 @@ impl Locker {
 
         if update.typ == LockType::Create {
             self.global
-                .write_if_not_exists(ctx, key, Vec::new(), new_tags)
+                .write_if_not_exists(ctx, key, Arc::from(&[] as &[u8]), new_tags)
                 .await?;
             return Ok(());
         }
@@ -656,7 +658,7 @@ mod tests {
             tx: tx(1),
             status: TxCommitStatus::Ok,
             value: TValue {
-                value: b"v".to_vec(),
+                value: Arc::from(&b"v"[..]),
                 deleted: false,
                 not_written: false,
             },
@@ -666,7 +668,7 @@ mod tests {
         assert!(ops.has_update);
         assert_eq!(ops.update.typ, LockType::None);
         assert_eq!(ops.update.writer, tx(1));
-        assert_eq!(ops.update.value.value, b"v");
+        assert_eq!(&*ops.update.value.value, b"v");
         assert_eq!(ops.unlocked_for, vec![tx(1)]);
     }
 
