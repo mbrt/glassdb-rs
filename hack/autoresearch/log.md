@@ -1223,8 +1223,8 @@ so it is recorded here rather than fixed.
   the overwhelmingly common case is a single locker whose base64 is already the
   answer. Lesson: collection+join helpers are convenient but allocate twice;
   special-casing the 0/1-element arities (the hot ones here) keeps the readable
-  fallback while removing the steady-state cost.
-- Commit: <pending>
+  fallback   while removing the steady-state cost.
+- Commit: 3495f55
 
 ## Summary
 
