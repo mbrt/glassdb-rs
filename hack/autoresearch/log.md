@@ -1075,3 +1075,59 @@ so it is recorded here rather than fixed.
   by allocation count, not size.
 - Commit: 09d4119
 
+## 35. Cache the memory backend's CAS version token on the object - KEPT
+- Hypothesis: `memory::Object::version()` minted a fresh `Arc<str>` "gen/metagen"
+  token on every call, and it is called on *every* backend op: each `read`,
+  `get_metadata`, `read_if_modified`, and once per `write*`/`set_tags_if`/
+  `delete_if` reply, plus once more on each conditional op just to *compare*
+  against `expected`. The token only changes when `gen` or `metagen` change (a
+  write or tag update), so caching it on the `Object` and recomputing only on
+  mutation makes every read/metadata-read/version-compare a refcount bump
+  instead of a fresh allocation. Read-validation (`validate_read` ->
+  `global.get_metadata` -> backend `get_metadata`) is one backend metaRead per
+  read, so read-heavy workloads mint a token per read today - pure waste.
+- Change: `crates/glassdb-backend/src/memory.rs` - `Object` gains a cached
+  `token: Arc<str>`; `mint_token(gen, metagen)` builds it via the stack buffer;
+  `refresh_token` recomputes it; `version()` returns `Version::new(token.clone())`
+  (a bump). The token is refreshed exactly once per mutation: `update_data`
+  refreshes it (covers `write`/`write_if`/`write_if_not_exists`, which call
+  `update_tags` then `update_data`), and `set_tags_if` refreshes after
+  `update_tags` (the only path that mutates tags without data); `update_tags`
+  itself no longer refreshes, so a write that touches both tags and data mints
+  the token once, not twice. `Default for Object` mints "0/0" to preserve exact
+  prior semantics. No public API or other crate changed.
+- Note: an initial version refreshed in *both* `update_tags` and `update_data`,
+  which double-minted on writes and pushed batchWrite100 *up* ~2% (9407 ->
+  9607). Moving the refresh to one place per op fixed it (batchWrite100 back to
+  ~9380, neutral) and is the version measured below - a reminder that a "cache
+  it" change can add allocs if the cache is rebuilt twice in one operation.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  workspace tests incl. the memory-backend write/read/version unit tests that
+  assert the exact "gen/metagen" token strings); all crate sim suites PASS;
+  `glassdb` `concurrent_sim` determinism-NEUTRAL (6 runs: 4 passed 9/9, 2 failed
+  8/9 on the pre-existing `recovery_holds` flake, identical "diverged at index
+  98"; caching an identical token cannot change the recovery stream);
+  `concurrent_tx` fuzz `--cfg sim` PASS (8969 runs, no crash); judge APPROVED
+  (legitimate token caching in an editable file, no test/stats/benchmark
+  gaming). Generated fuzz corpus removed before judging/commit. (Frozen
+  `check.sh --full` not runnable as-is for the usual reasons - stale `--cfg
+  madsim` fuzz flag and the bundled `recovery_holds` flake - so the manual `--cfg
+  sim` fuzz + crate sim suites + flake sampling are the equivalent full-tier
+  check.)
+- Primary: best 403.87 (refreshed) vs prior ~403.5 - flat within noise (3 medians
+  402.75 / 403.9 / 403.8; op counts unchanged).
+- Secondary (3 count-3 runs vs best.json/exp34 = allocsPerTx 236.93,
+  allocBytes 28030-ish): allocsPerTx -> 224.9 / 222.7 / 224.8 (~224, -5.4%, every
+  run well below baseline); allocBytesPerTx -> ~27050 (-3.5%); ns/cpu flat-to-down.
+  Per-workload (best.json refresh): batchRead10 108.4 -> ~98.5 (-9%), readRepeat
+  16.5 -> ~14.6 (-11%), multiRMW10 1026 -> ~1004 (-2%), singleRMW 43.2 -> ~42.4
+  (-2%), batchWrite100 9407 -> ~9380 (neutral). Reads move most because each
+  carries a backend metaRead that previously minted a token.
+- Outcome & why: KEPT. Primary flat, allocsPerTx down ~5% with the read-heavy
+  workloads down ~9-11% and no axis regressing. The CAS token was minted on every
+  backend op (even just to compare); it is immutable between writes, so caching
+  it on the object turns those into bumps. Lesson: an immutable per-object
+  identifier recomputed on every access is a caching opportunity - store it and
+  invalidate on the (rare) mutation, but refresh it exactly once per op.
+- Commit: __PENDING__
+
