@@ -823,5 +823,76 @@ so it is recorded here rather than fixed.
   takes. Lesson: a "clone the whole thing" cache accessor hides per-caller waste;
   a projection closure under the lock removes it without changing semantics or
   lock duration.
+- Commit: 61a0418
+
+## 30. Zero-alloc `WriterId` from the cached id's `Arc` - DISCARDED
+- Hypothesis: on the cached read-through path, `Global::read` builds the
+  conditional `read_if_modified` argument with
+  `WriterId::new(e.version.writer.as_bytes().to_vec())` - a fresh 16-byte `Vec`
+  copy of the cached `TxId` per read. `TxId` is already `Arc<[u8]>`, so if
+  `WriterId` also held `Arc<[u8]>` the expected-writer could share the cached
+  id's allocation (a refcount bump, zero copy). Expected to cut a per-read alloc
+  on the read-heavy workloads (batchRead10).
+- Change (reverted): `glassdb-data/src/txid.rs` - `TxId::as_arc()` (clone the
+  inner `Arc`). `glassdb-backend/src/lib.rs` - `WriterId(Vec<u8>)` ->
+  `WriterId(Arc<[u8]>)`, `new(impl Into<Arc<[u8]>>)` (all existing `Vec`-passing
+  callers, incl. the frozen `backendbench`, still compile), added
+  `WriterId::from_arc`. `glassdb-storage/src/global.rs` -
+  `WriterId::from_arc(e.version.writer.as_arc())`.
+- Correctness: workspace builds clean (incl. s3/gcs/frozen bench). Not taken to
+  the full gate - the perf result decided it.
+- Primary: ~403.2 -> ~403.6 (within noise).
+- Secondary (3 runs vs best.json/exp29): allocsPerTx 274.25 ->
+  272.56/271.73/276.0 (~273.4, -0.3%, inside noise - run 3 is above baseline);
+  allocBytesPerTx flat; **batchRead10 flat (131.1 -> 130.6)** and every other
+  workload flat.
+- Outcome & why: DISCARDED. The hypothesis was empirically wrong: removing the
+  `to_vec` did not move any workload, so the `read_if_modified` cached-revalidate
+  path (the only `WriterId` construction the score exercises) is not hot enough
+  for its one alloc to register - the benchmark's strong reads largely take the
+  full-read or local-cache-fast paths instead. The change is strictly-better and
+  zero-risk, but "strictly better" is not "measurably better"; with no geomean
+  movement it is not kept. Lesson: confirm a suspected hot path actually shows up
+  in the per-workload deltas before investing - an alloc on a rarely-taken branch
+  costs nothing to remove and nothing to keep.
+
+## 31. Single-allocation TxId mint (re-try of exp24 at lower denominators) - KEPT
+- Hypothesis: exp24 made `TxId::{new_at,new_random,renew,with_priority}` build
+  from a stack `[u8; 16]` + `Arc::from(&b[..])` (one alloc) instead of
+  `vec![0u8; 16].into()` (two: the Vec then a copy into the refcounted Arc),
+  saving exactly 1 alloc per minted id - i.e. 1 alloc/tx, since `begin` mints one
+  per transaction on every workload. exp24 was DISCARDED because at that point
+  the geomean only moved ~0.8% (readRepeat was 28.6, singleRMW 60.7), inside the
+  noise floor. Since then exp25/26/27/29 cut the small workloads' denominators
+  hard (readRepeat 28.6 -> ~19.8, singleRMW 60.7 -> ~52.3), and the geomean is a
+  5-workload geometric mean, so the *same* fixed 1-alloc/tx saving is now worth
+  ~1.6% (readRepeat -1/19.8 = -5%, singleRMW -1/52 = -1.9%, etc.). Re-trying the
+  identical change should now clear the floor - this is the exp25-over-exp24
+  lesson again: a fixed saving's geomean value rises as the denominators shrink.
+- Change: `crates/glassdb-data/src/txid.rs` - the four fixed-length constructors
+  use a stack `[u8; TX_ID_LEN]` + `Arc::from(&b[..])` (identical to exp24).
+  `from_bytes`/`from_slice` unchanged.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  tests, incl. the txid layout/priority/renew unit tests); all crate sim suites
+  PASS; `glassdb` `concurrent_sim` shows the usual 9/9-or-8/9 split on the
+  pre-existing `recovery_holds` flake (determinism-NEUTRAL, as exp24 established
+  at 18/36 with and without the change - a pure stack-vs-heap repr change cannot
+  affect the random/byte content of an id); `concurrent_tx` fuzz `--cfg sim` PASS
+  (7521 runs, no crash); judge APPROVED (equivalent-semantics alloc micro-opt).
+  Generated fuzz corpus removed before judging/commit.
+- Primary: 403.22 -> ~403.15 (4 runs 403.01/403.29/403.14/403.18; within noise,
+  op counts unchanged).
+- Secondary (4 runs vs best.json/exp29): allocsPerTx 274.25 -> 271.36/267.14/
+  270.96/270.59 (~270.0, -1.55%, *every* run below baseline); allocBytesPerTx
+  ~flat (28569 -> ~28505, -0.2%; the saved buffer is 16 bytes). Deterministic
+  per-workload: singleRMW 52.3 -> 51.3 (exactly -1.0 every run), batchRead10
+  131.1 -> ~129.5 (-1.2 to -1.5), readRepeat ~19.9 -> ~19.4 (noisy, ~-1);
+  batchWrite100 ~flat; multiRMW10 swamped by its own retry noise but never up.
+- Outcome & why: KEPT. Primary flat, allocsPerTx clearly down 1.55% (all runs
+  below baseline, singleRMW deterministic), no axis regressing. This is the same
+  code exp24 wrote, now kept purely because the earlier wins lowered the
+  denominators it divides into. Lesson: a sub-floor change is not permanently
+  rejected - re-evaluate fixed per-tx savings after the loop has shrunk the small
+  workloads, because their geomean leverage grows as their absolute counts fall.
 - Commit: <pending>
 
