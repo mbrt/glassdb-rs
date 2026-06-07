@@ -388,9 +388,23 @@ pub fn last_writer_from_tags(tags: &Tags) -> TxId {
 }
 
 fn tag_to_tid(a: &str) -> Result<TxId, base64::DecodeError> {
-    base64::engine::general_purpose::URL_SAFE
-        .decode(a)
-        .map(TxId::from_bytes)
+    let eng = base64::engine::general_purpose::URL_SAFE;
+    // Decoding straight into a stack buffer avoids the `Vec` that `decode`
+    // allocates (then `from_bytes` copies again into the `Arc`). This runs once
+    // per validated read / lock-info parse, so it is hot on the read and lock
+    // paths. Production ids are 16 bytes (24 b64 chars); the buffer covers any
+    // realistic id, with a heap fallback for the arbitrary-length case the API
+    // permits (e.g. fuzzer-supplied tags).
+    let mut buf = [0u8; 64];
+    if a.len() / 4 * 3 + 3 <= buf.len() {
+        match eng.decode_slice(a, &mut buf) {
+            Ok(n) => return Ok(TxId::from_slice(&buf[..n])),
+            Err(base64::DecodeSliceError::DecodeError(e)) => return Err(e),
+            // Buffer too small for this (unexpectedly long) id: fall through.
+            Err(base64::DecodeSliceError::OutputSliceTooSmall) => {}
+        }
+    }
+    eng.decode(a).map(TxId::from_bytes)
 }
 
 fn tid_to_tag(t: &TxId) -> String {
