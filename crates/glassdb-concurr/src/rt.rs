@@ -6,8 +6,10 @@
 //! running on the current thread, and fall back to real `tokio` otherwise (so
 //! ordinary `#[tokio::test]` unit tests still work under a `sim` build).
 //!
-//! Only `spawn` and time need redirection: `tokio::sync` and `biased`
-//! `tokio::select!` are runtime-agnostic and are used directly elsewhere.
+//! Only `spawn` and time need redirection: `tokio::sync` and `tokio::select!`
+//! are runtime-agnostic and are used directly elsewhere (non-`biased` selects
+//! stay deterministic under sim via the seeded branch-poll RNG; see
+//! `exec::block_on_with`).
 
 #[cfg(not(sim))]
 mod imp {

@@ -1,6 +1,8 @@
 # The fuzzer always builds against the in-repo deterministic simulation executor
 # (ADR-011), so a crash reproduces exactly from its input. `--cfg sim` routes
-# spawn/time/randomness through the seeded executor driven by the schedule tape.
+# spawn/time/randomness through the seeded executor driven by the schedule tape;
+# `--cfg tokio_unstable` lets the executor seed tokio's `select!` branch-poll RNG
+# (via `runtime::RngSeed`) so even non-biased selects replay deterministically.
 [build]
-rustflags = ["--cfg", "sim"]
-rustdocflags = ["--cfg", "sim"]
+rustflags = ["--cfg", "sim", "--cfg", "tokio_unstable"]
+rustdocflags = ["--cfg", "sim", "--cfg", "tokio_unstable"]

@@ -172,7 +172,10 @@ impl DelayBackend {
             if self.rlimit.try_acquire_token(path) {
                 return Ok(());
             }
+            // `biased`: cancellation wins over an elapsed backoff tick, and the
+            // fixed poll order keeps simulation runs deterministic.
             tokio::select! {
+                biased;
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled),
                 _ = rt::sleep(interval) => {}
             }
@@ -439,7 +442,10 @@ impl PrefixLimiter {
         if d.is_zero() {
             return Ok(());
         }
+        // `biased`: cancellation wins over an elapsed wait, and the fixed poll
+        // order keeps simulation runs deterministic.
         tokio::select! {
+            biased;
             _ = ctx.cancelled() => Err(BackendError::Cancelled),
             _ = rt::sleep(d) => Ok(()),
         }

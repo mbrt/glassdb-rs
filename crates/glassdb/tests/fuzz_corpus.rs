@@ -7,7 +7,7 @@
 //! deterministic executor with the `sim` harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
 //! ```
 #![cfg(all(sim, feature = "sim"))]
 

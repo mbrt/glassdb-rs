@@ -1238,8 +1238,11 @@ impl Algo {
             let (cctx, token) = ctx.child_cancel();
             let t2 = token.clone();
             rt::spawn(async move {
+                // Watchdog: either outcome leaves the token cancelled and the
+                // task done, so poll order is immaterial (not cancellation
+                // safety). Determinism under sim comes from the seeded select
+                // RNG (see exec::block_on_with).
                 tokio::select! {
-                    biased;
                     _ = rt::sleep(BG_CLEANUP_TIMEOUT) => t2.cancel(),
                     _ = t2.cancelled() => {}
                 }
@@ -1349,8 +1352,11 @@ impl Algo {
         let (child, token) = ctx.child_cancel();
         let t2 = token.clone();
         rt::spawn(async move {
+            // Watchdog: either outcome leaves the token cancelled and the task
+            // done, so poll order is immaterial (not cancellation safety).
+            // Determinism under sim comes from the seeded select RNG (see
+            // exec::block_on_with).
             tokio::select! {
-                biased;
                 _ = rt::sleep(timeout) => t2.cancel(),
                 _ = t2.cancelled() => {}
             }

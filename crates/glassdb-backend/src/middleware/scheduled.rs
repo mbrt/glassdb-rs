@@ -66,6 +66,9 @@ impl ScheduledBackend {
             return;
         }
         let dur = self.sched.tick * u32::from(d);
+        // Not `biased`: both arms are no-ops (the wait just ends either way), so
+        // poll order is immaterial to behavior. Under sim its determinism comes
+        // from the seeded select RNG (see exec::block_on_with).
         tokio::select! {
             _ = rt::sleep(dur) => {}
             _ = ctx.cancelled() => {}

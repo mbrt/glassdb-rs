@@ -1,5 +1,10 @@
 .PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score flamegraph profile
 
+# Flags for every build under the in-repo deterministic simulation executor:
+# `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
+# lets it seed tokio's `select!` branch-poll RNG (see crates/glassdb-concurr).
+SIM_RUSTFLAGS = --cfg sim --cfg tokio_unstable
+
 build:
 	cargo build --workspace
 
@@ -46,32 +51,27 @@ flamegraph profile:
 # self-check (tests/concurrent_sim.rs) and the committed fuzz-corpus replay
 # (tests/fuzz_corpus.rs).
 test-sim:
-	RUSTFLAGS="--cfg sim" cargo test \
+	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test \
 		-p glassdb-data -p glassdb-concurr -p glassdb-backend \
 		-p glassdb-storage -p glassdb-trans
-	RUSTFLAGS="--cfg sim" cargo test -p glassdb --features sim
+	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test -p glassdb --features sim
 
 # Run the deterministic concurrency fuzzer. Requires the nightly toolchain and
 # cargo-fuzz (`cargo install cargo-fuzz`). `cargo fuzz` sets its own RUSTFLAGS
 # (sanitizer + coverage) which overrides the `[build] rustflags` in
-# fuzz/.cargo/config.toml, so `--cfg sim` must be supplied via the environment
-# (cargo-fuzz appends its flags to it). With the deterministic executor active,
-# any crash reproduces exactly from its input (schedule tape + seed + workload):
-#   cd fuzz && RUSTFLAGS="--cfg sim" cargo +nightly fuzz run concurrent_tx <crash-file>
-#
-# Each run is single-threaded (for deterministic, reproducible crashes), so
-# parallelism comes from libFuzzer's `-fork` mode, which runs FUZZ_JOBS child
-# processes that share the corpus. Defaults to all cores; override with e.g.
-# `make fuzz FUZZ_JOBS=4`. Fork mode ignores OOMs/timeouts by default but stops
-# on the first crash (saving it to fuzz/artifacts/) so bugs surface immediately.
+# fuzz/.cargo/config.toml, so `--cfg sim --cfg tokio_unstable` must be supplied
+# via the environment (cargo-fuzz appends its flags to it). With the
+# deterministic executor active, any crash reproduces exactly from its input
+# (schedule tape + seed + workload):
+#   cd fuzz && RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run concurrent_tx <crash-file>
 FUZZ_JOBS ?= $(shell nproc)
 fuzz:
-	cd fuzz && RUSTFLAGS="--cfg sim" cargo +nightly fuzz run concurrent_tx -- \
+	cd fuzz && RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz run concurrent_tx -- \
 		-fork=$(FUZZ_JOBS)
 
 # Minimize the fuzz corpus: drop inputs that add no coverage, keeping the
 # smallest set that preserves the same reachable behavior. Run after a fuzzing
 # session (or before committing the corpus) to keep it small and fast to replay.
-# Same `--cfg sim` requirement as `fuzz` (see above).
+# Same `--cfg sim --cfg tokio_unstable` requirement as `fuzz` (see above).
 fuzz-min:
-	cd fuzz && RUSTFLAGS="--cfg sim" cargo +nightly fuzz cmin concurrent_tx
+	cd fuzz && RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz cmin concurrent_tx

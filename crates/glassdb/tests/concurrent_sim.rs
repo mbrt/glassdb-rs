@@ -5,7 +5,7 @@
 //! harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
 //! ```
 //!
 //! The central guarantee is that, for a fixed workload, schedule tape, and seed,
