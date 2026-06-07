@@ -548,3 +548,98 @@ still runs - just with the correct flag. `make test` + `make test-sim` (which us
   backend `Tags` type. Stop optimizing the lock path.
 - Commit: (reverted)
 
+## 24. Single-allocation TxId construction - DISCARDED
+- Hypothesis: `TxId::{new_at,new_random,renew,with_priority}` build a
+  `vec![0u8; 16]` then `.into()` an `Arc<[u8]>`. `Vec<u8> -> Arc<[u8]>` cannot
+  reuse the buffer (the Arc needs a refcount header contiguous with the data),
+  so it allocates the Vec *and* a separate Arc, copying. Building from a stack
+  `[u8; 16]` via `Arc::from(&b[..])` does it in one allocation. `begin` mints a
+  TxId on every transaction (all workloads), so this saves 1 alloc/tx broadly,
+  with the most geomean leverage on the small workloads (singleRMW, readRepeat).
+- Change: `crates/glassdb-data/src/txid.rs` - the four fixed-length constructors
+  use a stack `[u8; TX_ID_LEN]` buffer + `Arc::from(&b[..])` (one alloc) instead
+  of `vec![..].into()` (two). `from_bytes` keeps `Vec` (arbitrary length).
+- Correctness: fast gate PASS; `make test` PASS. NOTE: `make test-sim` is
+  unreliable here due to a PRE-EXISTING flaky determinism self-check (see infra
+  finding below); the change is determinism-NEUTRAL - `recovery_holds` fails at
+  the same ~50% rate with and without it (18/36 vs 18/36 over 36 runs each).
+  (Judge not run - discarded on measurement.)
+- Primary: 404.02 -> 404.20 (flat; op counts unchanged - pure repr change).
+- Secondary (4 runs vs 4 baseline runs): allocsPerTx baseline 356.0/355.1/358.3/
+  358.1 (~356.9) -> 354.2/352.5/353.7/354.8 (~353.8), ~-0.8%; allocBytesPerTx
+  flat (~35100 -> ~35070; the saved buffer is only 16 bytes). Deterministic
+  per-workload: singleRMW 60.7 -> 59.7 (exactly -1.0, zero variance every run),
+  batchRead10 ~221 -> ~220, batchWrite100 ~11310 -> ~11309, readRepeat ~28.6 ->
+  ~27.5 (all ~-1 as predicted); multiRMW10 swamped by its own retry noise (±35).
+- Outcome & why: DISCARDED. A correct, broad, deterministic 1-alloc/tx saving
+  (singleRMW drops exactly 1 every run), but the geomean allocsPerTx moves only
+  ~0.8% with allocBytes flat - the same magnitude as the discarded exp18/21/23,
+  i.e. within the run-to-run noise floor. One alloc/tx is simply too small a
+  fixed saving to clear the geomean noise even when it hits every workload (cf.
+  exp19/22, which removed several allocs per *key* and registered). Not a clear
+  improvement under the acceptance rule.
+
+## Infra finding - `recovery_holds` determinism self-check is ~50% flaky on HEAD
+While running exp24's full gate I found that
+`crates/glassdb/tests/concurrent_sim.rs::recovery_holds_under_crash_restart_and_outages`
+fails about half the time on the *unmodified* baseline (clean tree: 18 failures
+in 36 runs; "seed 0: recovery op stream diverged at index 98" - run 1 vs run 2
+of the same seed schedule different ops, e.g. key "13" vs key "12"). It is the
+only flaky test; the other 8 `concurrent_sim` cases and all of `make test` pass
+deterministically. The divergence is in op *ordering* across the crash/restart
+recovery path, not in this session's changes (every kept change is reverted when
+this was measured). Implication for the gate: the prior experiments' "make
+test-sim PASS" lines were lucky passes of this ~50% test; the meaningful
+correctness signals remain `make test` (fmt+clippy+all tests), the deterministic
+`concurrent_tx` fuzzer, and the other determinism/fault sim tests, plus the
+judge. Root-causing the recovery nondeterminism is a correctness task outside the
+performance-loop scope (and `concurrent_sim.rs` is a frozen verification test),
+so it is recorded here rather than fixed.
+
+## 25. Single-allocation TxId tag decoding - KEPT
+- Hypothesis: `tag_to_tid` (the base64 decoder for the `locked-by`/`last-writer`
+  storage tags) does `URL_SAFE.decode(a)` -> `Vec<u8>` and then
+  `TxId::from_bytes` -> `Arc<[u8]>`, which copies the Vec into a fresh
+  refcounted allocation = 2 allocs per call. It runs once per `tags_lock_info`
+  (last-writer) and once per locker, i.e. on every read validation
+  (`validate_read`) and every lock-info parse. Unlike exp24 (1 alloc/tx at
+  begin), this fires once per *validated key / lock op*, so the small,
+  high-ln-leverage read workloads pay it many times (batchRead10 ~10x/tx).
+  Decoding straight into a stack buffer + `Arc::from(&buf[..n])` removes the
+  intermediate Vec, saving 1 alloc per decode across every validating/locking tx.
+- Change: `crates/glassdb-data/src/txid.rs` - added `TxId::from_slice(&[u8])`
+  (one alloc, `Arc::from(slice)`; documents why `from_bytes(Vec)` cannot avoid
+  the copy). `crates/glassdb-storage/src/locker.rs` - `tag_to_tid` decodes via
+  `decode_slice` into a `[0u8; 64]` stack buffer (covers the 16-byte production
+  id = 24 b64 chars, and any realistic id), with a heap-`decode` fallback when
+  the encoded id would exceed the buffer (the API permits arbitrary-length ids,
+  e.g. fuzzer-supplied tags) - so behavior is identical, only the common-case
+  allocation is removed.
+- Correctness: fast gate PASS (build + `cargo test --workspace` incl.
+  `proptest_concurrent`); `make test` PASS (fmt + clippy -D warnings + all
+  tests); all crate sim suites + 8/9 `glassdb` `concurrent_sim` cases PASS
+  (the 9th, `recovery_holds`, is the pre-existing ~50% flake - this change is
+  determinism-NEUTRAL: 8/24 recovery passes here vs the baseline's 8/24);
+  `concurrent_tx` fuzz `--cfg sim` PASS (6246 runs, no crash); judge APPROVED
+  (honest hot-path optimization, no frozen files, no metric tampering). Generated
+  fuzz corpus removed before judging/commit.
+- Primary: 404.02 -> ~403.0 (3 runs 403.27/402.25/403.60, within noise; op
+  counts unchanged - pure decode-path representation change).
+- Secondary (3 runs vs best.json baseline): allocsPerTx 355.97 -> 339.6/343.2/
+  340.9 (~-4.5%, clear and repeatable); allocBytesPerTx ~flat (35100 -> ~34920,
+  -0.5%; the removed Vec buffers are tiny). Deterministic per-workload allocs:
+  batchRead10 220.9 -> ~201.5 (-8.8%), multiRMW10 1351.6 -> ~1257 (-7.0%),
+  singleRMW 60.7 -> ~58.5 (-3.6%), batchWrite100 11310 -> ~11114 (-1.7%);
+  readRepeat ~flat (its single read is served from the local cache without a
+  global metadata decode, so it has no tag_to_tid to save).
+- Outcome & why: KEPT. Primary flat, allocsPerTx clearly down ~4.5% with every
+  decoding workload dropping deterministically and no axis regressing. This is
+  the exp19/exp22 pattern (a cost on a *ubiquitous per-key helper*), and it
+  vindicates exp24's idea at a higher-leverage site: exp24 saved the same
+  single Vec->Arc copy but only 1x/tx (at begin), so it stayed in the noise;
+  moving the identical fix to `tag_to_tid` - which fires per validated read /
+  lock op - multiplies the saving by the key count and clears the floor. Lesson:
+  the *frequency* of a per-op allocation, not just its presence, decides whether
+  removing it registers on the geomean.
+- Commit: 6881846
+
