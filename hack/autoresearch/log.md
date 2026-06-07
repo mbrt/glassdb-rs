@@ -1001,5 +1001,5 @@ so it is recorded here rather than fixed.
   transaction and share it by `Arc`; the CAS token touches literally every
   backend op, so converting its copies to refcount bumps moved every workload at
   once.
-- Commit: __PENDING__
+- Commit: 0f93c51
 
