@@ -1176,5 +1176,5 @@ so it is recorded here rather than fixed.
   (here the decoded writer alongside the version) can be reused whenever the
   source's version is unchanged - compare the cheap version before redoing the
   decode.
-- Commit: __PENDING__
+- Commit: 9e2193d
 
