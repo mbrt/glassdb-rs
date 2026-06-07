@@ -117,6 +117,44 @@ pub fn to_transaction(suffix: &str) -> Result<TxId, PathError> {
     Ok(TxId::from_bytes(decode(Type::Transaction, suffix)?))
 }
 
+/// Borrowed components of a storage path. Unlike [`ParseResult`], `suffix` is
+/// the protobuf-style suffix (the type marker plus base64 payload, e.g.
+/// `_k/<b64>`) — i.e. everything after the collection prefix — so callers that
+/// need that form avoid both the parse allocations and a type/suffix re-join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseRef<'a> {
+    pub prefix: &'a str,
+    pub suffix: &'a str,
+    pub typ: Type,
+}
+
+/// Like [`parse`], but borrows from `p` and returns the protobuf-style suffix
+/// (type marker + base64) without allocating. Used on the hot log-marshaling
+/// path. The base64 alphabet contains no `/` or `.`, so the borrowed suffix is
+/// byte-identical to `gopath::join([type, base64])`.
+pub fn parse_ref(p: &str) -> Result<ParseRef<'_>, PathError> {
+    if is_collection_info(p) {
+        return Ok(ParseRef {
+            prefix: &p[..p.len() - 3],
+            suffix: "",
+            typ: Type::CollectionInfo,
+        });
+    }
+    let (prefix_idx, type_idx) =
+        path_parts_indexes(p).ok_or_else(|| PathError::Parse(p.to_string()))?;
+    let typ = match &p[prefix_idx + 1..type_idx] {
+        "_k" => Type::Key,
+        "_c" => Type::Collection,
+        "_t" => Type::Transaction,
+        _ => Type::Unknown,
+    };
+    Ok(ParseRef {
+        prefix: &p[..prefix_idx],
+        suffix: &p[prefix_idx + 1..],
+        typ,
+    })
+}
+
 /// Splits a storage path into its prefix, type, and suffix components.
 pub fn parse(p: &str) -> Result<ParseResult, PathError> {
     if is_collection_info(p) {

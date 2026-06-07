@@ -301,11 +301,32 @@ fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
     Ok(tr.encode_to_vec())
 }
 
+/// Returns the collection-writes entry for `prefix`, creating it if absent.
+/// Borrows `prefix` and only allocates when inserting a new collection, so a
+/// log writing many keys under one collection (e.g. a batch write) clones the
+/// prefix once instead of on every write/lock.
+fn coll_entry<'a>(
+    coll_writes: &'a mut BTreeMap<String, pb::CollectionWrites>,
+    prefix: &str,
+) -> &'a mut pb::CollectionWrites {
+    if !coll_writes.contains_key(prefix) {
+        coll_writes.insert(
+            prefix.to_string(),
+            pb::CollectionWrites {
+                prefix: prefix.to_string(),
+                writes: Vec::new(),
+                locks: Some(pb::CollectionLocks::default()),
+            },
+        );
+    }
+    coll_writes.get_mut(prefix).unwrap()
+}
+
 fn marshal_write(
     coll_writes: &mut BTreeMap<String, pb::CollectionWrites>,
     e: &TxWrite,
 ) -> Result<(), StorageError> {
-    let pr = paths::parse(&e.path).map_err(|e| StorageError::Other(e.to_string()))?;
+    let pr = paths::parse_ref(&e.path).map_err(|e| StorageError::Other(e.to_string()))?;
     if pr.typ != paths::Type::Key {
         return Err(StorageError::Other(format!(
             "expected 'key' path, got path {:?}",
@@ -318,18 +339,12 @@ fn marshal_write(
         pb::write::ValDelete::Value(e.value.clone())
     };
     let write = pb::Write {
-        suffix: gopath::join(&[pr.typ.as_str(), &pr.suffix]),
+        // `pr.suffix` is already the protobuf suffix (`_k/<b64>`); no re-join.
+        suffix: pr.suffix.to_string(),
         prev_tid: e.prev_writer.as_bytes().to_vec(),
         val_delete: Some(val_delete),
     };
-    let coll = coll_writes
-        .entry(pr.prefix.clone())
-        .or_insert_with(|| pb::CollectionWrites {
-            prefix: pr.prefix.clone(),
-            writes: Vec::new(),
-            locks: Some(pb::CollectionLocks::default()),
-        });
-    coll.writes.push(write);
+    coll_entry(coll_writes, pr.prefix).writes.push(write);
     Ok(())
 }
 
@@ -338,22 +353,16 @@ fn marshal_lock(
     e: &PathLock,
 ) -> Result<(), StorageError> {
     let lt = lock_type_to_proto(e.typ);
-    let pr = paths::parse(&e.path).map_err(|e| StorageError::Other(e.to_string()))?;
+    let pr = paths::parse_ref(&e.path).map_err(|e| StorageError::Other(e.to_string()))?;
 
-    let coll = coll_writes
-        .entry(pr.prefix.clone())
-        .or_insert_with(|| pb::CollectionWrites {
-            prefix: pr.prefix.clone(),
-            writes: Vec::new(),
-            locks: Some(pb::CollectionLocks::default()),
-        });
+    let coll = coll_entry(coll_writes, pr.prefix);
     let clocks = coll.locks.get_or_insert_with(pb::CollectionLocks::default);
 
     if pr.typ == paths::Type::CollectionInfo {
         clocks.collection_lock = lt as i32;
     } else {
         clocks.locks.push(pb::Lock {
-            suffix: gopath::join(&[pr.typ.as_str(), &pr.suffix]),
+            suffix: pr.suffix.to_string(),
             lock_type: lt as i32,
         });
     }

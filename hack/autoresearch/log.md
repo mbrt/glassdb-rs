@@ -419,5 +419,43 @@ still runs - just with the correct flag. `make test` + `make test-sim` (which us
   across the geomean. Lesson: prefer optimizations on truly ubiquitous helpers (path
   building, cache writes) over per-workload hot spots - broad leverage beats local
   depth for a geomean target.
+- Commit: ce9bef8
+
+## 20. Allocation-light transaction-log marshaling - KEPT
+- Hypothesis: when a multi-key commit persists its log, `marshal_write`/
+  `marshal_lock` run once per write/lock and each (a) call `paths::parse` (2
+  String allocs: prefix + base64 suffix) then `gopath::join` (1 alloc) just to
+  rebuild the protobuf suffix `_k/<b64>` that is already a contiguous substring
+  of the path, and (b) clone the collection prefix into the `coll_writes`
+  BTreeMap on *every* call (via `entry(prefix.clone())` + `or_insert_with`'s
+  second clone), even though a batch write puts all keys under one prefix. This
+  is ~3 wasted allocs per write/lock. Only multiRMW10 and batchWrite100 write
+  logs, but exp17 showed cutting those two ~6% registers on the geomean.
+- Change: `crates/glassdb-data/src/paths.rs` - added `parse_ref` returning
+  borrowed `prefix`/`typ` and the protobuf suffix (`_k/<b64>`) as a slice (the
+  base64 alphabet has no `/` or `.`, so the slice is byte-identical to the old
+  join). `crates/glassdb-storage/src/tlogger.rs` - `marshal_write`/`marshal_lock`
+  use `parse_ref` (suffix via one `to_string`, no parse/join) and a `coll_entry`
+  helper that does `contains_key`+`get_mut`, cloning the prefix only when the
+  collection is first inserted.
+- Correctness: fast gate PASS (op counts unchanged); full `make test`+
+  `make test-sim` PASS (45 suites, 0 failures); `concurrent_tx` fuzz `--cfg sim`
+  PASS (2806 runs, no crash); judge APPROVED (same serialized log bytes, fewer
+  allocations; no test/bench/stats changes).
+- Primary: 403.29 -> ~403.5 (3 runs 404.04/403.09/403.54, within noise; op counts
+  unchanged).
+- Secondary (3 runs vs best): allocsPerTx 373.7/370.6/374.6 (-2.7%..-3.7%, clear
+  and repeatable); allocBytesPerTx 36590/36265/36694 (flat -1.0%..+0.1%).
+  Deterministic per-workload: multiRMW10 1472 -> ~1361 (-7.4%), batchWrite100
+  12407 -> 11411 (-8.0%); read-only/single-RW workloads (no log) unchanged.
+- Outcome & why: KEPT. Primary flat, allocsPerTx clearly down ~3% with both
+  log-writing workloads dropping ~7-8% deterministically and no axis regressing.
+  This is the exp17 pattern (move the two lock/log-heavy workloads enough to
+  register) but larger, because per write/lock we removed ~3 allocs instead of
+  ~1. Lesson: the parse->rebuild round trip (decode then re-encode data you
+  already hold) and `entry(key.clone())` on a hot map are recurring, cheap-to-fix
+  alloc sources. Next: the remaining per-lock-op allocs in `apply_lock_tags`
+  (tag-key Strings + value clone) and the per-write value clones on the commit
+  path.
 - Commit: (pending)
 
