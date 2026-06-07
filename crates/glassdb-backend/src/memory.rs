@@ -3,7 +3,7 @@
 //! matching the GCS backend.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use glassdb_concurr::Ctx;
@@ -16,7 +16,9 @@ use crate::{
 #[derive(Clone, Default)]
 struct Object {
     data: Vec<u8>,
-    tags: Tags,
+    // Shared so `get_metadata` returns it with a refcount bump; mutated
+    // copy-on-write via `Arc::make_mut` in `update_tags`.
+    tags: Arc<Tags>,
     gen: i64,
     metagen: i64,
 }
@@ -70,8 +72,9 @@ impl State {
         if t.is_empty() {
             return;
         }
+        let tags = Arc::make_mut(&mut obj.tags);
         for (k, v) in t {
-            obj.tags.insert(k.clone(), v.clone());
+            tags.insert(k.clone(), v.clone());
         }
         obj.metagen += 1;
     }
@@ -105,7 +108,7 @@ impl Backend for MemoryBackend {
         Ok(ReadReply {
             contents: obj.data.clone(),
             version: obj.version(),
-            tags: obj.tags.clone(),
+            tags: (*obj.tags).clone(),
         })
     }
 
@@ -116,7 +119,7 @@ impl Backend for MemoryBackend {
         Ok(ReadReply {
             contents: obj.data.clone(),
             version: obj.version(),
-            tags: obj.tags.clone(),
+            tags: (*obj.tags).clone(),
         })
     }
 
