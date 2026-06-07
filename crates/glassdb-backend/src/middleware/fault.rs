@@ -180,7 +180,11 @@ impl FaultBackend {
             (delay, fault)
         };
         if let Some(d) = delay {
+            // `biased`: a cancelled transport must abort the op, never let it
+            // land, even if the injected delay elapses on the same tick. Fixed
+            // poll order also keeps the sim's recorded op stream deterministic.
             tokio::select! {
+                biased;
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled),
                 _ = rt::sleep(d) => {}
             }

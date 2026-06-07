@@ -9,9 +9,11 @@
 //! relies on (see ADR-010/011).
 //!
 //! Crucially, the executor reuses `tokio::sync` (which is runtime-agnostic) and
-//! `biased` `tokio::select!` unchanged: those wake tasks through the standard
-//! `Waker` API, which routes into this executor's ready set, so interleaving
-//! control is obtained without re-implementing the synchronization surface.
+//! `tokio::select!` unchanged: those wake tasks through the standard `Waker`
+//! API, which routes into this executor's ready set, so interleaving control is
+//! obtained without re-implementing the synchronization surface. `biased`
+//! selects poll top-to-bottom; non-`biased` ones stay deterministic because
+//! [`block_on_with`] seeds tokio's branch-poll RNG from the run seed.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -397,6 +399,25 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    // Seed tokio's `select!` branch-poll RNG from `entropy_seed` so that even a
+    // non-`biased` `select!` (ours or one inside a dependency) replays
+    // identically across runs instead of drawing from tokio's OS-seeded
+    // thread-local RNG. tokio swaps in the runtime's `RngSeed` only when it
+    // *enters* the runtime, and on current-thread that enter happens inside
+    // `block_on` (the public `Runtime::enter()` does not touch the select RNG).
+    // So we drive our own synchronous `run_loop` from within `block_on`: the
+    // seed is live for every task poll, and `tokio::select!` reads it on each
+    // poll, making the branch order a pure function of the seed. A fresh runtime
+    // per call is required - entering advances the seed generator, so reusing one
+    // would hand successive runs different seeds and reintroduce divergence.
+    // Requires `--cfg tokio_unstable` (paired with `--cfg sim`).
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .rng_seed(tokio::runtime::RngSeed::from_bytes(
+            &entropy_seed.to_le_bytes(),
+        ))
+        .build()
+        .expect("build sim-local tokio runtime for select-rng seeding");
+
     let wake = Arc::new(WakeQueue::new());
     let inner = Rc::new(RefCell::new(Inner {
         next_task: 0,
@@ -423,7 +444,17 @@ where
         *o2.lock().unwrap() = Some(v);
     }));
 
-    run_loop(&handle, &out);
+    // Drive the synchronous executor loop inside `block_on` so the seeded select
+    // RNG is installed for the duration. `unconstrained` disables tokio's
+    // cooperative budget, which would otherwise force the `tokio::sync`
+    // primitives our tasks use to yield after ~128 ops within our single
+    // synthetic poll (we never re-enter `block_on`, so a yield would stall).
+    tokio_rt.block_on(tokio::task::coop::unconstrained(std::future::poll_fn(
+        |_cx| {
+            run_loop(&handle, &out);
+            std::task::Poll::Ready(())
+        },
+    )));
 
     let result = out
         .lock()
@@ -554,6 +585,41 @@ mod tests {
             now_nanos() - start
         });
         assert_eq!(elapsed, Duration::from_secs(10).as_nanos() as u64);
+    }
+
+    #[test]
+    fn seeded_select_order_is_deterministic_per_seed() {
+        // Records the branch a non-biased `tokio::select!` picks for 32 decisions
+        // where both branches are immediately ready, so the only thing choosing
+        // is tokio's branch-poll RNG. `block_on_with` seeds that RNG from its
+        // `entropy_seed` (by entering a `RngSeed`-built runtime), so the sequence
+        // must be a pure function of the seed.
+        fn draws(seed: u64) -> Vec<u32> {
+            block_on_with(LowestFirst, seed, async {
+                let mut out = Vec::new();
+                for _ in 0..32 {
+                    let w: u32 = tokio::select! {
+                        _ = std::future::ready(()) => 0,
+                        _ = std::future::ready(()) => 1,
+                    };
+                    out.push(w);
+                }
+                out
+            })
+        }
+        // Same seed => identical decision sequence across independent runs.
+        // Without seeding on runtime-enter, tokio's thread-local select RNG would
+        // carry over between the two `block_on_with` calls and the sequences
+        // would diverge (the bug this guards against).
+        assert_eq!(draws(7), draws(7));
+        assert_eq!(draws(123), draws(123));
+        // The seed genuinely drives the order (so it is seeded, not fixed): some
+        // sequence differs, proving the choice is not constant.
+        assert!(
+            draws(7) != draws(8) || draws(1) != draws(2),
+            "select order did not vary with the seed; tokio's branch RNG may not \
+             be seeded by our runtime"
+        );
     }
 
     #[test]
