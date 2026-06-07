@@ -158,7 +158,17 @@ fn typed_prefix(prefix: &str, t: Type) -> String {
 }
 
 fn prefix_encode(prefix: &str, category: Type, a: &[u8]) -> String {
-    format!("{}/{}/{}", prefix, category.as_str(), base64::encode(a))
+    // Build the `prefix/type/base64(a)` path in a single allocation: encode the
+    // payload straight into the output buffer instead of through an intermediate
+    // base64 string. This runs on every key/collection/transaction path.
+    let cat = category.as_str();
+    let mut s = String::with_capacity(prefix.len() + cat.len() + 2 + a.len().div_ceil(3) * 4);
+    s.push_str(prefix);
+    s.push('/');
+    s.push_str(cat);
+    s.push('/');
+    base64::encode_into(a, &mut s);
+    s
 }
 
 fn decode(category: Type, suffix: &str) -> Result<Vec<u8>, PathError> {
