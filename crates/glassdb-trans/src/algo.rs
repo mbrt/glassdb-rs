@@ -1304,6 +1304,20 @@ impl Algo {
         if num == 0 {
             return (outs, Ok(()));
         }
+        if num == 1 {
+            // Single task: there are no siblings to cancel on error, so skip the
+            // child cancel token and the `buffer_unordered` stream machinery
+            // (both allocate). This is the common case for single-key
+            // transactions and keeps their per-tx allocation low.
+            let r = f(ctx.clone(), 0).await;
+            return match r {
+                Ok(v) => {
+                    outs[0] = Some(v);
+                    (outs, Ok(()))
+                }
+                Err(e) => (outs, Err(e)),
+            };
+        }
         let (child_ctx, token) = ctx.child_cancel();
         let f = &f;
         let child_ctx = &child_ctx;
