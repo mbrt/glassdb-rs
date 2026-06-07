@@ -166,12 +166,13 @@ impl TLogger {
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
-    pub async fn set(&self, ctx: &Ctx, mut l: TxLog) -> Result<backend::Version, StorageError> {
-        if l.timestamp.is_none() {
-            l.timestamp = Some(rt::system_now());
-        }
-        let buf = marshal_log(&l)?;
-        let tags = log_tags(&l);
+    ///
+    /// Borrows the log: the commit path writes the same `TxLog` repeatedly
+    /// (retries), and a locked commit hands its log here without cloning it.
+    pub async fn set(&self, ctx: &Ctx, l: &TxLog) -> Result<backend::Version, StorageError> {
+        let ts = l.timestamp.unwrap_or_else(rt::system_now);
+        let buf = marshal_log(l, ts)?;
+        let tags = log_tags(l, ts);
         let m = self
             .global
             .write_if_not_exists(
@@ -188,14 +189,12 @@ impl TLogger {
     pub async fn set_if(
         &self,
         ctx: &Ctx,
-        mut l: TxLog,
+        l: &TxLog,
         expected: &backend::Version,
     ) -> Result<backend::Version, StorageError> {
-        if l.timestamp.is_none() {
-            l.timestamp = Some(rt::system_now());
-        }
-        let buf = marshal_log(&l)?;
-        let tags = log_tags(&l);
+        let ts = l.timestamp.unwrap_or_else(rt::system_now);
+        let buf = marshal_log(l, ts)?;
+        let tags = log_tags(l, ts);
         let m = self
             .global
             .write_if(
@@ -272,7 +271,7 @@ fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
         .map_err(|e| StorageError::Other(format!("unmarshalling transaction log: {e}")))
 }
 
-fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
+fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
     if l.id.is_empty() {
         return Err(StorageError::Other("empty transaction ID".into()));
     }
@@ -295,9 +294,7 @@ fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
     };
 
     let tr = pb::TransactionLog {
-        timestamp: Some(system_to_proto_ts(
-            l.timestamp.unwrap_or_else(rt::system_now),
-        )),
+        timestamp: Some(system_to_proto_ts(ts)),
         status: status as i32,
         writes: coll_writes.into_values().collect(),
     };
@@ -383,15 +380,13 @@ fn parse_lock_type(t: i32) -> LockType {
     }
 }
 
-fn log_tags(l: &TxLog) -> Tags {
+fn log_tags(l: &TxLog, ts: SystemTime) -> Tags {
     let status = match l.status {
         TxCommitStatus::Ok => COMMIT_STATUS_OK,
         TxCommitStatus::Pending => COMMIT_STATUS_PENDING,
         _ => COMMIT_STATUS_ABORTED,
     };
-    let ts = l
-        .timestamp
-        .unwrap_or_else(rt::system_now)
+    let ts = ts
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
@@ -494,7 +489,7 @@ mod tests {
             ],
         };
         let ctx = Ctx::background();
-        t.set(&ctx, log.clone()).await.unwrap();
+        t.set(&ctx, &log).await.unwrap();
 
         let got = t.get(&ctx, &id).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
