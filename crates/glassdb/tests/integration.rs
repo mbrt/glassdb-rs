@@ -509,3 +509,23 @@ async fn list_collections() {
     sorted.sort();
     assert_eq!(got, sorted);
 }
+
+#[tokio::test(start_paused = true)]
+async fn builder_custom_options() {
+    use std::time::Duration;
+
+    let ctx = Ctx::background();
+    let db = DB::builder("example", mem())
+        .cache_size(8 * 1024 * 1024)
+        .retry_initial_interval(Duration::from_millis(10))
+        .retry_max_interval(Duration::from_millis(100))
+        .open(&ctx)
+        .await
+        .unwrap();
+
+    let coll = db.collection(b"demo-coll");
+    coll.create(&ctx).await.unwrap();
+    coll.write(&ctx, b"key1", b"value1").await.unwrap();
+    let buf = coll.read_strong(&ctx, b"key1").await.unwrap();
+    assert_eq!(buf, b"value1");
+}

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use glassdb_backend as backend;
-use glassdb_concurr::{rt, shard::Sharded, Background, Clock, Ctx};
+use glassdb_concurr::{rt, shard::Sharded, Background, Clock, Ctx, RetryConfig};
 use glassdb_data::TxId;
 use glassdb_storage::{Local, TLogger, TValue, TxCommitStatus, TxLog, Version, MAX_STALENESS};
 use tokio::sync::oneshot;
@@ -62,6 +62,7 @@ struct Inner {
     tl: TLogger,
     background: Arc<Background>,
     clock: Clock,
+    retry: RetryConfig,
     // The transaction-tracking maps are partitioned into independent shards
     // keyed by tid. Grouping the three maps under one lock per shard keeps
     // their cross-map updates (e.g. removing a tx and notifying its waiters)
@@ -91,18 +92,21 @@ pub struct WaitTxResult {
 }
 
 impl Monitor {
-    /// Creates a monitor using the real wall-clock.
+    /// Creates a monitor using the real wall-clock and default retry timing.
     pub fn new(local: Local, tl: TLogger, background: Arc<Background>) -> Self {
-        Self::with_clock(local, tl, background, Clock::real())
+        Self::with_config(local, tl, background, Clock::real(), RetryConfig::default())
     }
 
     /// Creates a monitor with a custom clock (used in tests for deterministic
-    /// expiry/refresh timing).
-    pub fn with_clock(
+    /// expiry/refresh timing) and retry-backoff configuration. The retry config
+    /// tunes the backoff used when polling a peer transaction's commit status
+    /// and when writing a transaction's final log.
+    pub fn with_config(
         local: Local,
         tl: TLogger,
         background: Arc<Background>,
         clock: Clock,
+        retry: RetryConfig,
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
@@ -110,6 +114,7 @@ impl Monitor {
                 tl,
                 background,
                 clock,
+                retry,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
             }),
         }
@@ -495,7 +500,7 @@ impl Monitor {
     }
 
     async fn poll_tx_status(&self, ctx: &Ctx, tid: &TxId) -> (TxCommitStatus, Option<TransError>) {
-        let mut interval = Duration::from_millis(200);
+        let mut backoff = self.inner.retry.backoff();
         loop {
             let s = match self.fetch_remote_tx_status(ctx, tid).await {
                 Err(e) => return (TxCommitStatus::Unknown, Some(e)),
@@ -509,9 +514,8 @@ impl Monitor {
                 _ = ctx.cancelled() => {
                     return (s, Some(TransError::Other("retry polling tx status".into())));
                 }
-                _ = rt::sleep(interval) => {}
+                _ = rt::sleep(backoff.next_delay()) => {}
             }
-            interval = std::cmp::min(interval.mul_f64(1.5), Duration::from_secs(5));
         }
     }
 
@@ -528,7 +532,7 @@ impl Monitor {
                 .unwrap_or_default()
         };
 
-        let mut interval = Duration::from_millis(200);
+        let mut backoff = self.inner.retry.backoff();
         loop {
             let r = if last_v.is_null() {
                 self.inner.tl.set(ctx, tlog.clone()).await
@@ -550,9 +554,8 @@ impl Monitor {
             tokio::select! {
                 biased;
                 _ = ctx.cancelled() => return Err(TransError::Cancelled),
-                _ = rt::sleep(interval) => {}
+                _ = rt::sleep(backoff.next_delay()) => {}
             }
-            interval = std::cmp::min(interval.mul_f64(1.5), Duration::from_secs(5));
         }
     }
 
@@ -657,7 +660,7 @@ mod tests {
         let global = Global::new(b, local.clone());
         let tl = TLogger::new(global.clone(), local.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::with_clock(local, tl.clone(), bg, clock);
+        let mon = Monitor::with_config(local, tl.clone(), bg, clock, RetryConfig::default());
         (mon, TestCtx { tl, global })
     }
 

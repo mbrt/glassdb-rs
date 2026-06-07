@@ -25,7 +25,7 @@ pub use clock::Clock;
 pub use ctx::{Cancelled, Ctx};
 pub use dedup::{await_signal, Controller, Dedup, DedupError, DedupWorker, MergeRequest};
 pub use fanout::Fanout;
-pub use retry::{retry, retry_with_backoff, RetryErr};
+pub use retry::{retry, retry_with_backoff, Backoff, RetryConfig, RetryErr};
 pub use rng::Rng;
 pub use shard::Sharded;
 pub use tape::Tape;
