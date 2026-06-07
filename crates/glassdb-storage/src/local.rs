@@ -134,34 +134,41 @@ impl Local {
 
     /// Reads the cached value, if present and not staler than `max_stale`.
     pub fn read(&self, key: &str, max_stale: Duration) -> Option<LocalRead> {
-        // `cache.get` already hands back an owned (cloned) entry, so move the
-        // value and version out of it instead of cloning them a second time.
-        let e = self.cache.get(key)?;
-        let outdated = e.is_value_outdated();
-        let v = e.v?;
-        if is_stale(v.updated, max_stale) {
-            return None;
-        }
-        Some(LocalRead {
-            value: v.value,
-            version: v.version,
-            deleted: v.deleted,
-            outdated,
-        })
+        // Clone only the value half of the entry under the cache lock; the
+        // metadata half (an `Arc` + decoded writer) is irrelevant to a value
+        // read, so projecting avoids touching it.
+        self.cache.get_with(key, |e| {
+            let outdated = e.is_value_outdated();
+            let v = e.v.as_ref()?;
+            if is_stale(v.updated, max_stale) {
+                return None;
+            }
+            Some(LocalRead {
+                value: v.value.clone(),
+                version: v.version.clone(),
+                deleted: v.deleted,
+                outdated,
+            })
+        })?
     }
 
     /// Reads the cached metadata, if present and not staler than `max_stale`.
     pub fn get_meta(&self, key: &str, max_stale: Duration) -> Option<LocalMetadata> {
-        let e = self.cache.get(key)?;
-        let outdated = e.is_meta_outdated();
-        let m = e.m?;
-        if is_stale(m.updated, max_stale) {
-            return None;
-        }
-        Some(LocalMetadata {
-            m: m.meta,
-            outdated,
-        })
+        // Clone only the metadata (a cheap `Arc` bump). The previous
+        // `cache.get` deep-cloned the whole entry, copying the value bytes just
+        // to drop them here; metadata reads happen on every read validation, so
+        // that copy was pure waste.
+        self.cache.get_with(key, |e| {
+            let outdated = e.is_meta_outdated();
+            let m = e.m.as_ref()?;
+            if is_stale(m.updated, max_stale) {
+                return None;
+            }
+            Some(LocalMetadata {
+                m: m.meta.clone(),
+                outdated,
+            })
+        })?
     }
 
     /// Stores both the value and its metadata atomically.

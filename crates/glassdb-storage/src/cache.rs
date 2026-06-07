@@ -91,6 +91,19 @@ impl<V: Weighable + Clone> CacheShard<V> {
         }
     }
 
+    fn get_with<F, R>(&self, key: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&V) -> R,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.map.contains_key(key) {
+            inner.move_to_front(key);
+            inner.map.get(key).map(f)
+        } else {
+            None
+        }
+    }
+
     fn set(&self, key: &str, val: V) {
         let mut inner = self.inner.lock().unwrap();
         let new_size = val.size_b();
@@ -207,6 +220,17 @@ impl<V: Weighable + Clone> Cache<V> {
     /// Returns the value for `key`, moving it to the front of the LRU list.
     pub fn get(&self, key: &str) -> Option<V> {
         self.sh.for_key(key.as_bytes()).get(key)
+    }
+
+    /// Projects the entry for `key` through `f` while holding the shard lock,
+    /// moving it to the front of the LRU list. Lets callers clone only the field
+    /// they need (e.g. just the metadata) instead of deep-cloning the whole
+    /// entry, which for a value entry would copy the value bytes.
+    pub fn get_with<F, R>(&self, key: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&V) -> R,
+    {
+        self.sh.for_key(key.as_bytes()).get_with(key, f)
     }
 
     /// Stores `val` under `key`.
