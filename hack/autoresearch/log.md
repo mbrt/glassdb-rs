@@ -1073,5 +1073,5 @@ so it is recorded here rather than fixed.
   the run. Lesson: extend "share immutable data by Arc" to the value payload
   itself; even tiny values cost a full allocation each, and the geomean is driven
   by allocation count, not size.
-- Commit: __PENDING__
+- Commit: 09d4119
 
