@@ -518,5 +518,5 @@ still runs - just with the correct flag. `make test` + `make test-sim` (which us
   paid by every key in every transaction. Next: the per-lock-op `apply_lock_tags`
   allocations (Tags BTreeMap keys + value clone) remain the largest untouched
   per-key cost on the write/commit path.
-- Commit: (pending)
+- Commit: e216ce1
 
