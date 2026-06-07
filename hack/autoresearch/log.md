@@ -520,3 +520,31 @@ still runs - just with the correct flag. `make test` + `make test-sim` (which us
   per-key cost on the write/commit path.
 - Commit: e216ce1
 
+## 23. Lazy dedup signal semaphore - DISCARDED
+- Hypothesis: `Dedup::run` allocates `Arc::new(Semaphore::new(0))` per call as the
+  "new request arrived" signal, but in the uncontended case (no second request,
+  worker never waits) it is never used. The deterministic per-workload alloc
+  counts show lock ops are uncontended in the bench, so making the semaphore lazy
+  saves one alloc per lock/unlock - hitting every lock op in multiRMW10 and
+  batchWrite100.
+- Change: `crates/glassdb-concurr/src/dedup.rs` - `Call.next: Option<Arc<Semaphore>>`,
+  created on first use via a `next_sem()` helper (called from the arrival
+  `add_permits` path and `on_next_do`); reset to `None` instead of re-allocating
+  in `wake_up_next`.
+- Correctness: fast gate PASS (incl. dedup unit tests + op counts unchanged).
+  (Full gate/judge not reached.)
+- Primary: flat (-0.1%).
+- Secondary (3 runs vs best): allocsPerTx 353.6/352.9/356.5 (median -0.68%, one run
+  +0.16% -> within noise); allocBytesPerTx flat. Deterministic per-workload:
+  batchWrite100 11310 -> ~11100 (-1.9%); multiRMW10 1352 -> ~1300 (-2..-4%, noisy);
+  read/single-RW workloads unaffected (they don't queue through dedup).
+- Outcome & why: DISCARDED. Correct and saves a real alloc, but - like exp18 and
+  exp21 - it only touches the two lock-heavy workloads, each by <2-4%, so the
+  geomean stays within noise. Third lock-path-concentrated discard: confirms that
+  no lock-path micro-opt can register, because (a) only multiRMW10/batchWrite100
+  use it and (b) batchWrite100 is ln-compressed while multiRMW10 is too noisy at
+  ~2%. The lock path's real floor is the `Tags` BTreeMap<String,String> (3 owned
+  key Strings + nodes per op), which can't shrink without changing the public
+  backend `Tags` type. Stop optimizing the lock path.
+- Commit: (reverted)
+
