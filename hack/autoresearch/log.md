@@ -894,5 +894,49 @@ so it is recorded here rather than fixed.
   denominators it divides into. Lesson: a sub-floor change is not permanently
   rejected - re-evaluate fixed per-tx savings after the loop has shrunk the small
   workloads, because their geomean leverage grows as their absolute counts fall.
+- Commit: d29c154
+
+## 32. Key the transaction monitor maps by TxId, not Vec<u8> - KEPT
+- Hypothesis: `Monitor::begin_tx` runs once per transaction (called from `commit`
+  / `validate_reads` on first entry, so on every workload incl. read-only) and
+  registers the tx with `local_tx.insert(tid.as_bytes().to_vec(), ..)` - a fresh
+  16-byte `Vec` copy of the id for the map key. The two sibling maps (`waiters`,
+  `unknown_tx`) copy the id the same way on insert. `TxId` is `Arc<[u8]>` and
+  derives `Hash`/`Eq` (by byte content), so keying the maps by `TxId` lets
+  `begin_tx` insert `tid.clone()` (a refcount bump, zero alloc) while lookups by
+  `&TxId` stay byte-content-based and identical. Saves ~1 alloc/tx broadly - the
+  same high-leverage per-tx class as exp31.
+- Change: `crates/glassdb-trans/src/monitor.rs` - `State`'s three maps go from
+  `HashMap<Vec<u8>, _>` to `HashMap<TxId, _>`; inserts use `tid.clone()` (Arc
+  bump) instead of `tid.as_bytes().to_vec()`; all `get/get_mut/remove` take the
+  `&TxId` directly instead of `tid.as_bytes()`. `shard_for` still routes by
+  `tid.as_bytes()` (sharding is byte-based, unchanged). No semantic change: the
+  keys hash and compare by the same bytes as before.
+- Correctness: fast gate PASS; `make test` PASS (fmt + clippy -D warnings + all
+  tests incl. the monitor's status/committed_value/wait/refresh unit tests, which
+  exercise insert/lookup/remove across the maps); all crate sim suites PASS;
+  `glassdb` `concurrent_sim` determinism-NEUTRAL - the only failure is the
+  pre-existing `recovery_holds` flake (sampled 3 fails / 5 passes over 8 runs,
+  matching the baseline's ~50%; "diverged at index 98" identical; the other 8
+  cases always pass); `concurrent_tx` fuzz `--cfg sim` PASS (8163 runs, no crash
+  - heavily exercises begin/commit/abort/wait/wound monitor paths under
+  concurrency); judge APPROVED (key-type change, lookup semantics preserved, no
+  Stats/frozen-file tampering). Generated fuzz corpus removed before
+  judging/commit.
+- Primary: ~403.2 -> ~403.4 (within noise; op counts unchanged - note the harness
+  primary itself varies run-to-run with 0 retries, as singleRMW/batchWrite100
+  costPerTx shift with cache/timing, independent of this alloc-only change).
+- Secondary (4 runs vs best.json/exp31): allocsPerTx 270.59 -> 269.28/264.72/
+  269.01/266.52 (~267.4, -1.2%, every run below baseline); allocBytesPerTx ~flat
+  (28534 -> ~28476, -0.2%). Deterministic per-workload: singleRMW 51.2 -> 50.4
+  (-1.0 every run), readRepeat ~19.7 -> ~18.7 (~-1.0), batchRead10 ~131 -> ~129
+  (~-0.7); multiRMW10 retry-noisy but never up; batchWrite100 ~flat.
+- Outcome & why: KEPT. Primary within noise, allocsPerTx down ~1.2% (all runs
+  below baseline, singleRMW deterministic), no axis regressing. Same per-tx-floor
+  pattern as exp31: a single fixed alloc removed from the begin path, worth ~1%+
+  on the geomean because the small workloads' counts are now low. Lesson: the
+  transaction-tracking maps copied the id into an owned key on every begin; an
+  `Arc`-keyed map shares it for free - prefer the refcounted id type as the key
+  for per-tx bookkeeping structures.
 - Commit: <pending>
 
