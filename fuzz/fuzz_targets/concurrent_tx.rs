@@ -22,24 +22,9 @@
 //! ```
 #![no_main]
 
-use arbitrary::{Arbitrary, Unstructured};
-use glassdb::rt::{block_on_with, TapeScheduler};
-use glassdb::sim::{run_and_assert_with_faults, FaultConfig, Workload};
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    let mut u = Unstructured::new(data);
-    let seed: u64 = u.arbitrary().unwrap_or(0);
-    let workload = Workload::arbitrary(&mut u).unwrap_or_default();
-    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
-    // Split the remaining bytes into a schedule tape and a fault tape. The
-    // scheduler falls back to a deterministic default once its tape is spent, and
-    // the fault schedule falls back to the seed, so a short tape is fine.
-    let rest = u.take_rest();
-    let mid = rest.len() / 2;
-    let schedule_tape = rest[..mid].to_vec();
-    let fault_tape = rest[mid..].to_vec();
-    block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
-        run_and_assert_with_faults(workload, faults, seed, fault_tape).await
-    });
-});
+// The decode-and-run logic lives in `glassdb::sim::replay_fuzz_input` so the
+// committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs) exercises
+// the exact same path as the fuzzer.
+fuzz_target!(|data: &[u8]| glassdb::sim::replay_fuzz_input(data));

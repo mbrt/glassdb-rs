@@ -9,7 +9,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
 # The simulation harness (Workload + run_and_assert) and the in-repo
 # deterministic executor (`glassdb::rt`, under `--cfg sim`). The `sim` feature
 # pulls in `arbitrary`; no external simulation runtime is needed.

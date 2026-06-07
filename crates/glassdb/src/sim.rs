@@ -601,6 +601,26 @@ pub const PCT_DEFAULT_DEPTH: usize = 3;
 #[cfg(sim)]
 pub const PCT_DEFAULT_STEPS: u64 = 2048;
 
+/// Decodes one libFuzzer input exactly as the `concurrent_tx` target does and
+/// runs it on the deterministic executor, asserting the bound. Panics on any
+/// violation. Shared by the fuzz target and the corpus-replay test so the two
+/// can never diverge.
+#[cfg(sim)]
+pub fn replay_fuzz_input(data: &[u8]) {
+    let mut u = Unstructured::new(data);
+    let seed: u64 = u.arbitrary().unwrap_or(0);
+    let workload = Workload::arbitrary(&mut u).unwrap_or_default();
+    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
+    // Split the remaining bytes into a schedule tape and a fault tape; the
+    // scheduler and fault schedule both fall back to defaults once spent.
+    let rest = u.take_rest();
+    let mid = rest.len() / 2;
+    let (schedule_tape, fault_tape) = (rest[..mid].to_vec(), rest[mid..].to_vec());
+    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
+        run_and_assert_with_faults(workload, faults, seed, fault_tape).await
+    });
+}
+
 /// Runs `workload` once under a PCT schedule seeded by `seed`, asserting the
 /// serializability bound. Panics on any violation.
 #[cfg(sim)]

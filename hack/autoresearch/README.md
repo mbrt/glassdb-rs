@@ -64,14 +64,14 @@ Every experiment must pass the gate before it can be kept; this is what protects
 strict serializability. The fast tier builds the workspace and runs
 `cargo test --workspace` (which includes the `proptest_concurrent`
 serializability property test). The full tier additionally runs `make test`
-(fmt + `clippy -D warnings`), `make sim-test` (the `madsim` determinism /
+(fmt + `clippy -D warnings`), `make test-sim` (the `madsim` determinism /
 serializability / fault-injection self-checks), and the deterministic
 concurrency fuzzer, so the correctness contract holds even when the
 implementation and its unit tests change substantially.
 
 ```bash
 hack/autoresearch/check.sh          # fast: build + workspace tests
-hack/autoresearch/check.sh --full   # full: make test + sim-test + fuzz (before keeping)
+hack/autoresearch/check.sh --full   # full: make test + test-sim + fuzz (before keeping)
 ```
 
 Tunable via `FUZZTIME` / `FULL_FUZZTIME` (seconds). Set `RUN_FAST_FUZZ=1` to add

@@ -41,7 +41,7 @@ async-trait = "0.1.89"
 
 # Transaction microbenchmarks ported from the Go `bench_test.go`. `harness =
 # false` lets criterion own `main`; `test = false` keeps `cargo test` (and the
-# sim-test run) from executing it — run it with `cargo bench`.
+# test-sim run) from executing it — run it with `cargo bench`.
 [[bench]]
 name = "transactions"
 harness = false

@@ -116,7 +116,7 @@ simulator provokes and observes it.
 - **tokio alias.** Every crate in the engine graph depends on
   `tokio = { package = "madsim-tokio" }`. Cloud backends (s3/gcs) use real
   tokio/reqwest/aws-sdk and cannot build under madsim, so they are excluded from
-  the simulated build (`make sim-test` lists packages explicitly).
+  the simulated build (`make test-sim` lists packages explicitly).
 - **`--cfg madsim` is a known cfg.** Declared once in the workspace
   `[workspace.lints.rust]` (`check-cfg`) so `#[cfg(madsim)]` does not trip the
   `unexpected_cfgs` lint in normal builds.
@@ -182,7 +182,7 @@ the workload result.
 
 - A failing schedule reproduces exactly from its libFuzzer input:
   `RUSTFLAGS="--cfg madsim" cargo +nightly fuzz run concurrent_tx <crash-file>`.
-- `make sim-test` runs the whole engine suite (and the op-stream self-check)
+- `make test-sim` runs the whole engine suite (and the op-stream self-check)
   under the simulator; `make test` keeps the normal build as the default gate so
   production paths stay covered both ways.
 - The `proptest_concurrent` test remains as a fast, non-madsim sanity check.

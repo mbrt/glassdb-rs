@@ -14,7 +14,7 @@
 #   fast  build + `cargo test --workspace` (integration tests + the
 #         `proptest_concurrent` serializability property test). No nightly
 #         toolchain required.
-#   full  `make test` (fmt + clippy -D warnings + tests) + `make sim-test`
+#   full  `make test` (fmt + clippy -D warnings + tests) + `make test-sim`
 #         (the madsim determinism / serializability / fault-injection
 #         self-checks) + the deterministic concurrency fuzzer
 #         (`FuzzConcurrentTx`'s Rust analog) for FULL_FUZZTIME seconds. Needs the
@@ -59,8 +59,8 @@ if [[ "$mode" == "full" ]]; then
 	echo "== full test suite (make test) =="
 	make test
 
-	echo "== deterministic simulator (make sim-test) =="
-	make sim-test
+	echo "== deterministic simulator (make test-sim) =="
+	make test-sim
 
 	run_fuzz "${FULL_FUZZTIME}"
 
