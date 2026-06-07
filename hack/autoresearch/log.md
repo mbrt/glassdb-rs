@@ -643,3 +643,55 @@ so it is recorded here rather than fixed.
   removing it registers on the geomean.
 - Commit: 6881846
 
+## 26. Share backend metadata tags via Arc (copy-on-write) - KEPT
+- Hypothesis: exp5 shared the *cache's* metadata via `Arc<Metadata>`, but the
+  backend -> Global boundary still deep-clones: `Backend::get_metadata` returns
+  an owned `Metadata { tags: Tags }`, and the in-memory backend builds it with
+  `obj.tags.clone()` - copying the whole `BTreeMap` and its ~3 key/value
+  `String`s (~7 allocs) on *every call*. `get_metadata` runs on every read
+  validation (`validate_read`, batchRead10 ~10x/tx) and every lock-info parse,
+  so this is the single largest remaining per-key allocation on the read/lock
+  path. Storing the backend's tag map behind an `Arc` and handing it out with a
+  refcount bump (copy-on-write on the rare tag mutation) should remove it, like
+  exp5 did one layer up. Tags are immutable once produced, so sharing is safe.
+- Change: `crates/glassdb-backend/src/lib.rs` - `Metadata.tags: Tags` ->
+  `Arc<Tags>`. `crates/glassdb-backend/src/memory.rs` - `Object.tags: Arc<Tags>`;
+  `get_metadata`/write methods return `obj.tags.clone()` (now an Arc bump);
+  `update_tags` mutates via `Arc::make_mut` (clones only when the map is still
+  shared with a cache entry / outstanding `Metadata`); the two `ReadReply` sites
+  (owned `Tags`) deep-clone explicitly. `crates/glassdb-storage/src/global.rs`,
+  `glassdb-backend-s3`, `glassdb-backend-gcs` - wrap their freshly-built tag maps
+  in `Arc::new(..)` at the `Metadata` construction sites (cloud backends parse
+  fresh tags per call, so they are neutral there). All readers reach `&Tags`
+  through `Arc` deref coercion, so `tags_lock_info(&meta.tags)` etc. are
+  unchanged.
+- Correctness: fast gate PASS (build incl. s3/gcs + `cargo test --workspace`
+  with `proptest_concurrent`); `make test` PASS (fmt + clippy -D warnings + all
+  tests incl. the memory-backend unit tests that exercise tag mutation); all
+  crate sim suites + 8/9 `glassdb` `concurrent_sim` cases PASS (the 9th is the
+  pre-existing `recovery_holds` flake; this change is determinism-neutral - 9/16
+  recovery passes vs the baseline's ~50%); `concurrent_tx` fuzz `--cfg sim` PASS
+  (6931 runs, no crash - exercises the copy-on-write path under concurrent
+  writers/readers); judge APPROVED (honest Arc/CoW optimization, no frozen files,
+  no Stats tampering). Generated fuzz corpus removed before judging/commit.
+- Primary: 404.02 -> ~403.3 (3 runs 403.45/403.00/403.32, within noise; op
+  counts unchanged - the backend does the same work, only the tag map is shared
+  rather than copied).
+- Secondary (3 runs vs best.json baseline): allocsPerTx 340.6 -> 288.9/286.5/
+  283.3 (~-15.8%); allocBytesPerTx ~34920 -> 29190/28950/28803 (~-17.0%) - BOTH
+  axes clearly and repeatably down (the eliminated clone was a whole BTreeMap +
+  its Strings, so bytes move as much as count). Deterministic per-workload:
+  batchRead10 201.5 -> ~140.7 (-30%), readRepeat 27.5 -> ~21.6 (-21%), singleRMW
+  58.5 -> ~53.3 (-9%), multiRMW10 1257 -> ~1160 (-8%), batchWrite100 11114 ->
+  ~10210 (-8%). Every workload improves.
+- Outcome & why: KEPT - the largest win of session 2. Primary flat, both
+  allocation axes down ~16-17% with every workload improving and no regression.
+  It is the exp5 lesson reapplied at the next layer: the cache no longer
+  deep-copies the tag map (exp5), and now neither does the backend that feeds it.
+  Validation, which fetches metadata for every read on the strong-read path, was
+  paying a full tag-map clone per key; sharing it via Arc removes that entirely
+  (batchRead10 -30%). Lesson: when one Arc-sharing change pays off, check the
+  *adjacent layers* on the same data - the same clone often recurs at each
+  ownership boundary (cache, then backend).
+- Commit: 3cebfc2
+
