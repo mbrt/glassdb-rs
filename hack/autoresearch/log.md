@@ -1129,5 +1129,5 @@ so it is recorded here rather than fixed.
   it on the object turns those into bumps. Lesson: an immutable per-object
   identifier recomputed on every access is a caching opportunity - store it and
   invalidate on the (rare) mutation, but refresh it exactly once per op.
-- Commit: __PENDING__
+- Commit: f086683
 
