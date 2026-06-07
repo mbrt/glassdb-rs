@@ -197,16 +197,10 @@ impl Local {
             version: v,
             updated: Instant::now(),
         };
-        self.cache.update(key, move |old| match old {
-            None => Some(CacheEntry {
-                v: Some(new_value),
-                m: None,
-            }),
-            Some(mut entry) => {
-                entry.v = Some(new_value);
-                Some(entry)
-            }
-        });
+        // Mutate in place: keeps any existing metadata, and avoids cloning the
+        // previous entry / re-allocating the key string.
+        self.cache
+            .modify(key, move |entry| entry.v = Some(new_value));
     }
 
     /// Updates only the metadata for `key`.
@@ -217,16 +211,8 @@ impl Local {
             writer,
             updated: Instant::now(),
         };
-        self.cache.update(key, move |old| match old {
-            None => Some(CacheEntry {
-                v: None,
-                m: Some(new_meta),
-            }),
-            Some(mut entry) => {
-                entry.m = Some(new_meta);
-                Some(entry)
-            }
-        });
+        self.cache
+            .modify(key, move |entry| entry.m = Some(new_meta));
     }
 
     /// Marks the value at `key` as outdated, only if it is at version `v`.
@@ -253,16 +239,8 @@ impl Local {
             version: v,
             updated: Instant::now(),
         };
-        self.cache.update(key, move |old| match old {
-            None => Some(CacheEntry {
-                v: Some(new_value),
-                m: None,
-            }),
-            Some(mut entry) => {
-                entry.v = Some(new_value);
-                Some(entry)
-            }
-        });
+        self.cache
+            .modify(key, move |entry| entry.v = Some(new_value));
     }
 
     /// Removes `key` entirely.
