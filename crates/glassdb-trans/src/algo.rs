@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use glassdb_backend::{self as backend, Metadata};
+use glassdb_backend::{self as backend, Metadata, LAST_WRITER_TAG};
 use glassdb_concurr::{rt, Background, CancelToken, Ctx};
 use glassdb_data::{paths, TxId};
 use glassdb_storage::{
-    tags_lock_info, Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version,
+    tag_matches_tid, tags_lock_info, tags_lock_type, Global, Local, LockType, PathLock, TValue,
+    TxLog, TxWrite, Version,
 };
 
 use crate::error::TransError;
@@ -634,17 +635,25 @@ impl Algo {
             }
             Err(e) => return Err(e.into()),
         };
-        let read_from = item.read_version.writer.clone();
-        let li = tags_lock_info(&meta.tags)?;
-
-        if li.typ == LockType::None || li.typ == LockType::Read {
-            if li.last_writer != read_from {
-                item.result = VResult::Retry;
+        // Unlocked/read-locked validation only needs to confirm the last writer
+        // is unchanged, so avoid building the full `LockInfo` (which decodes the
+        // last-writer tag into a freshly allocated `TxId`): read just the lock
+        // type and compare the tag bytes against the recorded writer in place.
+        let typ = tags_lock_type(&meta.tags)?;
+        if typ == LockType::None || typ == LockType::Read {
+            let unchanged = tag_matches_tid(
+                meta.tags.get(LAST_WRITER_TAG).map(String::as_str),
+                &item.read_version.writer,
+            );
+            item.result = if unchanged {
+                VResult::Ok
             } else {
-                item.result = VResult::Ok;
-            }
+                VResult::Retry
+            };
             return Ok(());
         }
+        let read_from = item.read_version.writer.clone();
+        let li = tags_lock_info(&meta.tags)?;
         self.validate_locked_read(ctx, item, &li, &read_from).await
     }
 
@@ -775,12 +784,13 @@ impl Algo {
             }
             Err(e) => return Err(e.into()),
         };
-        let li = tags_lock_info(&meta.tags)?;
-
-        if li.typ == LockType::None || li.typ == LockType::Read {
+        // The common outcome is "still unlocked / read-locked -> retry", which
+        // needs only the lock type, so skip allocating the full `LockInfo` here.
+        if matches!(tags_lock_type(&meta.tags)?, LockType::None | LockType::Read) {
             item.result = VResult::Retry;
             return Ok(());
         }
+        let li = tags_lock_info(&meta.tags)?;
         if li.locked_by.len() != 1 {
             return Err(TransError::Other(format!(
                 "bad lock: {:?} with {} lockers",

@@ -695,3 +695,56 @@ so it is recorded here rather than fixed.
   ownership boundary (cache, then backend).
 - Commit: 3cebfc2
 
+## 27. Allocation-free read-validation tag comparison - KEPT
+- Hypothesis: after exp26 shared the backend tag map via Arc, the next per-key
+  cost on the read-validation path is in `validate_read`/`validate_read_not_found`
+  themselves: both call `tags_lock_info(&meta.tags)`, which always parses the
+  full `LockInfo` - allocating a `Vec<TxId>` for `locked-by` and decoding the
+  `last-writer` tag into a fresh `TxId` (`Arc<[u8]>`) - even on the overwhelmingly
+  common unlocked / read-locked path, where all we need is (a) the lock *type*
+  and (b) whether the stored `last-writer` equals our read version's writer.
+  Computing the type without building `LockInfo`, and comparing the base64
+  last-writer tag to the `TxId` bytes on the stack (no decode allocation),
+  removes a `Vec` + an `Arc<[u8]>` per validated read on the hot path. This fires
+  per *validated key*, so read-fan-out workloads (batchRead10 ~10x/tx) pay it
+  many times.
+- Change: `crates/glassdb-storage/src/locker.rs` - added
+  `tags_lock_type(&Tags) -> Result<LockType>` (parses only the `lock-type` tag,
+  no allocation) and `tag_matches_tid(Option<&str>, &TxId) -> bool` (decodes the
+  base64 tag into a `[0u8; 64]` stack buffer and byte-compares to the TxId,
+  matching `last_writer_from_tags` semantics for missing/empty/over-long tags via
+  a heap fallback); refactored `tags_lock_info` to reuse `tags_lock_type` for its
+  type field (no behavior change). `crates/glassdb-storage/src/lib.rs` - export
+  the two helpers. `crates/glassdb-trans/src/algo.rs` - `validate_read` fast-paths
+  `LockType::None`/`Read` via `tags_lock_type` + `tag_matches_tid` (Ok if the
+  last-writer is unchanged, else Retry), falling back to the full
+  `tags_lock_info` + `validate_locked_read` only when an actual write/exclusive
+  lock is present; `validate_read_not_found` fast-paths the same unlocked/read
+  case via `tags_lock_type` instead of building `LockInfo`.
+- Correctness: fast gate PASS (build + `cargo test --workspace` incl.
+  `proptest_concurrent`); `make test` PASS (fmt + clippy -D warnings + all
+  tests); all crate sim suites PASS + 8/9 `glassdb` `concurrent_sim` cases (the
+  9th is the pre-existing `recovery_holds` ~50% flake; determinism-NEUTRAL);
+  `concurrent_tx` fuzz `--cfg sim` PASS (6181 runs, no crash - this is the
+  serializability-critical change of the session, so the fuzzer exercises the new
+  fast-path under concurrent writers/readers); judge APPROVED (honest hot-path
+  refactor, semantics preserved, no frozen files, no Stats tampering). Generated
+  fuzz corpus removed before judging/commit.
+- Primary: 403.04 -> 402.92 (within noise; op counts unchanged - same validation
+  decisions, only the representation of the comparison changed).
+- Secondary (3-run avg vs best.json/exp26 baseline): allocsPerTx 288.06 -> 279.28
+  (-3.0%, clear and repeatable); allocBytesPerTx 29041 -> 28722 (-1.1%; the
+  removed Vec + Arc<[u8]> are small). Deterministic per-workload allocs:
+  batchRead10 140.7 -> 130.4 (-7.3%), readRepeat 21.6 -> 20.4 (-5.6%),
+  multiRMW10/singleRMW/batchWrite100 flat (their reads either hit the local cache
+  or already took the locked path).
+- Outcome & why: KEPT. Primary flat, allocsPerTx down 3.0% with the read-fanout
+  workloads dropping deterministically and no axis regressing. It is the same
+  "save the Vec+Arc on the common path" idea as exp25/exp26 pushed one level
+  higher - into the validator itself - by recognizing that the full `LockInfo`
+  parse is only needed when a write lock is actually held. Lesson: after sharing
+  the data (exp26), look at the *consumer* - it was parsing more than it needed
+  on the hot path, and specializing the common case (unlocked/read-locked) avoids
+  the work entirely.
+- Commit: <pending>
+

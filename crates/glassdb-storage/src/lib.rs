@@ -17,8 +17,8 @@ pub use error::StorageError;
 pub use global::{Global, GlobalRead};
 pub use local::{Local, LocalMetadata, LocalRead, MAX_STALENESS};
 pub use locker::{
-    compute_lock_update, last_writer_from_tags, tags_lock_info, LockInfo, LockOps, LockRequest,
-    LockType, LockUpdate, Locker, TValue, TxPathState,
+    compute_lock_update, last_writer_from_tags, tag_matches_tid, tags_lock_info, tags_lock_type,
+    LockInfo, LockOps, LockRequest, LockType, LockUpdate, Locker, TValue, TxPathState,
 };
 pub use tlogger::{PathLock, TLogger, TxCommitStatus, TxLog, TxStatus, TxWrite};
 pub use version::{version_from_meta, Version};
