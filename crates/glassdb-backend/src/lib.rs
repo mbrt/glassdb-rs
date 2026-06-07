@@ -5,6 +5,7 @@
 //! object carries an opaque CAS [`Version`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -130,9 +131,16 @@ pub struct ReadReply {
 }
 
 /// The tags and version of an object (no contents).
+///
+/// `tags` is shared via `Arc` so a backend that already holds the tag map (e.g.
+/// the in-memory backend, and the read-through cache) can hand it out on
+/// `get_metadata`/read with a refcount bump instead of deep-copying the
+/// `BTreeMap` and all its key/value `String`s on every validation and lock-info
+/// parse. The map is immutable once produced; backends that mutate tags do so
+/// copy-on-write (`Arc::make_mut`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
-    pub tags: Tags,
+    pub tags: Arc<Tags>,
     pub version: Version,
 }
 

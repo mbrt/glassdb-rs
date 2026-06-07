@@ -276,7 +276,7 @@ impl GcsBackend {
         };
         let obj: ObjectResource = parse_json(resp, "Write", path).await?;
         Ok(Metadata {
-            tags,
+            tags: Arc::new(tags),
             version: obj.version(),
         })
     }
@@ -489,7 +489,7 @@ impl ObjectResource {
 
     fn metadata(&self) -> Metadata {
         Metadata {
-            tags: self.tags(),
+            tags: Arc::new(self.tags()),
             version: self.version(),
         }
     }

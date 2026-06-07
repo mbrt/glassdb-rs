@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -193,7 +194,10 @@ impl S3Backend {
                 .send_put(ctx, path, &payload, &metadata, &conds, self.retry.clone())
                 .await
             {
-                PutAttempt::Ok(version) => Ok(Metadata { tags, version }),
+                PutAttempt::Ok(version) => Ok(Metadata {
+                    tags: Arc::new(tags),
+                    version,
+                }),
                 PutAttempt::Cancelled => Err(BackendError::Cancelled),
                 PutAttempt::Err(e) => Err(annotate("Write", path, *e)),
             };
@@ -220,7 +224,12 @@ impl S3Backend {
                 )
                 .await
             {
-                PutAttempt::Ok(version) => return Ok(Metadata { tags, version }),
+                PutAttempt::Ok(version) => {
+                    return Ok(Metadata {
+                        tags: Arc::new(tags),
+                        version,
+                    })
+                }
                 PutAttempt::Cancelled => return Err(BackendError::Cancelled),
                 PutAttempt::Err(e) => *e,
             };
@@ -355,7 +364,7 @@ impl Backend for S3Backend {
         )
         .await?;
         Ok(Metadata {
-            tags: tags_from_meta(out.metadata()),
+            tags: Arc::new(tags_from_meta(out.metadata())),
             version: version_from_etag(out.e_tag()),
         })
     }

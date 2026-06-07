@@ -60,7 +60,7 @@ impl Global {
                 }
                 if modified {
                     let meta = Arc::new(Metadata {
-                        tags: reply.tags,
+                        tags: Arc::new(reply.tags),
                         version: reply.version,
                     });
                     self.local
@@ -79,7 +79,7 @@ impl Global {
 
         let r = self.backend.read(ctx, key).await?;
         let meta = Arc::new(Metadata {
-            tags: r.tags,
+            tags: Arc::new(r.tags),
             version: r.version,
         });
         self.local
