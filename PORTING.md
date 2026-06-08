@@ -67,29 +67,50 @@ invariant is enforced in CI by `clippy::await_holding_lock` under `-D warnings`.
 ### The `Dedup` state machine
 
 `concurr.Dedup` (the mergeable-request deduplicator used by the distributed
-locker) has no off-the-shelf Rust equivalent, so it was ported directly as a
-`Controller` driving per-key worker state (pending / queue / merge), with
-`await_signal` over a `Semaphore` for "wake the next waiter". This was one of the
-highest-risk pieces and its behavior tests were ported first.
+locker) has no off-the-shelf Rust equivalent. The Go port originally ran the
+worker *on a caller's goroutine* and used `defer` to hand the role to the next
+waiter; in Rust that coupling made worker liveness depend on a caller-future's
+lifetime, which a *dropped* future violates (orphaned keys / lost handoffs). It
+was reworked into a driver model where worker liveness is never tied to a single
+caller future:
 
-Go relied on `defer` to always run a worker's post-work cleanup (clear `main`,
-notify merged callers, promote the next waiter). Rust futures have no equivalent
-for a *dropped* future, so the cleanup lives in a `MainCleanup` RAII guard that
-runs on return **or** drop. Together with two related fixes — the promoted-waiter
-`select!` prefers a delivered handoff over its own cancellation, and `wake_up_next`
-only promotes a waiter whose handoff actually sends — this guarantees a key's
-`Call` is never left with `main` set but no running worker, which would otherwise
-strand every later request for that key. See the regression tests in
-[`dedup.rs`](crates/glassdb-concurr/src/dedup.rs).
+- A key is driven by exactly one **driver**. The first caller for an idle key is
+  the **inline driver**: it runs the worker on its own task with no spawn, so the
+  uncontended common case (one locker per key) keeps the original zero-overhead
+  hot path.
+- A driver hands off only when it genuinely must: its batch is done but
+  non-mergeable queued work remains, or its own future is dropped/cancelled with
+  live waiters. Both hand off by **`rt::spawn`-ing a fresh owner task** — never by
+  promoting a waiter's future-that-must-be-polled. A spawned task cannot be
+  dropped by a caller, so the handoff cannot be lost. A dropped inline driver is
+  caught by a `DriverGuard` RAII guard that requeues undelivered live members and
+  spawns the successor.
+- All driver/owner/exit transitions happen under the same per-key lock that
+  submitters use, so "the key entry exists iff it has a driver" holds without
+  races. Waiters simply `select!(done_rx, ctx.cancelled())`; dropping or
+  cancelling a waiter only drops its receiver and is pruned by the worker.
+- `BatchHandle::merged()` reconstructs the merged request (absorbing newly
+  arrived compatible work); `BatchHandle::changed()` (a `Notify`) wakes the
+  worker on new work. When a batch loses all live members the worker's context is
+  cancelled so it bails (best-effort: at worst one wasted round, never a hang).
+- `Dedup::close()` cancels a shutdown token (parent of every round's context) and
+  awaits any spawned owners, so none leak; it is wired through
+  `Locker::close` → `Algo::close` → `DB::close`.
+
+This was one of the highest-risk pieces; its behavior tests and drop/cancel
+regression tests live in [`dedup.rs`](crates/glassdb-concurr/src/dedup.rs).
 
 ### Cancel-safety contract
 
 Public futures are durability-safe to cancel: a mid-flight drop is equivalent to
-a crash and is recovered by the commit protocol. Callers should nonetheless
-prefer cancelling via `Ctx` over dropping the future (`timeout` / `select!` /
-`abort`): a `Ctx` cancellation unwinds in-memory coordination promptly, while a
-dropped future relies on the dedup drop-guard above for in-memory liveness and on
-wait/lease timeouts to reclaim on-storage locks. This contract is documented on
+a crash and is recovered by the commit protocol. For in-memory liveness the
+deduplicator now makes **dropping a future fully equivalent to cancelling its
+`Ctx`**: either way a queued caller is pruned and a dropped driver hands off to a
+spawned owner, so neither orphans a key nor strands other callers. Cancelling via
+`Ctx` (`timeout` / `select!` / `abort`) is still mildly preferable — it lets the
+driver abandon an all-cancelled batch one step sooner and is clearer — but it is
+no longer required for correctness or liveness. On-storage locks left by a drop
+are reclaimed by wait/lease timeouts as before. This contract is documented on
 the public API (`glassdb` `lib.rs` and `DB::tx`).
 
 ## Time and determinism

@@ -173,6 +173,7 @@ impl DB {
 
     /// Releases resources associated with the database.
     pub async fn close(&self) {
+        self.inner.algo.close().await;
         self.inner.background.close().await;
     }
 

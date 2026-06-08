@@ -23,7 +23,7 @@ pub use cancel::CancelToken;
 pub use channel::make_chan_inf_cap;
 pub use clock::Clock;
 pub use ctx::{Cancelled, Ctx};
-pub use dedup::{await_signal, Controller, Dedup, DedupError, DedupWorker, MergeRequest};
+pub use dedup::{BatchHandle, Dedup, DedupError, MergeRequest, Worker};
 pub use fanout::Fanout;
 pub use retry::{retry, retry_with_backoff, Backoff, RetryConfig, RetryErr};
 pub use rng::Rng;
