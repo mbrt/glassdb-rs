@@ -3,6 +3,17 @@
 //! Public API ported from the Go root package: [`DB`] opens a database over a
 //! [`glassdb_backend::Backend`], [`Collection`] groups keys, and [`Tx`] runs a
 //! serializable transaction (with automatic conflict retries) via [`DB::tx`].
+//!
+//! # Cancellation
+//!
+//! Every public async entry point takes a [`Ctx`] and is durability-safe to
+//! cancel: dropping a future mid-flight is equivalent to a crash and is
+//! recovered by the commit protocol, so it never corrupts data. Callers should
+//! prefer cancelling through the [`Ctx`] cancel token over dropping the future
+//! (`tokio::time::timeout`, `select!`, `JoinHandle::abort`). A `Ctx`
+//! cancellation unwinds in-memory coordination promptly, whereas a dropped
+//! future leaves on-storage locks held by the abandoned attempt to be reclaimed
+//! only after wait/lease timeouts. See [`DB::tx`] for details.
 
 mod collection;
 mod db;
