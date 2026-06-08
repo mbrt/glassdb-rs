@@ -14,14 +14,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_backend::{self as backend, BackendError};
 use glassdb_concurr::{
-    await_signal, rt, shard::Sharded, Controller, Ctx, Dedup, DedupError, DedupWorker, MergeRequest,
+    rt, shard::Sharded, BatchHandle, Ctx, Dedup, DedupError, MergeRequest, Worker,
 };
 use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
 use glassdb_storage::{
     compute_lock_update, tags_lock_info, Global, Local, LockInfo, LockRequest, LockType,
     LockUpdate, Locker as StorageLocker, PathLock, StorageError, TValue, TxPathState,
 };
-use tokio::sync::Semaphore;
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -254,19 +253,18 @@ struct LockerWorker {
 }
 
 #[async_trait]
-impl DedupWorker<LockReq, StorageError> for LockerWorker {
-    async fn work(
+impl Worker<LockReq, StorageError> for LockerWorker {
+    async fn run(
         &self,
         ctx: &Ctx,
         key: &str,
-        contr: &Controller<LockReq, StorageError>,
+        batch: &BatchHandle<LockReq, StorageError>,
     ) -> Result<(), StorageError> {
         let mut counter: u64 = 0;
-        let mut wait_sem: Option<Arc<Semaphore>> = None;
 
         let result = loop {
             counter += 1;
-            let req = contr.request(key).0;
+            let req = batch.merged().0;
 
             let lock_res = match self.core.do_lock_op(ctx, key, &req).await {
                 Ok(r) => r,
@@ -288,10 +286,7 @@ impl DedupWorker<LockReq, StorageError> for LockerWorker {
                 continue;
             }
             if !lock_res.wait_for_tx.is_empty() {
-                if let Err(e) = self
-                    .wait_for_tx(ctx, key, &lock_res.wait_for_tx, &mut wait_sem, contr)
-                    .await
-                {
+                if let Err(e) = self.wait_for_tx(ctx, &lock_res.wait_for_tx, batch).await {
                     break Err(e);
                 }
                 continue;
@@ -328,10 +323,8 @@ impl LockerWorker {
     async fn wait_for_tx(
         &self,
         ctx: &Ctx,
-        key: &str,
         txs: &[TxId],
-        wait_sem: &mut Option<Arc<Semaphore>>,
-        contr: &Controller<LockReq, StorageError>,
+        batch: &BatchHandle<LockReq, StorageError>,
     ) -> Result<(), StorageError> {
         for tx in txs {
             let status = self
@@ -343,17 +336,13 @@ impl LockerWorker {
             if status.is_final() {
                 continue;
             }
-            if wait_sem.is_none() {
-                *wait_sem = Some(contr.on_next_do(key));
-            }
-            let sem = wait_sem.as_ref().unwrap().clone();
             let wait_rx = self.core.tmon.wait_for_tx(ctx, tx);
 
             tokio::select! {
                 biased;
                 _ = ctx.cancelled() => return Err(BackendError::Cancelled.into()),
                 _ = wait_rx => {}
-                _ = await_signal(&sem) => {}
+                _ = batch.changed() => {}
                 _ = rt::sleep(WAIT_POLL_DURATION) => {}
             }
             break;
@@ -475,6 +464,12 @@ impl Locker {
                 out
             }
         }
+    }
+
+    /// Cancels in-flight lock work and awaits any spawned dedup owner tasks, so
+    /// none leak when the database shuts down.
+    pub async fn close(&self) {
+        self.inner.dedup.close().await;
     }
 
     /// Returns and resets the accumulated lock statistics.

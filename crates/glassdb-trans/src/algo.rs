@@ -344,6 +344,12 @@ impl Algo {
         }
     }
 
+    /// Releases coordinator resources, awaiting any spawned locker dedup owner
+    /// tasks so none leak on database close.
+    pub async fn close(&self) {
+        self.locker.close().await;
+    }
+
     /// Starts a new transaction with the given data.
     pub fn begin(&self, ctx: &Ctx, d: Data) -> Handle {
         let id = match ctx.tx_id() {
