@@ -29,16 +29,16 @@ use crate::rng::Rng;
 
 /// Maximum number of scheduler steps (task polls plus virtual-time advances) a
 /// single [`block_on_with`] run may take before it is declared non-terminating
-/// and panics. A deterministic backstop — a *single-execution timeout* measured
+/// and panics. A deterministic backstop (a *single-execution timeout* measured
 /// in schedule steps rather than wall-clock, so it trips identically on every
-/// replay — against livelock or an infinite retry loop (a bug class DST hunts):
+/// replay) against livelock or an infinite retry loop (a bug class DST hunts):
 /// a legitimate bounded workload uses orders of magnitude fewer steps, while a
-/// run that never terminates trips this instead of hanging forever. The panic
-/// surfaces as a libFuzzer crash (with a reproducing input) and, in the
-/// fuzz-corpus replay test, as a named failure for the offending file. Set well
-/// above the heaviest observed run (~1.7k steps across the whole sim suite) yet
-/// low enough to fail fast.
-const DEFAULT_STEP_BUDGET: u64 = 50_000_000;
+/// run that never terminates trips this instead of hanging forever.
+///
+/// Set ~700x above the heaviest legitimate run observed across the whole sim
+/// suite (~1.4k steps), so it cannot false-trip a bounded workload. Note this is
+/// a *complement* to, not a replacement for, libFuzzer's wall-clock `-timeout`.
+const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
 
 /// Unique id of a task within a single executor run. Assigned in spawn order, so
 /// it is a deterministic function of the (deterministic) schedule.

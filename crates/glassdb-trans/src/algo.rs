@@ -955,13 +955,19 @@ impl Algo {
         }
         let held = self.locker.locked_paths(&tx.id);
         for (p, elt) in &need_locks {
-            for lp in &held {
-                if &lp.path == p {
-                    if lp.typ != *elt && lp.typ != LockType::Write {
-                        return false;
-                    }
-                    break;
-                }
+            // The tx must already hold a compatible lock for *every* needed path.
+            // A path it holds with too weak a type, or does not hold at all,
+            // means the held set is partial: serial validation must release
+            // everything and re-acquire in sorted order. Treating a partial set
+            // as "already locked" keeps out-of-order locks (e.g. those an aborted
+            // parallel attempt left behind) and can re-create the very deadlock
+            // serial locking exists to break.
+            let compatible = held
+                .iter()
+                .find(|lp| &lp.path == p)
+                .is_some_and(|lp| lp.typ == *elt || lp.typ == LockType::Write);
+            if !compatible {
+                return false;
             }
         }
         true
@@ -1919,6 +1925,52 @@ mod tests {
         let rv = reader.read(&ctx, &key, MAX_STALENESS).await.unwrap();
         assert_eq!(rv.value, v1);
         assert_eq!(rv.version.writer, w1);
+    }
+
+    /// Regression: a timed-out parallel-locking attempt leaves a transaction
+    /// holding a *subset* of the locks it needs, possibly in the wrong order.
+    /// Serial validation breaks the resulting deadlock only if it releases and
+    /// re-acquires everything in sorted order, which it gates on
+    /// `already_locked`. The guard must therefore report a partial set as *not*
+    /// already locked; otherwise two equal-priority transactions (a tie
+    /// wound-wait cannot order) keep their cross-held locks and wait on each
+    /// other forever — the livelock a fuzz run surfaced.
+    #[tokio::test]
+    async fn already_locked_requires_every_needed_lock() {
+        let ctx = Ctx::background();
+        let (tm, tctx) = new_algo().await;
+        let k1 = paths::from_key(TEST_COLL, b"k1");
+        let k2 = paths::from_key(TEST_COLL, b"k2");
+
+        // Create both keys committed and unlocked on a separate client.
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let setup = commit_writes(&tm2, vec![wa(&k1, b"0"), wa(&k2, b"0")]).await;
+        flush_writes(&tm2, &setup).await;
+
+        // A transaction that writes both keys needs a write lock on each.
+        let h = tm.begin(
+            &ctx,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"1"), wa(&k2, b"1")],
+            },
+        );
+        tctx.tmon.begin_tx(h.id());
+        let vstate = init_validation(&h);
+
+        // Holding only one of the two needed locks is a partial set.
+        tctx.locker.lock_write(&ctx, &k1, h.id()).await.unwrap();
+        assert!(
+            !tm.already_locked(&vstate, &h),
+            "a partial lock set must not count as already locked"
+        );
+
+        // With every needed lock held, the serial re-lock is a no-op.
+        tctx.locker.lock_write(&ctx, &k2, h.id()).await.unwrap();
+        assert!(
+            tm.already_locked(&vstate, &h),
+            "holding every needed lock should count as already locked"
+        );
     }
 
     #[tokio::test]
