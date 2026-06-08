@@ -5,8 +5,9 @@ Description: >-
   instance reaches S3 via a gateway endpoint and is reachable via SSM Session
   Manager through interface endpoints. The instance pulls a prebuilt rtbench
   binary (a statically linked, musl-target Rust build) from the bucket, runs the
-  rw9010 and deadlock benchmarks against S3, uploads the result CSVs to the
-  results/ prefix, and then stops itself.
+  rw9010 and deadlock benchmarks against S3 (each repeated multiple times so
+  S3 can catch up between runs and the aggregated numbers are more reliable),
+  uploads the result CSVs to the results/ prefix, and then stops itself.
 
 Parameters:
   InstanceType:
@@ -271,16 +272,40 @@ Resources:
           OUT="results/$TS"
           mkdir -p out
 
-          ./rtbench --backend=s3 --test-name=rw9010 \
-            --max-dbs=${MaxDBs} --num-keys=${NumKeys} --duration=${RunDuration} \
-            --samples-out=out/samples.csv \
-            --stats-out=out/stats.csv \
-            --throughput-out=out/throughput.csv \
-            --client-stats-out=out/client-stats.csv
+          # Repeat each benchmark several times. S3 prefix throttling and
+          # connection state vary between runs, so aggregating samples across
+          # multiple back-to-back runs (with a short cool-down in between)
+          # gives the plot script's percentile bands more reliable inputs.
+          NRUNS=3
+          COOLDOWN=60
 
-          ./rtbench --backend=s3 --test-name=deadlock \
-            --duration=${DeadlockDuration} \
-            --deadlock-out=out/deadlock.csv
+          for run in $(seq 1 $NRUNS); do
+            echo ">> rw9010 run $run/$NRUNS"
+            ./rtbench --backend=s3 --test-name=rw9010 \
+              --max-dbs=${MaxDBs} --num-keys=${NumKeys} --duration=${RunDuration} \
+              --samples-out=out/samples-$run.csv \
+              --stats-out=out/stats-$run.csv \
+              --throughput-out=out/throughput-$run.csv \
+              --client-stats-out=out/client-stats-$run.csv
+            if [ $run -lt $NRUNS ]; then sleep $COOLDOWN; fi
+          done
+
+          for run in $(seq 1 $NRUNS); do
+            echo ">> deadlock run $run/$NRUNS"
+            ./rtbench --backend=s3 --test-name=deadlock \
+              --duration=${DeadlockDuration} \
+              --deadlock-out=out/deadlock-$run.csv
+            if [ $run -lt $NRUNS ]; then sleep $COOLDOWN; fi
+          done
+
+          # Concatenate the per-run CSVs into the combined files that plot.py
+          # expects: keep run 1's header, append the data rows from every run.
+          for f in samples stats throughput client-stats deadlock; do
+            head -n 1 "out/$f-1.csv" > "out/$f.csv"
+            for run in $(seq 1 $NRUNS); do
+              tail -n +2 "out/$f-$run.csv" >> "out/$f.csv"
+            done
+          done
 
           aws s3 cp out/ "s3://$BUCKET/$OUT/" --recursive
           aws s3 cp /var/log/rtbench-bootstrap.log "s3://$BUCKET/$OUT/bootstrap.log" || true

@@ -27,6 +27,11 @@
 #   RUN_DURATION       rw9010 per-step duration        (default: 60s)
 #   DEADLOCK_DURATION  deadlock per-config duration    (default: 20s)
 #   AUTO_STOP          stop instance when done         (default: true)
+#
+# Each benchmark (rw9010 and deadlock) is run 3 times back-to-back with a short
+# cool-down in between, and the per-run CSVs are concatenated into the combined
+# files plot.py reads. Repeating gives S3's prefix throttling and connection
+# state time to settle and tightens the aggregated percentile bands.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,8 +97,8 @@ cmd_deploy() {
   rm -f "$bin"
 
   echo
-  echo "Done. The instance will pull the binary, run the benchmarks, upload"
-  echo "results to s3://$bucket/results/<timestamp>/, then stop itself."
+  echo "Done. The instance will pull the binary, run each benchmark 3 times,"
+  echo "upload results to s3://$bucket/results/<timestamp>/, then stop itself."
   echo "Stream the live log with: $0 logs"
   echo "Download results when done with: $0 results"
 }
