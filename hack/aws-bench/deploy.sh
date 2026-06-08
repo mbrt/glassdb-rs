@@ -98,7 +98,7 @@ cmd_deploy() {
   rm -f "$bin"
 
   echo
-  echo "Done. The instance will pull the binary, run each benchmark 3 times,"
+  echo "Done. The instance will pull the binary, run the benchmark,"
   echo "upload results to s3://$bucket/results/<timestamp>/, then stop itself."
   echo "Stream the live log with: $0 logs"
   echo "Download results when done with: $0 results"

@@ -662,7 +662,7 @@ fn run_read_write_9010(
                 args.run_cooldown,
                 run + 1
             );
-            handle.block_on(tokio::time::sleep(args.run_cooldown));
+            handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
         }
         eprintln!("Run {}/{num_runs}", run + 1);
         let mut rnd = StdRng::seed_from_u64(42);
@@ -933,7 +933,7 @@ fn run_deadlock(
                 args.run_cooldown,
                 run + 1
             );
-            handle.block_on(tokio::time::sleep(args.run_cooldown));
+            handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
         }
         eprintln!("Run {}/{num_runs}", run + 1);
         for k in 1..=6usize {
