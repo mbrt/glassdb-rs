@@ -21,6 +21,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "cycle"
+path = "fuzz_targets/cycle.rs"
+test = false
+doc = false
+bench = false
+
 # Make this its own workspace so the cargo-fuzz crate (which needs nightly and a
 # sanitizer) stays out of the main workspace's normal build/test graph.
 [workspace]

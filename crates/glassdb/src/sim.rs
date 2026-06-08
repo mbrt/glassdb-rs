@@ -400,6 +400,75 @@ fn client_seed(seed: u64, i: usize) -> u64 {
     seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1)
 }
 
+/// The shared faultless backbone every client reaches through its own
+/// transport: a `MemoryBackend` behind a `RecordingBackend` whose ordered op log
+/// powers the byte-for-byte determinism self-check. Init and verification use it
+/// directly (a perfect connection).
+fn make_backbone() -> (Arc<dyn Backend>, OpLog) {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let rec = Arc::new(RecordingBackend::new(mem));
+    let log = rec.log();
+    let backbone: Arc<dyn Backend> = rec;
+    (backbone, log)
+}
+
+/// One transport per client over `backbone`. With faults enabled each is an
+/// active, tape-guided [`FaultBackend`]; otherwise each client shares the
+/// backbone directly. Returns the transports (for the outage nemesis and final
+/// healing) and the per-client backends, in client order.
+fn build_transports(
+    backbone: &Arc<dyn Backend>,
+    faults: FaultConfig,
+    seed: u64,
+    streams: &[Vec<u8>; FAULT_STREAMS],
+    nclients: usize,
+) -> (Vec<Arc<FaultBackend>>, Vec<Arc<dyn Backend>>) {
+    let mut transports: Vec<Arc<FaultBackend>> = Vec::new();
+    let mut client_backends: Vec<Arc<dyn Backend>> = Vec::with_capacity(nclients);
+    if faults.enabled {
+        let fopts = FaultOptions::from_intensity(faults.intensity);
+        for i in 0..nclients {
+            let tape = streams[CLIENT_STREAM_BASE + i % MAX_CLIENTS].clone();
+            let t = FaultBackend::with_tape(backbone.clone(), tape, client_seed(seed, i), fopts);
+            t.set_active(true);
+            transports.push(t.clone());
+            client_backends.push(t);
+        }
+    } else {
+        for _ in 0..nclients {
+            client_backends.push(backbone.clone());
+        }
+    }
+    (transports, client_backends)
+}
+
+/// Spawns the crash and outage nemeses when faults are enabled, each on its own
+/// fault-tape stream and a distinct fallback seed. The caller spawns the client
+/// tasks first, so the fixed spawn order (clients, then crash, then outage)
+/// keeps task ids — and thus the schedule — deterministic. Returns their join
+/// handles (both `None` with faults off).
+#[allow(clippy::type_complexity)]
+fn spawn_nemeses(
+    faults: FaultConfig,
+    seed: u64,
+    streams: &[Vec<u8>; FAULT_STREAMS],
+    tokens: &[CancelToken],
+    transports: &[Arc<FaultBackend>],
+) -> (Option<rt::JoinHandle<()>>, Option<rt::JoinHandle<()>>) {
+    if !faults.enabled {
+        return (None, None);
+    }
+    let crash_tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
+    let crash = rt::spawn(crash_nemesis(tokens.to_vec(), faults.intensity, crash_tape));
+    let outage_tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
+    let outage = rt::spawn(outage_nemesis(
+        transports.to_vec(),
+        faults.intensity,
+        outage_tape,
+    ));
+    (Some(crash), Some(outage))
+}
+
 /// Core harness: seed the store, run the clients as interleaved tasks under the
 /// (optional) fault nemesis, then verify the per-key bound. Always records the
 /// backend op stream and returns it for byte-for-byte determinism comparison.
@@ -417,12 +486,8 @@ async fn run_inner(
     let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
 
     // The store and a shared recorder form a faultless backbone; each client gets
-    // its own transport (`FaultBackend`) over it. Init and verification use the
-    // backbone directly (a perfect connection).
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let rec = Arc::new(RecordingBackend::new(mem));
-    let log = rec.log();
-    let backbone: Arc<dyn Backend> = rec;
+    // its own transport (`FaultBackend`) over it.
+    let (backbone, log) = make_backbone();
 
     // Initialize the collection and seed every key to zero up front (over the
     // faultless backbone, so this cannot fail spuriously).
@@ -446,22 +511,8 @@ async fn run_inner(
     // One transport per client over the shared backbone. Faults are live only
     // while the clients run.
     let nclients = workload.clients.len();
-    let mut transports: Vec<Arc<FaultBackend>> = Vec::new();
-    let mut client_backends: Vec<Arc<dyn Backend>> = Vec::with_capacity(nclients);
-    if faults.enabled {
-        let fopts = FaultOptions::from_intensity(faults.intensity);
-        for i in 0..nclients {
-            let tape = streams[CLIENT_STREAM_BASE + i % MAX_CLIENTS].clone();
-            let t = FaultBackend::with_tape(backbone.clone(), tape, client_seed(seed, i), fopts);
-            t.set_active(true);
-            transports.push(t.clone());
-            client_backends.push(t);
-        }
-    } else {
-        for _ in 0..nclients {
-            client_backends.push(backbone.clone());
-        }
-    }
+    let (transports, client_backends) =
+        build_transports(&backbone, faults, seed, &streams, nclients);
 
     // Each client runs as its own task over its own transport so the scheduler
     // can interleave them.
@@ -488,26 +539,7 @@ async fn run_inner(
 
     // The crash and outage nemeses run concurrently with the clients, each on its
     // own slice of the fault tape (and a distinct fallback seed).
-    let crash = if faults.enabled {
-        let tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
-        Some(rt::spawn(crash_nemesis(
-            tokens.clone(),
-            faults.intensity,
-            tape,
-        )))
-    } else {
-        None
-    };
-    let outage = if faults.enabled {
-        let tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
-        Some(rt::spawn(outage_nemesis(
-            transports.clone(),
-            faults.intensity,
-            tape,
-        )))
-    } else {
-        None
-    };
+    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &tokens, &transports);
 
     for h in handles {
         let _ = h.await;
@@ -653,5 +685,392 @@ pub fn pct_record(workload: &Workload, faults: FaultConfig, seed: u64) -> OpLog 
 pub fn pct_sweep(workload: &Workload, faults: FaultConfig, seeds: impl IntoIterator<Item = u64>) {
     for seed in seeds {
         pct_assert(workload, faults, seed);
+    }
+}
+
+// ===========================================================================
+// Cycle workload (ported from FoundationDB's `Cycle.cpp`).
+//
+// Keys form a ring `key(i) -> (i + 1) % N`; each transaction reads three
+// consecutive next-pointers and rotates their edges, which preserves a single
+// N-cycle. Because the rotation does not commute, any isolation or atomicity
+// break splits, shrinks, or grows the ring — a true serializability oracle that
+// the commutative RMW-increment workload above cannot provide. The ring stays
+// valid whether a swap commits or aborts, so the invariant holds as-is under the
+// crash/outage/lost-ack nemeses, with no relaxation.
+//
+// Alongside the swaps, an optional read-only observer snapshots the whole ring
+// in one transaction (reading all N pointers concurrently) and asserts that
+// snapshot is itself a valid ring. That adds a read-side serializability oracle
+// — a committed read-only tx must observe a single committed state — and is the
+// only workload that exercises `Tx`'s concurrent-read path.
+// ===========================================================================
+
+/// Smallest ring size that guarantees the four nodes a swap touches (the start
+/// node and its next three along the ring) are distinct, so the rotation
+/// preserves a single cycle.
+const MIN_NODES: usize = 4;
+/// Largest ring the workload generates (keeps state small for the executor).
+const MAX_NODES: usize = 12;
+/// Most snapshots the concurrent read-only observer takes during a run (keeps
+/// its work bounded at `MAX_SNAPSHOTS * node_count` reads).
+const MAX_SNAPSHOTS: usize = MAX_OPS_PER_CLIENT;
+/// Collection the ring lives in.
+const CYCLE_COLLECTION: &[u8] = b"cycle";
+
+/// A Cycle workload: `node_count` keys arranged in a ring, plus one swap
+/// sequence per client. Each `usize` is a swap's start node, already reduced to
+/// `0..node_count`. Clients run concurrently.
+#[derive(Debug, Clone)]
+pub struct CycleWorkload {
+    /// Number of nodes in the ring (>= [`MIN_NODES`]).
+    pub node_count: usize,
+    /// Per-client swap start nodes.
+    pub clients: Vec<Vec<usize>>,
+    /// How many times a concurrent read-only observer snapshots the whole ring
+    /// while the swaps run (`0` disables it). Each snapshot reads all `N`
+    /// next-pointers concurrently in one transaction and must observe a valid
+    /// ring — a read-side serializability oracle (see [`read_ring_snapshot`]).
+    pub snapshot_reads: usize,
+}
+
+impl Default for CycleWorkload {
+    fn default() -> Self {
+        CycleWorkload {
+            node_count: MIN_NODES,
+            clients: Vec::new(),
+            snapshot_reads: 0,
+        }
+    }
+}
+
+impl<'a> Arbitrary<'a> for CycleWorkload {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let node_count = MIN_NODES + (u.arbitrary::<u8>()? as usize % (MAX_NODES - MIN_NODES + 1));
+        // At least two clients so there is something to interleave.
+        let nclients = 2 + (u.arbitrary::<u8>()? as usize % (MAX_CLIENTS - 1));
+        let mut clients = Vec::with_capacity(nclients);
+        for _ in 0..nclients {
+            let nswaps = u.arbitrary::<u8>()? as usize % (MAX_OPS_PER_CLIENT + 1);
+            let mut swaps = Vec::with_capacity(nswaps);
+            for _ in 0..nswaps {
+                swaps.push(u.arbitrary::<u8>()? as usize % node_count);
+            }
+            clients.push(swaps);
+        }
+        let snapshot_reads = u.arbitrary::<u8>()? as usize % (MAX_SNAPSHOTS + 1);
+        Ok(CycleWorkload {
+            node_count,
+            clients,
+            snapshot_reads,
+        })
+    }
+}
+
+/// Reads node `idx`'s next-pointer within `tx`.
+async fn read_next(tx: &crate::Tx, coll: &Collection, idx: usize) -> Result<usize, Error> {
+    let v = tx.read(coll, &key_name(idx)).await?;
+    Ok(read_int(&v) as usize)
+}
+
+/// Sets node `idx`'s next-pointer to `next` within `tx`.
+fn write_next(tx: &crate::Tx, coll: &Collection, idx: usize, next: usize) -> Result<(), Error> {
+    tx.write(coll, &key_name(idx), &write_int(next as i64))
+}
+
+/// Asserts the stored next-pointers still form a single ring over every node in
+/// `0..N`: walking from node 0 visits each node exactly once and returns to 0
+/// after exactly `N` hops. A serializability or atomicity failure splits the
+/// ring (a revisit / early return to 0), drops a node, or dangles a pointer out
+/// of range.
+fn assert_ring(next: &[usize]) {
+    let n = next.len();
+    let mut seen = vec![false; n];
+    let mut cur = 0usize;
+    for hop in 0..n {
+        assert!(
+            cur < n,
+            "ring pointer {cur} out of range (n={n}) at hop {hop}"
+        );
+        assert!(
+            !seen[cur],
+            "ring revisits node {cur} at hop {hop}: cycle shorter than {n}"
+        );
+        seen[cur] = true;
+        cur = next[cur];
+    }
+    assert_eq!(
+        cur, 0,
+        "ring does not return to node 0 after {n} hops (broken or longer cycle)"
+    );
+}
+
+/// One ring edge-rotation transaction starting at node `r` (mirrors FDB's
+/// Cycle). Reads three consecutive next-pointers, then rotates the edges. For a
+/// single N-cycle with N >= 4 the four nodes are distinct, so the three writes
+/// target distinct keys and map the ring to another single N-cycle.
+async fn cycle_swap(ctx: &Ctx, db: &DB, coll: &Collection, r: usize) -> Result<(), Error> {
+    db.tx(ctx, |tx| async move {
+        let r2 = read_next(&tx, coll, r).await?;
+        let r3 = read_next(&tx, coll, r2).await?;
+        let r4 = read_next(&tx, coll, r3).await?;
+        write_next(&tx, coll, r, r3)?;
+        write_next(&tx, coll, r2, r4)?;
+        write_next(&tx, coll, r3, r2)
+    })
+    .await
+}
+
+/// Snapshots the whole ring within a single transaction, reading all `N`
+/// next-pointers *concurrently* (joined together as in-flight backend fetches),
+/// and returns the snapshot. Unlike [`cycle_swap`]'s dependent pointer walk,
+/// these reads have no data dependency, so this is what exercises `Tx`'s
+/// concurrent-read path (see `tx.rs`: `read` takes `&self` and never holds the
+/// lock across `.await`). A committed read-only transaction observes exactly one
+/// committed state under serializable isolation, so the caller can assert the
+/// snapshot is itself a valid ring.
+async fn read_ring_snapshot(
+    ctx: &Ctx,
+    db: &DB,
+    coll: &Collection,
+    node_count: usize,
+) -> Result<Vec<usize>, Error> {
+    db.tx(ctx, |tx| async move {
+        futures::future::try_join_all((0..node_count).map(|k| read_next(&tx, coll, k))).await
+    })
+    .await
+}
+
+/// Runs a client's swaps in order. Returns the number consumed: `swaps.len()` if
+/// all succeeded, or `i + 1` if swap `i` failed (left for recovery rather than
+/// replayed on restart).
+async fn run_cycle_client(ctx: &Ctx, db: &DB, coll: &Collection, swaps: &[usize]) -> usize {
+    for (i, r) in swaps.iter().enumerate() {
+        if cycle_swap(ctx, db, coll, *r).await.is_err() {
+            return i + 1;
+        }
+    }
+    swaps.len()
+}
+
+/// Opens the DB on `backend`, runs `swaps`, and closes it. Returns swaps consumed
+/// (see [`run_cycle_client`]); `0` if the open itself failed.
+async fn open_and_run_cycle(ctx: &Ctx, backend: &Arc<dyn Backend>, swaps: &[usize]) -> usize {
+    let Ok(db) = open_det_db(ctx, backend).await else {
+        return 0;
+    };
+    let coll = db.collection(CYCLE_COLLECTION);
+    let consumed = run_cycle_client(ctx, &db, &coll, swaps).await;
+    db.close().await;
+    consumed
+}
+
+/// Core Cycle harness: lay down the ring, run the clients as interleaved tasks
+/// under the (optional) fault nemesis, then assert the ring invariant. Mirrors
+/// [`run_inner`], reusing the same backbone, transports, and nemeses. Always
+/// records the backend op stream and returns it for determinism comparison.
+async fn run_cycle_inner(
+    workload: CycleWorkload,
+    faults: FaultConfig,
+    seed: u64,
+    fault_tape: Vec<u8>,
+) -> OpLog {
+    let ctx = Ctx::background();
+    let node_count = workload.node_count;
+    let snapshot_reads = workload.snapshot_reads;
+    let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
+
+    let (backbone, log) = make_backbone();
+
+    // Initialize the collection and lay down the ring (key(i) -> (i + 1) % N)
+    // over the faultless backbone, so setup cannot fail spuriously.
+    let init_db = open_det_db(&ctx, &backbone).await.expect("open init db");
+    let init_coll = init_db.collection(CYCLE_COLLECTION);
+    init_coll.create(&ctx).await.expect("create collection");
+    let seed_coll = &init_coll;
+    init_db
+        .tx(&ctx, |tx| async move {
+            for k in 0..node_count {
+                write_next(&tx, seed_coll, k, (k + 1) % node_count)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed ring");
+
+    // One transport per client over the shared backbone.
+    let nclients = workload.clients.len();
+    let (transports, client_backends) =
+        build_transports(&backbone, faults, seed, &streams, nclients);
+
+    // Each client runs its swaps as its own task so the scheduler interleaves
+    // them; a crashed client restarts on the same backend to finish its
+    // remaining swaps, recovering its own orphaned locks via lease expiry.
+    let mut handles = Vec::with_capacity(nclients);
+    let mut tokens = Vec::with_capacity(nclients);
+    for (swaps, backend) in workload.clients.into_iter().zip(client_backends) {
+        let (cctx, token) = Ctx::with_cancel();
+        tokens.push(token);
+        handles.push(rt::spawn(async move {
+            let consumed = open_and_run_cycle(&cctx, &backend, &swaps).await;
+            if consumed < swaps.len() && cctx.is_cancelled() {
+                let rctx = Ctx::background();
+                let _ = open_and_run_cycle(&rctx, &backend, &swaps[consumed..]).await;
+            }
+        }));
+    }
+
+    // A concurrent read-only observer: while the swaps mutate the ring it
+    // snapshots all N pointers in one transaction (concurrent reads, unlike the
+    // swaps' dependent walk) and asserts the snapshot is itself a valid ring. A
+    // committed read-only tx sees exactly one committed state under serializable
+    // isolation, and every committed ring state is valid, so a torn snapshot that
+    // still committed is a read-isolation bug `assert_ring` will catch. Runs on
+    // the faultless backbone so it stays a reliable observer regardless of the
+    // per-client transport faults. A panic here propagates out of the run, just
+    // like the final verification.
+    let reader = (snapshot_reads > 0).then(|| {
+        let backbone = backbone.clone();
+        rt::spawn(async move {
+            let rctx = Ctx::background();
+            let Ok(db) = open_det_db(&rctx, &backbone).await else {
+                return;
+            };
+            let coll = db.collection(CYCLE_COLLECTION);
+            for _ in 0..snapshot_reads {
+                rt::yield_now().await;
+                match read_ring_snapshot(&rctx, &db, &coll, node_count).await {
+                    Ok(snap) => assert_ring(&snap),
+                    Err(_) => break,
+                }
+            }
+            db.close().await;
+        })
+    });
+
+    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &tokens, &transports);
+
+    for h in handles {
+        let _ = h.await;
+    }
+    if let Some(h) = reader {
+        let _ = h.await;
+    }
+    if let Some(h) = crash {
+        let _ = h.await;
+    }
+    if let Some(h) = outage {
+        let _ = h.await;
+    }
+
+    // Heal every transport before verifying so recovery reads cannot fail.
+    for t in &transports {
+        t.set_active(false);
+    }
+
+    // Read every node's final next-pointer (driving recovery of any crashed
+    // client's locks via lease expiry) and assert the ring is still intact.
+    let mut next = vec![0usize; node_count];
+    for (k, slot) in next.iter_mut().enumerate() {
+        *slot = read_int(
+            &init_coll
+                .read_strong(&ctx, &key_name(k))
+                .await
+                .expect("final read"),
+        ) as usize;
+    }
+    init_db.close().await;
+
+    assert_ring(&next);
+    log
+}
+
+/// Runs a Cycle `workload` over a fresh in-memory ring and asserts the ring
+/// invariant, without injecting faults.
+pub async fn run_cycle_and_assert(workload: CycleWorkload) {
+    run_cycle_inner(workload, FaultConfig::none(), 0, Vec::new()).await;
+}
+
+/// Like [`run_cycle_and_assert`] but injects backend faults and client crashes
+/// per `faults`. The ring invariant holds regardless of how many swaps commit,
+/// since each swap is atomic. `fault_tape` guides the fault schedule; it falls
+/// back to `seed` once spent.
+pub async fn run_cycle_and_assert_with_faults(
+    workload: CycleWorkload,
+    faults: FaultConfig,
+    seed: u64,
+    fault_tape: Vec<u8>,
+) {
+    run_cycle_inner(workload, faults, seed, fault_tape).await;
+}
+
+/// Like [`run_cycle_and_assert`] but records the ordered backend op stream and
+/// returns the log, for byte-for-byte determinism comparison across runs.
+pub async fn run_cycle_and_record(workload: &CycleWorkload) -> OpLog {
+    run_cycle_inner(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
+}
+
+/// Like [`run_cycle_and_record`] but with fault injection enabled per `faults`.
+pub async fn run_cycle_and_record_with_faults(
+    workload: &CycleWorkload,
+    faults: FaultConfig,
+    seed: u64,
+    fault_tape: Vec<u8>,
+) -> OpLog {
+    run_cycle_inner(workload.clone(), faults, seed, fault_tape).await
+}
+
+/// Decodes one libFuzzer input for the `cycle` target and runs it on the
+/// deterministic executor, asserting the ring invariant. Panics on any
+/// violation. Shared by the fuzz target and the corpus-replay test so the two
+/// can never diverge.
+#[cfg(sim)]
+pub fn replay_cycle_input(data: &[u8]) {
+    let mut u = Unstructured::new(data);
+    let seed: u64 = u.arbitrary().unwrap_or(0);
+    let workload = CycleWorkload::arbitrary(&mut u).unwrap_or_default();
+    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
+    let rest = u.take_rest();
+    let mid = rest.len() / 2;
+    let (schedule_tape, fault_tape) = (rest[..mid].to_vec(), rest[mid..].to_vec());
+    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
+        run_cycle_and_assert_with_faults(workload, faults, seed, fault_tape).await
+    });
+}
+
+/// Runs a Cycle `workload` once under a PCT schedule seeded by `seed`, asserting
+/// the ring invariant. Panics on any violation.
+#[cfg(sim)]
+pub fn cycle_pct_assert(workload: &CycleWorkload, faults: FaultConfig, seed: u64) {
+    let w = workload.clone();
+    rt::block_on_with(
+        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
+        seed,
+        async move { run_cycle_and_assert_with_faults(w, faults, seed, Vec::new()).await },
+    );
+}
+
+/// Runs a Cycle `workload` under a PCT schedule and returns the recorded backend
+/// op stream, for per-seed determinism comparison.
+#[cfg(sim)]
+pub fn cycle_pct_record(workload: &CycleWorkload, faults: FaultConfig, seed: u64) -> OpLog {
+    let w = workload.clone();
+    rt::block_on_with(
+        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
+        seed,
+        async move { run_cycle_and_record_with_faults(&w, faults, seed, Vec::new()).await },
+    )
+}
+
+/// Seed-breadth sweep over a Cycle `workload`: one PCT schedule per seed,
+/// asserting the ring invariant on each.
+#[cfg(sim)]
+pub fn cycle_pct_sweep(
+    workload: &CycleWorkload,
+    faults: FaultConfig,
+    seeds: impl IntoIterator<Item = u64>,
+) {
+    for seed in seeds {
+        cycle_pct_assert(workload, faults, seed);
     }
 }

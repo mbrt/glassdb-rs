@@ -56,22 +56,43 @@ test-sim:
 		-p glassdb-storage -p glassdb-trans
 	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test -p glassdb --features sim
 
-# Run the deterministic concurrency fuzzer. Requires the nightly toolchain and
+# Run the deterministic concurrency fuzzers. Requires the nightly toolchain and
 # cargo-fuzz (`cargo install cargo-fuzz`). `cargo fuzz` sets its own RUSTFLAGS
 # (sanitizer + coverage) which overrides the `[build] rustflags` in
 # fuzz/.cargo/config.toml, so `--cfg sim --cfg tokio_unstable` must be supplied
 # via the environment (cargo-fuzz appends its flags to it). With the
 # deterministic executor active, any crash reproduces exactly from its input
 # (schedule tape + seed + workload):
-#   cd fuzz && RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run concurrent_tx <crash-file>
+#   cd fuzz && RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run <target> <crash-file>
+#
+# `make fuzz` fuzzes every target `cargo fuzz list` reports (the single source of
+# truth -- adding a target needs no change here), one after another, each bounded
+# by FUZZ_TIME seconds (so the loop terminates) and forked across all cores.
+# Sequential runs give each target every core (no oversubscription); the
+# trade-off is wall time = sum of the per-target budgets. Override e.g.
+# `make fuzz FUZZ_TARGETS=cycle FUZZ_TIME=0` to fuzz one target indefinitely, or
+# `make fuzz FUZZ_TIME=300` for a longer sweep.
 FUZZ_JOBS ?= $(shell nproc)
+FUZZ_TIME ?= 60
+FUZZ_TARGETS ?=
 fuzz:
-	cd fuzz && RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz run concurrent_tx -- \
-		-fork=$(FUZZ_JOBS)
+	cd fuzz && targets="$(FUZZ_TARGETS)"; \
+		[ -n "$$targets" ] || targets=$$(cargo +nightly fuzz list); \
+		for t in $$targets; do \
+			echo "=== fuzzing $$t for $(FUZZ_TIME)s ==="; \
+			RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz run $$t -- \
+				-fork=$(FUZZ_JOBS) -max_total_time=$(FUZZ_TIME) \
+				-timeout=10 || exit $$?; \
+		done
 
-# Minimize the fuzz corpus: drop inputs that add no coverage, keeping the
+# Minimize the fuzz corpora: drop inputs that add no coverage, keeping the
 # smallest set that preserves the same reachable behavior. Run after a fuzzing
 # session (or before committing the corpus) to keep it small and fast to replay.
-# Same `--cfg sim --cfg tokio_unstable` requirement as `fuzz` (see above).
+# Loops over the same auto-discovered target list as `fuzz`; same
+# `--cfg sim --cfg tokio_unstable` requirement (see above).
 fuzz-min:
-	cd fuzz && RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz cmin concurrent_tx
+	cd fuzz && targets="$(FUZZ_TARGETS)"; \
+		[ -n "$$targets" ] || targets=$$(cargo +nightly fuzz list); \
+		for t in $$targets; do \
+			RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz cmin $$t || exit $$?; \
+		done
