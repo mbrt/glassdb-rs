@@ -27,6 +27,19 @@ use std::time::Duration;
 
 use crate::rng::Rng;
 
+/// Maximum number of scheduler steps (task polls plus virtual-time advances) a
+/// single [`block_on_with`] run may take before it is declared non-terminating
+/// and panics. A deterministic backstop — a *single-execution timeout* measured
+/// in schedule steps rather than wall-clock, so it trips identically on every
+/// replay — against livelock or an infinite retry loop (a bug class DST hunts):
+/// a legitimate bounded workload uses orders of magnitude fewer steps, while a
+/// run that never terminates trips this instead of hanging forever. The panic
+/// surfaces as a libFuzzer crash (with a reproducing input) and, in the
+/// fuzz-corpus replay test, as a named failure for the offending file. Set well
+/// above the heaviest observed run (~1.7k steps across the whole sim suite) yet
+/// low enough to fail fast.
+const DEFAULT_STEP_BUDGET: u64 = 50_000_000;
+
 /// Unique id of a task within a single executor run. Assigned in spawn order, so
 /// it is a deterministic function of the (deterministic) schedule.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -392,8 +405,25 @@ impl Future for DetYield {
 /// Panics deterministically if the system deadlocks: no task is runnable and no
 /// timer is pending while `root` has not completed.
 ///
+/// Panics deterministically if the run exceeds [`DEFAULT_STEP_BUDGET`] scheduler
+/// steps, treating non-termination (livelock / infinite retry) as a failure
+/// instead of hanging forever.
+///
 /// `entropy_seed` seeds the simulated entropy source read by [`fill_random`].
 pub fn block_on_with<S, F, T>(scheduler: S, entropy_seed: u64, root: F) -> T
+where
+    S: Scheduler + 'static,
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, root)
+}
+
+/// As [`block_on_with`], but with an explicit per-run step `budget`. Private so
+/// the public entry point always uses [`DEFAULT_STEP_BUDGET`]; a small budget
+/// lets the tests exercise the non-termination guard without spinning millions
+/// of steps.
+fn block_on_with_budget<S, F, T>(scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
 where
     S: Scheduler + 'static,
     F: Future<Output = T> + Send + 'static,
@@ -451,7 +481,7 @@ where
     // synthetic poll (we never re-enter `block_on`, so a yield would stall).
     tokio_rt.block_on(tokio::task::coop::unconstrained(std::future::poll_fn(
         |_cx| {
-            run_loop(&handle, &out);
+            run_loop(&handle, &out, budget);
             std::task::Poll::Ready(())
         },
     )));
@@ -464,8 +494,20 @@ where
     result
 }
 
-fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>) {
+fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
+    let mut steps: u64 = 0;
     loop {
+        // Bound a single execution: a run that never terminates (livelock /
+        // infinite retry) trips this deterministic step budget and panics rather
+        // than hanging the fuzzer or a corpus replay forever.
+        steps += 1;
+        if steps > budget {
+            panic!(
+                "simulation executor exceeded its step budget ({budget} scheduler \
+                 steps): the run is not terminating (livelock or infinite retry loop)"
+            );
+        }
+
         // 1. Fold woken tasks into the (sorted) ready set.
         let woken = handle.wake.take();
         {
@@ -574,6 +616,20 @@ mod tests {
     fn runs_a_simple_future() {
         let v = block_on_with(LowestFirst, 0, async { 1 + 2 });
         assert_eq!(v, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeded its step budget")]
+    fn step_budget_bounds_a_runaway_execution() {
+        // A run that takes far more steps than its budget allows must trip the
+        // deterministic non-termination guard and panic, instead of spinning
+        // forever and hanging the fuzzer or a corpus replay. A tiny budget keeps
+        // the test fast: the workload below would otherwise take ~10k steps.
+        block_on_with_budget(LowestFirst, 0, 100, async {
+            for _ in 0..10_000 {
+                DetYield::default().await;
+            }
+        });
     }
 
     #[test]

@@ -247,6 +247,18 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   ordering (now justified) and a fixed-base deterministic clock. Run with
   `make test-sim` / `make fuzz`. The `proptest_concurrent` test is kept as a fast
   non-sim sanity check. Go's byte-schedule approach was inspiration only.
+- **Cycle serializability oracle (ported from FoundationDB's `Cycle.cpp`).** A
+  second fuzz target (`cycle`) lays down a ring `key(i) -> (i+1) % N` and has
+  clients rotate three consecutive edges per transaction. The rotation does not
+  commute, so any isolation or atomicity break splits/shrinks/grows the ring —
+  catching serializability anomalies the commutative RMW-increment workload
+  cannot. It reuses the same backbone/transports/nemeses and runs under both the
+  schedule-tape and PCT schedulers. A concurrent read-only observer also
+  snapshots the whole ring in one transaction (all `N` pointer reads issued
+  concurrently via `try_join_all`) and asserts the snapshot is itself a valid
+  ring: a committed read-only tx must see a single committed state, so this adds
+  a read-side oracle and is the only workload exercising `Tx`'s concurrent-read
+  path. See `tests/cycle_sim.rs` and `fuzz/corpus/cycle`.
 - **Behavioral tests, ported wholesale.** The unit tests of the hard pieces
   (`dedup`, `algo`, `tlocker`, `monitor`, `gc`, `cache`) were ported from their
   Go counterparts to lock in equivalent behavior.
