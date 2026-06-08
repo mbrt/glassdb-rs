@@ -190,6 +190,17 @@ impl DB {
     /// transaction future is `Send` and can be `tokio::spawn`-ed. Write the body
     /// as `|tx| async move { ... }`. The framework owns the retry loop and may
     /// invoke `f` multiple times, so `f` must be `FnMut`.
+    ///
+    /// # Cancellation
+    ///
+    /// This future is durability-safe to cancel: dropping it mid-flight is
+    /// equivalent to a crash and is recovered by the commit protocol, so it
+    /// never corrupts data or leaves a half-applied transaction. Prefer
+    /// cancelling through `ctx` (a [`Ctx`] with a cancel token) over dropping the
+    /// future via `tokio::time::timeout`, `select!`, or `JoinHandle::abort`: a
+    /// `ctx` cancellation unwinds the coordination state promptly, whereas a
+    /// dropped future relies on lock wait/lease timeouts to reclaim on-storage
+    /// locks held by the abandoned attempt.
     pub async fn tx<T, F, Fut>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
     where
         F: FnMut(Tx) -> Fut + Send,

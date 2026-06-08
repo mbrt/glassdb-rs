@@ -23,6 +23,10 @@ use crate::error::Error;
 
 /// An active database transaction. Reads and writes are buffered and only
 /// applied atomically when the surrounding [`crate::DB::tx`] commits.
+///
+/// Awaiting [`Tx::read`] (and the enclosing [`crate::DB::tx`] future) is
+/// durability-safe to cancel; see the cancellation note on [`crate::DB::tx`] for
+/// why callers should prefer `Ctx` cancellation over dropping the future.
 pub struct Tx {
     ctx: Ctx,
     reader: Reader,

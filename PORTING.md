@@ -72,6 +72,26 @@ locker) has no off-the-shelf Rust equivalent, so it was ported directly as a
 `await_signal` over a `Semaphore` for "wake the next waiter". This was one of the
 highest-risk pieces and its behavior tests were ported first.
 
+Go relied on `defer` to always run a worker's post-work cleanup (clear `main`,
+notify merged callers, promote the next waiter). Rust futures have no equivalent
+for a *dropped* future, so the cleanup lives in a `MainCleanup` RAII guard that
+runs on return **or** drop. Together with two related fixes — the promoted-waiter
+`select!` prefers a delivered handoff over its own cancellation, and `wake_up_next`
+only promotes a waiter whose handoff actually sends — this guarantees a key's
+`Call` is never left with `main` set but no running worker, which would otherwise
+strand every later request for that key. See the regression tests in
+[`dedup.rs`](crates/glassdb-concurr/src/dedup.rs).
+
+### Cancel-safety contract
+
+Public futures are durability-safe to cancel: a mid-flight drop is equivalent to
+a crash and is recovered by the commit protocol. Callers should nonetheless
+prefer cancelling via `Ctx` over dropping the future (`timeout` / `select!` /
+`abort`): a `Ctx` cancellation unwinds in-memory coordination promptly, while a
+dropped future relies on the dedup drop-guard above for in-memory liveness and on
+wait/lease timeouts to reclaim on-storage locks. This contract is documented on
+the public API (`glassdb` `lib.rs` and `DB::tx`).
+
 ## Time and determinism
 
 The original tests use Go's `synctest` to make time deterministic. Rust's

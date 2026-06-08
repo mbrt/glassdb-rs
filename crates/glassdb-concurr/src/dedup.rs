@@ -154,35 +154,51 @@ where
             }
         };
 
-        let work_res: Result<(), Arc<E>> = match start {
-            Start::Main => worker.work(ctx, key, self).await.map_err(Arc::new),
+        match start {
+            Start::Main => self.run_main_worker(ctx, key, worker).await,
             Start::Wait(rx) => {
+                // Prefer a delivered promotion (`Notification::Next`) over our own
+                // cancellation. A promoted waiter must run the worker so the
+                // cleanup guard hands off to the next request; otherwise the
+                // key's `Call` would be left with `main` set but no running
+                // worker, stranding every later request for the key.
                 tokio::select! {
                     biased;
-                    _ = ctx.cancelled() => return Err(DedupError::Cancelled),
                     n = rx => match n {
-                        Ok(Notification::Next) => worker.work(ctx, key, self).await.map_err(Arc::new),
-                        Ok(Notification::Done(res)) => return res.map_err(DedupError::Work),
-                        Err(_) => return Err(DedupError::Cancelled),
-                    }
+                        Ok(Notification::Next) => self.run_main_worker(ctx, key, worker).await,
+                        Ok(Notification::Done(res)) => res.map_err(DedupError::Work),
+                        Err(_) => Err(DedupError::Cancelled),
+                    },
+                    _ = ctx.cancelled() => Err(DedupError::Cancelled),
                 }
-            }
-        };
-
-        {
-            let mut calls = self.calls.lock().unwrap();
-            if let Some(c) = calls.get_mut(key) {
-                c.curr.main = None;
-                // If the context expired, do not notify the whole bundle:
-                // another request in there could pick up the work.
-                if work_res.is_ok() || !ctx.is_cancelled() {
-                    notify_bundle(&mut c.curr, &work_res);
-                    c.curr = RequestBundle::default();
-                }
-                Self::wake_up_next(&mut calls, key);
             }
         }
+    }
 
+    /// Runs `worker` as the main worker for `key`, guaranteeing that the key's
+    /// bookkeeping cleanup (clear `main`, notify merged callers, promote the next
+    /// request) always runs - whether `work()` returns normally or this future
+    /// is dropped/cancelled mid-flight. The cleanup lives in a [`MainCleanup`]
+    /// drop guard, so a dropped future can never orphan the `Call`.
+    async fn run_main_worker<W>(
+        &self,
+        ctx: &Ctx,
+        key: &str,
+        worker: &W,
+    ) -> Result<(), DedupError<E>>
+    where
+        W: DedupWorker<R, E>,
+    {
+        let mut guard = MainCleanup {
+            calls: &self.calls,
+            key,
+            outcome: None,
+        };
+        let work_res = worker.work(ctx, key, self).await.map_err(Arc::new);
+        // Hand the outcome to the guard so it can notify merged callers on the
+        // success path. If the future is dropped before reaching here, the guard
+        // still clears `main` and promotes the next request.
+        guard.outcome = Some((work_res.clone(), ctx.is_cancelled()));
         work_res.map_err(DedupError::Work)
     }
 
@@ -258,8 +274,42 @@ where
             .next
             .clone()
     }
+}
 
-    fn wake_up_next(calls: &mut HashMap<String, Call<R, E>>, key: &str) {
+/// RAII cleanup for the main worker of a key. On drop - whether the worker
+/// future returned or was dropped/cancelled mid-flight - it clears `main`,
+/// (on the success path) notifies merged callers, and promotes the next queued
+/// request. Keeping this in `Drop` restores the unconditional cleanup that Go's
+/// `defer` provided, so a dropped future cannot leave a key with `main` set but
+/// no running worker.
+struct MainCleanup<'a, R, E> {
+    calls: &'a Mutex<HashMap<String, Call<R, E>>>,
+    key: &'a str,
+    /// `Some((work_res, ctx_cancelled))` once `work()` returned; `None` if the
+    /// future was dropped before completing.
+    outcome: Option<(Result<(), Arc<E>>, bool)>,
+}
+
+impl<R, E> Drop for MainCleanup<'_, R, E> {
+    fn drop(&mut self) {
+        let mut calls = self.calls.lock().unwrap();
+        if let Some(c) = calls.get_mut(self.key) {
+            c.curr.main = None;
+            if let Some((res, cancelled)) = &self.outcome {
+                // If the context expired, do not notify the whole bundle:
+                // another request in there could pick up the work.
+                if res.is_ok() || !*cancelled {
+                    notify_bundle(&mut c.curr, res);
+                    c.curr = RequestBundle::default();
+                }
+            }
+            wake_up_next(&mut calls, self.key);
+        }
+    }
+}
+
+fn wake_up_next<R, E>(calls: &mut HashMap<String, Call<R, E>>, key: &str) {
+    loop {
         let c = calls.get_mut(key).unwrap();
         c.curr.other = filter_expired(std::mem::take(&mut c.curr.other));
         c.pending = filter_expired(std::mem::take(&mut c.pending));
@@ -277,15 +327,26 @@ where
 
         match next_main {
             Some(mut rc) => {
-                if let Some(tx) = rc.notify.take() {
-                    let _ = tx.send(Notification::Next);
+                // Only hand off to a waiter we can actually reach. If its
+                // receiver is gone (the caller's future was dropped, which
+                // `filter_expired` does not catch since the ctx is not
+                // cancelled), promoting it would orphan the key, so skip it and
+                // try the next candidate.
+                let delivered = match rc.notify.take() {
+                    Some(tx) => tx.send(Notification::Next).is_ok(),
+                    None => false,
+                };
+                if !delivered {
+                    continue;
                 }
                 // A fresh signal source for the new main worker.
                 c.next = Arc::new(Semaphore::new(0));
                 c.curr.main = Some(rc);
+                return;
             }
             None => {
                 calls.remove(key);
+                return;
             }
         }
     }
@@ -347,6 +408,7 @@ where
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct TestRequest {
@@ -438,6 +500,154 @@ mod tests {
             self.res.lock().unwrap().push(r.counter);
             Ok(())
         }
+    }
+
+    /// Worker whose first invocation (the main worker) blocks on `release`,
+    /// letting tests park a main worker and set up queued/dropped waiters before
+    /// it finishes. Later invocations run through (honoring cancellation).
+    struct GatedWorker {
+        release: Arc<Semaphore>,
+        calls: StdMutex<i64>,
+        done: StdMutex<Vec<i64>>,
+    }
+
+    impl GatedWorker {
+        fn new() -> Self {
+            GatedWorker {
+                release: Arc::new(Semaphore::new(0)),
+                calls: StdMutex::new(0),
+                done: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DedupWorker<TestRequest, ()> for GatedWorker {
+        async fn work(
+            &self,
+            ctx: &Ctx,
+            key: &str,
+            contr: &Controller<TestRequest, ()>,
+        ) -> Result<(), ()> {
+            let r = contr.request(key);
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if n == 1 {
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancelled() => return Err(()),
+                    _ = await_signal(&self.release) => {}
+                }
+            } else if ctx.is_cancelled() {
+                return Err(());
+            }
+            self.done.lock().unwrap().push(r.counter);
+            Ok(())
+        }
+    }
+
+    // Regression (defect A): if the main worker's `run` future is dropped
+    // mid-`work()`, the drop guard must still clear `main` and promote the next
+    // queued waiter, so the key is not orphaned.
+    #[tokio::test]
+    async fn dropped_main_future_promotes_next_waiter() {
+        let d = Arc::new(Dedup::new(GatedWorker::new()));
+        let ctx = Ctx::background();
+
+        // A becomes the main worker and parks in the gate.
+        let mut a = Box::pin(d.run(&ctx, "key", unmergeable(1)));
+        assert!(futures::poll!(a.as_mut()).is_pending());
+
+        // B enqueues behind A.
+        let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+        assert!(futures::poll!(b.as_mut()).is_pending());
+
+        // Drop A's future mid-work(): the guard must promote B.
+        drop(a);
+
+        let r = tokio::time::timeout(Duration::from_secs(2), b).await;
+        assert!(
+            matches!(r, Ok(Ok(()))),
+            "dropped main worker orphaned the key: {r:?}"
+        );
+        assert_eq!(*d.worker.done.lock().unwrap(), vec![2]);
+    }
+
+    // Regression (defect C): if a queued waiter's `run` future is dropped (its
+    // receiver is gone but its ctx is not cancelled, so `filter_expired` keeps
+    // it), `wake_up_next` must skip that unreachable waiter instead of promoting
+    // it and orphaning the key.
+    #[tokio::test]
+    async fn dropped_waiter_future_does_not_orphan_key() {
+        let d = Arc::new(Dedup::new(GatedWorker::new()));
+        let release = d.worker.release.clone();
+        let ctx = Ctx::background();
+
+        // A becomes the main worker and parks in the gate.
+        let mut a = Box::pin(d.run(&ctx, "key", unmergeable(1)));
+        assert!(futures::poll!(a.as_mut()).is_pending());
+
+        // B enqueues behind A, then is dropped: its receiver is gone while its
+        // context stays live.
+        {
+            let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+            assert!(futures::poll!(b.as_mut()).is_pending());
+        }
+
+        // Release A; its cleanup must skip the unreachable B and free the key.
+        release.add_permits(1);
+        let ra = tokio::time::timeout(Duration::from_secs(2), a).await;
+        assert!(
+            matches!(ra, Ok(Ok(()))),
+            "main worker did not finish: {ra:?}"
+        );
+
+        // A fresh request for the same key must still be served.
+        let rc =
+            tokio::time::timeout(Duration::from_secs(2), d.run(&ctx, "key", unmergeable(3))).await;
+        assert!(
+            matches!(rc, Ok(Ok(()))),
+            "key was orphaned after a dropped waiter: {rc:?}"
+        );
+    }
+
+    // Regression (defect B, the `deadlock` benchmark hang): a waiter promoted to
+    // main while its ctx was live, then cancelled before it is polled, must still
+    // run the handoff instead of bailing on cancellation - otherwise the key is
+    // left with `main` set but no running worker.
+    #[tokio::test]
+    async fn cancelled_promoted_waiter_does_not_orphan_key() {
+        let d = Arc::new(Dedup::new(GatedWorker::new()));
+        let release = d.worker.release.clone();
+        let ctx = Ctx::background();
+
+        // A becomes the main worker and parks in the gate.
+        let mut a = Box::pin(d.run(&ctx, "key", unmergeable(1)));
+        assert!(futures::poll!(a.as_mut()).is_pending());
+
+        // B enqueues behind A with a cancellable, still-live ctx.
+        let (ctx_b, token_b) = Ctx::with_cancel();
+        let mut b = Box::pin(d.run(&ctx_b, "key", unmergeable(2)));
+        assert!(futures::poll!(b.as_mut()).is_pending());
+
+        // Release A and drive it to completion: its cleanup promotes B (delivers
+        // the handoff and marks B as main) while B's ctx is still live.
+        release.add_permits(1);
+        assert!(a.await.is_ok());
+
+        // Only now cancel B's ctx: B is promoted but has not yet been polled.
+        token_b.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), b)
+            .await
+            .expect("promoted-then-cancelled waiter hung");
+
+        // The key must be free for a fresh request.
+        let rc =
+            tokio::time::timeout(Duration::from_secs(2), d.run(&ctx, "key", unmergeable(3))).await;
+        assert!(matches!(rc, Ok(Ok(()))), "key was orphaned: {rc:?}");
     }
 
     #[tokio::test]
