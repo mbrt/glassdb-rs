@@ -28,10 +28,11 @@
 #   DEADLOCK_DURATION  deadlock per-config duration    (default: 20s)
 #   AUTO_STOP          stop instance when done         (default: true)
 #
-# Each benchmark (rw9010 and deadlock) is run 3 times back-to-back with a short
-# cool-down in between, and the per-run CSVs are concatenated into the combined
-# files plot.py reads. Repeating gives S3's prefix throttling and connection
-# state time to settle and tightens the aggregated percentile bands.
+# Each benchmark sweep (rw9010 and deadlock) is repeated 3 times back-to-back
+# with a 60s cool-down between runs (rtbench --num-runs / --run-cooldown). The
+# expensive rw9010 50k-key init is shared across runs; only the measured sweeps
+# are repeated, and every run appends to the same CSVs, so the plot script ends
+# up with tighter percentile bands.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

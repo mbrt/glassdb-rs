@@ -272,40 +272,22 @@ Resources:
           OUT="results/$TS"
           mkdir -p out
 
-          # Repeat each benchmark several times. S3 prefix throttling and
-          # connection state vary between runs, so aggregating samples across
-          # multiple back-to-back runs (with a short cool-down in between)
-          # gives the plot script's percentile bands more reliable inputs.
-          NRUNS=3
-          COOLDOWN=60
+          # Repeat each parameter sweep three times with a 60s cool-down
+          # between runs. rtbench shares the (expensive) rw9010 key set across
+          # runs and appends every run's samples to the same CSVs, so the plot
+          # script aggregates them into tighter percentile bands.
+          ./rtbench --backend=s3 --test-name=rw9010 \
+            --max-dbs=${MaxDBs} --num-keys=${NumKeys} --duration=${RunDuration} \
+            --num-runs=3 --run-cooldown=60s \
+            --samples-out=out/samples.csv \
+            --stats-out=out/stats.csv \
+            --throughput-out=out/throughput.csv \
+            --client-stats-out=out/client-stats.csv
 
-          for run in $(seq 1 $NRUNS); do
-            echo ">> rw9010 run $run/$NRUNS"
-            ./rtbench --backend=s3 --test-name=rw9010 \
-              --max-dbs=${MaxDBs} --num-keys=${NumKeys} --duration=${RunDuration} \
-              --samples-out=out/samples-$run.csv \
-              --stats-out=out/stats-$run.csv \
-              --throughput-out=out/throughput-$run.csv \
-              --client-stats-out=out/client-stats-$run.csv
-            if [ $run -lt $NRUNS ]; then sleep $COOLDOWN; fi
-          done
-
-          for run in $(seq 1 $NRUNS); do
-            echo ">> deadlock run $run/$NRUNS"
-            ./rtbench --backend=s3 --test-name=deadlock \
-              --duration=${DeadlockDuration} \
-              --deadlock-out=out/deadlock-$run.csv
-            if [ $run -lt $NRUNS ]; then sleep $COOLDOWN; fi
-          done
-
-          # Concatenate the per-run CSVs into the combined files that plot.py
-          # expects: keep run 1's header, append the data rows from every run.
-          for f in samples stats throughput client-stats deadlock; do
-            head -n 1 "out/$f-1.csv" > "out/$f.csv"
-            for run in $(seq 1 $NRUNS); do
-              tail -n +2 "out/$f-$run.csv" >> "out/$f.csv"
-            done
-          done
+          ./rtbench --backend=s3 --test-name=deadlock \
+            --duration=${DeadlockDuration} \
+            --num-runs=3 --run-cooldown=60s \
+            --deadlock-out=out/deadlock.csv
 
           aws s3 cp out/ "s3://$BUCKET/$OUT/" --recursive
           aws s3 cp /var/log/rtbench-bootstrap.log "s3://$BUCKET/$OUT/bootstrap.log" || true
