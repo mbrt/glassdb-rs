@@ -71,8 +71,8 @@ impl Default for Background {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn runs_and_rejects_after_close() {

@@ -13,9 +13,9 @@
 
 #[cfg(not(sim))]
 mod imp {
-    pub use tokio::task::yield_now;
     pub use tokio::task::JoinHandle;
-    pub use tokio::time::{sleep, Instant};
+    pub use tokio::task::yield_now;
+    pub use tokio::time::{Instant, sleep};
 
     /// The current wall-clock time. In production this is just the real clock.
     pub fn system_now() -> std::time::SystemTime {
@@ -44,7 +44,7 @@ mod imp {
     use crate::exec;
 
     pub use crate::exec::{
-        block_on_with, in_sim, PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId,
+        PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId, block_on_with, in_sim,
     };
 
     /// Fills `buf` with deterministic simulated entropy from the running

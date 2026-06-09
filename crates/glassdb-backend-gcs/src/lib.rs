@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId,
-    LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
+    encode_writer_tag,
 };
 use glassdb_concurr::Ctx;
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;

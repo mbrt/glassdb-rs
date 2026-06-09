@@ -357,12 +357,11 @@ impl DbInner {
         };
 
         // Always finalize the handle (a committed handle is a no-op).
-        if let Some(h) = handle.as_mut() {
-            if let Err(e) = self.algo.end(ctx, h).await {
-                if result.is_ok() {
-                    return Err(e.into());
-                }
-            }
+        if let Some(h) = handle.as_mut()
+            && let Err(e) = self.algo.end(ctx, h).await
+            && result.is_ok()
+        {
+            return Err(e.into());
         }
         result
     }

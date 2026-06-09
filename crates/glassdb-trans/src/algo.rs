@@ -11,10 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use glassdb_backend::{self as backend, Metadata};
-use glassdb_concurr::{rt, Background, CancelToken, Ctx};
-use glassdb_data::{paths, TxId};
+use glassdb_concurr::{Background, CancelToken, Ctx, rt};
+use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    tags_lock_info, Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version,
+    Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version, tags_lock_info,
 };
 
 use crate::error::TransError;
@@ -556,7 +556,7 @@ impl Algo {
                 return Err(TransError::Other(format!(
                     "getting metadata for {:?}: {e}",
                     read.path
-                )))
+                )));
             }
         };
 
@@ -593,7 +593,7 @@ impl Algo {
                             return Err(TransError::Other(format!(
                                 "getting metadata for {:?}: {e}",
                                 read.path
-                            )))
+                            )));
                         }
                     };
                 }
@@ -814,7 +814,7 @@ impl Algo {
                 li.last_writer.clone()
             }
             glassdb_storage::TxCommitStatus::Unknown => {
-                return Err(TransError::Other("unknown tx commit status".into()))
+                return Err(TransError::Other("unknown tx commit status".into()));
             }
         };
 
@@ -1411,9 +1411,9 @@ impl Drop for DeadlockGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{memory::MemoryBackend, Backend, Tags};
+    use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
     use glassdb_data::TxId;
-    use glassdb_storage::{LockType, TLogger, TxCommitStatus, MAX_STALENESS};
+    use glassdb_storage::{LockType, MAX_STALENESS, TLogger, TxCommitStatus};
 
     const TEST_COLL: &str = "testp";
     const COLL_INFO: &[u8] = b"__foo__";

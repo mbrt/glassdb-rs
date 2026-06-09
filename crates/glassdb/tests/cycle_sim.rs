@@ -17,11 +17,11 @@
 //! identical backend op stream on every run.
 #![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::{first_divergence, OpRecord};
-use glassdb::rt::{block_on_with, TapeScheduler};
+use glassdb::middleware::{OpRecord, first_divergence};
+use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    cycle_pct_record, cycle_pct_sweep, run_cycle_and_assert, run_cycle_and_assert_with_faults,
-    run_cycle_and_record, run_cycle_and_record_with_faults, CycleWorkload, FaultConfig,
+    CycleWorkload, FaultConfig, cycle_pct_record, cycle_pct_sweep, run_cycle_and_assert,
+    run_cycle_and_assert_with_faults, run_cycle_and_record, run_cycle_and_record_with_faults,
 };
 
 /// A contended ring: a small node count with several clients each rotating

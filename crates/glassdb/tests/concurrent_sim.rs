@@ -15,11 +15,11 @@
 //! result — is what proves the schedule itself replayed deterministically.
 #![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::{first_divergence, OpRecord};
-use glassdb::rt::{block_on_with, TapeScheduler};
+use glassdb::middleware::{OpRecord, first_divergence};
+use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults, run_and_record,
-    run_and_record_with_faults, FaultConfig, Op, Workload,
+    FaultConfig, Op, Workload, pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults,
+    run_and_record, run_and_record_with_faults,
 };
 
 /// A contended workload: every client hammers overlapping keys with single- and

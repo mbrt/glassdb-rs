@@ -93,7 +93,7 @@ impl Gc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{memory::MemoryBackend, Backend};
+    use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_storage::{Global, Local, TxCommitStatus, TxLog};
 
     #[tokio::test(start_paused = true)]

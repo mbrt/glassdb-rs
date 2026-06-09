@@ -9,21 +9,21 @@ use async_trait::async_trait;
 use glassdb_concurr::Ctx;
 
 use crate::{
-    encode_writer_tag, Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId,
-    LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
+    encode_writer_tag,
 };
 
 #[derive(Clone, Default)]
 struct Object {
     data: Vec<u8>,
     tags: Tags,
-    gen: i64,
+    generation: i64,
     metagen: i64,
 }
 
 impl Object {
     fn version(&self) -> Version {
-        Version::new(format!("{}/{}", self.gen, self.metagen))
+        Version::new(format!("{}/{}", self.generation, self.metagen))
     }
 }
 
@@ -78,7 +78,7 @@ impl State {
 
     fn update_data(&mut self, obj: &mut Object, d: Vec<u8>) {
         obj.data = d;
-        obj.gen = self.next_generation();
+        obj.generation = self.next_generation();
         obj.metagen = 1;
     }
 }

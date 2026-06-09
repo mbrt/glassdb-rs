@@ -13,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use glassdb::{Stats, DB};
+use glassdb::{DB, Stats};
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -29,7 +29,7 @@ pub struct CountingAlloc;
 // relaxed atomic counters around it, preserving the allocator contract.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
+        let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
@@ -38,11 +38,11 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(layout);
+        let p = unsafe { System.alloc_zeroed(layout) };
         if !p.is_null() {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
@@ -51,7 +51,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
         // Count only the growth as freshly allocated bytes; a shrink/in-place
         // realloc is not a new allocation.
         if !p.is_null() && new_size > layout.size() {

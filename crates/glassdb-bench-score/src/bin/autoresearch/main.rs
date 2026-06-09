@@ -27,7 +27,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Ctx, Stats, DB};
+use glassdb::{Backend, Ctx, DB, Stats};
 
 use crate::metrics::Sample;
 
@@ -147,10 +147,10 @@ fn main() {
     let mut final_run = median_run(runs);
     final_run.scores = scores;
 
-    if args.record {
-        if let Err(e) = append_record(&final_run) {
-            eprintln!("warning: could not record: {e}");
-        }
+    if args.record
+        && let Err(e) = append_record(&final_run)
+    {
+        eprintln!("warning: could not record: {e}");
     }
 
     if args.json {

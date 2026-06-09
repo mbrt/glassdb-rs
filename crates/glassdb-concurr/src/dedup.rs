@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{Notify, oneshot};
 
 use crate::cancel::CancelToken;
 use crate::ctx::Ctx;
@@ -280,10 +280,10 @@ where
         let st = map
             .get_mut(&self.key)
             .expect("dedup: merged() for an unknown key");
-        if !st.reconstruct() {
-            if let Some(t) = &st.op_token {
-                t.cancel();
-            }
+        if !st.reconstruct()
+            && let Some(t) = &st.op_token
+        {
+            t.cancel();
         }
         st.merged.clone()
     }

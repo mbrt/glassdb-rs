@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Tags, Version, WriterId, LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Tags, Version, WriterId, encode_writer_tag,
 };
 use glassdb_concurr::Ctx;
 use http_body_util::{BodyExt, Full};
@@ -18,7 +18,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use crate::{GcsBackend, BOUNDARY};
+use crate::{BOUNDARY, GcsBackend};
 
 fn ctx() -> Ctx {
     Ctx::background()
@@ -178,10 +178,9 @@ fn insert(
     if let Some(m) = query
         .get("ifMetagenerationMatch")
         .and_then(|v| v.parse::<i64>().ok())
+        && existing.map(|o| o.metageneration) != Some(m)
     {
-        if existing.map(|o| o.metageneration) != Some(m) {
-            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-        }
+        return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
     }
 
     store.gen_ctr += 1;
@@ -229,10 +228,9 @@ fn get_media(
     if let Some(g) = query
         .get("ifGenerationMatch")
         .and_then(|v| v.parse::<i64>().ok())
+        && g != o.generation
     {
-        if g != o.generation {
-            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-        }
+        return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -255,18 +253,16 @@ fn patch(
         if let Some(g) = query
             .get("ifGenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && g != o.generation
         {
-            if g != o.generation {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
         if let Some(m) = query
             .get("ifMetagenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && m != o.metageneration
         {
-            if m != o.metageneration {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
     }
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -286,18 +282,16 @@ fn delete(state: &FakeState, name: &str, query: &HashMap<String, String>) -> Res
         if let Some(g) = query
             .get("ifGenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && g != o.generation
         {
-            if g != o.generation {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
         if let Some(m) = query
             .get("ifMetagenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && m != o.metageneration
         {
-            if m != o.metageneration {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
     }
     store.objects.remove(name);
@@ -318,11 +312,11 @@ fn list(state: &FakeState, query: &HashMap<String, String>) -> Response<Full<Byt
         let Some(rest) = k.strip_prefix(&prefix) else {
             continue;
         };
-        if !delim.is_empty() {
-            if let Some(idx) = rest.find(&delim) {
-                prefixes.insert(format!("{prefix}{}", &rest[..=idx]));
-                continue;
-            }
+        if !delim.is_empty()
+            && let Some(idx) = rest.find(&delim)
+        {
+            prefixes.insert(format!("{prefix}{}", &rest[..=idx]));
+            continue;
         }
         items.push(k);
     }

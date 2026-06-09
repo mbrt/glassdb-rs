@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Collection, Ctx, Error, Tx, DB};
+use glassdb::{Backend, Collection, Ctx, DB, Error, Tx};
 
 async fn init_db(b: Arc<dyn Backend>) -> DB {
     DB::open(&Ctx::background(), "example", b).await.unwrap()
