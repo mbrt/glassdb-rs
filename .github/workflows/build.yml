@@ -28,11 +28,38 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: Install protoc
-      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
     - name: Test all
       run: make test
 
     - name: Test sim
       run: make test-sim
+
+  proto-codegen:
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+    - name: Regenerate prost bindings
+      run: hack/regen-proto.sh
+
+    - name: Verify generated bindings are up-to-date
+      run: |
+        target=crates/glassdb-proto/src/generated.rs
+        drift=$(git status --porcelain -- "$target")
+        if [ -n "$drift" ]; then
+          echo "::error::$target is out of sync with proto/transaction.proto. Run hack/regen-proto.sh and commit the result." >&2
+          echo "$drift" >&2
+          git --no-pager diff -- "$target" >&2 || true
+          exit 1
+        fi
