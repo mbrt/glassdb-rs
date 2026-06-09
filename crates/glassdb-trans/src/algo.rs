@@ -2143,4 +2143,201 @@ mod tests {
         let ra2 = do_read(&tctx, &keyp).await;
         assert_eq!(ra2.version.last_writer, *wh.id());
     }
+
+    /// Variant of [`new_algo_from_backend`] that wires a real [`Background`]
+    /// into the [`Algo`] so `async_cleanup` actually runs.
+    async fn new_algo_with_bg() -> (Algo, Tctx, Arc<Background>, Gc) {
+        let b = Arc::new(MemoryBackend::new());
+        let ctx = Ctx::background();
+        let local = Local::new(1024);
+        let global = Global::new(b.clone(), local.clone());
+        let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
+        let bg = Arc::new(Background::new());
+        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg.clone());
+        let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
+        let gc = Gc::new(bg.clone(), tlogger.clone());
+
+        global
+            .write(
+                &ctx,
+                &paths::collection_info(TEST_COLL),
+                COLL_INFO.to_vec(),
+                Tags::new(),
+            )
+            .await
+            .unwrap();
+
+        let algo = Algo::new(
+            global.clone(),
+            local.clone(),
+            locker.clone(),
+            tmon.clone(),
+            gc.clone(),
+            Some(bg.clone()),
+        );
+        (
+            algo,
+            Tctx {
+                backend: b,
+                global,
+                local,
+                tlogger,
+                tmon,
+                locker,
+            },
+            bg,
+            gc,
+        )
+    }
+
+    /// Yield-driven polling for background side effects. Yields between checks
+    /// so spawned tasks get a scheduler slice without consuming virtual time
+    /// (so it composes with `start_paused` tests that later advance the clock
+    /// via `tokio::time::sleep`).
+    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for: {label}");
+    }
+
+    /// Happy path: after a normal commit, the spawned cleanup task releases
+    /// every lock the transaction held, both in the local cache and in
+    /// storage. We never call `unlock_all` ourselves.
+    #[tokio::test]
+    async fn async_cleanup_releases_locks() {
+        let ctx = Ctx::background();
+        let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
+        let k1 = paths::from_key(TEST_COLL, b"k1");
+        let k2 = paths::from_key(TEST_COLL, b"k2");
+
+        let mut h = tm.begin(
+            &ctx,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
+            },
+        );
+        tm.commit(&ctx, &mut h).await.unwrap();
+        let tid = h.id().clone();
+
+        wait_for("async cleanup released the local lock set", || {
+            tctx.locker.locked_paths(&tid).is_empty()
+        })
+        .await;
+
+        for k in [&k1, &k2] {
+            let info = lock_info(&tctx, k).await;
+            assert_eq!(info.typ, LockType::None, "{k} still locked in storage");
+            assert_eq!(info.last_writer, tid);
+        }
+
+        bg.close().await;
+    }
+
+    /// Cancelling the original caller's context after `commit` returned must
+    /// not stop the cleanup: `Background::go` rebinds the spawned task to the
+    /// background's own cancellation token, so the parent's cancellation is
+    /// invisible to it.
+    #[tokio::test]
+    async fn async_cleanup_ignores_parent_cancellation() {
+        let (ctx, cancel) = Ctx::with_cancel();
+        let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
+        let k1 = paths::from_key(TEST_COLL, b"k1");
+
+        let mut h = tm.begin(
+            &ctx,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"v")],
+            },
+        );
+        tm.commit(&ctx, &mut h).await.unwrap();
+        let tid = h.id().clone();
+
+        cancel.cancel();
+
+        wait_for("async cleanup released locks despite parent cancel", || {
+            tctx.locker.locked_paths(&tid).is_empty()
+        })
+        .await;
+        let info = lock_info(&tctx, &k1).await;
+        assert_eq!(info.typ, LockType::None);
+        assert_eq!(info.last_writer, tid);
+
+        bg.close().await;
+    }
+
+    /// On success the cleanup schedules the transaction log for delayed GC.
+    /// We exercise the GC loop end-to-end: time auto-advances past the
+    /// cleanup interval and the log must be deleted from storage.
+    #[tokio::test(start_paused = true)]
+    async fn async_cleanup_schedules_tx_log_gc() {
+        let ctx = Ctx::background();
+        let (tm, tctx, bg, gc) = new_algo_with_bg().await;
+        gc.start(&ctx);
+        let k1 = paths::from_key(TEST_COLL, b"k1");
+
+        let mut h = tm.begin(
+            &ctx,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"v")],
+            },
+        );
+        tm.commit(&ctx, &mut h).await.unwrap();
+        let tid = h.id().clone();
+
+        assert!(
+            tctx.tlogger.get(&ctx, &tid).await.is_ok(),
+            "tx log must exist right after commit"
+        );
+
+        wait_for("async cleanup finished unlocking", || {
+            tctx.locker.locked_paths(&tid).is_empty()
+        })
+        .await;
+
+        // Two GC cleanup intervals plus slack: scheduling adds an item with
+        // `due = now + CLEANUP_INTERVAL`, and the loop drains items every
+        // `CLEANUP_INTERVAL`, so a single tick can miss it depending on
+        // ordering. Two ticks is always enough.
+        tokio::time::sleep(Duration::from_secs(180)).await;
+
+        let err = tctx.tlogger.get(&ctx, &tid).await.unwrap_err();
+        assert!(err.is_not_found(), "expected log deleted, got {err:?}");
+
+        bg.close().await;
+    }
+
+    /// Best-effort guarantee: shutting down while a cleanup is still in
+    /// flight must not hang. `Background::close` cancels the cleanup's
+    /// context, the in-flight unlocks bail with `Cancelled`, and the task
+    /// finishes. The cleanup is intentionally cheap: it doesn't compete with
+    /// real workload by holding the runtime hostage past shutdown.
+    #[tokio::test]
+    async fn async_cleanup_does_not_block_background_close() {
+        let ctx = Ctx::background();
+        let (tm, _tctx, bg, _gc) = new_algo_with_bg().await;
+        let k1 = paths::from_key(TEST_COLL, b"k1");
+
+        let mut h = tm.begin(
+            &ctx,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"v")],
+            },
+        );
+        tm.commit(&ctx, &mut h).await.unwrap();
+
+        // No wait here: close races the freshly-spawned cleanup task. If the
+        // cleanup ignored the shutdown signal (e.g. spun on the watchdog
+        // timeout) this would hang well past the test's default timeout.
+        tokio::time::timeout(Duration::from_secs(5), bg.close())
+            .await
+            .expect("Background::close did not return promptly");
+    }
 }
