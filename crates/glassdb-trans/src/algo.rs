@@ -157,7 +157,7 @@ struct ValidationState {
 }
 
 impl ValidationState {
-    fn to_error(&self) -> Result<(), TransError> {
+    fn outcome(&self) -> Result<(), TransError> {
         let mut retry = 0usize;
         let mut unknown = 0usize;
         let mut needsclock = 0usize;
@@ -652,7 +652,7 @@ impl Algo {
         }
         err?;
 
-        let res = vstate.to_error();
+        let res = vstate.outcome();
         if let Err(TransError::Retry) = &res {
             // Avoid retrying too often: do regular validation after locking.
             tx.require_locks = true;
@@ -892,7 +892,7 @@ impl Algo {
             None => validate.await,
         };
         res?;
-        vstate.to_error()
+        vstate.outcome()
     }
 
     async fn lock_collections(
@@ -955,7 +955,7 @@ impl Algo {
             vstate.paths[i] = item;
             r?;
         }
-        vstate.to_error()
+        vstate.outcome()
     }
 
     fn already_locked(&self, vstate: &ValidationState, tx: &Handle) -> bool {

@@ -39,15 +39,12 @@ crate is meant to be used directly.
 ## Quick start
 
 ```rust
-use std::sync::Arc;
-
+use glassdb::DB;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, DB};
 
 #[tokio::main]
 async fn main() -> Result<(), glassdb::Error> {
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let db = DB::open("example", backend).await?;
+    let db = DB::open("example", MemoryBackend::new()).await?;
 
     let users = db.collection(b"users");
     users.create().await?;

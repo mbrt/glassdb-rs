@@ -185,13 +185,23 @@ pub struct DB {
 impl DB {
     /// Starts building a database with the given name and backend. Chain setters
     /// on the returned [`DbBuilder`], then call [`DbBuilder::open`].
-    pub fn builder(name: impl Into<String>, b: Arc<dyn Backend>) -> DbBuilder {
-        DbBuilder::new(name, b)
+    ///
+    /// `b` may be any concrete backend (`MemoryBackend::new()`, etc.) or a
+    /// pre-erased `Arc<dyn Backend>` (covered by the crate's `impl Backend for
+    /// Arc<B>` blanket).
+    pub fn builder<B>(name: impl Into<String>, b: B) -> DbBuilder
+    where
+        B: Backend + 'static,
+    {
+        DbBuilder::new(name, Arc::new(b))
     }
 
     /// Opens a database with the given name using default options. Shorthand for
     /// `DB::builder(name, b).open()`.
-    pub async fn open(name: &str, b: Arc<dyn Backend>) -> Result<DB, Error> {
+    pub async fn open<B>(name: &str, b: B) -> Result<DB, Error>
+    where
+        B: Backend + 'static,
+    {
         DB::builder(name, b).open().await
     }
 
@@ -257,8 +267,8 @@ impl DB {
     /// Retrieves ongoing performance stats. Only updated when transactions
     /// close. Counters only increase; use [`Stats::sub`] for intervals.
     pub fn stats(&self) -> Stats {
-        let mut s = self.inner.stats.lock().unwrap();
         let bstats = self.inner.backend.stats_and_reset();
+        let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
         *s
     }

@@ -195,3 +195,76 @@ pub trait Backend: Send + Sync {
     /// Immediate sub-directory prefixes are returned, not their contents.
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError>;
 }
+
+/// Transparent delegation so any `Arc<B: Backend>` (including
+/// `Arc<dyn Backend>`) is itself a `Backend`. Lets generic APIs like
+/// `DB::open<B: Backend + 'static>(name, b)` accept a pre-erased
+/// `Arc<dyn Backend>` (e.g. a middleware stack assembled in a test) without a
+/// dedicated entry point.
+#[async_trait]
+impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
+    async fn read_if_modified(
+        &self,
+        path: &str,
+        expected_writer: &WriterId,
+    ) -> Result<ReadReply, BackendError> {
+        (**self).read_if_modified(path, expected_writer).await
+    }
+
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        (**self).read(path).await
+    }
+
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        (**self).get_metadata(path).await
+    }
+
+    async fn set_tags_if(
+        &self,
+        path: &str,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).set_tags_if(path, expected, tags).await
+    }
+
+    async fn write(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).write(path, value, tags).await
+    }
+
+    async fn write_if(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).write_if(path, value, expected, tags).await
+    }
+
+    async fn write_if_not_exists(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).write_if_not_exists(path, value, tags).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        (**self).delete(path).await
+    }
+
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        (**self).delete_if(path, expected).await
+    }
+
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        (**self).list(dir_path).await
+    }
+}
