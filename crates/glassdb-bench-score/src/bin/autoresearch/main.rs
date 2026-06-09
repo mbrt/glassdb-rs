@@ -20,14 +20,13 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use serde::Serialize;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Ctx, DB, Stats};
+use glassdb::{DB, Stats};
 
 use crate::metrics::Sample;
 
@@ -168,10 +167,9 @@ fn main() {
 async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
     let mut results = Vec::with_capacity(workloads::NAMES.len());
     for &name in workloads::NAMES {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let db = DB::open(&Ctx::background(), "autoresearch", backend).await?;
+        let db = DB::open("autoresearch", MemoryBackend::new()).await?;
         let sample = workloads::run(name, &db).await?;
-        db.close().await;
+        db.shutdown().await;
         results.push(to_result(sample)?);
     }
 

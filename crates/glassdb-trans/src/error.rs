@@ -3,7 +3,6 @@
 //! while wrapping storage/backend errors.
 
 use glassdb_backend::BackendError;
-use glassdb_concurr::Cancelled;
 use glassdb_storage::StorageError;
 
 /// Errors produced by the transaction engine.
@@ -23,9 +22,6 @@ pub enum TransError {
     /// with a fresh attempt that preserves the original priority.
     #[error("transaction was wounded")]
     Wounded,
-    /// The context was cancelled.
-    #[error("context canceled")]
-    Cancelled,
     /// Internal: re-run validation without retrying the whole transaction.
     #[error("retry validation")]
     ValidateRetry,
@@ -43,12 +39,6 @@ pub enum TransError {
 impl From<BackendError> for TransError {
     fn from(e: BackendError) -> Self {
         TransError::Storage(StorageError::Backend(e))
-    }
-}
-
-impl From<Cancelled> for TransError {
-    fn from(_: Cancelled) -> Self {
-        TransError::Cancelled
     }
 }
 
@@ -78,14 +68,5 @@ impl TransError {
     /// transaction must not be retried transparently.
     pub fn is_unavailable(&self) -> bool {
         matches!(self, TransError::Storage(s) if s.is_unavailable())
-    }
-
-    /// Reports whether the context was cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, TransError::Cancelled)
-            || matches!(
-                self,
-                TransError::Storage(StorageError::Backend(BackendError::Cancelled))
-            )
     }
 }
