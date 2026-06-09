@@ -27,6 +27,12 @@
 #   RUN_DURATION       rw9010 per-step duration        (default: 60s)
 #   DEADLOCK_DURATION  deadlock per-config duration    (default: 20s)
 #   AUTO_STOP          stop instance when done         (default: true)
+#
+# Each benchmark sweep (rw9010 and deadlock) is repeated 3 times back-to-back
+# with a 60s cool-down between runs (rtbench --num-runs / --run-cooldown). The
+# expensive rw9010 50k-key init is shared across runs; only the measured sweeps
+# are repeated, and every run appends to the same CSVs, so the plot script ends
+# up with tighter percentile bands.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,8 +98,8 @@ cmd_deploy() {
   rm -f "$bin"
 
   echo
-  echo "Done. The instance will pull the binary, run the benchmarks, upload"
-  echo "results to s3://$bucket/results/<timestamp>/, then stop itself."
+  echo "Done. The instance will pull the binary, run the benchmark,"
+  echo "upload results to s3://$bucket/results/<timestamp>/, then stop itself."
   echo "Stream the live log with: $0 logs"
   echo "Download results when done with: $0 results"
 }
