@@ -83,7 +83,20 @@ recover it on its own**:
    as `AlreadyFinalized`, which the commit path maps to a wound. This recovery
    is invisible to the caller.
 
-4. **Only the single-RW fast path surfaces in-doubt to the caller.** The fast
+4. **Pre-commit operations recover `Unavailable` in place.** An in-doubt
+   outcome while acquiring a *lock* happens before the commit point: no
+   user-visible value has been made durable yet, so re-reading the lock
+   metadata reveals whether the conditional write took, and re-applying it is
+   idempotent. The locker therefore retries the lock operation itself on
+   `Unavailable` (`LockerWorker::run` reloads metadata and re-attempts,
+   exactly as it already does for a stale `Precondition`), resolving the
+   uncertainty in place. The exception is `LockType::Create`: its outcome
+   under in-doubt is genuinely ambiguous from outside the writer (same
+   reasoning as the single-RW fast path), so a `Create` in-doubt result is
+   not retried by the locker. This recovery never escalates into a
+   whole-transaction retry that would needlessly re-run the user's closure.
+
+5. **Only the single-RW fast path surfaces in-doubt to the caller.** The fast
    path is logless: its value write is the commit point, and a lost ack
    followed by a re-observed precondition is indistinguishable from a genuine
    conflict from outside the writer. `DB::tx`'s loop only re-runs on
