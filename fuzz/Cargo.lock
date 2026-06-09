@@ -269,6 +269,7 @@ dependencies = [
  "glassdb-trans",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -293,6 +294,7 @@ dependencies = [
  "futures",
  "rand",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -347,6 +349,7 @@ dependencies = [
  "glassdb-storage",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
