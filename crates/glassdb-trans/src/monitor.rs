@@ -178,12 +178,11 @@ impl Monitor {
             tl.status = TxCommitStatus::Ok;
             self.set_final_log(ctx, tl.clone()).await.map_err(|e| {
                 // Preserve AlreadyFinalized so the commit path can recognize a
-                // wound (the log was already aborted out from under us), and an
-                // in-doubt outcome so the caller sees it and we never retry it
-                // transparently (which could double-apply the writes).
+                // wound (the log was already aborted out from under us).
+                // In-doubt outcomes are retried inside `set_final_log` because
+                // the log is keyed by tx id and the write is idempotent.
                 match e {
                     TransError::AlreadyFinalized => TransError::AlreadyFinalized,
-                    e if e.is_unavailable() => e,
                     other => TransError::Other(format!("writing tx log: {other}")),
                 }
             })?;
@@ -542,13 +541,38 @@ impl Monitor {
             match r {
                 Ok(_) => return Ok(()),
                 Err(e) if e.is_precondition() => {
-                    // Possible race on set; refresh the last version and retry.
+                    // The version moved under us. Possible races: our own
+                    // `refresh_pending` advancing the pending log, a wound
+                    // from another client writing `aborted`, or our own
+                    // previously-landed write (e.g. an `Unavailable` retry
+                    // below). Re-read and decide:
+                    //   - Status still `Pending`: it's a non-final race; it is
+                    //     always safe to refresh `last_v` and retry.
+                    //   - Status matches what we are writing: either us (only
+                    //     we write `committed` for our own tx id) or a wound
+                    //     that converged to the same outcome we wanted (only
+                    //     possible for `aborted`). Either way the desired
+                    //     final state is durable -> success.
+                    //   - Status final but mismatched (we wanted `committed`,
+                    //     found `aborted`): a wound landed first -> surface as
+                    //     `AlreadyFinalized` so the commit path treats it as a
+                    //     wound.
                     let st = self.inner.tl.commit_status(ctx, &tid).await?;
+                    if st.status == tlog.status {
+                        return Ok(());
+                    }
                     if st.status.is_final() {
                         return Err(TransError::AlreadyFinalized);
                     }
                     last_v = st.version;
                 }
+                // In-doubt outcome: the log write may or may not have landed.
+                // It is always safe to retry as long as the log status was not
+                // final: a not-yet-final log can only become final by a write
+                // that converges on our intent (us or a wound to `aborted`),
+                // and the precondition branch above resolves the matching /
+                // mismatched final outcomes correctly.
+                Err(e) if e.is_unavailable() => {}
                 Err(e) => return Err(e.into()),
             }
             tokio::select! {

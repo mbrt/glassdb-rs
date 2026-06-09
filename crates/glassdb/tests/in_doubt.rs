@@ -286,12 +286,20 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 }
 
 /// The logged (multi-write) path: when the *committed* transaction-log write —
-/// the commit point — lands but loses its ack, the commit must surface as
-/// in-doubt and must drive that commit point exactly once. A transparent retry
-/// would write a second committed log and re-apply the writes; asserting the
-/// committed-log write count is 1 proves it did not.
+/// the commit point — lands but loses its ack, the engine must retry the log
+/// write transparently and recognize the landed log as its own previously
+/// successful attempt. The log is keyed by tx id and only this client writes
+/// its own log, so the conditional write is idempotent: a transparent retry
+/// cannot double-apply.
+///
+/// The retry's `write_if_not_exists` sees the landed log and is rejected by a
+/// real `Precondition`. The engine then reads the log status, sees the final
+/// `committed` matching its own intent, and returns success. We observe two
+/// attempts at the committed-log path (the original lost-ack one + a single
+/// retry that fails with `Precondition`), but the writes themselves are
+/// applied exactly once.
 #[tokio::test(start_paused = true)]
-async fn logged_commit_lost_ack_surfaces_in_doubt_without_redrive() {
+async fn logged_commit_lost_ack_retries_transparently() {
     let ctx = Ctx::background();
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
@@ -316,23 +324,28 @@ async fn logged_commit_lost_ack_surfaces_in_doubt_without_redrive() {
     // Two distinct writes force the locked, log-based commit path. Capture `coll`
     // by reference so the body stays `FnMut` (re-runnable on a retry).
     let coll = &coll;
-    let res = db
-        .tx(&ctx, |tx| async move {
-            let a = read_int(&tx.read(coll, b"a").await.unwrap());
-            let b = read_int(&tx.read(coll, b"b").await.unwrap());
-            tx.write(coll, b"a", &write_int(a + 1))?;
-            tx.write(coll, b"b", &write_int(b + 1))
-        })
-        .await;
+    db.tx(&ctx, |tx| async move {
+        let a = read_int(&tx.read(coll, b"a").await.unwrap());
+        let b = read_int(&tx.read(coll, b"b").await.unwrap());
+        tx.write(coll, b"a", &write_int(a + 1))?;
+        tx.write(coll, b"b", &write_int(b + 1))
+    })
+    .await
+    .expect("the logged commit must retry the in-doubt log write transparently");
 
-    assert!(
-        matches!(res, Err(ref e) if e.is_unavailable()),
-        "expected an in-doubt error, got {res:?}"
-    );
+    // Each write applied exactly once — the safety invariant.
+    assert_eq!(read_int(&coll.read_strong(&ctx, b"a").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read_strong(&ctx, b"b").await.unwrap()), 1);
+
+    // Bound the retry: the engine drives the commit point exactly twice (the
+    // original lost-ack write, then a single retry that observes the landed
+    // log via `Precondition` and resolves to success). A bound above 2 would
+    // mean the engine kept hammering the committed-log path instead of
+    // recognizing its own landed write.
     assert_eq!(
         backend.committed_log_writes() - before,
-        1,
-        "the commit point must be driven exactly once (no transparent re-drive)"
+        2,
+        "expected one original + one retry attempt on the committed-log path",
     );
 }
 

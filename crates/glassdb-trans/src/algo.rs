@@ -414,16 +414,13 @@ impl Algo {
 
         if let Err(e) = self.commit_writes(ctx, &tx.data.writes, &tx.id).await {
             if matches!(e, TransError::AlreadyFinalized) {
-                // The log was already finalized as aborted: we were wounded (or
-                // reclaimed as expired) between validation and commit.
+                // The log was already finalized as `aborted`: we were wounded
+                // (or reclaimed as expired) between validation and commit.
+                // Third parties only write our log to wound (status
+                // `aborted`); a `committed` status can only come from our own
+                // previously-landed attempt, which `set_final_log` resolves to
+                // `Ok` internally.
                 return Err(TransError::Wounded);
-            }
-            if e.is_unavailable() {
-                // The commit outcome is unknown (e.g. the log write landed but
-                // its ack was lost). Surface it unchanged so the caller decides;
-                // the engine must not retry transparently, which could
-                // double-apply the writes.
-                return Err(e);
             }
             return Err(TransError::Other(format!(
                 "committing writes for tx {}: {e}",
@@ -1209,10 +1206,6 @@ impl Algo {
         self.mon.commit_tx(ctx, tl).await.map_err(|e| match e {
             // Preserve AlreadyFinalized so the commit path can map it to a wound.
             TransError::AlreadyFinalized => TransError::AlreadyFinalized,
-            // Preserve an in-doubt outcome (rather than flattening it to a
-            // string) so the caller can detect it and it is not retried
-            // transparently.
-            e if e.is_unavailable() => e,
             other => TransError::Other(format!("creating transaction object: {other}")),
         })
     }
