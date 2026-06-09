@@ -5,11 +5,11 @@
 //! transaction to finalize.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use glassdb_backend as backend;
-use glassdb_concurr::{Background, CancelToken, Clock, RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{Local, MAX_STALENESS, TLogger, TValue, TxCommitStatus, TxLog, Version};
 use tokio::sync::oneshot;
@@ -59,7 +59,10 @@ struct State {
 struct Inner {
     local: Local,
     tl: TLogger,
-    background: Arc<Background>,
+    // Weak so a `Monitor` clone captured inside a spawned task does not keep
+    // the [`Background`] alive across DB shutdown. The single strong owner
+    // is `DbInner._background`.
+    background: Weak<Background>,
     clock: Clock,
     retry: RetryConfig,
     // The transaction-tracking maps are partitioned into independent shards
@@ -92,7 +95,7 @@ pub struct WaitTxResult {
 
 impl Monitor {
     /// Creates a monitor using the real wall-clock and default retry timing.
-    pub fn new(local: Local, tl: TLogger, background: Arc<Background>) -> Self {
+    pub fn new(local: Local, tl: TLogger, background: Weak<Background>) -> Self {
         Self::with_config(local, tl, background, Clock::real(), RetryConfig::default())
     }
 
@@ -103,7 +106,7 @@ impl Monitor {
     pub fn with_config(
         local: Local,
         tl: TLogger,
-        background: Arc<Background>,
+        background: Weak<Background>,
         clock: Clock,
         retry: RetryConfig,
     ) -> Self {
@@ -144,8 +147,8 @@ impl Monitor {
     }
 
     /// Starts a background task that periodically refreshes the pending log so
-    /// the transaction is not considered expired. The task stops when its
-    /// [`Background`] is closed.
+    /// the transaction is not considered expired. The task is aborted when its
+    /// [`Background`] is dropped.
     pub fn start_refresh_tx(&self, tid: &TxId) {
         let need_start = {
             let mut st = self.shard_for(tid).lock().unwrap();
@@ -160,10 +163,16 @@ impl Monitor {
         if !need_start {
             return;
         }
+        // The captured `Monitor` clone only holds a `Weak<Background>`, so it
+        // does not keep `Background` alive past DB shutdown. If `Background`
+        // is already gone the refresh is silently skipped.
+        let Some(bg) = self.inner.background.upgrade() else {
+            return;
+        };
         let m = self.clone();
         let tid = tid.clone();
-        self.inner.background.go(move |token| async move {
-            m.refresh_pending(&token, tid).await;
+        bg.spawn(async move {
+            m.refresh_pending(tid).await;
         });
     }
 
@@ -601,18 +610,14 @@ impl Monitor {
         }
     }
 
-    async fn refresh_pending(&self, ctx: &CancelToken, tid: TxId) {
+    async fn refresh_pending(&self, tid: TxId) {
         if !self.should_refresh(&tid) {
             return;
         }
         let mut last_version = backend::Version::default();
 
         loop {
-            tokio::select! {
-                biased;
-                _ = ctx.cancelled() => return,
-                _ = rt::sleep(refresh_timeout()) => {}
-            }
+            rt::sleep(refresh_timeout()).await;
             if !self.should_refresh(&tid) {
                 return;
             }
@@ -660,6 +665,10 @@ mod tests {
     struct TestCtx {
         tl: TLogger,
         global: Global,
+        // The strong `Arc<Background>` lives here so refresh tasks can be
+        // spawned for the duration of the test; the `Monitor` only stores a
+        // `Weak`.
+        _bg: Arc<Background>,
     }
 
     fn new_test_monitor(b: Arc<dyn Backend>) -> (Monitor, TestCtx) {
@@ -671,8 +680,21 @@ mod tests {
         let global = Global::new(b, local.clone());
         let tl = TLogger::new(global.clone(), local.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::with_config(local, tl.clone(), bg, clock, RetryConfig::default());
-        (mon, TestCtx { tl, global })
+        let mon = Monitor::with_config(
+            local,
+            tl.clone(),
+            Arc::downgrade(&bg),
+            clock,
+            RetryConfig::default(),
+        );
+        (
+            mon,
+            TestCtx {
+                tl,
+                global,
+                _bg: bg,
+            },
+        )
     }
 
     #[tokio::test]

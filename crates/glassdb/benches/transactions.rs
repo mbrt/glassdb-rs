@@ -185,7 +185,7 @@ fn bench_single_rmw(c: &mut Criterion, rt: &Runtime) {
         group.bench_function(name, |bch| {
             bch.iter(|| rt.block_on(single_rmw(&db, &coll)));
         });
-        rt.block_on(db.close());
+        rt.block_on(db.shutdown());
     }
     group.finish();
 }
@@ -202,7 +202,7 @@ fn bench_multi_rmw(c: &mut Criterion, rt: &Runtime) {
         group.bench_function(name, |bch| {
             bch.iter(|| rt.block_on(multi_rmw(&db, &coll, &keys)));
         });
-        rt.block_on(db.close());
+        rt.block_on(db.shutdown());
     }
     group.finish();
 }
@@ -232,7 +232,7 @@ fn bench_multi_read(c: &mut Criterion, rt: &Runtime) {
         group.bench_function(name, |bch| {
             bch.iter(|| rt.block_on(multi_read(&db, &coll, &keys)));
         });
-        rt.block_on(db.close());
+        rt.block_on(db.shutdown());
     }
     group.finish();
 }
@@ -253,7 +253,7 @@ fn bench_hundred_writes(c: &mut Criterion, rt: &Runtime) {
                 rt.block_on(hundred_writes(&db, &coll, base));
             });
         });
-        rt.block_on(db.close());
+        rt.block_on(db.shutdown());
     }
     group.finish();
 }
@@ -297,8 +297,8 @@ fn bench_concurr_multi_rmw(c: &mut Criterion, rt: &Runtime) {
 
         handle.abort();
         let _ = rt.block_on(handle);
-        rt.block_on(db1.close());
-        rt.block_on(db2.close());
+        rt.block_on(db1.shutdown());
+        rt.block_on(db2.shutdown());
     }
     group.finish();
 }
@@ -346,7 +346,7 @@ fn bench_shared_read(c: &mut Criterion, rt: &Runtime) {
 
         handle.abort();
         let _ = rt.block_on(handle);
-        rt.block_on(db.close());
+        rt.block_on(db.shutdown());
     }
     group.finish();
 }

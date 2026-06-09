@@ -275,7 +275,7 @@ async fn open_and_run(
     };
     let coll = db.collection(COLLECTION);
     let _ = run_client(&db, &coll, ops, acct, consumed).await;
-    db.close().await;
+    db.shutdown().await;
 }
 
 /// Opens the simulation DB with the deterministic clock the fuzzer relies on
@@ -516,10 +516,13 @@ async fn run_inner(
     // Each client runs as its own task over its own transport so the scheduler
     // can interleave them. A `CancelToken` lets the crash nemesis simulate a
     // hard crash by racing the cancellation against the client's run loop; the
-    // dropped future is the in-Rust analog of a process death. The DB is
-    // always closed before we leave the task, so spawned background loops do
-    // not linger between phases (or across the restart) and consume scheduler
-    // steps for the rest of the run.
+    // dropped future is the in-Rust analog of a process death. On a clean run
+    // we `DB::shutdown` to drain in-flight transactions and dedup owners
+    // before the DB clone drops; on a crash we *skip* shutdown and let `Drop`
+    // tear everything down abruptly — that is the whole point of the crash
+    // nemesis. The background loops are torn down in both cases by
+    // `Background::drop` once the last `DB` clone goes out of scope (the
+    // captured-task cycle is broken by subsystems holding `Weak<Background>`).
     let mut handles = Vec::with_capacity(nclients);
     let mut tokens = Vec::with_capacity(nclients);
     for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
@@ -538,7 +541,9 @@ async fn run_inner(
                     _ = token.cancelled() => true,
                     _ = run_client(&db, &coll, &ops, &acct, &consumed) => false,
                 };
-                db.close().await;
+                if !crashed {
+                    db.shutdown().await;
+                }
                 crashed
             };
             // Crash-and-restart: a cancelled (crashed) client reopens the DB on
@@ -586,7 +591,7 @@ async fn run_inner(
                 .expect("final read"),
         );
     }
-    init_db.close().await;
+    init_db.shutdown().await;
 
     let acct = acct.lock().unwrap();
     assert_bounds(&acct, &finals, &expected, faults.enabled);
@@ -886,7 +891,7 @@ async fn open_and_run_cycle(backend: &Arc<dyn Backend>, swaps: &[usize], consume
     };
     let coll = db.collection(CYCLE_COLLECTION);
     let _ = run_cycle_client(&db, &coll, swaps, consumed).await;
-    db.close().await;
+    db.shutdown().await;
 }
 
 /// Core Cycle harness: lay down the ring, run the clients as interleaved tasks
@@ -929,8 +934,11 @@ async fn run_cycle_inner(
     // Each client runs its swaps as its own task so the scheduler interleaves
     // them; a crashed client restarts on the same backend to finish its
     // remaining swaps, recovering its own orphaned locks via lease expiry.
-    // The DB is closed before the task returns so its background loops do not
-    // linger for the rest of the run.
+    // On a clean run the DB is gracefully shut down (drain in-flight + dedup
+    // owners); on a crash we drop the DB without shutdown — that's the
+    // in-Rust analog of process death and the whole point of the crash
+    // nemesis. `Background::drop` still aborts spawned background loops in
+    // both cases.
     let mut handles = Vec::with_capacity(nclients);
     let mut tokens = Vec::with_capacity(nclients);
     for (swaps, backend) in workload.clients.into_iter().zip(client_backends) {
@@ -948,7 +956,9 @@ async fn run_cycle_inner(
                     _ = token.cancelled() => true,
                     _ = run_cycle_client(&db, &coll, &swaps, &consumed) => false,
                 };
-                db.close().await;
+                if !crashed {
+                    db.shutdown().await;
+                }
                 crashed
             };
             let n = consumed.load(Ordering::SeqCst);
@@ -982,7 +992,7 @@ async fn run_cycle_inner(
                     Err(_) => break,
                 }
             }
-            db.close().await;
+            db.shutdown().await;
         })
     });
 
@@ -1017,7 +1027,7 @@ async fn run_cycle_inner(
                 .expect("final read"),
         ) as usize;
     }
-    init_db.close().await;
+    init_db.shutdown().await;
 
     assert_ring(&next);
     log

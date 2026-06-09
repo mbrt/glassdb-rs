@@ -487,6 +487,25 @@ where
         .unwrap()
         .take()
         .expect("root task did not complete");
+
+    // Drop background tasks BEFORE the `CurrentGuard` clears `CURRENT`. Some
+    // futures invoke `rt::spawn` from their `Drop` (e.g. `Dedup::DriverGuard`
+    // hands the rest of a batch off to a freshly-spawned owner), and that
+    // dispatch needs to see the simulation executor still installed. Re-entrant
+    // spawns from a task's `Drop` would deadlock on the executor's `RefCell`
+    // if we held it across the drop, so we repeatedly snapshot-and-clear the
+    // task map until it stays empty.
+    loop {
+        let drained: Vec<_> = std::mem::take(&mut handle.inner.borrow_mut().tasks)
+            .into_iter()
+            .collect();
+        if drained.is_empty() {
+            break;
+        }
+        drop(drained);
+    }
+    drop(handle);
+
     result
 }
 

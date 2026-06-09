@@ -382,7 +382,7 @@ where
     let db = open_db(handle, backend);
     let mut ben = Benchmarker::new(duration);
     let res = f(&mut ben, &db, handle);
-    handle.block_on(db.close());
+    handle.block_on(db.shutdown());
     res?;
     println!("{name},{}", ben.results_row());
     Ok(())
@@ -786,7 +786,7 @@ fn read_write_9010_all_dbs(
             strong: benches[di].strong.results(),
             weak: benches[di].weak.results(),
         });
-        handle.block_on(db.close());
+        handle.block_on(db.shutdown());
     }
 
     run?;
@@ -905,7 +905,7 @@ fn init_keys(
     handle.block_on(async {
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
-    handle.block_on(db.close());
+    handle.block_on(db.shutdown());
     Ok(keys)
 }
 
@@ -940,7 +940,7 @@ fn run_deadlock(
                 let mut ben = Benchmarker::new(args.duration);
                 let res =
                     overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
-                handle.block_on(db.close());
+                handle.block_on(db.shutdown());
                 res?;
 
                 let results = ben.bench.results();

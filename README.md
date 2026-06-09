@@ -71,7 +71,7 @@ async fn main() -> Result<(), glassdb::Error> {
     })
     .await?;
 
-    db.close().await;
+    db.shutdown().await;
     Ok(())
 }
 ```

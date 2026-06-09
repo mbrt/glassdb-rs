@@ -48,10 +48,12 @@ Go's runtime primitives map onto tokio as follows.
 
 | Go | Rust |
 | --- | --- |
-| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context. `CancelToken` is an implementation detail of `Background` and `Dedup` (so background loops can observe DB shutdown) and is not threaded through the rest of the engine |
+| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context. `CancelToken` survives only as an internal helper inside `Dedup`; `Background` aborts spawned tasks via [`JoinHandle::abort`] from its `Drop` impl |
 | `context.Context` (values) | not used. The one Go consumer (a deterministic tx-id override) was dropped: under `--cfg sim` the same determinism falls out of `TxId::new_at` drawing its random prefix from the seeded executor RNG and its timestamp from the anchored clock |
 | goroutine | `tokio::spawn` |
-| `concurr.Background` (managed goroutines, cancelled together) | `Background` (TaskTracker-shaped) over `CancelToken` + tracked `JoinHandle`s; closures receive the shutdown token |
+| `concurr.Background` (managed goroutines, cancelled together) | `Background` is a [`JoinHandle`] collection: `spawn(fut)` tracks the handle; `Drop` calls `abort()` on every tracked handle. Subsystems hold `Weak<Background>` so the captured-task cycle does not pin it alive |
+| `db.Close` (graceful shutdown) | [`DB::shutdown`] — flips a shutting-down flag so new `DB::tx` calls return `Error::ShuttingDown`, awaits in-flight transactions to drain, then awaits dedup owners; background loops are torn down via `Drop` on the last `DB` clone |
+| Transaction cancellation cleanup | `DbInner::tx_impl` owns a `TxAbortGuard` RAII helper armed after `algo.begin`/`algo.rebegin` and disarmed after `algo.end`. If the surrounding future is dropped in-between, the guard's `Drop` schedules `Algo::async_abort` so the engine-side tx is marked aborted promptly instead of lingering until lease expiry |
 | `errgroup` / bounded fan-out | `futures::stream::iter(...).buffer_unordered(n)` (see `Algo::run_limited`) and, in tests, `tokio::join!` |
 | `sync.Mutex` over small state | `std::sync::Mutex`, **never held across `.await`** |
 | channels | `tokio::sync` channels |
