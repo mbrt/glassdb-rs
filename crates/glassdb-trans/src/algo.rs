@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use glassdb_backend::{self as backend, Metadata};
-use glassdb_concurr::{Background, CancelToken, Ctx, rt};
+use glassdb_concurr::{Background, CancelToken, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
     Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version, tags_lock_info,
@@ -357,12 +357,12 @@ impl Algo {
         &self.locker
     }
 
-    /// Starts a new transaction with the given data.
-    pub fn begin(&self, ctx: &Ctx, d: Data) -> Handle {
-        let id = match ctx.tx_id() {
-            Some(b) => TxId::from_bytes(b.to_vec()),
-            None => TxId::new_at(now_unix_nanos(self.mon.clock_now())),
-        };
+    /// Starts a new transaction with the given data. The id's random prefix
+    /// and timestamp are deterministic under `--cfg sim` because they are
+    /// drawn from the seeded executor RNG and the anchored clock
+    /// respectively, so wound-wait priorities replay byte-for-byte.
+    pub fn begin(&self, _ctx: &CancelToken, d: Data) -> Handle {
+        let id = TxId::new_at(now_unix_nanos(self.mon.clock_now()));
         Handle {
             data: d,
             status: Status::New,
@@ -388,7 +388,7 @@ impl Algo {
 
     /// Validates all reads and applies all writes, returning [`TransError::Retry`]
     /// on a detected conflict.
-    pub async fn commit(&self, ctx: &Ctx, tx: &mut Handle) -> Result<(), TransError> {
+    pub async fn commit(&self, ctx: &CancelToken, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
             tx.status = Status::Validating;
@@ -428,13 +428,13 @@ impl Algo {
             )));
         }
         tx.status = Status::Committed;
-        self.async_cleanup(ctx, tx);
+        self.async_cleanup(tx);
         Ok(())
     }
 
     /// Reports whether the transaction was already aborted by a higher-priority
     /// transaction. Best-effort: a status read error is not treated as a wound.
-    async fn was_wounded(&self, ctx: &Ctx, tx: &Handle) -> bool {
+    async fn was_wounded(&self, ctx: &CancelToken, tx: &Handle) -> bool {
         matches!(
             self.mon.tx_status(ctx, &tx.id).await,
             Ok(glassdb_storage::TxCommitStatus::Aborted)
@@ -443,7 +443,11 @@ impl Algo {
 
     /// Validates the reads of a read-only transaction, returning
     /// [`TransError::Retry`] if any read was invalidated.
-    pub async fn validate_reads(&self, ctx: &Ctx, tx: &mut Handle) -> Result<(), TransError> {
+    pub async fn validate_reads(
+        &self,
+        ctx: &CancelToken,
+        tx: &mut Handle,
+    ) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
             tx.status = Status::Validating;
@@ -471,13 +475,13 @@ impl Algo {
     }
 
     /// Aborts a non-committed transaction, releasing its locks.
-    pub async fn end(&self, ctx: &Ctx, tx: &mut Handle) -> Result<(), TransError> {
+    pub async fn end(&self, ctx: &CancelToken, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::Committed {
             return Ok(());
         }
         if let Err(e) = self.mon.abort_tx(ctx, &tx.id).await {
             // A timeout here is fine; we follow up with an async cleanup.
-            self.async_cleanup(ctx, tx);
+            self.async_cleanup(tx);
             return Err(e);
         }
         Ok(())
@@ -485,7 +489,7 @@ impl Algo {
 
     async fn validate_round(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
@@ -519,7 +523,7 @@ impl Algo {
 
     async fn validate_read_write(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
@@ -545,7 +549,7 @@ impl Algo {
         }
     }
 
-    async fn commit_single_rw(&self, ctx: &Ctx, tx: &mut Handle) -> Result<(), TransError> {
+    async fn commit_single_rw(&self, ctx: &CancelToken, tx: &mut Handle) -> Result<(), TransError> {
         let read = tx.data.reads[0].clone();
         let write = tx.data.writes[0].clone();
 
@@ -586,7 +590,7 @@ impl Algo {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is_precondition() => {
                     // Raced: refresh metadata with a strong read and retry.
-                    meta = match self.global.get_metadata(ctx, &read.path).await {
+                    meta = match self.global.get_metadata(&read.path).await {
                         Ok(m) => m,
                         Err(e) if e.is_not_found() => return Err(TransError::NoSingleWrite),
                         Err(e) => {
@@ -609,7 +613,7 @@ impl Algo {
 
     async fn validate_readonly(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
@@ -643,8 +647,12 @@ impl Algo {
         res
     }
 
-    async fn validate_read(&self, ctx: &Ctx, item: &mut PathState) -> Result<(), TransError> {
-        let meta = match self.global.get_metadata(ctx, &item.path).await {
+    async fn validate_read(
+        &self,
+        ctx: &CancelToken,
+        item: &mut PathState,
+    ) -> Result<(), TransError> {
+        let meta = match self.global.get_metadata(&item.path).await {
             Ok(m) => m,
             Err(e) if e.is_not_found() => {
                 item.result = VResult::Retry;
@@ -668,7 +676,7 @@ impl Algo {
 
     async fn validate_locked_read(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         item: &mut PathState,
         li: &glassdb_storage::LockInfo,
         read_from: &TxId,
@@ -782,10 +790,10 @@ impl Algo {
 
     async fn validate_read_not_found(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         item: &mut PathState,
     ) -> Result<(), TransError> {
-        let meta = match self.global.get_metadata(ctx, &item.path).await {
+        let meta = match self.global.get_metadata(&item.path).await {
             Ok(m) => m,
             Err(e) if e.is_not_found() => {
                 item.result = VResult::Ok;
@@ -863,7 +871,7 @@ impl Algo {
 
     async fn parallel_validate(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
@@ -891,7 +899,7 @@ impl Algo {
 
     async fn lock_collections(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &ValidationState,
         tx: &Handle,
     ) -> Result<(), TransError> {
@@ -916,7 +924,7 @@ impl Algo {
 
     async fn serial_validate(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
@@ -1002,7 +1010,7 @@ impl Algo {
 
     async fn lock_validate(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         vstate: &mut ValidationState,
         tx: &Handle,
     ) -> Result<(), TransError> {
@@ -1027,7 +1035,7 @@ impl Algo {
 
     async fn lock_validate_key(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         item: &mut PathState,
         tx: &Handle,
     ) -> Result<(), TransError> {
@@ -1052,14 +1060,14 @@ impl Algo {
 
     async fn lock_validate_found_key(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         item: &mut PathState,
         tx: &Handle,
     ) -> Result<(), TransError> {
         let lock_res = if item.write {
-            self.lock_write(ctx, &item.path, tx).await
+            self.locker.lock_write(ctx, &item.path, &tx.id).await
         } else if item.read {
-            self.lock_read(ctx, &item.path, tx).await
+            self.locker.lock_read(ctx, &item.path, &tx.id).await
         } else {
             Ok(())
         };
@@ -1095,12 +1103,12 @@ impl Algo {
 
     async fn lock_validate_not_found_key(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         item: &mut PathState,
         tx: &Handle,
     ) -> Result<(), TransError> {
         if item.read && item.write {
-            match self.lock_create(ctx, &item.path, tx).await {
+            match self.locker.lock_create(ctx, &item.path, &tx.id).await {
                 Ok(()) => {
                     item.result = VResult::Ok;
                     Ok(())
@@ -1112,7 +1120,7 @@ impl Algo {
                 Err(e) => Err(e),
             }
         } else if item.read && !item.write {
-            match self.global.get_metadata(ctx, &item.path).await {
+            match self.global.get_metadata(&item.path).await {
                 Err(e) if e.is_not_found() => {
                     item.result = VResult::Ok;
                     Ok(())
@@ -1120,7 +1128,7 @@ impl Algo {
                 Err(e) => Err(e.into()),
                 Ok(_) => {
                     // The item exists now; lock read and validate.
-                    match self.lock_read(ctx, &item.path, tx).await {
+                    match self.locker.lock_read(ctx, &item.path, &tx.id).await {
                         Err(e) if e.is_not_found() => {
                             item.result = VResult::Ok;
                             Ok(())
@@ -1134,14 +1142,14 @@ impl Algo {
                 }
             }
         } else if item.write {
-            match self.lock_create(ctx, &item.path, tx).await {
+            match self.locker.lock_create(ctx, &item.path, &tx.id).await {
                 Ok(()) => {
                     item.result = VResult::Ok;
                     Ok(())
                 }
                 Err(e) if e.is_precondition() => {
                     // Found now; lock it in write instead.
-                    self.lock_write(ctx, &item.path, tx).await?;
+                    self.locker.lock_write(ctx, &item.path, &tx.id).await?;
                     item.result = VResult::Ok;
                     Ok(())
                 }
@@ -1154,36 +1162,20 @@ impl Algo {
 
     async fn lock_path(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         path: &str,
         lt: LockType,
         tx: &Handle,
     ) -> Result<(), TransError> {
         match lt {
-            LockType::Read => self.lock_read(ctx, path, tx).await,
-            LockType::Write => self.lock_write(ctx, path, tx).await,
-            LockType::Create => self.lock_create(ctx, path, tx).await,
+            LockType::Read => self.locker.lock_read(ctx, path, &tx.id).await,
+            LockType::Write => self.locker.lock_write(ctx, path, &tx.id).await,
+            LockType::Create => self.locker.lock_create(ctx, path, &tx.id).await,
             other => Err(TransError::Other(format!(
                 "unsupported lock type {other:?}"
             ))),
         }
         .map_err(|e| TransError::Other(format!("locking path {path:?}: {e}")))
-    }
-
-    async fn lock_read(&self, ctx: &Ctx, key: &str, tx: &Handle) -> Result<(), TransError> {
-        self.locker.lock_read(ctx, key, &tx.id).await
-    }
-
-    async fn lock_write(&self, ctx: &Ctx, key: &str, tx: &Handle) -> Result<(), TransError> {
-        self.locker.lock_write(ctx, key, &tx.id).await
-    }
-
-    async fn lock_create(&self, ctx: &Ctx, key: &str, tx: &Handle) -> Result<(), TransError> {
-        self.locker.lock_create(ctx, key, &tx.id).await
-    }
-
-    async fn unlock(&self, ctx: &Ctx, key: &str, tx: &Handle) -> Result<(), TransError> {
-        self.locker.unlock(ctx, key, &tx.id).await
     }
 
     fn update_local_cache(&self, vstate: &ValidationState) {
@@ -1197,7 +1189,7 @@ impl Algo {
 
     async fn commit_writes(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         writes: &[WriteAccess],
         id: &TxId,
     ) -> Result<(), TransError> {
@@ -1222,7 +1214,7 @@ impl Algo {
         }
     }
 
-    async fn unlock_all(&self, ctx: &Ctx, tx: &Handle) -> Result<(), TransError> {
+    async fn unlock_all(&self, ctx: &CancelToken, tx: &Handle) -> Result<(), TransError> {
         let ps = self.locker.locked_paths(&tx.id);
         if ps.is_empty() {
             return Ok(());
@@ -1231,7 +1223,7 @@ impl Algo {
             .run_indexed(ctx, ps.len(), |ctx, i| {
                 let pl = ps[i].clone();
                 async move {
-                    match self.unlock(&ctx, &pl.path, tx).await {
+                    match self.locker.unlock(&ctx, &pl.path, &tx.id).await {
                         Ok(()) => Ok(None::<TransError>),
                         Err(e) => Ok(Some(TransError::Other(format!(
                             "unlocking {:?}: {e}",
@@ -1252,7 +1244,7 @@ impl Algo {
         Ok(())
     }
 
-    fn async_cleanup(&self, ctx: &Ctx, tx: &Handle) {
+    fn async_cleanup(&self, tx: &Handle) {
         let Some(bg) = &self.background else {
             return;
         };
@@ -1262,21 +1254,7 @@ impl Algo {
         }
         let algo = self.clone();
         let tid = tx.id.clone();
-        bg.go(ctx, move |ctx| async move {
-            // Bound the cleanup with a timeout.
-            let (cctx, token) = ctx.child_cancel();
-            let t2 = token.clone();
-            rt::spawn(async move {
-                // Watchdog: either outcome leaves the token cancelled and the
-                // task done, so poll order is immaterial (not cancellation
-                // safety). Determinism under sim comes from the seeded select
-                // RNG (see exec::block_on_with).
-                tokio::select! {
-                    _ = rt::sleep(BG_CLEANUP_TIMEOUT) => t2.cancel(),
-                    _ = t2.cancelled() => {}
-                }
-            });
-
+        bg.go(move |_tok| async move {
             let handle = Handle {
                 data: Data::default(),
                 status: Status::Committed,
@@ -1284,23 +1262,35 @@ impl Algo {
                 require_locks: false,
                 serial_locking: false,
             };
+            // Bound the cleanup with a sleep-based watchdog: when it elapses
+            // the `select!` drops the `run_limited` future, which in turn
+            // cancels every in-flight unlock attempt. Using `rt::sleep` keeps
+            // the watchdog deterministic under `--cfg sim`.
+            let bg_ctx = CancelToken::new();
+            let ps_len = ps.len();
             let algo_ref = &algo;
             let handle_ref = &handle;
             let ps_ref = &ps;
-            let (outs, _) = algo
-                .run_limited(
-                    &cctx,
-                    BACKGROUND_CONCURRENCY,
-                    ps.len(),
-                    move |ctx, i| async move {
-                        match algo_ref.unlock(&ctx, &ps_ref[i].path, handle_ref).await {
-                            Ok(()) => Ok(None::<()>),
-                            Err(_) => Ok(Some(())),
-                        }
-                    },
-                )
-                .await;
-            token.cancel();
+            let work = algo.run_limited(
+                &bg_ctx,
+                BACKGROUND_CONCURRENCY,
+                ps_len,
+                move |c, i| async move {
+                    match algo_ref
+                        .locker
+                        .unlock(&c, &ps_ref[i].path, &handle_ref.id)
+                        .await
+                    {
+                        Ok(()) => Ok(None::<()>),
+                        Err(_) => Ok(Some(())),
+                    }
+                },
+            );
+            let outs = tokio::select! {
+                biased;
+                r = work => r.0,
+                _ = rt::sleep(BG_CLEANUP_TIMEOUT) => return,
+            };
             let failures = outs.into_iter().flatten().flatten().count();
             if failures == 0 {
                 algo.gc.schedule_tx_cleanup(tid);
@@ -1310,12 +1300,12 @@ impl Algo {
 
     async fn run_indexed<T, F, Fut>(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         num: usize,
         f: F,
     ) -> (Vec<Option<T>>, Result<(), TransError>)
     where
-        F: Fn(Ctx, usize) -> Fut,
+        F: Fn(CancelToken, usize) -> Fut,
         Fut: std::future::Future<Output = Result<T, TransError>>,
     {
         self.run_limited(ctx, ALGO_CONCURRENCY, num, f).await
@@ -1323,22 +1313,22 @@ impl Algo {
 
     async fn run_limited<T, F, Fut>(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         limit: usize,
         num: usize,
         f: F,
     ) -> (Vec<Option<T>>, Result<(), TransError>)
     where
-        F: Fn(Ctx, usize) -> Fut,
+        F: Fn(CancelToken, usize) -> Fut,
         Fut: std::future::Future<Output = Result<T, TransError>>,
     {
         let mut outs: Vec<Option<T>> = (0..num).map(|_| None).collect();
         if num == 0 {
             return (outs, Ok(()));
         }
-        let (child_ctx, token) = ctx.child_cancel();
+        let token = ctx.child_token();
         let f = &f;
-        let child_ctx = &child_ctx;
+        let child_ctx = &token;
         let mut stream = futures::stream::iter(0..num)
             .map(|i| {
                 let c = child_ctx.clone();
@@ -1370,7 +1360,11 @@ impl Algo {
         self.locker.lock_type(&cpath, &tx.id) == expected
     }
 
-    fn deadlock_timeout_ctx(&self, ctx: &Ctx, vstate: &ValidationState) -> (Ctx, DeadlockGuard) {
+    fn deadlock_timeout_ctx(
+        &self,
+        ctx: &CancelToken,
+        vstate: &ValidationState,
+    ) -> (CancelToken, DeadlockGuard) {
         if vstate.paths.len() <= 1 {
             return (ctx.clone(), DeadlockGuard { token: None });
         }
@@ -1378,7 +1372,7 @@ impl Algo {
             LOCK_LATENCY * 4 * vstate.paths.len() as u32,
             MAX_DEADLOCK_TIMEOUT,
         );
-        let (child, token) = ctx.child_cancel();
+        let token = ctx.child_token();
         let t2 = token.clone();
         rt::spawn(async move {
             // Watchdog: either outcome leaves the token cancelled and the task
@@ -1390,7 +1384,7 @@ impl Algo {
                 _ = t2.cancelled() => {}
             }
         });
-        (child, DeadlockGuard { token: Some(token) })
+        (token.clone(), DeadlockGuard { token: Some(token) })
     }
 }
 
@@ -1432,7 +1426,6 @@ mod tests {
     }
 
     async fn new_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
-        let ctx = Ctx::background();
         let local = Local::new(1024);
         let global = Global::new(b.clone(), local.clone());
         let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
@@ -1443,7 +1436,6 @@ mod tests {
 
         global
             .write(
-                &ctx,
                 &paths::collection_info(TEST_COLL),
                 COLL_INFO.to_vec(),
                 Tags::new(),
@@ -1491,7 +1483,7 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(tctx.local.clone(), tctx.global.clone(), tctx.tmon.clone());
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         match reader.read(&ctx, path, MAX_STALENESS).await {
             Ok(rv) => ReadAccess {
                 path: path.into(),
@@ -1518,7 +1510,7 @@ mod tests {
     }
 
     async fn commit_access(tm: &Algo, d: Data) -> Handle {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let mut h = tm.begin(&ctx, d);
         tm.commit(&ctx, &mut h).await.unwrap();
         tm.end(&ctx, &mut h).await.unwrap();
@@ -1537,18 +1529,17 @@ mod tests {
     }
 
     async fn flush_writes(tm: &Algo, h: &Handle) {
-        tm.unlock_all(&Ctx::background(), h).await.unwrap();
+        tm.unlock_all(&CancelToken::new(), h).await.unwrap();
     }
 
     async fn lock_info(tctx: &Tctx, key: &str) -> glassdb_storage::LockInfo {
-        let ctx = Ctx::background();
-        let m = tctx.global.get_metadata(&ctx, key).await.unwrap();
+        let m = tctx.global.get_metadata(key).await.unwrap();
         tags_lock_info(&m.tags).unwrap()
     }
 
     #[tokio::test]
     async fn write_new() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -1564,7 +1555,7 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&ctx, &mut h).await.unwrap();
 
-        tctx.global.read(&ctx, &keyp).await.unwrap();
+        tctx.global.read(&keyp).await.unwrap();
         let status = tctx.tlogger.commit_status(&ctx, &tid).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
 
@@ -1591,7 +1582,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_not_found_write() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -1611,14 +1602,14 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&ctx, &mut h).await.unwrap();
 
-        tctx.global.read(&ctx, &keyp).await.unwrap();
+        tctx.global.read(&keyp).await.unwrap();
         let status = tctx.tlogger.commit_status(&ctx, &tid).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
     }
 
     #[tokio::test]
     async fn single_read_write() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -1626,7 +1617,7 @@ mod tests {
         let h = commit_writes(&tm, vec![wa(&keyp, b"init")]).await;
         flush_writes(&tm, &h).await;
 
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
 
         let mut h = tm.begin(
             &ctx,
@@ -1644,13 +1635,13 @@ mod tests {
         tm.commit(&ctx, &mut h).await.unwrap();
         tm.end(&ctx, &mut h).await.unwrap();
 
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
         assert_eq!(gr.value, val);
     }
 
     #[tokio::test]
     async fn read_write_while_lock_create() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -1659,7 +1650,7 @@ mod tests {
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         commit_writes(&tm2, vec![wa(&keyp, b"init")]).await;
 
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
 
         let mut h = tm.begin(
             &ctx,
@@ -1677,7 +1668,7 @@ mod tests {
         let err = tm.commit(&ctx, &mut h).await.unwrap_err();
         assert!(err.is_retry(), "expected retry, got {err:?}");
 
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
         tm.reset(
             &mut h,
             Data {
@@ -1699,13 +1690,13 @@ mod tests {
         assert_eq!(lr.version.writer, *h.id());
 
         tm.unlock_all(&ctx, &h).await.unwrap();
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
         assert_eq!(gr.value, val);
     }
 
     #[tokio::test]
     async fn readonly() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -1713,7 +1704,7 @@ mod tests {
         let h = commit_writes(&tm, vec![wa(&keyp, val)]).await;
         flush_writes(&tm, &h).await;
 
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
 
         let mut h = tm.begin(
             &ctx,
@@ -1731,13 +1722,13 @@ mod tests {
         tm.commit(&ctx, &mut h).await.unwrap();
         tm.end(&ctx, &mut h).await.unwrap();
 
-        let gr = tctx.global.read(&ctx, &keyp).await.unwrap();
+        let gr = tctx.global.read(&keyp).await.unwrap();
         assert_eq!(gr.value, val);
     }
 
     #[tokio::test]
     async fn readonly_in_lock_create() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -1758,7 +1749,7 @@ mod tests {
 
     #[tokio::test]
     async fn readonly_after_delete() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 
@@ -1790,7 +1781,7 @@ mod tests {
 
     #[tokio::test]
     async fn readonly_local_after_delete() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 
@@ -1810,7 +1801,7 @@ mod tests {
 
     #[tokio::test]
     async fn readonly_local_after_delete_flushed() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 
@@ -1831,7 +1822,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_rw_retry() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         let keyp = paths::from_key(TEST_COLL, b"k");
@@ -1877,7 +1868,7 @@ mod tests {
     /// so validation must not cache an unresolvable value tagged with that writer.
     #[tokio::test]
     async fn single_rw_lost_update() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm_writer, tctx_w) = new_algo().await;
         let (tm_victim, tctx_v) = new_algo_from_backend(tctx_w.backend.clone()).await;
         let (_, tctx_l) = new_algo_from_backend(tctx_w.backend.clone()).await;
@@ -1906,7 +1897,7 @@ mod tests {
         let w1 = h_w1.id.clone();
         let st = tctx_w.tlogger.commit_status(&ctx, &w1).await.unwrap();
         assert_eq!(st.status, TxCommitStatus::Unknown);
-        let gr = tctx_w.global.read(&ctx, &key).await.unwrap();
+        let gr = tctx_w.global.read(&key).await.unwrap();
         assert_eq!(gr.value, v1);
         assert_eq!(gr.writer(), w1);
 
@@ -1960,7 +1951,7 @@ mod tests {
     /// other forever — the livelock a fuzz run surfaced.
     #[tokio::test]
     async fn already_locked_requires_every_needed_lock() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let k1 = paths::from_key(TEST_COLL, b"k1");
         let k2 = paths::from_key(TEST_COLL, b"k2");
@@ -1998,7 +1989,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_writes_clean_abort() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keys = [
             paths::from_key(TEST_COLL, b"k1"),
@@ -2057,7 +2048,7 @@ mod tests {
         for num_writes in 1..=3 {
             let (tm, tctx) = new_algo().await;
             let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-            let ctx = Ctx::background();
+            let ctx = CancelToken::new();
 
             let keys: Vec<String> = (0..num_writes)
                 .map(|i| paths::from_key(TEST_COLL, format!("k{i}").as_bytes()))
@@ -2093,7 +2084,7 @@ mod tests {
 
     #[tokio::test]
     async fn readonly_from_uncommitted() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let val = b"v";
@@ -2141,7 +2132,6 @@ mod tests {
     /// into the [`Algo`] so `async_cleanup` actually runs.
     async fn new_algo_with_bg() -> (Algo, Tctx, Arc<Background>, Gc) {
         let b = Arc::new(MemoryBackend::new());
-        let ctx = Ctx::background();
         let local = Local::new(1024);
         let global = Global::new(b.clone(), local.clone());
         let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
@@ -2152,7 +2142,6 @@ mod tests {
 
         global
             .write(
-                &ctx,
                 &paths::collection_info(TEST_COLL),
                 COLL_INFO.to_vec(),
                 Tags::new(),
@@ -2202,7 +2191,7 @@ mod tests {
     /// storage. We never call `unlock_all` ourselves.
     #[tokio::test]
     async fn async_cleanup_releases_locks() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
         let k1 = paths::from_key(TEST_COLL, b"k1");
         let k2 = paths::from_key(TEST_COLL, b"k2");
@@ -2237,7 +2226,7 @@ mod tests {
     /// invisible to it.
     #[tokio::test]
     async fn async_cleanup_ignores_parent_cancellation() {
-        let (ctx, cancel) = Ctx::with_cancel();
+        let ctx = CancelToken::new();
         let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
         let k1 = paths::from_key(TEST_COLL, b"k1");
 
@@ -2251,7 +2240,7 @@ mod tests {
         tm.commit(&ctx, &mut h).await.unwrap();
         let tid = h.id().clone();
 
-        cancel.cancel();
+        ctx.cancel();
 
         wait_for("async cleanup released locks despite parent cancel", || {
             tctx.locker.locked_paths(&tid).is_empty()
@@ -2269,9 +2258,9 @@ mod tests {
     /// cleanup interval and the log must be deleted from storage.
     #[tokio::test(start_paused = true)]
     async fn async_cleanup_schedules_tx_log_gc() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, tctx, bg, gc) = new_algo_with_bg().await;
-        gc.start(&ctx);
+        gc.start();
         let k1 = paths::from_key(TEST_COLL, b"k1");
 
         let mut h = tm.begin(
@@ -2313,7 +2302,7 @@ mod tests {
     /// real workload by holding the runtime hostage past shutdown.
     #[tokio::test]
     async fn async_cleanup_does_not_block_background_close() {
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let (tm, _tctx, bg, _gc) = new_algo_with_bg().await;
         let k1 = paths::from_key(TEST_COLL, b"k1");
 

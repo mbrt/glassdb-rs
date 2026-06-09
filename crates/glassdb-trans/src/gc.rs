@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_concurr::rt::{self, Instant};
-use glassdb_concurr::{Background, Ctx};
+use glassdb_concurr::{Background, CancelToken};
 use glassdb_data::TxId;
 use glassdb_storage::TLogger;
 
@@ -42,17 +42,19 @@ impl Gc {
         }
     }
 
-    /// Starts the background cleanup loop.
-    pub fn start(&self, ctx: &Ctx) {
+    /// Starts the background cleanup loop. The loop stops when its
+    /// [`Background`] is closed (which cancels the token passed to the spawned
+    /// task).
+    pub fn start(&self) {
         let g = self.clone();
-        self.inner.bg.go(ctx, move |ctx| async move {
+        self.inner.bg.go(move |token| async move {
             // First cleanup happens only after one full interval (matching Go's
             // ticker, whose immediate first tick is skipped).
             loop {
                 tokio::select! {
                     biased;
-                    _ = ctx.cancelled() => return,
-                    _ = rt::sleep(CLEANUP_INTERVAL) => g.cleanup_round(&ctx).await,
+                    _ = token.cancelled() => return,
+                    _ = rt::sleep(CLEANUP_INTERVAL) => g.cleanup_round(&token).await,
                 }
             }
         });
@@ -69,7 +71,7 @@ impl Gc {
         items.push(CleanupItem { due, tid });
     }
 
-    async fn cleanup_round(&self, ctx: &Ctx) {
+    async fn cleanup_round(&self, ctx: &CancelToken) {
         let now = Instant::now();
         let to_cleanup = self.filter_due_items(now);
         for item in to_cleanup {
@@ -104,8 +106,8 @@ mod tests {
         let tl = TLogger::new(global, local, "test");
         let bg = Arc::new(Background::new());
         let gc = Gc::new(bg, tl.clone());
-        let ctx = Ctx::background();
-        gc.start(&ctx);
+        let ctx = CancelToken::new();
+        gc.start();
 
         let tid = TxId::from_bytes(b"tx1".to_vec());
         tl.set(&ctx, TxLog::new(tid.clone(), TxCommitStatus::Ok))

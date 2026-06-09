@@ -48,13 +48,14 @@ Go's runtime primitives map onto tokio as follows.
 
 | Go | Rust |
 | --- | --- |
-| `context.Context` (cancellation + values) | `glassdb_concurr::Ctx` wrapping an in-house `CancelToken` (hierarchical, over `tokio::sync::watch`), plus an optional tx-id value |
+| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context; internal `CancelToken` (hierarchical, over `tokio::sync::watch`) still backs DB shutdown and the deadlock watchdog |
+| `context.Context` (values) | not used. The one Go consumer (a deterministic tx-id override) was dropped: under `--cfg sim` the same determinism falls out of `TxId::new_at` drawing its random prefix from the seeded executor RNG and its timestamp from the anchored clock |
 | goroutine | `tokio::spawn` |
-| `concurr.Background` (managed goroutines, cancelled together) | `Background` over `CancelToken` + tracked `JoinHandle`s |
-| `errgroup` / bounded fan-out | `Fanout` (a `Semaphore`-bounded join of futures) and, in tests, `tokio::join!` |
+| `concurr.Background` (managed goroutines, cancelled together) | `Background` (TaskTracker-shaped) over `CancelToken` + tracked `JoinHandle`s; closures receive the shutdown token |
+| `errgroup` / bounded fan-out | `futures::stream::iter(...).buffer_unordered(n)` (see `Algo::run_limited`) and, in tests, `tokio::join!` |
 | `sync.Mutex` over small state | `std::sync::Mutex`, **never held across `.await`** |
-| channels | `tokio::sync` channels; `make_chan_inf_cap` for the unbounded case |
-| `select` on ctx + timers | `tokio::select!` on `ctx.cancelled()` + `tokio::time::sleep` |
+| channels | `tokio::sync` channels |
+| `select` on ctx + timers | `tokio::select!` on `ctx.cancelled()` + `tokio::time::sleep` (internal cancellation only); for caller-facing timeouts, `tokio::time::timeout` around the future |
 
 ### Synchronous mutexes, not async mutexes
 
@@ -79,16 +80,18 @@ caller future:
   uncontended common case (one locker per key) keeps the original zero-overhead
   hot path.
 - A driver hands off only when it genuinely must: its batch is done but
-  non-mergeable queued work remains, or its own future is dropped/cancelled with
-  live waiters. Both hand off by **`rt::spawn`-ing a fresh owner task** — never by
+  non-mergeable queued work remains, or its own future is dropped with live
+  waiters. Both hand off by **`rt::spawn`-ing a fresh owner task** — never by
   promoting a waiter's future-that-must-be-polled. A spawned task cannot be
   dropped by a caller, so the handoff cannot be lost. A dropped inline driver is
   caught by a `DriverGuard` RAII guard that requeues undelivered live members and
   spawns the successor.
 - All driver/owner/exit transitions happen under the same per-key lock that
   submitters use, so "the key entry exists iff it has a driver" holds without
-  races. Waiters simply `select!(done_rx, ctx.cancelled())`; dropping or
-  cancelling a waiter only drops its receiver and is pruned by the worker.
+  races. Waiters simply `await` their `oneshot::Receiver`; dropping that future
+  closes the corresponding `Sender`, and a `WaiterDropGuard` pings the per-key
+  `changed` notifier so the driver re-evaluates liveness and prunes the dead
+  member (abandoning the batch if no live caller remains).
 - `BatchHandle::merged()` reconstructs the merged request (absorbing newly
   arrived compatible work); `BatchHandle::changed()` (a `Notify`) wakes the
   worker on new work. When a batch loses all live members the worker's context is
@@ -103,15 +106,15 @@ regression tests live in [`dedup.rs`](crates/glassdb-concurr/src/dedup.rs).
 ### Cancel-safety contract
 
 Public futures are durability-safe to cancel: a mid-flight drop is equivalent to
-a crash and is recovered by the commit protocol. For in-memory liveness the
-deduplicator now makes **dropping a future fully equivalent to cancelling its
-`Ctx`**: either way a queued caller is pruned and a dropped driver hands off to a
-spawned owner, so neither orphans a key nor strands other callers. Cancelling via
-`Ctx` (`timeout` / `select!` / `abort`) is still mildly preferable — it lets the
-driver abandon an all-cancelled batch one step sooner and is clearer — but it is
-no longer required for correctness or liveness. On-storage locks left by a drop
-are reclaimed by wait/lease timeouts as before. This contract is documented on
-the public API (`glassdb` `lib.rs` and `DB::tx`).
+a crash and is recovered by the commit protocol. **Dropping the future is the
+only cancellation mechanism**: there is no `Ctx` argument to cancel separately.
+Wrap a future with `tokio::time::timeout`, race it in a `tokio::select!`, or
+`abort` the `JoinHandle` to stop it. The deduplicator makes dropping safe for
+in-memory liveness too: a queued caller is pruned via `WaiterDropGuard`, and a
+dropped inline driver hands its batch off to a spawned owner, so neither
+orphans a key nor strands other callers. On-storage locks left by a drop are
+reclaimed by wait/lease timeouts as before. This contract is documented on the
+public API (`glassdb` `lib.rs` and `DB::tx`).
 
 ## Time and determinism
 
@@ -142,16 +145,17 @@ Go drives control flow with `errors.Is(err, ErrRetry / ErrNotFound /
 ErrPrecondition / …)`. Rust replaces these with typed `thiserror` enums, one per
 layer, and preserves the exact matching semantics via `is_*` predicates:
 
-- `BackendError`: `NotFound`, `Precondition`, `Cancelled`, `Other`.
+- `BackendError`: `NotFound`, `Precondition`, `Other`. (Go's `ctx.Err()` has no
+  equivalent: a dropped future is the cancel; backends never observe a context.)
 - `StorageError`: wraps `BackendError`, plus `KeyNotFound`; `is_not_found` /
   `is_precondition` delegate to the backend.
 - `TransError`: the engine's control-flow errors — `Retry` (Go `ErrRetry`),
   `AlreadyFinalized`, `Wounded` (Go `ErrWounded`; a wound-wait abort, consumed by
-  the DB retry loop which restarts the victim with a renewed ID), `Cancelled`,
-  and the **internal** `ValidateRetry` (Go `errValidateRetry`) and
-  `LockTimeout` / `NoSingleWrite`.
+  the DB retry loop which restarts the victim with a renewed ID), and the
+  **internal** `ValidateRetry` (Go `errValidateRetry`) and
+  `LockTimeout` / `NoSingleWrite`. There is no `Cancelled` variant.
 - `glassdb::Error`: the public surface — `NotFound`, `Aborted`, `Precondition`,
-  `Cancelled`, `AlreadyFinalized`, `Other`.
+  `AlreadyFinalized`, `Other`.
 
 Each layer converts into the next with `From`, mapping sentinels losslessly.
 Care was taken that **internal** control-flow errors never leak: e.g.
@@ -251,8 +255,8 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   expose a terminal `err()` accessor (rather than Go's `Next() (v, ok)` plus
   `Err()` pattern, adapted to Rust's `Iterator`).
 - **Re-exports for ergonomics.** `glassdb` re-exports `Backend`, the `memory`
-  backend, `middleware`, and `Ctx`, so callers need only depend on the one
-  crate; the `s3` / `gcs` backends are re-exported under their cargo features.
+  backend, and `middleware`, so callers need only depend on the one crate; the
+  `s3` / `gcs` backends are re-exported under their cargo features.
 
 ## Testing strategy
 

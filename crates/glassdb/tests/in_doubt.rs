@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
-use glassdb::{Collection, Ctx, DB, Error};
+use glassdb::{Collection, DB, Error};
 
 /// What the [`FaultBackend`] should do when its trap matches a conditional write.
 #[derive(Clone, Copy)]
@@ -98,56 +98,48 @@ impl FaultBackend {
 impl Backend for FaultBackend {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
-        self.inner
-            .read_if_modified(ctx, path, expected_writer)
-            .await
+        self.inner.read_if_modified(path, expected_writer).await
     }
 
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
-        self.inner.read(ctx, path).await
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
-        self.inner.get_metadata(ctx, path).await
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        self.inner.get_metadata(path).await
     }
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
         match self.intercept("set_tags_if", path, &tags) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::LostAck) => {
-                match self.inner.set_tags_if(ctx, path, expected, tags).await {
-                    Ok(_) => Err(lost_ack("set_tags_if")),
-                    Err(e) => Err(e),
-                }
-            }
-            None => self.inner.set_tags_if(ctx, path, expected, tags).await,
+            Some(Action::LostAck) => match self.inner.set_tags_if(path, expected, tags).await {
+                Ok(_) => Err(lost_ack("set_tags_if")),
+                Err(e) => Err(e),
+            },
+            None => self.inner.set_tags_if(path, expected, tags).await,
         }
     }
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
         // Unconditional overwrite: idempotent, never faulted.
-        self.inner.write(ctx, path, value, tags).await
+        self.inner.write(path, value, tags).await
     }
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
@@ -155,19 +147,16 @@ impl Backend for FaultBackend {
     ) -> Result<Metadata, BackendError> {
         match self.intercept("write_if", path, &tags) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::LostAck) => {
-                match self.inner.write_if(ctx, path, value, expected, tags).await {
-                    Ok(_) => Err(lost_ack("write_if")),
-                    Err(e) => Err(e),
-                }
-            }
-            None => self.inner.write_if(ctx, path, value, expected, tags).await,
+            Some(Action::LostAck) => match self.inner.write_if(path, value, expected, tags).await {
+                Ok(_) => Err(lost_ack("write_if")),
+                Err(e) => Err(e),
+            },
+            None => self.inner.write_if(path, value, expected, tags).await,
         }
     }
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
@@ -175,37 +164,32 @@ impl Backend for FaultBackend {
         match self.intercept("write_if_not_exists", path, &tags) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
             Some(Action::LostAck) => {
-                match self.inner.write_if_not_exists(ctx, path, value, tags).await {
+                match self.inner.write_if_not_exists(path, value, tags).await {
                     Ok(_) => Err(lost_ack("write_if_not_exists")),
                     Err(e) => Err(e),
                 }
             }
-            None => self.inner.write_if_not_exists(ctx, path, value, tags).await,
+            None => self.inner.write_if_not_exists(path, value, tags).await,
         }
     }
 
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        self.inner.delete(ctx, path).await
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        self.inner.delete(path).await
     }
 
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         match self.intercept("delete_if", path, &Tags::new()) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::LostAck) => match self.inner.delete_if(ctx, path, expected).await {
+            Some(Action::LostAck) => match self.inner.delete_if(path, expected).await {
                 Ok(()) => Err(lost_ack("delete_if")),
                 Err(e) => Err(e),
             },
-            None => self.inner.delete_if(ctx, path, expected).await,
+            None => self.inner.delete_if(path, expected).await,
         }
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.inner.list(ctx, dir_path).await
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        self.inner.list(dir_path).await
     }
 }
 
@@ -223,15 +207,15 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn seed(coll: &Collection, ctx: &Ctx, key: &[u8], v: i64) {
-    coll.write(ctx, key, &write_int(v)).await.unwrap();
+async fn seed(coll: &Collection, key: &[u8], v: i64) {
+    coll.write(key, &write_int(v)).await.unwrap();
 }
 
 /// A single-key read-modify-write whose commit takes the logless fast path.
-async fn increment(db: &DB, ctx: &Ctx, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
+async fn increment(db: &DB, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
     // `coll` is already a reference, so `async move` copies it (references are
     // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
-    db.tx(ctx, |tx| async move {
+    db.tx(|tx| async move {
         let cur = match tx.read(coll, key).await {
             Ok(v) => read_int(&v),
             Err(e) if e.is_not_found() => 0,
@@ -249,16 +233,15 @@ async fn increment(db: &DB, ctx: &Ctx, coll: &Collection, key: &'static [u8]) ->
 /// conflict, fell back to the locked path, and incremented a second time.
 #[tokio::test(start_paused = true)]
 async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
-    let ctx = Ctx::background();
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open(&ctx, "example", backend.clone()).await.unwrap();
+    let db = DB::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
 
     // Seed the key so the read finds a value and the commit takes the single-RW
     // fast path (which requires `reads[0].found`).
-    seed(&coll, &ctx, b"k", 10).await;
+    seed(&coll, b"k", 10).await;
 
     // Trap the fast path's value write (a `write_if` on a key path `/_k/`): let
     // it land, then report the ack as lost.
@@ -270,7 +253,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
         }
     }));
 
-    let res = increment(&db, &ctx, &coll, b"k").await;
+    let res = increment(&db, &coll, b"k").await;
     assert!(
         matches!(res, Err(ref e) if e.is_unavailable()),
         "expected an in-doubt error, got {res:?}"
@@ -278,7 +261,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 
     // The write landed exactly once. The engine must not have retried and
     // applied it again: the value is 11, never 12.
-    let got = read_int(&coll.read_strong(&ctx, b"k").await.unwrap());
+    let got = read_int(&coll.read_strong(b"k").await.unwrap());
     assert_eq!(
         got, 11,
         "value must be applied at most once (no double-apply)"
@@ -300,14 +283,13 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 /// applied exactly once.
 #[tokio::test(start_paused = true)]
 async fn logged_commit_lost_ack_retries_transparently() {
-    let ctx = Ctx::background();
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open(&ctx, "example", backend.clone()).await.unwrap();
+    let db = DB::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
-    coll.create(&ctx).await.unwrap();
-    seed(&coll, &ctx, b"a", 0).await;
-    seed(&coll, &ctx, b"b", 0).await;
+    coll.create().await.unwrap();
+    seed(&coll, b"a", 0).await;
+    seed(&coll, b"b", 0).await;
 
     // Seeding committed its own logs; count only commit points from here on.
     let before = backend.committed_log_writes();
@@ -324,7 +306,7 @@ async fn logged_commit_lost_ack_retries_transparently() {
     // Two distinct writes force the locked, log-based commit path. Capture `coll`
     // by reference so the body stays `FnMut` (re-runnable on a retry).
     let coll = &coll;
-    db.tx(&ctx, |tx| async move {
+    db.tx(|tx| async move {
         let a = read_int(&tx.read(coll, b"a").await.unwrap());
         let b = read_int(&tx.read(coll, b"b").await.unwrap());
         tx.write(coll, b"a", &write_int(a + 1))?;
@@ -334,8 +316,8 @@ async fn logged_commit_lost_ack_retries_transparently() {
     .expect("the logged commit must retry the in-doubt log write transparently");
 
     // Each write applied exactly once — the safety invariant.
-    assert_eq!(read_int(&coll.read_strong(&ctx, b"a").await.unwrap()), 1);
-    assert_eq!(read_int(&coll.read_strong(&ctx, b"b").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read_strong(b"a").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read_strong(b"b").await.unwrap()), 1);
 
     // Bound the retry: the engine drives the commit point exactly twice (the
     // original lost-ack write, then a single retry that observes the landed
@@ -357,14 +339,13 @@ async fn logged_commit_lost_ack_retries_transparently() {
 /// transaction commits successfully without re-running the user's closure.
 #[tokio::test(start_paused = true)]
 async fn lock_acquisition_lost_ack_retries_in_place() {
-    let ctx = Ctx::background();
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open(&ctx, "example", backend.clone()).await.unwrap();
+    let db = DB::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
-    coll.create(&ctx).await.unwrap();
-    seed(&coll, &ctx, b"a", 0).await;
-    seed(&coll, &ctx, b"b", 0).await;
+    coll.create().await.unwrap();
+    seed(&coll, b"a", 0).await;
+    seed(&coll, b"b", 0).await;
 
     // Trap the first `set_tags_if` on a key path — that's how a non-create
     // write lock is taken on an existing object. Let it land, then lose the
@@ -381,7 +362,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // reference so the body stays `FnMut` (re-runnable, though we expect no
     // closure re-run here — the lock retry is invisible to `DB::tx`).
     let coll = &coll;
-    db.tx(&ctx, |tx| async move {
+    db.tx(|tx| async move {
         let a = read_int(&tx.read(coll, b"a").await.unwrap());
         let b = read_int(&tx.read(coll, b"b").await.unwrap());
         tx.write(coll, b"a", &write_int(a + 1))?;
@@ -391,8 +372,8 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     .expect("a pre-commit in-doubt lock outcome must be recovered in place");
 
     // Each write applied exactly once — the safety invariant.
-    assert_eq!(read_int(&coll.read_strong(&ctx, b"a").await.unwrap()), 1);
-    assert_eq!(read_int(&coll.read_strong(&ctx, b"b").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read_strong(b"a").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read_strong(b"b").await.unwrap()), 1);
 }
 
 /// A *clean* precondition (no lost ack) is a genuine conflict, and the engine
@@ -402,13 +383,12 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
 /// liveness (and the fault-free exact invariant) under normal contention.
 #[tokio::test(start_paused = true)]
 async fn clean_conflict_on_single_rw_still_commits() {
-    let ctx = Ctx::background();
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open(&ctx, "example", backend.clone()).await.unwrap();
+    let db = DB::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
-    coll.create(&ctx).await.unwrap();
-    seed(&coll, &ctx, b"k", 41).await;
+    coll.create().await.unwrap();
+    seed(&coll, b"k", 41).await;
 
     // Inject one clean precondition on the first fast-path value write, without
     // applying it: a genuine conflict that never landed. The fast path should
@@ -421,10 +401,10 @@ async fn clean_conflict_on_single_rw_still_commits() {
         }
     }));
 
-    increment(&db, &ctx, &coll, b"k")
+    increment(&db, &coll, b"k")
         .await
         .expect("a clean conflict must be retried transparently, not surfaced");
 
-    let got = read_int(&coll.read_strong(&ctx, b"k").await.unwrap());
+    let got = read_int(&coll.read_strong(b"k").await.unwrap());
     assert_eq!(got, 42, "the increment must be applied exactly once");
 }

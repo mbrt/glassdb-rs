@@ -3,7 +3,7 @@
 
 use base64::Engine;
 use glassdb_backend::Tags;
-use glassdb_concurr::Ctx;
+use glassdb_concurr::CancelToken;
 use glassdb_data::TxId;
 
 use crate::error::StorageError;
@@ -413,7 +413,7 @@ impl Locker {
     /// requires the object's version to match `expected`.
     pub async fn update_lock(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
         update: &LockUpdate,
@@ -437,7 +437,7 @@ impl Locker {
 
     async fn handle_lock_deletion(
         &self,
-        ctx: &Ctx,
+        _ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
         update: &LockUpdate,
@@ -449,18 +449,18 @@ impl Locker {
                     update.prev_type
                 ))));
             }
-            return Some(self.global.delete_if(ctx, key, expected).await);
+            return Some(self.global.delete_if(key, expected).await);
         }
         let is_unlock_create = update.typ == LockType::None && update.prev_type == LockType::Create;
         if is_unlock_create && (update.writer.is_empty() || update.value.not_written) {
-            return Some(self.global.delete_if(ctx, key, expected).await);
+            return Some(self.global.delete_if(key, expected).await);
         }
         None
     }
 
     async fn apply_lock_tags(
         &self,
-        ctx: &Ctx,
+        _ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
         update: &LockUpdate,
@@ -474,27 +474,25 @@ impl Locker {
 
         if update.typ == LockType::Create {
             self.global
-                .write_if_not_exists(ctx, key, Vec::new(), new_tags)
+                .write_if_not_exists(key, Vec::new(), new_tags)
                 .await?;
             return Ok(());
         }
         if !update.writer.is_empty() && !update.value.not_written {
             new_tags.insert(LAST_WRITER_TAG.to_string(), tid_to_tag(&update.writer));
             self.global
-                .write_if(ctx, key, update.value.value.clone(), expected, new_tags)
+                .write_if(key, update.value.value.clone(), expected, new_tags)
                 .await?;
             return Ok(());
         }
-        self.global
-            .set_tags_if(ctx, key, expected, new_tags)
-            .await?;
+        self.global.set_tags_if(key, expected, new_tags).await?;
         Ok(())
     }
 
     /// Releases a create-lock on an uncommitted object, deleting it.
     pub async fn unlock_create_uncommitted(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
     ) -> Result<(), StorageError> {

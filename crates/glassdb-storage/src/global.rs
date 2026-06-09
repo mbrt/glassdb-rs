@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use glassdb_backend::{self as backend, Backend, Metadata, Tags, WriterId};
-use glassdb_concurr::Ctx;
 use glassdb_data::TxId;
 
 use crate::error::StorageError;
@@ -41,7 +40,7 @@ impl Global {
     }
 
     /// Reads the value at `key`, using the cache when possible.
-    pub async fn read(&self, ctx: &Ctx, key: &str) -> Result<GlobalRead, StorageError> {
+    pub async fn read(&self, key: &str) -> Result<GlobalRead, StorageError> {
         if let Some(e) = self.local.read(key, MAX_STALENESS) {
             // For a local override or a value known to be outdated, do a
             // regular read instead.
@@ -49,7 +48,7 @@ impl Global {
                 let writer = WriterId::new(e.version.writer.as_bytes().to_vec());
                 let mut modified = true;
                 let mut reply = backend::ReadReply::default();
-                match self.backend.read_if_modified(ctx, key, &writer).await {
+                match self.backend.read_if_modified(key, &writer).await {
                     Ok(r) => reply = r,
                     Err(err) => {
                         if !err.is_precondition() {
@@ -77,7 +76,7 @@ impl Global {
             }
         }
 
-        let r = self.backend.read(ctx, key).await?;
+        let r = self.backend.read(key).await?;
         let meta = Arc::new(Metadata {
             tags: r.tags,
             version: r.version,
@@ -93,8 +92,8 @@ impl Global {
     /// Fetches metadata from the backend and updates the cache. The returned
     /// metadata is shared (`Arc`) with the cache entry, so neither the cache
     /// update nor the caller deep-copies the tag map.
-    pub async fn get_metadata(&self, ctx: &Ctx, key: &str) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.get_metadata(ctx, key).await?);
+    pub async fn get_metadata(&self, key: &str) -> Result<Arc<Metadata>, StorageError> {
+        let meta = Arc::new(self.backend.get_metadata(key).await?);
         self.local.set_meta(key, meta.clone());
         Ok(meta)
     }
@@ -102,12 +101,11 @@ impl Global {
     /// Conditionally sets tags and updates the metadata cache.
     pub async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         key: &str,
         expected: &backend::Version,
         t: Tags,
     ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.set_tags_if(ctx, key, expected, t).await?);
+        let meta = Arc::new(self.backend.set_tags_if(key, expected, t).await?);
         self.local.set_meta(key, meta.clone());
         Ok(meta)
     }
@@ -115,12 +113,11 @@ impl Global {
     /// Unconditionally writes and updates the cache.
     pub async fn write(
         &self,
-        ctx: &Ctx,
         key: &str,
         value: Vec<u8>,
         t: Tags,
     ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.write(ctx, key, value.clone(), t).await?);
+        let meta = Arc::new(self.backend.write(key, value.clone(), t).await?);
         self.local.write_with_meta(key, value, meta.clone());
         Ok(meta)
     }
@@ -128,7 +125,6 @@ impl Global {
     /// Conditionally writes and updates the cache.
     pub async fn write_if(
         &self,
-        ctx: &Ctx,
         key: &str,
         value: Vec<u8>,
         expected: &backend::Version,
@@ -136,7 +132,7 @@ impl Global {
     ) -> Result<Arc<Metadata>, StorageError> {
         let meta = Arc::new(
             self.backend
-                .write_if(ctx, key, value.clone(), expected, t)
+                .write_if(key, value.clone(), expected, t)
                 .await?,
         );
         self.local.write_with_meta(key, value, meta.clone());
@@ -146,14 +142,13 @@ impl Global {
     /// Creates the object if absent and updates the cache.
     pub async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         key: &str,
         value: Vec<u8>,
         t: Tags,
     ) -> Result<Arc<Metadata>, StorageError> {
         let meta = Arc::new(
             self.backend
-                .write_if_not_exists(ctx, key, value.clone(), t)
+                .write_if_not_exists(key, value.clone(), t)
                 .await?,
         );
         self.local.write_with_meta(key, value, meta.clone());
@@ -161,8 +156,8 @@ impl Global {
     }
 
     /// Deletes the object and removes it from the cache.
-    pub async fn delete(&self, ctx: &Ctx, key: &str) -> Result<(), StorageError> {
-        self.backend.delete(ctx, key).await?;
+    pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.backend.delete(key).await?;
         self.local.delete(key);
         Ok(())
     }
@@ -170,17 +165,16 @@ impl Global {
     /// Conditionally deletes the object and removes it from the cache.
     pub async fn delete_if(
         &self,
-        ctx: &Ctx,
         key: &str,
         expected: &backend::Version,
     ) -> Result<(), StorageError> {
-        self.backend.delete_if(ctx, key, expected).await?;
+        self.backend.delete_if(key, expected).await?;
         self.local.delete(key);
         Ok(())
     }
 
     /// Lists object paths under `dir_path`.
-    pub async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, StorageError> {
-        Ok(self.backend.list(ctx, dir_path).await?)
+    pub async fn list(&self, dir_path: &str) -> Result<Vec<String>, StorageError> {
+        Ok(self.backend.list(dir_path).await?)
     }
 }

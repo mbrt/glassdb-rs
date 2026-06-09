@@ -15,7 +15,6 @@ use glassdb_backend::{
     Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
     encode_writer_tag,
 };
-use glassdb_concurr::Ctx;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -151,13 +150,12 @@ impl GcsBackend {
         }
     }
 
-    /// Sends `rb`, cancelling on `ctx`.
-    async fn send(&self, ctx: &Ctx, rb: RequestBuilder) -> Result<reqwest::Response, BackendError> {
+    /// Sends `rb`. Cancellation is by dropping the surrounding future.
+    async fn send(&self, rb: RequestBuilder) -> Result<reqwest::Response, BackendError> {
         let rb = self.authorize(rb).await?;
-        tokio::select! {
-            _ = ctx.cancelled() => Err(BackendError::Cancelled),
-            r = rb.send() => r.map_err(|e| BackendError::Other(format!("gcs request: {e}"))),
-        }
+        rb.send()
+            .await
+            .map_err(|e| BackendError::Other(format!("gcs request: {e}")))
     }
 
     /// Sends a *conditional* request and maps its outcome with the in-doubt
@@ -171,21 +169,19 @@ impl GcsBackend {
     /// sent, so it is not in-doubt.
     async fn send_conditional(
         &self,
-        ctx: &Ctx,
         rb: RequestBuilder,
         op: &str,
         path: &str,
     ) -> Result<reqwest::Response, BackendError> {
         let rb = self.authorize(rb).await?;
-        let resp = tokio::select! {
-            _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-            r = rb.send() => match r {
-                Ok(resp) => resp,
-                // No response at all: the request may or may not have been applied.
-                Err(e) => return Err(BackendError::Unavailable(format!(
+        let resp = match rb.send().await {
+            Ok(resp) => resp,
+            // No response at all: the request may or may not have been applied.
+            Err(e) => {
+                return Err(BackendError::Unavailable(format!(
                     "{op}({path}): request failed, outcome unknown: {e}"
-                ))),
-            },
+                )));
+            }
         };
         let status = resp.status();
         if status.is_success() {
@@ -195,12 +191,12 @@ impl GcsBackend {
     }
 
     /// Fetches an object's metadata resource.
-    async fn attrs(&self, ctx: &Ctx, path: &str) -> Result<ObjectResource, BackendError> {
+    async fn attrs(&self, path: &str) -> Result<ObjectResource, BackendError> {
         let rb = self
             .http
             .get(self.object_url(path))
             .query(&[("alt", "json")]);
-        let resp = self.send(ctx, rb).await?;
+        let resp = self.send(rb).await?;
         check_status(resp.status(), "GetMetadata", path)?;
         parse_json(resp, "GetMetadata", path).await
     }
@@ -210,7 +206,6 @@ impl GcsBackend {
     /// retried a bounded number of times.
     async fn read_from_attrs(
         &self,
-        ctx: &Ctx,
         path: &str,
         mut attrs: ObjectResource,
     ) -> Result<ReadReply, BackendError> {
@@ -220,10 +215,10 @@ impl GcsBackend {
                 .http
                 .get(self.object_url(path))
                 .query(&[("alt", "media"), ("ifGenerationMatch", generation.as_str())]);
-            let resp = self.send(ctx, rb).await?;
+            let resp = self.send(rb).await?;
             let status = resp.status();
             if status == StatusCode::PRECONDITION_FAILED {
-                attrs = self.attrs(ctx, path).await?;
+                attrs = self.attrs(path).await?;
                 continue;
             }
             check_status(status, "Read", path)?;
@@ -247,7 +242,6 @@ impl GcsBackend {
     /// preconditions.
     async fn upload(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
@@ -268,9 +262,9 @@ impl GcsBackend {
             )
             .body(body);
         let resp = if conditional {
-            self.send_conditional(ctx, rb, "Write", path).await?
+            self.send_conditional(rb, "Write", path).await?
         } else {
-            let resp = self.send(ctx, rb).await?;
+            let resp = self.send(rb).await?;
             check_status(resp.status(), "Write", path)?;
             resp
         };
@@ -304,11 +298,10 @@ impl WriteConds {
 impl Backend for GcsBackend {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
-        let attrs = self.attrs(ctx, path).await?;
+        let attrs = self.attrs(path).await?;
         let current = attrs
             .tags()
             .get(LAST_WRITER_TAG)
@@ -317,21 +310,20 @@ impl Backend for GcsBackend {
         if current == encode_writer_tag(expected_writer) {
             return Err(BackendError::Precondition);
         }
-        self.read_from_attrs(ctx, path, attrs).await
+        self.read_from_attrs(path, attrs).await
     }
 
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
-        let attrs = self.attrs(ctx, path).await?;
-        self.read_from_attrs(ctx, path, attrs).await
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        let attrs = self.attrs(path).await?;
+        self.read_from_attrs(path, attrs).await
     }
 
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
-        Ok(self.attrs(ctx, path).await?.metadata())
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        Ok(self.attrs(path).await?.metadata())
     }
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
@@ -340,7 +332,7 @@ impl Backend for GcsBackend {
         // GCS replaces the entire metadata map on update, so the new tags are
         // merged onto the current set to preserve the last-writer tag (the
         // locker only sends the lock tags here).
-        let attrs = self.attrs(ctx, path).await?;
+        let attrs = self.attrs(path).await?;
         let mut merged = attrs.tags();
         for (k, v) in tags {
             merged.insert(k, v);
@@ -354,25 +346,22 @@ impl Backend for GcsBackend {
             ])
             .header(CONTENT_TYPE, "application/json")
             .body(metadata_patch_json(&merged));
-        let resp = self.send_conditional(ctx, rb, "SetTagsIf", path).await?;
+        let resp = self.send_conditional(rb, "SetTagsIf", path).await?;
         let obj: ObjectResource = parse_json(resp, "SetTagsIf", path).await?;
         Ok(obj.metadata())
     }
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.upload(ctx, path, value, tags, WriteConds::default())
-            .await
+        self.upload(path, value, tags, WriteConds::default()).await
     }
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
@@ -380,7 +369,6 @@ impl Backend for GcsBackend {
     ) -> Result<Metadata, BackendError> {
         let (generation, metageneration) = parse_token(expected)?;
         self.upload(
-            ctx,
             path,
             value,
             tags,
@@ -394,13 +382,11 @@ impl Backend for GcsBackend {
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
         self.upload(
-            ctx,
             path,
             value,
             tags,
@@ -412,29 +398,24 @@ impl Backend for GcsBackend {
         .await
     }
 
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
         let rb = self.http.delete(self.object_url(path));
-        let resp = self.send(ctx, rb).await?;
+        let resp = self.send(rb).await?;
         check_status(resp.status(), "Delete", path)?;
         Ok(())
     }
 
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         let (generation, metageneration) = parse_token(expected)?;
         let rb = self.http.delete(self.object_url(path)).query(&[
             ("ifGenerationMatch", generation.as_str()),
             ("ifMetagenerationMatch", metageneration.as_str()),
         ]);
-        self.send_conditional(ctx, rb, "DeleteIf", path).await?;
+        self.send_conditional(rb, "DeleteIf", path).await?;
         Ok(())
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
         let prefix = ensure_trailing_slash(dir_path);
         let mut page_token: Option<String> = None;
         let mut keys: Vec<String> = Vec::new();
@@ -445,7 +426,7 @@ impl Backend for GcsBackend {
                 query.push(("pageToken", t.clone()));
             }
             let rb = self.http.get(self.objects_url()).query(&query);
-            let resp = self.send(ctx, rb).await?;
+            let resp = self.send(rb).await?;
             check_status(resp.status(), "List", &prefix)?;
             let page: ListResponse = parse_json(resp, "List", &prefix).await?;
             keys.extend(page.prefixes);
