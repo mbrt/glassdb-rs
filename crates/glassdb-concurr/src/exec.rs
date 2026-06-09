@@ -225,16 +225,12 @@ struct Inner {
 
 /// Tasks woken via a `Waker`. The only state shared with wakers, so it is the
 /// only part that must be `Send + Sync`.
+#[derive(Default)]
 struct WakeQueue {
     woken: Mutex<Vec<TaskId>>,
 }
 
 impl WakeQueue {
-    fn new() -> Self {
-        WakeQueue {
-            woken: Mutex::new(Vec::new()),
-        }
-    }
     fn push(&self, t: TaskId) {
         self.woken.lock().unwrap().push(t);
     }
@@ -448,7 +444,7 @@ where
         .build()
         .expect("build sim-local tokio runtime for select-rng seeding");
 
-    let wake = Arc::new(WakeQueue::new());
+    let wake = Arc::new(WakeQueue::default());
     let inner = Rc::new(RefCell::new(Inner {
         next_task: 0,
         next_timer: 0,
