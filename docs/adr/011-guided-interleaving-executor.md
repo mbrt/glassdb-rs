@@ -40,7 +40,7 @@ Surveying the engine's async surface showed the redirected area is small:
 
 - **`tokio::sync` is runtime-agnostic.** `Notify`, `Semaphore`, `mpsc`,
   `oneshot` work on any executor; only `*_timeout` needs the timer. So
-  `CancelToken` (over `Notify`), `Dedup` (over `Semaphore`),
+  `AbortSignal` (over `Notify`), `Dedup` (over `Semaphore`),
   and `biased` `tokio::select!` are **reused unchanged** — exactly
   the surface `madsim`/`turmoil` spend most of their code re-implementing.
 - Only **`tokio::spawn` and `tokio::time`** actually need the runtime, so they are
@@ -83,7 +83,7 @@ flowchart TD
   rt["crate rt: spawn / sleep / Instant / yield / block_on_with / JoinHandle / system_now"]
   rt --> realtokio
   rt --> exec
-  reuse["reused as-is: tokio::sync, biased tokio::select!, futures, CancelToken, Dedup"]
+  reuse["reused as-is: tokio::sync, biased tokio::select!, futures, AbortSignal, Dedup"]
   engine["engine crates"] --> rt
   engine --> reuse
 ```
