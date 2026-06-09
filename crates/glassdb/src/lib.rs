@@ -17,6 +17,7 @@
 
 mod collection;
 mod db;
+pub mod diagnostics;
 mod error;
 mod iter;
 #[cfg(feature = "sim")]
@@ -27,6 +28,7 @@ mod version;
 
 pub use collection::Collection;
 pub use db::{DbBuilder, DB};
+pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionsIter, KeysIter};
 pub use stats::Stats;

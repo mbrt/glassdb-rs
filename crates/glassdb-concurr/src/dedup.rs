@@ -311,6 +311,28 @@ enum Round {
     Exit,
 }
 
+/// Diagnostic snapshot of one key's coordination state inside a [`Dedup`].
+///
+/// Returned by [`Dedup::snapshot`] for operators investigating hangs: a key
+/// that stays in the snapshot with `has_active_op = true` and a non-zero queue
+/// would indicate a stuck worker; a key with `has_active_op = false` and
+/// non-zero `batch_count` would indicate the round delivered but post-round
+/// cleanup did not run. Both are signatures of orphan-key hangs the dedup
+/// driver model is designed to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupKeySnapshot {
+    pub key: String,
+    /// Members currently being served by an in-flight worker round (or, after
+    /// delivery and before round-end cleanup, transiently zero).
+    pub batch_count: usize,
+    /// Reorderable submissions queued for a future round.
+    pub pending_count: usize,
+    /// FIFO submissions queued for a future round.
+    pub queue_count: usize,
+    /// `true` if a worker round is in flight for this key.
+    pub has_active_op: bool,
+}
+
 struct Inner<R, E, W> {
     worker: Arc<W>,
     shards: Sharded<Arc<Shard<R, E>>>,
@@ -342,14 +364,26 @@ where
             let mut map = shard.map.lock().unwrap();
             let st = match map.get_mut(key) {
                 Some(s) => s,
-                None => return Round::Exit,
+                None => {
+                    tracing::trace!(target: "glassdb::dedup", key, "round_exit_no_state");
+                    return Round::Exit;
+                }
             };
             if self.shutdown.is_cancelled() || !st.build_batch() {
                 map.remove(key);
+                tracing::trace!(target: "glassdb::dedup", key, "key_removed");
                 return Round::Exit;
             }
             let tok = self.shutdown.child_token();
             st.op_token = Some(tok.clone());
+            tracing::trace!(
+                target: "glassdb::dedup",
+                key,
+                batch_count = st.batch.len(),
+                pending_count = st.pending.len(),
+                queue_count = st.queue.len(),
+                "round_start",
+            );
             Ctx::from_token(tok)
         };
 
@@ -363,7 +397,15 @@ where
             let mut map = shard.map.lock().unwrap();
             if let Some(st) = map.get_mut(key) {
                 st.op_token = None;
+                let delivered = st.batch.len();
                 st.deliver(&res);
+                tracing::trace!(
+                    target: "glassdb::dedup",
+                    key,
+                    delivered,
+                    is_err = res.is_err(),
+                    "round_delivered",
+                );
             }
         }
         Round::Delivered
@@ -394,6 +436,7 @@ where
         let inner = self.clone();
         let shard = shard.clone();
         let key = key.to_string();
+        tracing::trace!(target: "glassdb::dedup", key = %key, "spawn_owner");
         // Detached: the owner is tracked via `active_owners`/`owners_idle` for
         // `close`, not by joining a handle (which would accumulate per handoff).
         let owner = rt::spawn(async move {
@@ -498,16 +541,38 @@ where
         let mut map = self.shard.map.lock().unwrap();
         let st = match map.get_mut(&self.key) {
             Some(s) => s,
-            None => return,
+            None => {
+                tracing::debug!(
+                    target: "glassdb::dedup",
+                    key = %self.key,
+                    "inline_driver_dropped_no_state",
+                );
+                return;
+            }
         };
+        let had_op = st.op_token.is_some();
         if let Some(t) = st.op_token.take() {
             t.cancel();
         }
         st.requeue_batch();
         st.prune();
         if st.incoming_live() {
+            tracing::debug!(
+                target: "glassdb::dedup",
+                key = %self.key,
+                had_op,
+                pending_count = st.pending.len(),
+                queue_count = st.queue.len(),
+                "inline_driver_dropped_handoff",
+            );
             self.inner.spawn_owner(&self.shard, &self.key);
         } else {
+            tracing::debug!(
+                target: "glassdb::dedup",
+                key = %self.key,
+                had_op,
+                "inline_driver_dropped_key_removed",
+            );
             map.remove(&self.key);
         }
     }
@@ -605,6 +670,28 @@ where
         while self.inner.active_owners.load(Ordering::SeqCst) > 0 {
             self.inner.owners_idle.notified().await;
         }
+    }
+
+    /// Returns a per-key diagnostic snapshot of the deduplicator's coordination
+    /// state. Pull-only and zero cost unless called: takes each shard's lock
+    /// briefly, copies the keys and their (batch / pending / queue / op-token)
+    /// counts, and returns. Output is sorted by key for stable display.
+    pub fn snapshot(&self) -> Vec<DedupKeySnapshot> {
+        let mut out = Vec::new();
+        self.inner.shards.each(|shard| {
+            let map = shard.map.lock().unwrap();
+            for (key, st) in map.iter() {
+                out.push(DedupKeySnapshot {
+                    key: key.clone(),
+                    batch_count: st.batch.len(),
+                    pending_count: st.pending.len(),
+                    queue_count: st.queue.len(),
+                    has_active_op: st.op_token.is_some(),
+                });
+            }
+        });
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
     }
 
     /// Number of live spawned owner tasks. Test-only behavioral assertion of the
@@ -1010,5 +1097,49 @@ mod tests {
         assert!(d.inner.worker.res.lock().unwrap().is_empty());
         d.close().await;
         assert_eq!(d.active_owners(), 0);
+    }
+
+    // Diagnostics smoke test: while a batch is in flight, snapshot reports the
+    // key with an active op and the queued/pending counts; after delivery, the
+    // key is gone (no orphan).
+    #[tokio::test]
+    async fn snapshot_reflects_inflight_state_and_clears_after_delivery() {
+        let d = Arc::new(Dedup::new(GatedWorker::new()));
+        let release = d.inner.worker.release.clone();
+        let ctx = Ctx::background();
+
+        // No state when idle.
+        assert!(d.snapshot().is_empty());
+
+        // A is the inline driver (gated). B queues behind, C is reorderable.
+        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        assert!(futures::poll!(a.as_mut()).is_pending());
+        let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+        assert!(futures::poll!(b.as_mut()).is_pending());
+        let mut c = Box::pin(d.run(&ctx, "key", reorderable(3)));
+        assert!(futures::poll!(c.as_mut()).is_pending());
+
+        let snap = d.snapshot();
+        assert_eq!(snap.len(), 1, "expected one keyed entry: {snap:?}");
+        let s = &snap[0];
+        assert_eq!(s.key, "key");
+        assert!(s.has_active_op, "worker round should be in flight");
+        assert_eq!(s.batch_count, 1, "only A is in the batch");
+        assert_eq!(s.queue_count, 1, "B queued");
+        assert_eq!(s.pending_count, 1, "C reorderable pending");
+
+        // Drain to completion.
+        release.add_permits(1);
+        assert!(a.await.is_ok());
+        assert!(b.await.is_ok());
+        assert!(c.await.is_ok());
+        d.close().await;
+
+        // Snapshot is empty once all work is delivered (key removed).
+        assert!(
+            d.snapshot().is_empty(),
+            "post-delivery snapshot: {:?}",
+            d.snapshot()
+        );
     }
 }

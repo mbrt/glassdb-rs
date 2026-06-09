@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_backend::{self as backend, BackendError};
 use glassdb_concurr::{
-    rt, shard::Sharded, BatchHandle, Ctx, Dedup, DedupError, MergeRequest, Worker,
+    rt, shard::Sharded, BatchHandle, Ctx, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker,
 };
 use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
 use glassdb_storage::{
@@ -51,6 +51,17 @@ pub struct LockStats {
     pub calls: usize,
     pub hits: usize,
     pub retries: usize,
+}
+
+/// Diagnostic snapshot of one transaction's locally-tracked held locks.
+///
+/// Returned by [`Locker::tx_locks_snapshot`] for operators investigating hangs
+/// or partial-lock deadlocks. The locks list is sorted by path for stable
+/// display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxLockSnapshot {
+    pub tx_id: TxId,
+    pub locks: Vec<PathLock>,
 }
 
 /// A lock/unlock request that can merge with another for the same key.
@@ -481,6 +492,42 @@ impl Locker {
         }
     }
 
+    /// Returns a snapshot of the per-key dedup state used to coordinate lock
+    /// requests. Pull-only and zero cost unless called.
+    pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
+        self.inner.dedup.snapshot()
+    }
+
+    /// Returns one entry per transaction that currently holds any local-cache
+    /// lock, with the held paths sorted by path. Pull-only and zero cost unless
+    /// called. Output is sorted by transaction id for stable display.
+    pub fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
+        let mut out = Vec::new();
+        self.inner.tlocks.each(|shard| {
+            let m = shard.lock().unwrap();
+            for (tid_bytes, locks) in m.iter() {
+                if locks.is_empty() {
+                    continue;
+                }
+                let tx_id = TxId::from_bytes(tid_bytes.clone());
+                let mut paths: Vec<PathLock> = locks
+                    .iter()
+                    .map(|(p, t)| PathLock {
+                        path: p.clone(),
+                        typ: *t,
+                    })
+                    .collect();
+                paths.sort_by(|a, b| a.path.cmp(&b.path));
+                out.push(TxLockSnapshot {
+                    tx_id,
+                    locks: paths,
+                });
+            }
+        });
+        out.sort_by(|a, b| a.tx_id.cmp(&b.tx_id));
+        out
+    }
+
     async fn push_request(
         &self,
         ctx: &Ctx,
@@ -563,12 +610,26 @@ impl Locker {
                     tlocks.remove(tid.as_bytes());
                 }
             }
+            tracing::trace!(
+                target: "glassdb::locker",
+                tx = %tid,
+                key,
+                lock_type = %LockType::None,
+                "lock_released",
+            );
             return;
         }
         tlocks
             .entry(tid.as_bytes().to_vec())
             .or_default()
             .insert(key.to_string(), lt);
+        tracing::trace!(
+            target: "glassdb::locker",
+            tx = %tid,
+            key,
+            lock_type = %lt,
+            "lock_acquired",
+        );
     }
 }
 
@@ -1097,5 +1158,66 @@ mod tests {
         // The younger transaction was wounded (aborted).
         let status = tctx.monitor.tx_status(&ctx, &tx_young).await.unwrap();
         assert_eq!(status, TxCommitStatus::Aborted);
+    }
+
+    // Diagnostic snapshot reflects each tx's held locks (sorted by path) and is
+    // empty after every lock is released.
+    #[tokio::test]
+    async fn tx_locks_snapshot_lists_held_locks_per_tx() {
+        let ctx = Ctx::background();
+        let (locker, tctx) = init_tl_test();
+        let key_a = paths::from_key("coll", b"a");
+        let key_b = paths::from_key("coll", b"b");
+        let key_c = paths::from_key("coll", b"c");
+
+        // Pre-create the keys so reads can take a non-Create lock.
+        for k in [&key_a, &key_b, &key_c] {
+            tctx.global
+                .write(&ctx, k, b"x".to_vec(), Tags::new())
+                .await
+                .unwrap();
+        }
+
+        let tx1 = mk_tid(1, "tx1");
+        let tx2 = mk_tid(2, "tx2");
+        tctx.monitor.begin_tx(&tx1);
+        tctx.monitor.begin_tx(&tx2);
+
+        // tx1 holds a write on b and a read on a; tx2 holds a read on c.
+        locker.lock_write(&ctx, &key_b, &tx1).await.unwrap();
+        locker.lock_read(&ctx, &key_a, &tx1).await.unwrap();
+        locker.lock_read(&ctx, &key_c, &tx2).await.unwrap();
+
+        let snap = locker.tx_locks_snapshot();
+        assert_eq!(snap.len(), 2, "expected two txs: {snap:?}");
+        let s1 = snap.iter().find(|s| s.tx_id == tx1).expect("tx1 missing");
+        let s2 = snap.iter().find(|s| s.tx_id == tx2).expect("tx2 missing");
+        // Locks are sorted by path within each tx.
+        assert_eq!(
+            s1.locks,
+            vec![
+                PathLock {
+                    path: key_a.clone(),
+                    typ: LockType::Read,
+                },
+                PathLock {
+                    path: key_b.clone(),
+                    typ: LockType::Write,
+                },
+            ],
+        );
+        assert_eq!(
+            s2.locks,
+            vec![PathLock {
+                path: key_c.clone(),
+                typ: LockType::Read,
+            }],
+        );
+
+        // Releasing every lock empties the snapshot.
+        locker.unlock(&ctx, &key_a, &tx1).await.unwrap();
+        locker.unlock(&ctx, &key_b, &tx1).await.unwrap();
+        locker.unlock(&ctx, &key_c, &tx2).await.unwrap();
+        assert!(locker.tx_locks_snapshot().is_empty());
     }
 }

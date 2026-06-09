@@ -440,6 +440,43 @@ async fn read_weak() {
     assert_eq!(stats.tx_retries, 0);
 }
 
+// `DB::diagnostics` smoke test: on a fresh DB the snapshot is empty, and after
+// running a transaction that acquires locks the snapshot exposes the
+// post-commit state in a structured form that callers can render via the
+// `Display` impl. (Locks linger briefly while the background cleanup task
+// releases them; deeper unit tests in `glassdb-trans` assert the
+// per-tx-held-locks shape directly.)
+#[tokio::test(start_paused = true)]
+async fn diagnostics_returns_typed_snapshot() {
+    let ctx = Ctx::background();
+    let db = init_db(mem()).await;
+
+    // A fresh DB has no coordination state.
+    let idle = db.diagnostics();
+    assert!(idle.locker_dedup.is_empty(), "fresh dedup: {idle:?}");
+    assert!(idle.transactions.is_empty(), "fresh tx locks: {idle:?}");
+
+    // After running a transaction, the snapshot is still callable and renders
+    // through the Display impl; the schema (typed fields) is the contract we
+    // care about here.
+    let coll = db.collection(b"demo-coll");
+    coll.create(&ctx).await.unwrap();
+    let coll_ref = &coll;
+    db.tx(&ctx, |tx| async move {
+        tx.write(coll_ref, b"k1", b"v1")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let diag = db.diagnostics();
+    let rendered = format!("{diag}");
+    assert!(
+        rendered.starts_with("Diagnostics:"),
+        "unexpected dump: {rendered}",
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn list_keys() {
     let ctx = Ctx::background();
