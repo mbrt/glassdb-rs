@@ -42,7 +42,7 @@ use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
-use glassdb::{Collection, Ctx, DB, Error as GError, Stats};
+use glassdb::{Collection, DB, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
 
@@ -201,7 +201,7 @@ fn env_var(k: &str) -> Result<String, Box<dyn Error>> {
 
 fn open_db(handle: &Handle, backend: Arc<dyn Backend>) -> DB {
     handle
-        .block_on(DB::open(&Ctx::background(), "bench", backend))
+        .block_on(DB::open("bench", backend))
         .expect("open db")
 }
 
@@ -401,13 +401,13 @@ fn independent_single_rmw(
             let bench = b.bench.clone();
             handle.spawn(async move {
                 let coll = db.collection(format!("c{i}").as_bytes());
-                coll.create(&Ctx::background()).await?;
+                coll.create().await?;
                 let coll = &coll;
                 let db = &db;
                 while !bench.is_finished() {
                     bench
                         .measure(|| async move {
-                            db.tx(&Ctx::background(), |tx| async move {
+                            db.tx(|tx| async move {
                                 let v = match tx.read(coll, b"key").await {
                                     Ok(v) => v,
                                     Err(e) if e.is_not_found() => Vec::new(),
@@ -442,7 +442,7 @@ fn independent_multi_rmw(
             let bench = b.bench.clone();
             handle.spawn(async move {
                 let coll = db.collection(format!("c{i}").as_bytes());
-                coll.create(&Ctx::background()).await?;
+                coll.create().await?;
                 let keys: Vec<Vec<u8>> = (0..numkeys)
                     .map(|j| format!("key{j}").into_bytes())
                     .collect();
@@ -452,7 +452,7 @@ fn independent_multi_rmw(
                 while !bench.is_finished() {
                     bench
                         .measure(|| async move {
-                            db.tx(&Ctx::background(), |tx| async move {
+                            db.tx(|tx| async move {
                                 // Read all keys in parallel, then write each back.
                                 let vals = futures::future::join_all(
                                     keys.iter().map(|k| tx.read(coll, k)),
@@ -491,7 +491,7 @@ fn overlapping_multi_rmw(
 ) -> Result<(), GError> {
     let coll = db.collection(b"omrmw");
     handle.block_on(async {
-        let _ = coll.create(&Ctx::background()).await;
+        let _ = coll.create().await;
     });
 
     let n_keys = n_writers * n_keys_per_writer - n_overlap;
@@ -502,7 +502,7 @@ fn overlapping_multi_rmw(
     handle.block_on(async {
         let coll = &coll;
         let all_keys = &all_keys;
-        db.tx(&Ctx::background(), |tx| async move {
+        db.tx(|tx| async move {
             for k in all_keys {
                 tx.write(coll, k.as_slice(), &rand_1k())?;
             }
@@ -530,7 +530,7 @@ fn overlapping_multi_rmw(
                 while !bench.is_finished() {
                     bench
                         .measure(|| async move {
-                            db.tx(&Ctx::background(), |tx| async move {
+                            db.tx(|tx| async move {
                                 let vals = futures::future::join_all(
                                     keys.iter().map(|k| tx.read(coll, k)),
                                 )
@@ -837,7 +837,7 @@ async fn read_write_9010_worker(
 }
 
 async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
-    db.tx(&Ctx::background(), |tx| async move {
+    db.tx(|tx| async move {
         // Read both keys in parallel, then swap their values.
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
         let v0 = r0?;
@@ -850,7 +850,7 @@ async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<()
 }
 
 async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
-    db.tx(&Ctx::background(), |tx| async move {
+    db.tx(|tx| async move {
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
         r0?;
         r1?;
@@ -860,9 +860,7 @@ async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(),
 }
 
 async fn weak_read_tx(coll: &Collection, k: &[u8]) -> Result<(), GError> {
-    coll.read_weak(&Ctx::background(), k, Duration::from_secs(10))
-        .await
-        .map(|_| ())
+    coll.read_weak(k, Duration::from_secs(10)).await.map(|_| ())
 }
 
 fn init_keys(
@@ -876,7 +874,7 @@ fn init_keys(
     let db = open_db(handle, backend);
     let keys = handle.block_on(async {
         let coll = db.collection(READ_WRITE_9010_CNAME.as_bytes());
-        coll.create(&Ctx::background()).await?;
+        coll.create().await?;
         let mut keys: Vec<Vec<u8>> = vec![Vec::new(); num];
         // Initialize in batches of 100 keys.
         let mut i = 0;
@@ -889,7 +887,7 @@ fn init_keys(
                 .collect();
             let batch_ref = &batch;
             let coll_ref = &coll;
-            db.tx(&Ctx::background(), |tx| async move {
+            db.tx(|tx| async move {
                 for k in batch_ref {
                     tx.write(coll_ref, k, &rand_1k())?;
                 }

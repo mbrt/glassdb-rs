@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{BackendError, Metadata};
-use glassdb_concurr::Ctx;
+use glassdb_concurr::CancelToken;
 use glassdb_storage::{
     Global, Local, LockType, StorageError, TxCommitStatus, Version, tags_lock_info,
 };
@@ -42,7 +42,7 @@ impl Reader {
     /// Reads the value for `key`, accepting cached values up to `max_stale`.
     pub async fn read(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         key: &str,
         max_stale: Duration,
     ) -> Result<ReadValue, StorageError> {
@@ -58,7 +58,7 @@ impl Reader {
             };
             return self.handle_lock_create(ctx, key, lres).await;
         }
-        let gr = self.global.read(ctx, key).await?;
+        let gr = self.global.read(key).await?;
         let gres = ReadValue {
             value: gr.value,
             version: gr.version,
@@ -69,7 +69,7 @@ impl Reader {
     /// Returns the object metadata, using the local cache when fresh enough.
     pub async fn get_metadata(
         &self,
-        ctx: &Ctx,
+        _ctx: &CancelToken,
         key: &str,
         max_stale: Duration,
     ) -> Result<Arc<Metadata>, StorageError> {
@@ -78,7 +78,7 @@ impl Reader {
         {
             return Ok(lm.m);
         }
-        self.global.get_metadata(ctx, key).await
+        self.global.get_metadata(key).await
     }
 
     /// Resolves a possibly-empty read. An empty value can be a lock placeholder
@@ -92,7 +92,7 @@ impl Reader {
     /// and re-read the committed value.
     async fn handle_lock_create(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         key: &str,
         rv: ReadValue,
     ) -> Result<ReadValue, StorageError> {
@@ -100,7 +100,7 @@ impl Reader {
             // A non-empty value is never a lock placeholder.
             return Ok(rv);
         }
-        let meta = self.global.get_metadata(ctx, key).await?;
+        let meta = self.global.get_metadata(key).await?;
         let info = tags_lock_info(&meta.tags)?;
 
         // Determine whose committed value is authoritative for this empty object.

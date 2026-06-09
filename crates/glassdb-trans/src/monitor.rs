@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use glassdb_backend as backend;
-use glassdb_concurr::{Background, Clock, Ctx, RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{Background, CancelToken, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{Local, MAX_STALENESS, TLogger, TValue, TxCommitStatus, TxLog, Version};
 use tokio::sync::oneshot;
@@ -46,7 +46,6 @@ struct TxStatusEntry {
 }
 
 struct WaitRequest {
-    ctx: Ctx,
     tx: oneshot::Sender<WaitTxResult>,
 }
 
@@ -85,7 +84,7 @@ pub struct KeyCommitStatus {
 }
 
 /// The outcome of waiting for a transaction to complete.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WaitTxResult {
     pub status: TxCommitStatus,
     pub err: Option<TransError>,
@@ -145,8 +144,9 @@ impl Monitor {
     }
 
     /// Starts a background task that periodically refreshes the pending log so
-    /// the transaction is not considered expired.
-    pub fn start_refresh_tx(&self, ctx: &Ctx, tid: &TxId) {
+    /// the transaction is not considered expired. The task stops when its
+    /// [`Background`] is closed.
+    pub fn start_refresh_tx(&self, tid: &TxId) {
         let need_start = {
             let mut st = self.shard_for(tid).lock().unwrap();
             match st.local_tx.get_mut(tid.as_bytes()) {
@@ -162,14 +162,14 @@ impl Monitor {
         }
         let m = self.clone();
         let tid = tid.clone();
-        self.inner.background.go(ctx, move |ctx| async move {
-            m.refresh_pending(ctx, tid).await;
+        self.inner.background.go(move |token| async move {
+            m.refresh_pending(&token, tid).await;
         });
     }
 
     /// Marks the transaction committed, writing the final log (if it held
     /// locks), updating local storage, and notifying waiters.
-    pub async fn commit_tx(&self, ctx: &Ctx, mut tl: TxLog) -> Result<(), TransError> {
+    pub async fn commit_tx(&self, ctx: &CancelToken, mut tl: TxLog) -> Result<(), TransError> {
         self.stop_tx_refresh(&tl.id);
 
         // Optimization: if nothing was locked (RO or single-W tx), avoid writing
@@ -222,7 +222,7 @@ impl Monitor {
 
     /// Marks the transaction aborted, writing the final log and notifying
     /// waiters. The local state is cleared even if writing the log fails.
-    pub async fn abort_tx(&self, ctx: &Ctx, tid: &TxId) -> Result<(), TransError> {
+    pub async fn abort_tx(&self, ctx: &CancelToken, tid: &TxId) -> Result<(), TransError> {
         self.stop_tx_refresh(tid);
 
         let res = self
@@ -251,7 +251,7 @@ impl Monitor {
     /// The abort is made durable via a conditional write on the transaction log,
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
-    pub async fn wound_tx(&self, ctx: &Ctx, tid: &TxId) -> Result<(), TransError> {
+    pub async fn wound_tx(&self, ctx: &CancelToken, tid: &TxId) -> Result<(), TransError> {
         let cs =
             self.inner.tl.commit_status(ctx, tid).await.map_err(|e| {
                 TransError::Other(format!("reading status of wound target {tid}: {e}"))
@@ -290,7 +290,11 @@ impl Monitor {
     }
 
     /// Returns the commit status, checking locally first then remote storage.
-    pub async fn tx_status(&self, ctx: &Ctx, tid: &TxId) -> Result<TxCommitStatus, TransError> {
+    pub async fn tx_status(
+        &self,
+        ctx: &CancelToken,
+        tid: &TxId,
+    ) -> Result<TxCommitStatus, TransError> {
         {
             let st = self.shard_for(tid).lock().unwrap();
             if let Some(e) = st.local_tx.get(tid.as_bytes()) {
@@ -301,8 +305,17 @@ impl Monitor {
     }
 
     /// Waits asynchronously for the transaction to finalize. The returned
-    /// receiver yields exactly one result.
-    pub fn wait_for_tx(&self, ctx: &Ctx, tid: &TxId) -> oneshot::Receiver<WaitTxResult> {
+    /// future yields exactly one result; dropping it cancels the wait.
+    pub fn wait_for_tx(
+        &self,
+        ctx: &CancelToken,
+        tid: &TxId,
+    ) -> impl std::future::Future<Output = WaitTxResult> + Send + use<> {
+        let rx = self.wait_for_tx_rx(ctx, tid);
+        async move { rx.await.unwrap_or_default() }
+    }
+
+    fn wait_for_tx_rx(&self, _ctx: &CancelToken, tid: &TxId) -> oneshot::Receiver<WaitTxResult> {
         let (tx, rx) = oneshot::channel();
 
         let mut st = self.shard_for(tid).lock().unwrap();
@@ -317,56 +330,36 @@ impl Monitor {
         }
 
         if let Some(ws) = st.waiters.get_mut(tid.as_bytes()) {
-            ws.push(WaitRequest {
-                ctx: ctx.clone(),
-                tx,
-            });
+            ws.push(WaitRequest { tx });
             return rx;
         }
 
         if is_local {
             // Local transition: no worker needed; we'll be notified by
             // commit_tx/abort_tx.
-            st.waiters.insert(
-                tid.as_bytes().to_vec(),
-                vec![WaitRequest {
-                    ctx: ctx.clone(),
-                    tx,
-                }],
-            );
+            st.waiters
+                .insert(tid.as_bytes().to_vec(), vec![WaitRequest { tx }]);
             return rx;
         }
 
-        // Remote transaction: spawn a poller.
-        st.waiters.insert(tid.as_bytes().to_vec(), Vec::new());
+        // Remote transaction: spawn a poller. Waiter liveness is checked
+        // between polls so the poller exits promptly once every caller has
+        // dropped its `wait_for_tx` future.
+        st.waiters
+            .insert(tid.as_bytes().to_vec(), vec![WaitRequest { tx }]);
         drop(st);
 
         let m = self.clone();
         let tid = tid.clone();
-        let ctx0 = ctx.clone();
+        // Detached poller: it terminates either when the tx finalizes (final
+        // status or a fetch error) or when every caller has dropped its
+        // `wait_for_tx` future.
+        let poll_ctx = CancelToken::new();
         rt::spawn(async move {
-            let mut cur_ctx = ctx0;
-            loop {
-                let (status, err) = m.poll_tx_status(&cur_ctx, &tid).await;
-                if err.is_none() || !cur_ctx.is_cancelled() {
-                    let res = WaitTxResult { status, err };
-                    {
-                        let mut st = m.shard_for(&tid).lock().unwrap();
-                        notify_waiters(&mut st, &tid, res.clone());
-                    }
-                    let _ = tx.send(res);
-                    return;
-                }
-                // The context expired. See whether somebody else is interested.
-                let next = {
-                    let mut st = m.shard_for(&tid).lock().unwrap();
-                    next_waiter(&mut st, &tid)
-                };
-                match next {
-                    Some(c) => cur_ctx = c,
-                    None => return,
-                }
-            }
+            let (status, err) = m.poll_tx_status_with_liveness(&poll_ctx, &tid).await;
+            let res = WaitTxResult { status, err };
+            let mut st = m.shard_for(&tid).lock().unwrap();
+            notify_waiters(&mut st, &tid, res);
         });
 
         rx
@@ -376,7 +369,7 @@ impl Monitor {
     /// local storage or the transaction log.
     pub async fn committed_value(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         key: &str,
         tid: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
@@ -430,7 +423,7 @@ impl Monitor {
 
     async fn fetch_remote_tx_status(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         tid: &TxId,
     ) -> Result<TxCommitStatus, TransError> {
         let status = self.inner.tl.commit_status(ctx, tid).await?;
@@ -447,7 +440,11 @@ impl Monitor {
         }
     }
 
-    async fn handle_unknown_tx(&self, ctx: &Ctx, tid: &TxId) -> Result<TxCommitStatus, TransError> {
+    async fn handle_unknown_tx(
+        &self,
+        ctx: &CancelToken,
+        tid: &TxId,
+    ) -> Result<TxCommitStatus, TransError> {
         let now = self.inner.clock.now();
         let first_check = {
             let mut st = self.shard_for(tid).lock().unwrap();
@@ -478,7 +475,7 @@ impl Monitor {
 
     async fn try_abort_remote_tx(
         &self,
-        ctx: &Ctx,
+        ctx: &CancelToken,
         tid: &TxId,
         expected: &backend::Version,
     ) -> Result<TxCommitStatus, TransError> {
@@ -498,7 +495,15 @@ impl Monitor {
         }
     }
 
-    async fn poll_tx_status(&self, ctx: &Ctx, tid: &TxId) -> (TxCommitStatus, Option<TransError>) {
+    /// Polls the remote tx status until it finalizes, a fetch fails, or every
+    /// caller has dropped its `wait_for_tx` future (signalled by closed
+    /// `oneshot::Sender`s in the waiters list). The latter is the future-drop
+    /// equivalent of the per-call cancellation contexts the Go original used.
+    async fn poll_tx_status_with_liveness(
+        &self,
+        ctx: &CancelToken,
+        tid: &TxId,
+    ) -> (TxCommitStatus, Option<TransError>) {
         let mut backoff = self.inner.retry.backoff();
         loop {
             let s = match self.fetch_remote_tx_status(ctx, tid).await {
@@ -507,6 +512,27 @@ impl Monitor {
             };
             if s.is_final() {
                 return (s, None);
+            }
+            let alive = {
+                let mut st = self.shard_for(tid).lock().unwrap();
+                match st.waiters.get_mut(tid.as_bytes()) {
+                    Some(ws) => {
+                        ws.retain(|w| !w.tx.is_closed());
+                        if ws.is_empty() {
+                            st.waiters.remove(tid.as_bytes());
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    None => false,
+                }
+            };
+            if !alive {
+                return (
+                    s,
+                    Some(TransError::Other("no live waiters; abandoning poll".into())),
+                );
             }
             tokio::select! {
                 biased;
@@ -518,7 +544,7 @@ impl Monitor {
         }
     }
 
-    async fn set_final_log(&self, ctx: &Ctx, tlog: TxLog) -> Result<(), TransError> {
+    async fn set_final_log(&self, ctx: &CancelToken, tlog: TxLog) -> Result<(), TransError> {
         let tid = tlog.id.clone();
         if tid.is_empty() {
             return Err(TransError::Other("missing required tlog ID".into()));
@@ -577,7 +603,9 @@ impl Monitor {
             }
             tokio::select! {
                 biased;
-                _ = ctx.cancelled() => return Err(TransError::Cancelled),
+                _ = ctx.cancelled() => {
+                    return Err(TransError::Other("shutting down".into()));
+                }
                 _ = rt::sleep(backoff.next_delay()) => {}
             }
         }
@@ -602,7 +630,7 @@ impl Monitor {
         }
     }
 
-    async fn refresh_pending(&self, ctx: Ctx, tid: TxId) {
+    async fn refresh_pending(&self, ctx: &CancelToken, tid: TxId) {
         if !self.should_refresh(&tid) {
             return;
         }
@@ -623,9 +651,9 @@ impl Monitor {
             tl.timestamp = Some(start);
 
             let r = if last_version.is_null() {
-                self.inner.tl.set(&ctx, tl).await
+                self.inner.tl.set(ctx, tl).await
             } else {
-                self.inner.tl.set_if(&ctx, tl, &last_version).await
+                self.inner.tl.set_if(ctx, tl, &last_version).await
             };
             match r {
                 Ok(v) => {
@@ -644,23 +672,11 @@ impl Monitor {
 fn notify_waiters(st: &mut State, tid: &TxId, res: WaitTxResult) {
     if let Some(ws) = st.waiters.remove(tid.as_bytes()) {
         for w in ws {
-            if !w.ctx.is_cancelled() {
-                let _ = w.tx.send(res.clone());
-            }
+            // `send` silently fails if the receiver has been dropped,
+            // which is the new "waiter cancelled" signal.
+            let _ = w.tx.send(res.clone());
         }
     }
-}
-
-fn next_waiter(st: &mut State, tid: &TxId) -> Option<Ctx> {
-    let ws = st.waiters.get_mut(tid.as_bytes())?;
-    let i = ws
-        .iter()
-        .position(|w| !w.ctx.is_cancelled())
-        .unwrap_or(ws.len());
-    if i > 0 {
-        ws.drain(0..i);
-    }
-    ws.first().map(|w| w.ctx.clone())
 }
 
 #[cfg(test)]
@@ -693,7 +709,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let key = paths::from_key("example", b"key1");
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
@@ -734,11 +750,11 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let key = paths::from_key("example", b"key");
 
         t1.global
-            .write(&ctx, &key, b"x".to_vec(), Tags::new())
+            .write(&key, b"x".to_vec(), Tags::new())
             .await
             .unwrap();
 
@@ -771,7 +787,7 @@ mod tests {
     async fn wait_for_local_tx() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b);
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
 
@@ -779,8 +795,8 @@ mod tests {
         let ch2 = mon1.wait_for_tx(&ctx, &tx);
 
         mon1.abort_tx(&ctx, &tx).await.unwrap();
-        assert_eq!(ch1.await.unwrap().status, TxCommitStatus::Aborted);
-        assert_eq!(ch2.await.unwrap().status, TxCommitStatus::Aborted);
+        assert_eq!(ch1.await.status, TxCommitStatus::Aborted);
+        assert_eq!(ch2.await.status, TxCommitStatus::Aborted);
     }
 
     #[tokio::test]
@@ -788,8 +804,8 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
-        let ctx = Ctx::background();
-        let (ctx1, cancel1) = Ctx::with_cancel();
+        let ctx = CancelToken::new();
+        let ctx1 = CancelToken::new();
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
 
@@ -797,21 +813,21 @@ mod tests {
         let ch2 = mon2.wait_for_tx(&ctx, &tx);
         let ch3 = mon2.wait_for_tx(&ctx, &tx);
 
-        cancel1.cancel();
+        ctx1.cancel();
         mon1.abort_tx(&ctx, &tx).await.unwrap();
 
-        assert_eq!(ch2.await.unwrap().status, TxCommitStatus::Aborted);
-        assert_eq!(ch3.await.unwrap().status, TxCommitStatus::Aborted);
+        assert_eq!(ch2.await.status, TxCommitStatus::Aborted);
+        assert_eq!(ch3.await.status, TxCommitStatus::Aborted);
     }
 
     #[tokio::test(start_paused = true)]
     async fn refresh_keeps_pending() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
-        let ctx = Ctx::background();
+        let ctx = CancelToken::new();
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon.begin_tx(&tx);
-        mon.start_refresh_tx(&ctx, &tx);
+        mon.start_refresh_tx(&tx);
 
         // Advance well past the pending timeout. Refresh keeps it alive.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;

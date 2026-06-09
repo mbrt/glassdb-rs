@@ -1,19 +1,17 @@
 //! GlassDB: a stateless ACID key/value store on top of object storage.
 //!
-//! Public API ported from the Go root package: [`DB`] opens a database over a
+//! Public API: [`DB`] opens a database over a
 //! [`glassdb_backend::Backend`], [`Collection`] groups keys, and [`Tx`] runs a
 //! serializable transaction (with automatic conflict retries) via [`DB::tx`].
 //!
 //! # Cancellation
 //!
-//! Every public async entry point takes a [`Ctx`] and is durability-safe to
-//! cancel: dropping a future mid-flight is equivalent to a crash and is
-//! recovered by the commit protocol, so it never corrupts data. Callers should
-//! prefer cancelling through the [`Ctx`] cancel token over dropping the future
-//! (`tokio::time::timeout`, `select!`, `JoinHandle::abort`). A `Ctx`
-//! cancellation unwinds in-memory coordination promptly, whereas a dropped
-//! future leaves on-storage locks held by the abandoned attempt to be reclaimed
-//! only after wait/lease timeouts. See [`DB::tx`] for details.
+//! Every public async entry point is durability-safe to cancel: dropping a
+//! future mid-flight is equivalent to a crash and is recovered by the commit
+//! protocol, so it never corrupts data. Cancel by wrapping the future with
+//! `tokio::time::timeout`, `tokio::select!`, or aborting a `JoinHandle`. Locks
+//! held by an abandoned attempt are reclaimed after wait/lease timeouts. See
+//! [`DB::tx`] for details.
 
 mod collection;
 mod db;
@@ -44,9 +42,6 @@ pub use glassdb_backend::{self as backend, Backend, memory, middleware};
 pub use glassdb_backend_gcs as gcs;
 #[cfg(feature = "s3")]
 pub use glassdb_backend_s3 as s3;
-
-// Re-export the cancellation context, required by every public entry point.
-pub use glassdb_concurr::Ctx;
 
 // The deterministic simulation runtime (only under `--cfg sim`). Used by the
 // concurrency fuzzer and the `concurrent_sim` self-check to drive the harness on

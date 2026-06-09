@@ -31,7 +31,6 @@ use async_trait::async_trait;
 use tokio::sync::{Notify, oneshot};
 
 use crate::cancel::CancelToken;
-use crate::ctx::Ctx;
 use crate::rt;
 use crate::shard::Sharded;
 
@@ -56,7 +55,7 @@ where
     R: MergeRequest,
     E: Send + Sync + 'static,
 {
-    async fn run(&self, ctx: &Ctx, key: &str, batch: &BatchHandle<R, E>) -> Result<(), E>;
+    async fn run(&self, ctx: &CancelToken, key: &str, batch: &BatchHandle<R, E>) -> Result<(), E>;
 }
 
 /// Error returned by [`Dedup::run`].
@@ -82,16 +81,17 @@ impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for DedupError<E>
 
 /// A single submitted request awaiting a batch result.
 struct Member<R, E> {
-    ctx: Ctx,
     request: R,
     done: oneshot::Sender<Result<(), Arc<E>>>,
 }
 
 impl<R, E> Member<R, E> {
-    /// A member is live while its caller is still interested: the context is not
-    /// cancelled and the result receiver has not been dropped.
+    /// A member is live while its caller is still interested. With cancellation
+    /// modelled as future-drop, that's identical to "the result receiver has
+    /// not been dropped": dropping the `run` future drops the `oneshot`
+    /// receiver, which `is_closed` observes.
     fn live(&self) -> bool {
-        !self.ctx.is_cancelled() && !self.done.is_closed()
+        !self.done.is_closed()
     }
 }
 
@@ -384,7 +384,7 @@ where
                 queue_count = st.queue.len(),
                 "round_start",
             );
-            Ctx::from_token(tok)
+            tok
         };
 
         let res = self
@@ -463,11 +463,14 @@ where
     }
 
     /// Drives the inline fast path for the first caller of an idle key. Runs one
-    /// round on the caller's own task, responsive to the caller's own
-    /// cancellation, and returns that caller's own result.
+    /// round on the caller's own task and returns that caller's own result.
+    ///
+    /// If the surrounding `run` future is dropped mid-round, the
+    /// [`DriverGuard`] (kept armed until success) runs on drop and hands any
+    /// live waiters off to a spawned owner, so cancellation is just
+    /// future-drop.
     async fn drive_inline(
         self: &Arc<Self>,
-        ctx: &Ctx,
         shard: &Arc<Shard<R, E>>,
         key: &str,
         mut rx: oneshot::Receiver<Result<(), Arc<E>>>,
@@ -483,30 +486,15 @@ where
             armed: true,
         };
 
-        let round = tokio::select! {
-            biased;
-            r = self.drive_one_round(shard, key, &handle) => Some(r),
-            // The caller cancelled its own context: bail and let the (still
-            // armed) guard hand off any live waiters to a spawned owner. This
-            // keeps the inline driver responsive to its own cancellation without
-            // abandoning merged waiters.
-            _ = ctx.cancelled() => None,
-        };
-
-        match round {
-            Some(round) => {
-                guard.armed = false;
-                if let Round::Delivered = round {
-                    self.finish_round(shard, key);
-                }
-                match rx.try_recv() {
-                    Ok(res) => res.map_err(DedupError::Work),
-                    // Our own member was pruned (we were cancelled) before
-                    // delivery.
-                    Err(_) => Err(DedupError::Cancelled),
-                }
-            }
-            None => Err(DedupError::Cancelled),
+        let round = self.drive_one_round(shard, key, &handle).await;
+        guard.armed = false;
+        if let Round::Delivered = round {
+            self.finish_round(shard, key);
+        }
+        match rx.try_recv() {
+            Ok(res) => res.map_err(DedupError::Work),
+            // Our own member was pruned (e.g. by shutdown) before delivery.
+            Err(_) => Err(DedupError::Cancelled),
         }
     }
 }
@@ -578,6 +566,24 @@ where
     }
 }
 
+/// Disarms after the waiter receives its result. On drop while armed (the
+/// `run` future was cancelled mid-wait), it pokes the per-key `changed`
+/// notifier so the driver re-evaluates liveness and can abandon the batch if
+/// no caller remains. Without it, the driver might sit indefinitely in
+/// `BatchHandle::changed`.
+struct WaiterDropGuard {
+    changed: Arc<Notify>,
+    armed: bool,
+}
+
+impl Drop for WaiterDropGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.changed.notify_one();
+        }
+    }
+}
+
 /// Deduplicates and merges concurrent requests for the same key using `W`.
 ///
 /// Requests are partitioned across independent shards by key hash to reduce lock
@@ -613,17 +619,16 @@ where
     /// Dropping or cancelling the returned future is safe: a queued waiter simply
     /// drops its receiver, and a dropped inline driver hands its work off to a
     /// spawned owner, so neither orphans the key nor strands other callers.
-    pub async fn run(&self, ctx: &Ctx, key: &str, r: R) -> Result<(), DedupError<E>> {
+    pub async fn run(&self, key: &str, r: R) -> Result<(), DedupError<E>> {
         let shard = self.inner.shards.for_key(key.as_bytes()).clone();
         let (tx, rx) = oneshot::channel();
         let reorder = r.can_reorder();
         let member = Member {
-            ctx: ctx.clone(),
             request: r,
             done: tx,
         };
 
-        let is_driver = {
+        let (is_driver, changed) = {
             let mut map = shard.map.lock().unwrap();
             match map.get_mut(key) {
                 Some(st) => {
@@ -633,34 +638,34 @@ where
                         st.queue.push(member);
                     }
                     st.changed.notify_one();
-                    false
+                    (false, st.changed.clone())
                 }
                 None => {
-                    map.insert(key.to_string(), KeyState::new(member));
-                    true
+                    let st = KeyState::new(member);
+                    let changed = st.changed.clone();
+                    map.insert(key.to_string(), st);
+                    (true, changed)
                 }
             }
         };
 
         if is_driver {
-            return self.inner.drive_inline(ctx, &shard, key, rx).await;
+            return self.inner.drive_inline(&shard, key, rx).await;
         }
 
-        tokio::select! {
-            biased;
-            r = rx => match r {
-                Ok(res) => res.map_err(DedupError::Work),
-                Err(_) => Err(DedupError::Cancelled),
-            },
-            _ = ctx.cancelled() => {
-                // Wake the driver so it prunes us promptly and can abandon the
-                // batch if we were the last live caller.
-                if let Some(st) = shard.map.lock().unwrap().get(key) {
-                    st.changed.notify_one();
-                }
-                Err(DedupError::Cancelled)
-            }
-        }
+        // If a queued waiter is dropped mid-wait, its `oneshot::Receiver` goes
+        // with it; the guard wakes the driver so it can prune the dead member
+        // promptly (and abandon the batch if no live caller remains).
+        let mut guard = WaiterDropGuard {
+            changed,
+            armed: true,
+        };
+        let out = match rx.await {
+            Ok(res) => res.map_err(DedupError::Work),
+            Err(_) => Err(DedupError::Cancelled),
+        };
+        guard.armed = false;
+        out
     }
 
     /// Cancels all in-flight work and awaits any spawned owner tasks, so no owner
@@ -772,7 +777,7 @@ mod tests {
     impl Worker<TestRequest, ()> for GatedWorker {
         async fn run(
             &self,
-            ctx: &Ctx,
+            ctx: &CancelToken,
             _key: &str,
             batch: &BatchHandle<TestRequest, ()>,
         ) -> Result<(), ()> {
@@ -811,7 +816,7 @@ mod tests {
     impl Worker<TestRequest, ()> for AccumWorker {
         async fn run(
             &self,
-            ctx: &Ctx,
+            ctx: &CancelToken,
             _key: &str,
             batch: &BatchHandle<TestRequest, ()>,
         ) -> Result<(), ()> {
@@ -839,20 +844,20 @@ mod tests {
     impl Worker<TestRequest, ()> for CounterWorker {
         async fn run(
             &self,
-            ctx: &Ctx,
+            ctx: &CancelToken,
             _key: &str,
             batch: &BatchHandle<TestRequest, ()>,
         ) -> Result<(), ()> {
             let _ = batch.merged();
             *self.counter.lock().unwrap() += 1;
-            ctx.err().map_err(|_| ())
+            if ctx.is_cancelled() { Err(()) } else { Ok(()) }
         }
     }
 
     #[tokio::test]
     async fn single_call() {
         let d = Dedup::new(CounterWorker::default());
-        assert!(d.run(&Ctx::background(), "key", mergeable(0)).await.is_ok());
+        assert!(d.run("key", mergeable(0)).await.is_ok());
         assert_eq!(*d.inner.worker.counter.lock().unwrap(), 1);
     }
 
@@ -861,18 +866,19 @@ mod tests {
     async fn uncontended_runs_inline_without_spawn() {
         let d = Dedup::new(CounterWorker::default());
         for i in 0..5 {
-            assert!(d.run(&Ctx::background(), "key", mergeable(i)).await.is_ok());
+            assert!(d.run("key", mergeable(i)).await.is_ok());
         }
         assert_eq!(d.active_owners(), 0, "uncontended work should not spawn");
     }
 
+    /// Closing the deduplicator cancels all in-flight work; any subsequent
+    /// inline call observes `Cancelled` because the shutdown token propagates
+    /// to the worker round.
     #[tokio::test]
-    async fn context_expired() {
+    async fn close_surfaces_cancelled() {
         let d = Dedup::new(CounterWorker::default());
-        let (ctx, token) = Ctx::with_cancel();
-        token.cancel();
-        let err = d.run(&ctx, "key", mergeable(0)).await;
-        // The inline driver bails on its own cancellation before running.
+        d.close().await;
+        let err = d.run("key", mergeable(0)).await;
         assert!(matches!(err, Err(DedupError::Cancelled)), "got {err:?}");
     }
 
@@ -882,13 +888,12 @@ mod tests {
             target: 2,
             res: StdMutex::new(Vec::new()),
         }));
-        let ctx = Ctx::background();
 
         // A becomes the inline driver and waits for the merged total to reach 2.
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut a = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
         // B merges in.
-        let mut b = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut b = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(b.as_mut()).is_pending());
 
         assert!(a.await.is_ok());
@@ -901,12 +906,11 @@ mod tests {
     async fn sequential_do() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
         let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
 
         // A is the inline driver (gated); B queues behind it (non-mergeable).
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut a = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
-        let mut b = Box::pin(d.run(&ctx, "key", unmergeable(1)));
+        let mut b = Box::pin(d.run("key", unmergeable(1)));
         assert!(futures::poll!(b.as_mut()).is_pending());
 
         // Release A: it serves its own batch, then hands B off to a spawned owner.
@@ -921,11 +925,10 @@ mod tests {
     async fn handoff_spawns_owner() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
         let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
 
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut a = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
-        let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+        let mut b = Box::pin(d.run("key", unmergeable(2)));
         assert!(futures::poll!(b.as_mut()).is_pending());
 
         release.add_permits(1);
@@ -942,14 +945,13 @@ mod tests {
     async fn reorder_merge() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
         let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
 
         // Seed (gated), a non-mergeable queued request, and a reorderable one.
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(5)));
+        let mut a = Box::pin(d.run("key", mergeable(5)));
         assert!(futures::poll!(a.as_mut()).is_pending());
-        let mut wa = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+        let mut wa = Box::pin(d.run("key", unmergeable(2)));
         assert!(futures::poll!(wa.as_mut()).is_pending());
-        let mut wb = Box::pin(d.run(&ctx, "key", reorderable(3)));
+        let mut wb = Box::pin(d.run("key", reorderable(3)));
         assert!(futures::poll!(wb.as_mut()).is_pending());
 
         // Release: the seed merges the reorderable (5+3=8); the non-mergeable (2)
@@ -966,12 +968,11 @@ mod tests {
     async fn result_fans_out_to_all_mergeable_callers() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
         let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
 
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut a = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
         let mut waiters: Vec<_> = (0..4)
-            .map(|_| Box::pin(d.run(&ctx, "key", mergeable(1))))
+            .map(|_| Box::pin(d.run("key", mergeable(1))))
             .collect();
         for w in &mut waiters {
             assert!(futures::poll!(w.as_mut()).is_pending());
@@ -992,11 +993,10 @@ mod tests {
     #[tokio::test]
     async fn dropped_inline_driver_with_waiters_spawns_owner() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
-        let ctx = Ctx::background();
 
-        let mut a = Box::pin(d.run(&ctx, "key", unmergeable(1)));
+        let mut a = Box::pin(d.run("key", unmergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
-        let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+        let mut b = Box::pin(d.run("key", unmergeable(2)));
         assert!(futures::poll!(b.as_mut()).is_pending());
 
         // Drop A mid-round: the guard hands B off to a fresh owner.
@@ -1018,12 +1018,11 @@ mod tests {
     async fn dropped_waiter_future_does_not_orphan_key() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
         let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
 
-        let mut a = Box::pin(d.run(&ctx, "key", unmergeable(1)));
+        let mut a = Box::pin(d.run("key", unmergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
         {
-            let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+            let mut b = Box::pin(d.run("key", unmergeable(2)));
             assert!(futures::poll!(b.as_mut()).is_pending());
         }
 
@@ -1032,66 +1031,41 @@ mod tests {
         assert!(matches!(ra, Ok(Ok(()))), "driver did not finish: {ra:?}");
 
         // The key is free for a fresh request.
-        let rc =
-            tokio::time::timeout(Duration::from_secs(2), d.run(&ctx, "key", unmergeable(3))).await;
+        let rc = tokio::time::timeout(Duration::from_secs(2), d.run("key", unmergeable(3))).await;
         assert!(matches!(rc, Ok(Ok(()))), "key was orphaned: {rc:?}");
     }
 
-    // A queued waiter that cancels its context is pruned and never orphans the
-    // key.
+    /// When every caller drops its `run` future mid-flight, the worker's
+    /// per-round context is cancelled (no live members remain) so it
+    /// abandons the work and the key is removed without an orphan.
     #[tokio::test]
-    async fn cancelled_waiter_does_not_orphan_key() {
-        let d = Arc::new(Dedup::new(GatedWorker::new()));
-        let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
-
-        let mut a = Box::pin(d.run(&ctx, "key", unmergeable(1)));
-        assert!(futures::poll!(a.as_mut()).is_pending());
-        let (ctx_b, token_b) = Ctx::with_cancel();
-        let mut b = Box::pin(d.run(&ctx_b, "key", unmergeable(2)));
-        assert!(futures::poll!(b.as_mut()).is_pending());
-
-        // Cancel B before it is served.
-        token_b.cancel();
-        let rb = tokio::time::timeout(Duration::from_secs(2), b).await;
-        assert!(
-            matches!(rb, Ok(Err(DedupError::Cancelled))),
-            "cancelled waiter: {rb:?}"
-        );
-
-        // Release A and confirm the key is reusable.
-        release.add_permits(1);
-        assert!(a.await.is_ok());
-        let rc =
-            tokio::time::timeout(Duration::from_secs(2), d.run(&ctx, "key", unmergeable(3))).await;
-        assert!(matches!(rc, Ok(Ok(()))), "key was orphaned: {rc:?}");
-        d.close().await;
-        assert_eq!(d.active_owners(), 0);
-    }
-
-    // When every member of a batch is cancelled mid-flight, the worker's context
-    // is cancelled so it abandons the work.
-    #[tokio::test]
-    async fn all_members_cancelled_abandons_batch() {
+    async fn all_members_dropped_abandons_batch() {
         let d = Arc::new(Dedup::new(AccumWorker {
-            // Never reachable: forces the worker to wait on `changed` until its
-            // context is cancelled.
+            // Never reachable: forces the worker to wait on `changed` until
+            // every caller drops and the round's token is cancelled.
             target: i64::MAX,
             res: StdMutex::new(Vec::new()),
         }));
-        let (ctx, token) = Ctx::with_cancel();
 
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut a = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
-        let mut b = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut b = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(b.as_mut()).is_pending());
 
-        // Cancel everyone: the inline driver bails on its own context.
-        token.cancel();
-        let ra = tokio::time::timeout(Duration::from_secs(2), a).await;
-        let rb = tokio::time::timeout(Duration::from_secs(2), b).await;
-        assert!(matches!(ra, Ok(Err(DedupError::Cancelled))), "a: {ra:?}");
-        assert!(matches!(rb, Ok(Err(DedupError::Cancelled))), "b: {rb:?}");
+        // Drop everyone: the inline driver bails on its own future-drop;
+        // the waiter pokes `changed` so the spawned owner re-evaluates.
+        drop(a);
+        drop(b);
+
+        // Wait for the spawned owner to drain its empty batch and remove the
+        // key entirely, signalling no orphan.
+        let rc = tokio::time::timeout(Duration::from_secs(2), async {
+            while !d.snapshot().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(rc.is_ok(), "key was not abandoned: {rc:?}");
 
         // No work was recorded and nothing leaked.
         assert!(d.inner.worker.res.lock().unwrap().is_empty());
@@ -1106,17 +1080,16 @@ mod tests {
     async fn snapshot_reflects_inflight_state_and_clears_after_delivery() {
         let d = Arc::new(Dedup::new(GatedWorker::new()));
         let release = d.inner.worker.release.clone();
-        let ctx = Ctx::background();
 
         // No state when idle.
         assert!(d.snapshot().is_empty());
 
         // A is the inline driver (gated). B queues behind, C is reorderable.
-        let mut a = Box::pin(d.run(&ctx, "key", mergeable(1)));
+        let mut a = Box::pin(d.run("key", mergeable(1)));
         assert!(futures::poll!(a.as_mut()).is_pending());
-        let mut b = Box::pin(d.run(&ctx, "key", unmergeable(2)));
+        let mut b = Box::pin(d.run("key", unmergeable(2)));
         assert!(futures::poll!(b.as_mut()).is_pending());
-        let mut c = Box::pin(d.run(&ctx, "key", reorderable(3)));
+        let mut c = Box::pin(d.run("key", reorderable(3)));
         assert!(futures::poll!(c.as_mut()).is_pending());
 
         let snap = d.snapshot();

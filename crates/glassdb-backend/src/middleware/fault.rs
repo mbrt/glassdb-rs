@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use glassdb_concurr::Tape;
 use glassdb_concurr::rt;
-use glassdb_concurr::{Ctx, Tape};
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
 
@@ -146,12 +146,9 @@ impl FaultBackend {
 
     /// Runs `op` through the faulty transport: an optional delay, then either the
     /// real call, a dropped request (no landing), or a landed call whose ack is
-    /// lost. During an outage every op faults.
-    async fn transport<T, Fut>(
-        &self,
-        ctx: &Ctx,
-        op: impl FnOnce() -> Fut,
-    ) -> Result<T, BackendError>
+    /// lost. During an outage every op faults. The caller cancels by dropping
+    /// the surrounding future.
+    async fn transport<T, Fut>(&self, op: impl FnOnce() -> Fut) -> Result<T, BackendError>
     where
         Fut: std::future::Future<Output = Result<T, BackendError>>,
     {
@@ -180,14 +177,7 @@ impl FaultBackend {
             (delay, fault)
         };
         if let Some(d) = delay {
-            // `biased`: a cancelled transport must abort the op, never let it
-            // land, even if the injected delay elapses on the same tick. Fixed
-            // poll order also keeps the sim's recorded op stream deterministic.
-            tokio::select! {
-                biased;
-                _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                _ = rt::sleep(d) => {}
-            }
+            rt::sleep(d).await;
         }
         match fault {
             None => op().await,
@@ -210,90 +200,72 @@ impl FaultBackend {
 impl Backend for FaultBackend {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
-        self.transport(ctx, || {
-            self.inner.read_if_modified(ctx, path, expected_writer)
-        })
-        .await
-    }
-
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
-        self.transport(ctx, || self.inner.read(ctx, path)).await
-    }
-
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
-        self.transport(ctx, || self.inner.get_metadata(ctx, path))
+        self.transport(|| self.inner.read_if_modified(path, expected_writer))
             .await
+    }
+
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        self.transport(|| self.inner.read(path)).await
+    }
+
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        self.transport(|| self.inner.get_metadata(path)).await
     }
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.transport(ctx, || self.inner.set_tags_if(ctx, path, expected, tags))
+        self.transport(|| self.inner.set_tags_if(path, expected, tags))
             .await
     }
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.transport(ctx, || self.inner.write(ctx, path, value, tags))
-            .await
+        self.transport(|| self.inner.write(path, value, tags)).await
     }
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.transport(ctx, || {
-            self.inner.write_if(ctx, path, value, expected, tags)
-        })
-        .await
+        self.transport(|| self.inner.write_if(path, value, expected, tags))
+            .await
     }
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.transport(ctx, || {
-            self.inner.write_if_not_exists(ctx, path, value, tags)
-        })
-        .await
-    }
-
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        self.transport(ctx, || self.inner.delete(ctx, path)).await
-    }
-
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
-        self.transport(ctx, || self.inner.delete_if(ctx, path, expected))
+        self.transport(|| self.inner.write_if_not_exists(path, value, tags))
             .await
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.transport(ctx, || self.inner.list(ctx, dir_path)).await
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        self.transport(|| self.inner.delete(path)).await
+    }
+
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        self.transport(|| self.inner.delete_if(path, expected))
+            .await
+    }
+
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        self.transport(|| self.inner.list(dir_path)).await
     }
 }
 
@@ -306,12 +278,9 @@ mod tests {
     async fn inactive_passes_through() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let fb = FaultBackend::new(mem, 1, FaultOptions::from_intensity(255));
-        let ctx = Ctx::background();
         // While inactive, an unconditional write/read round-trips cleanly.
-        fb.write(&ctx, "p", b"v".to_vec(), Tags::new())
-            .await
-            .unwrap();
-        let r = fb.read(&ctx, "p").await.unwrap();
+        fb.write("p", b"v".to_vec(), Tags::new()).await.unwrap();
+        let r = fb.read("p").await.unwrap();
         assert_eq!(r.contents, b"v");
     }
 
@@ -320,12 +289,11 @@ mod tests {
         async fn run(tape: Vec<u8>) -> Vec<bool> {
             let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
             let fb = FaultBackend::with_tape(mem, tape, 7, FaultOptions::from_intensity(255));
-            let ctx = Ctx::background();
             fb.set_active(true);
             let mut outcomes = Vec::new();
             for i in 0..32 {
                 let ok = fb
-                    .write_if_not_exists(&ctx, &format!("k{i}"), b"v".to_vec(), Tags::new())
+                    .write_if_not_exists(&format!("k{i}"), b"v".to_vec(), Tags::new())
                     .await
                     .is_ok();
                 outcomes.push(ok);
@@ -352,7 +320,6 @@ mod tests {
             max_delay: Duration::from_millis(0),
         };
         let fb = FaultBackend::new(mem, 1, opts);
-        let ctx = Ctx::background();
         fb.set_active(true);
 
         // While down, the transport is all-or-nothing: every op fails, whatever
@@ -361,7 +328,7 @@ mod tests {
         for i in 0..32 {
             assert!(
                 matches!(
-                    fb.read(&ctx, &format!("p{i}")).await,
+                    fb.read(&format!("p{i}")).await,
                     Err(BackendError::Unavailable(_))
                 ),
                 "op {i} should fail during a transport outage"
@@ -373,7 +340,7 @@ mod tests {
         for i in 0..32 {
             assert!(
                 !matches!(
-                    fb.read(&ctx, &format!("p{i}")).await,
+                    fb.read(&format!("p{i}")).await,
                     Err(BackendError::Unavailable(_))
                 ),
                 "op {i} still outaged after heal"
@@ -385,7 +352,6 @@ mod tests {
     async fn active_eventually_injects_faults() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let fb = FaultBackend::new(mem, 7, FaultOptions::from_intensity(255));
-        let ctx = Ctx::background();
         fb.set_active(true);
         // With max intensity, some conditional writes are faulted within a few
         // dozen attempts.
@@ -393,7 +359,7 @@ mod tests {
         for i in 0..200 {
             let path = format!("k{i}");
             let r = fb
-                .write_if_not_exists(&ctx, &path, b"v".to_vec(), Tags::new())
+                .write_if_not_exists(&path, b"v".to_vec(), Tags::new())
                 .await;
             if r.is_err() {
                 faults += 1;

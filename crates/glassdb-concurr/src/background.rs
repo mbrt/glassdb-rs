@@ -1,14 +1,16 @@
-//! Background task management. Ported from the Go `concurr.Background`: spawns
-//! tasks that are cancelled together on [`Background::close`].
+//! Background task management. Spawns tasks that share a [`CancelToken`] cancelled
+//! together on [`Background::close`], shaped after `tokio_util::task::TaskTracker`.
+//! Long-running spawned tasks observe the token (via [`CancelToken::cancelled`])
+//! to learn that the parent is shutting down.
 
 use std::future::Future;
 use std::sync::Mutex;
 
 use crate::cancel::CancelToken;
-use crate::ctx::Ctx;
 use crate::rt::{self, JoinHandle};
 
-/// Manages a set of background tasks cancelled together on close.
+/// Manages a set of background tasks cancelled together on close. Each task
+/// receives a shared [`CancelToken`] it can observe to react to shutdown.
 pub struct Background {
     token: CancelToken,
     handles: Mutex<Vec<JoinHandle<()>>>,
@@ -25,21 +27,20 @@ impl Background {
         }
     }
 
-    /// Spawns `f` as a background task, passing it a context whose cancellation
-    /// is tied to this manager (but which preserves the parent's values).
-    /// Returns `false` if the manager is already closed.
-    pub fn go<F, Fut>(&self, ctx: &Ctx, f: F) -> bool
+    /// Spawns `f` as a background task, passing it the manager's shared
+    /// [`CancelToken`]. Returns `false` if the manager is already closed.
+    pub fn go<F, Fut>(&self, f: F) -> bool
     where
-        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        F: FnOnce(CancelToken) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let closed = self.closed.lock().unwrap();
         if *closed {
             return false;
         }
-        let child = ctx.with_new_cancel(self.token.clone());
+        let token = self.token.clone();
         let handle = rt::spawn(async move {
-            f(child).await;
+            f(token).await;
         });
         self.handles.lock().unwrap().push(handle);
         true
@@ -79,12 +80,12 @@ mod tests {
         let b = Background::new();
         let ran = Arc::new(AtomicBool::new(false));
         let r = ran.clone();
-        assert!(b.go(&Ctx::background(), move |_ctx| async move {
+        assert!(b.go(move |_tok| async move {
             r.store(true, Ordering::SeqCst);
         }));
         b.close().await;
         assert!(ran.load(Ordering::SeqCst));
-        assert!(!b.go(&Ctx::background(), |_ctx| async {}));
+        assert!(!b.go(|_tok| async {}));
     }
 
     #[tokio::test]
@@ -92,8 +93,8 @@ mod tests {
         let b = Arc::new(Background::new());
         let done = Arc::new(AtomicUsize::new(0));
         let d = done.clone();
-        b.go(&Ctx::background(), move |ctx| async move {
-            ctx.cancelled().await;
+        b.go(move |tok| async move {
+            tok.cancelled().await;
             d.fetch_add(1, Ordering::SeqCst);
         });
         // Give the task a chance to start.

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Clock, Ctx, RetryConfig};
+use glassdb_concurr::{Background, CancelToken, Clock, RetryConfig};
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor};
@@ -88,7 +88,7 @@ impl DbBuilder {
 
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
-    pub async fn open(self, ctx: &Ctx) -> Result<DB, Error> {
+    pub async fn open(self) -> Result<DB, Error> {
         let DbBuilder {
             name,
             backend: b,
@@ -102,7 +102,7 @@ impl DbBuilder {
                 "name must be alphanumeric, got {name:?}"
             )));
         }
-        check_or_create_db_meta(ctx, &b, &name).await?;
+        check_or_create_db_meta(&b, &name).await?;
 
         let backend = Arc::new(StatsBackend::new(b));
         let dyn_backend: Arc<dyn Backend> = backend.clone();
@@ -118,7 +118,7 @@ impl DbBuilder {
         let tmon = Monitor::with_config(local.clone(), tl.clone(), bg.clone(), clock, retry);
         let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
         let gc = Gc::new(bg.clone(), tl);
-        gc.start(ctx);
+        gc.start();
         let algo = Algo::new(
             global.clone(),
             local.clone(),
@@ -167,9 +167,9 @@ impl DB {
     }
 
     /// Opens a database with the given name using default options. Shorthand for
-    /// `DB::builder(name, b).open(ctx)`.
-    pub async fn open(ctx: &Ctx, name: &str, b: Arc<dyn Backend>) -> Result<DB, Error> {
-        DB::builder(name, b).open(ctx).await
+    /// `DB::builder(name, b).open()`.
+    pub async fn open(name: &str, b: Arc<dyn Backend>) -> Result<DB, Error> {
+        DB::builder(name, b).open().await
     }
 
     /// Releases resources associated with the database.
@@ -197,19 +197,17 @@ impl DB {
     ///
     /// This future is durability-safe to cancel: dropping it mid-flight is
     /// equivalent to a crash and is recovered by the commit protocol, so it
-    /// never corrupts data or leaves a half-applied transaction. Prefer
-    /// cancelling through `ctx` (a [`Ctx`] with a cancel token) over dropping the
-    /// future via `tokio::time::timeout`, `select!`, or `JoinHandle::abort`: a
-    /// `ctx` cancellation unwinds the coordination state promptly, whereas a
-    /// dropped future relies on lock wait/lease timeouts to reclaim on-storage
-    /// locks held by the abandoned attempt.
-    pub async fn tx<T, F, Fut>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
+    /// never corrupts data or leaves a half-applied transaction. Cancel by
+    /// dropping the surrounding future — e.g. via `tokio::time::timeout`,
+    /// `select!`, or `JoinHandle::abort`. On-storage locks held by an
+    /// abandoned attempt are reclaimed by the lock-lease timeout.
+    pub async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Tx) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        self.inner.tx(ctx, f).await
+        self.inner.tx(f).await
     }
 
     /// Retrieves ongoing performance stats. Only updated when transactions
@@ -247,7 +245,7 @@ impl DbInner {
         stats.add(s);
     }
 
-    pub(crate) async fn tx<T, F, Fut>(&self, ctx: &Ctx, f: F) -> Result<T, Error>
+    pub(crate) async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Tx) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
@@ -258,18 +256,22 @@ impl DbInner {
             ..Default::default()
         };
         let begin = std::time::Instant::now();
-        let res = self.tx_impl(ctx, f, &mut stats).await;
+        let res = self.tx_impl(f, &mut stats).await;
         stats.tx_time = begin.elapsed();
         self.update_stats(&stats);
         res
     }
 
-    async fn tx_impl<T, F, Fut>(&self, ctx: &Ctx, mut f: F, stats: &mut Stats) -> Result<T, Error>
+    async fn tx_impl<T, F, Fut>(&self, mut f: F, stats: &mut Stats) -> Result<T, Error>
     where
         F: FnMut(Tx) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
+        // External cancellation is by dropping this future; internally the
+        // engine threads a fresh, uncancelled `CancelToken` solely so subroutines
+        // that race against it (validation, lock waits) keep working unchanged.
+        let ctx = CancelToken::new();
         let tx = Tx::new(
             ctx.clone(),
             self.global.clone(),
@@ -279,9 +281,6 @@ impl DbInner {
         let mut handle = None;
 
         let result: Result<T, Error> = loop {
-            if ctx.is_cancelled() {
-                break Err(Error::Cancelled);
-            }
             // Hand a fresh handle to the user closure (which consumes it); `tx`
             // retains access to the same shared state to collect accesses and
             // reset between retries.
@@ -301,7 +300,7 @@ impl DbInner {
                     // handle owns the data from here on; the wound path below
                     // recovers it from the handle, so no separate clone is kept.
                     match handle.as_mut() {
-                        None => handle = Some(self.algo.begin(ctx, access)),
+                        None => handle = Some(self.algo.begin(&ctx, access)),
                         Some(h) => self.algo.reset(h, access),
                     }
                     v
@@ -312,11 +311,11 @@ impl DbInner {
                     let mut ro = access;
                     ro.writes.clear();
                     match handle.as_mut() {
-                        None => handle = Some(self.algo.begin(ctx, ro)),
+                        None => handle = Some(self.algo.begin(&ctx, ro)),
                         Some(h) => self.algo.reset(h, ro),
                     }
                     let h = handle.as_mut().unwrap();
-                    match self.algo.validate_reads(ctx, h).await {
+                    match self.algo.validate_reads(&ctx, h).await {
                         Err(e) if e.is_retry() => {
                             tx.reset();
                             stats.tx_retries += 1;
@@ -330,7 +329,7 @@ impl DbInner {
             // Try to commit.
             let commit_res = {
                 let h = handle.as_mut().unwrap();
-                self.algo.commit(ctx, h).await
+                self.algo.commit(&ctx, h).await
             };
             match commit_res {
                 Ok(()) => break Ok(value),
@@ -339,7 +338,7 @@ impl DbInner {
                     // we were holding and restart with a fresh ID that preserves
                     // our priority, so we are not starved on the retry.
                     if let Some(h) = handle.as_mut() {
-                        let _ = self.algo.end(ctx, h).await;
+                        let _ = self.algo.end(&ctx, h).await;
                     }
                     let old = handle.take().unwrap();
                     handle = Some(self.algo.rebegin(old));
@@ -358,7 +357,7 @@ impl DbInner {
 
         // Always finalize the handle (a committed handle is a no-op).
         if let Some(h) = handle.as_mut()
-            && let Err(e) = self.algo.end(ctx, h).await
+            && let Err(e) = self.algo.end(&ctx, h).await
             && result.is_ok()
         {
             return Err(e.into());

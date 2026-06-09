@@ -25,6 +25,7 @@
 //! two same-seed/tape runs can be compared byte-for-byte (see the
 //! `concurrent_sim` self-check and ADR-010/011).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,7 +35,7 @@ use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
 use glassdb_concurr::{CancelToken, Tape, rt};
 
-use crate::{Collection, Ctx, DB, Error};
+use crate::{Collection, DB, Error};
 
 /// Number of distinct keys the workload operates on.
 pub const KEY_COUNT: usize = 4;
@@ -182,13 +183,7 @@ impl Acct {
 /// Attempts a single op in its own transaction, updating `acct`: `started` is
 /// bumped before the attempt, `acked` only on success. A failure leaves the op
 /// counted in `started` but not `acked` (i.e. in-doubt).
-async fn run_one(
-    ctx: &Ctx,
-    db: &DB,
-    coll: &Collection,
-    op: &Op,
-    acct: &Mutex<Acct>,
-) -> Result<(), Error> {
+async fn run_one(db: &DB, coll: &Collection, op: &Op, acct: &Mutex<Acct>) -> Result<(), Error> {
     match op {
         Op::Rmw(k) => {
             acct.lock().unwrap().started[*k] += 1;
@@ -196,7 +191,7 @@ async fn run_one(
             // (`Copy`) instead of moving the key, keeping the closure
             // `FnMut` for retries.
             let kn = &key_name(*k);
-            db.tx(ctx, |tx| async move {
+            db.tx(|tx| async move {
                 let cur = read_int_from_tx(&tx, coll, kn).await?;
                 tx.write(coll, kn, &write_int(cur + 1))
             })
@@ -211,7 +206,7 @@ async fn run_one(
             }
             let ka = &key_name(*a);
             let kb = &key_name(*b);
-            db.tx(ctx, |tx| async move {
+            db.tx(|tx| async move {
                 let va = read_int_from_tx(&tx, coll, ka).await?;
                 let vb = read_int_from_tx(&tx, coll, kb).await?;
                 tx.write(coll, ka, &write_int(va + 1))?;
@@ -227,7 +222,7 @@ async fn run_one(
         Op::ReadOnly(keys) => {
             let names: Vec<Vec<u8>> = keys.iter().map(|k| key_name(*k)).collect();
             let names = &names;
-            db.tx(ctx, |tx| async move {
+            db.tx(|tx| async move {
                 for kn in names {
                     let v = read_int_from_tx(&tx, coll, kn).await?;
                     assert!(v >= 0, "observed negative value {v} for key {kn:?}");
@@ -245,17 +240,24 @@ async fn run_one(
 /// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
 /// RMW would double-apply).
 async fn run_client(
-    ctx: &Ctx,
     db: &DB,
     coll: &Collection,
     ops: &[Op],
     acct: &Mutex<Acct>,
+    consumed: &AtomicUsize,
 ) -> usize {
     for (i, op) in ops.iter().enumerate() {
-        if run_one(ctx, db, coll, op, acct).await.is_err() {
+        // Bump consumed *before* attempting the op. If the outer crash future
+        // drops us mid-`run_one`, this op is counted as consumed (left in
+        // doubt) and is not replayed by the restart path. We need this counter
+        // on a shared atomic because the `tokio::select!` cancel arm simply
+        // drops this future and cannot read its return value.
+        consumed.store(i + 1, Ordering::SeqCst);
+        if run_one(db, coll, op, acct).await.is_err() {
             return i + 1;
         }
     }
+    consumed.store(ops.len(), Ordering::SeqCst);
     ops.len()
 }
 
@@ -263,26 +265,25 @@ async fn run_client(
 /// (see [`run_client`]); `0` if the open itself failed (e.g. a crash during
 /// startup).
 async fn open_and_run(
-    ctx: &Ctx,
     backend: &Arc<dyn Backend>,
     ops: &[Op],
     acct: &Mutex<Acct>,
-) -> usize {
-    let Ok(db) = open_det_db(ctx, backend).await else {
-        return 0;
+    consumed: &AtomicUsize,
+) {
+    let Ok(db) = open_det_db(backend).await else {
+        return;
     };
     let coll = db.collection(COLLECTION);
-    let consumed = run_client(ctx, &db, &coll, ops, acct).await;
+    let _ = run_client(&db, &coll, ops, acct, consumed).await;
     db.close().await;
-    consumed
 }
 
 /// Opens the simulation DB with the deterministic clock the fuzzer relies on
 /// for byte-identical replays.
-async fn open_det_db(ctx: &Ctx, backend: &Arc<dyn Backend>) -> Result<DB, Error> {
+async fn open_det_db(backend: &Arc<dyn Backend>) -> Result<DB, Error> {
     DB::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
-        .open(ctx)
+        .open()
         .await
 }
 
@@ -478,8 +479,6 @@ async fn run_inner(
     seed: u64,
     fault_tape: Vec<u8>,
 ) -> OpLog {
-    let ctx = Ctx::background();
-
     // The fault tape guides each client's transport faults, crash timing, and
     // outage windows; with an empty tape all fall back to the seed
     // (PCT/seed-breadth runs).
@@ -491,12 +490,12 @@ async fn run_inner(
 
     // Initialize the collection and seed every key to zero up front (over the
     // faultless backbone, so this cannot fail spuriously).
-    let init_db = open_det_db(&ctx, &backbone).await.expect("open init db");
+    let init_db = open_det_db(&backbone).await.expect("open init db");
     let init_coll = init_db.collection(COLLECTION);
-    init_coll.create(&ctx).await.expect("create collection");
+    init_coll.create().await.expect("create collection");
     let seed_coll = &init_coll;
     init_db
-        .tx(&ctx, |tx| async move {
+        .tx(|tx| async move {
             for k in 0..KEY_COUNT {
                 tx.write(seed_coll, &key_name(k), &write_int(0))?;
             }
@@ -515,24 +514,43 @@ async fn run_inner(
         build_transports(&backbone, faults, seed, &streams, nclients);
 
     // Each client runs as its own task over its own transport so the scheduler
-    // can interleave them.
+    // can interleave them. A `CancelToken` lets the crash nemesis simulate a
+    // hard crash by racing the cancellation against the client's run loop; the
+    // dropped future is the in-Rust analog of a process death. The DB is
+    // always closed before we leave the task, so spawned background loops do
+    // not linger between phases (or across the restart) and consume scheduler
+    // steps for the rest of the run.
     let mut handles = Vec::with_capacity(nclients);
     let mut tokens = Vec::with_capacity(nclients);
     for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
-        let (cctx, token) = Ctx::with_cancel();
-        tokens.push(token);
+        let token = CancelToken::new();
+        tokens.push(token.clone());
         let acct = acct.clone();
         handles.push(rt::spawn(async move {
-            let consumed = open_and_run(&cctx, &backend, &ops, &acct).await;
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let crashed = {
+                let Ok(db) = open_det_db(&backend).await else {
+                    return;
+                };
+                let coll = db.collection(COLLECTION);
+                let crashed = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => true,
+                    _ = run_client(&db, &coll, &ops, &acct, &consumed) => false,
+                };
+                db.close().await;
+                crashed
+            };
             // Crash-and-restart: a cancelled (crashed) client reopens the DB on
-            // the same backend and finishes its remaining ops, recovering its own
-            // orphaned locks via lease expiry. The in-doubt op it died on is left
-            // for recovery rather than replayed (which would double-apply a
-            // non-idempotent RMW). The restart is uncancellable so it runs to
-            // completion.
-            if consumed < ops.len() && cctx.is_cancelled() {
-                let rctx = Ctx::background();
-                let _ = open_and_run(&rctx, &backend, &ops[consumed..], &acct).await;
+            // the same backend and finishes its remaining ops, recovering its
+            // own orphaned locks via lease expiry. The in-doubt op it died on
+            // is left for recovery rather than replayed (which would
+            // double-apply a non-idempotent RMW). The restart is uncancellable
+            // so it runs to completion.
+            let n = consumed.load(Ordering::SeqCst);
+            if crashed && n < ops.len() {
+                let dummy = AtomicUsize::new(0);
+                open_and_run(&backend, &ops[n..], &acct, &dummy).await;
             }
         }));
     }
@@ -563,7 +581,7 @@ async fn run_inner(
     for (k, slot) in finals.iter_mut().enumerate() {
         *slot = read_int(
             &init_coll
-                .read_strong(&ctx, &key_name(k))
+                .read_strong(&key_name(k))
                 .await
                 .expect("final read"),
         );
@@ -809,8 +827,8 @@ fn assert_ring(next: &[usize]) {
 /// Cycle). Reads three consecutive next-pointers, then rotates the edges. For a
 /// single N-cycle with N >= 4 the four nodes are distinct, so the three writes
 /// target distinct keys and map the ring to another single N-cycle.
-async fn cycle_swap(ctx: &Ctx, db: &DB, coll: &Collection, r: usize) -> Result<(), Error> {
-    db.tx(ctx, |tx| async move {
+async fn cycle_swap(db: &DB, coll: &Collection, r: usize) -> Result<(), Error> {
+    db.tx(|tx| async move {
         let r2 = read_next(&tx, coll, r).await?;
         let r3 = read_next(&tx, coll, r2).await?;
         let r4 = read_next(&tx, coll, r3).await?;
@@ -830,12 +848,11 @@ async fn cycle_swap(ctx: &Ctx, db: &DB, coll: &Collection, r: usize) -> Result<(
 /// committed state under serializable isolation, so the caller can assert the
 /// snapshot is itself a valid ring.
 async fn read_ring_snapshot(
-    ctx: &Ctx,
     db: &DB,
     coll: &Collection,
     node_count: usize,
 ) -> Result<Vec<usize>, Error> {
-    db.tx(ctx, |tx| async move {
+    db.tx(|tx| async move {
         futures::future::try_join_all((0..node_count).map(|k| read_next(&tx, coll, k))).await
     })
     .await
@@ -844,25 +861,32 @@ async fn read_ring_snapshot(
 /// Runs a client's swaps in order. Returns the number consumed: `swaps.len()` if
 /// all succeeded, or `i + 1` if swap `i` failed (left for recovery rather than
 /// replayed on restart).
-async fn run_cycle_client(ctx: &Ctx, db: &DB, coll: &Collection, swaps: &[usize]) -> usize {
+async fn run_cycle_client(
+    db: &DB,
+    coll: &Collection,
+    swaps: &[usize],
+    consumed: &AtomicUsize,
+) -> usize {
     for (i, r) in swaps.iter().enumerate() {
-        if cycle_swap(ctx, db, coll, *r).await.is_err() {
+        consumed.store(i + 1, Ordering::SeqCst);
+        if cycle_swap(db, coll, *r).await.is_err() {
             return i + 1;
         }
     }
+    consumed.store(swaps.len(), Ordering::SeqCst);
     swaps.len()
 }
 
-/// Opens the DB on `backend`, runs `swaps`, and closes it. Returns swaps consumed
-/// (see [`run_cycle_client`]); `0` if the open itself failed.
-async fn open_and_run_cycle(ctx: &Ctx, backend: &Arc<dyn Backend>, swaps: &[usize]) -> usize {
-    let Ok(db) = open_det_db(ctx, backend).await else {
-        return 0;
+/// Opens the DB on `backend`, runs `swaps`, and closes it. Records swaps
+/// consumed in `consumed` (see [`run_cycle_client`]); leaves it at `0` if the
+/// open itself failed.
+async fn open_and_run_cycle(backend: &Arc<dyn Backend>, swaps: &[usize], consumed: &AtomicUsize) {
+    let Ok(db) = open_det_db(backend).await else {
+        return;
     };
     let coll = db.collection(CYCLE_COLLECTION);
-    let consumed = run_cycle_client(ctx, &db, &coll, swaps).await;
+    let _ = run_cycle_client(&db, &coll, swaps, consumed).await;
     db.close().await;
-    consumed
 }
 
 /// Core Cycle harness: lay down the ring, run the clients as interleaved tasks
@@ -875,7 +899,6 @@ async fn run_cycle_inner(
     seed: u64,
     fault_tape: Vec<u8>,
 ) -> OpLog {
-    let ctx = Ctx::background();
     let node_count = workload.node_count;
     let snapshot_reads = workload.snapshot_reads;
     let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
@@ -884,12 +907,12 @@ async fn run_cycle_inner(
 
     // Initialize the collection and lay down the ring (key(i) -> (i + 1) % N)
     // over the faultless backbone, so setup cannot fail spuriously.
-    let init_db = open_det_db(&ctx, &backbone).await.expect("open init db");
+    let init_db = open_det_db(&backbone).await.expect("open init db");
     let init_coll = init_db.collection(CYCLE_COLLECTION);
-    init_coll.create(&ctx).await.expect("create collection");
+    init_coll.create().await.expect("create collection");
     let seed_coll = &init_coll;
     init_db
-        .tx(&ctx, |tx| async move {
+        .tx(|tx| async move {
             for k in 0..node_count {
                 write_next(&tx, seed_coll, k, (k + 1) % node_count)?;
             }
@@ -906,16 +929,32 @@ async fn run_cycle_inner(
     // Each client runs its swaps as its own task so the scheduler interleaves
     // them; a crashed client restarts on the same backend to finish its
     // remaining swaps, recovering its own orphaned locks via lease expiry.
+    // The DB is closed before the task returns so its background loops do not
+    // linger for the rest of the run.
     let mut handles = Vec::with_capacity(nclients);
     let mut tokens = Vec::with_capacity(nclients);
     for (swaps, backend) in workload.clients.into_iter().zip(client_backends) {
-        let (cctx, token) = Ctx::with_cancel();
-        tokens.push(token);
+        let token = CancelToken::new();
+        tokens.push(token.clone());
         handles.push(rt::spawn(async move {
-            let consumed = open_and_run_cycle(&cctx, &backend, &swaps).await;
-            if consumed < swaps.len() && cctx.is_cancelled() {
-                let rctx = Ctx::background();
-                let _ = open_and_run_cycle(&rctx, &backend, &swaps[consumed..]).await;
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let crashed = {
+                let Ok(db) = open_det_db(&backend).await else {
+                    return;
+                };
+                let coll = db.collection(CYCLE_COLLECTION);
+                let crashed = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => true,
+                    _ = run_cycle_client(&db, &coll, &swaps, &consumed) => false,
+                };
+                db.close().await;
+                crashed
+            };
+            let n = consumed.load(Ordering::SeqCst);
+            if crashed && n < swaps.len() {
+                let dummy = AtomicUsize::new(0);
+                open_and_run_cycle(&backend, &swaps[n..], &dummy).await;
             }
         }));
     }
@@ -932,14 +971,13 @@ async fn run_cycle_inner(
     let reader = (snapshot_reads > 0).then(|| {
         let backbone = backbone.clone();
         rt::spawn(async move {
-            let rctx = Ctx::background();
-            let Ok(db) = open_det_db(&rctx, &backbone).await else {
+            let Ok(db) = open_det_db(&backbone).await else {
                 return;
             };
             let coll = db.collection(CYCLE_COLLECTION);
             for _ in 0..snapshot_reads {
                 rt::yield_now().await;
-                match read_ring_snapshot(&rctx, &db, &coll, node_count).await {
+                match read_ring_snapshot(&db, &coll, node_count).await {
                     Ok(snap) => assert_ring(&snap),
                     Err(_) => break,
                 }
@@ -974,7 +1012,7 @@ async fn run_cycle_inner(
     for (k, slot) in next.iter_mut().enumerate() {
         *slot = read_int(
             &init_coll
-                .read_strong(&ctx, &key_name(k))
+                .read_strong(&key_name(k))
                 .await
                 .expect("final read"),
         ) as usize;

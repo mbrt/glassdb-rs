@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use glassdb_concurr::Ctx;
+use glassdb_concurr::CancelToken;
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, MAX_STALENESS};
 use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
@@ -25,10 +25,10 @@ use crate::error::Error;
 /// applied atomically when the surrounding [`crate::DB::tx`] commits.
 ///
 /// Awaiting [`Tx::read`] (and the enclosing [`crate::DB::tx`] future) is
-/// durability-safe to cancel; see the cancellation note on [`crate::DB::tx`] for
-/// why callers should prefer `Ctx` cancellation over dropping the future.
+/// durability-safe to cancel by being dropped (`tokio::time::timeout`,
+/// `select!`, or `JoinHandle::abort`).
 pub struct Tx {
-    ctx: Ctx,
+    ctx: CancelToken,
     reader: Reader,
     inner: Arc<Mutex<TxInner>>,
 }
@@ -42,7 +42,7 @@ struct TxInner {
 
 impl Tx {
     pub(crate) fn new(
-        ctx: Ctx,
+        ctx: CancelToken,
         global: Global,
         local: Local,
         tmon: glassdb_trans::Monitor,
