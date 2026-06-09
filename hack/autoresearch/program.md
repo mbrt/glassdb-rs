@@ -220,8 +220,8 @@ reduce backend operations (`metaReads`/`metaWrites`/`objReads`/`objWrites`):
 - Collapse redundant metadata round-trips in the read/validate/commit path
   (`glassdb-storage`, `glassdb-trans`); cache more aggressively where the cache
   is sound (`glassdb-storage` local/global caches).
-- Batch or parallelize independent backend calls using `glassdb-concurr`
-  (`Fanout`) or `futures::future::join_all`, so a transaction issues fewer
+- Batch or parallelize independent backend calls using
+  `futures::stream::iter(...).buffer_unordered(n)` or `futures::future::join_all`, so a transaction issues fewer
   sequential round-trips. (`batchWrite100` currently does far more metadata
   reads than it needs - a promising target.)
 - Read path: avoid promoting weak reads to strong reads unnecessarily; reuse
