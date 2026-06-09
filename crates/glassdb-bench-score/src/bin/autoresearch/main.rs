@@ -171,7 +171,7 @@ async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let db = DB::open("autoresearch", backend).await?;
         let sample = workloads::run(name, &db).await?;
-        db.close().await;
+        db.shutdown().await;
         results.push(to_result(sample)?);
     }
 

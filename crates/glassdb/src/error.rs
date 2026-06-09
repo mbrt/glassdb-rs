@@ -31,6 +31,10 @@ pub enum Error {
     /// uncertainty.
     #[error("transaction outcome unknown (in doubt): {0}")]
     Unavailable(String),
+    /// The database is shutting down and is no longer accepting new
+    /// transactions. Existing in-flight transactions are allowed to complete.
+    #[error("database is shutting down")]
+    ShuttingDown,
     /// Any other error.
     #[error("{0}")]
     Other(String),

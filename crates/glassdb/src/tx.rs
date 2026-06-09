@@ -25,7 +25,10 @@ use crate::error::Error;
 ///
 /// Awaiting [`Tx::read`] (and the enclosing [`crate::DB::tx`] future) is
 /// durability-safe to cancel by being dropped (`tokio::time::timeout`,
-/// `select!`, or `JoinHandle::abort`).
+/// `select!`, or `JoinHandle::abort`). When the future is dropped mid-flight
+/// the surrounding `DB::tx` arranges (via an internal RAII guard) for the
+/// engine-side transaction to be asynchronously aborted, so locks are
+/// released promptly instead of waiting for lease expiry.
 pub struct Tx {
     reader: Reader,
     inner: Arc<Mutex<TxInner>>,
@@ -39,23 +42,6 @@ struct TxInner {
 }
 
 impl Tx {
-    pub(crate) fn new(global: Global, local: Local, tmon: glassdb_trans::Monitor) -> Self {
-        Tx {
-            reader: Reader::new(local, global, tmon),
-            inner: Arc::new(Mutex::new(TxInner::default())),
-        }
-    }
-
-    /// Returns another handle to the same transaction state. The framework
-    /// passes a handle to the user closure (which consumes it) while keeping one
-    /// to inspect the staged accesses and reset between retries.
-    pub(crate) fn handle(&self) -> Tx {
-        Tx {
-            reader: self.reader.clone(),
-            inner: self.inner.clone(),
-        }
-    }
-
     /// Reads the value for `key` within the transaction. Repeatable: a value
     /// read once is returned consistently, and a key not found stays not found
     /// (avoiding phantom reads).
@@ -148,6 +134,23 @@ impl Tx {
     pub fn abort(&self) -> Result<(), Error> {
         self.inner.lock().unwrap().aborted = true;
         Err(Error::Aborted)
+    }
+
+    pub(crate) fn new(global: Global, local: Local, tmon: glassdb_trans::Monitor) -> Self {
+        Tx {
+            reader: Reader::new(local, global, tmon),
+            inner: Arc::new(Mutex::new(TxInner::default())),
+        }
+    }
+
+    /// Returns another handle to the same transaction state. The framework
+    /// passes a handle to the user closure (which consumes it) while keeping one
+    /// to inspect the staged accesses and reset between retries.
+    pub(crate) fn handle(&self) -> Tx {
+        Tx {
+            reader: self.reader.clone(),
+            inner: self.inner.clone(),
+        }
     }
 
     pub(crate) fn aborted(&self) -> bool {

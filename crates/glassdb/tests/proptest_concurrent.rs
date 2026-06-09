@@ -122,8 +122,8 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     assert_eq!(v2 as u32, a2 + b1 + b2, "k2 mismatch");
     assert_eq!(v3 as u32, a3 + b2, "k3 mismatch");
 
-    db1.close().await;
-    db2.close().await;
+    db1.shutdown().await;
+    db2.shutdown().await;
 }
 
 proptest! {

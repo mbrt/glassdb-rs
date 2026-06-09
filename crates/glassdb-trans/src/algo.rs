@@ -6,7 +6,7 @@
 //! deadlock (lock timeout), falls back to serialized, sorted locking.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -319,7 +319,9 @@ pub struct Algo {
     locker: Locker,
     mon: Monitor,
     gc: Gc,
-    background: Option<Arc<Background>>,
+    // Weak so a captured `Algo` clone inside a spawned async-cleanup task
+    // does not keep [`Background`] alive past DB shutdown.
+    background: Option<Weak<Background>>,
 }
 
 impl Algo {
@@ -330,7 +332,7 @@ impl Algo {
         locker: Locker,
         mon: Monitor,
         gc: Gc,
-        background: Option<Arc<Background>>,
+        background: Option<Weak<Background>>,
     ) -> Self {
         let reader = Reader::new(local.clone(), global.clone(), mon.clone());
         Algo {
@@ -481,6 +483,24 @@ impl Algo {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Best-effort asynchronous abort of `tx_id`, used when a transaction's
+    /// future is dropped mid-flight so [`Algo::end`] never ran. Synchronous:
+    /// schedules a spawned task on the background executor and returns
+    /// immediately. The spawned task writes the Aborted log entry; if it
+    /// fails, the transaction's locks linger until lease expiry, exactly the
+    /// behaviour we'd have without this method. Idempotent (a transaction
+    /// that already finalized is a no-op in `mon.abort_tx`).
+    pub fn async_abort(&self, tx_id: &TxId) {
+        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let mon = self.mon.clone();
+        let tx_id = tx_id.clone();
+        bg.spawn(async move {
+            let _ = mon.abort_tx(&tx_id).await;
+        });
     }
 
     async fn validate_round(
@@ -1198,7 +1218,7 @@ impl Algo {
     }
 
     fn async_cleanup(&self, tx: &Handle) {
-        let Some(bg) = &self.background else {
+        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
             return;
         };
         let ps = self.locker.locked_paths(&tx.id);
@@ -1207,7 +1227,7 @@ impl Algo {
         }
         let algo = self.clone();
         let tid = tx.id.clone();
-        bg.go(move |_tok| async move {
+        bg.spawn(async move {
             let handle = Handle {
                 data: Data::default(),
                 status: Status::Committed,
@@ -1345,9 +1365,10 @@ mod tests {
         let global = Global::new(b.clone(), local.clone());
         let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
         let bg = Arc::new(Background::new());
-        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg.clone());
+        let bg_weak = Arc::downgrade(&bg);
+        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
         let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
-        let gc = Gc::new(bg.clone(), tlogger.clone());
+        let gc = Gc::new(bg_weak.clone(), tlogger.clone());
 
         global
             .write(
@@ -1989,9 +2010,10 @@ mod tests {
         let global = Global::new(b.clone(), local.clone());
         let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
         let bg = Arc::new(Background::new());
-        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg.clone());
+        let bg_weak = Arc::downgrade(&bg);
+        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
         let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
-        let gc = Gc::new(bg.clone(), tlogger.clone());
+        let gc = Gc::new(bg_weak.clone(), tlogger.clone());
 
         global
             .write(
@@ -2008,7 +2030,7 @@ mod tests {
             locker.clone(),
             tmon.clone(),
             gc.clone(),
-            Some(bg.clone()),
+            Some(bg_weak),
         );
         (
             algo,
@@ -2066,7 +2088,7 @@ mod tests {
             assert_eq!(info.last_writer, tid);
         }
 
-        bg.close().await;
+        drop(bg);
     }
 
     /// On success the cleanup schedules the transaction log for delayed GC.
@@ -2104,14 +2126,12 @@ mod tests {
         let err = tctx.tlogger.get(&tid).await.unwrap_err();
         assert!(err.is_not_found(), "expected log deleted, got {err:?}");
 
-        bg.close().await;
+        drop(bg);
     }
 
-    /// Best-effort guarantee: shutting down while a cleanup is still in
-    /// flight must not hang. `Background::close` cancels the cleanup's
-    /// context, the in-flight unlocks bail with `Cancelled`, and the task
-    /// finishes. The cleanup is intentionally cheap: it doesn't compete with
-    /// real workload by holding the runtime hostage past shutdown.
+    /// Best-effort guarantee: tearing down the `Background` while a cleanup is
+    /// still in flight must not hang. `Drop` aborts the cleanup synchronously;
+    /// the in-flight unlocks are dropped at their next `.await`.
     #[tokio::test]
     async fn async_cleanup_does_not_block_background_close() {
         let (tm, _tctx, bg, _gc) = new_algo_with_bg().await;
@@ -2123,11 +2143,35 @@ mod tests {
         });
         tm.commit(&mut h).await.unwrap();
 
-        // No wait here: close races the freshly-spawned cleanup task. If the
-        // cleanup ignored the shutdown signal (e.g. spun on the watchdog
-        // timeout) this would hang well past the test's default timeout.
-        tokio::time::timeout(Duration::from_secs(5), bg.close())
-            .await
-            .expect("Background::close did not return promptly");
+        // Dropping `bg` races the freshly-spawned cleanup task. `Drop` is
+        // synchronous and aborts every tracked handle; nothing can hang.
+        drop(bg);
+    }
+
+    /// `async_abort` is the fire-and-forget abort used when a transaction's
+    /// future is dropped between `begin` and `end`: the tx log entry must end
+    /// up marked Aborted without the caller awaiting anything. We `begin` a
+    /// transaction (skipping `commit` to leave it unfinalized) and verify the
+    /// stored status flips to `Aborted` after the background task runs.
+    #[tokio::test]
+    async fn async_abort_marks_tx_aborted() {
+        let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
+        let h = tm.begin(Data {
+            reads: Vec::new(),
+            writes: vec![wa(&paths::from_key(TEST_COLL, b"k1"), b"v")],
+        });
+        let tid = h.id().clone();
+
+        tm.async_abort(&tid);
+
+        for _ in 0..10_000 {
+            let cs = tctx.tlogger.commit_status(&tid).await.unwrap();
+            if cs.status == glassdb_storage::TxCommitStatus::Aborted {
+                drop(bg);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("async_abort never marked tx as Aborted");
     }
 }

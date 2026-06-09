@@ -1,7 +1,7 @@
 //! Delayed garbage collection of finalized transaction logs. Ported from the
 //! Go `internal/trans/gc.go`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::Background;
@@ -18,7 +18,9 @@ struct CleanupItem {
 }
 
 struct GcInner {
-    bg: Arc<Background>,
+    // Weak so a `Gc` clone captured inside the cleanup loop does not keep
+    // [`Background`] alive past DB shutdown.
+    bg: Weak<Background>,
     tl: TLogger,
     items: Mutex<Vec<CleanupItem>>,
 }
@@ -32,7 +34,7 @@ pub struct Gc {
 
 impl Gc {
     /// Creates a GC using the given background executor and logger.
-    pub fn new(bg: Arc<Background>, tl: TLogger) -> Self {
+    pub fn new(bg: Weak<Background>, tl: TLogger) -> Self {
         Gc {
             inner: Arc::new(GcInner {
                 bg,
@@ -42,20 +44,21 @@ impl Gc {
         }
     }
 
-    /// Starts the background cleanup loop. The loop stops when its
-    /// [`Background`] is closed (which cancels the token passed to the spawned
-    /// task).
+    /// Starts the background cleanup loop. The loop is aborted when its
+    /// owning [`Background`] is dropped.
     pub fn start(&self) {
+        let Some(bg) = self.inner.bg.upgrade() else {
+            return;
+        };
         let g = self.clone();
-        self.inner.bg.go(move |token| async move {
+        bg.spawn(async move {
             // First cleanup happens only after one full interval (matching Go's
-            // ticker, whose immediate first tick is skipped).
+            // ticker, whose immediate first tick is skipped). The loop runs
+            // until the owning `Background` is dropped, which aborts this
+            // task at its next `.await`.
             loop {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => return,
-                    _ = rt::sleep(CLEANUP_INTERVAL) => g.cleanup_round().await,
-                }
+                rt::sleep(CLEANUP_INTERVAL).await;
+                g.cleanup_round().await;
             }
         });
     }
@@ -105,7 +108,7 @@ mod tests {
         let global = Global::new(b, local.clone());
         let tl = TLogger::new(global, local, "test");
         let bg = Arc::new(Background::new());
-        let gc = Gc::new(bg, tl.clone());
+        let gc = Gc::new(Arc::downgrade(&bg), tl.clone());
         gc.start();
 
         let tid = TxId::from_bytes(b"tx1".to_vec());

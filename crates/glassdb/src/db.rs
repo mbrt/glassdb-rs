@@ -2,14 +2,16 @@
 //! the transaction retry loop, collections, and stats.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
-use glassdb_data::paths;
+use glassdb_data::{TxId, paths};
 use glassdb_storage::{Global, Local, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor};
+use tokio::sync::Notify;
 
 use crate::collection::Collection;
 use crate::diagnostics::Diagnostics;
@@ -115,9 +117,14 @@ impl DbBuilder {
         } else {
             Clock::real()
         };
-        let tmon = Monitor::with_config(local.clone(), tl.clone(), bg.clone(), clock, retry);
+        // Subsystems hold `Weak<Background>`. `DbInner._background` (set below)
+        // is the sole strong owner; this prevents spawned-task captures (which
+        // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
+        // would keep `Background` alive forever.
+        let bg_weak = Arc::downgrade(&bg);
+        let tmon = Monitor::with_config(local.clone(), tl.clone(), bg_weak.clone(), clock, retry);
         let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
-        let gc = Gc::new(bg.clone(), tl);
+        let gc = Gc::new(bg_weak.clone(), tl);
         gc.start();
         let algo = Algo::new(
             global.clone(),
@@ -125,7 +132,7 @@ impl DbBuilder {
             locker,
             tmon.clone(),
             gc,
-            Some(bg.clone()),
+            Some(bg_weak),
         );
 
         let inner = Arc::new(DbInner {
@@ -133,10 +140,13 @@ impl DbBuilder {
             backend,
             local,
             global,
-            background: bg,
             tmon,
             algo,
             stats: Mutex::new(Stats::default()),
+            shutting_down: AtomicBool::new(false),
+            tx_in_flight: AtomicUsize::new(0),
+            tx_drained: Notify::new(),
+            _background: bg,
         });
         Ok(DB { inner })
     }
@@ -147,10 +157,23 @@ pub(crate) struct DbInner {
     pub(crate) backend: Arc<StatsBackend>,
     pub(crate) local: Local,
     pub(crate) global: Global,
-    background: Arc<Background>,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
     stats: Mutex<Stats>,
+    // Graceful-shutdown bookkeeping. `shutting_down` flips first so any
+    // subsequent `DB::tx` call rejects with `Error::ShuttingDown`. In-flight
+    // transactions increment `tx_in_flight` while their future runs; the
+    // decrement notifies `tx_drained` so `DB::shutdown` can await drain.
+    shutting_down: AtomicBool,
+    tx_in_flight: AtomicUsize,
+    tx_drained: Notify,
+    // Sole strong owner of the background task manager. Subsystems (Monitor,
+    // Gc, Algo) hold `Weak<Background>`s so that captured clones inside
+    // spawned tasks do not form a cycle that would prevent `Background::drop`
+    // from firing. When this struct drops, the `Arc` count reaches zero,
+    // `Background::drop` aborts every spawned task, and the captured clones
+    // unwind.
+    _background: Arc<Background>,
 }
 
 /// An open GlassDB database instance.
@@ -172,10 +195,29 @@ impl DB {
         DB::builder(name, b).open().await
     }
 
-    /// Releases resources associated with the database.
-    pub async fn close(&self) {
+    /// Gracefully shuts the database down: refuses any new [`DB::tx`] calls
+    /// (they return [`Error::ShuttingDown`]) and awaits every in-flight
+    /// transaction future to complete. Idempotent; safe to call from multiple
+    /// `DB` clones concurrently.
+    ///
+    /// Background loops (GC, transaction-log refresh, async lock cleanup) and
+    /// the dedup owners are torn down via [`Drop`] when the last [`DB`] clone
+    /// is dropped; calling `shutdown` is *not* required for cleanup to happen,
+    /// only for caller-observable draining of user transactions.
+    pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        loop {
+            // Acquire the wait future BEFORE re-checking the counter so a
+            // racing in-flight drop's notify cannot be missed.
+            let notified = self.inner.tx_drained.notified();
+            if self.inner.tx_in_flight.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            notified.await;
+        }
+        // Drain spawned dedup owner tasks so callers observing `shutdown` to
+        // return synchronize with their full release.
         self.inner.algo.close().await;
-        self.inner.background.close().await;
     }
 
     /// Returns a top-level collection with the given name.
@@ -199,8 +241,10 @@ impl DB {
     /// equivalent to a crash and is recovered by the commit protocol, so it
     /// never corrupts data or leaves a half-applied transaction. Cancel by
     /// dropping the surrounding future — e.g. via `tokio::time::timeout`,
-    /// `select!`, or `JoinHandle::abort`. On-storage locks held by an
-    /// abandoned attempt are reclaimed by the lock-lease timeout.
+    /// `select!`, or `JoinHandle::abort`. The cancelled attempt's transaction
+    /// log entry is asynchronously marked aborted from `Tx`'s `Drop`, so
+    /// peer transactions observe the release immediately; the lock-lease
+    /// timeout is only the backstop for when the abort write itself fails.
     pub async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Tx) -> Fut + Send,
@@ -235,6 +279,33 @@ impl DB {
     }
 }
 
+/// RAII counter for in-flight user transactions. The increment happens on
+/// construction (so `DB::shutdown` sees the new tx) and the decrement on drop
+/// (so a cancelled transaction future still releases its slot). When the
+/// counter hits zero, [`DbInner::tx_drained`] is notified, releasing any
+/// `shutdown` waiter.
+struct InFlightGuard<'a> {
+    inner: &'a DbInner,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(inner: &'a DbInner) -> Self {
+        inner.tx_in_flight.fetch_add(1, Ordering::SeqCst);
+        Self { inner }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.inner.tx_in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // notify_waiters wakes every current waiter (`shutdown` uses
+            // exactly one) and remains correct even if multiple shutdowns
+            // race.
+            self.inner.tx_drained.notify_waiters();
+        }
+    }
+}
+
 impl DbInner {
     pub(crate) fn open_collection(self: &Arc<Self>, prefix: String) -> Collection {
         Collection::new(prefix, self.clone())
@@ -251,6 +322,13 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::ShuttingDown);
+        }
+        // RAII: increment now and decrement on drop, so a cancelled (dropped)
+        // future still notifies the shutdown waiter.
+        let _guard = InFlightGuard::new(self);
+
         let mut stats = Stats {
             tx_n: 1,
             ..Default::default()
@@ -270,6 +348,13 @@ impl DbInner {
     {
         let tx = Tx::new(self.global.clone(), self.local.clone(), self.tmon.clone());
         let mut handle = None;
+        // RAII safety net: if this future is dropped between `algo.begin` and
+        // `algo.end` (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
+        // the guard's `Drop` runs `algo.async_abort` so the engine-side tx is
+        // marked aborted promptly instead of lingering until lease expiry.
+        // Updated to the current tx id after every `begin`/`rebegin`; cleared
+        // once `end` has run.
+        let mut abort_guard = TxAbortGuard::new(&self.algo);
 
         let result: Result<T, Error> = loop {
             // Hand a fresh handle to the user closure (which consumes it); `tx`
@@ -291,7 +376,11 @@ impl DbInner {
                     // handle owns the data from here on; the wound path below
                     // recovers it from the handle, so no separate clone is kept.
                     match handle.as_mut() {
-                        None => handle = Some(self.algo.begin(access)),
+                        None => {
+                            let h = self.algo.begin(access);
+                            abort_guard.arm(h.id().clone());
+                            handle = Some(h);
+                        }
                         Some(h) => self.algo.reset(h, access),
                     }
                     v
@@ -302,7 +391,11 @@ impl DbInner {
                     let mut ro = access;
                     ro.writes.clear();
                     match handle.as_mut() {
-                        None => handle = Some(self.algo.begin(ro)),
+                        None => {
+                            let h = self.algo.begin(ro);
+                            abort_guard.arm(h.id().clone());
+                            handle = Some(h);
+                        }
                         Some(h) => self.algo.reset(h, ro),
                     }
                     let h = handle.as_mut().unwrap();
@@ -332,7 +425,12 @@ impl DbInner {
                         let _ = self.algo.end(h).await;
                     }
                     let old = handle.take().unwrap();
-                    handle = Some(self.algo.rebegin(old));
+                    let new = self.algo.rebegin(old);
+                    // Refresh the cancellation safety net with the new id so a
+                    // drop after the rebegin aborts the retry's tx, not the
+                    // (already-ended) original.
+                    abort_guard.arm(new.id().clone());
+                    handle = Some(new);
                     tx.reset();
                     stats.tx_retries += 1;
                     continue;
@@ -346,13 +444,55 @@ impl DbInner {
             }
         };
 
-        // Always finalize the handle (a committed handle is a no-op).
-        if let Some(h) = handle.as_mut()
-            && let Err(e) = self.algo.end(h).await
+        // Always finalize the handle (a committed handle is a no-op). The
+        // safety-net guard is disarmed either way so its `Drop` does not fire
+        // a redundant async abort for an already-finalized tx.
+        let end_result = if let Some(h) = handle.as_mut() {
+            self.algo.end(h).await
+        } else {
+            Ok(())
+        };
+        abort_guard.disarm();
+        if let Err(e) = end_result
             && result.is_ok()
         {
             return Err(e.into());
         }
         result
+    }
+}
+
+/// RAII safety net for [`DbInner::tx_impl`]: if the surrounding future is
+/// dropped between `algo.begin` and `algo.end`, the guard's `Drop` runs
+/// [`Algo::async_abort`] for the currently-armed transaction id, so peer
+/// transactions see the abort marker quickly instead of waiting for the
+/// lock-lease timeout.
+struct TxAbortGuard<'a> {
+    algo: &'a Algo,
+    armed: Option<TxId>,
+}
+
+impl<'a> TxAbortGuard<'a> {
+    fn new(algo: &'a Algo) -> Self {
+        Self { algo, armed: None }
+    }
+
+    /// Arms the guard for `tx_id`. Replaces any prior id (e.g. after a wound
+    /// retry that gets a fresh id via `algo.rebegin`).
+    fn arm(&mut self, tx_id: TxId) {
+        self.armed = Some(tx_id);
+    }
+
+    /// Disarms the guard: called once `algo.end` ran so `Drop` is a no-op.
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for TxAbortGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.armed.take() {
+            self.algo.async_abort(&id);
+        }
     }
 }

@@ -684,6 +684,8 @@ mod tests {
         global: Global,
         backend: Arc<dyn Backend>,
         monitor: Monitor,
+        // Strong owner so spawning still works during the test.
+        _bg: Arc<Background>,
     }
 
     fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
@@ -691,7 +693,7 @@ mod tests {
         let global = Global::new(b.clone(), local.clone());
         let tl = TLogger::new(global.clone(), local.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(local.clone(), tl, bg);
+        let mon = Monitor::new(local.clone(), tl, Arc::downgrade(&bg));
         let locker = Locker::new(local, global.clone(), mon.clone());
         (
             locker,
@@ -699,6 +701,7 @@ mod tests {
                 global,
                 backend: b,
                 monitor: mon,
+                _bg: bg,
             },
         )
     }
