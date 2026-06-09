@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{BackendError, Metadata};
-use glassdb_concurr::CancelToken;
 use glassdb_storage::{
     Global, Local, LockType, StorageError, TxCommitStatus, Version, tags_lock_info,
 };
@@ -40,12 +39,7 @@ impl Reader {
     }
 
     /// Reads the value for `key`, accepting cached values up to `max_stale`.
-    pub async fn read(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-        max_stale: Duration,
-    ) -> Result<ReadValue, StorageError> {
+    pub async fn read(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
         if let Some(lr) = self.local.read(key, max_stale)
             && !lr.outdated
         {
@@ -56,20 +50,19 @@ impl Reader {
                 value: lr.value,
                 version: lr.version,
             };
-            return self.handle_lock_create(ctx, key, lres).await;
+            return self.handle_lock_create(key, lres).await;
         }
         let gr = self.global.read(key).await?;
         let gres = ReadValue {
             value: gr.value,
             version: gr.version,
         };
-        self.handle_lock_create(ctx, key, gres).await
+        self.handle_lock_create(key, gres).await
     }
 
     /// Returns the object metadata, using the local cache when fresh enough.
     pub async fn get_metadata(
         &self,
-        _ctx: &CancelToken,
         key: &str,
         max_stale: Duration,
     ) -> Result<Arc<Metadata>, StorageError> {
@@ -92,7 +85,6 @@ impl Reader {
     /// and re-read the committed value.
     async fn handle_lock_create(
         &self,
-        ctx: &CancelToken,
         key: &str,
         rv: ReadValue,
     ) -> Result<ReadValue, StorageError> {
@@ -117,9 +109,9 @@ impl Reader {
             let locker = info.locked_by[0].clone();
             // The locker if it has committed and wrote this key, otherwise the
             // previous last writer.
-            match self.tmon.tx_status(ctx, &locker).await {
+            match self.tmon.tx_status(&locker).await {
                 Ok(TxCommitStatus::Ok) => {
-                    match self.tmon.committed_value(ctx, key, &locker).await {
+                    match self.tmon.committed_value(key, &locker).await {
                         Ok(cv) if cv.status == TxCommitStatus::Ok && !cv.value.not_written => {
                             // The locker's own committed write is authoritative.
                             return self.materialize(key, locker, cv.value);
@@ -146,7 +138,7 @@ impl Reader {
             // No prior committed value (e.g. a pending create): not found.
             return Err(BackendError::NotFound.into());
         }
-        match self.tmon.committed_value(ctx, key, &writer).await {
+        match self.tmon.committed_value(key, &writer).await {
             Ok(cv) if cv.status == TxCommitStatus::Ok && !cv.value.not_written => {
                 self.materialize(key, writer, cv.value)
             }

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, CancelToken, Clock, RetryConfig};
+use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor};
@@ -268,16 +268,7 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        // External cancellation is by dropping this future; internally the
-        // engine threads a fresh, uncancelled `CancelToken` solely so subroutines
-        // that race against it (validation, lock waits) keep working unchanged.
-        let ctx = CancelToken::new();
-        let tx = Tx::new(
-            ctx.clone(),
-            self.global.clone(),
-            self.local.clone(),
-            self.tmon.clone(),
-        );
+        let tx = Tx::new(self.global.clone(), self.local.clone(), self.tmon.clone());
         let mut handle = None;
 
         let result: Result<T, Error> = loop {
@@ -300,7 +291,7 @@ impl DbInner {
                     // handle owns the data from here on; the wound path below
                     // recovers it from the handle, so no separate clone is kept.
                     match handle.as_mut() {
-                        None => handle = Some(self.algo.begin(&ctx, access)),
+                        None => handle = Some(self.algo.begin(access)),
                         Some(h) => self.algo.reset(h, access),
                     }
                     v
@@ -311,11 +302,11 @@ impl DbInner {
                     let mut ro = access;
                     ro.writes.clear();
                     match handle.as_mut() {
-                        None => handle = Some(self.algo.begin(&ctx, ro)),
+                        None => handle = Some(self.algo.begin(ro)),
                         Some(h) => self.algo.reset(h, ro),
                     }
                     let h = handle.as_mut().unwrap();
-                    match self.algo.validate_reads(&ctx, h).await {
+                    match self.algo.validate_reads(h).await {
                         Err(e) if e.is_retry() => {
                             tx.reset();
                             stats.tx_retries += 1;
@@ -329,7 +320,7 @@ impl DbInner {
             // Try to commit.
             let commit_res = {
                 let h = handle.as_mut().unwrap();
-                self.algo.commit(&ctx, h).await
+                self.algo.commit(h).await
             };
             match commit_res {
                 Ok(()) => break Ok(value),
@@ -338,7 +329,7 @@ impl DbInner {
                     // we were holding and restart with a fresh ID that preserves
                     // our priority, so we are not starved on the retry.
                     if let Some(h) = handle.as_mut() {
-                        let _ = self.algo.end(&ctx, h).await;
+                        let _ = self.algo.end(h).await;
                     }
                     let old = handle.take().unwrap();
                     handle = Some(self.algo.rebegin(old));
@@ -357,7 +348,7 @@ impl DbInner {
 
         // Always finalize the handle (a committed handle is a no-op).
         if let Some(h) = handle.as_mut()
-            && let Err(e) = self.algo.end(&ctx, h).await
+            && let Err(e) = self.algo.end(h).await
             && result.is_ok()
         {
             return Err(e.into());

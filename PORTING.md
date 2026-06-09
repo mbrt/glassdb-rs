@@ -48,7 +48,7 @@ Go's runtime primitives map onto tokio as follows.
 
 | Go | Rust |
 | --- | --- |
-| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context; internal `CancelToken` (hierarchical, over `tokio::sync::watch`) still backs DB shutdown and the deadlock watchdog |
+| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context. `CancelToken` is an implementation detail of `Background` and `Dedup` (so background loops can observe DB shutdown) and is not threaded through the rest of the engine |
 | `context.Context` (values) | not used. The one Go consumer (a deterministic tx-id override) was dropped: under `--cfg sim` the same determinism falls out of `TxId::new_at` drawing its random prefix from the seeded executor RNG and its timestamp from the anchored clock |
 | goroutine | `tokio::spawn` |
 | `concurr.Background` (managed goroutines, cancelled together) | `Background` (TaskTracker-shaped) over `CancelToken` + tracked `JoinHandle`s; closures receive the shutdown token |

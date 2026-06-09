@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_backend::Tags;
-use glassdb_concurr::CancelToken;
 use glassdb_data::paths;
 use glassdb_trans::Reader;
 
@@ -54,8 +53,7 @@ impl Collection {
             self.db.global.clone(),
             self.db.tmon.clone(),
         );
-        let ctx = CancelToken::new();
-        let rv = r.read(&ctx, &p, max_staleness).await?;
+        let rv = r.read(&p, max_staleness).await?;
         Ok(rv.value)
     }
 

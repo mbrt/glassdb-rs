@@ -3,7 +3,6 @@
 
 use base64::Engine;
 use glassdb_backend::Tags;
-use glassdb_concurr::CancelToken;
 use glassdb_data::TxId;
 
 use crate::error::StorageError;
@@ -413,12 +412,11 @@ impl Locker {
     /// requires the object's version to match `expected`.
     pub async fn update_lock(
         &self,
-        ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
         update: &LockUpdate,
     ) -> Result<(), StorageError> {
-        if let Some(res) = self.handle_lock_deletion(ctx, key, expected, update).await {
+        if let Some(res) = self.handle_lock_deletion(key, expected, update).await {
             return res;
         }
         if expected.is_null() {
@@ -432,12 +430,11 @@ impl Locker {
                 _ => {}
             }
         }
-        self.apply_lock_tags(ctx, key, expected, update).await
+        self.apply_lock_tags(key, expected, update).await
     }
 
     async fn handle_lock_deletion(
         &self,
-        _ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
         update: &LockUpdate,
@@ -460,7 +457,6 @@ impl Locker {
 
     async fn apply_lock_tags(
         &self,
-        _ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
         update: &LockUpdate,
@@ -492,12 +488,10 @@ impl Locker {
     /// Releases a create-lock on an uncommitted object, deleting it.
     pub async fn unlock_create_uncommitted(
         &self,
-        ctx: &CancelToken,
         key: &str,
         expected: &glassdb_backend::Version,
     ) -> Result<(), StorageError> {
         self.update_lock(
-            ctx,
             key,
             expected,
             &LockUpdate {
