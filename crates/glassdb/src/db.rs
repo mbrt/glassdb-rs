@@ -12,6 +12,7 @@ use glassdb_storage::{Global, Local, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor};
 
 use crate::collection::Collection;
+use crate::diagnostics::Diagnostics;
 use crate::error::Error;
 use crate::stats::Stats;
 use crate::tx::Tx;
@@ -218,6 +219,21 @@ impl DB {
         let bstats = self.inner.backend.stats_and_reset();
         s.add_backend(&bstats);
         *s
+    }
+
+    /// Returns a snapshot of the lock coordinator's live state, intended for
+    /// operators investigating hangs or unexpected contention. See
+    /// [`crate::diagnostics`] for the data shape and how to enable the
+    /// complementary `tracing` events.
+    ///
+    /// Pull-only and zero cost unless called: each shard's lock is taken
+    /// briefly while collecting counts, then released.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let locker = self.inner.algo.locker();
+        Diagnostics {
+            locker_dedup: locker.dedup_snapshot(),
+            transactions: locker.tx_locks_snapshot(),
+        }
     }
 }
 

@@ -350,6 +350,13 @@ impl Algo {
         self.locker.close().await;
     }
 
+    /// Returns a reference to the underlying [`Locker`], so higher layers can
+    /// pull lock-coordination diagnostics (dedup state and per-transaction held
+    /// locks) without needing access to the locker directly.
+    pub fn locker(&self) -> &Locker {
+        &self.locker
+    }
+
     /// Starts a new transaction with the given data.
     pub fn begin(&self, ctx: &Ctx, d: Data) -> Handle {
         let id = match ctx.tx_id() {
@@ -527,6 +534,14 @@ impl Algo {
             Err(TransError::LockTimeout) => {
                 // Most likely deadlocked: restart with serialized locking.
                 tx.serial_locking = true;
+                let held = self.locker.locked_paths(&tx.id);
+                tracing::debug!(
+                    target: "glassdb::algo",
+                    tx = %tx.id,
+                    needed_paths = vstate.paths.len(),
+                    held_locks = held.len(),
+                    "parallel_lock_timeout_fallback_to_serial",
+                );
                 Err(TransError::ValidateRetry)
             }
             Err(e) => Err(e),
@@ -973,6 +988,15 @@ impl Algo {
                 .find(|lp| &lp.path == p)
                 .is_some_and(|lp| lp.typ == *elt || lp.typ == LockType::Write);
             if !compatible {
+                tracing::debug!(
+                    target: "glassdb::algo",
+                    tx = %tx.id,
+                    missing_path = %p,
+                    needed_lock = %elt,
+                    held_count = held.len(),
+                    needed_count = need_locks.len(),
+                    "serial_validate_held_set_partial",
+                );
                 return false;
             }
         }

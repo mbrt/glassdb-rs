@@ -13,4 +13,9 @@ pub use error::TransError;
 pub use gc::Gc;
 pub use monitor::{KeyCommitStatus, Monitor, WaitTxResult};
 pub use reader::{ReadValue, Reader};
-pub use tlocker::{LockStats, Locker};
+pub use tlocker::{LockStats, Locker, TxLockSnapshot};
+
+// Re-exported so the public diagnostics surface (returned by
+// `Locker::dedup_snapshot` / `Algo::diagnostics`) does not force callers to
+// pull in `glassdb-concurr` directly.
+pub use glassdb_concurr::DedupKeySnapshot;
