@@ -101,6 +101,19 @@ struct Args {
     /// Duration of each rw9010 / deadlock step.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
+    /// Repeat the parameter sweep this many times. The expensive setup (e.g.
+    /// rw9010's 50k-key init) happens once and is shared across runs; only
+    /// the measured sweeps are repeated. All runs append to the same CSV
+    /// outputs, which the plot script aggregates into tighter percentile
+    /// bands. Useful against real S3, where back-to-back repeats give the
+    /// service time to settle and reduce per-run variance.
+    #[arg(long, default_value_t = 1)]
+    num_runs: usize,
+    /// Sleep this long between repeated sweeps (only when --num-runs > 1).
+    /// Lets S3's prefix throttling / connection state quiesce before the
+    /// next run begins.
+    #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
+    run_cooldown: Duration,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -638,27 +651,40 @@ fn run_read_write_9010(
          http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-goroutines\n",
     )?;
 
-    // Deterministic random source, for reproducibility.
-    let mut rnd = StdRng::seed_from_u64(42);
-
-    let mut i = 0;
-    while i <= args.max_dbs {
-        let numdb = i.max(1);
-        eprintln!("Testing {numdb} dbs");
-        run_read_write_9010_step(
-            handle,
-            args,
-            &backend,
-            metrics.as_ref(),
-            &keys,
-            numdb,
-            &mut rnd,
-            &mut samples,
-            &mut stats,
-            &mut throughput,
-            &mut client,
-        )?;
-        i += 5;
+    // Deterministic random source, for reproducibility. Re-seeded from the
+    // same value at the start of each repeated sweep so every run picks the
+    // same per-DB seeds and key access patterns.
+    let num_runs = args.num_runs.max(1);
+    for run in 0..num_runs {
+        if run > 0 {
+            eprintln!(
+                "Sleeping {:?} before run {}/{num_runs}",
+                args.run_cooldown,
+                run + 1
+            );
+            handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
+        }
+        eprintln!("Run {}/{num_runs}", run + 1);
+        let mut rnd = StdRng::seed_from_u64(42);
+        let mut i = 0;
+        while i <= args.max_dbs {
+            let numdb = i.max(1);
+            eprintln!("Testing {numdb} dbs");
+            run_read_write_9010_step(
+                handle,
+                args,
+                &backend,
+                metrics.as_ref(),
+                &keys,
+                numdb,
+                &mut rnd,
+                &mut samples,
+                &mut stats,
+                &mut throughput,
+                &mut client,
+            )?;
+            i += 5;
+        }
     }
 
     Ok(())
@@ -899,27 +925,40 @@ fn run_deadlock(
         "num-keys,overlap,overlap-pct,latency-ms\n",
     )?;
 
-    for k in 1..=6usize {
-        for overlap in 1..=k {
-            let db = open_db(handle, backend.clone());
-            let mut ben = Benchmarker::new(args.duration);
-            let res =
-                overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
-            handle.block_on(db.close());
-            res?;
-
-            let results = ben.bench.results();
-            let overlap_pct = 100 * overlap / k;
-            for s in &results.samples {
-                let lat_ms = s.as_secs_f64() * 1000.0;
-                writeln!(out, "{k},{overlap},{overlap_pct},{lat_ms:.2}")?;
-            }
+    let num_runs = args.num_runs.max(1);
+    for run in 0..num_runs {
+        if run > 0 {
             eprintln!(
-                "deadlock: keys={k} overlap={overlap} ({overlap_pct}%) samples={} p50={:?} p90={:?}",
-                results.samples.len(),
-                results.percentile(0.5),
-                results.percentile(0.9),
+                "Sleeping {:?} before run {}/{num_runs}",
+                args.run_cooldown,
+                run + 1
             );
+            handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
+        }
+        eprintln!("Run {}/{num_runs}", run + 1);
+        for k in 1..=6usize {
+            for overlap in 1..=k {
+                let db = open_db(handle, backend.clone());
+                let mut ben = Benchmarker::new(args.duration);
+                let res =
+                    overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
+                handle.block_on(db.close());
+                res?;
+
+                let results = ben.bench.results();
+                let overlap_pct = 100 * overlap / k;
+                for s in &results.samples {
+                    let lat_ms = s.as_secs_f64() * 1000.0;
+                    writeln!(out, "{k},{overlap},{overlap_pct},{lat_ms:.2}")?;
+                }
+                eprintln!(
+                    "deadlock: keys={k} overlap={overlap} ({overlap_pct}%) samples={} \
+                     p50={:?} p90={:?}",
+                    results.samples.len(),
+                    results.percentile(0.5),
+                    results.percentile(0.9),
+                );
+            }
         }
     }
     Ok(())
