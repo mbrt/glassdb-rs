@@ -33,7 +33,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
-use glassdb_concurr::{CancelToken, Tape, rt};
+use glassdb_concurr::{AbortSignal, Tape, rt};
 
 use crate::{Collection, DB, Error};
 
@@ -328,19 +328,19 @@ fn assert_bounds(acct: &Acct, finals: &[i64], expected: &[i64], faults_enabled: 
     }
 }
 
-/// The crash nemesis: cancels a few clients' contexts at deterministic virtual
-/// times, modelling an abrupt client stop mid-transaction. Each cancelled client
-/// closes its `DB` (releasing background refreshers), so its in-flight locks are
-/// recovered later via lease expiry during the final reads. Crash timing and
+/// The crash nemesis: cancels a few clients' abort signals at deterministic
+/// virtual times, modelling an abrupt client stop mid-transaction. Each cancelled
+/// client drops its `DB` (without calling `shutdown`), so its in-flight locks
+/// are recovered later via lease expiry during the final reads. Crash timing and
 /// targets are drawn from `tape` (the fuzzer-guided fault schedule), falling back
 /// to the tape's seeded PRNG once its bytes run out.
-async fn crash_nemesis(tokens: Vec<CancelToken>, intensity: u8, mut tape: Tape) {
-    let crashes = (intensity as usize % 3).min(tokens.len());
+async fn crash_nemesis(signals: Vec<Arc<AbortSignal>>, intensity: u8, mut tape: Tape) {
+    let crashes = (intensity as usize % 3).min(signals.len());
     for _ in 0..crashes {
         let gap = tape.below(40) + 1;
         rt::sleep(Duration::from_millis(gap)).await;
-        let idx = tape.below(tokens.len() as u64) as usize;
-        tokens[idx].cancel();
+        let idx = tape.below(signals.len() as u64) as usize;
+        signals[idx].cancel();
     }
 }
 
@@ -453,14 +453,18 @@ fn spawn_nemeses(
     faults: FaultConfig,
     seed: u64,
     streams: &[Vec<u8>; FAULT_STREAMS],
-    tokens: &[CancelToken],
+    signals: &[Arc<AbortSignal>],
     transports: &[Arc<FaultBackend>],
 ) -> (Option<rt::JoinHandle<()>>, Option<rt::JoinHandle<()>>) {
     if !faults.enabled {
         return (None, None);
     }
     let crash_tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
-    let crash = rt::spawn(crash_nemesis(tokens.to_vec(), faults.intensity, crash_tape));
+    let crash = rt::spawn(crash_nemesis(
+        signals.to_vec(),
+        faults.intensity,
+        crash_tape,
+    ));
     let outage_tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
     let outage = rt::spawn(outage_nemesis(
         transports.to_vec(),
@@ -514,8 +518,8 @@ async fn run_inner(
         build_transports(&backbone, faults, seed, &streams, nclients);
 
     // Each client runs as its own task over its own transport so the scheduler
-    // can interleave them. A `CancelToken` lets the crash nemesis simulate a
-    // hard crash by racing the cancellation against the client's run loop; the
+    // can interleave them. An `AbortSignal` lets the crash nemesis simulate a
+    // hard crash by racing the signal against the client's run loop; the
     // dropped future is the in-Rust analog of a process death. On a clean run
     // we `DB::shutdown` to drain in-flight transactions and dedup owners
     // before the DB clone drops; on a crash we *skip* shutdown and let `Drop`
@@ -524,10 +528,10 @@ async fn run_inner(
     // `Background::drop` once the last `DB` clone goes out of scope (the
     // captured-task cycle is broken by subsystems holding `Weak<Background>`).
     let mut handles = Vec::with_capacity(nclients);
-    let mut tokens = Vec::with_capacity(nclients);
+    let mut signals: Vec<Arc<AbortSignal>> = Vec::with_capacity(nclients);
     for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
-        let token = CancelToken::new();
-        tokens.push(token.clone());
+        let signal = Arc::new(AbortSignal::new());
+        signals.push(signal.clone());
         let acct = acct.clone();
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
@@ -538,7 +542,7 @@ async fn run_inner(
                 let coll = db.collection(COLLECTION);
                 let crashed = tokio::select! {
                     biased;
-                    _ = token.cancelled() => true,
+                    _ = signal.cancelled() => true,
                     _ = run_client(&db, &coll, &ops, &acct, &consumed) => false,
                 };
                 if !crashed {
@@ -562,7 +566,7 @@ async fn run_inner(
 
     // The crash and outage nemeses run concurrently with the clients, each on its
     // own slice of the fault tape (and a distinct fallback seed).
-    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &tokens, &transports);
+    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
 
     for h in handles {
         let _ = h.await;
@@ -940,10 +944,10 @@ async fn run_cycle_inner(
     // nemesis. `Background::drop` still aborts spawned background loops in
     // both cases.
     let mut handles = Vec::with_capacity(nclients);
-    let mut tokens = Vec::with_capacity(nclients);
+    let mut signals: Vec<Arc<AbortSignal>> = Vec::with_capacity(nclients);
     for (swaps, backend) in workload.clients.into_iter().zip(client_backends) {
-        let token = CancelToken::new();
-        tokens.push(token.clone());
+        let signal = Arc::new(AbortSignal::new());
+        signals.push(signal.clone());
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
             let crashed = {
@@ -953,7 +957,7 @@ async fn run_cycle_inner(
                 let coll = db.collection(CYCLE_COLLECTION);
                 let crashed = tokio::select! {
                     biased;
-                    _ = token.cancelled() => true,
+                    _ = signal.cancelled() => true,
                     _ = run_cycle_client(&db, &coll, &swaps, &consumed) => false,
                 };
                 if !crashed {
@@ -996,7 +1000,7 @@ async fn run_cycle_inner(
         })
     });
 
-    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &tokens, &transports);
+    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
 
     for h in handles {
         let _ = h.await;

@@ -14,8 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_backend::{self as backend};
 use glassdb_concurr::{
-    BatchHandle, CancelToken, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt,
-    shard::Sharded,
+    BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt, shard::Sharded,
 };
 use glassdb_data::{TxId, TxIdSet, set_diff, set_union};
 use glassdb_storage::{
@@ -252,7 +251,6 @@ struct LockerWorker {
 impl Worker<LockReq, StorageError> for LockerWorker {
     async fn run(
         &self,
-        _ctx: &CancelToken,
         key: &str,
         batch: &BatchHandle<LockReq, StorageError>,
     ) -> Result<(), StorageError> {

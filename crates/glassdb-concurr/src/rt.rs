@@ -146,50 +146,9 @@ mod imp {
     }
     impl std::error::Error for JoinError {}
 
-    /// Error returned when a joined task did not produce a value (it was dropped
-    /// or aborted). Defined again here so the sim and prod paths share the same
-    /// public type.
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::Notify;
 
-    /// Sim-only abort signal: an `AtomicBool` plus a `Notify` to wake the
-    /// spawned future. Strictly cheaper than `CancelToken` (no parent chain,
-    /// no `Vec`/`select_all`) — important because every `rt::spawn` allocates
-    /// one of these. Public only because `JoinHandle::Det` exposes an
-    /// `Arc<AbortSignal>`; the API is `JoinHandle::abort()`.
-    pub struct AbortSignal {
-        cancelled: AtomicBool,
-        notify: Notify,
-    }
-
-    impl AbortSignal {
-        fn new() -> Self {
-            Self {
-                cancelled: AtomicBool::new(false),
-                notify: Notify::new(),
-            }
-        }
-
-        fn cancel(&self) {
-            if !self.cancelled.swap(true, Ordering::SeqCst) {
-                self.notify.notify_waiters();
-            }
-        }
-
-        async fn cancelled(&self) {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return;
-            }
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.cancelled.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
-    }
+    use crate::abort_signal::AbortSignal;
 
     /// A handle to a spawned task. Backed by the deterministic executor when one
     /// is running, or by tokio otherwise. Dropping it detaches the task; call

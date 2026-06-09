@@ -1,8 +1,11 @@
 //! Concurrency utilities: background task management, mergeable work
-//! deduplication, and retry-with-backoff. `CancelToken` is re-exported only
-//! because it remains an implementation detail of `Dedup`
+//! deduplication, and retry-with-backoff. Cancellation throughout is by
+//! future-drop (`tokio::time::timeout`, `select!`, `JoinHandle::abort`);
+//! [`AbortSignal`] is the small wakeup primitive used wherever an outside
+//! caller needs to drop a specific in-flight future (sim
+//! `JoinHandle::abort`, `Dedup::close`, simulation-harness crash nemesis).
+mod abort_signal;
 mod background;
-mod cancel;
 mod clock;
 mod dedup;
 #[cfg(sim)]
@@ -13,8 +16,8 @@ pub mod rt;
 pub mod shard;
 mod tape;
 
+pub use abort_signal::AbortSignal;
 pub use background::Background;
-pub use cancel::CancelToken;
 pub use clock::Clock;
 pub use dedup::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker};
 pub use retry::{Backoff, RetryConfig, RetryErr, retry, retry_with_backoff};

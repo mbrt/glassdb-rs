@@ -48,7 +48,7 @@ Go's runtime primitives map onto tokio as follows.
 
 | Go | Rust |
 | --- | --- |
-| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context. `CancelToken` survives only as an internal helper inside `Dedup`; `Background` aborts spawned tasks via [`JoinHandle::abort`] from its `Drop` impl |
+| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context. `Background` aborts spawned tasks via [`JoinHandle::abort`] from its `Drop` impl. The one residual primitive is `AbortSignal` (`AtomicBool` + `Notify`), used to drop a specific in-flight future from outside (sim `JoinHandle::abort`, `Dedup::close`, sim crash nemesis) — never plumbed into worker bodies |
 | `context.Context` (values) | not used. The one Go consumer (a deterministic tx-id override) was dropped: under `--cfg sim` the same determinism falls out of `TxId::new_at` drawing its random prefix from the seeded executor RNG and its timestamp from the anchored clock |
 | goroutine | `tokio::spawn` |
 | `concurr.Background` (managed goroutines, cancelled together) | `Background` is a [`JoinHandle`] collection: `spawn(fut)` tracks the handle; `Drop` calls `abort()` on every tracked handle. Subsystems hold `Weak<Background>` so the captured-task cycle does not pin it alive |
