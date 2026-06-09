@@ -9,7 +9,7 @@ use std::time::Duration;
 use glassdb_backend::{BackendError, Metadata};
 use glassdb_concurr::Ctx;
 use glassdb_storage::{
-    tags_lock_info, Global, Local, LockType, StorageError, TxCommitStatus, Version,
+    Global, Local, LockType, StorageError, TxCommitStatus, Version, tags_lock_info,
 };
 
 use crate::monitor::Monitor;
@@ -46,17 +46,17 @@ impl Reader {
         key: &str,
         max_stale: Duration,
     ) -> Result<ReadValue, StorageError> {
-        if let Some(lr) = self.local.read(key, max_stale) {
-            if !lr.outdated {
-                if lr.deleted {
-                    return Err(BackendError::NotFound.into());
-                }
-                let lres = ReadValue {
-                    value: lr.value,
-                    version: lr.version,
-                };
-                return self.handle_lock_create(ctx, key, lres).await;
+        if let Some(lr) = self.local.read(key, max_stale)
+            && !lr.outdated
+        {
+            if lr.deleted {
+                return Err(BackendError::NotFound.into());
             }
+            let lres = ReadValue {
+                value: lr.value,
+                version: lr.version,
+            };
+            return self.handle_lock_create(ctx, key, lres).await;
         }
         let gr = self.global.read(ctx, key).await?;
         let gres = ReadValue {
@@ -73,10 +73,10 @@ impl Reader {
         key: &str,
         max_stale: Duration,
     ) -> Result<Arc<Metadata>, StorageError> {
-        if let Some(lm) = self.local.get_meta(key, max_stale) {
-            if !lm.outdated {
-                return Ok(lm.m);
-            }
+        if let Some(lm) = self.local.get_meta(key, max_stale)
+            && !lm.outdated
+        {
+            return Ok(lm.m);
         }
         self.global.get_metadata(ctx, key).await
     }
@@ -134,7 +134,7 @@ impl Reader {
                     info.last_writer.clone()
                 }
                 Ok(TxCommitStatus::Unknown) => {
-                    return Err(StorageError::Other("unknown tx commit status".into()))
+                    return Err(StorageError::Other("unknown tx commit status".into()));
                 }
                 Err(_) => return Err(BackendError::NotFound.into()),
             }

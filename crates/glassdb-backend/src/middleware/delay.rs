@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::rt::{self, Instant};
 use glassdb_concurr::Ctx;
+use glassdb_concurr::rt::{self, Instant};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};

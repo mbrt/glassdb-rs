@@ -80,11 +80,11 @@ impl Tx {
             if let Some(tv) = inner.staged.get(&p) {
                 return Ok(tv.val.clone());
             }
-            if let Some(info) = inner.reads.get(&p) {
-                if !info.found {
-                    // Be consistent with values not found the first time.
-                    return Err(Error::NotFound);
-                }
+            if let Some(info) = inner.reads.get(&p)
+                && !info.found
+            {
+                // Be consistent with values not found the first time.
+                return Err(Error::NotFound);
             }
         }
 

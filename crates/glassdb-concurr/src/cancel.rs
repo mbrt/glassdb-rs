@@ -16,8 +16,8 @@
 //! Semantics mirror the subset of `CancellationToken` the codebase uses: a
 //! token is cancelled when it, or any of its ancestors, is cancelled.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 

@@ -14,12 +14,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_backend::{self as backend, BackendError};
 use glassdb_concurr::{
-    rt, shard::Sharded, BatchHandle, Ctx, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker,
+    BatchHandle, Ctx, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt, shard::Sharded,
 };
-use glassdb_data::{set_diff, set_union, TxId, TxIdSet};
+use glassdb_data::{TxId, TxIdSet, set_diff, set_union};
 use glassdb_storage::{
-    compute_lock_update, tags_lock_info, Global, Local, LockInfo, LockRequest, LockType,
-    LockUpdate, Locker as StorageLocker, PathLock, StorageError, TValue, TxPathState,
+    Global, Local, LockInfo, LockRequest, LockType, LockUpdate, Locker as StorageLocker, PathLock,
+    StorageError, TValue, TxPathState, compute_lock_update, tags_lock_info,
 };
 
 use crate::error::TransError;
@@ -647,7 +647,7 @@ impl Locker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{memory::MemoryBackend, Backend, Tags};
+    use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
     use glassdb_concurr::Background;
     use glassdb_data::paths;
     use glassdb_storage::{TLogger, TxCommitStatus, TxLog, TxWrite};

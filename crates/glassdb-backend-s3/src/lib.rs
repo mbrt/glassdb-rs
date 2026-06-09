@@ -11,14 +11,14 @@ use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId,
-    LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
+    encode_writer_tag,
 };
 use glassdb_concurr::Ctx;
 
@@ -168,13 +168,13 @@ impl S3Backend {
         tags: Tags,
         conds: PutConds,
     ) -> Result<Metadata, BackendError> {
-        if let Some(m) = &conds.if_match {
-            if m.is_empty() {
-                // An empty token can never match a stored ETag and S3 rejects an
-                // empty If-Match header. Treat it as a failed precondition rather
-                // than risk an unconditional overwrite.
-                return Err(BackendError::Precondition);
-            }
+        if let Some(m) = &conds.if_match
+            && m.is_empty()
+        {
+            // An empty token can never match a stored ETag and S3 rejects an
+            // empty If-Match header. Treat it as a failed precondition rather
+            // than risk an unconditional overwrite.
+            return Err(BackendError::Precondition);
         }
         let payload = add_nonce(&value);
         let metadata: Option<HashMap<String, String>> = if tags.is_empty() {
@@ -605,7 +605,7 @@ where
     if let Some(c) = code.as_deref() {
         match c {
             "PreconditionFailed" | "ConditionalRequestConflict" => {
-                return BackendError::Precondition
+                return BackendError::Precondition;
             }
             "NoSuchKey" | "NotFound" | "NoSuchBucket" => return BackendError::NotFound,
             _ => {}

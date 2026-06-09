@@ -11,15 +11,15 @@
 //! of Go's `benchStats` custom metrics: retries/op, w/op, r/op, metaw/op,
 //! metar/op).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{gcs_delays, s3_delays, DelayBackend, DelayOptions};
-use glassdb::{Backend, Collection, Ctx, Error, Tx, DB};
+use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
+use glassdb::{Backend, Collection, Ctx, DB, Error, Tx};
 
 // Number of iterations used for the one-off stats summary printed per backend.
 const STATS_ITERS: i64 = 30;

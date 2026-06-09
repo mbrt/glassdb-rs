@@ -27,7 +27,7 @@ mod tx;
 mod version;
 
 pub use collection::Collection;
-pub use db::{DbBuilder, DB};
+pub use db::{DB, DbBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionsIter, KeysIter};
@@ -36,7 +36,7 @@ pub use tx::Tx;
 
 // Re-export the backend abstraction so callers can construct a DB without
 // depending on the backend crate directly.
-pub use glassdb_backend::{self as backend, memory, middleware, Backend};
+pub use glassdb_backend::{self as backend, Backend, memory, middleware};
 
 // Cloud backends, gated behind features so the heavy SDK dependencies are only
 // pulled in when requested.

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Collection, Ctx, Error, DB};
+use glassdb::{Backend, Collection, Ctx, DB, Error};
 use proptest::prelude::*;
 
 fn write_int(n: i64) -> Vec<u8> {

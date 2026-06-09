@@ -1,8 +1,8 @@
 //! A [`Backend`] decorator that counts operations. Ported from the Go
 //! `statsBackend` in `stats.go`.
 
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use glassdb_concurr::Ctx;

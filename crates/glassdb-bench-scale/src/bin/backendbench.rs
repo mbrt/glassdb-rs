@@ -24,9 +24,9 @@ use clap::Parser;
 use rand::Rng;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{gcs_delays, DelayBackend};
+use glassdb::middleware::{DelayBackend, gcs_delays};
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Metadata, Tags, Version, WriterId, LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Metadata, Tags, Version, WriterId, encode_writer_tag,
 };
 use glassdb_bench_scale::bench::Bench;
 use glassdb_concurr::Ctx;

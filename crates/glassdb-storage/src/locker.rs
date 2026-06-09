@@ -363,13 +363,13 @@ pub fn tags_lock_info(tags: &Tags) -> Result<LockInfo, StorageError> {
             other => return Err(StorageError::Other(format!("unknown lock type {other:?}"))),
         };
     }
-    if let Some(v) = tags.get(LOCKED_BY_TAG) {
-        if !v.is_empty() {
-            for lt in v.split(',') {
-                let d = tag_to_tid(lt)
-                    .map_err(|e| StorageError::Other(format!("invalid locked-by tag: {e}")))?;
-                res.locked_by.push(d);
-            }
+    if let Some(v) = tags.get(LOCKED_BY_TAG)
+        && !v.is_empty()
+    {
+        for lt in v.split(',') {
+            let d = tag_to_tid(lt)
+                .map_err(|e| StorageError::Other(format!("invalid locked-by tag: {e}")))?;
+            res.locked_by.push(d);
         }
     }
     // On a malformed last-writer tag, leave it empty (matches Go).
@@ -427,7 +427,7 @@ impl Locker {
                 LockType::Read | LockType::Write => {
                     return Err(StorageError::Backend(
                         glassdb_backend::BackendError::NotFound,
-                    ))
+                    ));
                 }
                 _ => {}
             }

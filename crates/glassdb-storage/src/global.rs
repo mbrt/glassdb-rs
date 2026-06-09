@@ -9,7 +9,7 @@ use glassdb_data::TxId;
 
 use crate::error::StorageError;
 use crate::local::{Local, MAX_STALENESS};
-use crate::version::{version_from_meta, Version};
+use crate::version::{Version, version_from_meta};
 
 /// The result of reading a value from global storage.
 #[derive(Debug, Clone)]

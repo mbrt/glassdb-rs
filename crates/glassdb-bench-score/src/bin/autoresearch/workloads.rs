@@ -13,7 +13,7 @@
 
 use futures::future::join_all;
 
-use glassdb::{Collection, Ctx, Error, DB};
+use glassdb::{Collection, Ctx, DB, Error};
 
 use crate::metrics::{Measure, Sample};
 

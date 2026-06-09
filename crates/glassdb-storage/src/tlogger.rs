@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend::{self as backend, Tags};
-use glassdb_concurr::{rt, Ctx};
-use glassdb_data::{gopath, paths, TxId};
+use glassdb_concurr::{Ctx, rt};
+use glassdb_data::{TxId, gopath, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -127,7 +127,7 @@ impl TLogger {
             pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
             pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
             pb::transaction_log::Status::Default => {
-                return Err(StorageError::Other("unknown commit status".into()))
+                return Err(StorageError::Other("unknown commit status".into()));
             }
         };
         let mut res = TxLog {
@@ -290,7 +290,7 @@ fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
         TxCommitStatus::Aborted => pb::transaction_log::Status::Aborted,
         TxCommitStatus::Pending => pb::transaction_log::Status::Pending,
         TxCommitStatus::Unknown => {
-            return Err(StorageError::Other("unsupported commit status".into()))
+            return Err(StorageError::Other("unsupported commit status".into()));
         }
     };
 
@@ -412,7 +412,7 @@ fn parse_log_tags(t: &Tags) -> Result<TxStatus, StorageError> {
         other => {
             return Err(StorageError::Other(format!(
                 "unknown commit-status tag {other:?}"
-            )))
+            )));
         }
     };
     let ts = t

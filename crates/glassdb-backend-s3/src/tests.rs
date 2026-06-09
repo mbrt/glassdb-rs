@@ -5,14 +5,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
-use aws_sdk_s3::Client;
 use bytes::Bytes;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Tags, Version, WriterId, LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Tags, Version, WriterId, encode_writer_tag,
 };
 use glassdb_concurr::Ctx;
 use http_body_util::{BodyExt, Full};
@@ -207,23 +207,24 @@ fn put_object(
 
     let mut meta = HashMap::new();
     for (name, val) in headers {
-        if let Some(k) = name.as_str().strip_prefix("x-amz-meta-") {
-            if let Ok(v) = val.to_str() {
-                meta.insert(k.to_string(), v.to_string());
-            }
+        if let Some(k) = name.as_str().strip_prefix("x-amz-meta-")
+            && let Ok(v) = val.to_str()
+        {
+            meta.insert(k.to_string(), v.to_string());
         }
     }
 
     let mut objs = state.objects.lock().unwrap();
     let existing = objs.get(key);
-    if let Some(inm) = &if_none_match {
-        if inm == "*" && existing.is_some() {
-            return xml_error(
-                StatusCode::PRECONDITION_FAILED,
-                "PreconditionFailed",
-                "object exists",
-            );
-        }
+    if let Some(inm) = &if_none_match
+        && inm == "*"
+        && existing.is_some()
+    {
+        return xml_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "object exists",
+        );
     }
     if let Some(im) = &if_match {
         match existing {
@@ -233,7 +234,7 @@ fn put_object(
                     StatusCode::PRECONDITION_FAILED,
                     "PreconditionFailed",
                     "etag mismatch",
-                )
+                );
             }
         }
     }
@@ -296,11 +297,11 @@ fn list_objects(state: &FakeState, query: &str) -> Response<Full<Bytes>> {
         let Some(rest) = k.strip_prefix(&prefix) else {
             continue;
         };
-        if !delim.is_empty() {
-            if let Some(idx) = rest.find(&delim) {
-                common.insert(format!("{prefix}{}", &rest[..=idx]));
-                continue;
-            }
+        if !delim.is_empty()
+            && let Some(idx) = rest.find(&delim)
+        {
+            common.insert(format!("{prefix}{}", &rest[..=idx]));
+            continue;
         }
         contents.push(k.clone());
     }
@@ -395,12 +396,13 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(h);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(h);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;

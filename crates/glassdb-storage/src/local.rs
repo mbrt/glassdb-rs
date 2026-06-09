@@ -233,12 +233,12 @@ impl Local {
     pub fn mark_value_outdated(&self, key: &str, v: Version) {
         self.cache.update(key, move |old| {
             let mut entry = old?;
-            if let Some(val) = &entry.v {
-                if val.version.equal_contents(&v) {
-                    let mut newval = val.clone();
-                    newval.outdated = true;
-                    entry.v = Some(newval);
-                }
+            if let Some(val) = &entry.v
+                && val.version.equal_contents(&v)
+            {
+                let mut newval = val.clone();
+                newval.outdated = true;
+                entry.v = Some(newval);
             }
             Some(entry)
         });

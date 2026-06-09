@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
-use glassdb::{Collection, Ctx, Error, DB};
+use glassdb::{Collection, Ctx, DB, Error};
 
 /// What the [`FaultBackend`] should do when its trap matches a conditional write.
 #[derive(Clone, Copy)]

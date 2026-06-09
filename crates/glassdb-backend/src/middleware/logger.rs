@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use glassdb_concurr::Ctx;
 
 use crate::{
-    encode_writer_tag, Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId,
+    Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId, encode_writer_tag,
 };
 
 /// A [`Backend`] decorator that emits a `tracing` debug event for every

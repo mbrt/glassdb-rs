@@ -24,11 +24,11 @@ struct Inner<V> {
 
 impl<V: Weighable + Clone> Inner<V> {
     fn move_to_front(&mut self, key: &str) {
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            if pos != 0 {
-                let k = self.order.remove(pos);
-                self.order.insert(0, k);
-            }
+        if let Some(pos) = self.order.iter().position(|k| k == key)
+            && pos != 0
+        {
+            let k = self.order.remove(pos);
+            self.order.insert(0, k);
         }
     }
 

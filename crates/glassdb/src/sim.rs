@@ -29,12 +29,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
+use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
-use glassdb_backend::Backend;
-use glassdb_concurr::{rt, CancelToken, Tape};
+use glassdb_concurr::{CancelToken, Tape, rt};
 
-use crate::{Collection, Ctx, Error, DB};
+use crate::{Collection, Ctx, DB, Error};
 
 /// Number of distinct keys the workload operates on.
 pub const KEY_COUNT: usize = 4;

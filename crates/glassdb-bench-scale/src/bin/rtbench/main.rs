@@ -41,8 +41,8 @@ use rand::{Rng, RngExt, SeedableRng};
 use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{gcs_delays, s3_delays, DelayBackend, DelayOptions};
-use glassdb::{Collection, Ctx, Error as GError, Stats, DB};
+use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
+use glassdb::{Collection, Ctx, DB, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
 

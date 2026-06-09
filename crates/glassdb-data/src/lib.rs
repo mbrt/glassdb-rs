@@ -7,4 +7,4 @@ pub mod gopath;
 pub mod paths;
 mod txid;
 
-pub use txid::{set_diff, set_intersect, set_union, TxId, TxIdSet};
+pub use txid::{TxId, TxIdSet, set_diff, set_intersect, set_union};

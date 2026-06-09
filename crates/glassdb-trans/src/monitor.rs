@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use glassdb_backend as backend;
-use glassdb_concurr::{rt, shard::Sharded, Background, Clock, Ctx, RetryConfig};
+use glassdb_concurr::{Background, Clock, Ctx, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
-use glassdb_storage::{Local, TLogger, TValue, TxCommitStatus, TxLog, Version, MAX_STALENESS};
+use glassdb_storage::{Local, MAX_STALENESS, TLogger, TValue, TxCommitStatus, TxLog, Version};
 use tokio::sync::oneshot;
 
 use crate::error::TransError;
@@ -380,17 +380,17 @@ impl Monitor {
         key: &str,
         tid: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
-        if let Some(lr) = self.inner.local.read(key, MAX_STALENESS) {
-            if lr.version.writer == *tid {
-                return Ok(KeyCommitStatus {
-                    status: TxCommitStatus::Ok,
-                    value: TValue {
-                        value: lr.value,
-                        deleted: lr.deleted,
-                        not_written: false,
-                    },
-                });
-            }
+        if let Some(lr) = self.inner.local.read(key, MAX_STALENESS)
+            && lr.version.writer == *tid
+        {
+            return Ok(KeyCommitStatus {
+                status: TxCommitStatus::Ok,
+                value: TValue {
+                    value: lr.value,
+                    deleted: lr.deleted,
+                    not_written: false,
+                },
+            });
         }
 
         let status = self.tx_status(ctx, tid).await?;
@@ -666,7 +666,7 @@ fn next_waiter(st: &mut State, tid: &TxId) -> Option<Ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{memory::MemoryBackend, Backend, Tags};
+    use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
     use glassdb_data::paths;
     use glassdb_storage::{Global, LockType, PathLock, TxWrite};
 

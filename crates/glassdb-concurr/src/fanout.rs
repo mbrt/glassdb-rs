@@ -47,11 +47,11 @@ impl Fanout {
 
         let mut result = Ok(());
         while let Some(r) = stream.next().await {
-            if let Err(e) = r {
-                if result.is_ok() {
-                    result = Err(e);
-                    group_token.cancel();
-                }
+            if let Err(e) = r
+                && result.is_ok()
+            {
+                result = Err(e);
+                group_token.cancel();
             }
         }
         result
@@ -61,8 +61,8 @@ impl Fanout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -89,11 +89,7 @@ mod tests {
         let f = Fanout::new(3);
         let res: Result<(), i32> = f
             .spawn(&Ctx::background(), 3, |_ctx, i| async move {
-                if i == 1 {
-                    Err(42)
-                } else {
-                    Ok(())
-                }
+                if i == 1 { Err(42) } else { Ok(()) }
             })
             .await;
         assert_eq!(res, Err(42));
