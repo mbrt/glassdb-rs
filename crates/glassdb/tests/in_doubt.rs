@@ -349,6 +349,52 @@ async fn logged_commit_lost_ack_retries_transparently() {
     );
 }
 
+/// Lock acquisition is a *pre-commit* operation: no durable user value has been
+/// produced yet, so a lost ack on a conditional lock write is recoverable
+/// in place by re-reading the lock metadata (which reveals whether the write
+/// took). The locker therefore retries on `Unavailable` instead of surfacing
+/// it, exactly as it already does for a stale `Precondition`. The whole
+/// transaction commits successfully without re-running the user's closure.
+#[tokio::test(start_paused = true)]
+async fn lock_acquisition_lost_ack_retries_in_place() {
+    let ctx = Ctx::background();
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = FaultBackend::new(mem);
+    let db = DB::open(&ctx, "example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"c");
+    coll.create(&ctx).await.unwrap();
+    seed(&coll, &ctx, b"a", 0).await;
+    seed(&coll, &ctx, b"b", 0).await;
+
+    // Trap the first `set_tags_if` on a key path — that's how a non-create
+    // write lock is taken on an existing object. Let it land, then lose the
+    // ack: the lock is actually applied but the locker observes `Unavailable`.
+    backend.arm(Box::new(|kind, path, _tags| {
+        if kind == "set_tags_if" && path.contains("/_k/") {
+            Some(Action::LostAck)
+        } else {
+            None
+        }
+    }));
+
+    // Two writes force the locked, log-based commit path. Capture `coll` by
+    // reference so the body stays `FnMut` (re-runnable, though we expect no
+    // closure re-run here — the lock retry is invisible to `DB::tx`).
+    let coll = &coll;
+    db.tx(&ctx, |tx| async move {
+        let a = read_int(&tx.read(coll, b"a").await.unwrap());
+        let b = read_int(&tx.read(coll, b"b").await.unwrap());
+        tx.write(coll, b"a", &write_int(a + 1))?;
+        tx.write(coll, b"b", &write_int(b + 1))
+    })
+    .await
+    .expect("a pre-commit in-doubt lock outcome must be recovered in place");
+
+    // Each write applied exactly once — the safety invariant.
+    assert_eq!(read_int(&coll.read_strong(&ctx, b"a").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read_strong(&ctx, b"b").await.unwrap()), 1);
+}
+
 /// A *clean* precondition (no lost ack) is a genuine conflict, and the engine
 /// must still resolve it transparently: the single-RW path retries and commits
 /// successfully, applying the increment exactly once. This guards against

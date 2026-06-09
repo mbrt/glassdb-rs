@@ -280,8 +280,19 @@ impl Worker<LockReq, StorageError> for LockerWorker {
             let lock_res = match self.core.do_lock_op(ctx, key, &req).await {
                 Ok(r) => r,
                 Err(e) => {
-                    if e.is_precondition() && req.typ != LockType::Create {
-                        // The lock info was outdated; force a reload and retry.
+                    // Two recoverable cases reload metadata and try again:
+                    //   - a precondition on a non-create means our cached lock
+                    //     info was stale (someone else changed it);
+                    //   - an in-doubt outcome means the conditional lock write
+                    //     may or may not have landed. Acquiring a lock is
+                    //     pre-commit and idempotent: a fresh read reveals
+                    //     whether it took, and re-applying is harmless. So we
+                    //     retry the lock operation itself rather than
+                    //     surfacing the uncertainty — only the commit point
+                    //     must surface in-doubt (ADR-009), where a blind retry
+                    //     could double-apply a durable write.
+                    let stale = e.is_precondition() && req.typ != LockType::Create;
+                    if stale || e.is_unavailable() {
                         let _ = self.core.global.get_metadata(ctx, key).await;
                         continue;
                     }
