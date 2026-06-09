@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use base64::Engine;
-use glassdb_concurr::Ctx;
 
 pub mod memory;
 pub mod middleware;
@@ -20,6 +19,10 @@ pub use stats::{BackendStats, StatsBackend};
 pub const LAST_WRITER_TAG: &str = "last-writer";
 
 /// Errors returned by backend operations.
+///
+/// Cancellation is not modeled as an error: backend futures are cancelled by
+/// being dropped (via `tokio::time::timeout`, `select!`, or
+/// `JoinHandle::abort`), and a dropped future simply returns nothing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BackendError {
     /// The object does not exist.
@@ -28,9 +31,6 @@ pub enum BackendError {
     /// A conditional operation's precondition failed (version mismatch).
     #[error("precondition failed")]
     Precondition,
-    /// The operation's context was cancelled.
-    #[error("context canceled")]
-    Cancelled,
     /// The operation's outcome is unknown: the request may or may not have been
     /// applied. Returned when a call cannot be completed with a definitive
     /// answer — e.g. a conditional write whose acknowledgement was lost and
@@ -136,47 +136,41 @@ pub struct Metadata {
     pub version: Version,
 }
 
-/// The contract with an object store. All methods take a [`Ctx`] for
-/// cancellation.
+/// The contract with an object store.
+///
+/// Backend futures are cancelled by being dropped: wrap a call in
+/// `tokio::time::timeout` or `select!`.
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Returns the object only if its `last-writer` tag differs from
     /// `expected_writer`; otherwise returns [`BackendError::Precondition`].
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError>;
 
     /// Reads the full object.
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError>;
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError>;
 
     /// Returns the object's tags and version.
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError>;
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError>;
 
     /// Conditionally merges `tags` if the object's version matches `expected`.
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError>;
 
     /// Unconditionally writes (creates or overwrites) the object.
-    async fn write(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError>;
+    async fn write(&self, path: &str, value: Vec<u8>, tags: Tags)
+    -> Result<Metadata, BackendError>;
 
     /// Conditionally writes if the object exists and its version matches.
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
@@ -186,24 +180,91 @@ pub trait Backend: Send + Sync {
     /// Creates the object only if it does not already exist.
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError>;
 
     /// Unconditionally deletes the object.
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError>;
+    async fn delete(&self, path: &str) -> Result<(), BackendError>;
 
     /// Conditionally deletes if the object's version matches `expected`.
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError>;
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError>;
 
     /// Lists object paths under `dir_path` (separator `/`), lexicographically.
     /// Immediate sub-directory prefixes are returned, not their contents.
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError>;
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError>;
+}
+
+/// Transparent delegation so any `Arc<B: Backend>` (including
+/// `Arc<dyn Backend>`) is itself a `Backend`. Lets generic APIs like
+/// `DB::open<B: Backend + 'static>(name, b)` accept a pre-erased
+/// `Arc<dyn Backend>` (e.g. a middleware stack assembled in a test) without a
+/// dedicated entry point.
+#[async_trait]
+impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
+    async fn read_if_modified(
+        &self,
+        path: &str,
+        expected_writer: &WriterId,
+    ) -> Result<ReadReply, BackendError> {
+        (**self).read_if_modified(path, expected_writer).await
+    }
+
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        (**self).read(path).await
+    }
+
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        (**self).get_metadata(path).await
+    }
+
+    async fn set_tags_if(
+        &self,
+        path: &str,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).set_tags_if(path, expected, tags).await
+    }
+
+    async fn write(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).write(path, value, tags).await
+    }
+
+    async fn write_if(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).write_if(path, value, expected, tags).await
+    }
+
+    async fn write_if_not_exists(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        (**self).write_if_not_exists(path, value, tags).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        (**self).delete(path).await
+    }
+
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        (**self).delete_if(path, expected).await
+    }
+
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        (**self).list(dir_path).await
+    }
 }

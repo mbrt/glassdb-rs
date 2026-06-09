@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Collection, Ctx, DB, Error};
+use glassdb::{Backend, Collection, DB, Error};
 use proptest::prelude::*;
 
 fn write_int(n: i64) -> Vec<u8> {
@@ -34,9 +34,9 @@ async fn read_int_from_tx(tx: &glassdb::Tx, c: &Collection, k: &[u8]) -> Result<
     }
 }
 
-async fn rmw(ctx: &Ctx, db: &DB, coll: &Collection, key: &[u8], n: u32) -> Result<(), Error> {
+async fn rmw(db: &DB, coll: &Collection, key: &[u8], n: u32) -> Result<(), Error> {
     for _ in 0..n {
-        db.tx(ctx, |tx| async move {
+        db.tx(|tx| async move {
             let cur = read_int_from_tx(&tx, coll, key).await?;
             tx.write(coll, key, &write_int(cur + 1))
         })
@@ -45,16 +45,9 @@ async fn rmw(ctx: &Ctx, db: &DB, coll: &Collection, key: &[u8], n: u32) -> Resul
     Ok(())
 }
 
-async fn multi_rmw(
-    ctx: &Ctx,
-    db: &DB,
-    coll: &Collection,
-    a: &[u8],
-    b: &[u8],
-    n: u32,
-) -> Result<(), Error> {
+async fn multi_rmw(db: &DB, coll: &Collection, a: &[u8], b: &[u8], n: u32) -> Result<(), Error> {
     for _ in 0..n {
-        db.tx(ctx, |tx| async move {
+        db.tx(|tx| async move {
             let va = read_int_from_tx(&tx, coll, a).await?;
             let vb = read_int_from_tx(&tx, coll, b).await?;
             tx.write(coll, a, &write_int(va + 1))?;
@@ -65,8 +58,8 @@ async fn multi_rmw(
     Ok(())
 }
 
-async fn read_only(ctx: &Ctx, db: &DB, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
-    db.tx(ctx, |tx| async move {
+async fn read_only(db: &DB, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
+    db.tx(|tx| async move {
         for k in keys {
             match tx.read(coll, k).await {
                 Ok(v) => assert!(read_int(&v) >= 0, "negative value for {k:?}"),
@@ -81,18 +74,17 @@ async fn read_only(ctx: &Ctx, db: &DB, coll: &Collection, keys: &[&[u8]]) -> Res
 
 #[allow(clippy::too_many_arguments)]
 async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
-    let ctx = Ctx::background();
     let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let db1 = DB::open(&ctx, "example", backend.clone()).await.unwrap();
-    let db2 = DB::open(&ctx, "example", backend).await.unwrap();
+    let db1 = DB::open("example", backend.clone()).await.unwrap();
+    let db2 = DB::open("example", backend).await.unwrap();
 
     let coll1 = db1.collection(b"fuzz-coll");
     let coll2 = db2.collection(b"fuzz-coll");
     let (k1, k2, k3): (&[u8], &[u8], &[u8]) = (b"k1", b"k2", b"k3");
 
-    coll1.create(&ctx).await.unwrap();
+    coll1.create().await.unwrap();
     let seed_coll = &coll1;
-    db1.tx(&ctx, |tx| async move {
+    db1.tx(|tx| async move {
         for k in [k1, k2, k3] {
             tx.write(seed_coll, k, &write_int(0))?;
         }
@@ -103,18 +95,18 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
 
     // DB1 workload: rmw(k1), multi(k1,k2), read-only, rmw(k3).
     let w1 = async {
-        rmw(&ctx, &db1, &coll1, k1, a1).await?;
-        multi_rmw(&ctx, &db1, &coll1, k1, k2, a2).await?;
-        read_only(&ctx, &db1, &coll1, &[k1, k2, k3]).await?;
-        rmw(&ctx, &db1, &coll1, k3, a3).await?;
+        rmw(&db1, &coll1, k1, a1).await?;
+        multi_rmw(&db1, &coll1, k1, k2, a2).await?;
+        read_only(&db1, &coll1, &[k1, k2, k3]).await?;
+        rmw(&db1, &coll1, k3, a3).await?;
         Ok::<(), Error>(())
     };
     // DB2 workload: rmw(k2), multi(k2,k3), read-only, rmw(k1).
     let w2 = async {
-        rmw(&ctx, &db2, &coll2, k2, b1).await?;
-        multi_rmw(&ctx, &db2, &coll2, k2, k3, b2).await?;
-        read_only(&ctx, &db2, &coll2, &[k1, k2, k3]).await?;
-        rmw(&ctx, &db2, &coll2, k1, b3).await?;
+        rmw(&db2, &coll2, k2, b1).await?;
+        multi_rmw(&db2, &coll2, k2, k3, b2).await?;
+        read_only(&db2, &coll2, &[k1, k2, k3]).await?;
+        rmw(&db2, &coll2, k1, b3).await?;
         Ok::<(), Error>(())
     };
 
@@ -123,15 +115,15 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     r2.unwrap();
 
     // Each key's final value must equal the total increments applied to it.
-    let v1 = read_int(&coll1.read_strong(&ctx, k1).await.unwrap());
-    let v2 = read_int(&coll1.read_strong(&ctx, k2).await.unwrap());
-    let v3 = read_int(&coll1.read_strong(&ctx, k3).await.unwrap());
+    let v1 = read_int(&coll1.read_strong(k1).await.unwrap());
+    let v2 = read_int(&coll1.read_strong(k2).await.unwrap());
+    let v3 = read_int(&coll1.read_strong(k3).await.unwrap());
     assert_eq!(v1 as u32, a1 + a2 + b3, "k1 mismatch");
     assert_eq!(v2 as u32, a2 + b1 + b2, "k2 mismatch");
     assert_eq!(v3 as u32, a3 + b2, "k3 mismatch");
 
-    db1.close().await;
-    db2.close().await;
+    db1.shutdown().await;
+    db2.shutdown().await;
 }
 
 proptest! {

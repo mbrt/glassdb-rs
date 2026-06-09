@@ -13,7 +13,7 @@
 
 use futures::future::join_all;
 
-use glassdb::{Collection, Ctx, DB, Error};
+use glassdb::{Collection, DB, Error};
 
 use crate::metrics::{Measure, Sample};
 
@@ -67,7 +67,7 @@ fn read_int(b: &[u8]) -> i64 {
 
 async fn create_coll(db: &DB, name: &str) -> Result<Collection, Error> {
     let coll = db.collection(name.as_bytes());
-    coll.create(&Ctx::background()).await?;
+    coll.create().await?;
     Ok(coll)
 }
 
@@ -80,14 +80,13 @@ fn make_keys(n: usize) -> Vec<Vec<u8>> {
 /// 200 read-modify-write transactions on a single key.
 async fn single_rmw(db: &DB) -> Result<Sample, Error> {
     let coll = create_coll(db, "single").await?;
-    let ctx = Ctx::background();
     let coll = &coll;
     let key: &[u8] = b"k";
 
     let mut m = Measure::new("singleRMW");
     m.begin(db);
     for _ in 0..SINGLE_RMW_TX {
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             let v = match tx.read(coll, key).await {
                 Ok(v) => v,
                 Err(e) if e.is_not_found() => Vec::new(),
@@ -105,14 +104,13 @@ async fn single_rmw(db: &DB) -> Result<Sample, Error> {
 async fn multi_rmw(db: &DB) -> Result<Sample, Error> {
     let coll = create_coll(db, "multi").await?;
     let keys = make_keys(MULTI_RMW_KEYS);
-    let ctx = Ctx::background();
     let coll = &coll;
     let keys = &keys;
 
     let mut m = Measure::new("multiRMW10");
     m.begin(db);
     for _ in 0..MULTI_RMW_TX {
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             for (k, rv) in keys.iter().zip(vals) {
                 let v = match rv {
@@ -134,13 +132,12 @@ async fn multi_rmw(db: &DB) -> Result<Sample, Error> {
 async fn batch_read(db: &DB) -> Result<Sample, Error> {
     let coll = create_coll(db, "bread").await?;
     let keys = make_keys(BATCH_READ_KEYS);
-    let ctx = Ctx::background();
 
     // Seed the keys (unmeasured).
     {
         let coll = &coll;
         let keys = &keys;
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             for (i, k) in keys.iter().enumerate() {
                 tx.write(coll, k, &write_int(i as i64))?;
             }
@@ -154,7 +151,7 @@ async fn batch_read(db: &DB) -> Result<Sample, Error> {
     let mut m = Measure::new("batchRead10");
     m.begin(db);
     for _ in 0..BATCH_READ_TX {
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             for rv in vals {
                 rv?;
@@ -170,13 +167,12 @@ async fn batch_read(db: &DB) -> Result<Sample, Error> {
 /// 50 transactions that each write 100 distinct keys.
 async fn batch_write(db: &DB) -> Result<Sample, Error> {
     let coll = create_coll(db, "bwrite").await?;
-    let ctx = Ctx::background();
     let coll = &coll;
 
     let mut m = Measure::new("batchWrite100");
     m.begin(db);
     for i in 0..BATCH_WRITE_TX {
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             for j in 0..BATCH_WRITE_KEYS {
                 let k = format!("k{}", i * BATCH_WRITE_KEYS + j);
                 tx.write(coll, k.as_bytes(), &write_int(j as i64))?;
@@ -192,28 +188,21 @@ async fn batch_write(db: &DB) -> Result<Sample, Error> {
 /// 200 transactions that repeatedly read the same pre-seeded key.
 async fn read_repeat(db: &DB) -> Result<Sample, Error> {
     let coll = create_coll(db, "rrepeat").await?;
-    let ctx = Ctx::background();
     let key: &[u8] = b"k";
 
     // Seed the key (unmeasured).
     {
         let coll = &coll;
-        db.tx(
-            &ctx,
-            |tx| async move { tx.write(coll, key, &write_int(42)) },
-        )
-        .await?;
+        db.tx(|tx| async move { tx.write(coll, key, &write_int(42)) })
+            .await?;
     }
 
     let coll = &coll;
     let mut m = Measure::new("readRepeat");
     m.begin(db);
     for _ in 0..READ_REPEAT_TX {
-        db.tx(
-            &ctx,
-            |tx| async move { tx.read(coll, key).await.map(|_| ()) },
-        )
-        .await?;
+        db.tx(|tx| async move { tx.read(coll, key).await.map(|_| ()) })
+            .await?;
     }
     m.end(db);
     Ok(m.into_sample())

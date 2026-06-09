@@ -3,8 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_backend::{Backend, Tags};
-use glassdb_concurr::Ctx;
+use glassdb_backend::Tags;
 use glassdb_data::paths;
 use glassdb_trans::Reader;
 
@@ -31,10 +30,10 @@ impl Collection {
     }
 
     /// Reads the value for `key` with strong (serializable) consistency.
-    pub async fn read_strong(&self, ctx: &Ctx, key: &[u8]) -> Result<Vec<u8>, Error> {
+    pub async fn read_strong(&self, key: &[u8]) -> Result<Vec<u8>, Error> {
         let res: Option<Vec<u8>> = self
             .db
-            .tx(ctx, |tx| async move {
+            .tx(|tx| async move {
                 match tx.read(self, key).await {
                     Ok(v) => Ok(Some(v)),
                     // We must still validate the transaction even when not found.
@@ -47,38 +46,31 @@ impl Collection {
     }
 
     /// Reads the value for `key` allowing stale results up to `max_staleness`.
-    pub async fn read_weak(
-        &self,
-        ctx: &Ctx,
-        key: &[u8],
-        max_staleness: Duration,
-    ) -> Result<Vec<u8>, Error> {
+    pub async fn read_weak(&self, key: &[u8], max_staleness: Duration) -> Result<Vec<u8>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
             self.db.local.clone(),
             self.db.global.clone(),
             self.db.tmon.clone(),
         );
-        let rv = r.read(ctx, &p, max_staleness).await?;
+        let rv = r.read(&p, max_staleness).await?;
         Ok(rv.value)
     }
 
     /// Writes `value` for `key` within a transaction.
-    pub async fn write(&self, ctx: &Ctx, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    pub async fn write(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         self.db
-            .tx(ctx, |tx| async move { tx.write(self, key, value) })
+            .tx(|tx| async move { tx.write(self, key, value) })
             .await
     }
 
     /// Removes `key` within a transaction.
-    pub async fn delete(&self, ctx: &Ctx, key: &[u8]) -> Result<(), Error> {
-        self.db
-            .tx(ctx, |tx| async move { tx.delete(self, key) })
-            .await
+    pub async fn delete(&self, key: &[u8]) -> Result<(), Error> {
+        self.db.tx(|tx| async move { tx.delete(self, key) }).await
     }
 
     /// Atomically reads `key`, applies `f`, and writes the result back.
-    pub async fn update<F>(&self, ctx: &Ctx, key: &[u8], f: F) -> Result<Vec<u8>, Error>
+    pub async fn update<F>(&self, key: &[u8], f: F) -> Result<Vec<u8>, Error>
     where
         F: FnMut(Vec<u8>) -> Result<Vec<u8>, Error> + Send,
     {
@@ -89,7 +81,7 @@ impl Collection {
         // `.await`.
         let f = Arc::new(Mutex::new(f));
         self.db
-            .tx(ctx, move |tx| {
+            .tx(move |tx| {
                 let f = f.clone();
                 async move {
                     let old = tx.read(self, key).await?;
@@ -108,9 +100,9 @@ impl Collection {
     }
 
     /// Ensures the collection exists in the backend, creating it if necessary.
-    pub async fn create(&self, ctx: &Ctx) -> Result<(), Error> {
+    pub async fn create(&self) -> Result<(), Error> {
         let p = paths::collection_info(&self.prefix);
-        match self.db.global.get_metadata(ctx, &p).await {
+        match self.db.global.get_metadata(&p).await {
             Ok(_) => return Ok(()),
             Err(e) if !e.is_not_found() => return Err(e.into()),
             Err(_) => {}
@@ -118,7 +110,7 @@ impl Collection {
         match self
             .db
             .global
-            .write_if_not_exists(ctx, &p, COLL_INFO_CONTENTS.to_vec(), Tags::new())
+            .write_if_not_exists(&p, COLL_INFO_CONTENTS.to_vec(), Tags::new())
             .await
         {
             Ok(_) => Ok(()),
@@ -129,16 +121,16 @@ impl Collection {
     }
 
     /// Returns an iterator over the keys in the collection.
-    pub async fn keys(&self, ctx: &Ctx) -> Result<KeysIter, Error> {
+    pub async fn keys(&self) -> Result<KeysIter, Error> {
         let keys_prefix = paths::keys_prefix(&self.prefix);
-        let items = self.db.backend.list(ctx, &keys_prefix).await?;
+        let items = self.db.global.list(&keys_prefix).await?;
         Ok(KeysIter::new(items))
     }
 
     /// Returns an iterator over the sub-collections in this collection.
-    pub async fn collections(&self, ctx: &Ctx) -> Result<CollectionsIter, Error> {
+    pub async fn collections(&self) -> Result<CollectionsIter, Error> {
         let cprefix = paths::collections_prefix(&self.prefix);
-        let items = self.db.backend.list(ctx, &cprefix).await?;
+        let items = self.db.global.list(&cprefix).await?;
         Ok(CollectionsIter::new(items))
     }
 }

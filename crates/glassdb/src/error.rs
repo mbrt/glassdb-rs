@@ -5,6 +5,10 @@ use glassdb_storage::StorageError;
 use glassdb_trans::TransError;
 
 /// Errors returned by the GlassDB public API.
+///
+/// Cancellation is not modeled as an error: a transaction that was cancelled by
+/// dropping its future (`tokio::time::timeout`, `select!`, or
+/// `JoinHandle::abort`) simply returns nothing.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// The requested object does not exist.
@@ -16,9 +20,6 @@ pub enum Error {
     /// A conditional operation's precondition failed.
     #[error("precondition failed")]
     Precondition,
-    /// The context was cancelled.
-    #[error("context canceled")]
-    Cancelled,
     /// The transaction was already committed or aborted remotely.
     #[error("transaction was already finalized")]
     AlreadyFinalized,
@@ -30,6 +31,10 @@ pub enum Error {
     /// uncertainty.
     #[error("transaction outcome unknown (in doubt): {0}")]
     Unavailable(String),
+    /// The database is shutting down and is no longer accepting new
+    /// transactions. Existing in-flight transactions are allowed to complete.
+    #[error("database is shutting down")]
+    ShuttingDown,
     /// Any other error.
     #[error("{0}")]
     Other(String),
@@ -51,11 +56,6 @@ impl Error {
         matches!(self, Error::Aborted)
     }
 
-    /// Reports whether the context was cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, Error::Cancelled)
-    }
-
     /// Reports whether the transaction's outcome is unknown (in doubt). Such a
     /// transaction may or may not have committed; the engine does not retry it
     /// transparently, leaving the decision to the caller.
@@ -69,7 +69,6 @@ impl From<BackendError> for Error {
         match e {
             BackendError::NotFound => Error::NotFound,
             BackendError::Precondition => Error::Precondition,
-            BackendError::Cancelled => Error::Cancelled,
             BackendError::Unavailable(s) => Error::Unavailable(s),
             BackendError::Other(s) => Error::Other(s),
         }
@@ -90,7 +89,6 @@ impl From<TransError> for Error {
     fn from(e: TransError) -> Self {
         match e {
             TransError::Storage(s) => s.into(),
-            TransError::Cancelled => Error::Cancelled,
             TransError::AlreadyFinalized => Error::AlreadyFinalized,
             TransError::Retry => Error::Other("retry transaction".into()),
             other => Error::Other(other.to_string()),

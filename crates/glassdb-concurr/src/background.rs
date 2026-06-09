@@ -1,70 +1,59 @@
-//! Background task management. Ported from the Go `concurr.Background`: spawns
-//! tasks that are cancelled together on [`Background::close`].
+//! Background task management.
+//!
+//! [`Background`] is an owning collection of detached tasks. Each task is
+//! spawned with [`Background::spawn`] and the only way it observes shutdown
+//! is by being aborted at its next `.await` point: dropping `Background`
+//! aborts every spawned task. Long-running tasks are expected to be written
+//! as loops that `.await` between iterations, so abort is granular.
 
 use std::future::Future;
 use std::sync::Mutex;
 
-use crate::cancel::CancelToken;
-use crate::ctx::Ctx;
 use crate::rt::{self, JoinHandle};
 
-/// Manages a set of background tasks cancelled together on close.
+/// Manages a set of background tasks. When the `Background` is dropped, every
+/// tracked task is aborted; the abort fires at the task's next `.await`.
 pub struct Background {
-    token: CancelToken,
     handles: Mutex<Vec<JoinHandle<()>>>,
-    closed: Mutex<bool>,
 }
 
 impl Background {
     /// Creates a new background task manager.
     pub fn new() -> Self {
         Self {
-            token: CancelToken::new(),
             handles: Mutex::new(Vec::new()),
-            closed: Mutex::new(false),
         }
     }
 
-    /// Spawns `f` as a background task, passing it a context whose cancellation
-    /// is tied to this manager (but which preserves the parent's values).
-    /// Returns `false` if the manager is already closed.
-    pub fn go<F, Fut>(&self, ctx: &Ctx, f: F) -> bool
+    /// Spawns `f` as a background task. The task runs until it completes or
+    /// the `Background` is dropped (at which point [`JoinHandle::abort`] is
+    /// called on every tracked task).
+    pub fn spawn<F>(&self, f: F)
     where
-        F: FnOnce(Ctx) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
-        let closed = self.closed.lock().unwrap();
-        if *closed {
-            return false;
-        }
-        let child = ctx.with_new_cancel(self.token.clone());
-        let handle = rt::spawn(async move {
-            f(child).await;
-        });
+        let handle = rt::spawn(f);
         self.handles.lock().unwrap().push(handle);
-        true
-    }
-
-    /// Signals all background tasks to stop and waits for them to finish.
-    pub async fn close(&self) {
-        {
-            let mut c = self.closed.lock().unwrap();
-            if *c {
-                return;
-            }
-            *c = true;
-        }
-        self.token.cancel();
-        let handles = std::mem::take(&mut *self.handles.lock().unwrap());
-        for handle in handles {
-            let _ = handle.await;
-        }
     }
 }
 
 impl Default for Background {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        // Take handles out so any `JoinHandle` still observed elsewhere (none
+        // by construction here, but defensive) is left alone.
+        let handles = std::mem::take(self.handles.get_mut().unwrap());
+        for h in &handles {
+            h.abort();
+        }
+        // Handles are dropped here, detaching the (now-aborted) tasks. The
+        // sim runtime's wrapping `select!` and tokio's native abort both drop
+        // the spawned future at its next `.await`.
     }
 }
 
@@ -75,30 +64,40 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[tokio::test]
-    async fn runs_and_rejects_after_close() {
+    async fn spawned_task_runs() {
         let b = Background::new();
         let ran = Arc::new(AtomicBool::new(false));
         let r = ran.clone();
-        assert!(b.go(&Ctx::background(), move |_ctx| async move {
+        b.spawn(async move {
             r.store(true, Ordering::SeqCst);
-        }));
-        b.close().await;
+        });
+        // Give the task a chance to run before drop.
+        for _ in 0..10 {
+            if ran.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(ran.load(Ordering::SeqCst));
-        assert!(!b.go(&Ctx::background(), |_ctx| async {}));
     }
 
     #[tokio::test]
-    async fn cancels_tasks_on_close() {
-        let b = Arc::new(Background::new());
+    async fn drop_aborts_tasks() {
+        let b = Background::new();
         let done = Arc::new(AtomicUsize::new(0));
         let d = done.clone();
-        b.go(&Ctx::background(), move |ctx| async move {
-            ctx.cancelled().await;
+        b.spawn(async move {
+            // Long sleep, never expected to complete.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             d.fetch_add(1, Ordering::SeqCst);
         });
-        // Give the task a chance to start.
         tokio::task::yield_now().await;
-        b.close().await;
-        assert_eq!(done.load(Ordering::SeqCst), 1);
+        drop(b);
+        // Yield enough times for the aborted task to be dropped before it
+        // could increment the counter.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 0);
     }
 }

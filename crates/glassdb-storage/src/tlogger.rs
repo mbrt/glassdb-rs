@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend::{self as backend, Tags};
-use glassdb_concurr::{Ctx, rt};
+use glassdb_concurr::rt;
 use glassdb_data::{TxId, gopath, paths};
 use glassdb_proto as pb;
 use prost::Message;
@@ -107,8 +107,8 @@ impl TLogger {
 
     /// Returns the commit status of transaction `id`, using the cache when
     /// possible.
-    pub async fn commit_status(&self, ctx: &Ctx, id: &TxId) -> Result<TxStatus, StorageError> {
-        match self.read_tags(ctx, id).await {
+    pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
+        match self.read_tags(id).await {
             Ok(ts) => Ok(ts),
             Err(e) if e.is_not_found() => Ok(TxStatus {
                 status: TxCommitStatus::Unknown,
@@ -120,8 +120,8 @@ impl TLogger {
     }
 
     /// Reads and parses the full transaction log for `id`.
-    pub async fn get(&self, ctx: &Ctx, id: &TxId) -> Result<TxLog, StorageError> {
-        let tr = self.read_log(ctx, id).await?;
+    pub async fn get(&self, id: &TxId) -> Result<TxLog, StorageError> {
+        let tr = self.read_log(id).await?;
         let status = match tr.status() {
             pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
             pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
@@ -166,7 +166,7 @@ impl TLogger {
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
-    pub async fn set(&self, ctx: &Ctx, mut l: TxLog) -> Result<backend::Version, StorageError> {
+    pub async fn set(&self, mut l: TxLog) -> Result<backend::Version, StorageError> {
         if l.timestamp.is_none() {
             l.timestamp = Some(rt::system_now());
         }
@@ -174,12 +174,7 @@ impl TLogger {
         let tags = log_tags(&l);
         let m = self
             .global
-            .write_if_not_exists(
-                ctx,
-                &paths::from_transaction(&self.prefix, &l.id),
-                buf,
-                tags,
-            )
+            .write_if_not_exists(&paths::from_transaction(&self.prefix, &l.id), buf, tags)
             .await?;
         Ok(m.version.clone())
     }
@@ -187,7 +182,6 @@ impl TLogger {
     /// Updates the log only if its current version matches `expected`.
     pub async fn set_if(
         &self,
-        ctx: &Ctx,
         mut l: TxLog,
         expected: &backend::Version,
     ) -> Result<backend::Version, StorageError> {
@@ -199,7 +193,6 @@ impl TLogger {
         let m = self
             .global
             .write_if(
-                ctx,
                 &paths::from_transaction(&self.prefix, &l.id),
                 buf,
                 expected,
@@ -210,10 +203,10 @@ impl TLogger {
     }
 
     /// Removes the log for `id`, ignoring not-found errors.
-    pub async fn delete(&self, ctx: &Ctx, id: &TxId) -> Result<(), StorageError> {
+    pub async fn delete(&self, id: &TxId) -> Result<(), StorageError> {
         match self
             .global
-            .delete(ctx, &paths::from_transaction(&self.prefix, id))
+            .delete(&paths::from_transaction(&self.prefix, id))
             .await
         {
             Ok(()) => Ok(()),
@@ -222,7 +215,7 @@ impl TLogger {
         }
     }
 
-    async fn read_log(&self, ctx: &Ctx, id: &TxId) -> Result<pb::TransactionLog, StorageError> {
+    async fn read_log(&self, id: &TxId) -> Result<pb::TransactionLog, StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
         if let Some(lr) = self.local.read(&p, MAX_STALENESS) {
             let log = parse_log(&lr.value)?;
@@ -235,11 +228,11 @@ impl TLogger {
             // global.read bypasses ReadIfModified.
             self.local.mark_value_outdated(&p, lr.version);
         }
-        let gr = self.global.read(ctx, &p).await?;
+        let gr = self.global.read(&p).await?;
         parse_log(&gr.value)
     }
 
-    async fn read_tags(&self, ctx: &Ctx, id: &TxId) -> Result<TxStatus, StorageError> {
+    async fn read_tags(&self, id: &TxId) -> Result<TxStatus, StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
         if let Some(lm) = self.local.get_meta(&p, MAX_STALENESS) {
             let mut ts = parse_log_tags(&lm.m.tags)?;
@@ -249,7 +242,7 @@ impl TLogger {
             }
             // Pending: the cached value could be stale, read globally.
         }
-        let gm = self.global.get_metadata(ctx, &p).await?;
+        let gm = self.global.get_metadata(&p).await?;
         let mut ts = parse_log_tags(&gm.tags)?;
         ts.version = gm.version.clone();
         Ok(ts)
@@ -493,10 +486,9 @@ mod tests {
                 },
             ],
         };
-        let ctx = Ctx::background();
-        t.set(&ctx, log.clone()).await.unwrap();
+        t.set(log.clone()).await.unwrap();
 
-        let got = t.get(&ctx, &id).await.unwrap();
+        let got = t.get(&id).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         // Locks include the collection lock and the key lock.
@@ -509,17 +501,14 @@ mod tests {
             typ: LockType::Write
         }));
 
-        let status = t.commit_status(&ctx, &id).await.unwrap();
+        let status = t.commit_status(&id).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
     }
 
     #[tokio::test]
     async fn commit_status_unknown_when_absent() {
         let t = new_tlogger();
-        let status = t
-            .commit_status(&Ctx::background(), &TxId::from_bytes(vec![7]))
-            .await
-            .unwrap();
+        let status = t.commit_status(&TxId::from_bytes(vec![7])).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
     }
 }

@@ -200,7 +200,7 @@ the workload result.
   in-doubt conversion for ambiguous conditional writes, see ADR-009).
   `#[cfg(madsim)]`.
 - `crates/glassdb-backend/src/middleware/recording.rs` — `RecordingBackend`.
-- `crates/glassdb-concurr/src/cancel.rs` — `CancelToken` (over `tokio::sync::Notify`).
+- `crates/glassdb-concurr/src/abort_signal.rs` — `AbortSignal` (over `tokio::sync::Notify`); the `CancelToken` referenced in the *Decision* above was later removed when cancellation throughout the engine became future-drop (`tokio::select!`, `JoinHandle::abort`).
 - `crates/glassdb/tests/concurrent_sim.rs` — the op-stream self-checks (with and
   without faults), only under `--cfg madsim` + `--features sim`.
 - `fuzz/` — the cargo-fuzz crate (its own workspace), target `concurrent_tx`,
