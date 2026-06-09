@@ -4,8 +4,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use glassdb_concurr::Background;
 use glassdb_concurr::rt::{self, Instant};
-use glassdb_concurr::{Background, CancelToken};
 use glassdb_data::TxId;
 use glassdb_storage::TLogger;
 
@@ -54,7 +54,7 @@ impl Gc {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => return,
-                    _ = rt::sleep(CLEANUP_INTERVAL) => g.cleanup_round(&token).await,
+                    _ = rt::sleep(CLEANUP_INTERVAL) => g.cleanup_round().await,
                 }
             }
         });
@@ -71,11 +71,11 @@ impl Gc {
         items.push(CleanupItem { due, tid });
     }
 
-    async fn cleanup_round(&self, ctx: &CancelToken) {
+    async fn cleanup_round(&self) {
         let now = Instant::now();
         let to_cleanup = self.filter_due_items(now);
         for item in to_cleanup {
-            let _ = self.inner.tl.delete(ctx, &item.tid).await;
+            let _ = self.inner.tl.delete(&item.tid).await;
         }
     }
 
@@ -106,20 +106,19 @@ mod tests {
         let tl = TLogger::new(global, local, "test");
         let bg = Arc::new(Background::new());
         let gc = Gc::new(bg, tl.clone());
-        let ctx = CancelToken::new();
         gc.start();
 
         let tid = TxId::from_bytes(b"tx1".to_vec());
-        tl.set(&ctx, TxLog::new(tid.clone(), TxCommitStatus::Ok))
+        tl.set(TxLog::new(tid.clone(), TxCommitStatus::Ok))
             .await
             .unwrap();
-        assert!(tl.get(&ctx, &tid).await.is_ok());
+        assert!(tl.get(&tid).await.is_ok());
 
         gc.schedule_tx_cleanup(tid.clone());
 
         // Wait for several cleanup intervals; the log should be deleted.
         tokio::time::sleep(CLEANUP_INTERVAL * 3).await;
-        let err = tl.get(&ctx, &tid).await.unwrap_err();
+        let err = tl.get(&tid).await.unwrap_err();
         assert!(err.is_not_found(), "expected not-found, got {err:?}");
     }
 }

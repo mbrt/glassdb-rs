@@ -1,5 +1,7 @@
-//! Concurrency utilities: a cancellation token, background task management,
-//! mergeable work deduplication, and retry-with-backoff.
+//! Concurrency utilities: background task management, mergeable work
+//! deduplication, and retry-with-backoff. The `CancelToken` re-exported here
+//! is an implementation detail of `Background` and `Dedup` — it surfaces only
+//! because closures passed to them observe the shutdown signal.
 
 mod background;
 mod cancel;

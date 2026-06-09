@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use glassdb_concurr::CancelToken;
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, MAX_STALENESS};
 use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
@@ -28,7 +27,6 @@ use crate::error::Error;
 /// durability-safe to cancel by being dropped (`tokio::time::timeout`,
 /// `select!`, or `JoinHandle::abort`).
 pub struct Tx {
-    ctx: CancelToken,
     reader: Reader,
     inner: Arc<Mutex<TxInner>>,
 }
@@ -41,14 +39,8 @@ struct TxInner {
 }
 
 impl Tx {
-    pub(crate) fn new(
-        ctx: CancelToken,
-        global: Global,
-        local: Local,
-        tmon: glassdb_trans::Monitor,
-    ) -> Self {
+    pub(crate) fn new(global: Global, local: Local, tmon: glassdb_trans::Monitor) -> Self {
         Tx {
-            ctx,
             reader: Reader::new(local, global, tmon),
             inner: Arc::new(Mutex::new(TxInner::default())),
         }
@@ -59,7 +51,6 @@ impl Tx {
     /// to inspect the staged accesses and reset between retries.
     pub(crate) fn handle(&self) -> Tx {
         Tx {
-            ctx: self.ctx.clone(),
             reader: self.reader.clone(),
             inner: self.inner.clone(),
         }
@@ -88,7 +79,7 @@ impl Tx {
             }
         }
 
-        match self.reader.read(&self.ctx, &p, MAX_STALENESS).await {
+        match self.reader.read(&p, MAX_STALENESS).await {
             Err(e) if e.is_not_found() => {
                 let mut inner = self.inner.lock().unwrap();
                 inner.reads.insert(

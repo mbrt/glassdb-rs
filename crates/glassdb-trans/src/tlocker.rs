@@ -134,12 +134,7 @@ impl LockerCore {
         Reader::new(self.local.clone(), self.global.clone(), self.tmon.clone())
     }
 
-    async fn do_lock_op(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-        req: &LockRequest,
-    ) -> Result<LockOpResult, StorageError> {
+    async fn do_lock_op(&self, key: &str, req: &LockRequest) -> Result<LockOpResult, StorageError> {
         // A pure create request is self-checking: `write_if_not_exists` fails
         // with a precondition error if the object already exists, so the
         // preliminary metadata read (and lockers-state fetch) that the general
@@ -156,7 +151,7 @@ impl LockerCore {
                 ..Default::default()
             };
             locker
-                .update_lock(ctx, key, &backend::Version::default(), &update)
+                .update_lock(key, &backend::Version::default(), &update)
                 .await?;
             return Ok(LockOpResult {
                 locked_for: req.lockers.clone(),
@@ -164,8 +159,8 @@ impl LockerCore {
             });
         }
 
-        let ldata = self.fetch_lock_info(ctx, key).await?;
-        let txs = self.fetch_lockers_state(ctx, key, &ldata.info).await?;
+        let ldata = self.fetch_lock_info(key).await?;
+        let txs = self.fetch_lockers_state(key, &ldata.info).await?;
         let ops = compute_lock_update(ldata.info, req, &txs)?;
         if !ops.wound.is_empty() {
             // Lower-priority holders are in the way. Abort them and retry.
@@ -182,9 +177,7 @@ impl LockerCore {
         }
         if ops.has_update {
             let locker = StorageLocker::new(self.global.clone());
-            locker
-                .update_lock(ctx, key, &ldata.version, &ops.update)
-                .await?;
+            locker.update_lock(key, &ldata.version, &ops.update).await?;
         }
         Ok(LockOpResult {
             locked_for: ops.locked_for,
@@ -193,16 +186,8 @@ impl LockerCore {
         })
     }
 
-    async fn fetch_lock_info(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-    ) -> Result<LockData, StorageError> {
-        let meta = match self
-            .reader()
-            .get_metadata(ctx, key, META_MAX_STALENESS)
-            .await
-        {
+    async fn fetch_lock_info(&self, key: &str) -> Result<LockData, StorageError> {
+        let meta = match self.reader().get_metadata(key, META_MAX_STALENESS).await {
             Ok(m) => m,
             Err(e) if e.is_not_found() => {
                 return Ok(LockData {
@@ -225,19 +210,14 @@ impl LockerCore {
 
     async fn fetch_lockers_state(
         &self,
-        ctx: &CancelToken,
         key: &str,
         info: &LockInfo,
     ) -> Result<Vec<TxPathState>, StorageError> {
         if info.typ == LockType::Create || info.typ == LockType::Write {
             let tx = info.locked_by[0].clone();
-            let tv = self
-                .tmon
-                .committed_value(ctx, key, &tx)
-                .await
-                .map_err(|_| {
-                    StorageError::Other(format!("getting committed value from tx {tx}"))
-                })?;
+            let tv = self.tmon.committed_value(key, &tx).await.map_err(|_| {
+                StorageError::Other(format!("getting committed value from tx {tx}"))
+            })?;
             return Ok(vec![TxPathState {
                 tx,
                 status: tv.status,
@@ -250,7 +230,7 @@ impl LockerCore {
         for tx in &info.locked_by {
             let status = self
                 .tmon
-                .tx_status(ctx, tx)
+                .tx_status(tx)
                 .await
                 .map_err(|_| StorageError::Other(format!("getting tx status for {tx}")))?;
             txs.push(TxPathState {
@@ -272,7 +252,7 @@ struct LockerWorker {
 impl Worker<LockReq, StorageError> for LockerWorker {
     async fn run(
         &self,
-        ctx: &CancelToken,
+        _ctx: &CancelToken,
         key: &str,
         batch: &BatchHandle<LockReq, StorageError>,
     ) -> Result<(), StorageError> {
@@ -282,7 +262,7 @@ impl Worker<LockReq, StorageError> for LockerWorker {
             counter += 1;
             let req = batch.merged().0;
 
-            let lock_res = match self.core.do_lock_op(ctx, key, &req).await {
+            let lock_res = match self.core.do_lock_op(key, &req).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Two recoverable cases reload metadata and try again:
@@ -306,14 +286,14 @@ impl Worker<LockReq, StorageError> for LockerWorker {
                 }
             };
             if !lock_res.wound_tx.is_empty() {
-                if let Err(e) = self.wound_txs(ctx, &lock_res.wound_tx).await {
+                if let Err(e) = self.wound_txs(&lock_res.wound_tx).await {
                     break Err(e);
                 }
                 // Retry now that the lower-priority holders are aborted.
                 continue;
             }
             if !lock_res.wait_for_tx.is_empty() {
-                if let Err(e) = self.wait_for_tx(ctx, &lock_res.wait_for_tx, batch).await {
+                if let Err(e) = self.wait_for_tx(&lock_res.wait_for_tx, batch).await {
                     break Err(e);
                 }
                 continue;
@@ -336,11 +316,11 @@ impl Worker<LockReq, StorageError> for LockerWorker {
 impl LockerWorker {
     /// Aborts the given lower-priority holders so the requester can take over
     /// their locks under the wound-wait rule.
-    async fn wound_txs(&self, ctx: &CancelToken, txs: &[TxId]) -> Result<(), StorageError> {
+    async fn wound_txs(&self, txs: &[TxId]) -> Result<(), StorageError> {
         for tx in txs {
             self.core
                 .tmon
-                .wound_tx(ctx, tx)
+                .wound_tx(tx)
                 .await
                 .map_err(trans_to_storage)?;
         }
@@ -349,7 +329,6 @@ impl LockerWorker {
 
     async fn wait_for_tx(
         &self,
-        ctx: &CancelToken,
         txs: &[TxId],
         batch: &BatchHandle<LockReq, StorageError>,
     ) -> Result<(), StorageError> {
@@ -357,13 +336,13 @@ impl LockerWorker {
             let status = self
                 .core
                 .tmon
-                .tx_status(ctx, tx)
+                .tx_status(tx)
                 .await
                 .map_err(trans_to_storage)?;
             if status.is_final() {
                 continue;
             }
-            let wait_fut = self.core.tmon.wait_for_tx(ctx, tx);
+            let wait_fut = self.core.tmon.wait_for_tx(tx);
 
             tokio::select! {
                 biased;
@@ -374,6 +353,37 @@ impl LockerWorker {
             break;
         }
         Ok(())
+    }
+}
+
+/// RAII guard that marks a lock as `Unknown` in the locker's per-tx state if
+/// the `push_request` future is dropped before `dedup.run` returns. The driver
+/// hand-off in `Dedup` may still complete the storage update in a spawned
+/// owner; recording the lock as unknown forces a subsequent serial validate to
+/// `unlock_all` before re-acquiring, keeping `tlocks` and storage consistent
+/// without threading a cancellation token through every locker call.
+struct PushGuard {
+    locker: Arc<LockerState>,
+    key: String,
+    tid: TxId,
+    armed: bool,
+}
+
+impl Drop for PushGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut tlocks = self
+            .locker
+            .tlocks
+            .for_key(self.tid.as_bytes())
+            .lock()
+            .unwrap();
+        tlocks
+            .entry(self.tid.as_bytes().to_vec())
+            .or_default()
+            .insert(self.key.clone(), LockType::Unknown);
     }
 }
 
@@ -434,38 +444,23 @@ impl Locker {
     }
 
     /// Acquires a read lock on `key` for the transaction.
-    pub async fn lock_read(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-        tid: &TxId,
-    ) -> Result<(), TransError> {
-        self.push_request(ctx, key, LockType::Read, tid).await
+    pub async fn lock_read(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
+        self.push_request(key, LockType::Read, tid).await
     }
 
     /// Acquires a write lock on `key` for the transaction.
-    pub async fn lock_write(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-        tid: &TxId,
-    ) -> Result<(), TransError> {
-        self.push_request(ctx, key, LockType::Write, tid).await
+    pub async fn lock_write(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
+        self.push_request(key, LockType::Write, tid).await
     }
 
     /// Acquires a create lock on `key` (first-time creation) for the transaction.
-    pub async fn lock_create(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-        tid: &TxId,
-    ) -> Result<(), TransError> {
-        self.push_request(ctx, key, LockType::Create, tid).await
+    pub async fn lock_create(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
+        self.push_request(key, LockType::Create, tid).await
     }
 
     /// Releases the lock held by the transaction on `key`.
-    pub async fn unlock(&self, ctx: &CancelToken, key: &str, tid: &TxId) -> Result<(), TransError> {
-        self.push_request(ctx, key, LockType::None, tid).await
+    pub async fn unlock(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
+        self.push_request(key, LockType::None, tid).await
     }
 
     /// Returns the lock type currently held by `tid` on `key`.
@@ -557,13 +552,7 @@ impl Locker {
         out
     }
 
-    async fn push_request(
-        &self,
-        ctx: &CancelToken,
-        key: &str,
-        lt: LockType,
-        tid: &TxId,
-    ) -> Result<(), TransError> {
+    async fn push_request(&self, key: &str, lt: LockType, tid: &TxId) -> Result<(), TransError> {
         self.inner.stats.n_calls.fetch_add(1, Ordering::Relaxed);
         let (txs, nproc) = self.needs_processing(key, tid, lt);
         if !nproc {
@@ -586,21 +575,26 @@ impl Locker {
             unlockers,
         });
 
-        // Honour caller cancellation here (notably the deadlock watchdog
-        // token): backends no longer observe a per-call context, so dropping
-        // the `dedup.run` future is the only way to abort an in-progress lock
-        // acquisition. Dropping the inline driver hands its work to a spawned
-        // owner so other waiters on the same key are not stranded.
-        let outcome = tokio::select! {
-            biased;
-            res = self.inner.dedup.run(key, req) => Some(res),
-            _ = ctx.cancelled() => None,
+        // If our future is dropped mid-`dedup.run` (e.g. the caller hit a
+        // deadlock watchdog and dropped the validate work), we don't know
+        // whether storage was actually mutated. Be conservative and mark the
+        // lock `Unknown` in our per-tx state so a subsequent serial validate
+        // observes the discrepancy and unlocks before reacquiring. On normal
+        // completion the guard is disarmed and the real outcome is recorded
+        // below.
+        let mut guard = PushGuard {
+            locker: Arc::clone(&self.inner),
+            key: key.to_string(),
+            tid: tid.clone(),
+            armed: true,
         };
 
-        let (err, lock_updated, final_lt): (Result<(), TransError>, bool, LockType) = match outcome
-        {
-            Some(Ok(())) => (Ok(()), true, lt),
-            Some(Err(DedupError::Work(e))) => {
+        let res = self.inner.dedup.run(key, req).await;
+        guard.armed = false;
+
+        let (err, lock_updated, final_lt): (Result<(), TransError>, bool, LockType) = match res {
+            Ok(()) => (Ok(()), true, lt),
+            Err(DedupError::Work(e)) => {
                 if e.is_precondition() {
                     (Err(TransError::Storage((*e).clone())), false, lt)
                 } else {
@@ -613,13 +607,8 @@ impl Locker {
                     )
                 }
             }
-            Some(Err(DedupError::Cancelled)) => (
+            Err(DedupError::Cancelled) => (
                 Err(TransError::Other("dedup shutdown".into())),
-                true,
-                LockType::Unknown,
-            ),
-            None => (
-                Err(TransError::Other("lock cancelled".into())),
                 true,
                 LockType::Unknown,
             ),
@@ -736,7 +725,6 @@ mod tests {
 
     #[tokio::test]
     async fn lock_create() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
         let tx = TxId::new_random();
@@ -744,16 +732,16 @@ mod tests {
 
         // Lock + unlock without commit, repeated.
         for _ in 0..3 {
-            locker.lock_create(&ctx, &key, &tx).await.unwrap();
+            locker.lock_create(&key, &tx).await.unwrap();
             assert_lock_info(&tctx.global, &key, LockType::Create, vec![tx.clone()]).await;
 
-            locker.unlock(&ctx, &key, &tx).await.unwrap();
+            locker.unlock(&key, &tx).await.unwrap();
             let err = tctx.global.get_metadata(&key).await.unwrap_err();
             assert!(err.is_not_found());
         }
 
         // Lock, commit, unlock writes the value.
-        locker.lock_create(&ctx, &key, &tx).await.unwrap();
+        locker.lock_create(&key, &tx).await.unwrap();
         let value = b"val".to_vec();
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
@@ -762,8 +750,8 @@ mod tests {
             deleted: false,
             prev_writer: TxId::default(),
         }];
-        tctx.monitor.commit_tx(&ctx, tl).await.unwrap();
-        locker.unlock(&ctx, &key, &tx).await.unwrap();
+        tctx.monitor.commit_tx(tl).await.unwrap();
+        locker.unlock(&key, &tx).await.unwrap();
 
         let gr = tctx.global.read(&key).await.unwrap();
         assert_eq!(gr.value, value);
@@ -771,7 +759,6 @@ mod tests {
 
     #[tokio::test]
     async fn lock_create_fail() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
         let tx = TxId::new_random();
@@ -782,13 +769,12 @@ mod tests {
             .await
             .unwrap();
 
-        let err = locker.lock_create(&ctx, &key, &tx).await.unwrap_err();
+        let err = locker.lock_create(&key, &tx).await.unwrap_err();
         assert!(err.is_precondition(), "expected precondition, got {err:?}");
     }
 
     #[tokio::test]
     async fn lock_read_write() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
         let tx = TxId::new_random();
@@ -799,22 +785,21 @@ mod tests {
             .await
             .unwrap();
 
-        locker.lock_read(&ctx, &key, &tx).await.unwrap();
+        locker.lock_read(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Read, vec![tx.clone()]).await;
 
-        locker.unlock(&ctx, &key, &tx).await.unwrap();
+        locker.unlock(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::None, vec![]).await;
 
-        locker.lock_write(&ctx, &key, &tx).await.unwrap();
+        locker.lock_write(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx.clone()]).await;
 
-        locker.unlock(&ctx, &key, &tx).await.unwrap();
+        locker.unlock(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::None, vec![]).await;
     }
 
     #[tokio::test]
     async fn lock_multiple_r() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
         let tx1 = TxId::new_random();
@@ -827,8 +812,8 @@ mod tests {
             .await
             .unwrap();
 
-        locker.lock_read(&ctx, &key, &tx1).await.unwrap();
-        locker.lock_read(&ctx, &key, &tx2).await.unwrap();
+        locker.lock_read(&key, &tx1).await.unwrap();
+        locker.lock_read(&key, &tx2).await.unwrap();
         assert_lock_info(
             &tctx.global,
             &key,
@@ -838,7 +823,7 @@ mod tests {
         .await;
 
         // Lock again with the same tx is a no-op.
-        locker.lock_read(&ctx, &key, &tx1).await.unwrap();
+        locker.lock_read(&key, &tx1).await.unwrap();
         assert_lock_info(
             &tctx.global,
             &key,
@@ -847,16 +832,15 @@ mod tests {
         )
         .await;
 
-        locker.unlock(&ctx, &key, &tx1).await.unwrap();
+        locker.unlock(&key, &tx1).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Read, vec![tx2.clone()]).await;
 
-        locker.unlock(&ctx, &key, &tx2).await.unwrap();
+        locker.unlock(&key, &tx2).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::None, vec![]).await;
     }
 
     #[tokio::test]
     async fn lock_read_after_delete() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
 
@@ -867,7 +851,7 @@ mod tests {
 
         let txw = TxId::from_bytes(b"txw".to_vec());
         tctx.monitor.begin_tx(&txw);
-        locker.lock_write(&ctx, &key, &txw).await.unwrap();
+        locker.lock_write(&key, &txw).await.unwrap();
         let mut tl = TxLog::new(txw.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
             path: key.clone(),
@@ -875,17 +859,16 @@ mod tests {
             deleted: true,
             prev_writer: TxId::default(),
         }];
-        tctx.monitor.commit_tx(&ctx, tl).await.unwrap();
+        tctx.monitor.commit_tx(tl).await.unwrap();
 
         let txr = TxId::from_bytes(b"txr".to_vec());
         tctx.monitor.begin_tx(&txr);
-        let err = locker.lock_read(&ctx, &key, &txr).await.unwrap_err();
+        let err = locker.lock_read(&key, &txr).await.unwrap_err();
         assert!(err.is_not_found(), "expected not-found, got {err:?}");
     }
 
     #[tokio::test]
     async fn lock_upgrade() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
         let tx = TxId::new_random();
@@ -896,16 +879,15 @@ mod tests {
             .await
             .unwrap();
 
-        locker.lock_read(&ctx, &key, &tx).await.unwrap();
+        locker.lock_read(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Read, vec![tx.clone()]).await;
 
-        locker.lock_write(&ctx, &key, &tx).await.unwrap();
+        locker.lock_write(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx.clone()]).await;
     }
 
     #[tokio::test]
     async fn wait_for_tx() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let locker = Arc::new(locker);
         let key = paths::from_key("example", b"key");
@@ -919,7 +901,7 @@ mod tests {
             .await
             .unwrap();
 
-        locker.lock_read(&ctx, &key, &txr).await.unwrap();
+        locker.lock_read(&key, &txr).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Read, vec![txr.clone()]).await;
 
         // Unlock the read just after the write starts waiting.
@@ -927,23 +909,21 @@ mod tests {
             let l = locker.clone();
             let k = key.clone();
             let t = txr.clone();
-            let c = ctx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                l.unlock(&c, &k, &t).await.unwrap();
+                l.unlock(&k, &t).await.unwrap();
             })
         };
-        locker.lock_write(&ctx, &key, &txw).await.unwrap();
+        locker.lock_write(&key, &txw).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![txw.clone()]).await;
 
         // Abort the write tx after a new read starts waiting.
         let abort_task = {
             let mon = tctx.monitor.clone();
             let t = txw.clone();
-            let c = ctx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                mon.abort_tx(&c, &t).await.unwrap();
+                mon.abort_tx(&t).await.unwrap();
             })
         };
         // Make sure the unlock and abort have finished before relocking with the
@@ -951,13 +931,12 @@ mod tests {
         unlock_task.await.unwrap();
         abort_task.await.unwrap();
 
-        locker.lock_read(&ctx, &key, &txr).await.unwrap();
+        locker.lock_read(&key, &txr).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Read, vec![txr.clone()]).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn queue_up() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let locker = Arc::new(locker);
         let key = paths::from_key("example", b"key");
@@ -969,7 +948,7 @@ mod tests {
             .await
             .unwrap();
 
-        locker.lock_write(&ctx, &key, &txw).await.unwrap();
+        locker.lock_write(&key, &txw).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![txw.clone()]).await;
 
         // Three transactions try to read-lock in parallel.
@@ -981,10 +960,9 @@ mod tests {
             let l = locker.clone();
             let k = key.clone();
             let mon = tctx.monitor.clone();
-            let c = ctx.clone();
             handles.push(tokio::spawn(async move {
                 mon.begin_tx(&tx);
-                l.lock_read(&c, &k, &tx).await
+                l.lock_read(&k, &tx).await
             }));
         }
 
@@ -994,18 +972,17 @@ mod tests {
             let l = locker.clone();
             let k = key.clone();
             let mon = tctx.monitor.clone();
-            let c = ctx.clone();
             let t = txw0.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 mon.begin_tx(&t);
-                l.lock_write(&c, &k, &t).await
+                l.lock_write(&k, &t).await
             })
         };
 
         // Unlock the original write once the reads are waiting.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        locker.unlock(&ctx, &key, &txw).await.unwrap();
+        locker.unlock(&key, &txw).await.unwrap();
 
         for h in handles {
             h.await.unwrap().unwrap();
@@ -1014,7 +991,7 @@ mod tests {
 
         // Abort all readers; the queued writer should then acquire the lock.
         for tx in &txrs {
-            tctx.monitor.abort_tx(&ctx, tx).await.unwrap();
+            tctx.monitor.abort_tx(tx).await.unwrap();
         }
         writer.await.unwrap().unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![txw0.clone()]).await;
@@ -1022,7 +999,6 @@ mod tests {
 
     #[tokio::test]
     async fn lock_upgrade_wait() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let locker = Arc::new(locker);
         let key = paths::from_key("example", b"key");
@@ -1038,8 +1014,8 @@ mod tests {
             .await
             .unwrap();
 
-        locker.lock_read(&ctx, &key, &tx).await.unwrap();
-        locker.lock_read(&ctx, &key, &txr).await.unwrap();
+        locker.lock_read(&key, &tx).await.unwrap();
+        locker.lock_read(&key, &txr).await.unwrap();
         assert_lock_info(
             &tctx.global,
             &key,
@@ -1052,19 +1028,17 @@ mod tests {
             let l = locker.clone();
             let k = key.clone();
             let t = txr.clone();
-            let c = ctx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                l.unlock(&c, &k, &t).await.unwrap();
+                l.unlock(&k, &t).await.unwrap();
             });
         }
-        locker.lock_write(&ctx, &key, &tx).await.unwrap();
+        locker.lock_write(&key, &tx).await.unwrap();
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx.clone()]).await;
     }
 
     #[tokio::test]
     async fn lock_read_remote() {
-        let ctx = CancelToken::new();
         let (locker1, tctx1) = init_tl_test();
         let (locker2, tctx2) = new_test_locker(tctx1.backend.clone());
 
@@ -1080,12 +1054,12 @@ mod tests {
 
         let tx2 = TxId::new_random();
         tctx2.monitor.begin_tx(&tx2);
-        locker2.lock_read(&ctx, &key, &tx2).await.unwrap();
+        locker2.lock_read(&key, &tx2).await.unwrap();
         assert_lock_info(&tctx2.global, &key, LockType::Read, vec![tx2.clone()]).await;
 
         let tx1 = TxId::new_random();
         tctx1.monitor.begin_tx(&tx1);
-        locker1.lock_read(&ctx, &key, &tx1).await.unwrap();
+        locker1.lock_read(&key, &tx1).await.unwrap();
         assert_lock_info(
             &tctx1.global,
             &key,
@@ -1101,7 +1075,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wait_remote() {
-        let ctx = CancelToken::new();
         let (locker1, tctx1) = init_tl_test();
         let (locker2, tctx2) = new_test_locker(tctx1.backend.clone());
         let locker2 = Arc::new(locker2);
@@ -1117,23 +1090,22 @@ mod tests {
         // instead of wounding it.
         let tx2 = mk_tid(1, "tx2");
         tctx2.monitor.begin_tx(&tx2);
-        locker2.lock_write(&ctx, &key, &tx2).await.unwrap();
+        locker2.lock_write(&key, &tx2).await.unwrap();
         assert_lock_info(&tctx2.global, &key, LockType::Write, vec![tx2.clone()]).await;
 
         {
             let l = locker2.clone();
             let k = key.clone();
             let t = tx2.clone();
-            let c = ctx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                l.unlock(&c, &k, &t).await.unwrap();
+                l.unlock(&k, &t).await.unwrap();
             });
         }
 
         let tx1 = mk_tid(1, "tx1");
         tctx1.monitor.begin_tx(&tx1);
-        locker1.lock_write(&ctx, &key, &tx1).await.unwrap();
+        locker1.lock_write(&key, &tx1).await.unwrap();
         assert_lock_info(&tctx1.global, &key, LockType::Write, vec![tx1.clone()]).await;
 
         // Commit tx2 after locker1 holds the write lock.
@@ -1141,7 +1113,6 @@ mod tests {
             let mon = tctx2.monitor.clone();
             let k = key.clone();
             let t = tx2.clone();
-            let c = ctx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let mut tl = TxLog::new(t.clone(), TxCommitStatus::Ok);
@@ -1151,17 +1122,16 @@ mod tests {
                     deleted: false,
                     prev_writer: TxId::default(),
                 }];
-                let _ = mon.commit_tx(&c, tl).await;
+                let _ = mon.commit_tx(tl).await;
             });
         }
 
-        locker1.lock_write(&ctx, &key, &tx1).await.unwrap();
+        locker1.lock_write(&key, &tx1).await.unwrap();
         assert_lock_info(&tctx1.global, &key, LockType::Write, vec![tx1.clone()]).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn wound_younger_holder() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key = paths::from_key("example", b"key");
 
@@ -1173,19 +1143,19 @@ mod tests {
         // A younger transaction holds the write lock.
         let tx_young = mk_tid(2, "young");
         tctx.monitor.begin_tx(&tx_young);
-        locker.lock_write(&ctx, &key, &tx_young).await.unwrap();
+        locker.lock_write(&key, &tx_young).await.unwrap();
 
         // An older (higher-priority) transaction wants the same lock. Under the
         // wound-wait rule it aborts the younger holder and takes the lock
         // without waiting.
         let tx_old = mk_tid(1, "old");
         tctx.monitor.begin_tx(&tx_old);
-        locker.lock_write(&ctx, &key, &tx_old).await.unwrap();
+        locker.lock_write(&key, &tx_old).await.unwrap();
 
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx_old.clone()]).await;
 
         // The younger transaction was wounded (aborted).
-        let status = tctx.monitor.tx_status(&ctx, &tx_young).await.unwrap();
+        let status = tctx.monitor.tx_status(&tx_young).await.unwrap();
         assert_eq!(status, TxCommitStatus::Aborted);
     }
 
@@ -1193,7 +1163,6 @@ mod tests {
     // empty after every lock is released.
     #[tokio::test]
     async fn tx_locks_snapshot_lists_held_locks_per_tx() {
-        let ctx = CancelToken::new();
         let (locker, tctx) = init_tl_test();
         let key_a = paths::from_key("coll", b"a");
         let key_b = paths::from_key("coll", b"b");
@@ -1213,9 +1182,9 @@ mod tests {
         tctx.monitor.begin_tx(&tx2);
 
         // tx1 holds a write on b and a read on a; tx2 holds a read on c.
-        locker.lock_write(&ctx, &key_b, &tx1).await.unwrap();
-        locker.lock_read(&ctx, &key_a, &tx1).await.unwrap();
-        locker.lock_read(&ctx, &key_c, &tx2).await.unwrap();
+        locker.lock_write(&key_b, &tx1).await.unwrap();
+        locker.lock_read(&key_a, &tx1).await.unwrap();
+        locker.lock_read(&key_c, &tx2).await.unwrap();
 
         let snap = locker.tx_locks_snapshot();
         assert_eq!(snap.len(), 2, "expected two txs: {snap:?}");
@@ -1244,9 +1213,9 @@ mod tests {
         );
 
         // Releasing every lock empties the snapshot.
-        locker.unlock(&ctx, &key_a, &tx1).await.unwrap();
-        locker.unlock(&ctx, &key_b, &tx1).await.unwrap();
-        locker.unlock(&ctx, &key_c, &tx2).await.unwrap();
+        locker.unlock(&key_a, &tx1).await.unwrap();
+        locker.unlock(&key_b, &tx1).await.unwrap();
+        locker.unlock(&key_c, &tx2).await.unwrap();
         assert!(locker.tx_locks_snapshot().is_empty());
     }
 }
