@@ -17,37 +17,31 @@ struct CleanupItem {
     tid: TxId,
 }
 
-struct GcInner {
-    // Weak so a `Gc` clone captured inside the cleanup loop does not keep
-    // [`Background`] alive past DB shutdown.
-    bg: Weak<Background>,
-    tl: TLogger,
-    items: Mutex<Vec<CleanupItem>>,
-}
-
 /// Periodically garbage-collects finalized transaction logs that are no longer
 /// needed.
 #[derive(Clone)]
 pub struct Gc {
-    inner: Arc<GcInner>,
+    // Weak so a `Gc` clone captured inside the cleanup loop does not keep
+    // [`Background`] alive past DB shutdown.
+    bg: Weak<Background>,
+    tl: TLogger,
+    items: Arc<Mutex<Vec<CleanupItem>>>,
 }
 
 impl Gc {
     /// Creates a GC using the given background executor and logger.
     pub fn new(bg: Weak<Background>, tl: TLogger) -> Self {
         Gc {
-            inner: Arc::new(GcInner {
-                bg,
-                tl,
-                items: Mutex::new(Vec::new()),
-            }),
+            bg,
+            tl,
+            items: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Starts the background cleanup loop. The loop is aborted when its
     /// owning [`Background`] is dropped.
     pub fn start(&self) {
-        let Some(bg) = self.inner.bg.upgrade() else {
+        let Some(bg) = self.bg.upgrade() else {
             return;
         };
         let g = self.clone();
@@ -66,7 +60,7 @@ impl Gc {
     /// Enqueues a transaction log for deletion after a delay.
     pub fn schedule_tx_cleanup(&self, tid: TxId) {
         let due = Instant::now() + CLEANUP_INTERVAL;
-        let mut items = self.inner.items.lock().unwrap();
+        let mut items = self.items.lock().unwrap();
         if items.len() > SIZE_LIMIT {
             // Avoid growing indefinitely.
             return;
@@ -78,12 +72,12 @@ impl Gc {
         let now = Instant::now();
         let to_cleanup = self.filter_due_items(now);
         for item in to_cleanup {
-            let _ = self.inner.tl.delete(&item.tid).await;
+            let _ = self.tl.delete(&item.tid).await;
         }
     }
 
     fn filter_due_items(&self, now: Instant) -> Vec<CleanupItem> {
-        let mut items = self.inner.items.lock().unwrap();
+        let mut items = self.items.lock().unwrap();
         let mut i = 0;
         while i < items.len() {
             if items[i].due > now {
