@@ -23,6 +23,9 @@ use glassdb_backend::{
 
 #[cfg(test)]
 mod tests;
+mod tuned_http;
+
+pub use tuned_http::tuned_http_client;
 
 /// Number of random bytes prepended to every object body to force a unique
 /// ETag on each write.
