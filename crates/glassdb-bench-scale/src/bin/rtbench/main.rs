@@ -160,7 +160,11 @@ async fn init_backend(
         "s3" => {
             let bucket = env_var("BUCKET")?;
             let metrics = Arc::new(HttpMetrics::default());
+            // The tuned HTTP client steers the SDK toward connection reuse
+            // (rustls + ALPN-negotiated HTTP/2), so high-concurrency steps
+            // don't pile DNS+TLS handshakes onto tokio's blocking pool.
             let base = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .http_client(glassdb::s3::tuned_http_client())
                 .load()
                 .await;
             let conf = aws_sdk_s3::config::Builder::from(&base)
