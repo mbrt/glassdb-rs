@@ -28,7 +28,7 @@ crate is meant to be used directly.
 | --- | --- |
 | `glassdb-data` | `TxId`, `TxIdSet`, and order-preserving path encoding. |
 | `glassdb-proto` | `prost`-generated transaction-log protobuf messages. |
-| `glassdb-concurr` | Concurrency utilities: `Background`, `Retry`, `Dedup`, `AbortSignal`. |
+| `glassdb-concurr` | Concurrency utilities: `Background`, `Retry`, `Dedup`. |
 | `glassdb-backend` | The `Backend` async trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger). |
 | `glassdb-backend-s3` | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature. |
 | `glassdb-backend-gcs` | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature. |

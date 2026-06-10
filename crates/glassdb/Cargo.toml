@@ -19,6 +19,7 @@ glassdb-concurr = { workspace = true }
 futures = "0.3.32"
 thiserror = "2.0.18"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-util = "0.7.18"
 # Only used by the `sim` feature (deterministic fuzz harness); kept optional so
 # production builds don't pull it in.
 arbitrary = { version = "1", optional = true }
