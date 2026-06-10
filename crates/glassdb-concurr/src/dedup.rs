@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, oneshot};
+use tokio_util::sync::CancellationToken;
 
-use crate::abort_signal::AbortSignal;
 use crate::rt;
 use crate::shard::Sharded;
 
@@ -118,7 +118,7 @@ struct KeyState<R, E> {
     /// Abort signal for the in-flight worker round, if any. Cancelled when the
     /// batch loses all live members so the [`Inner::drive_one_round`]
     /// `select!` drops the worker future at its next `.await`.
-    op_signal: Option<Arc<AbortSignal>>,
+    op_signal: Option<CancellationToken>,
     /// Notified whenever new work arrives (or a waiter cancels), so the worker
     /// can re-evaluate. A single stored permit is enough: the worker re-absorbs
     /// everything via [`KeyState::reconstruct`] on each wake.
@@ -281,7 +281,7 @@ where
 {
     /// Returns the current merged request, absorbing any newly-arrived
     /// compatible submissions. If every caller for the batch has gone away,
-    /// the round's [`AbortSignal`] is fired so the outer `select!` in
+    /// the round's [`CancellationToken`] is fired so the outer `select!` in
     /// [`Inner::drive_one_round`] drops the worker future at its next
     /// `.await`. The (now-stale) merged request is still returned so the
     /// worker has something to inspect for the rest of its current poll.
@@ -349,7 +349,7 @@ struct Inner<R, E, W> {
     /// Fired by [`Dedup::close`]. The outer `select!` in
     /// [`Inner::drive_one_round`] watches this and drops the worker future
     /// at its next `.await` when shutdown lands.
-    shutdown: AbortSignal,
+    shutdown: CancellationToken,
     /// Number of live spawned owner tasks, so [`Dedup::close`] can await them.
     active_owners: AtomicUsize,
     /// Notified when the last spawned owner exits.
@@ -403,7 +403,7 @@ where
                 tracing::trace!(target: "glassdb::dedup", key, "key_removed");
                 return Round::Exit;
             }
-            let signal = Arc::new(AbortSignal::new());
+            let signal = CancellationToken::new();
             st.op_signal = Some(signal.clone());
             tracing::trace!(
                 target: "glassdb::dedup",
@@ -666,7 +666,7 @@ where
             inner: Arc::new(Inner {
                 worker: Arc::new(worker),
                 shards: Sharded::new(|_| Arc::new(Shard::new())),
-                shutdown: AbortSignal::new(),
+                shutdown: CancellationToken::new(),
                 active_owners: AtomicUsize::new(0),
                 owners_idle: Notify::new(),
             }),

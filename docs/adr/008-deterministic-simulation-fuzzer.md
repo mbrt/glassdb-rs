@@ -200,7 +200,7 @@ the workload result.
   in-doubt conversion for ambiguous conditional writes, see ADR-009).
   `#[cfg(madsim)]`.
 - `crates/glassdb-backend/src/middleware/recording.rs` — `RecordingBackend`.
-- `crates/glassdb-concurr/src/abort_signal.rs` — `AbortSignal` (over `tokio::sync::Notify`); the `CancelToken` referenced in the *Decision* above was later removed when cancellation throughout the engine became future-drop (`tokio::select!`, `JoinHandle::abort`).
+- The `CancelToken` referenced in the *Decision* above was later removed when cancellation throughout the engine became future-drop (`tokio::select!`, `JoinHandle::abort`). The remaining outside-the-future wakeup primitive is `tokio_util::sync::CancellationToken` (over `tokio::sync::Notify`), used in `JoinHandle::abort`, `Dedup::close`, and the sim crash nemesis. `tokio_util` is once again usable now that ADR-011 replaced madsim with the in-repo `DetExecutor`, which redirects only `tokio::spawn` and `tokio::time`.
 - `crates/glassdb/tests/concurrent_sim.rs` — the op-stream self-checks (with and
   without faults), only under `--cfg madsim` + `--features sim`.
 - `fuzz/` — the cargo-fuzz crate (its own workspace), target `concurrent_tx`,

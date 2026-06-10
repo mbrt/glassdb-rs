@@ -1,10 +1,9 @@
 //! Concurrency utilities: background task management, mergeable work
 //! deduplication, and retry-with-backoff. Cancellation throughout is by
 //! future-drop (`tokio::time::timeout`, `select!`, `JoinHandle::abort`);
-//! [`AbortSignal`] is the small wakeup primitive used wherever an outside
-//! caller needs to drop a specific in-flight future (sim
+//! [`tokio_util::sync::CancellationToken`] is the small wakeup primitive used
+//! wherever an outside caller needs to drop a specific in-flight future (sim
 //! `JoinHandle::abort`, `Dedup::close`, simulation-harness crash nemesis).
-mod abort_signal;
 mod background;
 mod clock;
 mod dedup;
@@ -16,7 +15,6 @@ pub mod rt;
 pub mod shard;
 mod tape;
 
-pub use abort_signal::AbortSignal;
 pub use background::Background;
 pub use clock::Clock;
 pub use dedup::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker};

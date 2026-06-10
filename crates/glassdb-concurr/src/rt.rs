@@ -146,9 +146,7 @@ mod imp {
     }
     impl std::error::Error for JoinError {}
 
-    use std::sync::Arc;
-
-    use crate::abort_signal::AbortSignal;
+    use tokio_util::sync::CancellationToken;
 
     /// A handle to a spawned task. Backed by the deterministic executor when one
     /// is running, or by tokio otherwise. Dropping it detaches the task; call
@@ -156,7 +154,7 @@ mod imp {
     pub enum JoinHandle<T> {
         Det {
             rx: tokio::sync::oneshot::Receiver<Option<T>>,
-            abort: Arc<AbortSignal>,
+            abort: CancellationToken,
         },
         Tokio(tokio::task::JoinHandle<T>),
     }
@@ -196,7 +194,7 @@ mod imp {
         F::Output: Send + 'static,
     {
         if exec::in_sim() {
-            let abort = Arc::new(AbortSignal::new());
+            let abort = CancellationToken::new();
             let abort_inner = abort.clone();
             let rx = exec::det_spawn(async move {
                 tokio::select! {

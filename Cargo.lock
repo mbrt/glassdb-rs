@@ -1380,6 +1380,7 @@ dependencies = [
  "proptest",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1474,6 +1475,7 @@ dependencies = [
  "futures",
  "rand 0.10.1",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

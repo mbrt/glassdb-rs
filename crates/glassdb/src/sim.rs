@@ -33,7 +33,8 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
-use glassdb_concurr::{AbortSignal, Tape, rt};
+use glassdb_concurr::{Tape, rt};
+use tokio_util::sync::CancellationToken;
 
 use crate::{Collection, DB, Error};
 
@@ -334,7 +335,7 @@ fn assert_bounds(acct: &Acct, finals: &[i64], expected: &[i64], faults_enabled: 
 /// are recovered later via lease expiry during the final reads. Crash timing and
 /// targets are drawn from `tape` (the fuzzer-guided fault schedule), falling back
 /// to the tape's seeded PRNG once its bytes run out.
-async fn crash_nemesis(signals: Vec<Arc<AbortSignal>>, intensity: u8, mut tape: Tape) {
+async fn crash_nemesis(signals: Vec<CancellationToken>, intensity: u8, mut tape: Tape) {
     let crashes = (intensity as usize % 3).min(signals.len());
     for _ in 0..crashes {
         let gap = tape.below(40) + 1;
@@ -453,7 +454,7 @@ fn spawn_nemeses(
     faults: FaultConfig,
     seed: u64,
     streams: &[Vec<u8>; FAULT_STREAMS],
-    signals: &[Arc<AbortSignal>],
+    signals: &[CancellationToken],
     transports: &[Arc<FaultBackend>],
 ) -> (Option<rt::JoinHandle<()>>, Option<rt::JoinHandle<()>>) {
     if !faults.enabled {
@@ -518,19 +519,19 @@ async fn run_inner(
         build_transports(&backbone, faults, seed, &streams, nclients);
 
     // Each client runs as its own task over its own transport so the scheduler
-    // can interleave them. An `AbortSignal` lets the crash nemesis simulate a
-    // hard crash by racing the signal against the client's run loop; the
-    // dropped future is the in-Rust analog of a process death. On a clean run
-    // we `DB::shutdown` to drain in-flight transactions and dedup owners
-    // before the DB clone drops; on a crash we *skip* shutdown and let `Drop`
-    // tear everything down abruptly — that is the whole point of the crash
-    // nemesis. The background loops are torn down in both cases by
-    // `Background::drop` once the last `DB` clone goes out of scope (the
+    // can interleave them. A `CancellationToken` lets the crash nemesis
+    // simulate a hard crash by racing the signal against the client's run
+    // loop; the dropped future is the in-Rust analog of a process death. On
+    // a clean run we `DB::shutdown` to drain in-flight transactions and
+    // dedup owners before the DB clone drops; on a crash we *skip* shutdown
+    // and let `Drop` tear everything down abruptly — that is the whole point
+    // of the crash nemesis. The background loops are torn down in both cases
+    // by `Background::drop` once the last `DB` clone goes out of scope (the
     // captured-task cycle is broken by subsystems holding `Weak<Background>`).
     let mut handles = Vec::with_capacity(nclients);
-    let mut signals: Vec<Arc<AbortSignal>> = Vec::with_capacity(nclients);
+    let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
     for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
-        let signal = Arc::new(AbortSignal::new());
+        let signal = CancellationToken::new();
         signals.push(signal.clone());
         let acct = acct.clone();
         handles.push(rt::spawn(async move {
@@ -944,9 +945,9 @@ async fn run_cycle_inner(
     // nemesis. `Background::drop` still aborts spawned background loops in
     // both cases.
     let mut handles = Vec::with_capacity(nclients);
-    let mut signals: Vec<Arc<AbortSignal>> = Vec::with_capacity(nclients);
+    let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
     for (swaps, backend) in workload.clients.into_iter().zip(client_backends) {
-        let signal = Arc::new(AbortSignal::new());
+        let signal = CancellationToken::new();
         signals.push(signal.clone());
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
