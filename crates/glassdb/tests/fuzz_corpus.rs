@@ -17,6 +17,17 @@ use std::path::PathBuf;
 use glassdb::middleware::{OpRecord, first_divergence};
 use glassdb::sim::{record_cycle_input, record_fuzz_input};
 
+fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
+    if let Some((idx, a, b)) = first_divergence(first, second) {
+        panic!(
+            "{label}: op stream diverged at index {idx}\n  \
+             run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+            first.len(),
+            second.len(),
+        );
+    }
+}
+
 /// Replays every committed input under `fuzz/corpus/<target>` through `replay`,
 /// which panics on any invariant violation, and compares two back-to-back
 /// recorded op streams. On failure the offending file is named: it is the exact
@@ -40,15 +51,11 @@ fn replay_committed_corpus(target: &str, replay: fn(&[u8]) -> Vec<OpRecord>) {
             Ok(log) => log,
             Err(_) => panic!("second corpus replay failed for {}", path.display()),
         };
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "corpus replay diverged for {} at op {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                path.display(),
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(
+            &format!("corpus replay for {}", path.display()),
+            &first,
+            &second,
+        );
         count += 1;
     }
     assert!(count > 0, "no corpus files under {}", dir.display());

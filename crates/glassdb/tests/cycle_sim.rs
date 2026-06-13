@@ -24,18 +24,6 @@ use glassdb::sim::{
     run_cycle_and_assert_with_faults, run_cycle_and_record, run_cycle_and_record_with_faults,
 };
 
-/// A contended ring: a small node count with several clients each rotating
-/// overlapping edges, so transactions conflict on shared keys. A few concurrent
-/// ring snapshots run alongside, exercising the read-side serializability oracle
-/// and `Tx`'s concurrent-read path.
-fn contended_cycle() -> CycleWorkload {
-    CycleWorkload {
-        node_count: 6,
-        clients: vec![vec![0, 2, 4, 1], vec![1, 3, 5, 0], vec![2, 4, 0, 3]],
-        snapshot_reads: 3,
-    }
-}
-
 /// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
 /// long enough to cover every scheduling decision a run makes.
 fn tape(seed: u64) -> Vec<u8> {
@@ -54,6 +42,29 @@ fn tape(seed: u64) -> Vec<u8> {
 /// tape so the interleaving and the fault schedule vary independently.
 fn fault_tape(seed: u64) -> Vec<u8> {
     tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
+}
+
+fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
+    if let Some((idx, a, b)) = first_divergence(first, second) {
+        panic!(
+            "{label}: op stream diverged at index {idx}\n  \
+             run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+            first.len(),
+            second.len(),
+        );
+    }
+}
+
+/// A contended ring: a small node count with several clients each rotating
+/// overlapping edges, so transactions conflict on shared keys. A few concurrent
+/// ring snapshots run alongside, exercising the read-side serializability oracle
+/// and `Tx`'s concurrent-read path.
+fn contended_cycle() -> CycleWorkload {
+    CycleWorkload {
+        node_count: 6,
+        clients: vec![vec![0, 2, 4, 1], vec![1, 3, 5, 0], vec![2, 4, 0, 3]],
+        snapshot_reads: 3,
+    }
 }
 
 /// The op stream recorded for `workload` under `tape(seed)`/`seed`.
@@ -124,14 +135,7 @@ fn op_stream_is_byte_identical_across_runs() {
             !first.is_empty(),
             "seed {seed}: expected the workload to issue backend operations"
         );
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: backend op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: backend"), &first, &second);
     }
 }
 
@@ -156,14 +160,7 @@ fn op_stream_is_byte_identical_with_faults() {
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
         let first = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
         let second = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: faulted op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: faulted"), &first, &second);
     }
 }
 
@@ -196,14 +193,7 @@ fn ring_holds_under_crash_restart_and_outages() {
         let ft = fault_tape(seed);
         let first = record_faults_with_tape(seed, &workload, faults, ft.clone());
         let second = record_faults_with_tape(seed, &workload, faults, ft);
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: recovery op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: recovery"), &first, &second);
     }
 }
 
@@ -218,14 +208,7 @@ fn boundary_tapes_replay_deterministically() {
     ] {
         let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
         let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "cycle boundary tape replay diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence("cycle boundary tape replay", &first, &second);
     }
 }
 
@@ -240,14 +223,7 @@ fn pct_schedule_is_byte_identical_per_seed() {
         let second = cycle_pct_record(&workload, faults, seed);
         let first = first.lock().unwrap().clone();
         let second = second.lock().unwrap().clone();
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: PCT op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: PCT"), &first, &second);
     }
 }
 
@@ -266,14 +242,7 @@ fn concurrent_snapshot_reader_runs_and_stays_deterministic() {
     for seed in [0u64, 1, 42, 1234] {
         let first = record_once(seed, &with_reader);
         let second = record_once(seed, &with_reader);
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: snapshot-reader op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: snapshot-reader"), &first, &second);
         let baseline = record_once(seed, &without);
         assert!(
             first.len() > baseline.len(),
