@@ -117,7 +117,7 @@ impl DbBuilder {
         } else {
             Clock::real()
         };
-        // Subsystems hold `Weak<Background>`. `DbInner._background` (set below)
+        // Subsystems hold `Weak<Background>`. `DbInner::background` (set below)
         // is the sole strong owner; this prevents spawned-task captures (which
         // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
         // would keep `Background` alive forever.
@@ -146,7 +146,7 @@ impl DbBuilder {
             shutting_down: AtomicBool::new(false),
             tx_in_flight: AtomicUsize::new(0),
             tx_drained: Notify::new(),
-            _background: bg,
+            background: bg,
         });
         Ok(DB { inner })
     }
@@ -172,8 +172,9 @@ pub(crate) struct DbInner {
     // spawned tasks do not form a cycle that would prevent `Background::drop`
     // from firing. When this struct drops, the `Arc` count reaches zero,
     // `Background::drop` aborts every spawned task, and the captured clones
-    // unwind.
-    _background: Arc<Background>,
+    // unwind. `DB::shutdown` uses the same owner to wait for tasks that opted
+    // into clean-shutdown draining.
+    background: Arc<Background>,
 }
 
 /// An open GlassDB database instance.
@@ -211,9 +212,10 @@ impl DB {
     /// `DB` clones concurrently.
     ///
     /// Background loops (GC, transaction-log refresh, async lock cleanup) and
-    /// the dedup owners are torn down via [`Drop`] when the last [`DB`] clone
-    /// is dropped; calling `shutdown` is *not* required for cleanup to happen,
-    /// only for caller-observable draining of user transactions.
+    /// best-effort tasks are torn down via [`Drop`] when the last [`DB`] clone
+    /// is dropped; calling `shutdown` is *not* required for cleanup to happen.
+    /// Clean-shutdown background tasks, such as async aborts scheduled by a
+    /// cancelled transaction, are awaited before `shutdown` returns.
     pub async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         loop {
@@ -228,6 +230,7 @@ impl DB {
         // Drain spawned dedup owner tasks so callers observing `shutdown` to
         // return synchronize with their full release.
         self.inner.algo.close().await;
+        self.inner.background.shutdown().await;
     }
 
     /// Returns a top-level collection with the given name.
