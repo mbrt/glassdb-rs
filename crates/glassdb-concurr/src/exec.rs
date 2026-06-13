@@ -616,6 +616,8 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rng::Rng;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fixed-order scheduler: always polls the lowest-id ready task. Useful as
@@ -771,6 +773,58 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    #[test]
+    fn tape_scheduler_consumes_bytes_modulo_ready_set_then_falls_back() {
+        let mut scheduler = TapeScheduler::new(vec![5, 4]);
+        let ready = [TaskId(10), TaskId(20), TaskId(30)];
+
+        assert_eq!(scheduler.pick(&ready), 2, "5 % 3 selects index 2");
+        assert_eq!(scheduler.pick(&ready), 1, "4 % 3 selects index 1");
+        assert_eq!(
+            scheduler.pick(&ready),
+            0,
+            "exhausted tapes fall back to the deterministic lowest-ready choice"
+        );
+    }
+
+    #[test]
+    fn executor_presents_ready_tasks_in_sorted_order() {
+        struct ReadyRecorder {
+            seen: Arc<Mutex<Vec<Vec<TaskId>>>>,
+        }
+        impl Scheduler for ReadyRecorder {
+            fn pick(&mut self, ready: &[TaskId]) -> usize {
+                self.seen.lock().unwrap().push(ready.to_vec());
+                0
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        block_on_with(ReadyRecorder { seen: seen.clone() }, 0, async {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                handles.push(det_spawn(async {
+                    DetYield::default().await;
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|ready| ready.len() > 1),
+            "test never presented multiple ready tasks to the scheduler: {seen:?}"
+        );
+        for ready in seen.iter() {
+            assert!(
+                ready.windows(2).all(|pair| pair[0] < pair[1]),
+                "ready set was not sorted: {ready:?}"
+            );
+        }
+    }
+
     /// Drives four yielding tasks under a [`PctScheduler`] and returns the order
     /// in which their steps ran.
     fn pct_order(seed: u64) -> Vec<u32> {
@@ -807,5 +861,25 @@ mod tests {
         let baseline = pct_order(0);
         let differs = (1u64..32).any(|s| pct_order(s) != baseline);
         assert!(differs, "no PCT seed in 1..32 changed the interleaving");
+    }
+
+    #[test]
+    fn pct_change_point_demotes_selected_task() {
+        let mut scheduler = PctScheduler {
+            rng: Rng::new(0),
+            priorities: BTreeMap::from([(TaskId(1), 100), (TaskId(2), 90)]),
+            change_points: vec![1],
+            step: 0,
+            low_next: 0,
+        };
+        let ready = [TaskId(1), TaskId(2)];
+
+        assert_eq!(scheduler.pick(&ready), 0);
+        assert_eq!(scheduler.priorities[&TaskId(1)], 1);
+        assert_eq!(
+            scheduler.pick(&ready),
+            1,
+            "the demoted task must yield to the next-highest priority"
+        );
     }
 }

@@ -14,13 +14,14 @@
 
 use std::path::PathBuf;
 
-use glassdb::sim::{replay_cycle_input, replay_fuzz_input};
+use glassdb::middleware::{OpRecord, first_divergence};
+use glassdb::sim::{record_cycle_input, record_fuzz_input};
 
 /// Replays every committed input under `fuzz/corpus/<target>` through `replay`,
-/// which panics on any invariant violation. On failure the offending file is
-/// named: it is the exact libFuzzer reproducer for
-/// `cargo +nightly fuzz run <target> <file>`.
-fn replay_committed_corpus(target: &str, replay: fn(&[u8])) {
+/// which panics on any invariant violation, and compares two back-to-back
+/// recorded op streams. On failure the offending file is named: it is the exact
+/// libFuzzer reproducer for `cargo +nightly fuzz run <target> <file>`.
+fn replay_committed_corpus(target: &str, replay: fn(&[u8]) -> Vec<OpRecord>) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fuzz/corpus")
         .join(target);
@@ -31,8 +32,22 @@ fn replay_committed_corpus(target: &str, replay: fn(&[u8])) {
             continue;
         }
         let data = std::fs::read(&path).expect("read corpus file");
-        if std::panic::catch_unwind(|| replay(&data)).is_err() {
-            panic!("corpus replay failed for {}", path.display());
+        let first = match std::panic::catch_unwind(|| replay(&data)) {
+            Ok(log) => log,
+            Err(_) => panic!("corpus replay failed for {}", path.display()),
+        };
+        let second = match std::panic::catch_unwind(|| replay(&data)) {
+            Ok(log) => log,
+            Err(_) => panic!("second corpus replay failed for {}", path.display()),
+        };
+        if let Some((idx, a, b)) = first_divergence(&first, &second) {
+            panic!(
+                "corpus replay diverged for {} at op {idx}\n  \
+                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+                path.display(),
+                first.len(),
+                second.len(),
+            );
         }
         count += 1;
     }
@@ -41,10 +56,10 @@ fn replay_committed_corpus(target: &str, replay: fn(&[u8])) {
 
 #[test]
 fn replays_committed_corpus() {
-    replay_committed_corpus("concurrent_tx", replay_fuzz_input);
+    replay_committed_corpus("concurrent_tx", record_fuzz_input);
 }
 
 #[test]
 fn replays_committed_cycle_corpus() {
-    replay_committed_corpus("cycle", replay_cycle_input);
+    replay_committed_corpus("cycle", record_cycle_input);
 }
