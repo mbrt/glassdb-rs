@@ -510,6 +510,7 @@ async fn cancelled_tx_future_does_not_block_followups() {
 struct PausingBackend {
     inner: Arc<dyn Backend>,
     trap: Mutex<Option<Trap>>,
+    abort_write_gate: Mutex<Option<AbortWriteGate>>,
 }
 
 struct Trap {
@@ -517,11 +518,17 @@ struct Trap {
     arrived: oneshot::Sender<()>,
 }
 
+struct AbortWriteGate {
+    arrived: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
 impl PausingBackend {
     fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             trap: Mutex::new(None),
+            abort_write_gate: Mutex::new(None),
         })
     }
 
@@ -536,6 +543,16 @@ impl PausingBackend {
         rx
     }
 
+    fn arm_abort_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.abort_write_gate.lock().unwrap() = Some(AbortWriteGate {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        (arrived_rx, release_tx)
+    }
+
     fn take_match(&self, path: &str) -> Option<oneshot::Sender<()>> {
         let mut t = self.trap.lock().unwrap();
         if let Some(trap) = t.as_ref()
@@ -544,6 +561,17 @@ impl PausingBackend {
             return t.take().map(|trap| trap.arrived);
         }
         None
+    }
+
+    fn take_abort_write_gate(&self, path: &str, tags: &Tags) -> Option<AbortWriteGate> {
+        if !path.contains("/_t/")
+            || tags
+                .get("commit-status")
+                .is_none_or(|status| status != "aborted")
+        {
+            return None;
+        }
+        self.abort_write_gate.lock().unwrap().take()
     }
 }
 
@@ -599,6 +627,10 @@ impl Backend for PausingBackend {
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
+        if let Some(gate) = self.take_abort_write_gate(path, &tags) {
+            let _ = gate.arrived.send(());
+            let _ = gate.release.await;
+        }
         if let Some(arrived) = self.take_match(path) {
             let _ = arrived.send(());
             std::future::pending::<()>().await;
@@ -695,4 +727,64 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     assert_eq!(read_int(&v1), 11);
     let v2 = coll.read_strong(b"k2").await.unwrap();
     assert_eq!(read_int(&v2), 12);
+}
+
+/// Clean shutdown must wait for the async abort scheduled when a transaction
+/// future is dropped between `algo.begin` and `algo.end`. This test parks that
+/// abort-log write and verifies `DB::shutdown` remains pending until the write
+/// is released.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_cancelled_tx_async_abort() {
+    use std::time::Duration;
+
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = PausingBackend::new(mem);
+    let db = DB::open("example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"c");
+    coll.create().await.unwrap();
+    coll.write(b"k1", &write_int(1)).await.unwrap();
+    coll.write(b"k2", &write_int(2)).await.unwrap();
+
+    let commit_arrived = backend.arm("/_t/");
+    let (abort_arrived, release_abort) = backend.arm_abort_write_gate();
+
+    let stalled = tokio::spawn({
+        let db = db.clone();
+        let coll = coll.clone();
+        async move {
+            let coll_ref = &coll;
+            db.tx(|tx| async move {
+                tx.write(coll_ref, b"k1", &write_int(42))?;
+                tx.write(coll_ref, b"k2", &write_int(43))
+            })
+            .await
+        }
+    });
+
+    commit_arrived.await.unwrap();
+    stalled.abort();
+    let _ = stalled.await;
+
+    let shutdown = tokio::spawn({
+        let db = db.clone();
+        async move {
+            db.shutdown().await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), abort_arrived)
+        .await
+        .expect("async abort did not start during shutdown")
+        .unwrap();
+
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned before async abort completed"
+        );
+    }
+
+    release_abort.send(()).unwrap();
+    shutdown.await.unwrap();
 }

@@ -61,7 +61,7 @@ struct Inner {
     tl: TLogger,
     // Weak so a `Monitor` clone captured inside a spawned task does not keep
     // the [`Background`] alive across DB shutdown. The single strong owner
-    // is `DbInner._background`.
+    // is `DbInner::background`.
     background: Weak<Background>,
     clock: Clock,
     retry: RetryConfig,

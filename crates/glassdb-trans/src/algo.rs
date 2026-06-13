@@ -485,20 +485,21 @@ impl Algo {
         Ok(())
     }
 
-    /// Best-effort asynchronous abort of `tx_id`, used when a transaction's
+    /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
     /// future is dropped mid-flight so [`Algo::end`] never ran. Synchronous:
     /// schedules a spawned task on the background executor and returns
-    /// immediately. The spawned task writes the Aborted log entry; if it
-    /// fails, the transaction's locks linger until lease expiry, exactly the
-    /// behaviour we'd have without this method. Idempotent (a transaction
-    /// that already finalized is a no-op in `mon.abort_tx`).
+    /// immediately. `DB::shutdown` waits for the spawned task to write the
+    /// Aborted log entry. If it fails, the transaction's locks linger until
+    /// lease expiry, exactly the behaviour we'd have without this method.
+    /// Idempotent (a transaction that already finalized is a no-op in
+    /// `mon.abort_tx`).
     pub fn async_abort(&self, tx_id: &TxId) {
         let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
             return;
         };
         let mon = self.mon.clone();
         let tx_id = tx_id.clone();
-        bg.spawn(async move {
+        bg.spawn_waited(async move {
             let _ = mon.abort_tx(&tx_id).await;
         });
     }
@@ -2148,9 +2149,9 @@ mod tests {
         drop(bg);
     }
 
-    /// `async_abort` is the fire-and-forget abort used when a transaction's
-    /// future is dropped between `begin` and `end`: the tx log entry must end
-    /// up marked Aborted without the caller awaiting anything. We `begin` a
+    /// `async_abort` is scheduled synchronously when a transaction's future is
+    /// dropped between `begin` and `end`: the tx log entry must end up marked
+    /// Aborted without the dropping caller awaiting anything. We `begin` a
     /// transaction (skipping `commit` to leave it unfinalized) and verify the
     /// stored status flips to `Aborted` after the background task runs.
     #[tokio::test]
