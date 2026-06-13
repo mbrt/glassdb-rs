@@ -308,6 +308,70 @@ mod tests {
         assert!(faults > 0, "expected the low-byte tape to inject faults");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn tape_guided_delay_advances_tokio_time() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let opts = FaultOptions {
+            delay_prob: 255,
+            fault_prob: 0,
+            lost_ack_prob: 0,
+            max_delay: Duration::from_millis(10),
+        };
+        // First byte fires the delay roll; the next three encode 5_000_000ns.
+        let fb = FaultBackend::with_tape(mem, vec![0, 0x4c, 0x4b, 0x40], 1, opts);
+        fb.set_active(true);
+
+        let start = tokio::time::Instant::now();
+        let err = fb.read("missing").await.unwrap_err();
+
+        assert_eq!(err, BackendError::NotFound);
+        assert_eq!(start.elapsed(), Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn dropped_request_fails_without_landing() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let opts = FaultOptions {
+            delay_prob: 0,
+            fault_prob: 255,
+            lost_ack_prob: 0,
+            max_delay: Duration::from_millis(0),
+        };
+        let fb = FaultBackend::with_tape(mem.clone(), vec![0], 1, opts);
+        fb.set_active(true);
+
+        let err = fb
+            .write_if_not_exists("p", b"v".to_vec(), Tags::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendError::Unavailable(msg) if msg.contains("dropped request")));
+        assert_eq!(mem.read("p").await.unwrap_err(), BackendError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn lost_ack_reports_unavailable_after_landing() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let opts = FaultOptions {
+            delay_prob: 0,
+            fault_prob: 255,
+            lost_ack_prob: 255,
+            max_delay: Duration::from_millis(0),
+        };
+        // First byte fires the fault roll; second byte chooses lost-ack.
+        let fb = FaultBackend::with_tape(mem.clone(), vec![0, 0], 1, opts);
+        fb.set_active(true);
+
+        let err = fb
+            .write_if_not_exists("p", b"v".to_vec(), Tags::new())
+            .await
+            .unwrap_err();
+        let landed = mem.read("p").await.unwrap();
+
+        assert!(matches!(err, BackendError::Unavailable(msg) if msg.contains("lost ack")));
+        assert_eq!(landed.contents, b"v");
+    }
+
     #[tokio::test]
     async fn outage_downs_whole_transport_then_heals() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());

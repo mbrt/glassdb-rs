@@ -100,6 +100,72 @@ fn record_once_faults(seed: u64, workload: &Workload, faults: FaultConfig) -> Ve
     record_faults_with_tape(seed, workload, faults, fault_tape(seed))
 }
 
+/// Records with caller-provided schedule and fault tapes, for boundary cases
+/// like tape exhaustion that the seed-expanded helper intentionally avoids.
+fn record_with_tapes(
+    seed: u64,
+    workload: &Workload,
+    faults: FaultConfig,
+    schedule_tape: Vec<u8>,
+    fault_tape: Vec<u8>,
+) -> Vec<OpRecord> {
+    let w = workload.clone();
+    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
+        run_and_record_with_faults(&w, faults, seed, fault_tape).await
+    });
+    let recorded = log.lock().unwrap();
+    recorded.clone()
+}
+
+/// A boundary-heavy workload: maximum generated client/op shape, with frequent
+/// read-only transactions mixed into contended writes.
+fn max_read_heavy_workload() -> Workload {
+    Workload {
+        clients: vec![
+            vec![
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::Rmw(0),
+                Op::ReadOnly(vec![0, 2]),
+                Op::MultiRmw(0, 1),
+                Op::ReadOnly(vec![1, 3]),
+                Op::Rmw(2),
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::MultiRmw(2, 3),
+            ],
+            vec![
+                Op::ReadOnly(vec![3, 2, 1, 0]),
+                Op::Rmw(1),
+                Op::ReadOnly(vec![1, 2]),
+                Op::MultiRmw(1, 2),
+                Op::ReadOnly(vec![0, 3]),
+                Op::Rmw(3),
+                Op::ReadOnly(vec![2, 3]),
+                Op::MultiRmw(0, 3),
+            ],
+            vec![
+                Op::ReadOnly(vec![]),
+                Op::MultiRmw(2, 0),
+                Op::ReadOnly(vec![0]),
+                Op::Rmw(2),
+                Op::ReadOnly(vec![1, 2, 3]),
+                Op::MultiRmw(3, 1),
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::Rmw(0),
+            ],
+            vec![
+                Op::ReadOnly(vec![2]),
+                Op::Rmw(3),
+                Op::ReadOnly(vec![0, 3]),
+                Op::MultiRmw(0, 2),
+                Op::ReadOnly(vec![1]),
+                Op::Rmw(1),
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::MultiRmw(1, 3),
+            ],
+        ],
+    }
+}
+
 #[test]
 fn op_stream_is_byte_identical_across_runs() {
     let workload = contended_workload();
@@ -203,6 +269,28 @@ fn fault_tape_guides_the_fault_schedule() {
         "the fault tape changed no op stream; the fault schedule may not be \
          tape-guided"
     );
+}
+
+#[test]
+fn boundary_tapes_replay_deterministically() {
+    let workload = max_read_heavy_workload();
+    let faults = FaultConfig::enabled(128);
+    for (schedule, fault_tape) in [
+        (Vec::new(), Vec::new()),
+        (vec![0], Vec::new()),
+        (vec![255, 1], vec![0; 16]),
+    ] {
+        let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
+        let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
+        if let Some((idx, a, b)) = first_divergence(&first, &second) {
+            panic!(
+                "boundary tape replay diverged at index {idx}\n  \
+                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+                first.len(),
+                second.len(),
+            );
+        }
+    }
 }
 
 #[test]

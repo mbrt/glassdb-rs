@@ -32,6 +32,8 @@ use std::time::Duration;
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
+#[cfg(sim)]
+use glassdb_backend::middleware::OpRecord;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
 use tokio_util::sync::CancellationToken;
@@ -681,6 +683,25 @@ pub fn replay_fuzz_input(data: &[u8]) {
     });
 }
 
+/// Decodes one libFuzzer input exactly as [`replay_fuzz_input`] does, runs it,
+/// and returns the recorded backend op stream. Used by corpus replay tests to
+/// prove committed inputs replay byte-for-byte, not just invariant-cleanly.
+#[cfg(sim)]
+pub fn record_fuzz_input(data: &[u8]) -> Vec<OpRecord> {
+    let mut u = Unstructured::new(data);
+    let seed: u64 = u.arbitrary().unwrap_or(0);
+    let workload = Workload::arbitrary(&mut u).unwrap_or_default();
+    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
+    let rest = u.take_rest();
+    let mid = rest.len() / 2;
+    let (schedule_tape, fault_tape) = (rest[..mid].to_vec(), rest[mid..].to_vec());
+    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
+        let log = run_and_record_with_faults(&workload, faults, seed, fault_tape).await;
+        let recorded = log.lock().unwrap();
+        recorded.clone()
+    })
+}
+
 /// Runs `workload` once under a PCT schedule seeded by `seed`, asserting the
 /// serializability bound. Panics on any violation.
 #[cfg(sim)]
@@ -1089,6 +1110,25 @@ pub fn replay_cycle_input(data: &[u8]) {
     rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
         run_cycle_and_assert_with_faults(workload, faults, seed, fault_tape).await
     });
+}
+
+/// Decodes one Cycle libFuzzer input exactly as [`replay_cycle_input`] does,
+/// runs it, and returns the recorded backend op stream for byte-identical
+/// corpus replay checks.
+#[cfg(sim)]
+pub fn record_cycle_input(data: &[u8]) -> Vec<OpRecord> {
+    let mut u = Unstructured::new(data);
+    let seed: u64 = u.arbitrary().unwrap_or(0);
+    let workload = CycleWorkload::arbitrary(&mut u).unwrap_or_default();
+    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
+    let rest = u.take_rest();
+    let mid = rest.len() / 2;
+    let (schedule_tape, fault_tape) = (rest[..mid].to_vec(), rest[mid..].to_vec());
+    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
+        let log = run_cycle_and_record_with_faults(&workload, faults, seed, fault_tape).await;
+        let recorded = log.lock().unwrap();
+        recorded.clone()
+    })
 }
 
 /// Runs a Cycle `workload` once under a PCT schedule seeded by `seed`, asserting

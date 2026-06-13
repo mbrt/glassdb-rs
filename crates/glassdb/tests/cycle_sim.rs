@@ -82,6 +82,38 @@ fn record_faults_with_tape(
     recorded.clone()
 }
 
+/// Records with caller-provided schedule and fault tapes, for boundary cases
+/// like tape exhaustion that the seed-expanded helper intentionally avoids.
+fn record_with_tapes(
+    seed: u64,
+    workload: &CycleWorkload,
+    faults: FaultConfig,
+    schedule_tape: Vec<u8>,
+    fault_tape: Vec<u8>,
+) -> Vec<OpRecord> {
+    let w = workload.clone();
+    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
+        run_cycle_and_record_with_faults(&w, faults, seed, fault_tape).await
+    });
+    let recorded = log.lock().unwrap();
+    recorded.clone()
+}
+
+/// Boundary-heavy Cycle workload: larger ring, maximum generated client shape,
+/// and read-only snapshots enabled to exercise concurrent reads.
+fn max_snapshot_cycle() -> CycleWorkload {
+    CycleWorkload {
+        node_count: 12,
+        clients: vec![
+            vec![0, 2, 4, 6, 8, 10, 1, 3],
+            vec![1, 3, 5, 7, 9, 11, 2, 4],
+            vec![2, 4, 6, 8, 10, 0, 3, 5],
+            vec![3, 5, 7, 9, 11, 1, 4, 6],
+        ],
+        snapshot_reads: 8,
+    }
+}
+
 #[test]
 fn op_stream_is_byte_identical_across_runs() {
     let workload = contended_cycle();
@@ -167,6 +199,28 @@ fn ring_holds_under_crash_restart_and_outages() {
         if let Some((idx, a, b)) = first_divergence(&first, &second) {
             panic!(
                 "seed {seed}: recovery op stream diverged at index {idx}\n  \
+                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+                first.len(),
+                second.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn boundary_tapes_replay_deterministically() {
+    let workload = max_snapshot_cycle();
+    let faults = FaultConfig::enabled(128);
+    for (schedule, fault_tape) in [
+        (Vec::new(), Vec::new()),
+        (vec![0], Vec::new()),
+        (vec![255, 1], vec![0; 16]),
+    ] {
+        let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
+        let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
+        if let Some((idx, a, b)) = first_divergence(&first, &second) {
+            panic!(
+                "cycle boundary tape replay diverged at index {idx}\n  \
                  run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
                 first.len(),
                 second.len(),
