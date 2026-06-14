@@ -117,44 +117,6 @@ pub fn to_transaction(suffix: &str) -> Result<TxId, PathError> {
     Ok(TxId::from_bytes(decode(Type::Transaction, suffix)?))
 }
 
-/// Borrowed components of a storage path. Unlike [`ParseResult`], `suffix` is
-/// the protobuf-style suffix (the type marker plus base64 payload, e.g.
-/// `_k/<b64>`) — i.e. everything after the collection prefix — so callers that
-/// need that form avoid both the parse allocations and a type/suffix re-join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParseRef<'a> {
-    pub prefix: &'a str,
-    pub suffix: &'a str,
-    pub typ: Type,
-}
-
-/// Like [`parse`], but borrows from `p` and returns the protobuf-style suffix
-/// (type marker + base64) without allocating. Used on the hot log-marshaling
-/// path. The base64 alphabet contains no `/` or `.`, so the borrowed suffix is
-/// byte-identical to `gopath::join([type, base64])`.
-pub fn parse_ref(p: &str) -> Result<ParseRef<'_>, PathError> {
-    if is_collection_info(p) {
-        return Ok(ParseRef {
-            prefix: &p[..p.len() - 3],
-            suffix: "",
-            typ: Type::CollectionInfo,
-        });
-    }
-    let (prefix_idx, type_idx) =
-        path_parts_indexes(p).ok_or_else(|| PathError::Parse(p.to_string()))?;
-    let typ = match &p[prefix_idx + 1..type_idx] {
-        "_k" => Type::Key,
-        "_c" => Type::Collection,
-        "_t" => Type::Transaction,
-        _ => Type::Unknown,
-    };
-    Ok(ParseRef {
-        prefix: &p[..prefix_idx],
-        suffix: &p[prefix_idx + 1..],
-        typ,
-    })
-}
-
 /// Splits a storage path into its prefix, type, and suffix components.
 pub fn parse(p: &str) -> Result<ParseResult, PathError> {
     if is_collection_info(p) {
@@ -196,17 +158,7 @@ fn typed_prefix(prefix: &str, t: Type) -> String {
 }
 
 fn prefix_encode(prefix: &str, category: Type, a: &[u8]) -> String {
-    // Build the `prefix/type/base64(a)` path in a single allocation: encode the
-    // payload straight into the output buffer instead of through an intermediate
-    // base64 string. This runs on every key/collection/transaction path.
-    let cat = category.as_str();
-    let mut s = String::with_capacity(prefix.len() + cat.len() + 2 + a.len().div_ceil(3) * 4);
-    s.push_str(prefix);
-    s.push('/');
-    s.push_str(cat);
-    s.push('/');
-    base64::encode_into(a, &mut s);
-    s
+    format!("{}/{}/{}", prefix, category.as_str(), base64::encode(a))
 }
 
 fn decode(category: Type, suffix: &str) -> Result<Vec<u8>, PathError> {

@@ -10,12 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use glassdb_backend::{self as backend, Metadata, LAST_WRITER_TAG};
+use glassdb_backend::{self as backend, Metadata};
 use glassdb_concurr::{rt, Background, CancelToken, Ctx};
 use glassdb_data::{paths, TxId};
 use glassdb_storage::{
-    tag_matches_tid, tags_lock_info, tags_lock_type, Global, Local, LockType, PathLock, TValue,
-    TxLog, TxWrite, Version,
+    tags_lock_info, Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version,
 };
 
 use crate::error::TransError;
@@ -182,56 +181,40 @@ impl ValidationState {
 }
 
 fn init_validation(h: &Handle) -> ValidationState {
-    // `collect_accesses` emits reads and writes already sorted and unique by
-    // path (see ADR-008), so merge the two sorted runs directly into a
-    // path-sorted `PathState` list. This avoids a per-transaction `HashMap`
-    // allocation (plus its hashing and the separate final sort) while keeping
-    // the same deterministic, deduplicated validation order: a key that is both
-    // read and written yields a single merged entry.
-    let reads = &h.data.reads;
-    let writes = &h.data.writes;
-    let mut paths: Vec<PathState> = Vec::with_capacity(reads.len() + writes.len());
-    let (mut i, mut j) = (0, 0);
-    loop {
-        let (take_read, take_write) = match (reads.get(i), writes.get(j)) {
-            (Some(r), Some(w)) => match r.path.cmp(&w.path) {
-                std::cmp::Ordering::Less => (true, false),
-                std::cmp::Ordering::Greater => (false, true),
-                std::cmp::Ordering::Equal => (true, true),
-            },
-            (Some(_), None) => (true, false),
-            (None, Some(_)) => (false, true),
-            (None, None) => break,
-        };
-        let path = if take_read {
-            reads[i].path.clone()
-        } else {
-            writes[j].path.clone()
-        };
-        let mut ps = PathState {
-            path,
+    let mut m: HashMap<Arc<str>, PathState> = HashMap::new();
+    for r in &h.data.reads {
+        let e = m.entry(r.path.clone()).or_insert_with(|| PathState {
+            path: r.path.clone(),
             read: false,
             write: false,
             not_found: false,
             delete: false,
             read_version: Version::default(),
             result: VResult::Unknown,
-        };
-        if take_read {
-            let r = &reads[i];
-            ps.read = true;
-            ps.read_version = r.version.to_storage_version();
-            ps.not_found = !r.found;
-            i += 1;
-        }
-        if take_write {
-            let w = &writes[j];
-            ps.write = true;
-            ps.delete = w.delete;
-            j += 1;
-        }
-        paths.push(ps);
+        });
+        e.read = true;
+        e.read_version = r.version.to_storage_version();
+        e.not_found = !r.found;
     }
+    for w in &h.data.writes {
+        let e = m.entry(w.path.clone()).or_insert_with(|| PathState {
+            path: w.path.clone(),
+            read: false,
+            write: false,
+            not_found: false,
+            delete: false,
+            read_version: Version::default(),
+            result: VResult::Unknown,
+        });
+        e.write = true;
+        e.delete = w.delete;
+    }
+    // Sort by path so the validation order is independent of `HashMap`'s
+    // randomized iteration order. Under the madsim simulator this makes the
+    // sequence of backend operations a deterministic function of the seed (and
+    // is harmless in production).
+    let mut paths: Vec<PathState> = m.into_values().collect();
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
     ValidationState { paths }
 }
 
@@ -364,11 +347,11 @@ impl Algo {
     /// (timestamp) while minting a fresh log identity. Reusing the original
     /// priority prevents a restarted transaction from being starved by an
     /// endless stream of younger peers.
-    pub fn rebegin(&self, old: Handle) -> Handle {
+    pub fn rebegin(&self, old: &Handle, d: Data) -> Handle {
         Handle {
-            id: old.id.renew(),
-            data: old.data,
+            data: d,
             status: Status::New,
+            id: old.id.renew(),
             require_locks: false,
             serial_locking: false,
         }
@@ -400,7 +383,8 @@ impl Algo {
             }
         }
 
-        if let Err(e) = self.commit_writes(ctx, &tx.data.writes, &tx.id).await {
+        let writes = tx.data.writes.clone();
+        if let Err(e) = self.commit_writes(ctx, &writes, &tx.id).await {
             if matches!(e, TransError::AlreadyFinalized) {
                 // The log was already finalized as aborted: we were wounded (or
                 // reclaimed as expired) between validation and commit.
@@ -635,25 +619,17 @@ impl Algo {
             }
             Err(e) => return Err(e.into()),
         };
-        // Unlocked/read-locked validation only needs to confirm the last writer
-        // is unchanged, so avoid building the full `LockInfo` (which decodes the
-        // last-writer tag into a freshly allocated `TxId`): read just the lock
-        // type and compare the tag bytes against the recorded writer in place.
-        let typ = tags_lock_type(&meta.tags)?;
-        if typ == LockType::None || typ == LockType::Read {
-            let unchanged = tag_matches_tid(
-                meta.tags.get(LAST_WRITER_TAG).map(String::as_str),
-                &item.read_version.writer,
-            );
-            item.result = if unchanged {
-                VResult::Ok
-            } else {
-                VResult::Retry
-            };
-            return Ok(());
-        }
         let read_from = item.read_version.writer.clone();
         let li = tags_lock_info(&meta.tags)?;
+
+        if li.typ == LockType::None || li.typ == LockType::Read {
+            if li.last_writer != read_from {
+                item.result = VResult::Retry;
+            } else {
+                item.result = VResult::Ok;
+            }
+            return Ok(());
+        }
         self.validate_locked_read(ctx, item, &li, &read_from).await
     }
 
@@ -784,13 +760,12 @@ impl Algo {
             }
             Err(e) => return Err(e.into()),
         };
-        // The common outcome is "still unlocked / read-locked -> retry", which
-        // needs only the lock type, so skip allocating the full `LockInfo` here.
-        if matches!(tags_lock_type(&meta.tags)?, LockType::None | LockType::Read) {
+        let li = tags_lock_info(&meta.tags)?;
+
+        if li.typ == LockType::None || li.typ == LockType::Read {
             item.result = VResult::Retry;
             return Ok(());
         }
-        let li = tags_lock_info(&meta.tags)?;
         if li.locked_by.len() != 1 {
             return Err(TransError::Other(format!(
                 "bad lock: {:?} with {} lockers",
@@ -1313,20 +1288,6 @@ impl Algo {
         let mut outs: Vec<Option<T>> = (0..num).map(|_| None).collect();
         if num == 0 {
             return (outs, Ok(()));
-        }
-        if num == 1 {
-            // Single task: there are no siblings to cancel on error, so skip the
-            // child cancel token and the `buffer_unordered` stream machinery
-            // (both allocate). This is the common case for single-key
-            // transactions and keeps their per-tx allocation low.
-            let r = f(ctx.clone(), 0).await;
-            return match r {
-                Ok(v) => {
-                    outs[0] = Some(v);
-                    (outs, Ok(()))
-                }
-                Err(e) => (outs, Err(e)),
-            };
         }
         let (child_ctx, token) = ctx.child_cancel();
         let f = &f;

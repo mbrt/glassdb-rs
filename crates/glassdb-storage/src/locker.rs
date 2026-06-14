@@ -349,57 +349,22 @@ fn handle_no_ops(curr: &LockInfo, mut ops: LockOps) -> LockOps {
     ops
 }
 
-/// Parses just the lock-type tag, without decoding the lockers/last-writer.
-///
-/// Read validation usually only needs the lock type (and, for unlocked/read
-/// state, a single last-writer equality check via [`tag_matches_tid`]), so this
-/// avoids building the full [`LockInfo`] - which would decode the last-writer
-/// tag into a freshly allocated [`TxId`] on every validated read.
-pub fn tags_lock_type(tags: &Tags) -> Result<LockType, StorageError> {
-    match tags.get(LOCK_TYPE_TAG) {
-        None => Ok(LockType::None),
-        Some(v) => match v.as_str() {
-            LOCK_TAG_READ => Ok(LockType::Read),
-            LOCK_TAG_WRITE => Ok(LockType::Write),
-            LOCK_TAG_CREATE => Ok(LockType::Create),
-            LOCK_TAG_NONE | "" => Ok(LockType::None),
-            other => Err(StorageError::Other(format!("unknown lock type {other:?}"))),
-        },
-    }
-}
-
-/// Reports whether `tag` decodes to the same bytes as `tid`, without allocating
-/// a [`TxId`]. A missing or malformed tag is treated as the empty id (matching
-/// [`last_writer_from_tags`], which yields the default id in those cases), so it
-/// matches an empty `tid`.
-pub fn tag_matches_tid(tag: Option<&str>, tid: &TxId) -> bool {
-    match tag {
-        None => tid.is_empty(),
-        Some(s) => {
-            let eng = base64::engine::general_purpose::URL_SAFE;
-            let mut buf = [0u8; 64];
-            if s.len() / 4 * 3 + 3 <= buf.len() {
-                if let Ok(n) = eng.decode_slice(s, &mut buf) {
-                    return buf[..n] == *tid.as_bytes();
-                }
-            }
-            // Long or malformed tag: fall back to the allocating decode so the
-            // comparison stays exact for any id length.
-            match eng.decode(s) {
-                Ok(bytes) => bytes == *tid.as_bytes(),
-                Err(_) => tid.is_empty(),
-            }
-        }
-    }
-}
-
 /// Parses lock-managing tags into a [`LockInfo`].
 pub fn tags_lock_info(tags: &Tags) -> Result<LockInfo, StorageError> {
     let mut res = LockInfo {
-        typ: tags_lock_type(tags)?,
+        typ: LockType::None,
         ..Default::default()
     };
 
+    if let Some(v) = tags.get(LOCK_TYPE_TAG) {
+        res.typ = match v.as_str() {
+            LOCK_TAG_READ => LockType::Read,
+            LOCK_TAG_WRITE => LockType::Write,
+            LOCK_TAG_CREATE => LockType::Create,
+            LOCK_TAG_NONE | "" => LockType::None,
+            other => return Err(StorageError::Other(format!("unknown lock type {other:?}"))),
+        };
+    }
     if let Some(v) = tags.get(LOCKED_BY_TAG) {
         if !v.is_empty() {
             for lt in v.split(',') {
@@ -425,39 +390,13 @@ pub fn last_writer_from_tags(tags: &Tags) -> TxId {
 }
 
 fn tag_to_tid(a: &str) -> Result<TxId, base64::DecodeError> {
-    let eng = base64::engine::general_purpose::URL_SAFE;
-    // Decoding straight into a stack buffer avoids the `Vec` that `decode`
-    // allocates (then `from_bytes` copies again into the `Arc`). This runs once
-    // per validated read / lock-info parse, so it is hot on the read and lock
-    // paths. Production ids are 16 bytes (24 b64 chars); the buffer covers any
-    // realistic id, with a heap fallback for the arbitrary-length case the API
-    // permits (e.g. fuzzer-supplied tags).
-    let mut buf = [0u8; 64];
-    if a.len() / 4 * 3 + 3 <= buf.len() {
-        match eng.decode_slice(a, &mut buf) {
-            Ok(n) => return Ok(TxId::from_slice(&buf[..n])),
-            Err(base64::DecodeSliceError::DecodeError(e)) => return Err(e),
-            // Buffer too small for this (unexpectedly long) id: fall through.
-            Err(base64::DecodeSliceError::OutputSliceTooSmall) => {}
-        }
-    }
-    eng.decode(a).map(TxId::from_bytes)
+    base64::engine::general_purpose::URL_SAFE
+        .decode(a)
+        .map(TxId::from_bytes)
 }
 
 fn tid_to_tag(t: &TxId) -> String {
     base64::engine::general_purpose::URL_SAFE.encode(t.as_bytes())
-}
-
-/// Encodes the `locked-by` tag value (comma-joined base64 ids). The common
-/// single-locker case (a transaction taking a lock) produces the one base64
-/// string directly, and the empty case (an unlock) produces an empty string,
-/// both without the intermediate `Vec<String>` and `join` allocations.
-fn encode_lockers(lockers: &[TxId]) -> String {
-    match lockers {
-        [] => String::new(),
-        [one] => tid_to_tag(one),
-        many => many.iter().map(tid_to_tag).collect::<Vec<_>>().join(","),
-    }
 }
 
 /// Applies lock updates to storage objects via conditional writes.
@@ -532,7 +471,15 @@ impl Locker {
 
         let mut new_tags = Tags::new();
         new_tags.insert(LOCK_TYPE_TAG.to_string(), ltype.to_string());
-        new_tags.insert(LOCKED_BY_TAG.to_string(), encode_lockers(&update.lockers));
+        new_tags.insert(
+            LOCKED_BY_TAG.to_string(),
+            update
+                .lockers
+                .iter()
+                .map(tid_to_tag)
+                .collect::<Vec<String>>()
+                .join(","),
+        );
 
         if update.typ == LockType::Create {
             self.global

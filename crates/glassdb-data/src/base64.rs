@@ -42,42 +42,32 @@ impl std::error::Error for DecodeError {}
 
 /// Encodes `input` into the custom, order-preserving, unpadded base64 form.
 pub fn encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    encode_into(input, &mut out);
-    out
-}
-
-/// Appends the custom base64 encoding of `input` to `out`, without allocating an
-/// intermediate buffer. Used to build storage paths (`prefix/type/base64`) in a
-/// single allocation on the hot read/write/commit paths.
-pub fn encode_into(input: &[u8], out: &mut String) {
-    out.reserve(input.len().div_ceil(3) * 4);
-    // Every alphabet byte is ASCII, so pushing it as a `char` appends exactly one
-    // byte and keeps `out` valid UTF-8.
-    let mut push = |idx: u32| out.push(ALPHABET[(idx & 63) as usize] as char);
+    let mut out: Vec<u8> = Vec::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
         let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
-        push(n >> 18);
-        push(n >> 12);
-        push(n >> 6);
-        push(n);
+        out.push(ALPHABET[((n >> 18) & 63) as usize]);
+        out.push(ALPHABET[((n >> 12) & 63) as usize]);
+        out.push(ALPHABET[((n >> 6) & 63) as usize]);
+        out.push(ALPHABET[(n & 63) as usize]);
         i += 3;
     }
     match input.len() - i {
         1 => {
             let n = (input[i] as u32) << 16;
-            push(n >> 18);
-            push(n >> 12);
+            out.push(ALPHABET[((n >> 18) & 63) as usize]);
+            out.push(ALPHABET[((n >> 12) & 63) as usize]);
         }
         2 => {
             let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
-            push(n >> 18);
-            push(n >> 12);
-            push(n >> 6);
+            out.push(ALPHABET[((n >> 18) & 63) as usize]);
+            out.push(ALPHABET[((n >> 12) & 63) as usize]);
+            out.push(ALPHABET[((n >> 6) & 63) as usize]);
         }
         _ => {}
     }
+    // SAFETY: every pushed byte comes from ALPHABET, which is ASCII.
+    String::from_utf8(out).expect("alphabet is ascii")
 }
 
 /// Decodes a string produced by [`encode`].
