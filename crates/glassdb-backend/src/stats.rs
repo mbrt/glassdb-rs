@@ -2,7 +2,7 @@
 //! `statsBackend` in `stats.go`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
@@ -11,21 +11,21 @@ use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId}
 /// Snapshot of backend operation counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackendStats {
-    pub meta_reads: i64,
-    pub meta_writes: i64,
-    pub obj_reads: i64,
-    pub obj_writes: i64,
-    pub obj_lists: i64,
+    pub meta_reads: u64,
+    pub meta_writes: u64,
+    pub obj_reads: u64,
+    pub obj_writes: u64,
+    pub obj_lists: u64,
 }
 
 /// Wraps a backend and counts the operations performed on it.
 pub struct StatsBackend {
     inner: Arc<dyn Backend>,
-    meta_reads: AtomicI64,
-    meta_writes: AtomicI64,
-    obj_reads: AtomicI64,
-    obj_writes: AtomicI64,
-    obj_lists: AtomicI64,
+    meta_reads: AtomicU64,
+    meta_writes: AtomicU64,
+    obj_reads: AtomicU64,
+    obj_writes: AtomicU64,
+    obj_lists: AtomicU64,
 }
 
 impl StatsBackend {
@@ -33,11 +33,11 @@ impl StatsBackend {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
         StatsBackend {
             inner,
-            meta_reads: AtomicI64::new(0),
-            meta_writes: AtomicI64::new(0),
-            obj_reads: AtomicI64::new(0),
-            obj_writes: AtomicI64::new(0),
-            obj_lists: AtomicI64::new(0),
+            meta_reads: AtomicU64::new(0),
+            meta_writes: AtomicU64::new(0),
+            obj_reads: AtomicU64::new(0),
+            obj_writes: AtomicU64::new(0),
+            obj_lists: AtomicU64::new(0),
         }
     }
 

@@ -101,7 +101,7 @@ impl Reader {
             // its value reaches the object (the value still lives in its log).
             // Resolve through the recorded last writer; with none recorded the
             // empty value is genuinely committed.
-            if info.last_writer.is_empty() {
+            if info.last_writer.is_unset() {
                 return Ok(rv);
             }
             info.last_writer.clone()
@@ -134,7 +134,7 @@ impl Reader {
             return Err(BackendError::NotFound.into());
         };
 
-        if writer.is_empty() {
+        if writer.is_unset() {
             // No prior committed value (e.g. a pending create): not found.
             return Err(BackendError::NotFound.into());
         }

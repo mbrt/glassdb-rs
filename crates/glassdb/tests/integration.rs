@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::{BackendError, Metadata, ReadReply, Tags, Version, WriterId};
-use glassdb::{Backend, Collection, DB, Error, Tx};
+use glassdb::{Backend, Collection, Database, Error, Transaction};
 use tokio::sync::oneshot;
 
-async fn init_db(b: Arc<dyn Backend>) -> DB {
-    DB::open("example", b).await.unwrap()
+async fn init_db(b: Arc<dyn Backend>) -> Database {
+    Database::open("example", b).await.unwrap()
 }
 
 fn mem() -> Arc<dyn Backend> {
@@ -27,7 +27,7 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_from_tx(tx: &Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         // Treat a missing value as zero (i.e. initialize it).
@@ -36,7 +36,7 @@ async fn read_int_from_tx(tx: &Tx, c: &Collection, k: &[u8]) -> Result<i64, Erro
     }
 }
 
-async fn rmw(db: &DB, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
+async fn rmw(db: &Database, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
     for _ in 0..iters {
         db.tx(|tx| async move {
             let num = read_int_from_tx(&tx, coll, key).await?;
@@ -57,7 +57,7 @@ async fn rw() {
     coll.create().await.unwrap();
 
     coll.write(key, val).await.unwrap();
-    let buf = coll.read_strong(key).await.unwrap();
+    let buf = coll.read(key).await.unwrap();
     assert_eq!(buf, val);
 
     let stats = db.stats();
@@ -78,7 +78,7 @@ async fn delete() {
     coll.write(key, val).await.unwrap();
     coll.delete(key).await.unwrap();
 
-    let err = coll.read_strong(key).await.unwrap_err();
+    let err = coll.read(key).await.unwrap_err();
     assert!(err.is_not_found(), "expected not-found, got {err:?}");
 
     let stats = db.stats();
@@ -100,7 +100,7 @@ async fn read_from_another() {
     db1.collection(coll).create().await.unwrap();
     db1.collection(coll).write(key, val).await.unwrap();
 
-    let buf = db2.collection(coll).read_strong(key).await.unwrap();
+    let buf = db2.collection(coll).read(key).await.unwrap();
     assert_eq!(buf, val);
 }
 
@@ -166,12 +166,12 @@ async fn rmw_single() {
     assert_eq!(stats.tx_writes, 30);
     assert_eq!(stats.tx_retries, 0);
 
-    let val = coll.read_strong(key).await.unwrap();
+    let val = coll.read(key).await.unwrap();
     assert_eq!(read_int(&val), 30);
 }
 
 async fn multiple_rmw(
-    db: &DB,
+    db: &Database,
     coll: &Collection,
     key1: &[u8],
     key2: &[u8],
@@ -205,7 +205,7 @@ async fn concurrent_rmw() {
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2.collection(coll_name).read_strong(key).await.unwrap();
+    let val = db2.collection(coll_name).read(key).await.unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
@@ -219,7 +219,7 @@ async fn multiple_rmw_single() {
     coll.create().await.unwrap();
     multiple_rmw(&db, &coll, key1, key2, 30).await.unwrap();
 
-    let val = coll.read_strong(key1).await.unwrap();
+    let val = coll.read(key1).await.unwrap();
     assert_eq!(read_int(&val), 30);
 
     let stats = db.stats();
@@ -247,14 +247,14 @@ async fn concurrent_multiple_rmw() {
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2.collection(coll_name).read_strong(key1).await.unwrap();
+    let val = db2.collection(coll_name).read(key1).await.unwrap();
     assert_eq!(read_int(&val), 60);
-    let val = db2.collection(coll_name).read_strong(key2).await.unwrap();
+    let val = db2.collection(coll_name).read(key2).await.unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
 // Reads many keys concurrently within a single transaction (the parallelism
-// `read_multi` used to provide), now via `join_all` over `Tx::read`.
+// `read_multi` used to provide), now via `join_all` over `Transaction::read`.
 #[tokio::test(start_paused = true)]
 async fn concurrent_reads() {
     use futures::future::join_all;
@@ -295,13 +295,13 @@ async fn concurrent_reads() {
     assert_eq!(stats.tx_retries, 0);
 
     for k in keys {
-        let b = coll.read_strong(k).await.unwrap();
+        let b = coll.read(k).await.unwrap();
         assert_eq!(read_int(&b), 30);
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_weak() {
+async fn read_stale() {
     use std::time::Duration;
 
     let db = init_db(mem()).await;
@@ -323,7 +323,7 @@ async fn read_weak() {
         .await
         .unwrap();
 
-        let val = coll.read_weak(key, staleness).await.unwrap();
+        let val = coll.read_stale(key, staleness).await.unwrap();
         let read_num = read_int(&val);
         assert!(read_num <= i, "weak read {read_num} should be <= {i}");
         if i >= max_behind {
@@ -338,7 +338,7 @@ async fn read_weak() {
     assert_eq!(stats.tx_retries, 0);
 }
 
-// `DB::diagnostics` smoke test: on a fresh DB the snapshot is empty, and after
+// `Database::diagnostics` smoke test: on a fresh Database the snapshot is empty, and after
 // running a transaction that acquires locks the snapshot exposes the
 // post-commit state in a structured form that callers can render via the
 // `Display` impl. (Locks linger briefly while the background cleanup task
@@ -348,7 +348,7 @@ async fn read_weak() {
 async fn diagnostics_returns_typed_snapshot() {
     let db = init_db(mem()).await;
 
-    // A fresh DB has no coordination state.
+    // A fresh Database has no coordination state.
     let idle = db.diagnostics();
     assert!(idle.locker_dedup.is_empty(), "fresh dedup: {idle:?}");
     assert!(idle.transactions.is_empty(), "fresh tx locks: {idle:?}");
@@ -393,12 +393,12 @@ async fn list_keys() {
     .await
     .unwrap();
 
-    let mut iter = coll.keys().await.unwrap();
-    let mut got: Vec<Vec<u8>> = Vec::new();
-    for k in iter.by_ref() {
-        got.push(k);
-    }
-    assert!(iter.err().is_none(), "iter error: {:?}", iter.err());
+    let got: Vec<Vec<u8>> = coll
+        .keys()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
 
     assert_eq!(got.len(), keys.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
@@ -425,12 +425,12 @@ async fn list_collections() {
         coll.collection(c).create().await.unwrap();
     }
 
-    let mut iter = coll.collections().await.unwrap();
-    let mut got: Vec<Vec<u8>> = Vec::new();
-    for c in iter.by_ref() {
-        got.push(c);
-    }
-    assert!(iter.err().is_none(), "iter error: {:?}", iter.err());
+    let got: Vec<Vec<u8>> = coll
+        .collections()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
 
     assert_eq!(got.len(), colls.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
@@ -446,7 +446,7 @@ async fn list_collections() {
 async fn builder_custom_options() {
     use std::time::Duration;
 
-    let db = DB::builder("example", mem())
+    let db = Database::builder("example", mem())
         .cache_size(8 * 1024 * 1024)
         .retry_initial_interval(Duration::from_millis(10))
         .retry_max_interval(Duration::from_millis(100))
@@ -457,11 +457,11 @@ async fn builder_custom_options() {
     let coll = db.collection(b"demo-coll");
     coll.create().await.unwrap();
     coll.write(b"key1", b"value1").await.unwrap();
-    let buf = coll.read_strong(b"key1").await.unwrap();
+    let buf = coll.read(b"key1").await.unwrap();
     assert_eq!(buf, b"value1");
 }
 
-/// Dropping a `DB::tx` future mid-flight (e.g. via `tokio::time::timeout`)
+/// Dropping a `Database::tx` future mid-flight (e.g. via `tokio::time::timeout`)
 /// must not corrupt anything and must not leave the database unusable. The
 /// next transaction observes the committed state (or the absence of one) and
 /// completes promptly, exercising the `TxAbortGuard` cleanup hook end-to-end.
@@ -476,7 +476,7 @@ async fn cancelled_tx_future_does_not_block_followups() {
 
     let coll_ref = &coll;
     // The closure stages a write and then blocks forever; the outer timeout
-    // drops the entire `DB::tx` future. With the `Tx`-drop safety net in
+    // drops the entire `Database::tx` future. With the `Tx`-drop safety net in
     // place this releases all attached state synchronously and schedules an
     // async abort of whatever engine-side tx may have been registered.
     let r = tokio::time::timeout(Duration::from_millis(50), async {
@@ -492,12 +492,12 @@ async fn cancelled_tx_future_does_not_block_followups() {
     assert!(r.is_err(), "expected timeout, got {r:?}");
 
     // The cancelled tx never committed, so the original value still wins.
-    let val = coll.read_strong(b"k").await.unwrap();
+    let val = coll.read(b"k").await.unwrap();
     assert_eq!(read_int(&val), 1);
 
     // A normal RMW still runs and commits without contention.
     rmw(&db, &coll, b"k", 1).await.unwrap();
-    let val = coll.read_strong(b"k").await.unwrap();
+    let val = coll.read(b"k").await.unwrap();
     assert_eq!(read_int(&val), 2);
 }
 
@@ -652,7 +652,7 @@ impl Backend for PausingBackend {
     }
 }
 
-/// When a `DB::tx` future is dropped *during* its commit (after
+/// When a `Database::tx` future is dropped *during* its commit (after
 /// `algo.begin` registered the engine-side transaction, before `algo.end`
 /// ran), the `TxAbortGuard` must schedule an async abort so peer
 /// transactions see the abort marker promptly instead of waiting for the
@@ -666,7 +666,7 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
 
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = PausingBackend::new(mem);
-    let db = DB::open("example", backend.clone()).await.unwrap();
+    let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();
@@ -718,20 +718,20 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
         }),
     )
     .await;
-    let r = r.expect("peer tx timed out: TxAbortGuard didn't release the lock promptly");
+    let r = r.expect("peer tx timed out: TransactionAbortGuard didn't release the lock promptly");
     r.unwrap();
 
     // The cancelled tx never committed (its values 42/43 are gone); the
     // peer's reads observed the original values and incremented from there.
-    let v1 = coll.read_strong(b"k1").await.unwrap();
+    let v1 = coll.read(b"k1").await.unwrap();
     assert_eq!(read_int(&v1), 11);
-    let v2 = coll.read_strong(b"k2").await.unwrap();
+    let v2 = coll.read(b"k2").await.unwrap();
     assert_eq!(read_int(&v2), 12);
 }
 
 /// Clean shutdown must wait for the async abort scheduled when a transaction
 /// future is dropped between `algo.begin` and `algo.end`. This test parks that
-/// abort-log write and verifies `DB::shutdown` remains pending until the write
+/// abort-log write and verifies `Database::shutdown` remains pending until the write
 /// is released.
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_cancelled_tx_async_abort() {
@@ -739,7 +739,7 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
 
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = PausingBackend::new(mem);
-    let db = DB::open("example", backend.clone()).await.unwrap();
+    let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();

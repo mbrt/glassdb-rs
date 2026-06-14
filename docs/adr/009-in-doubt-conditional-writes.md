@@ -1,4 +1,4 @@
-# ADR-009: In-doubt conditional-write outcomes (`BackendError::Unavailable`)
+# ADR-009: In-doubt conditional-write outcomes (`BackendError::InDoubt`)
 
 ## Status
 
@@ -53,7 +53,7 @@ disambiguate them with (the logless single-RW path). The contract is
 **at-most-once application + report the uncertainty only when the engine cannot
 recover it on its own**:
 
-1. **New error variant `BackendError::Unavailable(String)`** — "the operation's
+1. **New error variant `BackendError::InDoubt(String)`** — "the operation's
    outcome is unknown; it may or may not have been applied." It is threaded
    through `StorageError → TransError → public Error` with `is_unavailable()`
    helpers at every layer, and is deliberately **not** classified as
@@ -99,9 +99,9 @@ recover it on its own**:
 5. **Only the single-RW fast path surfaces in-doubt to the caller.** The fast
    path is logless: its value write is the commit point, and a lost ack
    followed by a re-observed precondition is indistinguishable from a genuine
-   conflict from outside the writer. `DB::tx`'s loop only re-runs on
+   conflict from outside the writer. `Database::tx`'s loop only re-runs on
    `retry`/`wounded`; an `Unavailable` from the fast-path CAS breaks out as
-   `Error::Unavailable`. The transaction may or may not have committed; the
+   `Error::InDoubt`. The transaction may or may not have committed; the
    caller decides whether to retry (with its own idempotency) or accept the
    uncertainty.
 
@@ -140,7 +140,7 @@ log, so GC does not widen the in-doubt window.
   an acknowledgement, not just in the simulator. A backend that masked an
   in-doubt result as a confident `Precondition` would re-introduce it, so the
   property is tested per backend.
-- Applications must handle `Error::Unavailable`, but **only the single-RW fast
+- Applications must handle `Error::InDoubt`, but **only the single-RW fast
   path** can produce it: a logged-commit transaction recovers transparently. The
   honest contract for a stateless store over object storage is that the fast
   path is in-doubt under a lost ack; callers add idempotency (e.g. a
@@ -149,7 +149,7 @@ log, so GC does not widen the in-doubt window.
 
 ### Regression tests for the contract
 
-- `crates/glassdb/tests/in_doubt.rs` — DB/engine level. The `FaultBackend`
+- `crates/glassdb/tests/in_doubt.rs` — database/engine level. The `FaultBackend`
   middleware injects a lost ack on a landed conditional write and asserts: the
   single-RW path surfaces `Unavailable` without double-applying; the logged
   path recovers transparently (engine retries the log write and recognizes its

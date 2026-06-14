@@ -266,7 +266,7 @@ fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
 }
 
 fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
-    if l.id.is_empty() {
+    if l.id.is_unset() {
         return Err(StorageError::Other("empty transaction ID".into()));
     }
     let mut coll_writes: BTreeMap<String, pb::CollectionWrites> = BTreeMap::new();

@@ -13,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use glassdb::{DB, Stats};
+use glassdb::{Database, Stats};
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -141,7 +141,7 @@ impl Measure {
     }
 
     /// Snapshots all counters at the start of the measured region.
-    pub fn begin(&mut self, db: &DB) {
+    pub fn begin(&mut self, db: &Database) {
         self.start_stats = db.stats();
         self.start_alloc = alloc_snapshot();
         self.start_cpu = cpu_ns();
@@ -149,11 +149,11 @@ impl Measure {
     }
 
     /// Records the deltas accumulated since [`Measure::begin`].
-    pub fn end(&mut self, db: &DB) {
+    pub fn end(&mut self, db: &Database) {
         let wall_ns = self.start_wall.elapsed().as_nanos() as u64;
         let cpu_ns = cpu_ns().saturating_sub(self.start_cpu);
         let alloc = alloc_snapshot();
-        let stats = db.stats().sub(&self.start_stats);
+        let stats = db.stats() - self.start_stats;
         self.sample = Some(Sample {
             name: std::mem::take(&mut self.name),
             stats,

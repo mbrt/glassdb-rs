@@ -19,7 +19,7 @@ use tokio::runtime::Runtime;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
-use glassdb::{Backend, Collection, DB, Error, Tx};
+use glassdb::{Backend, Collection, Database, Error, Transaction};
 
 // Number of iterations used for the one-off stats summary printed per backend.
 const STATS_ITERS: i64 = 30;
@@ -62,7 +62,7 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_or_zero(tx: &Tx, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
+async fn read_int_or_zero(tx: &Transaction, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
     match tx.read(coll, key).await {
         Ok(v) => Ok(read_int(&v)),
         Err(e) if e.is_not_found() => Ok(0),
@@ -70,11 +70,11 @@ async fn read_int_or_zero(tx: &Tx, coll: &Collection, key: &[u8]) -> Result<i64,
     }
 }
 
-async fn open_db(backend: Arc<dyn Backend>) -> DB {
-    DB::open("bench", backend).await.expect("open db")
+async fn open_db(backend: Arc<dyn Backend>) -> Database {
+    Database::open("bench", backend).await.expect("open db")
 }
 
-async fn open_coll(backend: Arc<dyn Backend>, name: &[u8]) -> (DB, Collection) {
+async fn open_coll(backend: Arc<dyn Backend>, name: &[u8]) -> (Database, Collection) {
     let db = open_db(backend).await;
     let coll = db.collection(name);
     coll.create().await.expect("create coll");
@@ -87,12 +87,12 @@ fn make_keys(n: usize) -> Vec<Vec<u8>> {
 
 /// Runs `body` `STATS_ITERS` times and prints the per-op backend counters,
 /// the analog of Go's `benchStats`.
-async fn report_stats<F: AsyncFnMut()>(label: &str, db: &DB, mut body: F) {
+async fn report_stats<F: AsyncFnMut()>(label: &str, db: &Database, mut body: F) {
     let start = db.stats();
     for _ in 0..STATS_ITERS {
         body().await;
     }
-    let s = db.stats().sub(&start);
+    let s = db.stats() - start;
     let n = STATS_ITERS.max(1) as f64;
     println!(
         "  stats {label}: retries/op={:.3} w/op={:.2} r/op={:.2} metaw/op={:.2} metar/op={:.2}",
@@ -106,7 +106,7 @@ async fn report_stats<F: AsyncFnMut()>(label: &str, db: &DB, mut body: F) {
 
 // --- Workload bodies (one transaction each) -------------------------------
 
-async fn single_rmw(db: &DB, coll: &Collection) {
+async fn single_rmw(db: &Database, coll: &Collection) {
     db.tx(|tx| async move {
         let num = read_int_or_zero(&tx, coll, b"key").await?;
         tx.write(coll, b"key", &write_int(num + 1))
@@ -115,7 +115,7 @@ async fn single_rmw(db: &DB, coll: &Collection) {
     .expect("single rmw");
 }
 
-async fn multi_rmw(db: &DB, coll: &Collection, keys: &[Vec<u8>]) {
+async fn multi_rmw(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
     db.tx(|tx| async move {
         // Read every key in parallel, then write each incremented value.
         let vals = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
@@ -133,7 +133,7 @@ async fn multi_rmw(db: &DB, coll: &Collection, keys: &[Vec<u8>]) {
     .expect("multi rmw");
 }
 
-async fn multi_read(db: &DB, coll: &Collection, keys: &[Vec<u8>]) {
+async fn multi_read(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
     let _ = db
         .tx(|tx| async move {
             let _ = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
@@ -142,7 +142,7 @@ async fn multi_read(db: &DB, coll: &Collection, keys: &[Vec<u8>]) {
         .await;
 }
 
-async fn hundred_writes(db: &DB, coll: &Collection, base: usize) {
+async fn hundred_writes(db: &Database, coll: &Collection, base: usize) {
     db.tx(|tx| async move {
         for j in 0..100 {
             let k = format!("k{}", base * 100 + j);
@@ -154,7 +154,7 @@ async fn hundred_writes(db: &DB, coll: &Collection, base: usize) {
     .expect("hundred writes");
 }
 
-async fn update_two_keys(db: &DB, coll: &Collection) -> Result<(), Error> {
+async fn update_two_keys(db: &Database, coll: &Collection) -> Result<(), Error> {
     db.tx(|tx| async move {
         let n1 = read_int_or_zero(&tx, coll, b"key1").await?;
         tx.write(coll, b"key1", &write_int(n1 + 1))?;
@@ -164,7 +164,7 @@ async fn update_two_keys(db: &DB, coll: &Collection) -> Result<(), Error> {
     .await
 }
 
-async fn update_shared(db: &DB, coll: &Collection, key_w: &[u8]) -> Result<(), Error> {
+async fn update_shared(db: &Database, coll: &Collection, key_w: &[u8]) -> Result<(), Error> {
     db.tx(|tx| async move {
         let num = read_int_or_zero(&tx, coll, b"key-r").await?;
         tx.write(coll, key_w, &write_int(num + 1))

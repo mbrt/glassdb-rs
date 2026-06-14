@@ -134,14 +134,9 @@ impl TxId {
         self.0.to_vec()
     }
 
-    /// Reports whether the ID is empty (the nil transaction).
-    pub fn is_empty(&self) -> bool {
+    /// Reports whether the ID is unset.
+    pub fn is_unset(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// Number of bytes in the ID.
-    pub fn len(&self) -> usize {
-        self.0.len()
     }
 }
 
@@ -287,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn random_is_16_bytes_and_hex() {
         let id = TxId::new_random();
-        assert_eq!(id.len(), 16);
+        assert_eq!(id.as_bytes().len(), 16);
         assert_eq!(id.to_string().len(), 32);
     }
 
@@ -295,7 +290,7 @@ mod tests {
     async fn new_at_layout() {
         let nanos = 1_700_000_000_000_000_000u64;
         let id = TxId::new_at(nanos);
-        assert_eq!(id.len(), 16);
+        assert_eq!(id.as_bytes().len(), 16);
         assert_eq!(id.priority(), nanos);
     }
 
@@ -342,7 +337,7 @@ mod tests {
     async fn renew_preserves_priority() {
         let orig = TxId::new_at(123_456_789_000u64);
         let renewed = orig.renew();
-        assert_eq!(renewed.len(), 16);
+        assert_eq!(renewed.as_bytes().len(), 16);
         assert_eq!(orig.priority(), renewed.priority());
         assert_ne!(orig, renewed);
         // The fresh random prefix differs from the original.

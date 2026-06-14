@@ -1,8 +1,8 @@
 //! GlassDB: a stateless ACID key/value store on top of object storage.
 //!
-//! Public API: [`DB`] opens a database over a
-//! [`glassdb_backend::Backend`], [`Collection`] groups keys, and [`Tx`] runs a
-//! serializable transaction (with automatic conflict retries) via [`DB::tx`].
+//! Public API: [`Database`] opens a database over a
+//! [`glassdb_backend::Backend`], [`Collection`] groups keys, and [`Transaction`] runs a
+//! serializable transaction (with automatic conflict retries) via [`Database::tx`].
 //!
 //! # Cancellation
 //!
@@ -11,7 +11,7 @@
 //! protocol, so it never corrupts data. Cancel by wrapping the future with
 //! `tokio::time::timeout`, `tokio::select!`, or aborting a `JoinHandle`. Locks
 //! held by an abandoned attempt are reclaimed after wait/lease timeouts. See
-//! [`DB::tx`] for details.
+//! [`Database::tx`] for details.
 
 mod collection;
 mod db;
@@ -25,14 +25,14 @@ mod tx;
 mod version;
 
 pub use collection::Collection;
-pub use db::{DB, DbBuilder};
+pub use db::{Database, DatabaseBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionsIter, KeysIter};
 pub use stats::Stats;
-pub use tx::Tx;
+pub use tx::Transaction;
 
-// Re-export the backend abstraction so callers can construct a DB without
+// Re-export the backend abstraction so callers can construct a Database without
 // depending on the backend crate directly.
 pub use glassdb_backend::{self as backend, Backend, memory, middleware};
 

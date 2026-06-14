@@ -66,7 +66,7 @@ correctness contract; changing them invalidates the experiment):
   implementation. If one of these or the fuzzer fails, fix the code, never the
   test.
 
-Note: these frozen files use the public API (e.g. `DB`, `Tx`, `Collection`,
+Note: these frozen files use the public API (e.g. `Database`, `Transaction`, `Collection`,
 `Stats`). If you change a public signature, you must keep the API the frozen
 files and the scoring harness depend on compiling - adapt the implementation,
 not the frozen files.

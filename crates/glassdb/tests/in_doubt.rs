@@ -10,7 +10,7 @@
 //! The contract instead is at-most-once + surface in-doubt to the caller: a
 //! backend reports such an uncertain conditional write as
 //! [`BackendError::Unavailable`] rather than a confident `Precondition`, and the
-//! engine surfaces it as [`Error::Unavailable`] without retrying the transaction
+//! engine surfaces it as [`Error::InDoubt`] without retrying the transaction
 //! transparently (a transparent retry could double-apply a write that actually
 //! landed). The caller decides whether to retry (with its own idempotency) or
 //! accept the uncertainty.
@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
-use glassdb::{Collection, DB, Error};
+use glassdb::{Collection, Database, Error};
 
 /// What the [`FaultBackend`] should do when its trap matches a conditional write.
 #[derive(Clone, Copy)]
@@ -212,7 +212,7 @@ async fn seed(coll: &Collection, key: &[u8], v: i64) {
 }
 
 /// A single-key read-modify-write whose commit takes the logless fast path.
-async fn increment(db: &DB, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
+async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
     // `coll` is already a reference, so `async move` copies it (references are
     // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
     db.tx(|tx| async move {
@@ -235,12 +235,12 @@ async fn increment(db: &DB, coll: &Collection, key: &'static [u8]) -> Result<(),
 async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open("example", backend.clone()).await.unwrap();
+    let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
 
     // Seed the key so the read finds a value and the commit takes the single-RW
-    // fast path (which requires `reads[0].found`).
+    // fast path (which requires a found read version).
     seed(&coll, b"k", 10).await;
 
     // Trap the fast path's value write (a `write_if` on a key path `/_k/`): let
@@ -261,7 +261,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 
     // The write landed exactly once. The engine must not have retried and
     // applied it again: the value is 11, never 12.
-    let got = read_int(&coll.read_strong(b"k").await.unwrap());
+    let got = read_int(&coll.read(b"k").await.unwrap());
     assert_eq!(
         got, 11,
         "value must be applied at most once (no double-apply)"
@@ -285,7 +285,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 async fn logged_commit_lost_ack_retries_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open("example", backend.clone()).await.unwrap();
+    let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     seed(&coll, b"a", 0).await;
@@ -316,8 +316,8 @@ async fn logged_commit_lost_ack_retries_transparently() {
     .expect("the logged commit must retry the in-doubt log write transparently");
 
     // Each write applied exactly once — the safety invariant.
-    assert_eq!(read_int(&coll.read_strong(b"a").await.unwrap()), 1);
-    assert_eq!(read_int(&coll.read_strong(b"b").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"a").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"b").await.unwrap()), 1);
 
     // Bound the retry: the engine drives the commit point exactly twice (the
     // original lost-ack write, then a single retry that observes the landed
@@ -341,7 +341,7 @@ async fn logged_commit_lost_ack_retries_transparently() {
 async fn lock_acquisition_lost_ack_retries_in_place() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open("example", backend.clone()).await.unwrap();
+    let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     seed(&coll, b"a", 0).await;
@@ -360,7 +360,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
 
     // Two writes force the locked, log-based commit path. Capture `coll` by
     // reference so the body stays `FnMut` (re-runnable, though we expect no
-    // closure re-run here — the lock retry is invisible to `DB::tx`).
+    // closure re-run here — the lock retry is invisible to `Database::tx`).
     let coll = &coll;
     db.tx(|tx| async move {
         let a = read_int(&tx.read(coll, b"a").await.unwrap());
@@ -372,8 +372,8 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     .expect("a pre-commit in-doubt lock outcome must be recovered in place");
 
     // Each write applied exactly once — the safety invariant.
-    assert_eq!(read_int(&coll.read_strong(b"a").await.unwrap()), 1);
-    assert_eq!(read_int(&coll.read_strong(b"b").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"a").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"b").await.unwrap()), 1);
 }
 
 /// A *clean* precondition (no lost ack) is a genuine conflict, and the engine
@@ -385,7 +385,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
 async fn clean_conflict_on_single_rw_still_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = FaultBackend::new(mem);
-    let db = DB::open("example", backend.clone()).await.unwrap();
+    let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     seed(&coll, b"k", 41).await;
@@ -405,6 +405,6 @@ async fn clean_conflict_on_single_rw_still_commits() {
         .await
         .expect("a clean conflict must be retried transparently, not surfaced");
 
-    let got = read_int(&coll.read_strong(b"k").await.unwrap());
+    let got = read_int(&coll.read(b"k").await.unwrap());
     assert_eq!(got, 42, "the increment must be applied exactly once");
 }

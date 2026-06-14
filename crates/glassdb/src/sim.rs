@@ -38,7 +38,7 @@ use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBa
 use glassdb_concurr::{Tape, rt};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Collection, DB, Error};
+use crate::{Collection, Database, Error};
 
 /// Number of distinct keys the workload operates on.
 pub const KEY_COUNT: usize = 4;
@@ -159,7 +159,7 @@ fn key_name(k: usize) -> Vec<u8> {
     format!("k{k}").into_bytes()
 }
 
-async fn read_int_from_tx(tx: &crate::Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(tx: &crate::Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         Err(e) if e.is_not_found() => Ok(0),
@@ -186,7 +186,12 @@ impl Acct {
 /// Attempts a single op in its own transaction, updating `acct`: `started` is
 /// bumped before the attempt, `acked` only on success. A failure leaves the op
 /// counted in `started` but not `acked` (i.e. in-doubt).
-async fn run_one(db: &DB, coll: &Collection, op: &Op, acct: &Mutex<Acct>) -> Result<(), Error> {
+async fn run_one(
+    db: &Database,
+    coll: &Collection,
+    op: &Op,
+    acct: &Mutex<Acct>,
+) -> Result<(), Error> {
     match op {
         Op::Rmw(k) => {
             acct.lock().unwrap().started[*k] += 1;
@@ -243,7 +248,7 @@ async fn run_one(db: &DB, coll: &Collection, op: &Op, acct: &Mutex<Acct>) -> Res
 /// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
 /// RMW would double-apply).
 async fn run_client(
-    db: &DB,
+    db: &Database,
     coll: &Collection,
     ops: &[Op],
     acct: &Mutex<Acct>,
@@ -264,7 +269,7 @@ async fn run_client(
     ops.len()
 }
 
-/// Opens the DB on `backend`, runs `ops`, and closes it. Returns ops consumed
+/// Opens the Database on `backend`, runs `ops`, and closes it. Returns ops consumed
 /// (see [`run_client`]); `0` if the open itself failed (e.g. a crash during
 /// startup).
 async fn open_and_run(
@@ -281,10 +286,10 @@ async fn open_and_run(
     db.shutdown().await;
 }
 
-/// Opens the simulation DB with the deterministic clock the fuzzer relies on
+/// Opens the simulation Database with the deterministic clock the fuzzer relies on
 /// for byte-identical replays.
-async fn open_det_db(backend: &Arc<dyn Backend>) -> Result<DB, Error> {
-    DB::builder(DB_NAME, backend.clone())
+async fn open_det_db(backend: &Arc<dyn Backend>) -> Result<Database, Error> {
+    Database::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
         .open()
         .await
@@ -333,7 +338,7 @@ fn assert_bounds(acct: &Acct, finals: &[i64], expected: &[i64], faults_enabled: 
 
 /// The crash nemesis: cancels a few clients' abort signals at deterministic
 /// virtual times, modelling an abrupt client stop mid-transaction. Each cancelled
-/// client drops its `DB` (without calling `shutdown`), so its in-flight locks
+/// client drops its `Database` (without calling `shutdown`), so its in-flight locks
 /// are recovered later via lease expiry during the final reads. Crash timing and
 /// targets are drawn from `tape` (the fuzzer-guided fault schedule), falling back
 /// to the tape's seeded PRNG once its bytes run out.
@@ -524,11 +529,11 @@ async fn run_inner(
     // can interleave them. A `CancellationToken` lets the crash nemesis
     // simulate a hard crash by racing the signal against the client's run
     // loop; the dropped future is the in-Rust analog of a process death. On
-    // a clean run we `DB::shutdown` to drain in-flight transactions and
-    // dedup owners before the DB clone drops; on a crash we *skip* shutdown
+    // a clean run we `Database::shutdown` to drain in-flight transactions and
+    // dedup owners before the Database clone drops; on a crash we *skip* shutdown
     // and let `Drop` tear everything down abruptly — that is the whole point
     // of the crash nemesis. The background loops are torn down in both cases
-    // by `Background::drop` once the last `DB` clone goes out of scope (the
+    // by `Background::drop` once the last `Database` clone goes out of scope (the
     // captured-task cycle is broken by subsystems holding `Weak<Background>`).
     let mut handles = Vec::with_capacity(nclients);
     let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
@@ -553,7 +558,7 @@ async fn run_inner(
                 }
                 crashed
             };
-            // Crash-and-restart: a cancelled (crashed) client reopens the DB on
+            // Crash-and-restart: a cancelled (crashed) client reopens the Database on
             // the same backend and finishes its remaining ops, recovering its
             // own orphaned locks via lease expiry. The in-doubt op it died on
             // is left for recovery rather than replayed (which would
@@ -591,12 +596,7 @@ async fn run_inner(
     // locks via lease expiry) and check the invariant.
     let mut finals = vec![0i64; KEY_COUNT];
     for (k, slot) in finals.iter_mut().enumerate() {
-        *slot = read_int(
-            &init_coll
-                .read_strong(&key_name(k))
-                .await
-                .expect("final read"),
-        );
+        *slot = read_int(&init_coll.read(&key_name(k)).await.expect("final read"));
     }
     init_db.shutdown().await;
 
@@ -781,7 +781,7 @@ pub fn pct_sweep(workload: &Workload, faults: FaultConfig, seeds: impl IntoItera
 // in one transaction (reading all N pointers concurrently) and asserts that
 // snapshot is itself a valid ring. That adds a read-side serializability oracle
 // — a committed read-only tx must observe a single committed state — and is the
-// only workload that exercises `Tx`'s concurrent-read path.
+// only workload that exercises `Transaction`'s concurrent-read path.
 // ===========================================================================
 
 /// Smallest ring size that guarantees the four nodes a swap touches (the start
@@ -846,13 +846,18 @@ impl<'a> Arbitrary<'a> for CycleWorkload {
 }
 
 /// Reads node `idx`'s next-pointer within `tx`.
-async fn read_next(tx: &crate::Tx, coll: &Collection, idx: usize) -> Result<usize, Error> {
+async fn read_next(tx: &crate::Transaction, coll: &Collection, idx: usize) -> Result<usize, Error> {
     let v = tx.read(coll, &key_name(idx)).await?;
     Ok(read_int(&v) as usize)
 }
 
 /// Sets node `idx`'s next-pointer to `next` within `tx`.
-fn write_next(tx: &crate::Tx, coll: &Collection, idx: usize, next: usize) -> Result<(), Error> {
+fn write_next(
+    tx: &crate::Transaction,
+    coll: &Collection,
+    idx: usize,
+    next: usize,
+) -> Result<(), Error> {
     tx.write(coll, &key_name(idx), &write_int(next as i64))
 }
 
@@ -887,7 +892,7 @@ fn assert_ring(next: &[usize]) {
 /// Cycle). Reads three consecutive next-pointers, then rotates the edges. For a
 /// single N-cycle with N >= 4 the four nodes are distinct, so the three writes
 /// target distinct keys and map the ring to another single N-cycle.
-async fn cycle_swap(db: &DB, coll: &Collection, r: usize) -> Result<(), Error> {
+async fn cycle_swap(db: &Database, coll: &Collection, r: usize) -> Result<(), Error> {
     db.tx(|tx| async move {
         let r2 = read_next(&tx, coll, r).await?;
         let r3 = read_next(&tx, coll, r2).await?;
@@ -902,13 +907,13 @@ async fn cycle_swap(db: &DB, coll: &Collection, r: usize) -> Result<(), Error> {
 /// Snapshots the whole ring within a single transaction, reading all `N`
 /// next-pointers *concurrently* (joined together as in-flight backend fetches),
 /// and returns the snapshot. Unlike [`cycle_swap`]'s dependent pointer walk,
-/// these reads have no data dependency, so this is what exercises `Tx`'s
+/// these reads have no data dependency, so this is what exercises `Transaction`'s
 /// concurrent-read path (see `tx.rs`: `read` takes `&self` and never holds the
 /// lock across `.await`). A committed read-only transaction observes exactly one
 /// committed state under serializable isolation, so the caller can assert the
 /// snapshot is itself a valid ring.
 async fn read_ring_snapshot(
-    db: &DB,
+    db: &Database,
     coll: &Collection,
     node_count: usize,
 ) -> Result<Vec<usize>, Error> {
@@ -922,7 +927,7 @@ async fn read_ring_snapshot(
 /// all succeeded, or `i + 1` if swap `i` failed (left for recovery rather than
 /// replayed on restart).
 async fn run_cycle_client(
-    db: &DB,
+    db: &Database,
     coll: &Collection,
     swaps: &[usize],
     consumed: &AtomicUsize,
@@ -937,7 +942,7 @@ async fn run_cycle_client(
     swaps.len()
 }
 
-/// Opens the DB on `backend`, runs `swaps`, and closes it. Records swaps
+/// Opens the Database on `backend`, runs `swaps`, and closes it. Records swaps
 /// consumed in `consumed` (see [`run_cycle_client`]); leaves it at `0` if the
 /// open itself failed.
 async fn open_and_run_cycle(backend: &Arc<dyn Backend>, swaps: &[usize], consumed: &AtomicUsize) {
@@ -989,8 +994,8 @@ async fn run_cycle_inner(
     // Each client runs its swaps as its own task so the scheduler interleaves
     // them; a crashed client restarts on the same backend to finish its
     // remaining swaps, recovering its own orphaned locks via lease expiry.
-    // On a clean run the DB is gracefully shut down (drain in-flight + dedup
-    // owners); on a crash we drop the DB without shutdown — that's the
+    // On a clean run the Database is gracefully shut down (drain in-flight + dedup
+    // owners); on a crash we drop the Database without shutdown — that's the
     // in-Rust analog of process death and the whole point of the crash
     // nemesis. `Background::drop` still aborts spawned background loops in
     // both cases.
@@ -1075,12 +1080,7 @@ async fn run_cycle_inner(
     // client's locks via lease expiry) and assert the ring is still intact.
     let mut next = vec![0usize; node_count];
     for (k, slot) in next.iter_mut().enumerate() {
-        *slot = read_int(
-            &init_coll
-                .read_strong(&key_name(k))
-                .await
-                .expect("final read"),
-        ) as usize;
+        *slot = read_int(&init_coll.read(&key_name(k)).await.expect("final read")) as usize;
     }
     init_db.shutdown().await;
 

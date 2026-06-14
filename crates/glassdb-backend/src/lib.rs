@@ -83,7 +83,7 @@ impl Version {
     }
 
     /// Reports whether the version is unset.
-    pub fn is_null(&self) -> bool {
+    pub fn is_unset(&self) -> bool {
         self.token.is_empty()
     }
 }
@@ -100,8 +100,8 @@ impl WriterId {
         WriterId(b.into())
     }
 
-    /// Reports whether the writer is empty (nil).
-    pub fn is_empty(&self) -> bool {
+    /// Reports whether the writer is unset.
+    pub fn is_unset(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -114,7 +114,7 @@ impl WriterId {
 /// Encodes a [`WriterId`] into the string form used in object tags. Returns the
 /// empty string when the writer is nil.
 pub fn encode_writer_tag(w: &WriterId) -> String {
-    if w.0.is_empty() {
+    if w.is_unset() {
         String::new()
     } else {
         base64::engine::general_purpose::URL_SAFE.encode(&w.0)
@@ -198,7 +198,7 @@ pub trait Backend: Send + Sync {
 
 /// Transparent delegation so any `Arc<B: Backend>` (including
 /// `Arc<dyn Backend>`) is itself a `Backend`. Lets generic APIs like
-/// `DB::open<B: Backend + 'static>(name, b)` accept a pre-erased
+/// `Database::open<B: Backend + 'static>(name, b)` accept a pre-erased
 /// `Arc<dyn Backend>` (e.g. a middleware stack assembled in a test) without a
 /// dedicated entry point.
 #[async_trait]

@@ -34,24 +34,24 @@ crate is meant to be used directly.
 | `glassdb-backend-gcs` | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature. |
 | `glassdb-storage` | Byte-weighted LRU cache, value versioning, local/global caching, locker, and transaction logger. |
 | `glassdb-trans` | The transaction engine: monitor, reader, GC, distributed locker, and commit algorithm. |
-| `glassdb` | The public API: `DB`, `Collection`, `Tx`, iterators, and `Stats`. |
+| `glassdb` | The public API: `Database`, `Collection`, `Transaction`, iterators, and `Stats`. |
 
 ## Quick start
 
 ```rust
-use glassdb::DB;
+use glassdb::Database;
 use glassdb::backend::memory::MemoryBackend;
 
 #[tokio::main]
 async fn main() -> Result<(), glassdb::Error> {
-    let db = DB::open("example", MemoryBackend::new()).await?;
+    let db = Database::open("example", MemoryBackend::new()).await?;
 
     let users = db.collection(b"users");
     users.create().await?;
 
     // Single-key helpers run in their own transaction.
     users.write(b"alice", b"hello").await?;
-    let v = users.read_strong(b"alice").await?;
+    let v = users.read(b"alice").await?;
     assert_eq!(v, b"hello");
 
     // Multi-key serializable transaction with automatic conflict retries.
@@ -86,7 +86,7 @@ dependencies are only pulled in when needed:
 glassdb = { version = "0.1", features = ["s3", "gcs"] }
 ```
 
-Both implement the same `Backend` trait and can be dropped into `DB::open`:
+Both implement the same `Backend` trait and can be dropped into `Database::open`:
 
 ```rust,ignore
 // Amazon S3 (feature = "s3"): construct an aws-sdk-s3 client, then:

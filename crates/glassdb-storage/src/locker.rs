@@ -3,7 +3,7 @@
 
 use base64::Engine;
 use glassdb_backend::Tags;
-use glassdb_data::TxId;
+use glassdb_data::{TxId, TxIdSet};
 
 use crate::error::StorageError;
 use crate::global::Global;
@@ -52,8 +52,9 @@ fn is_writer_type(lt: LockType) -> bool {
 /// requesters is never wounded.
 fn partition_wound_wait(holders: &[TxId], requesters: &[TxId]) -> LockOps {
     let mut ops = LockOps::default();
+    let requester_set = TxIdSet::from_ids(requesters.iter().cloned());
     for h in holders {
-        if !requesters.contains(h) && any_older(requesters, h) {
+        if !requester_set.contains(h) && any_older(requesters, h) {
             ops.wound.push(h.clone());
         } else {
             ops.wait_for.push(h.clone());
@@ -109,8 +110,7 @@ pub struct TxPathState {
 /// the operation's effects.
 #[derive(Debug, Clone, Default)]
 pub struct LockOps {
-    pub update: LockUpdate,
-    pub has_update: bool,
+    pub update: Option<LockUpdate>,
     /// Higher-priority (older) holders the requester must wait for under the
     /// wound-wait rule.
     pub wait_for: Vec<TxId>,
@@ -152,10 +152,12 @@ impl LockInfo {
 }
 
 fn tids_diff(a: &[TxId], b: &[TxId]) -> Vec<TxId> {
+    let b = TxIdSet::from_ids(b.iter().cloned());
     a.iter().filter(|x| !b.contains(x)).cloned().collect()
 }
 
 fn tids_intersect(a: &[TxId], b: &[TxId]) -> Vec<TxId> {
+    let b = TxIdSet::from_ids(b.iter().cloned());
     a.iter().filter(|x| b.contains(x)).cloned().collect()
 }
 
@@ -174,15 +176,19 @@ pub fn compute_lock_update(
     if req.lockers.is_empty() {
         return Ok(handle_no_ops(&curr, unlock_ops));
     }
-    if unlock_ops.has_update && unlock_ops.update.value.deleted {
+    if unlock_ops
+        .update
+        .as_ref()
+        .is_some_and(|update| update.value.deleted)
+    {
         return Ok(unlock_ops);
     }
 
     let mut curr = curr;
-    if unlock_ops.has_update {
-        curr.typ = unlock_ops.update.typ;
-        curr.last_writer = unlock_ops.update.writer.clone();
-        curr.locked_by = unlock_ops.update.lockers.clone();
+    if let Some(update) = &unlock_ops.update {
+        curr.typ = update.typ;
+        curr.last_writer = update.writer.clone();
+        curr.locked_by = update.lockers.clone();
     }
     let lock_ops = compute_lock_update_inner(&curr, req.typ, &req.lockers)?;
     if (!lock_ops.wait_for.is_empty() || !lock_ops.wound.is_empty())
@@ -193,17 +199,21 @@ pub fn compute_lock_update(
     }
     let mut ops = LockOps {
         update: unlock_ops.update,
-        has_update: unlock_ops.has_update || lock_ops.has_update,
         wait_for: lock_ops.wait_for,
         wound: lock_ops.wound,
         locked_for: lock_ops.locked_for,
         unlocked_for: unlock_ops.unlocked_for,
     };
-    if !lock_ops.has_update {
+    let Some(lock_update) = lock_ops.update else {
         return Ok(handle_no_ops(&curr, ops));
+    };
+    match &mut ops.update {
+        Some(update) => {
+            update.typ = lock_update.typ;
+            update.lockers = lock_update.lockers;
+        }
+        None => ops.update = Some(lock_update),
     }
-    ops.update.typ = lock_ops.update.typ;
-    ops.update.lockers = lock_ops.update.lockers;
     Ok(ops)
 }
 
@@ -227,11 +237,12 @@ fn compute_unlock_update(
         ..Default::default()
     };
     let mut unlocked_for = already_unlocked;
+    let unlocker_set = TxIdSet::from_ids(unlockers.iter().cloned());
 
     for tx in &curr.locked_by {
         let v = find_tx_path_state(txs, tx)
             .ok_or_else(|| StorageError::Other(format!("missing state for tx {tx}")))?;
-        if !v.status.is_final() && !unlockers.contains(tx) {
+        if !v.status.is_final() && !unlocker_set.contains(tx) {
             update.lockers.push(tx.clone());
             continue;
         }
@@ -245,10 +256,8 @@ fn compute_unlock_update(
         update.typ = LockType::None;
     }
 
-    let has_update = !unlocked_for.is_empty();
     Ok(LockOps {
-        update,
-        has_update,
+        update: (!unlocked_for.is_empty()).then_some(update),
         unlocked_for,
         ..Default::default()
     })
@@ -280,12 +289,11 @@ fn compute_lock_update_inner(
     }
     if lt == LockType::Create {
         return Ok(LockOps {
-            update: LockUpdate {
+            update: Some(LockUpdate {
                 typ: LockType::Create,
                 lockers: lockers.to_vec(),
                 ..Default::default()
-            },
-            has_update: true,
+            }),
             locked_for: lockers.to_vec(),
             ..Default::default()
         });
@@ -297,12 +305,11 @@ fn compute_lock_update_inner(
         && curr.locked_by[0] == lockers[0]
     {
         return Ok(LockOps {
-            update: LockUpdate {
+            update: Some(LockUpdate {
                 typ: LockType::Write,
                 lockers: lockers.to_vec(),
                 ..Default::default()
-            },
-            has_update: true,
+            }),
             locked_for: lockers.to_vec(),
             ..Default::default()
         });
@@ -318,13 +325,12 @@ fn compute_lock_update_inner(
     let mut new_lockers = curr.locked_by.clone();
     new_lockers.extend_from_slice(lockers);
     Ok(LockOps {
-        update: LockUpdate {
+        update: Some(LockUpdate {
             typ: lt,
             prev_type: curr.typ,
             lockers: new_lockers,
             ..Default::default()
-        },
-        has_update: true,
+        }),
         locked_for: lockers.to_vec(),
         ..Default::default()
     })
@@ -334,15 +340,14 @@ fn handle_no_ops(curr: &LockInfo, mut ops: LockOps) -> LockOps {
     if ops.locked_for.is_empty() && ops.unlocked_for.is_empty() {
         return ops;
     }
-    if ops.has_update {
+    if ops.update.is_some() {
         return ops;
     }
-    ops.has_update = true;
-    ops.update = LockUpdate {
+    ops.update = Some(LockUpdate {
         typ: curr.typ,
         lockers: curr.locked_by.clone(),
         ..Default::default()
-    };
+    });
     ops
 }
 
@@ -419,7 +424,7 @@ impl Locker {
         if let Some(res) = self.handle_lock_deletion(key, expected, update).await {
             return res;
         }
-        if expected.is_null() {
+        if expected.is_unset() {
             match update.typ {
                 LockType::None => return Ok(()),
                 LockType::Read | LockType::Write => {
@@ -449,7 +454,7 @@ impl Locker {
             return Some(self.global.delete_if(key, expected).await);
         }
         let is_unlock_create = update.typ == LockType::None && update.prev_type == LockType::Create;
-        if is_unlock_create && (update.writer.is_empty() || update.value.not_written) {
+        if is_unlock_create && (update.writer.is_unset() || update.value.not_written) {
             return Some(self.global.delete_if(key, expected).await);
         }
         None
@@ -474,7 +479,7 @@ impl Locker {
                 .await?;
             return Ok(());
         }
-        if !update.writer.is_empty() && !update.value.not_written {
+        if !update.writer.is_unset() && !update.value.not_written {
             new_tags.insert(LAST_WRITER_TAG.to_string(), tid_to_tag(&update.writer));
             self.global
                 .write_if(key, update.value.value.clone(), expected, new_tags)
@@ -540,9 +545,9 @@ mod tests {
             unlockers: vec![],
         };
         let ops = compute_lock_update(curr, &req, &[]).unwrap();
-        assert!(ops.has_update);
-        assert_eq!(ops.update.typ, LockType::Read);
-        assert_eq!(ops.update.lockers, vec![tx(1)]);
+        let update = ops.update.expect("update");
+        assert_eq!(update.typ, LockType::Read);
+        assert_eq!(update.lockers, vec![tx(1)]);
         assert_eq!(ops.locked_for, vec![tx(1)]);
     }
 
@@ -561,7 +566,7 @@ mod tests {
         let txs = final_states(&[(2, TxCommitStatus::Pending)]);
         let ops = compute_lock_update(curr, &req, &txs).unwrap();
         assert_eq!(ops.wait_for, vec![tx(2)]);
-        assert!(!ops.has_update);
+        assert!(ops.update.is_none());
     }
 
     #[test]
@@ -578,9 +583,9 @@ mod tests {
         };
         let txs = final_states(&[(1, TxCommitStatus::Pending)]);
         let ops = compute_lock_update(curr, &req, &txs).unwrap();
-        assert!(ops.has_update);
-        assert_eq!(ops.update.typ, LockType::Write);
-        assert_eq!(ops.update.lockers, vec![tx(1)]);
+        let update = ops.update.expect("update");
+        assert_eq!(update.typ, LockType::Write);
+        assert_eq!(update.lockers, vec![tx(1)]);
     }
 
     #[test]
@@ -606,10 +611,10 @@ mod tests {
         }];
         // Empty lockers => unlock-only path.
         let ops = compute_lock_update(curr, &req, &txs).unwrap();
-        assert!(ops.has_update);
-        assert_eq!(ops.update.typ, LockType::None);
-        assert_eq!(ops.update.writer, tx(1));
-        assert_eq!(ops.update.value.value, b"v");
+        let update = ops.update.expect("update");
+        assert_eq!(update.typ, LockType::None);
+        assert_eq!(update.writer, tx(1));
+        assert_eq!(update.value.value, b"v");
         assert_eq!(ops.unlocked_for, vec![tx(1)]);
     }
 
@@ -625,8 +630,8 @@ mod tests {
             unlockers: vec![],
         };
         let ops = compute_lock_update(curr, &req, &[]).unwrap();
-        assert!(ops.has_update);
-        assert_eq!(ops.update.typ, LockType::Create);
+        let update = ops.update.expect("update");
+        assert_eq!(update.typ, LockType::Create);
         assert!(ops.wait_for.is_empty());
     }
 
@@ -796,7 +801,7 @@ mod tests {
             assert_eq!(ops.wound, c.want_wound, "{}: wound", c.name);
             assert_eq!(ops.wait_for, c.want_wait_for, "{}: wait_for", c.name);
             // Conflicts never produce a storage update.
-            assert!(!ops.has_update, "{}: has_update", c.name);
+            assert!(ops.update.is_none(), "{}: update", c.name);
             assert!(ops.locked_for.is_empty(), "{}: locked_for", c.name);
         }
     }

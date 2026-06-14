@@ -58,8 +58,7 @@ enum VResult {
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
     pub path: Arc<str>,
-    pub version: ReadVersion,
-    pub found: bool,
+    pub version: Option<ReadVersion>,
 }
 
 /// Identifies the version read by a transaction (the writer's transaction ID).
@@ -82,8 +81,34 @@ impl ReadVersion {
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
     pub path: Arc<str>,
-    pub val: Vec<u8>,
-    pub delete: bool,
+    pub op: WriteOp,
+}
+
+/// The write operation staged for a key.
+#[derive(Debug, Clone)]
+pub enum WriteOp {
+    Put(Vec<u8>),
+    Delete,
+}
+
+impl WriteAccess {
+    pub fn put(path: Arc<str>, value: Vec<u8>) -> Self {
+        Self {
+            path,
+            op: WriteOp::Put(value),
+        }
+    }
+
+    pub fn delete(path: Arc<str>) -> Self {
+        Self {
+            path,
+            op: WriteOp::Delete,
+        }
+    }
+
+    fn is_delete(&self) -> bool {
+        matches!(self.op, WriteOp::Delete)
+    }
 }
 
 /// The reads and writes that make up a transaction.
@@ -98,8 +123,7 @@ pub struct Handle {
     data: Data,
     status: Status,
     id: TxId,
-    require_locks: bool,
-    serial_locking: bool,
+    mode: CommitMode,
 }
 
 impl Handle {
@@ -109,22 +133,83 @@ impl Handle {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitMode {
+    Fast,
+    Locked,
+    Serial,
+}
+
 #[derive(Clone)]
 struct PathState {
     path: Arc<str>,
-    read: bool,
-    write: bool,
-    not_found: bool,
-    delete: bool,
-    read_version: Version,
+    read: Option<PathRead>,
+    write: Option<PathWrite>,
+    existence: PathExistence,
     result: VResult,
 }
 
+#[derive(Clone)]
+enum PathRead {
+    Found(Version),
+    NotFound,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathWrite {
+    Put,
+    Delete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathExistence {
+    Unknown,
+    Found,
+    NotFound,
+}
+
 impl PathState {
+    fn has_read(&self) -> bool {
+        self.read.is_some()
+    }
+
+    fn has_write(&self) -> bool {
+        self.write.is_some()
+    }
+
+    fn read_not_found(&self) -> bool {
+        self.existence == PathExistence::NotFound
+    }
+
+    fn write_deletes(&self) -> bool {
+        matches!(self.write, Some(PathWrite::Delete))
+    }
+
+    fn read_version(&self) -> &Version {
+        match &self.read {
+            Some(PathRead::Found(version)) => version,
+            Some(PathRead::NotFound) => {
+                panic!("not-found read has no concrete version")
+            }
+            None => panic!("path has no read version"),
+        }
+    }
+
+    fn read_version_for_invalidation(&self) -> Version {
+        match &self.read {
+            Some(PathRead::Found(version)) => version.clone(),
+            Some(PathRead::NotFound) | None => Version::default(),
+        }
+    }
+
+    fn mark_not_found(&mut self) {
+        self.existence = PathExistence::NotFound;
+    }
+
     fn needs_locks(&self) -> Result<Vec<PathLock>, TransError> {
-        let lt = if self.read {
+        let lt = if self.has_read() {
             LockType::Read
-        } else if self.write || self.delete {
+        } else if self.has_write() {
             LockType::Write
         } else {
             return Ok(Vec::new());
@@ -133,7 +218,7 @@ impl PathState {
             path: self.path.to_string(),
             typ: lt,
         }];
-        if !self.not_found {
+        if !self.read_not_found() {
             return Ok(res);
         }
         let pr = paths::parse(&self.path).map_err(|e| TransError::Other(e.to_string()))?;
@@ -209,24 +294,29 @@ fn init_validation(h: &Handle) -> ValidationState {
         };
         let mut ps = PathState {
             path,
-            read: false,
-            write: false,
-            not_found: false,
-            delete: false,
-            read_version: Version::default(),
+            read: None,
+            write: None,
+            existence: PathExistence::Unknown,
             result: VResult::Unknown,
         };
         if take_read {
             let r = &reads[i];
-            ps.read = true;
-            ps.read_version = r.version.to_storage_version();
-            ps.not_found = !r.found;
+            ps.read = Some(if let Some(version) = &r.version {
+                ps.existence = PathExistence::Found;
+                PathRead::Found(version.to_storage_version())
+            } else {
+                ps.existence = PathExistence::NotFound;
+                PathRead::NotFound
+            });
             i += 1;
         }
         if take_write {
             let w = &writes[j];
-            ps.write = true;
-            ps.delete = w.delete;
+            ps.write = Some(if w.is_delete() {
+                PathWrite::Delete
+            } else {
+                PathWrite::Put
+            });
             j += 1;
         }
         paths.push(ps);
@@ -241,7 +331,7 @@ fn is_single_rw(data: &Data) -> bool {
     if data.reads[0].path != data.writes[0].path {
         return false;
     }
-    data.reads[0].found
+    data.reads[0].version.is_some()
 }
 
 fn same_version_after_lock(v: &Version, meta: &Metadata) -> bool {
@@ -251,14 +341,26 @@ fn same_version_after_lock(v: &Version, meta: &Metadata) -> bool {
 fn to_log(id: TxId, writes: &[WriteAccess]) -> TxLog {
     let mut tl = TxLog::new(id, glassdb_storage::TxCommitStatus::Ok);
     for w in writes {
+        let (value, deleted) = match &w.op {
+            WriteOp::Put(value) => (value.clone(), false),
+            WriteOp::Delete => (Vec::new(), true),
+        };
         tl.writes.push(TxWrite {
             path: w.path.to_string(),
-            value: w.val.clone(),
-            deleted: w.delete,
+            value,
+            deleted,
             prev_writer: TxId::default(),
         });
     }
     tl
+}
+
+fn write_access_from_value(path: Arc<str>, value: Vec<u8>, deleted: bool) -> WriteAccess {
+    if deleted {
+        WriteAccess::delete(path)
+    } else {
+        WriteAccess::put(path, value)
+    }
 }
 
 fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransError> {
@@ -271,8 +373,12 @@ fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransErr
         // create-or-write path directly, instead of first attempting a write
         // lock (a wasted metadata read that returns not-found for a new key)
         // and only then retrying under a collection lock.
-        let blind_write = info.write && !info.read;
-        if !info.not_found && !info.delete && info.result != VResult::NeedsCLock && !blind_write {
+        let blind_write = info.has_write() && !info.has_read();
+        if !info.read_not_found()
+            && !info.write_deletes()
+            && info.result != VResult::NeedsCLock
+            && !blind_write
+        {
             // Only not-found, deleted, and blind-write items require collection
             // locks.
             continue;
@@ -284,11 +390,11 @@ fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransErr
                 info.path
             )));
         }
-        if info.write {
+        if info.has_write() {
             locks.insert(pr.prefix.clone(), LockType::Write);
             continue;
         }
-        if !info.read {
+        if !info.has_read() {
             continue;
         }
         if let Some(LockType::Write) = locks.get(&pr.prefix) {
@@ -369,8 +475,7 @@ impl Algo {
             data: d,
             status: Status::New,
             id,
-            require_locks: false,
-            serial_locking: false,
+            mode: CommitMode::Fast,
         }
     }
 
@@ -383,8 +488,7 @@ impl Algo {
             id: old.id.renew(),
             data: old.data,
             status: Status::New,
-            require_locks: false,
-            serial_locking: false,
+            mode: CommitMode::Fast,
         }
     }
 
@@ -488,7 +592,7 @@ impl Algo {
     /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
     /// future is dropped mid-flight so [`Algo::end`] never ran. Synchronous:
     /// schedules a spawned task on the background executor and returns
-    /// immediately. `DB::shutdown` waits for the spawned task to write the
+    /// immediately. `Database::shutdown` waits for the spawned task to write the
     /// Aborted log entry. If it fails, the transaction's locks linger until
     /// lease expiry, exactly the behaviour we'd have without this method.
     /// Idempotent (a transaction that already finalized is a no-op in
@@ -509,7 +613,7 @@ impl Algo {
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
-        if tx.require_locks {
+        if tx.mode != CommitMode::Fast {
             return self.validate_read_write(vstate, tx).await;
         }
         if tx.data.writes.is_empty() {
@@ -528,7 +632,7 @@ impl Algo {
             match self.commit_single_rw(tx).await {
                 Err(TransError::NoSingleWrite) | Err(TransError::Retry) => {
                     // Fall back to regular validation, acquiring locks early.
-                    tx.require_locks = true;
+                    tx.mode = CommitMode::Locked;
                     return Err(TransError::ValidateRetry);
                 }
                 other => return other,
@@ -542,14 +646,14 @@ impl Algo {
         vstate: &mut ValidationState,
         tx: &mut Handle,
     ) -> Result<(), TransError> {
-        if tx.serial_locking {
+        if tx.mode == CommitMode::Serial {
             return self.serial_validate(vstate, tx).await;
         }
         match self.parallel_validate(vstate, tx).await {
             Ok(()) => Ok(()),
             Err(TransError::LockTimeout) => {
                 // Most likely deadlocked: restart with serialized locking.
-                tx.serial_locking = true;
+                tx.mode = CommitMode::Serial;
                 let held = self.locker.locked_paths(&tx.id);
                 tracing::debug!(
                     target: "glassdb::algo",
@@ -567,6 +671,10 @@ impl Algo {
     async fn commit_single_rw(&self, tx: &mut Handle) -> Result<(), TransError> {
         let read = tx.data.reads[0].clone();
         let write = tx.data.writes[0].clone();
+        let read_version = read
+            .version
+            .as_ref()
+            .expect("single read-write fast path requires a found read");
 
         let mut meta = match self.reader.get_metadata(&read.path, MAX_STALE).await {
             Ok(m) => m,
@@ -581,10 +689,10 @@ impl Algo {
 
         // Try validating twice without retrying the whole transaction.
         for _ in 0..2 {
-            if let Err(e) = self.check_read_version_unlocked(&read.version, &meta) {
+            if let Err(e) = self.check_read_version_unlocked(read_version, &meta) {
                 if e.is_retry() {
                     self.local
-                        .mark_value_outdated(&write.path, read.version.to_storage_version());
+                        .mark_value_outdated(&write.path, read_version.to_storage_version());
                 }
                 return Err(e);
             }
@@ -592,9 +700,15 @@ impl Algo {
             let update = glassdb_storage::LockUpdate {
                 typ: LockType::None,
                 writer: tx.id.clone(),
-                value: TValue {
-                    value: write.val.clone(),
-                    ..Default::default()
+                value: match &write.op {
+                    WriteOp::Put(value) => TValue {
+                        value: value.clone(),
+                        ..Default::default()
+                    },
+                    WriteOp::Delete => TValue {
+                        deleted: true,
+                        ..Default::default()
+                    },
                 },
                 ..Default::default()
             };
@@ -622,7 +736,7 @@ impl Algo {
 
         // We keep getting raced against; do regular validations from now on.
         self.local
-            .mark_value_outdated(&read.path, read.version.to_storage_version());
+            .mark_value_outdated(&read.path, read_version.to_storage_version());
         Err(TransError::Retry)
     }
 
@@ -637,7 +751,7 @@ impl Algo {
             .run_indexed(n, |i| {
                 let mut item = paths[i].clone();
                 async move {
-                    if item.not_found {
+                    if item.read_not_found() {
                         self.validate_read_not_found(&mut item).await?;
                     } else {
                         self.validate_read(&mut item).await?;
@@ -656,7 +770,7 @@ impl Algo {
         let res = vstate.outcome();
         if let Err(TransError::Retry) = &res {
             // Avoid retrying too often: do regular validation after locking.
-            tx.require_locks = true;
+            tx.mode = CommitMode::Locked;
         }
         res
     }
@@ -670,7 +784,7 @@ impl Algo {
             }
             Err(e) => return Err(e.into()),
         };
-        let read_from = item.read_version.writer.clone();
+        let read_from = item.read_version().writer.clone();
         let li = tags_lock_info(&meta.tags)?;
 
         if li.typ == LockType::None || li.typ == LockType::Read {
@@ -710,14 +824,7 @@ impl Algo {
                     expected_writer = li.last_writer.clone();
                 } else if v.value.deleted {
                     item.result = VResult::Retry;
-                    self.update_local(
-                        &WriteAccess {
-                            path: item.path.clone(),
-                            val: v.value.value,
-                            delete: true,
-                        },
-                        &locker,
-                    );
+                    self.update_local(&WriteAccess::delete(item.path.clone()), &locker);
                     return Ok(());
                 } else {
                     expected_writer = locker.clone();
@@ -746,7 +853,7 @@ impl Algo {
                 Ok(v) => v,
                 Err(_) => {
                     self.local
-                        .mark_value_outdated(&item.path, item.read_version.clone());
+                        .mark_value_outdated(&item.path, item.read_version_for_invalidation());
                     return Ok(());
                 }
             },
@@ -757,7 +864,7 @@ impl Algo {
                 Ok(v) => v,
                 Err(_) => {
                     self.local
-                        .mark_value_outdated(&item.path, item.read_version.clone());
+                        .mark_value_outdated(&item.path, item.read_version_for_invalidation());
                     return Ok(());
                 }
             };
@@ -774,16 +881,12 @@ impl Algo {
             // losing an update. Instead, invalidate the stale cached value so the
             // retry re-reads the authoritative one straight from storage.
             self.local
-                .mark_value_outdated(&item.path, item.read_version.clone());
+                .mark_value_outdated(&item.path, item.read_version_for_invalidation());
             return Ok(());
         }
 
         self.update_local(
-            &WriteAccess {
-                path: item.path.clone(),
-                val: ev.value.value,
-                delete: ev.value.deleted,
-            },
+            &write_access_from_value(item.path.clone(), ev.value.value, ev.value.deleted),
             &expected_writer,
         );
         Ok(())
@@ -836,11 +939,7 @@ impl Algo {
         // just retry and let the next read fetch the authoritative value.
         if v.status == glassdb_storage::TxCommitStatus::Ok && !v.value.not_written {
             self.update_local(
-                &WriteAccess {
-                    path: item.path.clone(),
-                    val: v.value.value,
-                    delete: v.value.deleted,
-                },
+                &write_access_from_value(item.path.clone(), v.value.value, v.value.deleted),
                 &last_writer,
             );
         }
@@ -1029,7 +1128,7 @@ impl Algo {
         if item.result == VResult::Ok {
             return Ok(());
         }
-        if item.not_found {
+        if item.read_not_found() {
             return self.lock_validate_not_found_key(item, tx).await;
         }
         // A blind write (write with no prior read) has unknown existence. Take
@@ -1039,7 +1138,7 @@ impl Algo {
         // front by `collections_locks`. This avoids the wasted write-lock
         // attempt (and its not-found metadata read) on keys that must be
         // created.
-        if item.write && !item.read {
+        if item.has_write() && !item.has_read() {
             return self.lock_validate_not_found_key(item, tx).await;
         }
         self.lock_validate_found_key(item, tx).await
@@ -1050,9 +1149,9 @@ impl Algo {
         item: &mut PathState,
         tx: &Handle,
     ) -> Result<(), TransError> {
-        let lock_res = if item.write {
+        let lock_res = if item.has_write() {
             self.locker.lock_write(&item.path, &tx.id).await
-        } else if item.read {
+        } else if item.has_read() {
             self.locker.lock_read(&item.path, &tx.id).await
         } else {
             Ok(())
@@ -1060,11 +1159,11 @@ impl Algo {
 
         if let Err(e) = lock_res {
             if e.is_not_found() {
-                if item.read {
+                if item.has_read() {
                     item.result = VResult::Retry;
                     return Ok(());
                 }
-                item.not_found = true;
+                item.mark_not_found();
                 if self.is_key_collection_locked(&item.path, LockType::Write, tx) {
                     return self.lock_validate_not_found_key(item, tx).await;
                 }
@@ -1073,13 +1172,13 @@ impl Algo {
             }
             return Err(TransError::Other(format!("failed locking: {e}")));
         }
-        if !item.read {
+        if !item.has_read() {
             item.result = VResult::Ok;
             return Ok(());
         }
 
         let meta = self.reader.get_metadata(&item.path, MAX_STALE).await?;
-        if !same_version_after_lock(&item.read_version, &meta) {
+        if !same_version_after_lock(item.read_version(), &meta) {
             item.result = VResult::Retry;
             return Ok(());
         }
@@ -1092,7 +1191,7 @@ impl Algo {
         item: &mut PathState,
         tx: &Handle,
     ) -> Result<(), TransError> {
-        if item.read && item.write {
+        if item.has_read() && item.has_write() {
             match self.locker.lock_create(&item.path, &tx.id).await {
                 Ok(()) => {
                     item.result = VResult::Ok;
@@ -1104,7 +1203,7 @@ impl Algo {
                 }
                 Err(e) => Err(e),
             }
-        } else if item.read && !item.write {
+        } else if item.has_read() && !item.has_write() {
             match self.global.get_metadata(&item.path).await {
                 Err(e) if e.is_not_found() => {
                     item.result = VResult::Ok;
@@ -1126,7 +1225,7 @@ impl Algo {
                     }
                 }
             }
-        } else if item.write {
+        } else if item.has_write() {
             match self.locker.lock_create(&item.path, &tx.id).await {
                 Ok(()) => {
                     item.result = VResult::Ok;
@@ -1161,7 +1260,7 @@ impl Algo {
         for ps in &vstate.paths {
             if ps.result == VResult::Retry {
                 self.local
-                    .mark_value_outdated(&ps.path, ps.read_version.clone());
+                    .mark_value_outdated(&ps.path, ps.read_version_for_invalidation());
             }
         }
     }
@@ -1181,10 +1280,9 @@ impl Algo {
             b: backend::Version::default(),
             writer: tid.clone(),
         };
-        if w.delete {
-            self.local.mark_deleted(&w.path, version);
-        } else {
-            self.local.write(&w.path, w.val.clone(), version);
+        match &w.op {
+            WriteOp::Put(value) => self.local.write(&w.path, value.clone(), version),
+            WriteOp::Delete => self.local.mark_deleted(&w.path, version),
         }
     }
 
@@ -1233,8 +1331,7 @@ impl Algo {
                 data: Data::default(),
                 status: Status::Committed,
                 id: tid.clone(),
-                require_locks: false,
-                serial_locking: false,
+                mode: CommitMode::Fast,
             };
             // Bound the cleanup with a sleep-based watchdog: when it elapses
             // the `select!` drops the `run_limited` future, which in turn
@@ -1403,36 +1500,32 @@ mod tests {
     }
 
     fn wa(path: &str, val: &[u8]) -> WriteAccess {
-        WriteAccess {
-            path: path.into(),
-            val: val.to_vec(),
-            delete: false,
-        }
+        WriteAccess::put(path.into(), val.to_vec())
     }
 
     fn wdel(path: &str) -> WriteAccess {
-        WriteAccess {
+        WriteAccess::delete(path.into())
+    }
+
+    fn ra_found(path: &str, last_writer: TxId) -> ReadAccess {
+        ReadAccess {
             path: path.into(),
-            val: Vec::new(),
-            delete: true,
+            version: Some(ReadVersion { last_writer }),
+        }
+    }
+
+    fn ra_not_found(path: &str) -> ReadAccess {
+        ReadAccess {
+            path: path.into(),
+            version: None,
         }
     }
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(tctx.local.clone(), tctx.global.clone(), tctx.tmon.clone());
         match reader.read(path, MAX_STALENESS).await {
-            Ok(rv) => ReadAccess {
-                path: path.into(),
-                version: ReadVersion {
-                    last_writer: rv.version.writer,
-                },
-                found: true,
-            },
-            Err(e) if e.is_not_found() => ReadAccess {
-                path: path.into(),
-                version: ReadVersion::default(),
-                found: false,
-            },
+            Ok(rv) => ra_found(path, rv.version.writer),
+            Err(e) if e.is_not_found() => ra_not_found(path),
             Err(e) => panic!("reading {path}: {e:?}"),
         }
     }
@@ -1518,11 +1611,7 @@ mod tests {
         let val = b"v";
 
         let mut h = tm.begin(Data {
-            reads: vec![ReadAccess {
-                path: keyp.as_str().into(),
-                version: ReadVersion::default(),
-                found: false,
-            }],
+            reads: vec![ra_not_found(&keyp)],
             writes: vec![wa(&keyp, val)],
         });
         tm.commit(&mut h).await.unwrap();
@@ -1546,13 +1635,7 @@ mod tests {
         let gr = tctx.global.read(&keyp).await.unwrap();
 
         let mut h = tm.begin(Data {
-            reads: vec![ReadAccess {
-                path: keyp.as_str().into(),
-                version: ReadVersion {
-                    last_writer: gr.version.writer,
-                },
-                found: true,
-            }],
+            reads: vec![ra_found(&keyp, gr.version.writer)],
             writes: vec![wa(&keyp, val)],
         });
         tm.commit(&mut h).await.unwrap();
@@ -1575,13 +1658,7 @@ mod tests {
         let gr = tctx.global.read(&keyp).await.unwrap();
 
         let mut h = tm.begin(Data {
-            reads: vec![ReadAccess {
-                path: keyp.as_str().into(),
-                version: ReadVersion {
-                    last_writer: gr.version.writer,
-                },
-                found: true,
-            }],
+            reads: vec![ra_found(&keyp, gr.version.writer)],
             writes: vec![wa(&keyp, val)],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
@@ -1591,13 +1668,7 @@ mod tests {
         tm.reset(
             &mut h,
             Data {
-                reads: vec![ReadAccess {
-                    path: keyp.as_str().into(),
-                    version: ReadVersion {
-                        last_writer: gr.version.writer,
-                    },
-                    found: true,
-                }],
+                reads: vec![ra_found(&keyp, gr.version.writer)],
                 writes: vec![wa(&keyp, val)],
             },
         );
@@ -1625,13 +1696,7 @@ mod tests {
         let gr = tctx.global.read(&keyp).await.unwrap();
 
         let mut h = tm.begin(Data {
-            reads: vec![ReadAccess {
-                path: keyp.as_str().into(),
-                version: ReadVersion {
-                    last_writer: gr.version.writer,
-                },
-                found: true,
-            }],
+            reads: vec![ra_found(&keyp, gr.version.writer)],
             writes: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
@@ -1728,7 +1793,7 @@ mod tests {
         commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
 
         let ra = do_read(&tctx, &keyp).await;
-        assert!(ra.found);
+        assert!(ra.version.is_some());
 
         // Modify the value from another algo as a single-RW transaction.
         commit_access(
@@ -1776,7 +1841,7 @@ mod tests {
 
         // 2. The victim reads k, caching v0@W0 in its local storage.
         let ra0 = do_read(&tctx_v, &key).await;
-        assert!(ra0.found);
+        assert!(ra0.version.is_some());
 
         // 3. The writer overwrites k=v1 through the single-RW fast path.
         let ra_w = do_read(&tctx_w, &key).await;
@@ -2000,7 +2065,7 @@ mod tests {
         assert!(err.is_retry(), "expected retry, got {err:?}");
 
         let ra2 = do_read(&tctx, &keyp).await;
-        assert_eq!(ra2.version.last_writer, *wh.id());
+        assert_eq!(ra2.version.as_ref().unwrap().last_writer, *wh.id());
     }
 
     /// Variant of [`new_algo_from_backend`] that wires a real [`Background`]
