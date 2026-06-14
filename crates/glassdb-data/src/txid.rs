@@ -56,29 +56,29 @@ impl TxId {
     /// [`TxId::new_at`] with a clock-sourced timestamp; this constructor is for
     /// callers (mostly tests) that only need a unique identifier.
     pub fn new_random() -> Self {
-        let mut b = [0u8; TX_ID_LEN];
+        let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b);
-        TxId(Arc::from(&b[..]))
+        TxId(b.into())
     }
 
     /// Builds a transaction ID from a random prefix and an explicit UnixNano
     /// timestamp, which determines its wound-wait priority.
     pub fn new_at(unix_nanos: u64) -> Self {
-        let mut b = [0u8; TX_ID_LEN];
+        let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
-        TxId(Arc::from(&b[..]))
+        TxId(b.into())
     }
 
     /// Builds a transaction ID from an explicit timestamp and random prefix.
     /// Meant for tests that need deterministic priorities. At most the first 8
     /// bytes of `prefix` are used.
     pub fn with_priority(unix_nanos: u64, prefix: &[u8]) -> Self {
-        let mut b = [0u8; TX_ID_LEN];
+        let mut b = vec![0u8; TX_ID_LEN];
         let n = prefix.len().min(TX_ID_TS_OFF);
         b[..n].copy_from_slice(&prefix[..n]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
-        TxId(Arc::from(&b[..]))
+        TxId(b.into())
     }
 
     /// Returns a transaction ID that preserves the priority (timestamp) of
@@ -86,10 +86,10 @@ impl TxId {
     /// priority on restart to avoid starvation, while the new prefix gives it a
     /// distinct log object that lands in a different storage partition.
     pub fn renew(&self) -> Self {
-        let mut b = [0u8; TX_ID_LEN];
+        let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
-        TxId(Arc::from(&b[..]))
+        TxId(b.into())
     }
 
     /// Reports whether `self` has strictly higher priority than `other`, i.e. it
@@ -122,17 +122,6 @@ impl TxId {
     pub fn from_bytes(b: impl Into<Vec<u8>>) -> Self {
         let v: Vec<u8> = b.into();
         TxId(v.into())
-    }
-
-    /// Wraps a byte slice as a transaction ID in a single allocation.
-    ///
-    /// Unlike [`TxId::from_bytes`] (which takes an owned `Vec` and so cannot
-    /// reuse it - `Vec<u8> -> Arc<[u8]>` must copy into a freshly refcounted
-    /// allocation), this copies the slice straight into the `Arc`. Callers that
-    /// already hold a borrowed buffer (e.g. a base64 decode into a stack array)
-    /// avoid the intermediate `Vec` allocation.
-    pub fn from_slice(b: &[u8]) -> Self {
-        TxId(Arc::from(b))
     }
 
     /// Returns the raw bytes of the ID.

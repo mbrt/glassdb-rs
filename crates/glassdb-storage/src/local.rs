@@ -137,41 +137,34 @@ impl Local {
 
     /// Reads the cached value, if present and not staler than `max_stale`.
     pub fn read(&self, key: &str, max_stale: Duration) -> Option<LocalRead> {
-        // Clone only the value half of the entry under the cache lock; the
-        // metadata half (an `Arc` + decoded writer) is irrelevant to a value
-        // read, so projecting avoids touching it.
-        self.cache.get_with(key, |e| {
-            let outdated = e.is_value_outdated();
-            let v = e.v.as_ref()?;
-            if is_stale(v.updated, max_stale) {
-                return None;
-            }
-            Some(LocalRead {
-                value: v.value.clone(),
-                version: v.version.clone(),
-                deleted: v.deleted,
-                outdated,
-            })
-        })?
+        // `cache.get` already hands back an owned (cloned) entry, so move the
+        // value and version out of it instead of cloning them a second time.
+        let e = self.cache.get(key)?;
+        let outdated = e.is_value_outdated();
+        let v = e.v?;
+        if is_stale(v.updated, max_stale) {
+            return None;
+        }
+        Some(LocalRead {
+            value: v.value,
+            version: v.version,
+            deleted: v.deleted,
+            outdated,
+        })
     }
 
     /// Reads the cached metadata, if present and not staler than `max_stale`.
     pub fn get_meta(&self, key: &str, max_stale: Duration) -> Option<LocalMetadata> {
-        // Clone only the metadata (a cheap `Arc` bump). The previous
-        // `cache.get` deep-cloned the whole entry, copying the value bytes just
-        // to drop them here; metadata reads happen on every read validation, so
-        // that copy was pure waste.
-        self.cache.get_with(key, |e| {
-            let outdated = e.is_meta_outdated();
-            let m = e.m.as_ref()?;
-            if is_stale(m.updated, max_stale) {
-                return None;
-            }
-            Some(LocalMetadata {
-                m: m.meta.clone(),
-                outdated,
-            })
-        })?
+        let e = self.cache.get(key)?;
+        let outdated = e.is_meta_outdated();
+        let m = e.m?;
+        if is_stale(m.updated, max_stale) {
+            return None;
+        }
+        Some(LocalMetadata {
+            m: m.meta,
+            outdated,
+        })
     }
 
     /// Stores both the value and its metadata atomically.
@@ -207,32 +200,35 @@ impl Local {
             version: v,
             updated: Instant::now(),
         };
-        // Mutate in place: keeps any existing metadata, and avoids cloning the
-        // previous entry / re-allocating the key string.
-        self.cache
-            .modify(key, move |entry| entry.v = Some(new_value));
+        self.cache.update(key, move |old| match old {
+            None => Some(CacheEntry {
+                v: Some(new_value),
+                m: None,
+            }),
+            Some(mut entry) => {
+                entry.v = Some(new_value);
+                Some(entry)
+            }
+        });
     }
 
     /// Updates only the metadata for `key`.
     pub fn set_meta(&self, key: &str, meta: Arc<Metadata>) {
-        let updated = Instant::now();
-        self.cache.modify(key, move |entry| {
-            // Reuse the previously decoded last-writer when the object's CAS
-            // version is unchanged. The version changes on every tag mutation,
-            // so an equal version implies identical tags and thus the same
-            // last-writer; this skips a base64 `TxId` decode on every
-            // read-validation metaRead of an unchanged object (the common case
-            // for read-heavy workloads, where the same keys are validated each
-            // transaction).
-            let writer = match &entry.m {
-                Some(old) if old.meta.version == meta.version => old.writer.clone(),
-                _ => last_writer_from_tags(&meta.tags),
-            };
-            entry.m = Some(CacheMeta {
-                meta,
-                writer,
-                updated,
-            });
+        let writer = last_writer_from_tags(&meta.tags);
+        let new_meta = CacheMeta {
+            meta,
+            writer,
+            updated: Instant::now(),
+        };
+        self.cache.update(key, move |old| match old {
+            None => Some(CacheEntry {
+                v: None,
+                m: Some(new_meta),
+            }),
+            Some(mut entry) => {
+                entry.m = Some(new_meta);
+                Some(entry)
+            }
         });
     }
 
@@ -260,8 +256,16 @@ impl Local {
             version: v,
             updated: Instant::now(),
         };
-        self.cache
-            .modify(key, move |entry| entry.v = Some(new_value));
+        self.cache.update(key, move |old| match old {
+            None => Some(CacheEntry {
+                v: Some(new_value),
+                m: None,
+            }),
+            Some(mut entry) => {
+                entry.v = Some(new_value);
+                Some(entry)
+            }
+        });
     }
 
     /// Removes `key` entirely.

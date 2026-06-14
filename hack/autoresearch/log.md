@@ -1253,3 +1253,75 @@ Budget complete: 25 experiments run (the full budget), all logged above.
   being to attribute an aggregate delta to a specific deterministic per-workload
   mechanism before trusting it over run-to-run noise.
 
+---
+
+# Post-session review: reverts
+
+A human review after session 2 reverted a subset of the kept experiments. The
+rationale: the **primary** score (weighted backend-op count per txn) is the only
+metric that maps to production, where GCS/S3 latency is dominated by
+object-storage round-trips. The **secondary** axes (`allocsPerTx`/`cpuNsPerTx`)
+are measured against the *in-memory* backend and, as `README.md` notes, "reflect
+CPU/alloc cost, not the object-storage round-trips that dominate in production".
+Only exp1 and exp2 moved the primary; every other kept experiment was
+"primary flat" - pure in-memory allocation tuning with no production benefit
+(confirmed for the cloud backends: e.g. exp26/exp33 only add `Arc::new(..)`/
+`.to_string()` at the S3/GCS boundaries, which still parse fresh tags/tokens per
+call). The reverts target the allocation-only changes that *also* added code
+complexity, parallel/duplicated internal APIs, special-case fast paths, or only
+optimized the bench/test backend - i.e. things that traded legibility for a
+benchmark number that does not translate to production.
+
+## Reverted (13)
+- **exp3** - commit-path `Data`-clone removal. Restored `rebegin(&old, data)` and
+  the `commit` writes clone; reverting also re-collapses the `begin/reset` match
+  the change had duplicated into both retry-loop arms, so `db.rs` is simpler.
+- **exp10** - validation-state two-pointer merge. Restored the
+  `HashMap`+sort `init_validation`; the merge coupled validation to a
+  sorted-unique invariant from `collect_accesses`, fragile for a per-tx alloc.
+- **exp13** - in-place cache writes. Removed `Cache::modify`/`Shard::modify` (a
+  third near-duplicate of `set`/`update`); restored `set`->`update` delegation
+  and the `cache.update` write paths.
+- **exp16** - `run_limited` `num==1` fast path. Removed the special-case branch
+  in a concurrency primitive (saved only `FuturesUnordered` boxing, irrelevant
+  vs a network round-trip).
+- **exp19** - single-allocation path build. Removed `base64::encode_into`;
+  restored the two-allocation `prefix_encode`.
+- **exp20** - log-marshal `parse_ref`. Removed `paths::parse_ref`/`ParseRef` and
+  `coll_entry`; restored `paths::parse` + `gopath::join`. The borrowed-suffix
+  trick relied on a subtle "base64 alphabet has no `/`" coupling.
+- **exp25** - single-alloc tag decode. Removed `TxId::from_slice` and the
+  stack-buffer+heap-fallback `tag_to_tid`; restored the plain allocating decode.
+- **exp27** - allocation-free read-validation. Removed the parallel
+  `tags_lock_type`/`tag_matches_tid` helpers and the second code path through the
+  serializability-critical `validate_read`; restored the single `tags_lock_info`
+  path. Highest legibility cost of the set.
+- **exp29** - cache projection. Removed `Cache::get_with`; restored the
+  move-out-on-read `Local::read`/`get_meta` (the kept exp6 form).
+- **exp31** - stack-buffer `TxId` mint. Restored the `vec![0u8; ..]` constructors
+  (this was discarded as exp24, then re-kept only after denominators shrank).
+- **exp35** - memory-backend CAS-token cache. Reward hacking: it caches state
+  *only* on the in-memory `MemoryBackend` (test/bench backend); production S3/GCS
+  gain nothing, and it had already caused a double-mint regression once.
+- **exp36** - skip last-writer re-decode. Removed the version-equality
+  short-circuit added to the cache write path.
+- **exp37** - `encode_lockers` arities. The same lone-join micro-opt discarded as
+  exp4/exp11/exp28 (sub-noise three times), kept on the fourth try; restored the
+  `map/collect/join` form.
+
+## Kept
+- **exp1, exp2** - the only true production wins (fewer backend round-trips;
+  primary -3.4% / -3.9%).
+- The idiomatic `Arc`-sharing of immutable, pervasively-cloned types - exp5
+  (cache metadata), exp8 (`TxId`), exp9 (access paths), exp26 (backend tags),
+  exp33 (version token), exp34 (object value, whose multi-copy elimination has
+  general-case merit for large values) - and trivially-clean refactors with no
+  new API surface: exp14 (borrow `TxLog`), exp17 (`is_complete` via containment),
+  exp22 (unify `Tx` maps), exp32 (`TxId`-keyed monitor maps), exp6/exp7.
+
+Verification after the reverts: `make format` (clean), `make test`
+(fmt + `clippy -D warnings` + full suite), and `make test-sim` (determinism /
+serializability self-checks incl. `concurrent_sim`) all pass. The kept `Arc`
+types were preserved throughout, so the reverts are pure complexity removal with
+byte-identical behaviour.
+

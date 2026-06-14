@@ -13,7 +13,7 @@ use crate::{
     LAST_WRITER_TAG,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Object {
     data: Vec<u8>,
     // Shared so `get_metadata` returns it with a refcount bump; mutated
@@ -21,47 +21,23 @@ struct Object {
     tags: Arc<Tags>,
     gen: i64,
     metagen: i64,
-    // The cached `gen/metagen` CAS token. The token only changes when `gen` or
-    // `metagen` change (on a write or tag update), but `version()` is called on
-    // every read, metadata fetch, and version comparison; caching it makes those
-    // a refcount bump instead of minting a fresh `Arc<str>` each time.
-    token: Arc<str>,
 }
 
 impl Object {
-    /// Mints the `gen/metagen` token straight into an `Arc<str>` via a stack
-    /// buffer, so it is one allocation (the Arc) rather than a `String` followed
-    /// by an `Arc` copy. Two i64s plus a separator never exceed this buffer.
-    fn mint_token(gen: i64, metagen: i64) -> Arc<str> {
+    fn version(&self) -> Version {
+        // Format the `gen/metagen` token straight into the `Arc<str>` via a stack
+        // buffer, so minting a version is one allocation (the Arc) rather than a
+        // `String` followed by an `Arc` copy. Two i64s plus a separator never
+        // exceed this buffer.
         use std::io::Write;
         let mut buf = [0u8; 48];
         let n = {
             let mut cur = &mut buf[..];
-            let _ = write!(cur, "{gen}/{metagen}");
+            let _ = write!(cur, "{}/{}", self.gen, self.metagen);
             48 - cur.len()
         };
-        Arc::from(std::str::from_utf8(&buf[..n]).expect("ascii token"))
-    }
-
-    /// Recomputes the cached token after a `gen`/`metagen` change.
-    fn refresh_token(&mut self) {
-        self.token = Self::mint_token(self.gen, self.metagen);
-    }
-
-    fn version(&self) -> Version {
-        Version::new(self.token.clone())
-    }
-}
-
-impl Default for Object {
-    fn default() -> Self {
-        Object {
-            data: Vec::new(),
-            tags: Arc::default(),
-            gen: 0,
-            metagen: 0,
-            token: Object::mint_token(0, 0),
-        }
+        let s = std::str::from_utf8(&buf[..n]).expect("ascii token");
+        Version::new(s)
     }
 }
 
@@ -113,16 +89,12 @@ impl State {
             tags.insert(k.clone(), v.clone());
         }
         obj.metagen += 1;
-        // The token is refreshed by the caller (`update_data` for writes, or
-        // `set_tags_if` directly) so a write that updates both tags and data
-        // mints the token once, not twice.
     }
 
     fn update_data(&mut self, obj: &mut Object, d: Vec<u8>) {
         obj.data = d;
         obj.gen = self.next_generation();
         obj.metagen = 1;
-        obj.refresh_token();
     }
 }
 
@@ -191,7 +163,6 @@ impl Backend for MemoryBackend {
             return Err(BackendError::Precondition);
         }
         State::update_tags(&mut obj, &tags);
-        obj.refresh_token();
         let meta = Metadata {
             tags: obj.tags.clone(),
             version: obj.version(),
