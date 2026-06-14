@@ -10,7 +10,7 @@ use crate::error::Error;
 pub struct KeysIter {
     items: std::vec::IntoIter<String>,
     prefix: String,
-    err: Option<Error>,
+    done: bool,
 }
 
 impl KeysIter {
@@ -18,34 +18,34 @@ impl KeysIter {
         KeysIter {
             items: items.into_iter(),
             prefix: String::new(),
-            err: None,
+            done: false,
         }
-    }
-
-    /// Returns the first error encountered during iteration, if any.
-    pub fn err(&self) -> Option<&Error> {
-        self.err.as_ref()
     }
 }
 
 impl Iterator for KeysIter {
-    type Item = Vec<u8>;
+    type Item = Result<Vec<u8>, Error>;
 
-    fn next(&mut self) -> Option<Vec<u8>> {
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
         let backend_path = self.items.next()?;
         if self.prefix.is_empty() {
             match paths::parse(&backend_path) {
                 Ok(r) if r.typ == paths::Type::Key => self.prefix = format!("{}/", r.prefix),
                 Ok(r) => {
-                    self.err = Some(Error::Other(format!(
+                    self.done = true;
+                    return Some(Err(Error::Internal(format!(
                         "got path type {:?}, expected Key",
                         r.typ
-                    )));
-                    return None;
+                    ))));
                 }
                 Err(e) => {
-                    self.err = Some(Error::Other(format!("parsing path {backend_path:?}: {e}")));
-                    return None;
+                    self.done = true;
+                    return Some(Err(Error::Internal(format!(
+                        "parsing path {backend_path:?}: {e}"
+                    ))));
                 }
             }
         }
@@ -53,10 +53,10 @@ impl Iterator for KeysIter {
             .strip_prefix(&self.prefix)
             .unwrap_or(&backend_path);
         match paths::to_key(trimmed) {
-            Ok(k) => Some(k),
+            Ok(k) => Some(Ok(k)),
             Err(e) => {
-                self.err = Some(Error::Other(e.to_string()));
-                None
+                self.done = true;
+                Some(Err(Error::Internal(e.to_string())))
             }
         }
     }
@@ -66,7 +66,7 @@ impl Iterator for KeysIter {
 pub struct CollectionsIter {
     items: std::vec::IntoIter<String>,
     prefix: String,
-    err: Option<Error>,
+    done: bool,
 }
 
 impl CollectionsIter {
@@ -74,20 +74,18 @@ impl CollectionsIter {
         CollectionsIter {
             items: items.into_iter(),
             prefix: String::new(),
-            err: None,
+            done: false,
         }
-    }
-
-    /// Returns the first error encountered during iteration, if any.
-    pub fn err(&self) -> Option<&Error> {
-        self.err.as_ref()
     }
 }
 
 impl Iterator for CollectionsIter {
-    type Item = Vec<u8>;
+    type Item = Result<Vec<u8>, Error>;
 
-    fn next(&mut self) -> Option<Vec<u8>> {
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
         let backend_path = self.items.next()?;
         // Listing directories can produce a trailing slash; remove it.
         let backend_path = backend_path.trim_end_matches('/').to_string();
@@ -95,15 +93,17 @@ impl Iterator for CollectionsIter {
             match paths::parse(&backend_path) {
                 Ok(r) if r.typ == paths::Type::Collection => self.prefix = format!("{}/", r.prefix),
                 Ok(r) => {
-                    self.err = Some(Error::Other(format!(
+                    self.done = true;
+                    return Some(Err(Error::Internal(format!(
                         "got path type {:?}, expected Collection",
                         r.typ
-                    )));
-                    return None;
+                    ))));
                 }
                 Err(e) => {
-                    self.err = Some(Error::Other(format!("parsing path {backend_path:?}: {e}")));
-                    return None;
+                    self.done = true;
+                    return Some(Err(Error::Internal(format!(
+                        "parsing path {backend_path:?}: {e}"
+                    ))));
                 }
             }
         }
@@ -111,10 +111,10 @@ impl Iterator for CollectionsIter {
             .strip_prefix(&self.prefix)
             .unwrap_or(&backend_path);
         match paths::to_collection(trimmed) {
-            Ok(c) => Some(c),
+            Ok(c) => Some(Ok(c)),
             Err(e) => {
-                self.err = Some(Error::Other(e.to_string()));
-                None
+                self.done = true;
+                Some(Err(Error::Internal(e.to_string())))
             }
         }
     }

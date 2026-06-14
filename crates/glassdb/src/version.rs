@@ -25,7 +25,7 @@ pub(crate) async fn check_or_create_db_meta(b: &Arc<dyn Backend>, name: &str) ->
             // We raced against another instance; re-check the metadata.
             check_db_version(b, name).await
         }
-        Err(e) => Err(Error::Other(format!("creating db metadata: {e}"))),
+        Err(e) => Err(Error::Internal(format!("creating db metadata: {e}"))),
     }
 }
 
@@ -38,7 +38,7 @@ async fn check_db_version(b: &Arc<dyn Backend>, name: &str) -> Result<(), Error>
         .map(String::as_str)
         .unwrap_or("");
     if got != DB_VERSION {
-        return Err(Error::Other(format!(
+        return Err(Error::Internal(format!(
             "got db version {got:?}, expected {DB_VERSION:?}"
         )));
     }

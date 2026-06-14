@@ -30,7 +30,7 @@ impl Collection {
     }
 
     /// Reads the value for `key` with strong (serializable) consistency.
-    pub async fn read_strong(&self, key: &[u8]) -> Result<Vec<u8>, Error> {
+    pub async fn read(&self, key: &[u8]) -> Result<Vec<u8>, Error> {
         let res: Option<Vec<u8>> = self
             .db
             .tx(|tx| async move {
@@ -46,7 +46,7 @@ impl Collection {
     }
 
     /// Reads the value for `key` allowing stale results up to `max_staleness`.
-    pub async fn read_weak(&self, key: &[u8], max_staleness: Duration) -> Result<Vec<u8>, Error> {
+    pub async fn read_stale(&self, key: &[u8], max_staleness: Duration) -> Result<Vec<u8>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
             self.db.local.clone(),

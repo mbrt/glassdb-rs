@@ -44,7 +44,7 @@ impl Global {
         if let Some(e) = self.local.read(key, MAX_STALENESS) {
             // For a local override or a value known to be outdated, do a
             // regular read instead.
-            if !e.outdated && !e.version.b.is_null() {
+            if !e.outdated && !e.version.b.is_unset() {
                 let writer = WriterId::new(e.version.writer.as_bytes().to_vec());
                 let mut modified = true;
                 let mut reply = backend::ReadReply::default();

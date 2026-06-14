@@ -511,7 +511,7 @@ async fn read_write_roundtrip() {
         let mut tags = Tags::new();
         tags.insert("key".to_string(), "val".to_string());
         let meta = b.write(name, value.clone(), tags).await.unwrap();
-        assert!(!meta.version.is_null());
+        assert!(!meta.version.is_unset());
 
         let r = b.read(name).await.unwrap();
         assert_eq!(r.contents, value, "case {name}");

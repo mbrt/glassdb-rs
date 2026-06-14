@@ -174,9 +174,9 @@ impl LockerCore {
                 ..Default::default()
             });
         }
-        if ops.has_update {
+        if let Some(update) = ops.update {
             let locker = StorageLocker::new(self.global.clone());
-            locker.update_lock(key, &ldata.version, &ops.update).await?;
+            locker.update_lock(key, &ldata.version, &update).await?;
         }
         Ok(LockOpResult {
             locked_for: ops.locked_for,
@@ -379,7 +379,7 @@ impl Drop for PushGuard {
             .lock()
             .unwrap();
         tlocks
-            .entry(self.tid.as_bytes().to_vec())
+            .entry(self.tid.clone())
             .or_default()
             .insert(self.key.clone(), LockType::Unknown);
     }
@@ -407,8 +407,8 @@ pub struct Locker {
     inner: Arc<LockerState>,
 }
 
-/// One independent partition of the per-transaction locks, keyed by tid bytes.
-type LockerShard = Mutex<HashMap<Vec<u8>, HashMap<String, LockType>>>;
+/// One independent partition of the per-transaction locks.
+type LockerShard = Mutex<HashMap<TxId, HashMap<String, LockType>>>;
 
 struct LockerState {
     tmon: Monitor,
@@ -465,7 +465,7 @@ impl Locker {
     pub fn lock_type(&self, key: &str, tid: &TxId) -> LockType {
         let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         tlocks
-            .get(tid.as_bytes())
+            .get(tid)
             .and_then(|m| m.get(key))
             .copied()
             .unwrap_or(LockType::None)
@@ -474,13 +474,13 @@ impl Locker {
     /// Reports whether `tid` currently holds any lock.
     pub fn has_locks(&self, tid: &TxId) -> bool {
         let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        tlocks.get(tid.as_bytes()).is_some_and(|m| !m.is_empty())
+        tlocks.get(tid).is_some_and(|m| !m.is_empty())
     }
 
     /// Returns all paths currently locked by `tid`.
     pub fn locked_paths(&self, tid: &TxId) -> Vec<PathLock> {
         let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        match tlocks.get(tid.as_bytes()) {
+        match tlocks.get(tid) {
             None => Vec::new(),
             Some(m) => {
                 let mut out: Vec<PathLock> = m
@@ -527,11 +527,10 @@ impl Locker {
         let mut out = Vec::new();
         self.inner.tlocks.each(|shard| {
             let m = shard.lock().unwrap();
-            for (tid_bytes, locks) in m.iter() {
+            for (tx_id, locks) in m.iter() {
                 if locks.is_empty() {
                     continue;
                 }
-                let tx_id = TxId::from_bytes(tid_bytes.clone());
                 let mut paths: Vec<PathLock> = locks
                     .iter()
                     .map(|(p, t)| PathLock {
@@ -541,7 +540,7 @@ impl Locker {
                     .collect();
                 paths.sort_by(|a, b| a.path.cmp(&b.path));
                 out.push(TxLockSnapshot {
-                    tx_id,
+                    tx_id: tx_id.clone(),
                     locks: paths,
                 });
             }
@@ -620,7 +619,7 @@ impl Locker {
 
     fn needs_processing(&self, key: &str, tid: &TxId, lt: LockType) -> (TxState, bool) {
         let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        let txl = tlocks.get(tid.as_bytes());
+        let txl = tlocks.get(tid);
         let st = if txl.is_some() {
             TxState::Existing
         } else {
@@ -640,10 +639,10 @@ impl Locker {
     fn update_tx_locks(&self, key: &str, tid: &TxId, lt: LockType) {
         let mut tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
         if lt == LockType::None {
-            if let Some(m) = tlocks.get_mut(tid.as_bytes()) {
+            if let Some(m) = tlocks.get_mut(tid) {
                 m.remove(key);
                 if m.is_empty() {
-                    tlocks.remove(tid.as_bytes());
+                    tlocks.remove(tid);
                 }
             }
             tracing::trace!(
@@ -656,7 +655,7 @@ impl Locker {
             return;
         }
         tlocks
-            .entry(tid.as_bytes().to_vec())
+            .entry(tid.clone())
             .or_default()
             .insert(key.to_string(), lt);
         tracing::trace!(

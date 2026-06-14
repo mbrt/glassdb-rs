@@ -1,6 +1,6 @@
 //! Operator diagnostics for hang-prone coordination paths.
 //!
-//! [`DB::diagnostics`] returns a [`Diagnostics`] snapshot capturing the lock
+//! [`Database::diagnostics`] returns a [`Diagnostics`] snapshot capturing the lock
 //! coordinator's live state: per-key dedup state and per-transaction held
 //! locks. The snapshot is pull-only and zero cost unless called.
 //!
@@ -14,7 +14,7 @@
 //! `glassdb::dedup`, `glassdb::locker`, and `glassdb::algo` targets, e.g. via
 //! `tracing-subscriber` and `RUST_LOG=glassdb=debug`.
 //!
-//! [`DB::diagnostics`]: crate::DB::diagnostics
+//! [`Database::diagnostics`]: crate::Database::diagnostics
 //! [`tracing`]: https://docs.rs/tracing
 
 use std::fmt;
@@ -22,7 +22,7 @@ use std::fmt;
 pub use glassdb_trans::{DedupKeySnapshot, TxLockSnapshot};
 
 /// A snapshot of the lock coordinator's live state. Returned by
-/// [`crate::DB::diagnostics`].
+/// [`crate::Database::diagnostics`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
     /// Per-key dedup state inside the locker (one entry per key with live

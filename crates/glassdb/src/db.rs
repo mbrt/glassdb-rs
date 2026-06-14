@@ -17,7 +17,7 @@ use crate::collection::Collection;
 use crate::diagnostics::Diagnostics;
 use crate::error::Error;
 use crate::stats::Stats;
-use crate::tx::Tx;
+use crate::tx::Transaction;
 use crate::version::check_or_create_db_meta;
 
 /// Default cache size: 512 MiB, a reasonable middle ground for production.
@@ -28,13 +28,13 @@ const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 /// replays are byte-identical.
 const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
 
-/// Builds and opens a [`DB`], tweaking optional settings before opening.
+/// Builds and opens a [`Database`], tweaking optional settings before opening.
 ///
-/// Start from [`DB::builder`], chain any setters, then call
-/// [`DbBuilder::open`]. For the default configuration, [`DB::open`] is a
+/// Start from [`Database::builder`], chain any setters, then call
+/// [`DatabaseBuilder::open`]. For the default configuration, [`Database::open`] is a
 /// shorthand.
 #[derive(Clone)]
-pub struct DbBuilder {
+pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     cache_size: usize,
@@ -42,9 +42,9 @@ pub struct DbBuilder {
     retry: RetryConfig,
 }
 
-impl DbBuilder {
+impl DatabaseBuilder {
     fn new(name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
-        DbBuilder {
+        DatabaseBuilder {
             name: name.into(),
             backend,
             cache_size: DEFAULT_CACHE_SIZE,
@@ -64,7 +64,7 @@ impl DbBuilder {
     /// Sets the delay before the first retry of a transient
     /// transaction-coordination operation (polling a peer transaction's commit
     /// status, or writing a transaction's final log). The delay grows
-    /// exponentially up to [`DbBuilder::retry_max_interval`].
+    /// exponentially up to [`DatabaseBuilder::retry_max_interval`].
     pub fn retry_initial_interval(mut self, interval: Duration) -> Self {
         self.retry.initial_interval = interval;
         self
@@ -90,8 +90,8 @@ impl DbBuilder {
 
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
-    pub async fn open(self) -> Result<DB, Error> {
-        let DbBuilder {
+    pub async fn open(self) -> Result<Database, Error> {
+        let DatabaseBuilder {
             name,
             backend: b,
             cache_size,
@@ -100,7 +100,7 @@ impl DbBuilder {
         } = self;
 
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(Error::Other(format!(
+            return Err(Error::InvalidInput(format!(
                 "name must be alphanumeric, got {name:?}"
             )));
         }
@@ -148,7 +148,7 @@ impl DbBuilder {
             tx_drained: Notify::new(),
             background: bg,
         });
-        Ok(DB { inner })
+        Ok(Database { inner })
     }
 }
 
@@ -161,9 +161,9 @@ pub(crate) struct DbInner {
     pub(crate) algo: Algo,
     stats: Mutex<Stats>,
     // Graceful-shutdown bookkeeping. `shutting_down` flips first so any
-    // subsequent `DB::tx` call rejects with `Error::ShuttingDown`. In-flight
+    // subsequent `Database::tx` call rejects with `Error::ShuttingDown`. In-flight
     // transactions increment `tx_in_flight` while their future runs; the
-    // decrement notifies `tx_drained` so `DB::shutdown` can await drain.
+    // decrement notifies `tx_drained` so `Database::shutdown` can await drain.
     shutting_down: AtomicBool,
     tx_in_flight: AtomicUsize,
     tx_drained: Notify,
@@ -172,47 +172,47 @@ pub(crate) struct DbInner {
     // spawned tasks do not form a cycle that would prevent `Background::drop`
     // from firing. When this struct drops, the `Arc` count reaches zero,
     // `Background::drop` aborts every spawned task, and the captured clones
-    // unwind. `DB::shutdown` uses the same owner to wait for tasks that opted
+    // unwind. `Database::shutdown` uses the same owner to wait for tasks that opted
     // into clean-shutdown draining.
     background: Arc<Background>,
 }
 
 /// An open GlassDB database instance.
 #[derive(Clone)]
-pub struct DB {
+pub struct Database {
     inner: Arc<DbInner>,
 }
 
-impl DB {
+impl Database {
     /// Starts building a database with the given name and backend. Chain setters
-    /// on the returned [`DbBuilder`], then call [`DbBuilder::open`].
+    /// on the returned [`DatabaseBuilder`], then call [`DatabaseBuilder::open`].
     ///
     /// `b` may be any concrete backend (`MemoryBackend::new()`, etc.) or a
     /// pre-erased `Arc<dyn Backend>` (covered by the crate's `impl Backend for
     /// Arc<B>` blanket).
-    pub fn builder<B>(name: impl Into<String>, b: B) -> DbBuilder
+    pub fn builder<B>(name: impl Into<String>, b: B) -> DatabaseBuilder
     where
         B: Backend + 'static,
     {
-        DbBuilder::new(name, Arc::new(b))
+        DatabaseBuilder::new(name, Arc::new(b))
     }
 
     /// Opens a database with the given name using default options. Shorthand for
-    /// `DB::builder(name, b).open()`.
-    pub async fn open<B>(name: &str, b: B) -> Result<DB, Error>
+    /// `Database::builder(name, b).open()`.
+    pub async fn open<B>(name: &str, b: B) -> Result<Database, Error>
     where
         B: Backend + 'static,
     {
-        DB::builder(name, b).open().await
+        Database::builder(name, b).open().await
     }
 
-    /// Gracefully shuts the database down: refuses any new [`DB::tx`] calls
+    /// Gracefully shuts the database down: refuses any new [`Database::tx`] calls
     /// (they return [`Error::ShuttingDown`]) and awaits every in-flight
     /// transaction future to complete. Idempotent; safe to call from multiple
-    /// `DB` clones concurrently.
+    /// `Database` clones concurrently.
     ///
     /// Background loops (GC, transaction-log refresh, async lock cleanup) and
-    /// best-effort tasks are torn down via [`Drop`] when the last [`DB`] clone
+    /// best-effort tasks are torn down via [`Drop`] when the last [`Database`] clone
     /// is dropped; calling `shutdown` is *not* required for cleanup to happen.
     /// Clean-shutdown background tasks, such as async aborts scheduled by a
     /// cancelled transaction, are awaited before `shutdown` returns.
@@ -243,7 +243,7 @@ impl DB {
     /// The value returned by `f` on a successful commit is returned to the
     /// caller.
     ///
-    /// `f` receives the [`Tx`] handle by value and returns a future, so the
+    /// `f` receives the [`Transaction`] handle by value and returns a future, so the
     /// transaction future is `Send` and can be `tokio::spawn`-ed. Write the body
     /// as `|tx| async move { ... }`. The framework owns the retry loop and may
     /// invoke `f` multiple times, so `f` must be `FnMut`.
@@ -255,12 +255,12 @@ impl DB {
     /// never corrupts data or leaves a half-applied transaction. Cancel by
     /// dropping the surrounding future — e.g. via `tokio::time::timeout`,
     /// `select!`, or `JoinHandle::abort`. The cancelled attempt's transaction
-    /// log entry is asynchronously marked aborted from `Tx`'s `Drop`, so
+    /// log entry is asynchronously marked aborted from `Transaction`'s `Drop`, so
     /// peer transactions observe the release immediately; the lock-lease
     /// timeout is only the backstop for when the abort write itself fails.
     pub async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
-        F: FnMut(Tx) -> Fut + Send,
+        F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
@@ -268,7 +268,7 @@ impl DB {
     }
 
     /// Retrieves ongoing performance stats. Only updated when transactions
-    /// close. Counters only increase; use [`Stats::sub`] for intervals.
+    /// close. Counters only increase; subtract snapshots for intervals.
     pub fn stats(&self) -> Stats {
         let bstats = self.inner.backend.stats_and_reset();
         let mut s = self.inner.stats.lock().unwrap();
@@ -293,7 +293,7 @@ impl DB {
 }
 
 /// RAII counter for in-flight user transactions. The increment happens on
-/// construction (so `DB::shutdown` sees the new tx) and the decrement on drop
+/// construction (so `Database::shutdown` sees the new tx) and the decrement on drop
 /// (so a cancelled transaction future still releases its slot). When the
 /// counter hits zero, [`DbInner::tx_drained`] is notified, releasing any
 /// `shutdown` waiter.
@@ -331,7 +331,7 @@ impl DbInner {
 
     pub(crate) async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
-        F: FnMut(Tx) -> Fut + Send,
+        F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
@@ -355,11 +355,11 @@ impl DbInner {
 
     async fn tx_impl<T, F, Fut>(&self, mut f: F, stats: &mut Stats) -> Result<T, Error>
     where
-        F: FnMut(Tx) -> Fut + Send,
+        F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let tx = Tx::new(self.global.clone(), self.local.clone(), self.tmon.clone());
+        let tx = Transaction::new(self.global.clone(), self.local.clone(), self.tmon.clone());
         let mut handle = None;
         // RAII safety net: if this future is dropped between `algo.begin` and
         // `algo.end` (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
@@ -367,7 +367,7 @@ impl DbInner {
         // marked aborted promptly instead of lingering until lease expiry.
         // Updated to the current tx id after every `begin`/`rebegin`; cleared
         // once `end` has run.
-        let mut abort_guard = TxAbortGuard::new(&self.algo);
+        let mut abort_guard = TransactionAbortGuard::new(&self.algo);
 
         let result: Result<T, Error> = loop {
             // Hand a fresh handle to the user closure (which consumes it); `tx`
@@ -380,8 +380,8 @@ impl DbInner {
 
             // Collect the accesses produced by the user function.
             let access = tx.collect_accesses();
-            stats.tx_reads += access.reads.len() as i64;
-            stats.tx_writes += access.writes.len() as i64;
+            stats.tx_reads += access.reads.len() as u64;
+            stats.tx_writes += access.writes.len() as u64;
 
             let value = match fn_res {
                 Ok(v) => {
@@ -480,12 +480,12 @@ impl DbInner {
 /// [`Algo::async_abort`] for the currently-armed transaction id, so peer
 /// transactions see the abort marker quickly instead of waiting for the
 /// lock-lease timeout.
-struct TxAbortGuard<'a> {
+struct TransactionAbortGuard<'a> {
     algo: &'a Algo,
     armed: Option<TxId>,
 }
 
-impl<'a> TxAbortGuard<'a> {
+impl<'a> TransactionAbortGuard<'a> {
     fn new(algo: &'a Algo) -> Self {
         Self { algo, armed: None }
     }
@@ -502,7 +502,7 @@ impl<'a> TxAbortGuard<'a> {
     }
 }
 
-impl Drop for TxAbortGuard<'_> {
+impl Drop for TransactionAbortGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.armed.take() {
             self.algo.async_abort(&id);

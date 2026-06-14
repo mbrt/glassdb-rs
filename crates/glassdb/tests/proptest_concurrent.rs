@@ -1,6 +1,6 @@
 //! Property-based mirror of the Go `FuzzConcurrentTx`. Without the byte-driven
 //! scheduler middleware (not yet ported), this instead randomizes the per-key
-//! increment counts of two concurrently-running DB instances and checks the
+//! increment counts of two concurrently-running Database instances and checks the
 //! serializability invariant: each key's final value equals the total number of
 //! successful increments applied to it.
 //!
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Collection, DB, Error};
+use glassdb::{Backend, Collection, Database, Error};
 use proptest::prelude::*;
 
 fn write_int(n: i64) -> Vec<u8> {
@@ -26,7 +26,11 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_from_tx(tx: &glassdb::Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(
+    tx: &glassdb::Transaction,
+    c: &Collection,
+    k: &[u8],
+) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         Err(e) if e.is_not_found() => Ok(0),
@@ -34,7 +38,7 @@ async fn read_int_from_tx(tx: &glassdb::Tx, c: &Collection, k: &[u8]) -> Result<
     }
 }
 
-async fn rmw(db: &DB, coll: &Collection, key: &[u8], n: u32) -> Result<(), Error> {
+async fn rmw(db: &Database, coll: &Collection, key: &[u8], n: u32) -> Result<(), Error> {
     for _ in 0..n {
         db.tx(|tx| async move {
             let cur = read_int_from_tx(&tx, coll, key).await?;
@@ -45,7 +49,13 @@ async fn rmw(db: &DB, coll: &Collection, key: &[u8], n: u32) -> Result<(), Error
     Ok(())
 }
 
-async fn multi_rmw(db: &DB, coll: &Collection, a: &[u8], b: &[u8], n: u32) -> Result<(), Error> {
+async fn multi_rmw(
+    db: &Database,
+    coll: &Collection,
+    a: &[u8],
+    b: &[u8],
+    n: u32,
+) -> Result<(), Error> {
     for _ in 0..n {
         db.tx(|tx| async move {
             let va = read_int_from_tx(&tx, coll, a).await?;
@@ -58,7 +68,7 @@ async fn multi_rmw(db: &DB, coll: &Collection, a: &[u8], b: &[u8], n: u32) -> Re
     Ok(())
 }
 
-async fn read_only(db: &DB, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
+async fn read_only(db: &Database, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
     db.tx(|tx| async move {
         for k in keys {
             match tx.read(coll, k).await {
@@ -75,8 +85,8 @@ async fn read_only(db: &DB, coll: &Collection, keys: &[&[u8]]) -> Result<(), Err
 #[allow(clippy::too_many_arguments)]
 async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let db1 = DB::open("example", backend.clone()).await.unwrap();
-    let db2 = DB::open("example", backend).await.unwrap();
+    let db1 = Database::open("example", backend.clone()).await.unwrap();
+    let db2 = Database::open("example", backend).await.unwrap();
 
     let coll1 = db1.collection(b"fuzz-coll");
     let coll2 = db2.collection(b"fuzz-coll");
@@ -93,7 +103,7 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     .await
     .unwrap();
 
-    // DB1 workload: rmw(k1), multi(k1,k2), read-only, rmw(k3).
+    // Database1 workload: rmw(k1), multi(k1,k2), read-only, rmw(k3).
     let w1 = async {
         rmw(&db1, &coll1, k1, a1).await?;
         multi_rmw(&db1, &coll1, k1, k2, a2).await?;
@@ -101,7 +111,7 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
         rmw(&db1, &coll1, k3, a3).await?;
         Ok::<(), Error>(())
     };
-    // DB2 workload: rmw(k2), multi(k2,k3), read-only, rmw(k1).
+    // Database2 workload: rmw(k2), multi(k2,k3), read-only, rmw(k1).
     let w2 = async {
         rmw(&db2, &coll2, k2, b1).await?;
         multi_rmw(&db2, &coll2, k2, k3, b2).await?;
@@ -115,9 +125,9 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     r2.unwrap();
 
     // Each key's final value must equal the total increments applied to it.
-    let v1 = read_int(&coll1.read_strong(k1).await.unwrap());
-    let v2 = read_int(&coll1.read_strong(k2).await.unwrap());
-    let v3 = read_int(&coll1.read_strong(k3).await.unwrap());
+    let v1 = read_int(&coll1.read(k1).await.unwrap());
+    let v2 = read_int(&coll1.read(k2).await.unwrap());
+    let v3 = read_int(&coll1.read(k3).await.unwrap());
     assert_eq!(v1 as u32, a1 + a2 + b3, "k1 mismatch");
     assert_eq!(v2 as u32, a2 + b1 + b2, "k2 mismatch");
     assert_eq!(v3 as u32, a3 + b2, "k3 mismatch");

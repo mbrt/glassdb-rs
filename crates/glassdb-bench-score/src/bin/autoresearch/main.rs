@@ -26,7 +26,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{DB, Stats};
+use glassdb::{Database, Stats};
 
 use crate::metrics::Sample;
 
@@ -70,13 +70,13 @@ impl Weights {
 #[serde(rename_all = "camelCase")]
 struct WorkloadResult {
     name: String,
-    txn: i64,
-    obj_reads: i64,
-    obj_writes: i64,
-    meta_reads: i64,
-    meta_writes: i64,
-    obj_lists: i64,
-    retries: i64,
+    txn: u64,
+    obj_reads: u64,
+    obj_writes: u64,
+    meta_reads: u64,
+    meta_writes: u64,
+    obj_lists: u64,
+    retries: u64,
     cost_per_tx: f64,
     alloc_bytes_per_tx: f64,
     allocs_per_tx: f64,
@@ -162,12 +162,12 @@ fn main() {
     }
 }
 
-/// Runs every workload once (each on a fresh DB and backend) and aggregates the
+/// Runs every workload once (each on a fresh database and backend) and aggregates the
 /// per-workload results into a single suite score.
 async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
     let mut results = Vec::with_capacity(workloads::NAMES.len());
     for &name in workloads::NAMES {
-        let db = DB::open("autoresearch", MemoryBackend::new()).await?;
+        let db = Database::open("autoresearch", MemoryBackend::new()).await?;
         let sample = workloads::run(name, &db).await?;
         db.shutdown().await;
         results.push(to_result(sample)?);
@@ -196,7 +196,7 @@ async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
 /// Turns a raw [`Sample`] into a per-transaction-normalized [`WorkloadResult`].
 fn to_result(s: Sample) -> Result<WorkloadResult, Box<dyn Error>> {
     let txn = s.stats.tx_n;
-    if txn <= 0 {
+    if txn == 0 {
         return Err(format!("workload {}: no transactions recorded", s.name).into());
     }
     let n = txn as f64;

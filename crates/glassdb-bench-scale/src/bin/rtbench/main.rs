@@ -11,7 +11,7 @@
 //!
 //! ## Concurrency model
 //!
-//! `DB::tx` takes the transaction body by value (`|tx| async move { ... }`), so
+//! `Database::tx` takes the transaction body by value (`|tx| async move { ... }`), so
 //! its future is `Send` and every worker is a `tokio::spawn`-ed task on a shared
 //! multi-thread runtime. The runtime multiplexes all workers over its worker
 //! threads (rather than one OS thread per worker), so a single shared S3 client
@@ -42,7 +42,7 @@ use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
-use glassdb::{Collection, DB, Error as GError, Stats};
+use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
 
@@ -92,7 +92,7 @@ struct Args {
     /// Output file with deadlock latency samples.
     #[arg(long, default_value = "deadlock.csv")]
     deadlock_out: String,
-    /// Max concurrent DBs for the rw9010 test.
+    /// Max concurrent Databases for the rw9010 test.
     #[arg(long, default_value_t = 50)]
     max_dbs: usize,
     /// Number of keys for the rw9010 test.
@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// Backend / DB setup
+// Backend / Database setup
 // ---------------------------------------------------------------------------
 
 async fn init_backend(
@@ -203,9 +203,9 @@ fn env_var(k: &str) -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn open_db(handle: &Handle, backend: Arc<dyn Backend>) -> DB {
+fn open_db(handle: &Handle, backend: Arc<dyn Backend>) -> Database {
     handle
-        .block_on(DB::open("bench", backend))
+        .block_on(Database::open("bench", backend))
         .expect("open db")
 }
 
@@ -253,7 +253,13 @@ impl Benchmarker {
         }
     }
 
-    fn start(&mut self, db: &DB, num_keys: usize, num_workers: usize, num_keys_per_worker: usize) {
+    fn start(
+        &mut self,
+        db: &Database,
+        num_keys: usize,
+        num_workers: usize,
+        num_keys_per_worker: usize,
+    ) {
         self.num_keys = num_keys;
         self.num_workers = num_workers;
         self.num_keys_per_worker = num_keys_per_worker;
@@ -261,9 +267,9 @@ impl Benchmarker {
         self.bench.start();
     }
 
-    fn end(&mut self, db: &DB) {
+    fn end(&mut self, db: &Database) {
         self.bench.end();
-        self.delta_stats = db.stats().sub(&self.base_stats);
+        self.delta_stats = db.stats() - self.base_stats;
     }
 
     fn results_row(&self) -> String {
@@ -381,7 +387,7 @@ fn run_test<F>(
     f: F,
 ) -> Result<(), Box<dyn Error>>
 where
-    F: FnOnce(&mut Benchmarker, &DB, &Handle) -> Result<(), GError>,
+    F: FnOnce(&mut Benchmarker, &Database, &Handle) -> Result<(), GError>,
 {
     let db = open_db(handle, backend);
     let mut ben = Benchmarker::new(duration);
@@ -394,7 +400,7 @@ where
 
 fn independent_single_rmw(
     b: &mut Benchmarker,
-    db: &DB,
+    db: &Database,
     handle: &Handle,
     nwriters: usize,
 ) -> Result<(), GError> {
@@ -434,7 +440,7 @@ fn independent_single_rmw(
 
 fn independent_multi_rmw(
     b: &mut Benchmarker,
-    db: &DB,
+    db: &Database,
     handle: &Handle,
     nwriters: usize,
     numkeys: usize,
@@ -487,7 +493,7 @@ fn independent_multi_rmw(
 
 fn overlapping_multi_rmw(
     b: &mut Benchmarker,
-    db: &DB,
+    db: &Database,
     handle: &Handle,
     n_writers: usize,
     n_keys_per_writer: usize,
@@ -568,7 +574,9 @@ async fn join_tasks(
             Ok(Ok(())) => {}
             Ok(Err(e)) if result.is_ok() => result = Err(e),
             Ok(Err(_)) => {}
-            Err(_) if result.is_ok() => result = Err(GError::Other("worker task panicked".into())),
+            Err(_) if result.is_ok() => {
+                result = Err(GError::Internal("worker task panicked".into()));
+            }
             Err(_) => {}
         }
     }
@@ -580,17 +588,20 @@ async fn join_tasks(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum TxType {
+enum TransactionType {
     Write,
     ReadStrong,
     ReadWeak,
 }
 
-fn make_tx_series(num_w: usize, num_strong_r: usize, num_weak_r: usize) -> Vec<TxType> {
+fn make_tx_series(num_w: usize, num_strong_r: usize, num_weak_r: usize) -> Vec<TransactionType> {
     let mut v = Vec::with_capacity(num_w + num_strong_r + num_weak_r);
-    v.extend(std::iter::repeat_n(TxType::Write, num_w));
-    v.extend(std::iter::repeat_n(TxType::ReadStrong, num_strong_r));
-    v.extend(std::iter::repeat_n(TxType::ReadWeak, num_weak_r));
+    v.extend(std::iter::repeat_n(TransactionType::Write, num_w));
+    v.extend(std::iter::repeat_n(
+        TransactionType::ReadStrong,
+        num_strong_r,
+    ));
+    v.extend(std::iter::repeat_n(TransactionType::ReadWeak, num_weak_r));
     v
 }
 
@@ -745,11 +756,11 @@ fn read_write_9010_all_dbs(
     numdb: usize,
     rnd: &mut StdRng,
 ) -> Result<Vec<DbResults>, Box<dyn Error>> {
-    // One seed per DB, derived up front from the shared source.
+    // One seed per Database, derived up front from the shared source.
     let seeds: Vec<u64> = (0..numdb).map(|_| rnd.random()).collect();
 
-    // Open all DBs and create their per-type benches.
-    let dbs: Vec<DB> = (0..numdb)
+    // Open all Databases and create their per-type benches.
+    let dbs: Vec<Database> = (0..numdb)
         .map(|_| open_db(handle, backend.clone()))
         .collect();
     let benches: Vec<Arc<DbBench>> = (0..numdb)
@@ -760,7 +771,7 @@ fn read_write_9010_all_dbs(
     }
     let keys: Arc<[Vec<u8>]> = Arc::from(keys);
 
-    // Run every worker of every DB concurrently as spawned tasks, so the shared
+    // Run every worker of every Database concurrently as spawned tasks, so the shared
     // runtime multiplexes them over its worker threads.
     let mut worker_handles = Vec::new();
     for (di, db) in dbs.iter().enumerate() {
@@ -781,7 +792,7 @@ fn read_write_9010_all_dbs(
         db_bench.end();
     }
 
-    // Collect results and close DBs.
+    // Collect results and close Databases.
     let mut results = Vec::with_capacity(numdb);
     for (di, db) in dbs.iter().enumerate() {
         results.push(DbResults {
@@ -798,7 +809,7 @@ fn read_write_9010_all_dbs(
 }
 
 async fn read_write_9010_worker(
-    db: DB,
+    db: Database,
     db_bench: Arc<DbBench>,
     keys: Arc<[Vec<u8>]>,
     seed: u64,
@@ -816,19 +827,19 @@ async fn read_write_9010_worker(
             let i0 = rng.random_range(0..keys.len());
             let i1 = rng.random_range(0..keys.len());
             match tt {
-                TxType::Write => {
+                TransactionType::Write => {
                     db_bench
                         .write
                         .measure(|| write_tx(&db, &coll, &keys[i0], &keys[i1]))
                         .await?;
                 }
-                TxType::ReadStrong => {
+                TransactionType::ReadStrong => {
                     db_bench
                         .strong
                         .measure(|| read_tx(&db, &coll, &keys[i0], &keys[i1]))
                         .await?;
                 }
-                TxType::ReadWeak => {
+                TransactionType::ReadWeak => {
                     db_bench
                         .weak
                         .measure(|| weak_read_tx(&coll, &keys[i0]))
@@ -840,7 +851,7 @@ async fn read_write_9010_worker(
     Ok(())
 }
 
-async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
+async fn write_tx(db: &Database, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
     db.tx(|tx| async move {
         // Read both keys in parallel, then swap their values.
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
@@ -853,7 +864,7 @@ async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<()
     .await
 }
 
-async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
+async fn read_tx(db: &Database, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
     db.tx(|tx| async move {
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
         r0?;
@@ -864,7 +875,9 @@ async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(),
 }
 
 async fn weak_read_tx(coll: &Collection, k: &[u8]) -> Result<(), GError> {
-    coll.read_weak(k, Duration::from_secs(10)).await.map(|_| ())
+    coll.read_stale(k, Duration::from_secs(10))
+        .await
+        .map(|_| ())
 }
 
 fn init_keys(

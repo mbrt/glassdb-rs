@@ -9,6 +9,7 @@ use glassdb_trans::TransError;
 /// Cancellation is not modeled as an error: a transaction that was cancelled by
 /// dropping its future (`tokio::time::timeout`, `select!`, or
 /// `JoinHandle::abort`) simply returns nothing.
+#[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// The requested object does not exist.
@@ -30,14 +31,17 @@ pub enum Error {
     /// caller decides whether to retry (with its own idempotency) or accept the
     /// uncertainty.
     #[error("transaction outcome unknown (in doubt): {0}")]
-    Unavailable(String),
+    InDoubt(String),
     /// The database is shutting down and is no longer accepting new
     /// transactions. Existing in-flight transactions are allowed to complete.
     #[error("database is shutting down")]
     ShuttingDown,
-    /// Any other error.
+    /// Invalid user input.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    /// An unexpected internal failure or invariant violation.
     #[error("{0}")]
-    Other(String),
+    Internal(String),
 }
 
 impl Error {
@@ -60,7 +64,7 @@ impl Error {
     /// transaction may or may not have committed; the engine does not retry it
     /// transparently, leaving the decision to the caller.
     pub fn is_unavailable(&self) -> bool {
-        matches!(self, Error::Unavailable(_))
+        matches!(self, Error::InDoubt(_))
     }
 }
 
@@ -69,8 +73,8 @@ impl From<BackendError> for Error {
         match e {
             BackendError::NotFound => Error::NotFound,
             BackendError::Precondition => Error::Precondition,
-            BackendError::Unavailable(s) => Error::Unavailable(s),
-            BackendError::Other(s) => Error::Other(s),
+            BackendError::Unavailable(s) => Error::InDoubt(s),
+            BackendError::Other(s) => Error::Internal(s),
         }
     }
 }
@@ -80,7 +84,7 @@ impl From<StorageError> for Error {
         match e {
             StorageError::Backend(b) => b.into(),
             StorageError::KeyNotFound => Error::NotFound,
-            StorageError::Other(s) => Error::Other(s),
+            StorageError::Other(s) => Error::Internal(s),
         }
     }
 }
@@ -90,8 +94,14 @@ impl From<TransError> for Error {
         match e {
             TransError::Storage(s) => s.into(),
             TransError::AlreadyFinalized => Error::AlreadyFinalized,
-            TransError::Retry => Error::Other("retry transaction".into()),
-            other => Error::Other(other.to_string()),
+            TransError::Other(s) => Error::Internal(s),
+            TransError::Retry
+            | TransError::Wounded
+            | TransError::ValidateRetry
+            | TransError::LockTimeout
+            | TransError::NoSingleWrite => {
+                Error::Internal(format!("transaction control-flow error escaped: {e}"))
+            }
         }
     }
 }

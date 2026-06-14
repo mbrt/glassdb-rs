@@ -40,7 +40,7 @@ libFuzzer bytes ──arbitrary──▶ (u64 seed, Workload, FaultConfig)
                     run_and_assert_with_faults(workload, faults))
                                    │
         A storage node serves a MemoryBackend over the simulated network;
-        each client opens its own DB on its own node and reaches the store
+        each client opens its own database on its own node and reaches the store
         via a NetBackend RPC client; a seeded nemesis injects network and
         node faults. Assert each key's acked <= final <= started (exact
         equality with faults off). Violation ⇒ panic ⇒ libFuzzer crash +
@@ -54,7 +54,7 @@ Why madsim over a hand-rolled scheduler: it deterministically controls
 `RUSTFLAGS="--cfg madsim"`; in normal builds the `madsim-tokio` alias re-exports
 real tokio, so production behavior is unchanged.
 
-### Topology: one DB per node over a simulated network
+### Topology: one database per node over a simulated network
 
 Clients only ever coordinate through the object store, so faults are meaningful
 only if the backend path crosses the simulated network. The harness therefore
@@ -65,7 +65,7 @@ builds without madsim):
 - a **storage node** binds an `Endpoint` and runs `serve_backend` over a
   harness-owned `MemoryBackend` (or `RecordingBackend`) whose state survives
   every node fault (madsim nodes share process memory);
-- each **client node** opens its own `DB` over a `NetBackend` — a `Backend`
+- each **client node** opens its own `Database` over a `NetBackend` — a `Backend`
   implementation that forwards each call as an RPC. madsim's network *drops*
   clogged/partitioned packets, so `NetBackend` retries (bounded by `MAX_ATTEMPTS`,
   mirroring a real object-store client's adaptive retryer): a brief fault appears
@@ -79,14 +79,14 @@ builds without madsim):
   `NetBackend` does *not* pass that ambiguous `Precondition` up as a confident
   conflict: once a response has been lost, a `Precondition` on a *conditional
   write* is indistinguishable from "my own write landed", so it is converted to
-  the in-doubt `BackendError::Unavailable` (the in-doubt backend contract is
+  the in-doubt `BackendError::InDoubt` (the in-doubt backend contract is
   [ADR-009](009-in-doubt-conditional-writes.md)). This exposes the engine's
   "did my commit land?" handling rather than masking it;
 - a **nemesis node** drives a seeded sequence of faults via `NetSim`/`Handle`
   (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), eventually
   healing every network fault (some long enough to outlast the retry budget) and
   leaving the storage node up (it models durable cloud storage); and
-- a **verifier node** reads every key with `read_strong` (which drives recovery
+- a **verifier node** reads every key with `read` (which drives recovery
   of any crashed client's locks via virtual-time lease expiry) and checks the
   invariant.
 
@@ -137,13 +137,13 @@ of the seed:
    patch does not cover, so we do not rely on it. Instead `TxId` prefixes are
    drawn from `madsim::rand` under `#[cfg(madsim)]` (a one-line shim in
    `txid.rs`), which is seeded by the runtime.
-3. **Time.** `DbBuilder::deterministic_time` makes the monitor's `Clock` anchor a
+3. **Time.** `DatabaseBuilder::deterministic_time` makes the monitor's `Clock` anchor a
    *fixed* wall-clock base to `tokio::time::Instant` (`Clock::anchored_at`).
    Since `TxId` timestamps come from this clock, transaction-log object keys
    become deterministic. (Default stays `Clock::real()` in production.)
 4. **`HashMap` iteration order.** `std`'s `RandomState` is reseeded per process,
    so any commit-path slice built by iterating a `HashMap` would differ between
-   runs. The four such sites now emit a path-sorted order: `Tx::collect_accesses`
+   runs. The four such sites now emit a path-sorted order: `Transaction::collect_accesses`
    (writes/reads), `init_validation`, `collections_locks`, and
    `Locker::locked_paths`. This is harmless in production and is what makes the
    op stream below byte-identical.

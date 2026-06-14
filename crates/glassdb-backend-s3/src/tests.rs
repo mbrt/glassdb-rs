@@ -461,7 +461,7 @@ async fn read_strips_nonce() {
         let mut tags = Tags::new();
         tags.insert("key".to_string(), "val".to_string());
         let meta = b.write(name, value.clone(), tags).await.unwrap();
-        assert!(!meta.version.is_null());
+        assert!(!meta.version.is_unset());
 
         let r = b.read(name).await.unwrap();
         assert_eq!(r.contents, value, "case {name}");
