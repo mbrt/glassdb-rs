@@ -21,9 +21,6 @@ pub const MAX_STALENESS: Duration = Duration::MAX;
 
 #[derive(Clone)]
 struct CacheValue {
-    // The value bytes are shared via `Arc` so handing a cached value to a reader
-    // (and the reader staging it in the transaction's read set) is a refcount
-    // bump rather than a fresh copy of the bytes on every hop.
     value: Arc<[u8]>,
     deleted: bool,
     /// Marks the value as outdated for sure. When false, the status is unknown.

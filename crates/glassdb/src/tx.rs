@@ -31,10 +31,6 @@ pub struct Tx {
 
 #[derive(Default)]
 struct TxInner {
-    // Reads and writes for a path share one entry, so a found read allocates the
-    // path key once instead of inserting it into two maps. `staged` holds a
-    // read-cached value, a write, or a delete; `read` records the version read
-    // (for validation / repeatable reads).
     entries: HashMap<String, Entry>,
     aborted: bool,
 }
@@ -108,8 +104,6 @@ impl Tx {
             Ok(rv) => {
                 let mut inner = self.inner.lock().unwrap();
                 let e = inner.entries.entry(p).or_default();
-                // Stage the shared value (refcount bump) for repeatable reads and
-                // hand the caller an owned copy; only this final copy allocates.
                 e.staged = Some(Tvalue {
                     val: rv.value.clone(),
                     modified: false,

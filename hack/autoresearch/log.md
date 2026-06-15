@@ -1273,12 +1273,13 @@ optimized the bench/test backend - i.e. things that traded legibility for a
 benchmark number that does not translate to production.
 
 ## Reverted (13)
-- **exp3** - commit-path `Data`-clone removal. Restored `rebegin(&old, data)` and
-  the `commit` writes clone; reverting also re-collapses the `begin/reset` match
-  the change had duplicated into both retry-loop arms, so `db.rs` is simpler.
-- **exp10** - validation-state two-pointer merge. Restored the
-  `HashMap`+sort `init_validation`; the merge coupled validation to a
-  sorted-unique invariant from `collect_accesses`, fragile for a per-tx alloc.
+- **exp3** - commit-path `Data`-clone removal. Restored `rebegin(&old, data)`
+  and the `commit` writes clone; reverting also re-collapses the `begin/reset`
+  match the change had duplicated into both retry-loop arms, so `db.rs` is
+  simpler.
+- **exp10** - validation-state two-pointer merge. Restored the `HashMap`+sort
+  `init_validation`; the merge coupled validation to a sorted-unique invariant
+  from `collect_accesses`, fragile for a per-tx alloc.
 - **exp13** - in-place cache writes. Removed `Cache::modify`/`Shard::modify` (a
   third near-duplicate of `set`/`update`); restored `set`->`update` delegation
   and the `cache.update` write paths.
@@ -1293,21 +1294,22 @@ benchmark number that does not translate to production.
 - **exp25** - single-alloc tag decode. Removed `TxId::from_slice` and the
   stack-buffer+heap-fallback `tag_to_tid`; restored the plain allocating decode.
 - **exp27** - allocation-free read-validation. Removed the parallel
-  `tags_lock_type`/`tag_matches_tid` helpers and the second code path through the
-  serializability-critical `validate_read`; restored the single `tags_lock_info`
-  path. Highest legibility cost of the set.
+  `tags_lock_type`/`tag_matches_tid` helpers and the second code path through
+  the serializability-critical `validate_read`; restored the single
+  `tags_lock_info` path. Highest legibility cost of the set.
 - **exp29** - cache projection. Removed `Cache::get_with`; restored the
   move-out-on-read `Local::read`/`get_meta` (the kept exp6 form).
-- **exp31** - stack-buffer `TxId` mint. Restored the `vec![0u8; ..]` constructors
-  (this was discarded as exp24, then re-kept only after denominators shrank).
+- **exp31** - stack-buffer `TxId` mint. Restored the `vec![0u8; ..]`
+  constructors (this was discarded as exp24, then re-kept only after
+  denominators shrank).
 - **exp35** - memory-backend CAS-token cache. Reward hacking: it caches state
-  *only* on the in-memory `MemoryBackend` (test/bench backend); production S3/GCS
-  gain nothing, and it had already caused a double-mint regression once.
+  *only* on the in-memory `MemoryBackend` (test/bench backend); production
+  S3/GCS gain nothing, and it had already caused a double-mint regression once.
 - **exp36** - skip last-writer re-decode. Removed the version-equality
   short-circuit added to the cache write path.
-- **exp37** - `encode_lockers` arities. The same lone-join micro-opt discarded as
-  exp4/exp11/exp28 (sub-noise three times), kept on the fourth try; restored the
-  `map/collect/join` form.
+- **exp37** - `encode_lockers` arities. The same lone-join micro-opt discarded
+  as exp4/exp11/exp28 (sub-noise three times), kept on the fourth try; restored
+  the `map/collect/join` form.
 
 ## Kept
 - **exp1, exp2** - the only true production wins (fewer backend round-trips;
@@ -1316,12 +1318,12 @@ benchmark number that does not translate to production.
   (cache metadata), exp8 (`TxId`), exp9 (access paths), exp26 (backend tags),
   exp33 (version token), exp34 (object value, whose multi-copy elimination has
   general-case merit for large values) - and trivially-clean refactors with no
-  new API surface: exp14 (borrow `TxLog`), exp17 (`is_complete` via containment),
-  exp22 (unify `Tx` maps), exp32 (`TxId`-keyed monitor maps), exp6/exp7.
+  new API surface: exp14 (borrow `TxLog`), exp17 (`is_complete` via
+  containment), exp22 (unify `Tx` maps), exp32 (`TxId`-keyed monitor maps),
+  exp6/exp7.
 
-Verification after the reverts: `make format` (clean), `make test`
-(fmt + `clippy -D warnings` + full suite), and `make test-sim` (determinism /
+Verification after the reverts: `make format` (clean), `make test` (fmt +
+`clippy -D warnings` + full suite), and `make test-sim` (determinism /
 serializability self-checks incl. `concurrent_sim`) all pass. The kept `Arc`
 types were preserved throughout, so the reverts are pure complexity removal with
 byte-identical behaviour.
-
