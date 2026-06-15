@@ -40,8 +40,8 @@ Surveying the engine's async surface showed the redirected area is small:
 
 - **`tokio::sync` is runtime-agnostic.** `Notify`, `Semaphore`, `mpsc`,
   `oneshot` work on any executor; only `*_timeout` needs the timer. So
-  `CancelToken` (over `Notify`), `Dedup` (over `Semaphore`), the channel and
-  fanout helpers, and `biased` `tokio::select!` are **reused unchanged** — exactly
+  `tokio_util::sync::CancellationToken` (over `Notify`), `Dedup` (over `Semaphore`),
+  and `biased` `tokio::select!` are **reused unchanged** — exactly
   the surface `madsim`/`turmoil` spend most of their code re-implementing.
 - Only **`tokio::spawn` and `tokio::time`** actually need the runtime, so they are
   the only seams to redirect.
@@ -83,7 +83,7 @@ flowchart TD
   rt["crate rt: spawn / sleep / Instant / yield / block_on_with / JoinHandle / system_now"]
   rt --> realtokio
   rt --> exec
-  reuse["reused as-is: tokio::sync, biased tokio::select!, futures, CancelToken, Dedup, Fanout"]
+  reuse["reused as-is: tokio::sync, tokio_util CancellationToken, biased tokio::select!, futures, Dedup"]
   engine["engine crates"] --> rt
   engine --> reuse
 ```
@@ -95,8 +95,8 @@ flowchart TD
   `#[cfg(not(sim))]` these re-export real `tokio` with zero overhead. Under
   `#[cfg(sim)]` they route to the executor when one is running on the thread, and
   fall back to real `tokio` otherwise, so ordinary `#[tokio::test]` unit tests
-  still work in a `sim` build. `tokio::sync`, `tokio::select!`, and the channel /
-  fanout / cancel / dedup helpers stay direct.
+  still work in a `sim` build. `tokio::sync`, `tokio::select!`, and the
+  cancel / dedup helpers stay direct.
 - **`DetExecutor`** ([`exec.rs`](../../crates/glassdb-concurr/src/exec.rs), sim
   only). Single-threaded; a `BTreeMap` task slab plus a sorted ready set keyed by
   `TaskId`. A standard `Waker` marks a task ready (routing `tokio::sync` wakeups

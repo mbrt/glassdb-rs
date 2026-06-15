@@ -5,7 +5,7 @@
 //! harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
 //! ```
 //!
 //! The central guarantee is that, for a fixed workload, schedule tape, and seed,
@@ -15,12 +15,43 @@
 //! result — is what proves the schedule itself replayed deterministically.
 #![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::{first_divergence, OpRecord};
-use glassdb::rt::{block_on_with, TapeScheduler};
+use glassdb::middleware::{OpRecord, first_divergence};
+use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults, run_and_record,
-    run_and_record_with_faults, FaultConfig, Op, Workload,
+    FaultConfig, Op, Workload, pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults,
+    run_and_record, run_and_record_with_faults,
 };
+
+/// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
+/// long enough to cover every scheduling decision a run makes.
+fn tape(seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    (0..8192)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) as u8
+        })
+        .collect()
+}
+
+/// A deterministic fault tape derived from `seed`, distinct from the schedule
+/// tape so the interleaving and the fault schedule vary independently.
+fn fault_tape(seed: u64) -> Vec<u8> {
+    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
+}
+
+fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
+    if let Some((idx, a, b)) = first_divergence(first, second) {
+        panic!(
+            "{label}: op stream diverged at index {idx}\n  \
+             run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
+            first.len(),
+            second.len(),
+        );
+    }
+}
 
 /// A contended workload: every client hammers overlapping keys with single- and
 /// multi-key increments interleaved with read-only transactions.
@@ -49,20 +80,6 @@ fn contended_workload() -> Workload {
     }
 }
 
-/// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
-/// long enough to cover every scheduling decision a run makes.
-fn tape(seed: u64) -> Vec<u8> {
-    let mut s = seed;
-    (0..8192)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (s >> 33) as u8
-        })
-        .collect()
-}
-
 /// The op stream recorded for `workload` under `tape`/`seed`.
 fn record_once(seed: u64, workload: &Workload) -> Vec<OpRecord> {
     let w = workload.clone();
@@ -71,12 +88,6 @@ fn record_once(seed: u64, workload: &Workload) -> Vec<OpRecord> {
     });
     let recorded = log.lock().unwrap();
     recorded.clone()
-}
-
-/// A deterministic fault tape derived from `seed`, distinct from the schedule
-/// tape so the interleaving and the fault schedule vary independently.
-fn fault_tape(seed: u64) -> Vec<u8> {
-    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
 }
 
 /// The op stream recorded for `workload` under the schedule `tape(seed)`/`seed`
@@ -100,6 +111,72 @@ fn record_once_faults(seed: u64, workload: &Workload, faults: FaultConfig) -> Ve
     record_faults_with_tape(seed, workload, faults, fault_tape(seed))
 }
 
+/// Records with caller-provided schedule and fault tapes, for boundary cases
+/// like tape exhaustion that the seed-expanded helper intentionally avoids.
+fn record_with_tapes(
+    seed: u64,
+    workload: &Workload,
+    faults: FaultConfig,
+    schedule_tape: Vec<u8>,
+    fault_tape: Vec<u8>,
+) -> Vec<OpRecord> {
+    let w = workload.clone();
+    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
+        run_and_record_with_faults(&w, faults, seed, fault_tape).await
+    });
+    let recorded = log.lock().unwrap();
+    recorded.clone()
+}
+
+/// A boundary-heavy workload: maximum generated client/op shape, with frequent
+/// read-only transactions mixed into contended writes.
+fn max_read_heavy_workload() -> Workload {
+    Workload {
+        clients: vec![
+            vec![
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::Rmw(0),
+                Op::ReadOnly(vec![0, 2]),
+                Op::MultiRmw(0, 1),
+                Op::ReadOnly(vec![1, 3]),
+                Op::Rmw(2),
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::MultiRmw(2, 3),
+            ],
+            vec![
+                Op::ReadOnly(vec![3, 2, 1, 0]),
+                Op::Rmw(1),
+                Op::ReadOnly(vec![1, 2]),
+                Op::MultiRmw(1, 2),
+                Op::ReadOnly(vec![0, 3]),
+                Op::Rmw(3),
+                Op::ReadOnly(vec![2, 3]),
+                Op::MultiRmw(0, 3),
+            ],
+            vec![
+                Op::ReadOnly(vec![]),
+                Op::MultiRmw(2, 0),
+                Op::ReadOnly(vec![0]),
+                Op::Rmw(2),
+                Op::ReadOnly(vec![1, 2, 3]),
+                Op::MultiRmw(3, 1),
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::Rmw(0),
+            ],
+            vec![
+                Op::ReadOnly(vec![2]),
+                Op::Rmw(3),
+                Op::ReadOnly(vec![0, 3]),
+                Op::MultiRmw(0, 2),
+                Op::ReadOnly(vec![1]),
+                Op::Rmw(1),
+                Op::ReadOnly(vec![0, 1, 2, 3]),
+                Op::MultiRmw(1, 3),
+            ],
+        ],
+    }
+}
+
 #[test]
 fn op_stream_is_byte_identical_across_runs() {
     let workload = contended_workload();
@@ -112,14 +189,7 @@ fn op_stream_is_byte_identical_across_runs() {
             !first.is_empty(),
             "seed {seed}: expected the workload to issue backend operations"
         );
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: backend op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: backend"), &first, &second);
     }
 }
 
@@ -159,14 +229,7 @@ fn op_stream_is_byte_identical_with_faults() {
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
         let first = record_once_faults(seed, &workload, faults);
         let second = record_once_faults(seed, &workload, faults);
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: faulted op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: faulted"), &first, &second);
     }
 }
 
@@ -206,6 +269,21 @@ fn fault_tape_guides_the_fault_schedule() {
 }
 
 #[test]
+fn boundary_tapes_replay_deterministically() {
+    let workload = max_read_heavy_workload();
+    let faults = FaultConfig::enabled(128);
+    for (schedule, fault_tape) in [
+        (Vec::new(), Vec::new()),
+        (vec![0], Vec::new()),
+        (vec![255, 1], vec![0; 16]),
+    ] {
+        let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
+        let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
+        assert_no_divergence("boundary tape replay", &first, &second);
+    }
+}
+
+#[test]
 fn recovery_holds_under_crash_restart_and_outages() {
     // High intensity drives multiple client crashes (→ crash-and-restart on the
     // same backend) and sustained, all-or-nothing per-client transport outages.
@@ -219,14 +297,7 @@ fn recovery_holds_under_crash_restart_and_outages() {
         let ft = fault_tape(seed);
         let first = record_faults_with_tape(seed, &workload, faults, ft.clone());
         let second = record_faults_with_tape(seed, &workload, faults, ft);
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: recovery op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: recovery"), &first, &second);
     }
 }
 
@@ -241,14 +312,7 @@ fn pct_schedule_is_byte_identical_per_seed() {
         let second = pct_record(&workload, faults, seed);
         let first = first.lock().unwrap().clone();
         let second = second.lock().unwrap().clone();
-        if let Some((idx, a, b)) = first_divergence(&first, &second) {
-            panic!(
-                "seed {seed}: PCT op stream diverged at index {idx}\n  \
-                 run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-                first.len(),
-                second.len(),
-            );
-        }
+        assert_no_divergence(&format!("seed {seed}: PCT"), &first, &second);
     }
 }
 

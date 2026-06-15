@@ -6,14 +6,16 @@
 //! running on the current thread, and fall back to real `tokio` otherwise (so
 //! ordinary `#[tokio::test]` unit tests still work under a `sim` build).
 //!
-//! Only `spawn` and time need redirection: `tokio::sync` and `biased`
-//! `tokio::select!` are runtime-agnostic and are used directly elsewhere.
+//! Only `spawn` and time need redirection: `tokio::sync` and `tokio::select!`
+//! are runtime-agnostic and are used directly elsewhere (non-`biased` selects
+//! stay deterministic under sim via the seeded branch-poll RNG; see
+//! `exec::block_on_with`).
 
 #[cfg(not(sim))]
 mod imp {
-    pub use tokio::task::yield_now;
     pub use tokio::task::JoinHandle;
-    pub use tokio::time::{sleep, Instant};
+    pub use tokio::task::yield_now;
+    pub use tokio::time::{Instant, sleep};
 
     /// The current wall-clock time. In production this is just the real clock.
     pub fn system_now() -> std::time::SystemTime {
@@ -42,7 +44,7 @@ mod imp {
     use crate::exec;
 
     pub use crate::exec::{
-        block_on_with, in_sim, PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId,
+        PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId, block_on_with, in_sim,
     };
 
     /// Fills `buf` with deterministic simulated entropy from the running
@@ -144,31 +146,64 @@ mod imp {
     }
     impl std::error::Error for JoinError {}
 
+    use tokio_util::sync::CancellationToken;
+
     /// A handle to a spawned task. Backed by the deterministic executor when one
-    /// is running, or by tokio otherwise. Dropping it detaches the task.
+    /// is running, or by tokio otherwise. Dropping it detaches the task; call
+    /// [`JoinHandle::abort`] to cancel it.
     pub enum JoinHandle<T> {
-        Det(tokio::sync::oneshot::Receiver<T>),
+        Det {
+            rx: tokio::sync::oneshot::Receiver<Option<T>>,
+            abort: CancellationToken,
+        },
         Tokio(tokio::task::JoinHandle<T>),
+    }
+
+    impl<T> JoinHandle<T> {
+        /// Requests that the task be cancelled. The task is dropped at its next
+        /// `.await` point and the handle will yield [`JoinError`].
+        pub fn abort(&self) {
+            match self {
+                JoinHandle::Det { abort, .. } => abort.cancel(),
+                JoinHandle::Tokio(h) => h.abort(),
+            }
+        }
     }
 
     impl<T> Future for JoinHandle<T> {
         type Output = Result<T, JoinError>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             match self.get_mut() {
-                JoinHandle::Det(rx) => Pin::new(rx).poll(cx).map(|r| r.map_err(|_| JoinError)),
+                JoinHandle::Det { rx, .. } => Pin::new(rx).poll(cx).map(|r| match r {
+                    Ok(Some(v)) => Ok(v),
+                    _ => Err(JoinError),
+                }),
                 JoinHandle::Tokio(h) => Pin::new(h).poll(cx).map(|r| r.map_err(|_| JoinError)),
             }
         }
     }
 
     /// Spawns a task on the deterministic executor (if running) or on tokio.
+    ///
+    /// Under `--cfg sim`, the spawned future is wrapped in a `select!` against
+    /// an internal cancel signal so that [`JoinHandle::abort`] drops it at its
+    /// next `.await`; the deterministic executor itself has no native abort.
     pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         if exec::in_sim() {
-            JoinHandle::Det(exec::det_spawn(f))
+            let abort = CancellationToken::new();
+            let abort_inner = abort.clone();
+            let rx = exec::det_spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = abort_inner.cancelled() => None,
+                    v = f => Some(v),
+                }
+            });
+            JoinHandle::Det { rx, abort }
         } else {
             JoinHandle::Tokio(tokio::spawn(f))
         }

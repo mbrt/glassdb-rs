@@ -2,10 +2,10 @@
 //! tracked reads (to provide repeatable reads and avoid phantom reads), plus
 //! access collection for the commit algorithm.
 //!
-//! [`Tx`] is a cheap, `Send` handle over shared, interior-mutable state
-//! (`Arc<Mutex<TxInner>>`). It is passed *by value* into the transaction
+//! [`Transaction`] is a cheap, `Send` handle over shared, interior-mutable state
+//! (`Arc<Mutex<TransactionInner>>`). It is passed *by value* into the transaction
 //! closure so the resulting future is `Send` and can be `tokio::spawn`-ed; the
-//! framework keeps its own handle (see [`Tx::handle`]) to read the collected
+//! framework keeps its own handle (see [`Transaction::handle`]) to read the collected
 //! accesses after the closure returns and to reset between retries. All methods
 //! take `&self` and only hold the lock briefly — never across an `.await` — so
 //! several reads can run concurrently within a single transaction.
@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use glassdb_concurr::Ctx;
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, MAX_STALENESS};
 use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
@@ -22,50 +21,27 @@ use crate::collection::Collection;
 use crate::error::Error;
 
 /// An active database transaction. Reads and writes are buffered and only
-/// applied atomically when the surrounding [`crate::DB::tx`] commits.
-pub struct Tx {
-    ctx: Ctx,
+/// applied atomically when the surrounding [`crate::Database::tx`] commits.
+///
+/// Awaiting [`Transaction::read`] (and the enclosing [`crate::Database::tx`] future) is
+/// durability-safe to cancel by being dropped (`tokio::time::timeout`,
+/// `select!`, or `JoinHandle::abort`). When the future is dropped mid-flight
+/// the surrounding `Database::tx` arranges (via an internal RAII guard) for the
+/// engine-side transaction to be asynchronously aborted, so locks are
+/// released promptly instead of waiting for lease expiry.
+pub struct Transaction {
     reader: Reader,
-    inner: Arc<Mutex<TxInner>>,
+    inner: Arc<Mutex<TransactionInner>>,
 }
 
 #[derive(Default)]
-struct TxInner {
-    entries: HashMap<String, Entry>,
+struct TransactionInner {
+    staged: HashMap<String, StagedValue>,
+    reads: HashMap<String, ReadState>,
     aborted: bool,
 }
 
-#[derive(Default)]
-struct Entry {
-    staged: Option<Tvalue>,
-    read: Option<ReadInfo>,
-}
-
-impl Tx {
-    pub(crate) fn new(
-        ctx: Ctx,
-        global: Global,
-        local: Local,
-        tmon: glassdb_trans::Monitor,
-    ) -> Self {
-        Tx {
-            ctx,
-            reader: Reader::new(local, global, tmon),
-            inner: Arc::new(Mutex::new(TxInner::default())),
-        }
-    }
-
-    /// Returns another handle to the same transaction state. The framework
-    /// passes a handle to the user closure (which consumes it) while keeping one
-    /// to inspect the staged accesses and reset between retries.
-    pub(crate) fn handle(&self) -> Tx {
-        Tx {
-            ctx: self.ctx.clone(),
-            reader: self.reader.clone(),
-            inner: self.inner.clone(),
-        }
-    }
-
+impl Transaction {
     /// Reads the value for `key` within the transaction. Repeatable: a value
     /// read once is returned consistently, and a key not found stays not found
     /// (avoiding phantom reads).
@@ -78,43 +54,33 @@ impl Tx {
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
-            if let Some(e) = inner.entries.get(&p) {
-                if let Some(tv) = &e.staged {
-                    return Ok(tv.val.to_vec());
-                }
-                if let Some(info) = &e.read {
-                    if !info.found {
-                        // Be consistent with values not found the first time.
-                        return Err(Error::NotFound);
-                    }
-                }
+            if let Some(staged) = inner.staged.get(&p) {
+                return staged.read();
+            }
+            if let Some(ReadState::NotFound) = inner.reads.get(&p) {
+                // Be consistent with values not found the first time.
+                return Err(Error::NotFound);
             }
         }
 
-        match self.reader.read(&self.ctx, &p, MAX_STALENESS).await {
+        match self.reader.read(&p, MAX_STALENESS).await {
             Err(e) if e.is_not_found() => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.entries.entry(p).or_default().read = Some(ReadInfo {
-                    version: ReadVersion::default(),
-                    found: false,
-                });
+                inner.reads.insert(p, ReadState::NotFound);
                 Err(Error::NotFound)
             }
-            Err(e) => Err(Error::Other(format!("reading from storage: {e}"))),
+            Err(e) => Err(Error::Internal(format!("reading from storage: {e}"))),
             Ok(rv) => {
                 let mut inner = self.inner.lock().unwrap();
-                let e = inner.entries.entry(p).or_default();
-                e.staged = Some(Tvalue {
-                    val: rv.value.clone(),
-                    modified: false,
-                    deleted: false,
-                });
-                e.read = Some(ReadInfo {
-                    version: ReadVersion {
+                inner
+                    .staged
+                    .insert(p.clone(), StagedValue::Read(rv.value.clone()));
+                inner.reads.insert(
+                    p,
+                    ReadState::Found(ReadVersion {
                         last_writer: rv.version.writer,
-                    },
-                    found: true,
-                });
+                    }),
+                );
                 Ok(rv.value.to_vec())
             }
         }
@@ -126,14 +92,8 @@ impl Tx {
         self.inner
             .lock()
             .unwrap()
-            .entries
-            .entry(p)
-            .or_default()
-            .staged = Some(Tvalue {
-            val: Arc::from(value),
-            modified: true,
-            deleted: false,
-        });
+            .staged
+            .insert(p, StagedValue::Put(Arc::from(value)));
         Ok(())
     }
 
@@ -143,14 +103,8 @@ impl Tx {
         self.inner
             .lock()
             .unwrap()
-            .entries
-            .entry(p)
-            .or_default()
-            .staged = Some(Tvalue {
-            val: Arc::from(&[] as &[u8]),
-            modified: false,
-            deleted: true,
-        });
+            .staged
+            .insert(p, StagedValue::Delete);
         Ok(())
     }
 
@@ -160,58 +114,55 @@ impl Tx {
         Err(Error::Aborted)
     }
 
+    pub(crate) fn new(global: Global, local: Local, tmon: glassdb_trans::Monitor) -> Self {
+        Transaction {
+            reader: Reader::new(local, global, tmon),
+            inner: Arc::new(Mutex::new(TransactionInner::default())),
+        }
+    }
+
+    /// Returns another handle to the same transaction state. The framework
+    /// passes a handle to the user closure (which consumes it) while keeping one
+    /// to inspect the staged accesses and reset between retries.
+    pub(crate) fn handle(&self) -> Transaction {
+        Transaction {
+            reader: self.reader.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+
     pub(crate) fn aborted(&self) -> bool {
         self.inner.lock().unwrap().aborted
     }
 
     pub(crate) fn reset(&self) {
-        self.inner.lock().unwrap().entries.clear();
+        let mut inner = self.inner.lock().unwrap();
+        inner.staged.clear();
+        inner.reads.clear();
     }
 
     pub(crate) fn collect_accesses(&self) -> Data {
-        // Drain the entries: this is called once per attempt and the map is reset
-        // (or dropped) afterwards, so move out the staged values instead of
-        // cloning them, and build each path's `Arc<str>` once even when a key is
-        // both read and written.
-        let entries = std::mem::take(&mut self.inner.lock().unwrap().entries);
+        let inner = self.inner.lock().unwrap();
         let mut writes = Vec::new();
-        let mut reads = Vec::new();
-        for (k, e) in entries {
-            let has_write = e.staged.as_ref().is_some_and(|v| v.modified || v.deleted);
-            match (has_write, e.read.is_some()) {
-                (false, false) => {}
-                (true, false) => {
-                    let v = e.staged.unwrap();
-                    writes.push(WriteAccess {
-                        path: k.as_str().into(),
-                        val: v.val,
-                        delete: v.deleted,
-                    });
+        for (k, v) in &inner.staged {
+            match v {
+                StagedValue::Read(_) => {}
+                StagedValue::Put(val) => {
+                    writes.push(WriteAccess::put(k.as_str().into(), val.clone()))
                 }
-                (false, true) => {
-                    let r = e.read.unwrap();
-                    reads.push(ReadAccess {
-                        path: k.as_str().into(),
-                        version: r.version,
-                        found: r.found,
-                    });
-                }
-                (true, true) => {
-                    let path: Arc<str> = k.as_str().into();
-                    let v = e.staged.unwrap();
-                    writes.push(WriteAccess {
-                        path: path.clone(),
-                        val: v.val,
-                        delete: v.deleted,
-                    });
-                    let r = e.read.unwrap();
-                    reads.push(ReadAccess {
-                        path,
-                        version: r.version,
-                        found: r.found,
-                    });
-                }
+                StagedValue::Delete => writes.push(WriteAccess::delete(k.as_str().into())),
             }
+        }
+        let mut reads = Vec::new();
+        for (k, v) in &inner.reads {
+            let version = match v {
+                ReadState::Found(version) => Some(version.clone()),
+                ReadState::NotFound => None,
+            };
+            reads.push(ReadAccess {
+                path: k.as_str().into(),
+                version,
+            });
         }
         // Emit accesses in a stable path order so the commit path (transaction
         // log contents, lock acquisition order, validation order) is
@@ -224,13 +175,22 @@ impl Tx {
     }
 }
 
-struct Tvalue {
-    val: Arc<[u8]>,
-    modified: bool,
-    deleted: bool,
+enum StagedValue {
+    Read(Arc<[u8]>),
+    Put(Arc<[u8]>),
+    Delete,
 }
 
-struct ReadInfo {
-    version: ReadVersion,
-    found: bool,
+impl StagedValue {
+    fn read(&self) -> Result<Vec<u8>, Error> {
+        match self {
+            StagedValue::Read(value) | StagedValue::Put(value) => Ok(value.to_vec()),
+            StagedValue::Delete => Err(Error::NotFound),
+        }
+    }
+}
+
+enum ReadState {
+    Found(ReadVersion),
+    NotFound,
 }

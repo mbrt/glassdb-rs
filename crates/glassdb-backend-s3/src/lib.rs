@@ -12,19 +12,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId,
-    LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
+    encode_writer_tag,
 };
-use glassdb_concurr::Ctx;
 
 #[cfg(test)]
 mod tests;
+mod tuned_http;
+
+pub use tuned_http::tuned_http_client;
 
 /// Number of random bytes prepended to every object body to force a unique
 /// ETag on each write.
@@ -114,23 +116,20 @@ impl S3Backend {
         aws_sdk_s3::config::Builder::default().retry_config(self.retry.clone())
     }
 
-    /// Awaits an S3 operation, cancelling on `ctx` and mapping SDK errors.
-    async fn run<F, T, E>(ctx: &Ctx, op: &str, path: &str, fut: F) -> Result<T, BackendError>
+    /// Awaits an S3 operation and maps SDK errors. Cancellation is by
+    /// dropping the surrounding future.
+    async fn run<F, T, E>(op: &str, path: &str, fut: F) -> Result<T, BackendError>
     where
         F: Future<Output = Result<T, SdkError<E>>>,
         E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
     {
-        tokio::select! {
-            _ = ctx.cancelled() => Err(BackendError::Cancelled),
-            r = fut => r.map_err(|e| annotate(op, path, e)),
-        }
+        fut.await.map_err(|e| annotate(op, path, e))
     }
 
     /// Issues a single PutObject with the given retryer, returning the new
     /// version on success or the raw SDK error to be classified by the caller.
     async fn send_put(
         &self,
-        ctx: &Ctx,
         path: &str,
         payload: &[u8],
         metadata: &Option<HashMap<String, String>>,
@@ -151,31 +150,26 @@ impl S3Backend {
             op = op.if_none_match("*");
         }
         let cfg = aws_sdk_s3::config::Builder::default().retry_config(retry);
-        let send = op.customize().config_override(cfg).send();
-        tokio::select! {
-            _ = ctx.cancelled() => PutAttempt::Cancelled,
-            r = send => match r {
-                Ok(out) => PutAttempt::Ok(version_from_etag(out.e_tag())),
-                Err(e) => PutAttempt::Err(Box::new(e)),
-            },
+        match op.customize().config_override(cfg).send().await {
+            Ok(out) => PutAttempt::Ok(version_from_etag(out.e_tag())),
+            Err(e) => PutAttempt::Err(Box::new(e)),
         }
     }
 
     async fn put(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
         conds: PutConds,
     ) -> Result<Metadata, BackendError> {
-        if let Some(m) = &conds.if_match {
-            if m.is_empty() {
-                // An empty token can never match a stored ETag and S3 rejects an
-                // empty If-Match header. Treat it as a failed precondition rather
-                // than risk an unconditional overwrite.
-                return Err(BackendError::Precondition);
-            }
+        if let Some(m) = &conds.if_match
+            && m.is_empty()
+        {
+            // An empty token can never match a stored ETag and S3 rejects an
+            // empty If-Match header. Treat it as a failed precondition rather
+            // than risk an unconditional overwrite.
+            return Err(BackendError::Precondition);
         }
         let payload = add_nonce(&value);
         let metadata: Option<HashMap<String, String>> = if tags.is_empty() {
@@ -191,14 +185,13 @@ impl S3Backend {
             // throttling/transient failures transparently: re-applying is
             // harmless.
             return match self
-                .send_put(ctx, path, &payload, &metadata, &conds, self.retry.clone())
+                .send_put(path, &payload, &metadata, &conds, self.retry.clone())
                 .await
             {
                 PutAttempt::Ok(version) => Ok(Metadata {
                     tags: Arc::new(tags),
                     version,
                 }),
-                PutAttempt::Cancelled => Err(BackendError::Cancelled),
                 PutAttempt::Err(e) => Err(annotate("Write", path, *e)),
             };
         }
@@ -214,23 +207,15 @@ impl S3Backend {
         let mut attempt: u32 = 0;
         loop {
             let e = match self
-                .send_put(
-                    ctx,
-                    path,
-                    &payload,
-                    &metadata,
-                    &conds,
-                    RetryConfig::disabled(),
-                )
+                .send_put(path, &payload, &metadata, &conds, RetryConfig::disabled())
                 .await
             {
                 PutAttempt::Ok(version) => {
                     return Ok(Metadata {
                         tags: Arc::new(tags),
                         version,
-                    })
+                    });
                 }
-                PutAttempt::Cancelled => return Err(BackendError::Cancelled),
                 PutAttempt::Err(e) => *e,
             };
 
@@ -247,7 +232,7 @@ impl S3Backend {
             // raced; this one was not applied, so retrying it is safe and does
             // not taint a later precondition.
             if is_conflict(&e) && attempt < MAX_CONFLICT_RETRIES {
-                backoff(ctx, conflict_backoff(attempt)).await?;
+                tokio::time::sleep(conflict_backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }
@@ -256,7 +241,7 @@ impl S3Backend {
                 // An ambiguous attempt (timeout/dispatch/5xx) may have applied;
                 // a throttle (503/429) was rejected before applying and is safe.
                 lost = lost || ambiguous;
-                backoff(ctx, conflict_backoff(attempt)).await?;
+                tokio::time::sleep(conflict_backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }
@@ -274,7 +259,6 @@ impl S3Backend {
 /// The outcome of a single PutObject attempt.
 enum PutAttempt {
     Ok(Version),
-    Cancelled,
     Err(Box<SdkError<PutObjectError>>),
 }
 
@@ -289,7 +273,6 @@ struct PutConds {
 impl Backend for S3Backend {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
@@ -297,7 +280,6 @@ impl Backend for S3Backend {
         // last-writer tag is the source of truth: compare it via HEAD before
         // downloading.
         let head = Self::run(
-            ctx,
             "ReadIfModified",
             path,
             self.client
@@ -317,12 +299,11 @@ impl Backend for S3Backend {
         if current == encode_writer_tag(expected_writer) {
             return Err(BackendError::Precondition);
         }
-        self.read(ctx, path).await
+        self.read(path).await
     }
 
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         let out = Self::run(
-            ctx,
             "Read",
             path,
             self.client
@@ -349,9 +330,8 @@ impl Backend for S3Backend {
         })
     }
 
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
         let out = Self::run(
-            ctx,
             "GetMetadata",
             path,
             self.client
@@ -371,7 +351,6 @@ impl Backend for S3Backend {
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
@@ -381,7 +360,6 @@ impl Backend for S3Backend {
         // fresh nonce ensures the ETag changes so the conditional write is real
         // CAS.
         let out = Self::run(
-            ctx,
             "SetTagsIf",
             path,
             self.client
@@ -402,7 +380,6 @@ impl Backend for S3Backend {
             merged.insert(k, v);
         }
         self.put(
-            ctx,
             path,
             value,
             merged,
@@ -416,24 +393,21 @@ impl Backend for S3Backend {
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.put(ctx, path, value, tags, PutConds::default()).await
+        self.put(path, value, tags, PutConds::default()).await
     }
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
         self.put(
-            ctx,
             path,
             value,
             tags,
@@ -447,13 +421,11 @@ impl Backend for S3Backend {
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
         self.put(
-            ctx,
             path,
             value,
             tags,
@@ -465,9 +437,8 @@ impl Backend for S3Backend {
         .await
     }
 
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
         Self::run(
-            ctx,
             "Delete",
             path,
             self.client
@@ -482,16 +453,10 @@ impl Backend for S3Backend {
         .map(|_| ())
     }
 
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         // S3 has no conditional delete, so this is a HEAD-then-DELETE with a
         // documented TOCTOU window covered by the transaction algorithm.
         let head = Self::run(
-            ctx,
             "DeleteIf",
             path,
             self.client
@@ -507,7 +472,6 @@ impl Backend for S3Backend {
             return Err(BackendError::Precondition);
         }
         Self::run(
-            ctx,
             "DeleteIf",
             path,
             self.client
@@ -522,7 +486,7 @@ impl Backend for S3Backend {
         .map(|_| ())
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
         let prefix = ensure_trailing_slash(dir_path);
         let mut token: Option<String> = None;
         let mut keys: Vec<String> = Vec::new();
@@ -537,7 +501,6 @@ impl Backend for S3Backend {
                 op = op.continuation_token(t);
             }
             let out = Self::run(
-                ctx,
                 "List",
                 &prefix,
                 op.customize().config_override(self.overrides()).send(),
@@ -614,7 +577,7 @@ where
     if let Some(c) = code.as_deref() {
         match c {
             "PreconditionFailed" | "ConditionalRequestConflict" => {
-                return BackendError::Precondition
+                return BackendError::Precondition;
             }
             "NoSuchKey" | "NotFound" | "NoSuchBucket" => return BackendError::NotFound,
             _ => {}
@@ -688,14 +651,6 @@ fn in_doubt(op: &str, path: &str) -> BackendError {
     BackendError::Unavailable(format!(
         "{op}({path}): conditional write outcome unknown after a lost or ambiguous attempt"
     ))
-}
-
-/// Sleeps for `delay`, returning `Cancelled` if `ctx` is cancelled first.
-async fn backoff(ctx: &Ctx, delay: Duration) -> Result<(), BackendError> {
-    tokio::select! {
-        _ = ctx.cancelled() => Err(BackendError::Cancelled),
-        _ = tokio::time::sleep(delay) => Ok(()),
-    }
 }
 
 /// The delay before the given (zero-based) conflict retry: an exponential ramp

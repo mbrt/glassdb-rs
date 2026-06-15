@@ -1,0 +1,642 @@
+Initialize keys
+keys 0 - 100
+keys 100 - 200
+keys 200 - 300
+keys 300 - 400
+keys 400 - 500
+keys 500 - 600
+keys 600 - 700
+keys 700 - 800
+keys 800 - 900
+keys 900 - 1000
+keys 1000 - 1100
+keys 1100 - 1200
+keys 1200 - 1300
+keys 1300 - 1400
+keys 1400 - 1500
+keys 1500 - 1600
+keys 1600 - 1700
+keys 1700 - 1800
+keys 1800 - 1900
+keys 1900 - 2000
+keys 2000 - 2100
+keys 2100 - 2200
+keys 2200 - 2300
+keys 2300 - 2400
+keys 2400 - 2500
+keys 2500 - 2600
+keys 2600 - 2700
+keys 2700 - 2800
+keys 2800 - 2900
+keys 2900 - 3000
+keys 3000 - 3100
+keys 3100 - 3200
+keys 3200 - 3300
+keys 3300 - 3400
+keys 3400 - 3500
+keys 3500 - 3600
+keys 3600 - 3700
+keys 3700 - 3800
+keys 3800 - 3900
+keys 3900 - 4000
+keys 4000 - 4100
+keys 4100 - 4200
+keys 4200 - 4300
+keys 4300 - 4400
+keys 4400 - 4500
+keys 4500 - 4600
+keys 4600 - 4700
+keys 4700 - 4800
+keys 4800 - 4900
+keys 4900 - 5000
+keys 5000 - 5100
+keys 5100 - 5200
+keys 5200 - 5300
+keys 5300 - 5400
+keys 5400 - 5500
+keys 5500 - 5600
+keys 5600 - 5700
+keys 5700 - 5800
+keys 5800 - 5900
+keys 5900 - 6000
+keys 6000 - 6100
+keys 6100 - 6200
+keys 6200 - 6300
+keys 6300 - 6400
+keys 6400 - 6500
+keys 6500 - 6600
+keys 6600 - 6700
+keys 6700 - 6800
+keys 6800 - 6900
+keys 6900 - 7000
+keys 7000 - 7100
+keys 7100 - 7200
+keys 7200 - 7300
+keys 7300 - 7400
+keys 7400 - 7500
+keys 7500 - 7600
+keys 7600 - 7700
+keys 7700 - 7800
+keys 7800 - 7900
+keys 7900 - 8000
+keys 8000 - 8100
+keys 8100 - 8200
+keys 8200 - 8300
+keys 8300 - 8400
+keys 8400 - 8500
+keys 8500 - 8600
+keys 8600 - 8700
+keys 8700 - 8800
+keys 8800 - 8900
+keys 8900 - 9000
+keys 9000 - 9100
+keys 9100 - 9200
+keys 9200 - 9300
+keys 9300 - 9400
+keys 9400 - 9500
+keys 9500 - 9600
+keys 9600 - 9700
+keys 9700 - 9800
+keys 9800 - 9900
+keys 9900 - 10000
+keys 10000 - 10100
+keys 10100 - 10200
+keys 10200 - 10300
+keys 10300 - 10400
+keys 10400 - 10500
+keys 10500 - 10600
+keys 10600 - 10700
+keys 10700 - 10800
+keys 10800 - 10900
+keys 10900 - 11000
+keys 11000 - 11100
+keys 11100 - 11200
+keys 11200 - 11300
+keys 11300 - 11400
+keys 11400 - 11500
+keys 11500 - 11600
+keys 11600 - 11700
+keys 11700 - 11800
+keys 11800 - 11900
+keys 11900 - 12000
+keys 12000 - 12100
+keys 12100 - 12200
+keys 12200 - 12300
+keys 12300 - 12400
+keys 12400 - 12500
+keys 12500 - 12600
+keys 12600 - 12700
+keys 12700 - 12800
+keys 12800 - 12900
+keys 12900 - 13000
+keys 13000 - 13100
+keys 13100 - 13200
+keys 13200 - 13300
+keys 13300 - 13400
+keys 13400 - 13500
+keys 13500 - 13600
+keys 13600 - 13700
+keys 13700 - 13800
+keys 13800 - 13900
+keys 13900 - 14000
+keys 14000 - 14100
+keys 14100 - 14200
+keys 14200 - 14300
+keys 14300 - 14400
+keys 14400 - 14500
+keys 14500 - 14600
+keys 14600 - 14700
+keys 14700 - 14800
+keys 14800 - 14900
+keys 14900 - 15000
+keys 15000 - 15100
+keys 15100 - 15200
+keys 15200 - 15300
+keys 15300 - 15400
+keys 15400 - 15500
+keys 15500 - 15600
+keys 15600 - 15700
+keys 15700 - 15800
+keys 15800 - 15900
+keys 15900 - 16000
+keys 16000 - 16100
+keys 16100 - 16200
+keys 16200 - 16300
+keys 16300 - 16400
+keys 16400 - 16500
+keys 16500 - 16600
+keys 16600 - 16700
+keys 16700 - 16800
+keys 16800 - 16900
+keys 16900 - 17000
+keys 17000 - 17100
+keys 17100 - 17200
+keys 17200 - 17300
+keys 17300 - 17400
+keys 17400 - 17500
+keys 17500 - 17600
+keys 17600 - 17700
+keys 17700 - 17800
+keys 17800 - 17900
+keys 17900 - 18000
+keys 18000 - 18100
+keys 18100 - 18200
+keys 18200 - 18300
+keys 18300 - 18400
+keys 18400 - 18500
+keys 18500 - 18600
+keys 18600 - 18700
+keys 18700 - 18800
+keys 18800 - 18900
+keys 18900 - 19000
+keys 19000 - 19100
+keys 19100 - 19200
+keys 19200 - 19300
+keys 19300 - 19400
+keys 19400 - 19500
+keys 19500 - 19600
+keys 19600 - 19700
+keys 19700 - 19800
+keys 19800 - 19900
+keys 19900 - 20000
+keys 20000 - 20100
+keys 20100 - 20200
+keys 20200 - 20300
+keys 20300 - 20400
+keys 20400 - 20500
+keys 20500 - 20600
+keys 20600 - 20700
+keys 20700 - 20800
+keys 20800 - 20900
+keys 20900 - 21000
+keys 21000 - 21100
+keys 21100 - 21200
+keys 21200 - 21300
+keys 21300 - 21400
+keys 21400 - 21500
+keys 21500 - 21600
+keys 21600 - 21700
+keys 21700 - 21800
+keys 21800 - 21900
+keys 21900 - 22000
+keys 22000 - 22100
+keys 22100 - 22200
+keys 22200 - 22300
+keys 22300 - 22400
+keys 22400 - 22500
+keys 22500 - 22600
+keys 22600 - 22700
+keys 22700 - 22800
+keys 22800 - 22900
+keys 22900 - 23000
+keys 23000 - 23100
+keys 23100 - 23200
+keys 23200 - 23300
+keys 23300 - 23400
+keys 23400 - 23500
+keys 23500 - 23600
+keys 23600 - 23700
+keys 23700 - 23800
+keys 23800 - 23900
+keys 23900 - 24000
+keys 24000 - 24100
+keys 24100 - 24200
+keys 24200 - 24300
+keys 24300 - 24400
+keys 24400 - 24500
+keys 24500 - 24600
+keys 24600 - 24700
+keys 24700 - 24800
+keys 24800 - 24900
+keys 24900 - 25000
+keys 25000 - 25100
+keys 25100 - 25200
+keys 25200 - 25300
+keys 25300 - 25400
+keys 25400 - 25500
+keys 25500 - 25600
+keys 25600 - 25700
+keys 25700 - 25800
+keys 25800 - 25900
+keys 25900 - 26000
+keys 26000 - 26100
+keys 26100 - 26200
+keys 26200 - 26300
+keys 26300 - 26400
+keys 26400 - 26500
+keys 26500 - 26600
+keys 26600 - 26700
+keys 26700 - 26800
+keys 26800 - 26900
+keys 26900 - 27000
+keys 27000 - 27100
+keys 27100 - 27200
+keys 27200 - 27300
+keys 27300 - 27400
+keys 27400 - 27500
+keys 27500 - 27600
+keys 27600 - 27700
+keys 27700 - 27800
+keys 27800 - 27900
+keys 27900 - 28000
+keys 28000 - 28100
+keys 28100 - 28200
+keys 28200 - 28300
+keys 28300 - 28400
+keys 28400 - 28500
+keys 28500 - 28600
+keys 28600 - 28700
+keys 28700 - 28800
+keys 28800 - 28900
+keys 28900 - 29000
+keys 29000 - 29100
+keys 29100 - 29200
+keys 29200 - 29300
+keys 29300 - 29400
+keys 29400 - 29500
+keys 29500 - 29600
+keys 29600 - 29700
+keys 29700 - 29800
+keys 29800 - 29900
+keys 29900 - 30000
+keys 30000 - 30100
+keys 30100 - 30200
+keys 30200 - 30300
+keys 30300 - 30400
+keys 30400 - 30500
+keys 30500 - 30600
+keys 30600 - 30700
+keys 30700 - 30800
+keys 30800 - 30900
+keys 30900 - 31000
+keys 31000 - 31100
+keys 31100 - 31200
+keys 31200 - 31300
+keys 31300 - 31400
+keys 31400 - 31500
+keys 31500 - 31600
+keys 31600 - 31700
+keys 31700 - 31800
+keys 31800 - 31900
+keys 31900 - 32000
+keys 32000 - 32100
+keys 32100 - 32200
+keys 32200 - 32300
+keys 32300 - 32400
+keys 32400 - 32500
+keys 32500 - 32600
+keys 32600 - 32700
+keys 32700 - 32800
+keys 32800 - 32900
+keys 32900 - 33000
+keys 33000 - 33100
+keys 33100 - 33200
+keys 33200 - 33300
+keys 33300 - 33400
+keys 33400 - 33500
+keys 33500 - 33600
+keys 33600 - 33700
+keys 33700 - 33800
+keys 33800 - 33900
+keys 33900 - 34000
+keys 34000 - 34100
+keys 34100 - 34200
+keys 34200 - 34300
+keys 34300 - 34400
+keys 34400 - 34500
+keys 34500 - 34600
+keys 34600 - 34700
+keys 34700 - 34800
+keys 34800 - 34900
+keys 34900 - 35000
+keys 35000 - 35100
+keys 35100 - 35200
+keys 35200 - 35300
+keys 35300 - 35400
+keys 35400 - 35500
+keys 35500 - 35600
+keys 35600 - 35700
+keys 35700 - 35800
+keys 35800 - 35900
+keys 35900 - 36000
+keys 36000 - 36100
+keys 36100 - 36200
+keys 36200 - 36300
+keys 36300 - 36400
+keys 36400 - 36500
+keys 36500 - 36600
+keys 36600 - 36700
+keys 36700 - 36800
+keys 36800 - 36900
+keys 36900 - 37000
+keys 37000 - 37100
+keys 37100 - 37200
+keys 37200 - 37300
+keys 37300 - 37400
+keys 37400 - 37500
+keys 37500 - 37600
+keys 37600 - 37700
+keys 37700 - 37800
+keys 37800 - 37900
+keys 37900 - 38000
+keys 38000 - 38100
+keys 38100 - 38200
+keys 38200 - 38300
+keys 38300 - 38400
+keys 38400 - 38500
+keys 38500 - 38600
+keys 38600 - 38700
+keys 38700 - 38800
+keys 38800 - 38900
+keys 38900 - 39000
+keys 39000 - 39100
+keys 39100 - 39200
+keys 39200 - 39300
+keys 39300 - 39400
+keys 39400 - 39500
+keys 39500 - 39600
+keys 39600 - 39700
+keys 39700 - 39800
+keys 39800 - 39900
+keys 39900 - 40000
+keys 40000 - 40100
+keys 40100 - 40200
+keys 40200 - 40300
+keys 40300 - 40400
+keys 40400 - 40500
+keys 40500 - 40600
+keys 40600 - 40700
+keys 40700 - 40800
+keys 40800 - 40900
+keys 40900 - 41000
+keys 41000 - 41100
+keys 41100 - 41200
+keys 41200 - 41300
+keys 41300 - 41400
+keys 41400 - 41500
+keys 41500 - 41600
+keys 41600 - 41700
+keys 41700 - 41800
+keys 41800 - 41900
+keys 41900 - 42000
+keys 42000 - 42100
+keys 42100 - 42200
+keys 42200 - 42300
+keys 42300 - 42400
+keys 42400 - 42500
+keys 42500 - 42600
+keys 42600 - 42700
+keys 42700 - 42800
+keys 42800 - 42900
+keys 42900 - 43000
+keys 43000 - 43100
+keys 43100 - 43200
+keys 43200 - 43300
+keys 43300 - 43400
+keys 43400 - 43500
+keys 43500 - 43600
+keys 43600 - 43700
+keys 43700 - 43800
+keys 43800 - 43900
+keys 43900 - 44000
+keys 44000 - 44100
+keys 44100 - 44200
+keys 44200 - 44300
+keys 44300 - 44400
+keys 44400 - 44500
+keys 44500 - 44600
+keys 44600 - 44700
+keys 44700 - 44800
+keys 44800 - 44900
+keys 44900 - 45000
+keys 45000 - 45100
+keys 45100 - 45200
+keys 45200 - 45300
+keys 45300 - 45400
+keys 45400 - 45500
+keys 45500 - 45600
+keys 45600 - 45700
+keys 45700 - 45800
+keys 45800 - 45900
+keys 45900 - 46000
+keys 46000 - 46100
+keys 46100 - 46200
+keys 46200 - 46300
+keys 46300 - 46400
+keys 46400 - 46500
+keys 46500 - 46600
+keys 46600 - 46700
+keys 46700 - 46800
+keys 46800 - 46900
+keys 46900 - 47000
+keys 47000 - 47100
+keys 47100 - 47200
+keys 47200 - 47300
+keys 47300 - 47400
+keys 47400 - 47500
+keys 47500 - 47600
+keys 47600 - 47700
+keys 47700 - 47800
+keys 47800 - 47900
+keys 47900 - 48000
+keys 48000 - 48100
+keys 48100 - 48200
+keys 48200 - 48300
+keys 48300 - 48400
+keys 48400 - 48500
+keys 48500 - 48600
+keys 48600 - 48700
+keys 48700 - 48800
+keys 48800 - 48900
+keys 48900 - 49000
+keys 49000 - 49100
+keys 49100 - 49200
+keys 49200 - 49300
+keys 49300 - 49400
+keys 49400 - 49500
+keys 49500 - 49600
+keys 49600 - 49700
+keys 49700 - 49800
+keys 49800 - 49900
+keys 49900 - 50000
+End of keys initialization
+Run 1/3
+Testing 1 dbs
+clientmetrics num-db=1 cpu-util=0% (user=8.434443s sys=1.111106s wall=60.523029111s cores=32) http-req=34163 (564/s) throttle=0 5xx=0 new-conns=0 peak-threads=43
+Testing 5 dbs
+clientmetrics num-db=5 cpu-util=2% (user=37.839928s sys=4.136137s wall=63.039459743s cores=32) http-req=181014 (2871/s) throttle=0 5xx=0 new-conns=0 peak-threads=80
+Testing 10 dbs
+clientmetrics num-db=10 cpu-util=5% (user=82.087402s sys=8.407245s wall=62.071522522s cores=32) http-req=406559 (6550/s) throttle=1 5xx=0 new-conns=0 peak-threads=113
+Testing 15 dbs
+clientmetrics num-db=15 cpu-util=7% (user=126.347093s sys=13.680146s wall=61.670023774s cores=32) http-req=625606 (10144/s) throttle=0 5xx=0 new-conns=0 peak-threads=113
+Testing 20 dbs
+clientmetrics num-db=20 cpu-util=9% (user=152.060517s sys=19.720896s wall=61.757615893s cores=32) http-req=745917 (12078/s) throttle=0 5xx=0 new-conns=0 peak-threads=131
+Testing 25 dbs
+clientmetrics num-db=25 cpu-util=8% (user=148.330217s sys=16.031704s wall=65.540829994s cores=32) http-req=709856 (10831/s) throttle=0 5xx=0 new-conns=0 peak-threads=131
+Testing 30 dbs
+clientmetrics num-db=30 cpu-util=10% (user=158.946979s sys=32.78442s wall=62.276795064s cores=32) http-req=621370 (9978/s) throttle=16 5xx=0 new-conns=0 peak-threads=131
+Testing 35 dbs
+clientmetrics num-db=35 cpu-util=15% (user=225.006314s sys=81.123446s wall=62.691077632s cores=32) http-req=399941 (6380/s) throttle=29 5xx=0 new-conns=0 peak-threads=179
+Testing 40 dbs
+clientmetrics num-db=40 cpu-util=18% (user=272.711205s sys=97.933744s wall=65.580872353s cores=32) http-req=431011 (6572/s) throttle=16 5xx=2 new-conns=0 peak-threads=179
+Testing 45 dbs
+clientmetrics num-db=45 cpu-util=16% (user=274.487942s sys=70.506015s wall=67.426546933s cores=32) http-req=661046 (9804/s) throttle=31 5xx=6 new-conns=0 peak-threads=181
+Testing 50 dbs
+clientmetrics num-db=50 cpu-util=27% (user=358.688395s sys=191.492375s wall=62.597534015s cores=32) http-req=501803 (8016/s) throttle=8 5xx=5 new-conns=0 peak-threads=222
+Sleeping 60s before run 2/3
+Run 2/3
+Testing 1 dbs
+clientmetrics num-db=1 cpu-util=1% (user=11.012614s sys=1.108973s wall=60.433733985s cores=32) http-req=42996 (711/s) throttle=0 5xx=0 new-conns=0 peak-threads=49
+Testing 5 dbs
+clientmetrics num-db=5 cpu-util=3% (user=46.192037s sys=4.196434s wall=60.856691351s cores=32) http-req=215305 (3538/s) throttle=0 5xx=0 new-conns=0 peak-threads=75
+Testing 10 dbs
+clientmetrics num-db=10 cpu-util=5% (user=86.717331s sys=7.830354s wall=61.003345261s cores=32) http-req=418040 (6853/s) throttle=0 5xx=0 new-conns=0 peak-threads=91
+Testing 15 dbs
+clientmetrics num-db=15 cpu-util=6% (user=113.725723s sys=10.403081s wall=61.591463348s cores=32) http-req=548112 (8899/s) throttle=0 5xx=0 new-conns=0 peak-threads=137
+Testing 20 dbs
+clientmetrics num-db=20 cpu-util=8% (user=141.295188s sys=17.131261s wall=62.620887872s cores=32) http-req=634096 (10126/s) throttle=41 5xx=0 new-conns=0 peak-threads=138
+Testing 25 dbs
+clientmetrics num-db=25 cpu-util=4% (user=71.280287s sys=12.148847s wall=63.998699047s cores=32) http-req=129731 (2027/s) throttle=31 5xx=0 new-conns=0 peak-threads=336
+Testing 30 dbs
+clientmetrics num-db=30 cpu-util=6% (user=100.45356s sys=29.731254s wall=64.179364277s cores=32) http-req=177286 (2762/s) throttle=12 5xx=0 new-conns=0 peak-threads=546
+Testing 35 dbs
+clientmetrics num-db=35 cpu-util=15% (user=236.701523s sys=64.486371s wall=61.659591807s cores=32) http-req=377676 (6125/s) throttle=19 5xx=0 new-conns=0 peak-threads=353
+Testing 40 dbs
+clientmetrics num-db=40 cpu-util=17% (user=227.26684s sys=99.735426s wall=61.693939822s cores=32) http-req=373119 (6048/s) throttle=13 5xx=0 new-conns=0 peak-threads=293
+Testing 45 dbs
+clientmetrics num-db=45 cpu-util=24% (user=480.449268s sys=134.917173s wall=79.103597839s cores=32) http-req=647933 (8191/s) throttle=75 5xx=15 new-conns=0 peak-threads=217
+Testing 50 dbs
+clientmetrics num-db=50 cpu-util=38% (user=555.096652s sys=197.499994s wall=62.043144753s cores=32) http-req=666792 (10747/s) throttle=20 5xx=0 new-conns=0 peak-threads=155
+Sleeping 60s before run 3/3
+Run 3/3
+Testing 1 dbs
+clientmetrics num-db=1 cpu-util=1% (user=11.28543s sys=1.143569s wall=60.61148853s cores=32) http-req=44818 (739/s) throttle=0 5xx=0 new-conns=0 peak-threads=49
+Testing 5 dbs
+clientmetrics num-db=5 cpu-util=3% (user=47.167974s sys=3.40951s wall=60.726236933s cores=32) http-req=217634 (3584/s) throttle=0 5xx=0 new-conns=0 peak-threads=95
+Testing 10 dbs
+clientmetrics num-db=10 cpu-util=5% (user=93.905852s sys=6.580394s wall=60.945797667s cores=32) http-req=446580 (7327/s) throttle=0 5xx=0 new-conns=0 peak-threads=100
+Testing 15 dbs
+clientmetrics num-db=15 cpu-util=8% (user=144.573774s sys=14.203762s wall=61.196817511s cores=32) http-req=692127 (11310/s) throttle=0 5xx=0 new-conns=0 peak-threads=121
+Testing 20 dbs
+clientmetrics num-db=20 cpu-util=10% (user=182.674314s sys=18.211505s wall=61.722393718s cores=32) http-req=873201 (14147/s) throttle=0 5xx=0 new-conns=0 peak-threads=155
+Testing 25 dbs
+clientmetrics num-db=25 cpu-util=12% (user=163.964203s sys=67.727438s wall=61.866043122s cores=32) http-req=719682 (11633/s) throttle=27 5xx=1 new-conns=0 peak-threads=172
+Testing 30 dbs
+clientmetrics num-db=30 cpu-util=11% (user=169.437911s sys=51.034715s wall=65.545710709s cores=32) http-req=454333 (6932/s) throttle=35 5xx=0 new-conns=0 peak-threads=546
+Testing 35 dbs
+clientmetrics num-db=35 cpu-util=11% (user=165.974055s sys=56.960631s wall=61.55724287s cores=32) http-req=388212 (6307/s) throttle=56 5xx=6 new-conns=0 peak-threads=279
+Testing 40 dbs
+clientmetrics num-db=40 cpu-util=15% (user=215.53816s sys=87.543315s wall=62.242801771s cores=32) http-req=521276 (8375/s) throttle=72 5xx=11 new-conns=0 peak-threads=320
+Testing 45 dbs
+clientmetrics num-db=45 cpu-util=21% (user=315.739412s sys=119.839377s wall=64.474340622s cores=32) http-req=431035 (6685/s) throttle=63 5xx=11 new-conns=0 peak-threads=546
+Testing 50 dbs
+clientmetrics num-db=50 cpu-util=38% (user=568.07595s sys=195.157482s wall=61.956406276s cores=32) http-req=671726 (10842/s) throttle=7 5xx=2 new-conns=0 peak-threads=367
++ ./rtbench --backend=s3 --test-name=deadlock --duration=20s --num-runs=3 --run-cooldown=60s --deadlock-out=out/deadlock.csv
+Run 1/3
+deadlock: keys=1 overlap=1 (100%) samples=127 p50=96.026798ms p90=536.043554ms
+deadlock: keys=2 overlap=1 (50%) samples=155 p50=305.911186ms p90=1.958037548s
+deadlock: keys=2 overlap=2 (100%) samples=63 p50=1.21654636s p90=3.454957699s
+deadlock: keys=3 overlap=1 (33%) samples=169 p50=601.399825ms p90=816.226868ms
+deadlock: keys=3 overlap=2 (66%) samples=175 p50=562.668758ms p90=800.198055ms
+deadlock: keys=3 overlap=3 (100%) samples=192 p50=529.342432ms p90=697.91687ms
+deadlock: keys=4 overlap=1 (25%) samples=203 p50=474.265395ms p90=693.576108ms
+deadlock: keys=4 overlap=2 (50%) samples=37 p50=2.521862304s p90=6.359526531s
+deadlock: keys=4 overlap=3 (75%) samples=161 p50=372.63683ms p90=890.02834ms
+deadlock: keys=4 overlap=4 (100%) samples=263 p50=323.626042ms p90=390.82968ms
+deadlock: keys=5 overlap=1 (20%) samples=335 p50=295.18998ms p90=331.66878ms
+deadlock: keys=5 overlap=2 (40%) samples=327 p50=301.264079ms p90=335.948797ms
+deadlock: keys=5 overlap=3 (60%) samples=294 p50=320.080686ms p90=379.922152ms
+deadlock: keys=5 overlap=4 (80%) samples=222 p50=331.567196ms p90=460.063985ms
+deadlock: keys=5 overlap=5 (100%) samples=264 p50=322.620182ms p90=365.388184ms
+deadlock: keys=6 overlap=1 (16%) samples=322 p50=303.87359ms p90=348.876247ms
+deadlock: keys=6 overlap=2 (33%) samples=231 p50=317.398976ms p90=371.698132ms
+deadlock: keys=6 overlap=3 (50%) samples=83 p50=334.777522ms p90=4.71560163s
+deadlock: keys=6 overlap=4 (66%) samples=255 p50=319.21049ms p90=362.368462ms
+deadlock: keys=6 overlap=5 (83%) samples=173 p50=343.324674ms p90=664.790895ms
+deadlock: keys=6 overlap=6 (100%) samples=14 p50=7.949958149s p90=13.926156658s
+Sleeping 60s before run 2/3
+Run 2/3
+deadlock: keys=1 overlap=1 (100%) samples=366 p50=34.136765ms p90=105.093195ms
+deadlock: keys=2 overlap=1 (50%) samples=334 p50=296.809629ms p90=329.828899ms
+deadlock: keys=2 overlap=2 (100%) samples=282 p50=312.673734ms p90=389.111638ms
+deadlock: keys=3 overlap=1 (33%) samples=320 p50=307.610777ms p90=350.630339ms
+deadlock: keys=3 overlap=2 (66%) samples=317 p50=309.225754ms p90=351.002744ms
+deadlock: keys=3 overlap=3 (100%) samples=226 p50=327.946402ms p90=402.027076ms
+deadlock: keys=4 overlap=1 (25%) samples=341 p50=286.949852ms p90=324.861411ms
+deadlock: keys=4 overlap=2 (50%) samples=207 p50=318.491537ms p90=391.608137ms
+deadlock: keys=4 overlap=3 (75%) samples=301 p50=315.930066ms p90=397.407395ms
+deadlock: keys=4 overlap=4 (100%) samples=248 p50=326.417511ms p90=443.097286ms
+deadlock: keys=5 overlap=1 (20%) samples=349 p50=283.616815ms p90=313.737594ms
+deadlock: keys=5 overlap=2 (40%) samples=186 p50=310.118707ms p90=783.947373ms
+deadlock: keys=5 overlap=3 (60%) samples=129 p50=379.055435ms p90=1.131612827s
+deadlock: keys=5 overlap=4 (80%) samples=301 p50=320.47668ms p90=370.70668ms
+deadlock: keys=5 overlap=5 (100%) samples=219 p50=338.200459ms p90=830.873185ms
+deadlock: keys=6 overlap=1 (16%) samples=344 p50=284.754651ms p90=326.97802ms
+deadlock: keys=6 overlap=2 (33%) samples=182 p50=323.13862ms p90=423.401207ms
+deadlock: keys=6 overlap=3 (50%) samples=306 p50=316.119719ms p90=366.131722ms
+deadlock: keys=6 overlap=4 (66%) samples=243 p50=321.421722ms p90=403.728647ms
+deadlock: keys=6 overlap=5 (83%) samples=98 p50=402.568619ms p90=1.580588112s
+deadlock: keys=6 overlap=6 (100%) samples=68 p50=825.732246ms p90=2.39630757s
+Sleeping 60s before run 3/3
+Run 3/3
+deadlock: keys=1 overlap=1 (100%) samples=530 p50=32.864941ms p90=41.234196ms
+deadlock: keys=2 overlap=1 (50%) samples=330 p50=293.062373ms p90=343.593005ms
+deadlock: keys=2 overlap=2 (100%) samples=268 p50=324.081767ms p90=447.694832ms
+deadlock: keys=3 overlap=1 (33%) samples=329 p50=295.846033ms p90=347.627856ms
+deadlock: keys=3 overlap=2 (66%) samples=138 p50=298.998208ms p90=925.540587ms
+deadlock: keys=3 overlap=3 (100%) samples=296 p50=327.029236ms p90=381.55808ms
+deadlock: keys=4 overlap=1 (25%) samples=320 p50=290.815274ms p90=458.37332ms
+deadlock: keys=4 overlap=2 (50%) samples=313 p50=308.576129ms p90=362.068518ms
+deadlock: keys=4 overlap=3 (75%) samples=304 p50=320.000982ms p90=372.83576ms
+deadlock: keys=4 overlap=4 (100%) samples=255 p50=312.452651ms p90=396.483095ms
+deadlock: keys=5 overlap=1 (20%) samples=326 p50=300.653064ms p90=345.824448ms
+deadlock: keys=5 overlap=2 (40%) samples=17 p50=6.717767093s p90=12.239945157s
+deadlock: keys=5 overlap=3 (60%) samples=289 p50=327.981738ms p90=430.663366ms
+deadlock: keys=5 overlap=4 (80%) samples=250 p50=333.003549ms p90=383.514338ms
+deadlock: keys=5 overlap=5 (100%) samples=245 p50=329.795015ms p90=410.912891ms
+deadlock: keys=6 overlap=1 (16%) samples=334 p50=299.835581ms p90=328.408884ms
+deadlock: keys=6 overlap=2 (33%) samples=54 p50=303.151796ms p90=7.469654065s
+deadlock: keys=6 overlap=3 (50%) samples=250 p50=315.968195ms p90=386.016666ms
+deadlock: keys=6 overlap=4 (66%) samples=297 p50=320.905149ms p90=385.440682ms
+deadlock: keys=6 overlap=5 (83%) samples=208 p50=351.837903ms p90=629.927444ms
+deadlock: keys=6 overlap=6 (100%) samples=273 p50=327.948026ms p90=404.002558ms

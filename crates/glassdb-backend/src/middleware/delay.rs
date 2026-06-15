@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::rt::{self, Instant};
-use glassdb_concurr::Ctx;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
@@ -148,34 +147,30 @@ impl DelayBackend {
     }
 
     /// Blocks on the read prefix limiter (a no-op when it is disabled).
-    async fn prefix_read_wait(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        match &self.prefix_reads {
-            Some(l) => l.wait(ctx, path).await,
-            None => Ok(()),
+    async fn prefix_read_wait(&self, path: &str) {
+        if let Some(l) = &self.prefix_reads {
+            l.wait(path).await;
         }
     }
 
     /// Blocks on the write prefix limiter (a no-op when it is disabled).
-    async fn prefix_write_wait(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        match &self.prefix_writes {
-            Some(l) => l.wait(ctx, path).await,
-            None => Ok(()),
+    async fn prefix_write_wait(&self, path: &str) {
+        if let Some(l) = &self.prefix_writes {
+            l.wait(path).await;
         }
     }
 
     /// Blocks until a write token is available for `path`, retrying with
-    /// backoff. Returns [`BackendError::Cancelled`] if `ctx` is cancelled.
-    async fn backoff(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+    /// backoff. Returns when a token is acquired; the caller cancels by
+    /// dropping the surrounding future.
+    async fn backoff(&self, path: &str) {
         let max = self.retry_delay.saturating_mul(10);
         let mut interval = self.retry_delay;
         loop {
             if self.rlimit.try_acquire_token(path) {
-                return Ok(());
+                return;
             }
-            tokio::select! {
-                _ = ctx.cancelled() => return Err(BackendError::Cancelled),
-                _ = rt::sleep(interval) => {}
-            }
+            rt::sleep(interval).await;
             interval = std::cmp::min(interval.mul_f64(1.5), max);
         }
     }
@@ -185,105 +180,93 @@ impl DelayBackend {
 impl Backend for DelayBackend {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
-        self.prefix_read_wait(ctx, path).await?;
+        self.prefix_read_wait(path).await;
         self.delay(&self.obj_read).await;
-        self.inner
-            .read_if_modified(ctx, path, expected_writer)
-            .await
+        self.inner.read_if_modified(path, expected_writer).await
     }
 
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
-        self.prefix_read_wait(ctx, path).await?;
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        self.prefix_read_wait(path).await;
         self.delay(&self.obj_read).await;
-        self.inner.read(ctx, path).await
+        self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
-        self.prefix_read_wait(ctx, path).await?;
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        self.prefix_read_wait(path).await;
         self.delay(&self.meta_read).await;
-        self.inner.get_metadata(ctx, path).await
+        self.inner.get_metadata(path).await
     }
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.prefix_write_wait(ctx, path).await?;
-        self.backoff(ctx, path).await?;
+        self.prefix_write_wait(path).await;
+        self.backoff(path).await;
         self.delay(&self.meta_write).await;
-        self.inner.set_tags_if(ctx, path, expected, tags).await
+        self.inner.set_tags_if(path, expected, tags).await
     }
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.prefix_write_wait(ctx, path).await?;
-        self.backoff(ctx, path).await?;
+        self.prefix_write_wait(path).await;
+        self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.write(ctx, path, value, tags).await
+        self.inner.write(path, value, tags).await
     }
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.prefix_write_wait(ctx, path).await?;
-        self.backoff(ctx, path).await?;
+        self.prefix_write_wait(path).await;
+        self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.write_if(ctx, path, value, expected, tags).await
+        self.inner.write_if(path, value, expected, tags).await
     }
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        self.prefix_write_wait(ctx, path).await?;
-        self.backoff(ctx, path).await?;
+        self.prefix_write_wait(path).await;
+        self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.write_if_not_exists(ctx, path, value, tags).await
+        self.inner.write_if_not_exists(path, value, tags).await
     }
 
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        self.prefix_write_wait(ctx, path).await?;
-        self.backoff(ctx, path).await?;
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        self.prefix_write_wait(path).await;
+        self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.delete(ctx, path).await
+        self.inner.delete(path).await
     }
 
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
-        self.prefix_write_wait(ctx, path).await?;
-        self.backoff(ctx, path).await?;
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        self.prefix_write_wait(path).await;
+        self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.delete_if(ctx, path, expected).await
+        self.inner.delete_if(path, expected).await
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.prefix_read_wait(ctx, dir_path).await?;
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        self.prefix_read_wait(dir_path).await;
         self.delay(&self.list).await;
-        self.inner.list(ctx, dir_path).await
+        self.inner.list(dir_path).await
     }
 }
 
@@ -432,17 +415,14 @@ impl PrefixLimiter {
         })
     }
 
-    /// Blocks until a request token for `path`'s prefix is available, or until
-    /// `ctx` is cancelled.
-    async fn wait(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+    /// Blocks until a request token for `path`'s prefix is available. The
+    /// caller cancels by dropping the surrounding future.
+    async fn wait(&self, path: &str) {
         let d = self.reserve(prefix_key(path, self.depth), Instant::now());
         if d.is_zero() {
-            return Ok(());
+            return;
         }
-        tokio::select! {
-            _ = ctx.cancelled() => Err(BackendError::Cancelled),
-            _ = rt::sleep(d) => Ok(()),
-        }
+        rt::sleep(d).await;
     }
 
     /// Takes a token for `key` and returns how long the caller must wait before

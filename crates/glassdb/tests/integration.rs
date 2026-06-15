@@ -1,13 +1,16 @@
 //! Integration tests ported from the Go `glassdb_test.go` (memory-backend
 //! subset). Time-sensitive paths use `tokio::time::pause` for determinism.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Collection, Ctx, Error, Tx, DB};
+use glassdb::backend::{BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use glassdb::{Backend, Collection, Database, Error, Transaction};
+use tokio::sync::oneshot;
 
-async fn init_db(b: Arc<dyn Backend>) -> DB {
-    DB::open(&Ctx::background(), "example", b).await.unwrap()
+async fn init_db(b: Arc<dyn Backend>) -> Database {
+    Database::open("example", b).await.unwrap()
 }
 
 fn mem() -> Arc<dyn Backend> {
@@ -24,7 +27,7 @@ fn read_int(b: &[u8]) -> i64 {
     i64::from_le_bytes(arr)
 }
 
-async fn read_int_from_tx(tx: &Tx, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         // Treat a missing value as zero (i.e. initialize it).
@@ -33,9 +36,9 @@ async fn read_int_from_tx(tx: &Tx, c: &Collection, k: &[u8]) -> Result<i64, Erro
     }
 }
 
-async fn rmw(ctx: &Ctx, db: &DB, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
+async fn rmw(db: &Database, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
     for _ in 0..iters {
-        db.tx(ctx, |tx| async move {
+        db.tx(|tx| async move {
             let num = read_int_from_tx(&tx, coll, key).await?;
             tx.write(coll, key, &write_int(num + 1))
         })
@@ -46,16 +49,15 @@ async fn rmw(ctx: &Ctx, db: &DB, coll: &Collection, key: &[u8], iters: usize) ->
 
 #[tokio::test(start_paused = true)]
 async fn rw() {
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let key = b"key1";
     let val = b"value1";
 
     let coll = db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
 
-    coll.write(&ctx, key, val).await.unwrap();
-    let buf = coll.read_strong(&ctx, key).await.unwrap();
+    coll.write(key, val).await.unwrap();
+    let buf = coll.read(key).await.unwrap();
     assert_eq!(buf, val);
 
     let stats = db.stats();
@@ -66,18 +68,17 @@ async fn rw() {
 
 #[tokio::test(start_paused = true)]
 async fn delete() {
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let key = b"key1";
     let val = b"value1";
 
     let coll = db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
 
-    coll.write(&ctx, key, val).await.unwrap();
-    coll.delete(&ctx, key).await.unwrap();
+    coll.write(key, val).await.unwrap();
+    coll.delete(key).await.unwrap();
 
-    let err = coll.read_strong(&ctx, key).await.unwrap_err();
+    let err = coll.read(key).await.unwrap_err();
     assert!(err.is_not_found(), "expected not-found, got {err:?}");
 
     let stats = db.stats();
@@ -88,7 +89,6 @@ async fn delete() {
 
 #[tokio::test(start_paused = true)]
 async fn read_from_another() {
-    let ctx = Ctx::background();
     let b = mem();
     let db1 = init_db(b.clone()).await;
     let db2 = init_db(b).await;
@@ -97,16 +97,15 @@ async fn read_from_another() {
     let key = b"key1";
     let val = b"value1";
 
-    db1.collection(coll).create(&ctx).await.unwrap();
-    db1.collection(coll).write(&ctx, key, val).await.unwrap();
+    db1.collection(coll).create().await.unwrap();
+    db1.collection(coll).write(key, val).await.unwrap();
 
-    let buf = db2.collection(coll).read_strong(&ctx, key).await.unwrap();
+    let buf = db2.collection(coll).read(key).await.unwrap();
     assert_eq!(buf, val);
 }
 
 #[tokio::test(start_paused = true)]
 async fn read_deleted_from_another() {
-    let ctx = Ctx::background();
     let b = mem();
     let db1 = init_db(b.clone()).await;
     let db2 = init_db(b).await;
@@ -118,9 +117,9 @@ async fn read_deleted_from_another() {
     let newval = b"value1-modified";
 
     let db1coll = db1.collection(coll);
-    db1coll.create(&ctx).await.unwrap();
+    db1coll.create().await.unwrap();
     let db1coll = &db1coll;
-    db1.tx(&ctx, |tx| async move {
+    db1.tx(|tx| async move {
         tx.write(db1coll, key1, val)?;
         tx.write(db1coll, key2, val)
     })
@@ -128,7 +127,7 @@ async fn read_deleted_from_another() {
     .unwrap();
 
     let db2coll = &db2.collection(coll);
-    db2.tx(&ctx, |tx| async move {
+    db2.tx(|tx| async move {
         tx.write(db2coll, key1, newval)?;
         tx.delete(db2coll, key2)
     })
@@ -136,7 +135,7 @@ async fn read_deleted_from_another() {
     .unwrap();
 
     let (key1_read, key2_found) = db1
-        .tx(&ctx, |tx| async move {
+        .tx(|tx| async move {
             let k1 = tx.read(db1coll, key1).await?;
             let found = match tx.read(db1coll, key2).await {
                 Ok(_) => true,
@@ -154,13 +153,12 @@ async fn read_deleted_from_another() {
 
 #[tokio::test(start_paused = true)]
 async fn rmw_single() {
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let coll = db.collection(b"rmw-c");
     let key = b"key";
 
-    coll.create(&ctx).await.unwrap();
-    rmw(&ctx, &db, &coll, key, 30).await.unwrap();
+    coll.create().await.unwrap();
+    rmw(&db, &coll, key, 30).await.unwrap();
 
     let stats = db.stats();
     assert_eq!(stats.tx_n, 30);
@@ -168,20 +166,19 @@ async fn rmw_single() {
     assert_eq!(stats.tx_writes, 30);
     assert_eq!(stats.tx_retries, 0);
 
-    let val = coll.read_strong(&ctx, key).await.unwrap();
+    let val = coll.read(key).await.unwrap();
     assert_eq!(read_int(&val), 30);
 }
 
 async fn multiple_rmw(
-    ctx: &Ctx,
-    db: &DB,
+    db: &Database,
     coll: &Collection,
     key1: &[u8],
     key2: &[u8],
     iters: usize,
 ) -> Result<(), Error> {
     for _ in 0..iters {
-        db.tx(ctx, |tx| async move {
+        db.tx(|tx| async move {
             let n1 = read_int_from_tx(&tx, coll, key1).await?;
             tx.write(coll, key1, &write_int(n1 + 1))?;
             let n2 = read_int_from_tx(&tx, coll, key2).await?;
@@ -194,46 +191,35 @@ async fn multiple_rmw(
 
 #[tokio::test(start_paused = true)]
 async fn concurrent_rmw() {
-    let ctx = Ctx::background();
     let b = mem();
     let db1 = init_db(b.clone()).await;
     let db2 = init_db(b).await;
     let coll_name = b"rmw-c";
     let key = b"key";
 
-    db1.collection(coll_name).create(&ctx).await.unwrap();
+    db1.collection(coll_name).create().await.unwrap();
 
     let coll1 = db1.collection(coll_name);
     let coll2 = db2.collection(coll_name);
-    let (r1, r2) = tokio::join!(
-        rmw(&ctx, &db1, &coll1, key, 30),
-        rmw(&ctx, &db2, &coll2, key, 30),
-    );
+    let (r1, r2) = tokio::join!(rmw(&db1, &coll1, key, 30), rmw(&db2, &coll2, key, 30),);
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2
-        .collection(coll_name)
-        .read_strong(&ctx, key)
-        .await
-        .unwrap();
+    let val = db2.collection(coll_name).read(key).await.unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
 #[tokio::test(start_paused = true)]
 async fn multiple_rmw_single() {
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let coll = db.collection(b"multiple-rmw-c");
     let key1 = b"key1";
     let key2 = b"key2";
 
-    coll.create(&ctx).await.unwrap();
-    multiple_rmw(&ctx, &db, &coll, key1, key2, 30)
-        .await
-        .unwrap();
+    coll.create().await.unwrap();
+    multiple_rmw(&db, &coll, key1, key2, 30).await.unwrap();
 
-    let val = coll.read_strong(&ctx, key1).await.unwrap();
+    let val = coll.read(key1).await.unwrap();
     assert_eq!(read_int(&val), 30);
 
     let stats = db.stats();
@@ -243,7 +229,6 @@ async fn multiple_rmw_single() {
 
 #[tokio::test(start_paused = true)]
 async fn concurrent_multiple_rmw() {
-    let ctx = Ctx::background();
     let b = mem();
     let db1 = init_db(b.clone()).await;
     let db2 = init_db(b).await;
@@ -251,124 +236,38 @@ async fn concurrent_multiple_rmw() {
     let key1 = b"key1";
     let key2 = b"key2";
 
-    db1.collection(coll_name).create(&ctx).await.unwrap();
+    db1.collection(coll_name).create().await.unwrap();
 
     let coll1 = db1.collection(coll_name);
     let coll2 = db2.collection(coll_name);
     let (r1, r2) = tokio::join!(
-        multiple_rmw(&ctx, &db1, &coll1, key1, key2, 30),
-        multiple_rmw(&ctx, &db2, &coll2, key1, key2, 30),
+        multiple_rmw(&db1, &coll1, key1, key2, 30),
+        multiple_rmw(&db2, &coll2, key1, key2, 30),
     );
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2
-        .collection(coll_name)
-        .read_strong(&ctx, key1)
-        .await
-        .unwrap();
+    let val = db2.collection(coll_name).read(key1).await.unwrap();
     assert_eq!(read_int(&val), 60);
-    let val = db2
-        .collection(coll_name)
-        .read_strong(&ctx, key2)
-        .await
-        .unwrap();
+    let val = db2.collection(coll_name).read(key2).await.unwrap();
     assert_eq!(read_int(&val), 60);
-}
-
-// Builds the 16-byte priority-encoded transaction id used to pin a
-// transaction's wound-wait priority: `[8-byte name prefix][8-byte BE unix-nanos]`.
-// A smaller `secs` is older (higher priority).
-fn mk_tid_bytes(secs: u64, name: &[u8]) -> Vec<u8> {
-    let mut b = vec![0u8; 16];
-    let n = name.len().min(8);
-    b[..n].copy_from_slice(&name[..n]);
-    b[8..].copy_from_slice(&(secs * 1_000_000_000).to_be_bytes());
-    b
-}
-
-async fn wound_incr(
-    db: &DB,
-    ctx: &Ctx,
-    coll: &Collection,
-    first: &[u8],
-    second: &[u8],
-) -> Result<(), Error> {
-    db.tx(ctx, |tx| async move {
-        let a = read_int_from_tx(&tx, coll, first).await?;
-        let b = read_int_from_tx(&tx, coll, second).await?;
-        // Under paused time the clock only advances once every task is blocked,
-        // so sleeping here parks both transactions after their reads and before
-        // any write: they both observe the initial values and then commit
-        // concurrently, forcing the conflict the rule must resolve.
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        tx.write(coll, first, &write_int(a + 1))?;
-        tx.write(coll, second, &write_int(b + 1))
-    })
-    .await
-}
-
-// Exercises the classic deadlock setup: two concurrent transactions touch the
-// same two keys in opposite orders. Under the wound-wait rule the older
-// transaction wins and the younger one restarts, rather than both stalling
-// until the deadlock-timeout fallback fires.
-#[tokio::test(start_paused = true)]
-async fn wound_wait_reverse_contention() {
-    use std::time::Duration;
-
-    let ctx = Ctx::background();
-    let db = init_db(mem()).await;
-    let coll = db.collection(b"wound-wait-c");
-    let key1 = b"key1";
-    let key2 = b"key2";
-    coll.create(&ctx).await.unwrap();
-
-    // Deterministic priorities so the conflict has a well-defined winner: the
-    // "older" transaction has higher priority than the "younger" one.
-    let ctx_old = ctx.with_tx_id(mk_tid_bytes(1, b"older"));
-    let ctx_young = ctx.with_tx_id(mk_tid_bytes(2, b"younger"));
-
-    let start = tokio::time::Instant::now();
-    let (r1, r2) = tokio::join!(
-        wound_incr(&db, &ctx_old, &coll, key1, key2),
-        wound_incr(&db, &ctx_young, &coll, key2, key1),
-    );
-    r1.unwrap();
-    r2.unwrap();
-    let elapsed = start.elapsed();
-
-    // Both increments landed exactly once on top of each other.
-    let v1 = coll.read_strong(&ctx, key1).await.unwrap();
-    assert_eq!(read_int(&v1), 2);
-    let v2 = coll.read_strong(&ctx, key2).await.unwrap();
-    assert_eq!(read_int(&v2), 2);
-
-    // The contention forced one transaction to restart...
-    assert!(db.stats().tx_retries >= 1, "expected at least one retry");
-    // ...but wound-wait resolved it promptly instead of waiting out the
-    // multi-second deadlock-timeout fallback (MAX_DEADLOCK_TIMEOUT = 5s).
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "took too long: {elapsed:?}"
-    );
 }
 
 // Reads many keys concurrently within a single transaction (the parallelism
-// `read_multi` used to provide), now via `join_all` over `Tx::read`.
+// `read_multi` used to provide), now via `join_all` over `Transaction::read`.
 #[tokio::test(start_paused = true)]
 async fn concurrent_reads() {
     use futures::future::join_all;
 
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let coll = &db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
 
     let keys: Vec<Vec<u8>> = (0..15).map(|i| format!("key{i}").into_bytes()).collect();
     let keys = &keys;
 
     // Initialize the values.
-    db.tx(&ctx, |tx| async move {
+    db.tx(|tx| async move {
         for k in keys {
             tx.write(coll, k, &write_int(0))?;
         }
@@ -379,7 +278,7 @@ async fn concurrent_reads() {
 
     // Read all (in parallel) and increment.
     for _ in 0..30 {
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             for (k, r) in keys.iter().zip(vals) {
                 let cur = read_int(&r?);
@@ -396,19 +295,18 @@ async fn concurrent_reads() {
     assert_eq!(stats.tx_retries, 0);
 
     for k in keys {
-        let b = coll.read_strong(&ctx, k).await.unwrap();
+        let b = coll.read(k).await.unwrap();
         assert_eq!(read_int(&b), 30);
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_weak() {
+async fn read_stale() {
     use std::time::Duration;
 
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let coll = db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
     let key = b"key";
 
     let staleness = Duration::from_millis(300);
@@ -418,14 +316,14 @@ async fn read_weak() {
     let coll = &coll;
     for i in 0..30i64 {
         // Increment the value. The read avoids making this a blind write.
-        db.tx(&ctx, |tx| async move {
+        db.tx(|tx| async move {
             let _ = read_int_from_tx(&tx, coll, key).await?;
             tx.write(coll, key, &write_int(i))
         })
         .await
         .unwrap();
 
-        let val = coll.read_weak(&ctx, key, staleness).await.unwrap();
+        let val = coll.read_stale(key, staleness).await.unwrap();
         let read_num = read_int(&val);
         assert!(read_num <= i, "weak read {read_num} should be <= {i}");
         if i >= max_behind {
@@ -440,18 +338,53 @@ async fn read_weak() {
     assert_eq!(stats.tx_retries, 0);
 }
 
+// `Database::diagnostics` smoke test: on a fresh Database the snapshot is empty, and after
+// running a transaction that acquires locks the snapshot exposes the
+// post-commit state in a structured form that callers can render via the
+// `Display` impl. (Locks linger briefly while the background cleanup task
+// releases them; deeper unit tests in `glassdb-trans` assert the
+// per-tx-held-locks shape directly.)
+#[tokio::test(start_paused = true)]
+async fn diagnostics_returns_typed_snapshot() {
+    let db = init_db(mem()).await;
+
+    // A fresh Database has no coordination state.
+    let idle = db.diagnostics();
+    assert!(idle.locker_dedup.is_empty(), "fresh dedup: {idle:?}");
+    assert!(idle.transactions.is_empty(), "fresh tx locks: {idle:?}");
+
+    // After running a transaction, the snapshot is still callable and renders
+    // through the Display impl; the schema (typed fields) is the contract we
+    // care about here.
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+    let coll_ref = &coll;
+    db.tx(|tx| async move {
+        tx.write(coll_ref, b"k1", b"v1")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let diag = db.diagnostics();
+    let rendered = format!("{diag}");
+    assert!(
+        rendered.starts_with("Diagnostics:"),
+        "unexpected dump: {rendered}",
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn list_keys() {
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let coll = db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
 
     let keys: Vec<Vec<u8>> = (0u32..100).map(|i| i.to_be_bytes().to_vec()).collect();
     let test_val = b"val";
     let coll_ref = &coll;
     let keys_ref = &keys;
-    db.tx(&ctx, |tx| async move {
+    db.tx(|tx| async move {
         for k in keys_ref {
             tx.write(coll_ref, k, test_val)?;
         }
@@ -460,12 +393,12 @@ async fn list_keys() {
     .await
     .unwrap();
 
-    let mut iter = coll.keys(&ctx).await.unwrap();
-    let mut got: Vec<Vec<u8>> = Vec::new();
-    for k in iter.by_ref() {
-        got.push(k);
-    }
-    assert!(iter.err().is_none(), "iter error: {:?}", iter.err());
+    let got: Vec<Vec<u8>> = coll
+        .keys()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
 
     assert_eq!(got.len(), keys.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
@@ -483,22 +416,21 @@ async fn list_keys() {
 
 #[tokio::test(start_paused = true)]
 async fn list_collections() {
-    let ctx = Ctx::background();
     let db = init_db(mem()).await;
     let coll = db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
+    coll.create().await.unwrap();
 
     let colls: Vec<Vec<u8>> = (0u32..50).map(|i| i.to_be_bytes().to_vec()).collect();
     for c in &colls {
-        coll.collection(c).create(&ctx).await.unwrap();
+        coll.collection(c).create().await.unwrap();
     }
 
-    let mut iter = coll.collections(&ctx).await.unwrap();
-    let mut got: Vec<Vec<u8>> = Vec::new();
-    for c in iter.by_ref() {
-        got.push(c);
-    }
-    assert!(iter.err().is_none(), "iter error: {:?}", iter.err());
+    let got: Vec<Vec<u8>> = coll
+        .collections()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
 
     assert_eq!(got.len(), colls.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
@@ -514,18 +446,345 @@ async fn list_collections() {
 async fn builder_custom_options() {
     use std::time::Duration;
 
-    let ctx = Ctx::background();
-    let db = DB::builder("example", mem())
+    let db = Database::builder("example", mem())
         .cache_size(8 * 1024 * 1024)
         .retry_initial_interval(Duration::from_millis(10))
         .retry_max_interval(Duration::from_millis(100))
-        .open(&ctx)
+        .open()
         .await
         .unwrap();
 
     let coll = db.collection(b"demo-coll");
-    coll.create(&ctx).await.unwrap();
-    coll.write(&ctx, b"key1", b"value1").await.unwrap();
-    let buf = coll.read_strong(&ctx, b"key1").await.unwrap();
+    coll.create().await.unwrap();
+    coll.write(b"key1", b"value1").await.unwrap();
+    let buf = coll.read(b"key1").await.unwrap();
     assert_eq!(buf, b"value1");
+}
+
+/// Dropping a `Database::tx` future mid-flight (e.g. via `tokio::time::timeout`)
+/// must not corrupt anything and must not leave the database unusable. The
+/// next transaction observes the committed state (or the absence of one) and
+/// completes promptly, exercising the `TxAbortGuard` cleanup hook end-to-end.
+#[tokio::test(start_paused = true)]
+async fn cancelled_tx_future_does_not_block_followups() {
+    use std::time::Duration;
+
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"c");
+    coll.create().await.unwrap();
+    coll.write(b"k", &write_int(1)).await.unwrap();
+
+    let coll_ref = &coll;
+    // The closure stages a write and then blocks forever; the outer timeout
+    // drops the entire `Database::tx` future. With the `Tx`-drop safety net in
+    // place this releases all attached state synchronously and schedules an
+    // async abort of whatever engine-side tx may have been registered.
+    let r = tokio::time::timeout(Duration::from_millis(50), async {
+        db.tx(|tx| async move {
+            let _ = read_int_from_tx(&tx, coll_ref, b"k").await?;
+            tx.write(coll_ref, b"k", &write_int(99))?;
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .await
+    })
+    .await;
+    assert!(r.is_err(), "expected timeout, got {r:?}");
+
+    // The cancelled tx never committed, so the original value still wins.
+    let val = coll.read(b"k").await.unwrap();
+    assert_eq!(read_int(&val), 1);
+
+    // A normal RMW still runs and commits without contention.
+    rmw(&db, &coll, b"k", 1).await.unwrap();
+    let val = coll.read(b"k").await.unwrap();
+    assert_eq!(read_int(&val), 2);
+}
+
+/// A [`Backend`] decorator that lets a test pause at a single, known point in
+/// the commit pipeline. It arms a one-shot trap matched by path substring;
+/// the first `write_if_not_exists` whose path matches the substring (1) signals
+/// the test via a `oneshot::Sender`, then (2) parks forever on
+/// `pending().await` so the surrounding future stays alive until the test
+/// drops it.
+struct PausingBackend {
+    inner: Arc<dyn Backend>,
+    trap: Mutex<Option<Trap>>,
+    abort_write_gate: Mutex<Option<AbortWriteGate>>,
+}
+
+struct Trap {
+    path_contains: &'static str,
+    arrived: oneshot::Sender<()>,
+}
+
+struct AbortWriteGate {
+    arrived: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+impl PausingBackend {
+    fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            trap: Mutex::new(None),
+            abort_write_gate: Mutex::new(None),
+        })
+    }
+
+    /// Arms the (one-shot) trap. Returns a receiver that is fired when the
+    /// next matching `write_if_not_exists` enters the wrapper and parks.
+    fn arm(&self, path_contains: &'static str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        *self.trap.lock().unwrap() = Some(Trap {
+            path_contains,
+            arrived: tx,
+        });
+        rx
+    }
+
+    fn arm_abort_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.abort_write_gate.lock().unwrap() = Some(AbortWriteGate {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        (arrived_rx, release_tx)
+    }
+
+    fn take_match(&self, path: &str) -> Option<oneshot::Sender<()>> {
+        let mut t = self.trap.lock().unwrap();
+        if let Some(trap) = t.as_ref()
+            && path.contains(trap.path_contains)
+        {
+            return t.take().map(|trap| trap.arrived);
+        }
+        None
+    }
+
+    fn take_abort_write_gate(&self, path: &str, tags: &Tags) -> Option<AbortWriteGate> {
+        if !path.contains("/_t/")
+            || tags
+                .get("commit-status")
+                .is_none_or(|status| status != "aborted")
+        {
+            return None;
+        }
+        self.abort_write_gate.lock().unwrap().take()
+    }
+}
+
+#[async_trait]
+impl Backend for PausingBackend {
+    async fn read_if_modified(
+        &self,
+        path: &str,
+        expected_writer: &WriterId,
+    ) -> Result<ReadReply, BackendError> {
+        self.inner.read_if_modified(path, expected_writer).await
+    }
+
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        self.inner.read(path).await
+    }
+
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        self.inner.get_metadata(path).await
+    }
+
+    async fn set_tags_if(
+        &self,
+        path: &str,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        self.inner.set_tags_if(path, expected, tags).await
+    }
+
+    async fn write(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        self.inner.write(path, value, tags).await
+    }
+
+    async fn write_if(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        expected: &Version,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        self.inner.write_if(path, value, expected, tags).await
+    }
+
+    async fn write_if_not_exists(
+        &self,
+        path: &str,
+        value: Vec<u8>,
+        tags: Tags,
+    ) -> Result<Metadata, BackendError> {
+        if let Some(gate) = self.take_abort_write_gate(path, &tags) {
+            let _ = gate.arrived.send(());
+            let _ = gate.release.await;
+        }
+        if let Some(arrived) = self.take_match(path) {
+            let _ = arrived.send(());
+            std::future::pending::<()>().await;
+            unreachable!("PausingBackend pause should outlive any future that hits it");
+        }
+        self.inner.write_if_not_exists(path, value, tags).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        self.inner.delete(path).await
+    }
+
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        self.inner.delete_if(path, expected).await
+    }
+
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        self.inner.list(dir_path).await
+    }
+}
+
+/// When a `Database::tx` future is dropped *during* its commit (after
+/// `algo.begin` registered the engine-side transaction, before `algo.end`
+/// ran), the `TxAbortGuard` must schedule an async abort so peer
+/// transactions see the abort marker promptly instead of waiting for the
+/// 15-second lock lease. We exercise the exact mid-commit cancel path by
+/// trapping the first `write_if_not_exists` on a transaction-log path (the
+/// commit-log write, which only happens once locks have been acquired) and
+/// dropping the future from there.
+#[tokio::test(start_paused = true)]
+async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
+    use std::time::Duration;
+
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = PausingBackend::new(mem);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"c");
+    coll.create().await.unwrap();
+    coll.write(b"k1", &write_int(1)).await.unwrap();
+    coll.write(b"k2", &write_int(2)).await.unwrap();
+
+    // Trap the next commit-log write (`_t/<txid>` path). Setup ops above
+    // don't match and pass straight through.
+    let arrived = backend.arm("/_t/");
+
+    // Spawn a tx that writes two distinct keys, so it goes through the
+    // standard locked commit path (the single-RW fast path requires 1
+    // read + 1 write on the same key and would skip the tx-log write).
+    let stalled = tokio::spawn({
+        let db = db.clone();
+        let coll = coll.clone();
+        async move {
+            let coll_ref = &coll;
+            db.tx(|tx| async move {
+                tx.write(coll_ref, b"k1", &write_int(42))?;
+                tx.write(coll_ref, b"k2", &write_int(43))
+            })
+            .await
+        }
+    });
+
+    // Wait until the spawned tx has reached the commit-log trap. From here
+    // the engine-side tx is registered (`algo.begin` ran), the locks have
+    // been acquired, but the commit log hasn't been written yet. This is
+    // exactly the window the `TxAbortGuard` exists for.
+    arrived.await.unwrap();
+
+    // Drop the future. `TxAbortGuard::drop` fires here, calling
+    // `Algo::async_abort` which spawns a background task that writes the
+    // Aborted marker to the tx log via the (now-disarmed) backend.
+    stalled.abort();
+    let _ = stalled.await;
+
+    // A peer transaction on the same keys must complete quickly. Without
+    // the abort marker it would spin on the locks until the 15-second
+    // lease expires; with it, the locker sees `Aborted` and overrides.
+    let coll_ref = &coll;
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        db.tx(|tx| async move {
+            let n1 = read_int_from_tx(&tx, coll_ref, b"k1").await?;
+            let n2 = read_int_from_tx(&tx, coll_ref, b"k2").await?;
+            tx.write(coll_ref, b"k1", &write_int(n1 + 10))?;
+            tx.write(coll_ref, b"k2", &write_int(n2 + 10))
+        }),
+    )
+    .await;
+    let r = r.expect("peer tx timed out: TransactionAbortGuard didn't release the lock promptly");
+    r.unwrap();
+
+    // The cancelled tx never committed (its values 42/43 are gone); the
+    // peer's reads observed the original values and incremented from there.
+    let v1 = coll.read(b"k1").await.unwrap();
+    assert_eq!(read_int(&v1), 11);
+    let v2 = coll.read(b"k2").await.unwrap();
+    assert_eq!(read_int(&v2), 12);
+}
+
+/// Clean shutdown must wait for the async abort scheduled when a transaction
+/// future is dropped between `algo.begin` and `algo.end`. This test parks that
+/// abort-log write and verifies `Database::shutdown` remains pending until the write
+/// is released.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_cancelled_tx_async_abort() {
+    use std::time::Duration;
+
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = PausingBackend::new(mem);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"c");
+    coll.create().await.unwrap();
+    coll.write(b"k1", &write_int(1)).await.unwrap();
+    coll.write(b"k2", &write_int(2)).await.unwrap();
+
+    let commit_arrived = backend.arm("/_t/");
+    let (abort_arrived, release_abort) = backend.arm_abort_write_gate();
+
+    let stalled = tokio::spawn({
+        let db = db.clone();
+        let coll = coll.clone();
+        async move {
+            let coll_ref = &coll;
+            db.tx(|tx| async move {
+                tx.write(coll_ref, b"k1", &write_int(42))?;
+                tx.write(coll_ref, b"k2", &write_int(43))
+            })
+            .await
+        }
+    });
+
+    commit_arrived.await.unwrap();
+    stalled.abort();
+    let _ = stalled.await;
+
+    let shutdown = tokio::spawn({
+        let db = db.clone();
+        async move {
+            db.shutdown().await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), abort_arrived)
+        .await
+        .expect("async abort did not start during shutdown")
+        .unwrap();
+
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned before async abort completed"
+        );
+    }
+
+    release_abort.send(()).unwrap();
+    shutdown.await.unwrap();
 }

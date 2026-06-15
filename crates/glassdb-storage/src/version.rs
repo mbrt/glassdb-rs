@@ -16,14 +16,14 @@ pub struct Version {
 
 impl Version {
     /// Reports whether the version has no backend version and no writer.
-    pub fn is_null(&self) -> bool {
-        self.b.is_null() && self.writer.is_empty()
+    pub fn is_unset(&self) -> bool {
+        self.b.is_unset() && self.writer.is_unset()
     }
 
     /// Reports whether the version was written by a local, not-yet-committed
     /// transaction.
     pub fn is_local(&self) -> bool {
-        !self.writer.is_empty()
+        !self.writer.is_unset()
     }
 
     /// Reports whether `self` and `other` refer to the same value (same writer).

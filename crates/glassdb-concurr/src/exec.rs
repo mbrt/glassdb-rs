@@ -9,9 +9,11 @@
 //! relies on (see ADR-010/011).
 //!
 //! Crucially, the executor reuses `tokio::sync` (which is runtime-agnostic) and
-//! `biased` `tokio::select!` unchanged: those wake tasks through the standard
-//! `Waker` API, which routes into this executor's ready set, so interleaving
-//! control is obtained without re-implementing the synchronization surface.
+//! `tokio::select!` unchanged: those wake tasks through the standard `Waker`
+//! API, which routes into this executor's ready set, so interleaving control is
+//! obtained without re-implementing the synchronization surface. `biased`
+//! selects poll top-to-bottom; non-`biased` ones stay deterministic because
+//! [`block_on_with`] seeds tokio's branch-poll RNG from the run seed.
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -24,6 +26,19 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use crate::rng::Rng;
+
+/// Maximum number of scheduler steps (task polls plus virtual-time advances) a
+/// single [`block_on_with`] run may take before it is declared non-terminating
+/// and panics. A deterministic backstop (a *single-execution timeout* measured
+/// in schedule steps rather than wall-clock, so it trips identically on every
+/// replay) against livelock or an infinite retry loop (a bug class DST hunts):
+/// a legitimate bounded workload uses orders of magnitude fewer steps, while a
+/// run that never terminates trips this instead of hanging forever.
+///
+/// Set ~700x above the heaviest legitimate run observed across the whole sim
+/// suite (~1.4k steps), so it cannot false-trip a bounded workload. Note this is
+/// a *complement* to, not a replacement for, libFuzzer's wall-clock `-timeout`.
+const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
 
 /// Unique id of a task within a single executor run. Assigned in spawn order, so
 /// it is a deterministic function of the (deterministic) schedule.
@@ -210,16 +225,12 @@ struct Inner {
 
 /// Tasks woken via a `Waker`. The only state shared with wakers, so it is the
 /// only part that must be `Send + Sync`.
+#[derive(Default)]
 struct WakeQueue {
     woken: Mutex<Vec<TaskId>>,
 }
 
 impl WakeQueue {
-    fn new() -> Self {
-        WakeQueue {
-            woken: Mutex::new(Vec::new()),
-        }
-    }
     fn push(&self, t: TaskId) {
         self.woken.lock().unwrap().push(t);
     }
@@ -390,6 +401,10 @@ impl Future for DetYield {
 /// Panics deterministically if the system deadlocks: no task is runnable and no
 /// timer is pending while `root` has not completed.
 ///
+/// Panics deterministically if the run exceeds [`DEFAULT_STEP_BUDGET`] scheduler
+/// steps, treating non-termination (livelock / infinite retry) as a failure
+/// instead of hanging forever.
+///
 /// `entropy_seed` seeds the simulated entropy source read by [`fill_random`].
 pub fn block_on_with<S, F, T>(scheduler: S, entropy_seed: u64, root: F) -> T
 where
@@ -397,7 +412,39 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let wake = Arc::new(WakeQueue::new());
+    block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, root)
+}
+
+/// As [`block_on_with`], but with an explicit per-run step `budget`. Private so
+/// the public entry point always uses [`DEFAULT_STEP_BUDGET`]; a small budget
+/// lets the tests exercise the non-termination guard without spinning millions
+/// of steps.
+fn block_on_with_budget<S, F, T>(scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
+where
+    S: Scheduler + 'static,
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    // Seed tokio's `select!` branch-poll RNG from `entropy_seed` so that even a
+    // non-`biased` `select!` (ours or one inside a dependency) replays
+    // identically across runs instead of drawing from tokio's OS-seeded
+    // thread-local RNG. tokio swaps in the runtime's `RngSeed` only when it
+    // *enters* the runtime, and on current-thread that enter happens inside
+    // `block_on` (the public `Runtime::enter()` does not touch the select RNG).
+    // So we drive our own synchronous `run_loop` from within `block_on`: the
+    // seed is live for every task poll, and `tokio::select!` reads it on each
+    // poll, making the branch order a pure function of the seed. A fresh runtime
+    // per call is required - entering advances the seed generator, so reusing one
+    // would hand successive runs different seeds and reintroduce divergence.
+    // Requires `--cfg tokio_unstable` (paired with `--cfg sim`).
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .rng_seed(tokio::runtime::RngSeed::from_bytes(
+            &entropy_seed.to_le_bytes(),
+        ))
+        .build()
+        .expect("build sim-local tokio runtime for select-rng seeding");
+
+    let wake = Arc::new(WakeQueue::default());
     let inner = Rc::new(RefCell::new(Inner {
         next_task: 0,
         next_timer: 0,
@@ -423,18 +470,59 @@ where
         *o2.lock().unwrap() = Some(v);
     }));
 
-    run_loop(&handle, &out);
+    // Drive the synchronous executor loop inside `block_on` so the seeded select
+    // RNG is installed for the duration. `unconstrained` disables tokio's
+    // cooperative budget, which would otherwise force the `tokio::sync`
+    // primitives our tasks use to yield after ~128 ops within our single
+    // synthetic poll (we never re-enter `block_on`, so a yield would stall).
+    tokio_rt.block_on(tokio::task::coop::unconstrained(std::future::poll_fn(
+        |_cx| {
+            run_loop(&handle, &out, budget);
+            std::task::Poll::Ready(())
+        },
+    )));
 
     let result = out
         .lock()
         .unwrap()
         .take()
         .expect("root task did not complete");
+
+    // Drop background tasks BEFORE the `CurrentGuard` clears `CURRENT`. Some
+    // futures invoke `rt::spawn` from their `Drop` (e.g. `Dedup::DriverGuard`
+    // hands the rest of a batch off to a freshly-spawned owner), and that
+    // dispatch needs to see the simulation executor still installed. Re-entrant
+    // spawns from a task's `Drop` would deadlock on the executor's `RefCell`
+    // if we held it across the drop, so we repeatedly snapshot-and-clear the
+    // task map until it stays empty.
+    loop {
+        let drained: Vec<_> = std::mem::take(&mut handle.inner.borrow_mut().tasks)
+            .into_iter()
+            .collect();
+        if drained.is_empty() {
+            break;
+        }
+        drop(drained);
+    }
+    drop(handle);
+
     result
 }
 
-fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>) {
+fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
+    let mut steps: u64 = 0;
     loop {
+        // Bound a single execution: a run that never terminates (livelock /
+        // infinite retry) trips this deterministic step budget and panics rather
+        // than hanging the fuzzer or a corpus replay forever.
+        steps += 1;
+        if steps > budget {
+            panic!(
+                "simulation executor exceeded its step budget ({budget} scheduler \
+                 steps): the run is not terminating (livelock or infinite retry loop)"
+            );
+        }
+
         // 1. Fold woken tasks into the (sorted) ready set.
         let woken = handle.wake.take();
         {
@@ -528,6 +616,8 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rng::Rng;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fixed-order scheduler: always polls the lowest-id ready task. Useful as
@@ -546,6 +636,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "exceeded its step budget")]
+    fn step_budget_bounds_a_runaway_execution() {
+        // A run that takes far more steps than its budget allows must trip the
+        // deterministic non-termination guard and panic, instead of spinning
+        // forever and hanging the fuzzer or a corpus replay. A tiny budget keeps
+        // the test fast: the workload below would otherwise take ~10k steps.
+        block_on_with_budget(LowestFirst, 0, 100, async {
+            for _ in 0..10_000 {
+                DetYield::default().await;
+            }
+        });
+    }
+
+    #[test]
     fn sleep_advances_virtual_time_instantly() {
         // The sleep is for 10s of virtual time; the test returns immediately.
         let elapsed = block_on_with(LowestFirst, 0, async {
@@ -554,6 +658,41 @@ mod tests {
             now_nanos() - start
         });
         assert_eq!(elapsed, Duration::from_secs(10).as_nanos() as u64);
+    }
+
+    #[test]
+    fn seeded_select_order_is_deterministic_per_seed() {
+        // Records the branch a non-biased `tokio::select!` picks for 32 decisions
+        // where both branches are immediately ready, so the only thing choosing
+        // is tokio's branch-poll RNG. `block_on_with` seeds that RNG from its
+        // `entropy_seed` (by entering a `RngSeed`-built runtime), so the sequence
+        // must be a pure function of the seed.
+        fn draws(seed: u64) -> Vec<u32> {
+            block_on_with(LowestFirst, seed, async {
+                let mut out = Vec::new();
+                for _ in 0..32 {
+                    let w: u32 = tokio::select! {
+                        _ = std::future::ready(()) => 0,
+                        _ = std::future::ready(()) => 1,
+                    };
+                    out.push(w);
+                }
+                out
+            })
+        }
+        // Same seed => identical decision sequence across independent runs.
+        // Without seeding on runtime-enter, tokio's thread-local select RNG would
+        // carry over between the two `block_on_with` calls and the sequences
+        // would diverge (the bug this guards against).
+        assert_eq!(draws(7), draws(7));
+        assert_eq!(draws(123), draws(123));
+        // The seed genuinely drives the order (so it is seeded, not fixed): some
+        // sequence differs, proving the choice is not constant.
+        assert!(
+            draws(7) != draws(8) || draws(1) != draws(2),
+            "select order did not vary with the seed; tokio's branch RNG may not \
+             be seeded by our runtime"
+        );
     }
 
     #[test]
@@ -634,6 +773,58 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    #[test]
+    fn tape_scheduler_consumes_bytes_modulo_ready_set_then_falls_back() {
+        let mut scheduler = TapeScheduler::new(vec![5, 4]);
+        let ready = [TaskId(10), TaskId(20), TaskId(30)];
+
+        assert_eq!(scheduler.pick(&ready), 2, "5 % 3 selects index 2");
+        assert_eq!(scheduler.pick(&ready), 1, "4 % 3 selects index 1");
+        assert_eq!(
+            scheduler.pick(&ready),
+            0,
+            "exhausted tapes fall back to the deterministic lowest-ready choice"
+        );
+    }
+
+    #[test]
+    fn executor_presents_ready_tasks_in_sorted_order() {
+        struct ReadyRecorder {
+            seen: Arc<Mutex<Vec<Vec<TaskId>>>>,
+        }
+        impl Scheduler for ReadyRecorder {
+            fn pick(&mut self, ready: &[TaskId]) -> usize {
+                self.seen.lock().unwrap().push(ready.to_vec());
+                0
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        block_on_with(ReadyRecorder { seen: seen.clone() }, 0, async {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                handles.push(det_spawn(async {
+                    DetYield::default().await;
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|ready| ready.len() > 1),
+            "test never presented multiple ready tasks to the scheduler: {seen:?}"
+        );
+        for ready in seen.iter() {
+            assert!(
+                ready.windows(2).all(|pair| pair[0] < pair[1]),
+                "ready set was not sorted: {ready:?}"
+            );
+        }
+    }
+
     /// Drives four yielding tasks under a [`PctScheduler`] and returns the order
     /// in which their steps ran.
     fn pct_order(seed: u64) -> Vec<u32> {
@@ -670,5 +861,25 @@ mod tests {
         let baseline = pct_order(0);
         let differs = (1u64..32).any(|s| pct_order(s) != baseline);
         assert!(differs, "no PCT seed in 1..32 changed the interleaving");
+    }
+
+    #[test]
+    fn pct_change_point_demotes_selected_task() {
+        let mut scheduler = PctScheduler {
+            rng: Rng::new(0),
+            priorities: BTreeMap::from([(TaskId(1), 100), (TaskId(2), 90)]),
+            change_points: vec![1],
+            step: 0,
+            low_next: 0,
+        };
+        let ready = [TaskId(1), TaskId(2)];
+
+        assert_eq!(scheduler.pick(&ready), 0);
+        assert_eq!(scheduler.priorities[&TaskId(1)], 1);
+        assert_eq!(
+            scheduler.pick(&ready),
+            1,
+            "the demoted task must yield to the next-highest priority"
+        );
     }
 }
