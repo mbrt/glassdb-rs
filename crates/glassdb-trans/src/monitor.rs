@@ -52,9 +52,6 @@ struct WaitRequest {
 
 #[derive(Default)]
 struct State {
-    // Keyed by `TxId` (an `Arc<[u8]>` that hashes/compares by byte content), so
-    // registering a transaction is a refcount bump rather than a `Vec<u8>` copy
-    // of the id on every `begin_tx` (i.e. every committed transaction).
     local_tx: HashMap<TxId, TxStatusEntry>,
     waiters: HashMap<TxId, Vec<WaitRequest>>,
     unknown_tx: HashMap<TxId, SystemTime>,

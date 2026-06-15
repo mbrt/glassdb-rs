@@ -167,9 +167,6 @@ impl TLogger {
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
-    ///
-    /// Borrows the log: the commit path writes the same `TxLog` repeatedly
-    /// (retries), and a locked commit hands its log here without cloning it.
     pub async fn set(&self, ctx: &Ctx, l: &TxLog) -> Result<backend::Version, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let buf = marshal_log(l, ts)?;

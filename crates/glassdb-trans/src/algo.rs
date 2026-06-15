@@ -210,9 +210,9 @@ fn init_validation(h: &Handle) -> ValidationState {
         e.delete = w.delete;
     }
     // Sort by path so the validation order is independent of `HashMap`'s
-    // randomized iteration order. Under the madsim simulator this makes the
-    // sequence of backend operations a deterministic function of the seed (and
-    // is harmless in production).
+    // randomized iteration order. Under the simulator this makes the sequence
+    // of backend operations a deterministic function of the seed (and is
+    // harmless in production).
     let mut paths: Vec<PathState> = m.into_values().collect();
     paths.sort_by(|a, b| a.path.cmp(&b.path));
     ValidationState { paths }
