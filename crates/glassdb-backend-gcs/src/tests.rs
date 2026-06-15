@@ -8,9 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Tags, Version, WriterId, LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Tags, Version, WriterId, encode_writer_tag,
 };
-use glassdb_concurr::Ctx;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -18,11 +17,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use crate::{GcsBackend, BOUNDARY};
-
-fn ctx() -> Ctx {
-    Ctx::background()
-}
+use crate::{BOUNDARY, GcsBackend};
 
 // ---------------------------------------------------------------------------
 // In-process fake GCS server
@@ -178,10 +173,9 @@ fn insert(
     if let Some(m) = query
         .get("ifMetagenerationMatch")
         .and_then(|v| v.parse::<i64>().ok())
+        && existing.map(|o| o.metageneration) != Some(m)
     {
-        if existing.map(|o| o.metageneration) != Some(m) {
-            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-        }
+        return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
     }
 
     store.gen_ctr += 1;
@@ -229,10 +223,9 @@ fn get_media(
     if let Some(g) = query
         .get("ifGenerationMatch")
         .and_then(|v| v.parse::<i64>().ok())
+        && g != o.generation
     {
-        if g != o.generation {
-            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-        }
+        return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -255,18 +248,16 @@ fn patch(
         if let Some(g) = query
             .get("ifGenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && g != o.generation
         {
-            if g != o.generation {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
         if let Some(m) = query
             .get("ifMetagenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && m != o.metageneration
         {
-            if m != o.metageneration {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
     }
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -286,18 +277,16 @@ fn delete(state: &FakeState, name: &str, query: &HashMap<String, String>) -> Res
         if let Some(g) = query
             .get("ifGenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && g != o.generation
         {
-            if g != o.generation {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
         if let Some(m) = query
             .get("ifMetagenerationMatch")
             .and_then(|v| v.parse::<i64>().ok())
+            && m != o.metageneration
         {
-            if m != o.metageneration {
-                return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
-            }
+            return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
         }
     }
     store.objects.remove(name);
@@ -318,11 +307,11 @@ fn list(state: &FakeState, query: &HashMap<String, String>) -> Response<Full<Byt
         let Some(rest) = k.strip_prefix(&prefix) else {
             continue;
         };
-        if !delim.is_empty() {
-            if let Some(idx) = rest.find(&delim) {
-                prefixes.insert(format!("{prefix}{}", &rest[..=idx]));
-                continue;
-            }
+        if !delim.is_empty()
+            && let Some(idx) = rest.find(&delim)
+        {
+            prefixes.insert(format!("{prefix}{}", &rest[..=idx]));
+            continue;
         }
         items.push(k);
     }
@@ -521,10 +510,10 @@ async fn read_write_roundtrip() {
     ] {
         let mut tags = Tags::new();
         tags.insert("key".to_string(), "val".to_string());
-        let meta = b.write(&ctx(), name, value.clone(), tags).await.unwrap();
-        assert!(!meta.version.is_null());
+        let meta = b.write(name, value.clone(), tags).await.unwrap();
+        assert!(!meta.version.is_unset());
 
-        let r = b.read(&ctx(), name).await.unwrap();
+        let r = b.read(name).await.unwrap();
         assert_eq!(r.contents, value, "case {name}");
         assert_eq!(r.tags.get("key").map(String::as_str), Some("val"));
         assert_eq!(r.version, meta.version);
@@ -535,14 +524,8 @@ async fn read_write_roundtrip() {
 async fn write_produces_fresh_version_each_time() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m1 = b
-        .write(&ctx(), "k", b"same".to_vec(), Tags::new())
-        .await
-        .unwrap();
-    let m2 = b
-        .write(&ctx(), "k", b"same".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m1 = b.write("k", b"same".to_vec(), Tags::new()).await.unwrap();
+    let m2 = b.write("k", b"same".to_vec(), Tags::new()).await.unwrap();
     assert_ne!(m1.version, m2.version);
 }
 
@@ -555,15 +538,12 @@ async fn set_tags_if_merges_and_cas() {
     let mut tags = Tags::new();
     tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
     tags.insert("lock-type".to_string(), "-".to_string());
-    let m0 = b.write(&ctx(), "k", b"value".to_vec(), tags).await.unwrap();
+    let m0 = b.write("k", b"value".to_vec(), tags).await.unwrap();
 
     let mut new_tags = Tags::new();
     new_tags.insert("lock-type".to_string(), "w".to_string());
     new_tags.insert("locked-by".to_string(), "tx2".to_string());
-    let m1 = b
-        .set_tags_if(&ctx(), "k", &m0.version, new_tags)
-        .await
-        .unwrap();
+    let m1 = b.set_tags_if("k", &m0.version, new_tags).await.unwrap();
     assert_ne!(m0.version, m1.version);
     // The last-writer tag is preserved across a lock-only update.
     assert_eq!(
@@ -574,16 +554,13 @@ async fn set_tags_if_merges_and_cas() {
     assert_eq!(m1.tags.get("locked-by").map(String::as_str), Some("tx2"));
 
     // The object body is untouched by a tag update.
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"value");
 
     // The now-stale version fails the precondition.
     let mut t = Tags::new();
     t.insert("lock-type".to_string(), "r".to_string());
-    let err = b
-        .set_tags_if(&ctx(), "k", &m0.version, t)
-        .await
-        .unwrap_err();
+    let err = b.set_tags_if("k", &m0.version, t).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 }
 
@@ -594,7 +571,7 @@ async fn set_tags_if_not_found() {
     let mut t = Tags::new();
     t.insert("lock-type".to_string(), "r".to_string());
     let err = b
-        .set_tags_if(&ctx(), "missing", &Version::new("1/1"), t)
+        .set_tags_if("missing", &Version::new("1/1"), t)
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
@@ -604,15 +581,15 @@ async fn set_tags_if_not_found() {
 async fn write_if_not_exists() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write_if_not_exists(&ctx(), "k", b"a".to_vec(), Tags::new())
+    b.write_if_not_exists("k", b"a".to_vec(), Tags::new())
         .await
         .unwrap();
     let err = b
-        .write_if_not_exists(&ctx(), "k", b"b".to_vec(), Tags::new())
+        .write_if_not_exists("k", b"b".to_vec(), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"a");
 }
 
@@ -620,29 +597,20 @@ async fn write_if_not_exists() {
 async fn write_if_cas() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
 
     let err = b
-        .write_if(
-            &ctx(),
-            "k",
-            b"b".to_vec(),
-            &Version::new("999/999"),
-            Tags::new(),
-        )
+        .write_if("k", b"b".to_vec(), &Version::new("999/999"), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
     let m1 = b
-        .write_if(&ctx(), "k", b"b".to_vec(), &m0.version, Tags::new())
+        .write_if("k", b"b".to_vec(), &m0.version, Tags::new())
         .await
         .unwrap();
     assert_ne!(m0.version, m1.version);
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
 }
 
@@ -650,18 +618,15 @@ async fn write_if_cas() {
 async fn write_if_null_version_fails_precondition() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
 
     let err = b
-        .write_if(&ctx(), "k", b"b".to_vec(), &Version::default(), Tags::new())
+        .write_if("k", b"b".to_vec(), &Version::default(), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"a");
     assert_eq!(r.version, m0.version);
 }
@@ -673,13 +638,13 @@ async fn read_if_modified() {
     let writer = WriterId::new(b"w1".to_vec());
     let mut tags = Tags::new();
     tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
-    b.write(&ctx(), "k", b"x".to_vec(), tags).await.unwrap();
+    b.write("k", b"x".to_vec(), tags).await.unwrap();
 
-    let err = b.read_if_modified(&ctx(), "k", &writer).await.unwrap_err();
+    let err = b.read_if_modified("k", &writer).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
     let r = b
-        .read_if_modified(&ctx(), "k", &WriterId::new(b"other".to_vec()))
+        .read_if_modified("k", &WriterId::new(b"other".to_vec()))
         .await
         .unwrap();
     assert_eq!(r.contents, b"x");
@@ -689,20 +654,17 @@ async fn read_if_modified() {
 async fn delete_if() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"x".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"x".to_vec(), Tags::new()).await.unwrap();
 
     let err = b
-        .delete_if(&ctx(), "k", &Version::new("999/999"))
+        .delete_if("k", &Version::new("999/999"))
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
-    b.read(&ctx(), "k").await.unwrap();
+    b.read("k").await.unwrap();
 
-    b.delete_if(&ctx(), "k", &m0.version).await.unwrap();
-    let err = b.read(&ctx(), "k").await.unwrap_err();
+    b.delete_if("k", &m0.version).await.unwrap();
+    let err = b.read("k").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
@@ -710,11 +672,9 @@ async fn delete_if() {
 async fn delete_unconditional() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write(&ctx(), "k", b"x".to_vec(), Tags::new())
-        .await
-        .unwrap();
-    b.delete(&ctx(), "k").await.unwrap();
-    let err = b.read(&ctx(), "k").await.unwrap_err();
+    b.write("k", b"x".to_vec(), Tags::new()).await.unwrap();
+    b.delete("k").await.unwrap();
+    let err = b.read("k").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
@@ -722,9 +682,9 @@ async fn delete_unconditional() {
 async fn read_and_metadata_not_found() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let err = b.read(&ctx(), "missing").await.unwrap_err();
+    let err = b.read("missing").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
-    let err = b.get_metadata(&ctx(), "missing").await.unwrap_err();
+    let err = b.get_metadata("missing").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
@@ -733,13 +693,13 @@ async fn list_with_subdirs() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write(&ctx(), name, name.as_bytes().to_vec(), Tags::new())
+        b.write(name, name.as_bytes().to_vec(), Tags::new())
             .await
             .unwrap();
     }
-    let got = b.list(&ctx(), "d").await.unwrap();
+    let got = b.list("d").await.unwrap();
     assert_eq!(got, vec!["d/a/", "d/c/", "d/root"]);
-    let got = b.list(&ctx(), "d/a").await.unwrap();
+    let got = b.list("d/a").await.unwrap();
     assert_eq!(got, vec!["d/a/1", "d/a/2", "d/a/b/"]);
 }
 
@@ -760,7 +720,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
     // The create lands, but the server answers 500, hiding that it landed.
     fake.set_lost_ack(1);
     let err = b
-        .write_if_not_exists(&ctx(), "k", b"v".to_vec(), Tags::new())
+        .write_if_not_exists("k", b"v".to_vec(), Tags::new())
         .await
         .unwrap_err();
     assert!(
@@ -769,7 +729,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
     );
 
     // The write really did persist.
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"v");
 }
 
@@ -777,14 +737,11 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
 async fn write_if_lost_ack_is_in_doubt() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
 
     fake.set_lost_ack(1);
     let err = b
-        .write_if(&ctx(), "k", b"b".to_vec(), &m0.version, Tags::new())
+        .write_if("k", b"b".to_vec(), &m0.version, Tags::new())
         .await
         .unwrap_err();
     assert!(
@@ -792,7 +749,7 @@ async fn write_if_lost_ack_is_in_doubt() {
         "expected Unavailable (in-doubt), got {err:?}"
     );
 
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
 }
 
@@ -801,11 +758,11 @@ async fn clean_conflict_still_precondition() {
     // A genuine conflict with no lost ack must stay a retryable `Precondition`.
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write_if_not_exists(&ctx(), "k", b"a".to_vec(), Tags::new())
+    b.write_if_not_exists("k", b"a".to_vec(), Tags::new())
         .await
         .unwrap();
     let err = b
-        .write_if_not_exists(&ctx(), "k", b"b".to_vec(), Tags::new())
+        .write_if_not_exists("k", b"b".to_vec(), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition), "got {err:?}");

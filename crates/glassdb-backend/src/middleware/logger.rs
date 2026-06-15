@@ -4,10 +4,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use glassdb_concurr::Ctx;
 
 use crate::{
-    encode_writer_tag, Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId,
+    Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId, encode_writer_tag,
 };
 
 /// A [`Backend`] decorator that emits a `tracing` debug event for every
@@ -45,14 +44,10 @@ fn meta_summary(r: &Result<Metadata, BackendError>) -> String {
 impl Backend for BackendLogger {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
-        let r = self
-            .inner
-            .read_if_modified(ctx, path, expected_writer)
-            .await;
+        let r = self.inner.read_if_modified(path, expected_writer).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
@@ -63,29 +58,25 @@ impl Backend for BackendLogger {
         r
     }
 
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
-        let r = self.inner.read(ctx, path).await;
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+        let r = self.inner.read(path).await;
         tracing::debug!(backend_id = %self.id, path, res = %read_reply_summary(&r), "Read");
         r
     }
 
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
-        let r = self.inner.get_metadata(ctx, path).await;
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+        let r = self.inner.get_metadata(path).await;
         tracing::debug!(backend_id = %self.id, path, res = %meta_summary(&r), "GetMetadata");
         r
     }
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
-        let r = self
-            .inner
-            .set_tags_if(ctx, path, expected, tags.clone())
-            .await;
+        let r = self.inner.set_tags_if(path, expected, tags.clone()).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
@@ -98,13 +89,12 @@ impl Backend for BackendLogger {
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
     ) -> Result<Metadata, BackendError> {
         let size = value.len();
-        let r = self.inner.write(ctx, path, value, tags.clone()).await;
+        let r = self.inner.write(path, value, tags.clone()).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
@@ -117,7 +107,6 @@ impl Backend for BackendLogger {
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
@@ -126,7 +115,7 @@ impl Backend for BackendLogger {
         let size = value.len();
         let r = self
             .inner
-            .write_if(ctx, path, value, expected, tags.clone())
+            .write_if(path, value, expected, tags.clone())
             .await;
         tracing::debug!(
             backend_id = %self.id,
@@ -140,7 +129,6 @@ impl Backend for BackendLogger {
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
@@ -148,7 +136,7 @@ impl Backend for BackendLogger {
         let size = value.len();
         let r = self
             .inner
-            .write_if_not_exists(ctx, path, value, tags.clone())
+            .write_if_not_exists(path, value, tags.clone())
             .await;
         tracing::debug!(
             backend_id = %self.id,
@@ -160,19 +148,14 @@ impl Backend for BackendLogger {
         r
     }
 
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
-        let r = self.inner.delete(ctx, path).await;
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+        let r = self.inner.delete(path).await;
         tracing::debug!(backend_id = %self.id, path, err = ?r.as_ref().err(), "Delete");
         r
     }
 
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
-        let r = self.inner.delete_if(ctx, path, expected).await;
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        let r = self.inner.delete_if(path, expected).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
@@ -183,8 +166,8 @@ impl Backend for BackendLogger {
         r
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        let r = self.inner.list(ctx, dir_path).await;
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+        let r = self.inner.list(dir_path).await;
         tracing::debug!(backend_id = %self.id, path = dir_path, err = ?r.as_ref().err(), "List");
         r
     }

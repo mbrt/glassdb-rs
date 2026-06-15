@@ -18,7 +18,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use glassdb_concurr::Ctx;
 
 use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
 
@@ -109,31 +108,27 @@ impl RecordingBackend {
 impl Backend for RecordingBackend {
     async fn read_if_modified(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected_writer: &WriterId,
     ) -> Result<ReadReply, BackendError> {
         let mut args = Vec::new();
         enc_bytes(&mut args, expected_writer.as_bytes());
         self.record("read_if_modified", path, args);
-        self.inner
-            .read_if_modified(ctx, path, expected_writer)
-            .await
+        self.inner.read_if_modified(path, expected_writer).await
     }
 
-    async fn read(&self, ctx: &Ctx, path: &str) -> Result<ReadReply, BackendError> {
+    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.record("read", path, Vec::new());
-        self.inner.read(ctx, path).await
+        self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, ctx: &Ctx, path: &str) -> Result<Metadata, BackendError> {
+    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
         self.record("get_metadata", path, Vec::new());
-        self.inner.get_metadata(ctx, path).await
+        self.inner.get_metadata(path).await
     }
 
     async fn set_tags_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         expected: &Version,
         tags: Tags,
@@ -142,12 +137,11 @@ impl Backend for RecordingBackend {
         enc_version(&mut args, expected);
         enc_tags(&mut args, &tags);
         self.record("set_tags_if", path, args);
-        self.inner.set_tags_if(ctx, path, expected, tags).await
+        self.inner.set_tags_if(path, expected, tags).await
     }
 
     async fn write(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
@@ -156,12 +150,11 @@ impl Backend for RecordingBackend {
         enc_bytes(&mut args, &value);
         enc_tags(&mut args, &tags);
         self.record("write", path, args);
-        self.inner.write(ctx, path, value, tags).await
+        self.inner.write(path, value, tags).await
     }
 
     async fn write_if(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         expected: &Version,
@@ -172,12 +165,11 @@ impl Backend for RecordingBackend {
         enc_version(&mut args, expected);
         enc_tags(&mut args, &tags);
         self.record("write_if", path, args);
-        self.inner.write_if(ctx, path, value, expected, tags).await
+        self.inner.write_if(path, value, expected, tags).await
     }
 
     async fn write_if_not_exists(
         &self,
-        ctx: &Ctx,
         path: &str,
         value: Vec<u8>,
         tags: Tags,
@@ -186,29 +178,24 @@ impl Backend for RecordingBackend {
         enc_bytes(&mut args, &value);
         enc_tags(&mut args, &tags);
         self.record("write_if_not_exists", path, args);
-        self.inner.write_if_not_exists(ctx, path, value, tags).await
+        self.inner.write_if_not_exists(path, value, tags).await
     }
 
-    async fn delete(&self, ctx: &Ctx, path: &str) -> Result<(), BackendError> {
+    async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.record("delete", path, Vec::new());
-        self.inner.delete(ctx, path).await
+        self.inner.delete(path).await
     }
 
-    async fn delete_if(
-        &self,
-        ctx: &Ctx,
-        path: &str,
-        expected: &Version,
-    ) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         let mut args = Vec::new();
         enc_version(&mut args, expected);
         self.record("delete_if", path, args);
-        self.inner.delete_if(ctx, path, expected).await
+        self.inner.delete_if(path, expected).await
     }
 
-    async fn list(&self, ctx: &Ctx, dir_path: &str) -> Result<Vec<String>, BackendError> {
+    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
         self.record("list", dir_path, Vec::new());
-        self.inner.list(ctx, dir_path).await
+        self.inner.list(dir_path).await
     }
 }
 
@@ -240,13 +227,10 @@ mod tests {
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let rec = RecordingBackend::new(inner);
         let log = rec.log();
-        let ctx = Ctx::background();
 
-        rec.write(&ctx, "a/b", b"v".to_vec(), Tags::new())
-            .await
-            .unwrap();
-        let _ = rec.read(&ctx, "a/b").await;
-        let _ = rec.get_metadata(&ctx, "a/b").await;
+        rec.write("a/b", b"v".to_vec(), Tags::new()).await.unwrap();
+        let _ = rec.read("a/b").await;
+        let _ = rec.get_metadata("a/b").await;
 
         let recorded = log.lock().unwrap();
         let ops: Vec<&str> = recorded.iter().map(|r| r.op).collect();

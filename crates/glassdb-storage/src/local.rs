@@ -49,7 +49,7 @@ impl Weighable for CacheEntry {
     fn size_b(&self) -> usize {
         let mut res = 0;
         if let Some(v) = &self.v {
-            res += v.value.len() + v.version.writer.len();
+            res += v.value.len() + v.version.writer.as_bytes().len();
         }
         if let Some(m) = &self.m {
             res += m.meta.tags.len() * 16;
@@ -66,7 +66,7 @@ impl CacheEntry {
         let Some(m) = &self.m else {
             return false;
         };
-        if v.version.b.is_null() {
+        if v.version.b.is_unset() {
             return false;
         }
         if v.version.writer == m.writer {
@@ -87,7 +87,7 @@ impl CacheEntry {
         let Some(m) = &self.m else {
             return false;
         };
-        if v.version.b.is_null() {
+        if v.version.b.is_unset() {
             return false;
         }
         if v.version.writer == m.writer {
@@ -233,12 +233,12 @@ impl Local {
     pub fn mark_value_outdated(&self, key: &str, v: Version) {
         self.cache.update(key, move |old| {
             let mut entry = old?;
-            if let Some(val) = &entry.v {
-                if val.version.equal_contents(&v) {
-                    let mut newval = val.clone();
-                    newval.outdated = true;
-                    entry.v = Some(newval);
-                }
+            if let Some(val) = &entry.v
+                && val.version.equal_contents(&v)
+            {
+                let mut newval = val.clone();
+                newval.outdated = true;
+                entry.v = Some(newval);
             }
             Some(entry)
         });

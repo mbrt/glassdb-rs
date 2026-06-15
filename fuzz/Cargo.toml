@@ -2,7 +2,7 @@
 name = "glassdb-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -17,6 +17,13 @@ glassdb = { path = "../crates/glassdb", features = ["sim"] }
 [[bin]]
 name = "concurrent_tx"
 path = "fuzz_targets/concurrent_tx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cycle"
+path = "fuzz_targets/cycle.rs"
 test = false
 doc = false
 bench = false

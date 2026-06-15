@@ -5,9 +5,19 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# `regen` is an opt-in toggle for the `regen-proto` helper binary that
+# rebuilds `src/generated.rs` from `proto/transaction.proto`. The default
+# build pulls in only `prost`/`prost-types`, so consumers do not need
+# `protoc` on the build host.
+regen = ["dep:prost-build"]
+
 [dependencies]
 prost = "0.14.3"
 prost-types = "0.14.3"
+prost-build = { version = "0.14.3", optional = true }
 
-[build-dependencies]
-prost-build = "0.14.3"
+[[bin]]
+name = "regen-proto"
+path = "src/bin/regen.rs"
+required-features = ["regen"]

@@ -28,40 +28,36 @@ crate is meant to be used directly.
 | --- | --- |
 | `glassdb-data` | `TxId`, `TxIdSet`, and order-preserving path encoding. |
 | `glassdb-proto` | `prost`-generated transaction-log protobuf messages. |
-| `glassdb-concurr` | Concurrency utilities: `Ctx`, `Background`, `Fanout`, `Retry`, `Dedup`. |
+| `glassdb-concurr` | Concurrency utilities: `Background`, `Retry`, `Dedup`. |
 | `glassdb-backend` | The `Backend` async trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger). |
 | `glassdb-backend-s3` | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature. |
 | `glassdb-backend-gcs` | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature. |
 | `glassdb-storage` | Byte-weighted LRU cache, value versioning, local/global caching, locker, and transaction logger. |
 | `glassdb-trans` | The transaction engine: monitor, reader, GC, distributed locker, and commit algorithm. |
-| `glassdb` | The public API: `DB`, `Collection`, `Tx`, iterators, and `Stats`. |
+| `glassdb` | The public API: `Database`, `Collection`, `Transaction`, iterators, and `Stats`. |
 
 ## Quick start
 
 ```rust
-use std::sync::Arc;
-
+use glassdb::Database;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Ctx, DB};
 
 #[tokio::main]
 async fn main() -> Result<(), glassdb::Error> {
-    let ctx = Ctx::background();
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let db = DB::open(&ctx, "example", backend).await?;
+    let db = Database::open("example", MemoryBackend::new()).await?;
 
     let users = db.collection(b"users");
-    users.create(&ctx).await?;
+    users.create().await?;
 
     // Single-key helpers run in their own transaction.
-    users.write(&ctx, b"alice", b"hello").await?;
-    let v = users.read_strong(&ctx, b"alice").await?;
+    users.write(b"alice", b"hello").await?;
+    let v = users.read(b"alice").await?;
     assert_eq!(v, b"hello");
 
     // Multi-key serializable transaction with automatic conflict retries.
     // `tx` is an owned handle; write the body as `|tx| async move { ... }`.
     let users = &users;
-    db.tx(&ctx, |tx| async move {
+    db.tx(|tx| async move {
         let cur = match tx.read(users, b"counter").await {
             Ok(v) => v,
             Err(e) if e.is_not_found() => b"0".to_vec(),
@@ -72,10 +68,14 @@ async fn main() -> Result<(), glassdb::Error> {
     })
     .await?;
 
-    db.close().await;
+    db.shutdown().await;
     Ok(())
 }
 ```
+
+To bound how long a transaction may run, wrap it in `tokio::time::timeout`:
+dropping the future is the cancellation mechanism (the commit protocol
+recovers any in-flight state).
 
 ## Cloud backends
 
@@ -86,7 +86,7 @@ dependencies are only pulled in when needed:
 glassdb = { version = "0.1", features = ["s3", "gcs"] }
 ```
 
-Both implement the same `Backend` trait and can be dropped into `DB::open`:
+Both implement the same `Backend` trait and can be dropped into `Database::open`:
 
 ```rust,ignore
 // Amazon S3 (feature = "s3"): construct an aws-sdk-s3 client, then:

@@ -11,16 +11,16 @@
 //! stack) is always zero, and the peak-goroutine count is approximated by the
 //! peak OS-thread count (the worker model uses threads, not goroutines).
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::{
     BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextRef,
 };
-use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
 

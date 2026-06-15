@@ -5,16 +5,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
-use aws_sdk_s3::Client;
 use bytes::Bytes;
 use glassdb_backend::{
-    encode_writer_tag, Backend, BackendError, Tags, Version, WriterId, LAST_WRITER_TAG,
+    Backend, BackendError, LAST_WRITER_TAG, Tags, Version, WriterId, encode_writer_tag,
 };
-use glassdb_concurr::Ctx;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -23,10 +22,6 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::{Builder, S3Backend};
-
-fn ctx() -> Ctx {
-    Ctx::background()
-}
 
 // ---------------------------------------------------------------------------
 // In-process fake S3 server
@@ -207,23 +202,24 @@ fn put_object(
 
     let mut meta = HashMap::new();
     for (name, val) in headers {
-        if let Some(k) = name.as_str().strip_prefix("x-amz-meta-") {
-            if let Ok(v) = val.to_str() {
-                meta.insert(k.to_string(), v.to_string());
-            }
+        if let Some(k) = name.as_str().strip_prefix("x-amz-meta-")
+            && let Ok(v) = val.to_str()
+        {
+            meta.insert(k.to_string(), v.to_string());
         }
     }
 
     let mut objs = state.objects.lock().unwrap();
     let existing = objs.get(key);
-    if let Some(inm) = &if_none_match {
-        if inm == "*" && existing.is_some() {
-            return xml_error(
-                StatusCode::PRECONDITION_FAILED,
-                "PreconditionFailed",
-                "object exists",
-            );
-        }
+    if let Some(inm) = &if_none_match
+        && inm == "*"
+        && existing.is_some()
+    {
+        return xml_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "object exists",
+        );
     }
     if let Some(im) = &if_match {
         match existing {
@@ -233,7 +229,7 @@ fn put_object(
                     StatusCode::PRECONDITION_FAILED,
                     "PreconditionFailed",
                     "etag mismatch",
-                )
+                );
             }
         }
     }
@@ -296,11 +292,11 @@ fn list_objects(state: &FakeState, query: &str) -> Response<Full<Bytes>> {
         let Some(rest) = k.strip_prefix(&prefix) else {
             continue;
         };
-        if !delim.is_empty() {
-            if let Some(idx) = rest.find(&delim) {
-                common.insert(format!("{prefix}{}", &rest[..=idx]));
-                continue;
-            }
+        if !delim.is_empty()
+            && let Some(idx) = rest.find(&delim)
+        {
+            common.insert(format!("{prefix}{}", &rest[..=idx]));
+            continue;
         }
         contents.push(k.clone());
     }
@@ -395,12 +391,13 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(h);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(h);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -463,10 +460,10 @@ async fn read_strips_nonce() {
     ] {
         let mut tags = Tags::new();
         tags.insert("key".to_string(), "val".to_string());
-        let meta = b.write(&ctx(), name, value.clone(), tags).await.unwrap();
-        assert!(!meta.version.is_null());
+        let meta = b.write(name, value.clone(), tags).await.unwrap();
+        assert!(!meta.version.is_unset());
 
-        let r = b.read(&ctx(), name).await.unwrap();
+        let r = b.read(name).await.unwrap();
         assert_eq!(r.contents, value, "case {name}");
         assert_eq!(r.tags.get("key").map(String::as_str), Some("val"));
     }
@@ -478,14 +475,8 @@ async fn write_produces_fresh_version_each_time() {
     let b = backend(&fake);
     // Re-uploading identical bytes must still change the version because the
     // nonce forces a fresh ETag.
-    let m1 = b
-        .write(&ctx(), "k", b"same".to_vec(), Tags::new())
-        .await
-        .unwrap();
-    let m2 = b
-        .write(&ctx(), "k", b"same".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m1 = b.write("k", b"same".to_vec(), Tags::new()).await.unwrap();
+    let m2 = b.write("k", b"same".to_vec(), Tags::new()).await.unwrap();
     assert_ne!(m1.version, m2.version);
 }
 
@@ -498,15 +489,12 @@ async fn set_tags_if_merges_and_cas() {
     let mut tags = Tags::new();
     tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
     tags.insert("lock-type".to_string(), "-".to_string());
-    let m0 = b.write(&ctx(), "k", b"value".to_vec(), tags).await.unwrap();
+    let m0 = b.write("k", b"value".to_vec(), tags).await.unwrap();
 
     let mut new_tags = Tags::new();
     new_tags.insert("lock-type".to_string(), "w".to_string());
     new_tags.insert("locked-by".to_string(), "tx2".to_string());
-    let m1 = b
-        .set_tags_if(&ctx(), "k", &m0.version, new_tags)
-        .await
-        .unwrap();
+    let m1 = b.set_tags_if("k", &m0.version, new_tags).await.unwrap();
     assert_ne!(m0.version, m1.version);
     assert_eq!(
         m1.tags.get(LAST_WRITER_TAG).map(String::as_str),
@@ -516,16 +504,13 @@ async fn set_tags_if_merges_and_cas() {
     assert_eq!(m1.tags.get("locked-by").map(String::as_str), Some("tx2"));
 
     // The underlying value is untouched by a tag update.
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"value");
 
     // The now-stale version fails the precondition.
     let mut t = Tags::new();
     t.insert("lock-type".to_string(), "r".to_string());
-    let err = b
-        .set_tags_if(&ctx(), "k", &m0.version, t)
-        .await
-        .unwrap_err();
+    let err = b.set_tags_if("k", &m0.version, t).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 }
 
@@ -536,7 +521,7 @@ async fn set_tags_if_not_found() {
     let mut t = Tags::new();
     t.insert("lock-type".to_string(), "r".to_string());
     let err = b
-        .set_tags_if(&ctx(), "missing", &Version::new("\"x\""), t)
+        .set_tags_if("missing", &Version::new("\"x\""), t)
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
@@ -546,15 +531,15 @@ async fn set_tags_if_not_found() {
 async fn write_if_not_exists() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    b.write_if_not_exists(&ctx(), "k", b"a".to_vec(), Tags::new())
+    b.write_if_not_exists("k", b"a".to_vec(), Tags::new())
         .await
         .unwrap();
     let err = b
-        .write_if_not_exists(&ctx(), "k", b"b".to_vec(), Tags::new())
+        .write_if_not_exists("k", b"b".to_vec(), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"a");
 }
 
@@ -562,29 +547,20 @@ async fn write_if_not_exists() {
 async fn write_if_cas() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
 
     let err = b
-        .write_if(
-            &ctx(),
-            "k",
-            b"b".to_vec(),
-            &Version::new("\"stale\""),
-            Tags::new(),
-        )
+        .write_if("k", b"b".to_vec(), &Version::new("\"stale\""), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
     let m1 = b
-        .write_if(&ctx(), "k", b"b".to_vec(), &m0.version, Tags::new())
+        .write_if("k", b"b".to_vec(), &m0.version, Tags::new())
         .await
         .unwrap();
     assert_ne!(m0.version, m1.version);
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
 }
 
@@ -592,27 +568,24 @@ async fn write_if_cas() {
 async fn write_if_null_version_fails_precondition() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
 
     // A null expected version has an empty token; it must fail rather than
     // overwrite unconditionally.
     let err = b
-        .write_if(&ctx(), "k", b"b".to_vec(), &Version::default(), Tags::new())
+        .write_if("k", b"b".to_vec(), &Version::default(), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"a");
     assert_eq!(r.version, m0.version);
 
     let mut t = Tags::new();
     t.insert("lock-type".to_string(), "r".to_string());
     let err = b
-        .set_tags_if(&ctx(), "k", &Version::default(), t)
+        .set_tags_if("k", &Version::default(), t)
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
@@ -625,13 +598,13 @@ async fn read_if_modified() {
     let writer = WriterId::new(b"w1".to_vec());
     let mut tags = Tags::new();
     tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
-    b.write(&ctx(), "k", b"x".to_vec(), tags).await.unwrap();
+    b.write("k", b"x".to_vec(), tags).await.unwrap();
 
-    let err = b.read_if_modified(&ctx(), "k", &writer).await.unwrap_err();
+    let err = b.read_if_modified("k", &writer).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
     let r = b
-        .read_if_modified(&ctx(), "k", &WriterId::new(b"other".to_vec()))
+        .read_if_modified("k", &WriterId::new(b"other".to_vec()))
         .await
         .unwrap();
     assert_eq!(r.contents, b"x");
@@ -641,20 +614,17 @@ async fn read_if_modified() {
 async fn delete_if() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"x".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"x".to_vec(), Tags::new()).await.unwrap();
 
     let err = b
-        .delete_if(&ctx(), "k", &Version::new("\"wrong\""))
+        .delete_if("k", &Version::new("\"wrong\""))
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
-    b.read(&ctx(), "k").await.unwrap();
+    b.read("k").await.unwrap();
 
-    b.delete_if(&ctx(), "k", &m0.version).await.unwrap();
-    let err = b.read(&ctx(), "k").await.unwrap_err();
+    b.delete_if("k", &m0.version).await.unwrap();
+    let err = b.read("k").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
@@ -662,9 +632,9 @@ async fn delete_if() {
 async fn read_and_metadata_not_found() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let err = b.read(&ctx(), "missing").await.unwrap_err();
+    let err = b.read("missing").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
-    let err = b.get_metadata(&ctx(), "missing").await.unwrap_err();
+    let err = b.get_metadata("missing").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
@@ -673,13 +643,13 @@ async fn list_with_subdirs() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write(&ctx(), name, name.as_bytes().to_vec(), Tags::new())
+        b.write(name, name.as_bytes().to_vec(), Tags::new())
             .await
             .unwrap();
     }
-    let got = b.list(&ctx(), "d").await.unwrap();
+    let got = b.list("d").await.unwrap();
     assert_eq!(got, vec!["d/a/", "d/c/", "d/root"]);
-    let got = b.list(&ctx(), "d/a").await.unwrap();
+    let got = b.list("d/a").await.unwrap();
     assert_eq!(got, vec!["d/a/1", "d/a/2", "d/a/b/"]);
 }
 
@@ -689,12 +659,10 @@ async fn write_retries_through_slow_down() {
     let b = builder(&fake).retry_config(fast_retry()).build();
     fake.set_slowdown(2, Some(Method::PUT));
 
-    b.write(&ctx(), "k", b"v".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    b.write("k", b"v".to_vec(), Tags::new()).await.unwrap();
     assert_eq!(fake.slowdown_remaining(), 0);
 
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"v");
 }
 
@@ -704,12 +672,10 @@ async fn read_retries_through_slow_down() {
     let b = builder(&fake).retry_config(fast_retry()).build();
 
     // The write is a PUT, so it is not throttled here.
-    b.write(&ctx(), "k", b"v".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    b.write("k", b"v".to_vec(), Tags::new()).await.unwrap();
 
     fake.set_slowdown(2, Some(Method::GET));
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"v");
     assert_eq!(fake.slowdown_remaining(), 0);
 }
@@ -720,10 +686,7 @@ async fn nop_retryer_surfaces_slow_down() {
     let b = builder(&fake).disable_retries().build();
     fake.set_slowdown(1, Some(Method::PUT));
 
-    let err = b
-        .write(&ctx(), "k", b"v".to_vec(), Tags::new())
-        .await
-        .unwrap_err();
+    let err = b.write("k", b"v".to_vec(), Tags::new()).await.unwrap_err();
     let msg = format!("{err:?}");
     assert!(msg.contains("SlowDown"), "got: {msg}");
 }
@@ -747,7 +710,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
     // and gets 412.
     fake.set_lost_ack(1);
     let err = b
-        .write_if_not_exists(&ctx(), "k", b"v".to_vec(), Tags::new())
+        .write_if_not_exists("k", b"v".to_vec(), Tags::new())
         .await
         .unwrap_err();
     assert!(
@@ -756,7 +719,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
     );
 
     // The first attempt really did persist the object.
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"v");
 }
 
@@ -764,16 +727,13 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
 async fn write_if_lost_ack_is_in_doubt() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let m0 = b
-        .write(&ctx(), "k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
+    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
 
     // The CAS write lands (changing the ETag), but its ack is lost; the re-send's
     // If-Match no longer matches and gets 412.
     fake.set_lost_ack(1);
     let err = b
-        .write_if(&ctx(), "k", b"b".to_vec(), &m0.version, Tags::new())
+        .write_if("k", b"b".to_vec(), &m0.version, Tags::new())
         .await
         .unwrap_err();
     assert!(
@@ -781,7 +741,7 @@ async fn write_if_lost_ack_is_in_doubt() {
         "expected Unavailable (in-doubt), got {err:?}"
     );
 
-    let r = b.read(&ctx(), "k").await.unwrap();
+    let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
 }
 
@@ -791,11 +751,11 @@ async fn clean_conflict_still_precondition() {
     // must still be a retryable `Precondition`, not in-doubt.
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    b.write_if_not_exists(&ctx(), "k", b"a".to_vec(), Tags::new())
+    b.write_if_not_exists("k", b"a".to_vec(), Tags::new())
         .await
         .unwrap();
     let err = b
-        .write_if_not_exists(&ctx(), "k", b"b".to_vec(), Tags::new())
+        .write_if_not_exists("k", b"b".to_vec(), Tags::new())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition), "got {err:?}");

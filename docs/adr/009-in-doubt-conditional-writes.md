@@ -1,4 +1,4 @@
-# ADR-009: In-doubt conditional-write outcomes (`BackendError::Unavailable`)
+# ADR-009: In-doubt conditional-write outcomes (`BackendError::InDoubt`)
 
 ## Status
 
@@ -46,19 +46,18 @@ tested for each one that can actually lose an acknowledgement.
 
 ## Decision
 
-### At-most-once, with in-doubt surfaced to the caller
+### At-most-once, with in-doubt scoped to the logless path
 
-We do **not** attempt transparent exactly-once retries (impossible for the
-logless path). Instead the contract is **at-most-once application + report the
-uncertainty**:
+We do **not** attempt transparent exactly-once retries when there is nothing to
+disambiguate them with (the logless single-RW path). The contract is
+**at-most-once application + report the uncertainty only when the engine cannot
+recover it on its own**:
 
-1. **New error variant `BackendError::Unavailable(String)`** — "the operation's
+1. **New error variant `BackendError::InDoubt(String)`** — "the operation's
    outcome is unknown; it may or may not have been applied." It is threaded
    through `StorageError → TransError → public Error` with `is_unavailable()`
    helpers at every layer, and is deliberately **not** classified as
-   `retry`/`wounded`/`precondition`. The commit path preserves it (rather than
-   flattening it into a string) wherever errors were previously stringified
-   (`Algo::commit_writes`, `Monitor::commit_tx`).
+   `retry`/`wounded`/`precondition`.
 
 2. **Backends own conditional-write retries and must report an uncertain
    outcome as `Unavailable`, never as a confident `Precondition`.** Concretely,
@@ -68,12 +67,43 @@ uncertainty**:
    Reads and unconditional (idempotent) writes are unaffected and may be retried
    freely.
 
-3. **The engine surfaces it without a transparent retry.** `DB::tx`'s loop only
-   re-runs on `retry`/`wounded`; an `Unavailable` commit breaks out as
-   `Error::Unavailable`. The transaction may or may not have committed; the
+3. **The logged commit path retries `Unavailable` internally.** A transaction
+   log is keyed by its tx id; only the owning client writes `committed`, and
+   third parties only write to it to wound (status `aborted`). The conditional
+   write (`write_if_not_exists` / `write_if`) is therefore idempotent across
+   retries: as long as the log is not yet final, any race (our own
+   `refresh_pending` advancing the pending log, a wound, or our own previously
+   landed attempt) is safe to resolve by re-reading. `Monitor::set_final_log`
+   therefore retries on `Unavailable`; if a previous attempt actually landed,
+   the retry observes the existing log via `Precondition`, reads its commit
+   status, and treats a final status matching its own intent as success
+   (`committed==committed` is necessarily our own write; `aborted==aborted`
+   converges on the desired outcome regardless of who wrote it). A mismatched
+   final status (we wanted `committed` but found `aborted`) is still surfaced
+   as `AlreadyFinalized`, which the commit path maps to a wound. This recovery
+   is invisible to the caller.
+
+4. **Pre-commit operations recover `Unavailable` in place.** An in-doubt
+   outcome while acquiring a *lock* happens before the commit point: no
+   user-visible value has been made durable yet, so re-reading the lock
+   metadata reveals whether the conditional write took, and re-applying it is
+   idempotent. The locker therefore retries the lock operation itself on
+   `Unavailable` (`LockerWorker::run` reloads metadata and re-attempts,
+   exactly as it already does for a stale `Precondition`), resolving the
+   uncertainty in place. The exception is `LockType::Create`: its outcome
+   under in-doubt is genuinely ambiguous from outside the writer (same
+   reasoning as the single-RW fast path), so a `Create` in-doubt result is
+   not retried by the locker. This recovery never escalates into a
+   whole-transaction retry that would needlessly re-run the user's closure.
+
+5. **Only the single-RW fast path surfaces in-doubt to the caller.** The fast
+   path is logless: its value write is the commit point, and a lost ack
+   followed by a re-observed precondition is indistinguishable from a genuine
+   conflict from outside the writer. `Database::tx`'s loop only re-runs on
+   `retry`/`wounded`; an `Unavailable` from the fast-path CAS breaks out as
+   `Error::InDoubt`. The transaction may or may not have committed; the
    caller decides whether to retry (with its own idempotency) or accept the
-   uncertainty. This reuses the existing "terminate on non-retryable error"
-   behavior rather than adding a new mechanism.
+   uncertainty.
 
 This let us **keep the single-RW fast path**: it stays a logless CAS, and its one
 unsafe interleaving (lost ack + re-observed precondition) is reported as in-doubt
@@ -110,18 +140,21 @@ log, so GC does not widen the in-doubt window.
   an acknowledgement, not just in the simulator. A backend that masked an
   in-doubt result as a confident `Precondition` would re-introduce it, so the
   property is tested per backend.
-- Applications must handle `Error::Unavailable`: a transaction that returns it
-  may or may not have committed. This is the honest contract for a stateless
-  store over object storage; callers add idempotency (e.g. a client-supplied
-  write token) if they need to retry safely.
+- Applications must handle `Error::InDoubt`, but **only the single-RW fast
+  path** can produce it: a logged-commit transaction recovers transparently. The
+  honest contract for a stateless store over object storage is that the fast
+  path is in-doubt under a lost ack; callers add idempotency (e.g. a
+  client-supplied write token) if they need to retry safely.
 - The single-RW fast path is retained, preserving its latency win.
 
 ### Regression tests for the contract
 
-- `crates/glassdb/tests/in_doubt.rs` — DB/engine level. The `FaultBackend`
-  middleware injects a lost ack on a landed conditional write and asserts
-  at-most-once application for both the single-RW and logged paths, and that a
-  *clean* conflict still retries transparently.
+- `crates/glassdb/tests/in_doubt.rs` — database/engine level. The `FaultBackend`
+  middleware injects a lost ack on a landed conditional write and asserts: the
+  single-RW path surfaces `Unavailable` without double-applying; the logged
+  path recovers transparently (engine retries the log write and recognizes its
+  own landed log via `Precondition`); a *clean* conflict still retries
+  transparently on the fast path.
 - `crates/glassdb-backend/src/middleware/fault.rs` — the `FaultBackend` lost-ack
   path (`active_eventually_injects_faults`, `same_seed_same_fault_sequence`).
 - `crates/glassdb-backend-s3/src/tests.rs` — the in-process fake injects

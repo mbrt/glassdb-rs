@@ -48,13 +48,16 @@ Go's runtime primitives map onto tokio as follows.
 
 | Go | Rust |
 | --- | --- |
-| `context.Context` (cancellation + values) | `glassdb_concurr::Ctx` wrapping an in-house `CancelToken` (hierarchical, over `tokio::sync::watch`), plus an optional tx-id value |
+| `context.Context` (cancellation) | dropped futures (`tokio::time::timeout`, `tokio::select!`, `JoinHandle::abort`). Public APIs take no context. `Background` aborts spawned tasks via [`JoinHandle::abort`] from its `Drop` impl. The one residual primitive is `tokio_util::sync::CancellationToken`, used to drop a specific in-flight future from outside (sim `JoinHandle::abort`, `Dedup::close`, sim crash nemesis) — never plumbed into worker bodies |
+| `context.Context` (values) | not used. The one Go consumer (a deterministic tx-id override) was dropped: under `--cfg sim` the same determinism falls out of `TxId::new_at` drawing its random prefix from the seeded executor RNG and its timestamp from the anchored clock |
 | goroutine | `tokio::spawn` |
-| `concurr.Background` (managed goroutines, cancelled together) | `Background` over `CancelToken` + tracked `JoinHandle`s |
-| `errgroup` / bounded fan-out | `Fanout` (a `Semaphore`-bounded join of futures) and, in tests, `tokio::join!` |
+| `concurr.Background` (managed goroutines, cancelled together) | `Background` is a [`JoinHandle`] collection: `spawn(fut)` tracks the handle; `Drop` calls `abort()` on every tracked handle. Subsystems hold `Weak<Background>` so the captured-task cycle does not pin it alive |
+| `db.Close` (graceful shutdown) | [`Database::shutdown`] — flips a shutting-down flag so new `Database::tx` calls return `Error::ShuttingDown`, awaits in-flight transactions to drain, then awaits dedup owners; background loops are torn down via `Drop` on the last `Database` clone |
+| Transaction cancellation cleanup | `DbInner::tx_impl` owns a `TxAbortGuard` RAII helper armed after `algo.begin`/`algo.rebegin` and disarmed after `algo.end`. If the surrounding future is dropped in-between, the guard's `Drop` schedules `Algo::async_abort` so the engine-side tx is marked aborted promptly instead of lingering until lease expiry |
+| `errgroup` / bounded fan-out | `futures::stream::iter(...).buffer_unordered(n)` (see `Algo::run_limited`) and, in tests, `tokio::join!` |
 | `sync.Mutex` over small state | `std::sync::Mutex`, **never held across `.await`** |
-| channels | `tokio::sync` channels; `make_chan_inf_cap` for the unbounded case |
-| `select` on ctx + timers | `tokio::select!` on `ctx.cancelled()` + `tokio::time::sleep` |
+| channels | `tokio::sync` channels |
+| `select` on ctx + timers | `tokio::select!` on `ctx.cancelled()` + `tokio::time::sleep` (internal cancellation only); for caller-facing timeouts, `tokio::time::timeout` around the future |
 
 ### Synchronous mutexes, not async mutexes
 
@@ -67,10 +70,53 @@ invariant is enforced in CI by `clippy::await_holding_lock` under `-D warnings`.
 ### The `Dedup` state machine
 
 `concurr.Dedup` (the mergeable-request deduplicator used by the distributed
-locker) has no off-the-shelf Rust equivalent, so it was ported directly as a
-`Controller` driving per-key worker state (pending / queue / merge), with
-`await_signal` over a `Semaphore` for "wake the next waiter". This was one of the
-highest-risk pieces and its behavior tests were ported first.
+locker) has no off-the-shelf Rust equivalent. The Go port originally ran the
+worker *on a caller's goroutine* and used `defer` to hand the role to the next
+waiter; in Rust that coupling made worker liveness depend on a caller-future's
+lifetime, which a *dropped* future violates (orphaned keys / lost handoffs). It
+was reworked into a driver model where worker liveness is never tied to a single
+caller future:
+
+- A key is driven by exactly one **driver**. The first caller for an idle key is
+  the **inline driver**: it runs the worker on its own task with no spawn, so the
+  uncontended common case (one locker per key) keeps the original zero-overhead
+  hot path.
+- A driver hands off only when it genuinely must: its batch is done but
+  non-mergeable queued work remains, or its own future is dropped with live
+  waiters. Both hand off by **`rt::spawn`-ing a fresh owner task** — never by
+  promoting a waiter's future-that-must-be-polled. A spawned task cannot be
+  dropped by a caller, so the handoff cannot be lost. A dropped inline driver is
+  caught by a `DriverGuard` RAII guard that requeues undelivered live members and
+  spawns the successor.
+- All driver/owner/exit transitions happen under the same per-key lock that
+  submitters use, so "the key entry exists iff it has a driver" holds without
+  races. Waiters simply `await` their `oneshot::Receiver`; dropping that future
+  closes the corresponding `Sender`, and a `WaiterDropGuard` pings the per-key
+  `changed` notifier so the driver re-evaluates liveness and prunes the dead
+  member (abandoning the batch if no live caller remains).
+- `BatchHandle::merged()` reconstructs the merged request (absorbing newly
+  arrived compatible work); `BatchHandle::changed()` (a `Notify`) wakes the
+  worker on new work. When a batch loses all live members the worker's context is
+  cancelled so it bails (best-effort: at worst one wasted round, never a hang).
+- `Dedup::close()` cancels a shutdown token (parent of every round's context) and
+  awaits any spawned owners, so none leak; it is wired through
+  `Locker::close` → `Algo::close` → `Database::close`.
+
+This was one of the highest-risk pieces; its behavior tests and drop/cancel
+regression tests live in [`dedup.rs`](crates/glassdb-concurr/src/dedup.rs).
+
+### Cancel-safety contract
+
+Public futures are durability-safe to cancel: a mid-flight drop is equivalent to
+a crash and is recovered by the commit protocol. **Dropping the future is the
+only cancellation mechanism**: there is no `Ctx` argument to cancel separately.
+Wrap a future with `tokio::time::timeout`, race it in a `tokio::select!`, or
+`abort` the `JoinHandle` to stop it. The deduplicator makes dropping safe for
+in-memory liveness too: a queued caller is pruned via `WaiterDropGuard`, and a
+dropped inline driver hands its batch off to a spawned owner, so neither
+orphans a key nor strands other callers. On-storage locks left by a drop are
+reclaimed by wait/lease timeouts as before. This contract is documented on the
+public API (`glassdb` `lib.rs` and `Database::tx`).
 
 ## Time and determinism
 
@@ -101,16 +147,17 @@ Go drives control flow with `errors.Is(err, ErrRetry / ErrNotFound /
 ErrPrecondition / …)`. Rust replaces these with typed `thiserror` enums, one per
 layer, and preserves the exact matching semantics via `is_*` predicates:
 
-- `BackendError`: `NotFound`, `Precondition`, `Cancelled`, `Other`.
+- `BackendError`: `NotFound`, `Precondition`, `Other`. (Go's `ctx.Err()` has no
+  equivalent: a dropped future is the cancel; backends never observe a context.)
 - `StorageError`: wraps `BackendError`, plus `KeyNotFound`; `is_not_found` /
   `is_precondition` delegate to the backend.
 - `TransError`: the engine's control-flow errors — `Retry` (Go `ErrRetry`),
   `AlreadyFinalized`, `Wounded` (Go `ErrWounded`; a wound-wait abort, consumed by
-  the DB retry loop which restarts the victim with a renewed ID), `Cancelled`,
-  and the **internal** `ValidateRetry` (Go `errValidateRetry`) and
-  `LockTimeout` / `NoSingleWrite`.
+  the database retry loop which restarts the victim with a renewed ID), and the
+  **internal** `ValidateRetry` (Go `errValidateRetry`) and
+  `LockTimeout` / `NoSingleWrite`. There is no `Cancelled` variant.
 - `glassdb::Error`: the public surface — `NotFound`, `Aborted`, `Precondition`,
-  `Cancelled`, `AlreadyFinalized`, `Other`.
+  `AlreadyFinalized`, `Other`.
 
 Each layer converts into the next with `From`, mapping sentinels losslessly.
 Care was taken that **internal** control-flow errors never leak: e.g.
@@ -191,27 +238,26 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
 
 ## Public API choices
 
-- **`DB::tx` takes the body by value: `FnMut(Tx) -> impl Future + Send`.** Write
-  it as `|tx| async move { ... }`. `Tx` is a cheap, `Send` handle over
+- **`Database::tx` takes the body by value: `FnMut(Transaction) -> impl Future + Send`.** Write
+  it as `|tx| async move { ... }`. `Transaction` is a cheap, `Send` handle over
   interior-mutable state, passed by value rather than `&mut`, so the transaction
   future is `Send` and can be `tokio::spawn`-ed for true multiplexing. (An
   `async |tx|` closure cannot: bounding its returned future as `Send` is not
   expressible for `AsyncFn*` on stable Rust.) The framework owns the retry loop
   and reruns the closure on conflict, mirroring Go's `db.Tx(ctx, func(tx) error)`
   while letting the body `.await` reads.
-- **One read primitive: `Tx::read`.** Because `read` takes `&self`, several
+- **One read primitive: `Transaction::read`.** Because `read` takes `&self`, several
   reads can be polled concurrently for parallel fetches
   (`futures::future::join_all(keys.iter().map(|k| tx.read(coll, k)))`), so the
   old batched `read_multi` (and its `FqKey`/`ReadResult` types) was dropped.
-- **`Collection` helpers** (`read_strong`, `write`, `delete`, `update`, …) each
+- **`Collection` helpers** (`read`, `write`, `delete`, `update`, …) each
   run a one-shot transaction via the same retry loop, matching the original.
 - **Iterators return in-memory snapshots.** The memory backend returns the full
-  listing up front, so `KeysIter`/`CollectionsIter` iterate a decoded `Vec` and
-  expose a terminal `err()` accessor (rather than Go's `Next() (v, ok)` plus
-  `Err()` pattern, adapted to Rust's `Iterator`).
+  listing up front, so `KeysIter`/`CollectionsIter` decode that snapshot while
+  yielding `Result<Vec<u8>, Error>` items.
 - **Re-exports for ergonomics.** `glassdb` re-exports `Backend`, the `memory`
-  backend, `middleware`, and `Ctx`, so callers need only depend on the one
-  crate; the `s3` / `gcs` backends are re-exported under their cargo features.
+  backend, and `middleware`, so callers need only depend on the one crate; the
+  `s3` / `gcs` backends are re-exported under their cargo features.
 
 ## Testing strategy
 
@@ -247,6 +293,18 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   ordering (now justified) and a fixed-base deterministic clock. Run with
   `make test-sim` / `make fuzz`. The `proptest_concurrent` test is kept as a fast
   non-sim sanity check. Go's byte-schedule approach was inspiration only.
+- **Cycle serializability oracle (ported from FoundationDB's `Cycle.cpp`).** A
+  second fuzz target (`cycle`) lays down a ring `key(i) -> (i+1) % N` and has
+  clients rotate three consecutive edges per transaction. The rotation does not
+  commute, so any isolation or atomicity break splits/shrinks/grows the ring —
+  catching serializability anomalies the commutative RMW-increment workload
+  cannot. It reuses the same backbone/transports/nemeses and runs under both the
+  schedule-tape and PCT schedulers. A concurrent read-only observer also
+  snapshots the whole ring in one transaction (all `N` pointer reads issued
+  concurrently via `try_join_all`) and asserts the snapshot is itself a valid
+  ring: a committed read-only tx must see a single committed state, so this adds
+  a read-side oracle and is the only workload exercising `Transaction`'s concurrent-read
+  path. See `tests/cycle_sim.rs` and `fuzz/corpus/cycle`.
 - **Behavioral tests, ported wholesale.** The unit tests of the hard pieces
   (`dedup`, `algo`, `tlocker`, `monitor`, `gc`, `cache`) were ported from their
   Go counterparts to lock in equivalent behavior.
@@ -273,13 +331,13 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
   sim-s3}`. The simulated profiles compress latency 1000× (`scale = 1/1000`),
   matching the Go bench scaling. Each pairing also prints the per-operation
   backend counters (`retries/op`, `w/op`, `r/op`, …) derived from
-  `DB::stats()`, the analog of Go's `benchStats` custom metrics.
+  `Database::stats()`, the analog of Go's `benchStats` custom metrics.
 - **`glassdb-bench-scale` crate** — concurrency / throughput benchmarks against
   real or simulated cloud backends (the AWS / GCS SDKs live here), ported from
   `hack/rtbench` and `hack/backendbench`:
   - `rtbench` — the `simple`, `rw9010`, and `deadlock` scenarios, with the same
     flags and CSV schema as the Go tool (so the plotting scripts are shared),
-    deterministic per-DB/per-worker seeds, and a real-S3 client wired up via
+    deterministic per-database/per-worker seeds, and a real-S3 client wired up via
     `aws_config` + a `BUCKET` env var (faithful to the Go tooling), or real GCS
     via Application Default Credentials.
   - `backendbench` — raw backend-operation latencies (`WriteSame`,
@@ -336,18 +394,18 @@ per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorat
 
 ### Determinism work (built Rust-native, see ADR-008 and ADR-011)
 
-- Stable path ordering of commit-path slices (`Tx::collect_accesses`,
+- Stable path ordering of commit-path slices (`Transaction::collect_accesses`,
   `init_validation`, `collections_locks`, `Locker::locked_paths`)
 - In-repo deterministic executor (`glassdb-concurr` `rt`/`exec`) with schedule-tape
   and PCT schedulers; seeded scheduling/time/randomness; `TxId` prefix from the
-  run's seeded RNG (`#[cfg(sim)]`); `DbBuilder::deterministic_time` fixed-base clock
+  run's seeded RNG (`#[cfg(sim)]`); `DatabaseBuilder::deterministic_time` fixed-base clock
   and `rt::system_now` for persisted timestamps
 - `FaultBackend` (Backend-level fault injection) + `RecordingBackend` op-stream
   self-check + cargo-fuzz `concurrent_tx` target (schedule-tape)
 
 ### What was not ported (use as inspiration only)
 
-- Injectable TxId prefix source / DB `Rand` option (the `#[cfg(sim)]` seeded-RNG
+- Injectable TxId prefix source / database `Rand` option (the `#[cfg(sim)]` seeded-RNG
   shim supersedes)
 - Configurable retry + jitter / `DisableJitter`
 - `Monitor` Retrier refactor

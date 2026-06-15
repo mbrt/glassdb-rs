@@ -5,8 +5,9 @@ Description: >-
   instance reaches S3 via a gateway endpoint and is reachable via SSM Session
   Manager through interface endpoints. The instance pulls a prebuilt rtbench
   binary (a statically linked, musl-target Rust build) from the bucket, runs the
-  rw9010 and deadlock benchmarks against S3, uploads the result CSVs to the
-  results/ prefix, and then stops itself.
+  rw9010 and deadlock benchmarks against S3 (each repeated multiple times so
+  S3 can catch up between runs and the aggregated numbers are more reliable),
+  uploads the result CSVs to the results/ prefix, and then stops itself.
 
 Parameters:
   InstanceType:
@@ -271,8 +272,13 @@ Resources:
           OUT="results/$TS"
           mkdir -p out
 
+          # Repeat each parameter sweep three times with a 60s cool-down
+          # between runs. rtbench shares the (expensive) rw9010 key set across
+          # runs and appends every run's samples to the same CSVs, so the plot
+          # script aggregates them into tighter percentile bands.
           ./rtbench --backend=s3 --test-name=rw9010 \
             --max-dbs=${MaxDBs} --num-keys=${NumKeys} --duration=${RunDuration} \
+            --num-runs=3 --run-cooldown=60s \
             --samples-out=out/samples.csv \
             --stats-out=out/stats.csv \
             --throughput-out=out/throughput.csv \
@@ -280,6 +286,7 @@ Resources:
 
           ./rtbench --backend=s3 --test-name=deadlock \
             --duration=${DeadlockDuration} \
+            --num-runs=3 --run-cooldown=60s \
             --deadlock-out=out/deadlock.csv
 
           aws s3 cp out/ "s3://$BUCKET/$OUT/" --recursive

@@ -11,7 +11,7 @@
 //!
 //! ## Concurrency model
 //!
-//! `DB::tx` takes the transaction body by value (`|tx| async move { ... }`), so
+//! `Database::tx` takes the transaction body by value (`|tx| async move { ... }`), so
 //! its future is `Send` and every worker is a `tokio::spawn`-ed task on a shared
 //! multi-thread runtime. The runtime multiplexes all workers over its worker
 //! threads (rather than one OS thread per worker), so a single shared S3 client
@@ -41,8 +41,8 @@ use rand::{Rng, RngExt, SeedableRng};
 use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{gcs_delays, s3_delays, DelayBackend, DelayOptions};
-use glassdb::{Collection, Ctx, Error as GError, Stats, DB};
+use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
+use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
 
@@ -92,7 +92,7 @@ struct Args {
     /// Output file with deadlock latency samples.
     #[arg(long, default_value = "deadlock.csv")]
     deadlock_out: String,
-    /// Max concurrent DBs for the rw9010 test.
+    /// Max concurrent Databases for the rw9010 test.
     #[arg(long, default_value_t = 50)]
     max_dbs: usize,
     /// Number of keys for the rw9010 test.
@@ -101,6 +101,19 @@ struct Args {
     /// Duration of each rw9010 / deadlock step.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
+    /// Repeat the parameter sweep this many times. The expensive setup (e.g.
+    /// rw9010's 50k-key init) happens once and is shared across runs; only
+    /// the measured sweeps are repeated. All runs append to the same CSV
+    /// outputs, which the plot script aggregates into tighter percentile
+    /// bands. Useful against real S3, where back-to-back repeats give the
+    /// service time to settle and reduce per-run variance.
+    #[arg(long, default_value_t = 1)]
+    num_runs: usize,
+    /// Sleep this long between repeated sweeps (only when --num-runs > 1).
+    /// Lets S3's prefix throttling / connection state quiesce before the
+    /// next run begins.
+    #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
+    run_cooldown: Duration,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -122,7 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// Backend / DB setup
+// Backend / Database setup
 // ---------------------------------------------------------------------------
 
 async fn init_backend(
@@ -147,7 +160,11 @@ async fn init_backend(
         "s3" => {
             let bucket = env_var("BUCKET")?;
             let metrics = Arc::new(HttpMetrics::default());
+            // The tuned HTTP client steers the SDK toward connection reuse
+            // (rustls + ALPN-negotiated HTTP/2), so high-concurrency steps
+            // don't pile DNS+TLS handshakes onto tokio's blocking pool.
             let base = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .http_client(glassdb::s3::tuned_http_client())
                 .load()
                 .await;
             let conf = aws_sdk_s3::config::Builder::from(&base)
@@ -186,9 +203,9 @@ fn env_var(k: &str) -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn open_db(handle: &Handle, backend: Arc<dyn Backend>) -> DB {
+fn open_db(handle: &Handle, backend: Arc<dyn Backend>) -> Database {
     handle
-        .block_on(DB::open(&Ctx::background(), "bench", backend))
+        .block_on(Database::open("bench", backend))
         .expect("open db")
 }
 
@@ -236,7 +253,13 @@ impl Benchmarker {
         }
     }
 
-    fn start(&mut self, db: &DB, num_keys: usize, num_workers: usize, num_keys_per_worker: usize) {
+    fn start(
+        &mut self,
+        db: &Database,
+        num_keys: usize,
+        num_workers: usize,
+        num_keys_per_worker: usize,
+    ) {
         self.num_keys = num_keys;
         self.num_workers = num_workers;
         self.num_keys_per_worker = num_keys_per_worker;
@@ -244,9 +267,9 @@ impl Benchmarker {
         self.bench.start();
     }
 
-    fn end(&mut self, db: &DB) {
+    fn end(&mut self, db: &Database) {
         self.bench.end();
-        self.delta_stats = db.stats().sub(&self.base_stats);
+        self.delta_stats = db.stats() - self.base_stats;
     }
 
     fn results_row(&self) -> String {
@@ -364,12 +387,12 @@ fn run_test<F>(
     f: F,
 ) -> Result<(), Box<dyn Error>>
 where
-    F: FnOnce(&mut Benchmarker, &DB, &Handle) -> Result<(), GError>,
+    F: FnOnce(&mut Benchmarker, &Database, &Handle) -> Result<(), GError>,
 {
     let db = open_db(handle, backend);
     let mut ben = Benchmarker::new(duration);
     let res = f(&mut ben, &db, handle);
-    handle.block_on(db.close());
+    handle.block_on(db.shutdown());
     res?;
     println!("{name},{}", ben.results_row());
     Ok(())
@@ -377,7 +400,7 @@ where
 
 fn independent_single_rmw(
     b: &mut Benchmarker,
-    db: &DB,
+    db: &Database,
     handle: &Handle,
     nwriters: usize,
 ) -> Result<(), GError> {
@@ -388,13 +411,13 @@ fn independent_single_rmw(
             let bench = b.bench.clone();
             handle.spawn(async move {
                 let coll = db.collection(format!("c{i}").as_bytes());
-                coll.create(&Ctx::background()).await?;
+                coll.create().await?;
                 let coll = &coll;
                 let db = &db;
                 while !bench.is_finished() {
                     bench
                         .measure(|| async move {
-                            db.tx(&Ctx::background(), |tx| async move {
+                            db.tx(|tx| async move {
                                 let v = match tx.read(coll, b"key").await {
                                     Ok(v) => v,
                                     Err(e) if e.is_not_found() => Vec::new(),
@@ -417,7 +440,7 @@ fn independent_single_rmw(
 
 fn independent_multi_rmw(
     b: &mut Benchmarker,
-    db: &DB,
+    db: &Database,
     handle: &Handle,
     nwriters: usize,
     numkeys: usize,
@@ -429,7 +452,7 @@ fn independent_multi_rmw(
             let bench = b.bench.clone();
             handle.spawn(async move {
                 let coll = db.collection(format!("c{i}").as_bytes());
-                coll.create(&Ctx::background()).await?;
+                coll.create().await?;
                 let keys: Vec<Vec<u8>> = (0..numkeys)
                     .map(|j| format!("key{j}").into_bytes())
                     .collect();
@@ -439,7 +462,7 @@ fn independent_multi_rmw(
                 while !bench.is_finished() {
                     bench
                         .measure(|| async move {
-                            db.tx(&Ctx::background(), |tx| async move {
+                            db.tx(|tx| async move {
                                 // Read all keys in parallel, then write each back.
                                 let vals = futures::future::join_all(
                                     keys.iter().map(|k| tx.read(coll, k)),
@@ -470,7 +493,7 @@ fn independent_multi_rmw(
 
 fn overlapping_multi_rmw(
     b: &mut Benchmarker,
-    db: &DB,
+    db: &Database,
     handle: &Handle,
     n_writers: usize,
     n_keys_per_writer: usize,
@@ -478,7 +501,7 @@ fn overlapping_multi_rmw(
 ) -> Result<(), GError> {
     let coll = db.collection(b"omrmw");
     handle.block_on(async {
-        let _ = coll.create(&Ctx::background()).await;
+        let _ = coll.create().await;
     });
 
     let n_keys = n_writers * n_keys_per_writer - n_overlap;
@@ -489,7 +512,7 @@ fn overlapping_multi_rmw(
     handle.block_on(async {
         let coll = &coll;
         let all_keys = &all_keys;
-        db.tx(&Ctx::background(), |tx| async move {
+        db.tx(|tx| async move {
             for k in all_keys {
                 tx.write(coll, k.as_slice(), &rand_1k())?;
             }
@@ -517,7 +540,7 @@ fn overlapping_multi_rmw(
                 while !bench.is_finished() {
                     bench
                         .measure(|| async move {
-                            db.tx(&Ctx::background(), |tx| async move {
+                            db.tx(|tx| async move {
                                 let vals = futures::future::join_all(
                                     keys.iter().map(|k| tx.read(coll, k)),
                                 )
@@ -551,7 +574,9 @@ async fn join_tasks(
             Ok(Ok(())) => {}
             Ok(Err(e)) if result.is_ok() => result = Err(e),
             Ok(Err(_)) => {}
-            Err(_) if result.is_ok() => result = Err(GError::Other("worker task panicked".into())),
+            Err(_) if result.is_ok() => {
+                result = Err(GError::Internal("worker task panicked".into()));
+            }
             Err(_) => {}
         }
     }
@@ -563,17 +588,20 @@ async fn join_tasks(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum TxType {
+enum TransactionType {
     Write,
     ReadStrong,
     ReadWeak,
 }
 
-fn make_tx_series(num_w: usize, num_strong_r: usize, num_weak_r: usize) -> Vec<TxType> {
+fn make_tx_series(num_w: usize, num_strong_r: usize, num_weak_r: usize) -> Vec<TransactionType> {
     let mut v = Vec::with_capacity(num_w + num_strong_r + num_weak_r);
-    v.extend(std::iter::repeat_n(TxType::Write, num_w));
-    v.extend(std::iter::repeat_n(TxType::ReadStrong, num_strong_r));
-    v.extend(std::iter::repeat_n(TxType::ReadWeak, num_weak_r));
+    v.extend(std::iter::repeat_n(TransactionType::Write, num_w));
+    v.extend(std::iter::repeat_n(
+        TransactionType::ReadStrong,
+        num_strong_r,
+    ));
+    v.extend(std::iter::repeat_n(TransactionType::ReadWeak, num_weak_r));
     v
 }
 
@@ -638,27 +666,40 @@ fn run_read_write_9010(
          http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-goroutines\n",
     )?;
 
-    // Deterministic random source, for reproducibility.
-    let mut rnd = StdRng::seed_from_u64(42);
-
-    let mut i = 0;
-    while i <= args.max_dbs {
-        let numdb = i.max(1);
-        eprintln!("Testing {numdb} dbs");
-        run_read_write_9010_step(
-            handle,
-            args,
-            &backend,
-            metrics.as_ref(),
-            &keys,
-            numdb,
-            &mut rnd,
-            &mut samples,
-            &mut stats,
-            &mut throughput,
-            &mut client,
-        )?;
-        i += 5;
+    // Deterministic random source, for reproducibility. Re-seeded from the
+    // same value at the start of each repeated sweep so every run picks the
+    // same per-DB seeds and key access patterns.
+    let num_runs = args.num_runs.max(1);
+    for run in 0..num_runs {
+        if run > 0 {
+            eprintln!(
+                "Sleeping {:?} before run {}/{num_runs}",
+                args.run_cooldown,
+                run + 1
+            );
+            handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
+        }
+        eprintln!("Run {}/{num_runs}", run + 1);
+        let mut rnd = StdRng::seed_from_u64(42);
+        let mut i = 0;
+        while i <= args.max_dbs {
+            let numdb = i.max(1);
+            eprintln!("Testing {numdb} dbs");
+            run_read_write_9010_step(
+                handle,
+                args,
+                &backend,
+                metrics.as_ref(),
+                &keys,
+                numdb,
+                &mut rnd,
+                &mut samples,
+                &mut stats,
+                &mut throughput,
+                &mut client,
+            )?;
+            i += 5;
+        }
     }
 
     Ok(())
@@ -715,11 +756,11 @@ fn read_write_9010_all_dbs(
     numdb: usize,
     rnd: &mut StdRng,
 ) -> Result<Vec<DbResults>, Box<dyn Error>> {
-    // One seed per DB, derived up front from the shared source.
+    // One seed per Database, derived up front from the shared source.
     let seeds: Vec<u64> = (0..numdb).map(|_| rnd.random()).collect();
 
-    // Open all DBs and create their per-type benches.
-    let dbs: Vec<DB> = (0..numdb)
+    // Open all Databases and create their per-type benches.
+    let dbs: Vec<Database> = (0..numdb)
         .map(|_| open_db(handle, backend.clone()))
         .collect();
     let benches: Vec<Arc<DbBench>> = (0..numdb)
@@ -730,7 +771,7 @@ fn read_write_9010_all_dbs(
     }
     let keys: Arc<[Vec<u8>]> = Arc::from(keys);
 
-    // Run every worker of every DB concurrently as spawned tasks, so the shared
+    // Run every worker of every Database concurrently as spawned tasks, so the shared
     // runtime multiplexes them over its worker threads.
     let mut worker_handles = Vec::new();
     for (di, db) in dbs.iter().enumerate() {
@@ -751,7 +792,7 @@ fn read_write_9010_all_dbs(
         db_bench.end();
     }
 
-    // Collect results and close DBs.
+    // Collect results and close Databases.
     let mut results = Vec::with_capacity(numdb);
     for (di, db) in dbs.iter().enumerate() {
         results.push(DbResults {
@@ -760,7 +801,7 @@ fn read_write_9010_all_dbs(
             strong: benches[di].strong.results(),
             weak: benches[di].weak.results(),
         });
-        handle.block_on(db.close());
+        handle.block_on(db.shutdown());
     }
 
     run?;
@@ -768,7 +809,7 @@ fn read_write_9010_all_dbs(
 }
 
 async fn read_write_9010_worker(
-    db: DB,
+    db: Database,
     db_bench: Arc<DbBench>,
     keys: Arc<[Vec<u8>]>,
     seed: u64,
@@ -786,19 +827,19 @@ async fn read_write_9010_worker(
             let i0 = rng.random_range(0..keys.len());
             let i1 = rng.random_range(0..keys.len());
             match tt {
-                TxType::Write => {
+                TransactionType::Write => {
                     db_bench
                         .write
                         .measure(|| write_tx(&db, &coll, &keys[i0], &keys[i1]))
                         .await?;
                 }
-                TxType::ReadStrong => {
+                TransactionType::ReadStrong => {
                     db_bench
                         .strong
                         .measure(|| read_tx(&db, &coll, &keys[i0], &keys[i1]))
                         .await?;
                 }
-                TxType::ReadWeak => {
+                TransactionType::ReadWeak => {
                     db_bench
                         .weak
                         .measure(|| weak_read_tx(&coll, &keys[i0]))
@@ -810,8 +851,8 @@ async fn read_write_9010_worker(
     Ok(())
 }
 
-async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
-    db.tx(&Ctx::background(), |tx| async move {
+async fn write_tx(db: &Database, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
+    db.tx(|tx| async move {
         // Read both keys in parallel, then swap their values.
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
         let v0 = r0?;
@@ -823,8 +864,8 @@ async fn write_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<()
     .await
 }
 
-async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
-    db.tx(&Ctx::background(), |tx| async move {
+async fn read_tx(db: &Database, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(), GError> {
+    db.tx(|tx| async move {
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
         r0?;
         r1?;
@@ -834,7 +875,7 @@ async fn read_tx(db: &DB, coll: &Collection, k0: &[u8], k1: &[u8]) -> Result<(),
 }
 
 async fn weak_read_tx(coll: &Collection, k: &[u8]) -> Result<(), GError> {
-    coll.read_weak(&Ctx::background(), k, Duration::from_secs(10))
+    coll.read_stale(k, Duration::from_secs(10))
         .await
         .map(|_| ())
 }
@@ -850,7 +891,7 @@ fn init_keys(
     let db = open_db(handle, backend);
     let keys = handle.block_on(async {
         let coll = db.collection(READ_WRITE_9010_CNAME.as_bytes());
-        coll.create(&Ctx::background()).await?;
+        coll.create().await?;
         let mut keys: Vec<Vec<u8>> = vec![Vec::new(); num];
         // Initialize in batches of 100 keys.
         let mut i = 0;
@@ -863,7 +904,7 @@ fn init_keys(
                 .collect();
             let batch_ref = &batch;
             let coll_ref = &coll;
-            db.tx(&Ctx::background(), |tx| async move {
+            db.tx(|tx| async move {
                 for k in batch_ref {
                     tx.write(coll_ref, k, &rand_1k())?;
                 }
@@ -881,7 +922,7 @@ fn init_keys(
     handle.block_on(async {
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
-    handle.block_on(db.close());
+    handle.block_on(db.shutdown());
     Ok(keys)
 }
 
@@ -899,27 +940,40 @@ fn run_deadlock(
         "num-keys,overlap,overlap-pct,latency-ms\n",
     )?;
 
-    for k in 1..=6usize {
-        for overlap in 1..=k {
-            let db = open_db(handle, backend.clone());
-            let mut ben = Benchmarker::new(args.duration);
-            let res =
-                overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
-            handle.block_on(db.close());
-            res?;
-
-            let results = ben.bench.results();
-            let overlap_pct = 100 * overlap / k;
-            for s in &results.samples {
-                let lat_ms = s.as_secs_f64() * 1000.0;
-                writeln!(out, "{k},{overlap},{overlap_pct},{lat_ms:.2}")?;
-            }
+    let num_runs = args.num_runs.max(1);
+    for run in 0..num_runs {
+        if run > 0 {
             eprintln!(
-                "deadlock: keys={k} overlap={overlap} ({overlap_pct}%) samples={} p50={:?} p90={:?}",
-                results.samples.len(),
-                results.percentile(0.5),
-                results.percentile(0.9),
+                "Sleeping {:?} before run {}/{num_runs}",
+                args.run_cooldown,
+                run + 1
             );
+            handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
+        }
+        eprintln!("Run {}/{num_runs}", run + 1);
+        for k in 1..=6usize {
+            for overlap in 1..=k {
+                let db = open_db(handle, backend.clone());
+                let mut ben = Benchmarker::new(args.duration);
+                let res =
+                    overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
+                handle.block_on(db.shutdown());
+                res?;
+
+                let results = ben.bench.results();
+                let overlap_pct = 100 * overlap / k;
+                for s in &results.samples {
+                    let lat_ms = s.as_secs_f64() * 1000.0;
+                    writeln!(out, "{k},{overlap},{overlap_pct},{lat_ms:.2}")?;
+                }
+                eprintln!(
+                    "deadlock: keys={k} overlap={overlap} ({overlap_pct}%) samples={} \
+                     p50={:?} p90={:?}",
+                    results.samples.len(),
+                    results.percentile(0.5),
+                    results.percentile(0.9),
+                );
+            }
         }
     }
     Ok(())

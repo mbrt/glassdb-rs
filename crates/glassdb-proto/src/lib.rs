@@ -1,8 +1,11 @@
 //! Protobuf definitions for transaction logs. Ported from the Go
-//! `internal/proto` package; messages are generated from
-//! `proto/transaction.proto` at build time via `prost`.
+//! `internal/proto` package. The Rust bindings in `generated.rs` are
+//! pre-generated from `proto/transaction.proto` with `prost-build` and
+//! checked into the repo, so building the crate does not require `protoc`.
+//! Run `hack/regen-proto.sh` after editing the `.proto` file.
 
-include!(concat!(env!("OUT_DIR"), "/glassdb.rs"));
+mod generated;
+pub use generated::*;
 
 #[cfg(test)]
 mod tests {
