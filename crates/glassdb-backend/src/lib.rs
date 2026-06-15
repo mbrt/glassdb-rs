@@ -5,6 +5,7 @@
 //! object carries an opaque CAS [`Version`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -71,12 +72,16 @@ pub type Tags = BTreeMap<String, String>;
 /// An opaque CAS token identifying a generation of an object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Version {
-    pub token: String,
+    pub token: Arc<str>,
 }
 
 impl Version {
     /// Wraps a token string.
-    pub fn new(token: impl Into<String>) -> Self {
+    ///
+    /// The token is stored behind an `Arc` so cloning a `Version` - which
+    /// happens on every cached read and CAS comparison - is a refcount bump
+    /// rather than a string copy.
+    pub fn new(token: impl Into<Arc<str>>) -> Self {
         Version {
             token: token.into(),
         }
@@ -130,9 +135,13 @@ pub struct ReadReply {
 }
 
 /// The tags and version of an object (no contents).
+///
+/// The map is immutable once produced; backends that mutate tags do so
+/// copy-on-write (`Arc::make_mut`) so cloning `Metadata` (e.g. handing a cached
+/// entry to a reader) is a refcount bump rather than a deep map copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
-    pub tags: Tags,
+    pub tags: Arc<Tags>,
     pub version: Version,
 }
 

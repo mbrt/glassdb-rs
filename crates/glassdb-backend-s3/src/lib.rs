@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -187,7 +188,10 @@ impl S3Backend {
                 .send_put(path, &payload, &metadata, &conds, self.retry.clone())
                 .await
             {
-                PutAttempt::Ok(version) => Ok(Metadata { tags, version }),
+                PutAttempt::Ok(version) => Ok(Metadata {
+                    tags: Arc::new(tags),
+                    version,
+                }),
                 PutAttempt::Err(e) => Err(annotate("Write", path, *e)),
             };
         }
@@ -206,7 +210,12 @@ impl S3Backend {
                 .send_put(path, &payload, &metadata, &conds, RetryConfig::disabled())
                 .await
             {
-                PutAttempt::Ok(version) => return Ok(Metadata { tags, version }),
+                PutAttempt::Ok(version) => {
+                    return Ok(Metadata {
+                        tags: Arc::new(tags),
+                        version,
+                    });
+                }
                 PutAttempt::Err(e) => *e,
             };
 
@@ -335,7 +344,7 @@ impl Backend for S3Backend {
         )
         .await?;
         Ok(Metadata {
-            tags: tags_from_meta(out.metadata()),
+            tags: Arc::new(tags_from_meta(out.metadata())),
             version: version_from_etag(out.e_tag()),
         })
     }
@@ -375,7 +384,7 @@ impl Backend for S3Backend {
             value,
             merged,
             PutConds {
-                if_match: Some(expected.token.clone()),
+                if_match: Some(expected.token.to_string()),
                 if_none_match: false,
             },
         )
@@ -403,7 +412,7 @@ impl Backend for S3Backend {
             value,
             tags,
             PutConds {
-                if_match: Some(expected.token.clone()),
+                if_match: Some(expected.token.to_string()),
                 if_none_match: false,
             },
         )

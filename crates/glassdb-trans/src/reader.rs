@@ -16,7 +16,7 @@ use crate::monitor::Monitor;
 /// The result of reading a key: the raw value and its storage version.
 #[derive(Debug, Clone, Default)]
 pub struct ReadValue {
-    pub value: Vec<u8>,
+    pub value: Arc<[u8]>,
     pub version: Version,
 }
 

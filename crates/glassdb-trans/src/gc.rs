@@ -106,7 +106,7 @@ mod tests {
         gc.start();
 
         let tid = TxId::from_bytes(b"tx1".to_vec());
-        tl.set(TxLog::new(tid.clone(), TxCommitStatus::Ok))
+        tl.set(&TxLog::new(tid.clone(), TxCommitStatus::Ok))
             .await
             .unwrap();
         assert!(tl.get(&tid).await.is_ok());

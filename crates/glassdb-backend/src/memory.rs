@@ -3,7 +3,7 @@
 //! matching the GCS backend.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -15,7 +15,9 @@ use crate::{
 #[derive(Clone, Default)]
 struct Object {
     data: Vec<u8>,
-    tags: Tags,
+    // Shared so `get_metadata` and `Metadata` clones are refcount bumps; mutated
+    // copy-on-write via `Arc::make_mut` in `update_tags`.
+    tags: Arc<Tags>,
     generation: i64,
     metagen: i64,
 }
@@ -65,8 +67,9 @@ impl State {
         if t.is_empty() {
             return;
         }
+        let tags = Arc::make_mut(&mut obj.tags);
         for (k, v) in t {
-            obj.tags.insert(k.clone(), v.clone());
+            tags.insert(k.clone(), v.clone());
         }
         obj.metagen += 1;
     }
@@ -98,7 +101,7 @@ impl Backend for MemoryBackend {
         Ok(ReadReply {
             contents: obj.data.clone(),
             version: obj.version(),
-            tags: obj.tags.clone(),
+            tags: (*obj.tags).clone(),
         })
     }
 
@@ -108,7 +111,7 @@ impl Backend for MemoryBackend {
         Ok(ReadReply {
             contents: obj.data.clone(),
             version: obj.version(),
-            tags: obj.tags.clone(),
+            tags: (*obj.tags).clone(),
         })
     }
 
@@ -263,7 +266,7 @@ mod tests {
         let b = MemoryBackend::new();
         assert!(matches!(b.read("a").await, Err(BackendError::NotFound)));
         let m = b.write("a", b"hello".to_vec(), Tags::new()).await.unwrap();
-        assert_eq!(m.version.token, "1/1");
+        assert_eq!(&*m.version.token, "1/1");
         let r = b.read("a").await.unwrap();
         assert_eq!(r.contents, b"hello");
         b.delete("a").await.unwrap();
@@ -302,7 +305,7 @@ mod tests {
         let writer = WriterId::new(vec![1, 2, 3]);
         tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
         let m = b.write("a", b"v".to_vec(), tags).await.unwrap();
-        assert_eq!(m.version.token, "1/1");
+        assert_eq!(&*m.version.token, "1/1");
 
         // ReadIfModified with the same writer => precondition (unchanged).
         assert!(matches!(
@@ -317,7 +320,7 @@ mod tests {
         let mut t2 = Tags::new();
         t2.insert("k".to_string(), "v".to_string());
         let m2 = b.set_tags_if("a", &m.version, t2).await.unwrap();
-        assert_eq!(m2.version.token, "1/2");
+        assert_eq!(&*m2.version.token, "1/2");
     }
 
     #[tokio::test]

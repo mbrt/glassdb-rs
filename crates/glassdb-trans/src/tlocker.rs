@@ -16,7 +16,7 @@ use glassdb_backend::{self as backend};
 use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt, shard::Sharded,
 };
-use glassdb_data::{TxId, TxIdSet, set_diff, set_union};
+use glassdb_data::{TxId, TxIdSet, set_union};
 use glassdb_storage::{
     Global, Local, LockInfo, LockRequest, LockType, LockUpdate, Locker as StorageLocker, PathLock,
     StorageError, TValue, TxPathState, compute_lock_update, tags_lock_info,
@@ -393,11 +393,13 @@ fn trans_to_storage(e: TransError) -> StorageError {
 }
 
 fn is_complete(req: &LockRequest, res: &LockOpResult) -> bool {
-    let to_lock = TxIdSet::from_ids(req.lockers.clone());
-    let to_unlock = TxIdSet::from_ids(req.unlockers.clone());
-    let locked = TxIdSet::from_ids(res.locked_for.clone());
-    let unlocked = TxIdSet::from_ids(res.unlocked_for.clone());
-    set_diff(&to_lock, &locked).is_empty() && set_diff(&to_unlock, &unlocked).is_empty()
+    // Complete when every requested locker ended up locked and every requested
+    // unlocker ended up unlocked. Checked by direct containment over these
+    // (typically single-element) slices: deduplicating into `TxIdSet`s first
+    // would only add allocations without changing the result, and this runs on
+    // every lock/unlock worker iteration.
+    req.lockers.iter().all(|t| res.locked_for.contains(t))
+        && req.unlockers.iter().all(|t| res.unlocked_for.contains(t))
 }
 
 /// Acquires and releases distributed locks on storage objects, hiding waits and
@@ -742,7 +744,7 @@ mod tests {
 
         // Lock, commit, unlock writes the value.
         locker.lock_create(&key, &tx).await.unwrap();
-        let value = b"val".to_vec();
+        let value: Arc<[u8]> = Arc::from(&b"val"[..]);
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
             path: key.clone(),
@@ -765,7 +767,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -781,7 +783,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -808,7 +810,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx2);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -845,7 +847,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -855,7 +857,7 @@ mod tests {
         let mut tl = TxLog::new(txw.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
             path: key.clone(),
-            value: Vec::new(),
+            value: Arc::from(&[] as &[u8]),
             deleted: true,
             prev_writer: TxId::default(),
         }];
@@ -875,7 +877,7 @@ mod tests {
         tctx.monitor.begin_tx(&tx);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -897,7 +899,7 @@ mod tests {
         tctx.monitor.begin_tx(&txw);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -944,7 +946,7 @@ mod tests {
         tctx.monitor.begin_tx(&txw);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1010,7 +1012,7 @@ mod tests {
         tctx.monitor.begin_tx(&txr);
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1045,7 +1047,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
         tctx1
             .global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1082,7 +1084,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
         tctx1
             .global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1118,7 +1120,7 @@ mod tests {
                 let mut tl = TxLog::new(t.clone(), TxCommitStatus::Ok);
                 tl.writes = vec![TxWrite {
                     path: k,
-                    value: b"foo".to_vec(),
+                    value: Arc::from(&b"foo"[..]),
                     deleted: false,
                     prev_writer: TxId::default(),
                 }];
@@ -1136,7 +1138,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
 
         tctx.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -1171,7 +1173,7 @@ mod tests {
         // Pre-create the keys so reads can take a non-Create lock.
         for k in [&key_a, &key_b, &key_c] {
             tctx.global
-                .write(k, b"x".to_vec(), Tags::new())
+                .write(k, Arc::from(&b"x"[..]), Tags::new())
                 .await
                 .unwrap();
         }

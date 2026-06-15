@@ -3,6 +3,7 @@
 //! and timestamp tags.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend::{self as backend, Tags};
@@ -67,7 +68,7 @@ impl TxLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxWrite {
     pub path: String,
-    pub value: Vec<u8>,
+    pub value: Arc<[u8]>,
     pub deleted: bool,
     pub prev_writer: TxId,
 }
@@ -166,15 +167,17 @@ impl TLogger {
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
-    pub async fn set(&self, mut l: TxLog) -> Result<backend::Version, StorageError> {
-        if l.timestamp.is_none() {
-            l.timestamp = Some(rt::system_now());
-        }
-        let buf = marshal_log(&l)?;
-        let tags = log_tags(&l);
+    pub async fn set(&self, l: &TxLog) -> Result<backend::Version, StorageError> {
+        let ts = l.timestamp.unwrap_or_else(rt::system_now);
+        let buf = marshal_log(l, ts)?;
+        let tags = log_tags(l, ts);
         let m = self
             .global
-            .write_if_not_exists(&paths::from_transaction(&self.prefix, &l.id), buf, tags)
+            .write_if_not_exists(
+                &paths::from_transaction(&self.prefix, &l.id),
+                Arc::from(buf),
+                tags,
+            )
             .await?;
         Ok(m.version.clone())
     }
@@ -182,19 +185,17 @@ impl TLogger {
     /// Updates the log only if its current version matches `expected`.
     pub async fn set_if(
         &self,
-        mut l: TxLog,
+        l: &TxLog,
         expected: &backend::Version,
     ) -> Result<backend::Version, StorageError> {
-        if l.timestamp.is_none() {
-            l.timestamp = Some(rt::system_now());
-        }
-        let buf = marshal_log(&l)?;
-        let tags = log_tags(&l);
+        let ts = l.timestamp.unwrap_or_else(rt::system_now);
+        let buf = marshal_log(l, ts)?;
+        let tags = log_tags(l, ts);
         let m = self
             .global
             .write_if(
                 &paths::from_transaction(&self.prefix, &l.id),
-                buf,
+                Arc::from(buf),
                 expected,
                 tags,
             )
@@ -249,10 +250,10 @@ impl TLogger {
     }
 }
 
-fn write_value(w: &pb::Write) -> Vec<u8> {
+fn write_value(w: &pb::Write) -> Arc<[u8]> {
     match &w.val_delete {
-        Some(pb::write::ValDelete::Value(v)) => v.clone(),
-        _ => Vec::new(),
+        Some(pb::write::ValDelete::Value(v)) => Arc::from(v.as_slice()),
+        _ => Arc::from(&[] as &[u8]),
     }
 }
 
@@ -265,7 +266,7 @@ fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
         .map_err(|e| StorageError::Other(format!("unmarshalling transaction log: {e}")))
 }
 
-fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
+fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
     if l.id.is_unset() {
         return Err(StorageError::Other("empty transaction ID".into()));
     }
@@ -288,9 +289,7 @@ fn marshal_log(l: &TxLog) -> Result<Vec<u8>, StorageError> {
     };
 
     let tr = pb::TransactionLog {
-        timestamp: Some(system_to_proto_ts(
-            l.timestamp.unwrap_or_else(rt::system_now),
-        )),
+        timestamp: Some(system_to_proto_ts(ts)),
         status: status as i32,
         writes: coll_writes.into_values().collect(),
     };
@@ -311,7 +310,7 @@ fn marshal_write(
     let val_delete = if e.deleted {
         pb::write::ValDelete::Deleted(true)
     } else {
-        pb::write::ValDelete::Value(e.value.clone())
+        pb::write::ValDelete::Value(e.value.to_vec())
     };
     let write = pb::Write {
         suffix: gopath::join(&[pr.typ.as_str(), &pr.suffix]),
@@ -376,15 +375,13 @@ fn parse_lock_type(t: i32) -> LockType {
     }
 }
 
-fn log_tags(l: &TxLog) -> Tags {
+fn log_tags(l: &TxLog, ts: SystemTime) -> Tags {
     let status = match l.status {
         TxCommitStatus::Ok => COMMIT_STATUS_OK,
         TxCommitStatus::Pending => COMMIT_STATUS_PENDING,
         _ => COMMIT_STATUS_ABORTED,
     };
-    let ts = l
-        .timestamp
-        .unwrap_or_else(rt::system_now)
+    let ts = ts
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
@@ -451,7 +448,6 @@ fn proto_ts_to_system(ts: prost_types::Timestamp) -> SystemTime {
 mod tests {
     use super::*;
     use glassdb_backend::memory::MemoryBackend;
-    use std::sync::Arc;
 
     fn new_tlogger() -> TLogger {
         let local = Local::new(1 << 20);
@@ -471,7 +467,7 @@ mod tests {
             status: TxCommitStatus::Ok,
             writes: vec![TxWrite {
                 path: key_path.clone(),
-                value: b"world".to_vec(),
+                value: Arc::from(&b"world"[..]),
                 deleted: false,
                 prev_writer: TxId::from_bytes(vec![9]),
             }],
@@ -486,7 +482,7 @@ mod tests {
                 },
             ],
         };
-        t.set(log.clone()).await.unwrap();
+        t.set(&log).await.unwrap();
 
         let got = t.get(&id).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);

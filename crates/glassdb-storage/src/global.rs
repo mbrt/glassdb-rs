@@ -13,7 +13,7 @@ use crate::version::{Version, version_from_meta};
 /// The result of reading a value from global storage.
 #[derive(Debug, Clone)]
 pub struct GlobalRead {
-    pub value: Vec<u8>,
+    pub value: Arc<[u8]>,
     pub version: Version,
 }
 
@@ -59,13 +59,14 @@ impl Global {
                 }
                 if modified {
                     let meta = Arc::new(Metadata {
-                        tags: reply.tags,
+                        tags: Arc::new(reply.tags),
                         version: reply.version,
                     });
+                    let contents: Arc<[u8]> = Arc::from(reply.contents);
                     self.local
-                        .write_with_meta(key, reply.contents.clone(), meta.clone());
+                        .write_with_meta(key, contents.clone(), meta.clone());
                     return Ok(GlobalRead {
-                        value: reply.contents,
+                        value: contents,
                         version: version_from_meta(&meta),
                     });
                 }
@@ -78,13 +79,14 @@ impl Global {
 
         let r = self.backend.read(key).await?;
         let meta = Arc::new(Metadata {
-            tags: r.tags,
+            tags: Arc::new(r.tags),
             version: r.version,
         });
+        let contents: Arc<[u8]> = Arc::from(r.contents);
         self.local
-            .write_with_meta(key, r.contents.clone(), meta.clone());
+            .write_with_meta(key, contents.clone(), meta.clone());
         Ok(GlobalRead {
-            value: r.contents,
+            value: contents,
             version: version_from_meta(&meta),
         })
     }
@@ -114,10 +116,10 @@ impl Global {
     pub async fn write(
         &self,
         key: &str,
-        value: Vec<u8>,
+        value: Arc<[u8]>,
         t: Tags,
     ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.write(key, value.clone(), t).await?);
+        let meta = Arc::new(self.backend.write(key, value.to_vec(), t).await?);
         self.local.write_with_meta(key, value, meta.clone());
         Ok(meta)
     }
@@ -126,13 +128,13 @@ impl Global {
     pub async fn write_if(
         &self,
         key: &str,
-        value: Vec<u8>,
+        value: Arc<[u8]>,
         expected: &backend::Version,
         t: Tags,
     ) -> Result<Arc<Metadata>, StorageError> {
         let meta = Arc::new(
             self.backend
-                .write_if(key, value.clone(), expected, t)
+                .write_if(key, value.to_vec(), expected, t)
                 .await?,
         );
         self.local.write_with_meta(key, value, meta.clone());
@@ -143,12 +145,12 @@ impl Global {
     pub async fn write_if_not_exists(
         &self,
         key: &str,
-        value: Vec<u8>,
+        value: Arc<[u8]>,
         t: Tags,
     ) -> Result<Arc<Metadata>, StorageError> {
         let meta = Arc::new(
             self.backend
-                .write_if_not_exists(key, value.clone(), t)
+                .write_if_not_exists(key, value.to_vec(), t)
                 .await?,
         );
         self.local.write_with_meta(key, value, meta.clone());

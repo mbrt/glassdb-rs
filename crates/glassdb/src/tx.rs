@@ -81,7 +81,7 @@ impl Transaction {
                         last_writer: rv.version.writer,
                     }),
                 );
-                Ok(rv.value)
+                Ok(rv.value.to_vec())
             }
         }
     }
@@ -93,7 +93,7 @@ impl Transaction {
             .lock()
             .unwrap()
             .staged
-            .insert(p, StagedValue::Put(value.to_vec()));
+            .insert(p, StagedValue::Put(Arc::from(value)));
         Ok(())
     }
 
@@ -176,15 +176,15 @@ impl Transaction {
 }
 
 enum StagedValue {
-    Read(Vec<u8>),
-    Put(Vec<u8>),
+    Read(Arc<[u8]>),
+    Put(Arc<[u8]>),
     Delete,
 }
 
 impl StagedValue {
     fn read(&self) -> Result<Vec<u8>, Error> {
         match self {
-            StagedValue::Read(value) | StagedValue::Put(value) => Ok(value.clone()),
+            StagedValue::Read(value) | StagedValue::Put(value) => Ok(value.to_vec()),
             StagedValue::Delete => Err(Error::NotFound),
         }
     }

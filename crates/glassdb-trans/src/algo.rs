@@ -87,12 +87,12 @@ pub struct WriteAccess {
 /// The write operation staged for a key.
 #[derive(Debug, Clone)]
 pub enum WriteOp {
-    Put(Vec<u8>),
+    Put(Arc<[u8]>),
     Delete,
 }
 
 impl WriteAccess {
-    pub fn put(path: Arc<str>, value: Vec<u8>) -> Self {
+    pub fn put(path: Arc<str>, value: Arc<[u8]>) -> Self {
         Self {
             path,
             op: WriteOp::Put(value),
@@ -341,9 +341,9 @@ fn same_version_after_lock(v: &Version, meta: &Metadata) -> bool {
 fn to_log(id: TxId, writes: &[WriteAccess]) -> TxLog {
     let mut tl = TxLog::new(id, glassdb_storage::TxCommitStatus::Ok);
     for w in writes {
-        let (value, deleted) = match &w.op {
+        let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
             WriteOp::Put(value) => (value.clone(), false),
-            WriteOp::Delete => (Vec::new(), true),
+            WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
         };
         tl.writes.push(TxWrite {
             path: w.path.to_string(),
@@ -355,7 +355,7 @@ fn to_log(id: TxId, writes: &[WriteAccess]) -> TxLog {
     tl
 }
 
-fn write_access_from_value(path: Arc<str>, value: Vec<u8>, deleted: bool) -> WriteAccess {
+fn write_access_from_value(path: Arc<str>, value: Arc<[u8]>, deleted: bool) -> WriteAccess {
     if deleted {
         WriteAccess::delete(path)
     } else {
@@ -1471,7 +1471,7 @@ mod tests {
         global
             .write(
                 &paths::collection_info(TEST_COLL),
-                COLL_INFO.to_vec(),
+                Arc::from(COLL_INFO),
                 Tags::new(),
             )
             .await
@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     fn wa(path: &str, val: &[u8]) -> WriteAccess {
-        WriteAccess::put(path.into(), val.to_vec())
+        WriteAccess::put(path.into(), Arc::from(val))
     }
 
     fn wdel(path: &str) -> WriteAccess {
@@ -1587,7 +1587,7 @@ mod tests {
         assert!(txlog.timestamp.is_some());
         assert_eq!(txlog.writes.len(), 1);
         assert_eq!(txlog.writes[0].path, keyp);
-        assert_eq!(txlog.writes[0].value, val);
+        assert_eq!(&*txlog.writes[0].value, val);
         let mut locks = txlog.locks.clone();
         locks.sort_by(|a, b| a.path.cmp(&b.path));
         let mut expected = vec![
@@ -1642,7 +1642,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let gr = tctx.global.read(&keyp).await.unwrap();
-        assert_eq!(gr.value, val);
+        assert_eq!(&*gr.value, val);
     }
 
     #[tokio::test]
@@ -1676,12 +1676,12 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let lr = tctx.local.read(&keyp, MAX_STALENESS).unwrap();
-        assert_eq!(lr.value, val);
+        assert_eq!(&*lr.value, val);
         assert_eq!(lr.version.writer, *h.id());
 
         tm.unlock_all(&h).await.unwrap();
         let gr = tctx.global.read(&keyp).await.unwrap();
-        assert_eq!(gr.value, val);
+        assert_eq!(&*gr.value, val);
     }
 
     #[tokio::test]
@@ -1703,7 +1703,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let gr = tctx.global.read(&keyp).await.unwrap();
-        assert_eq!(gr.value, val);
+        assert_eq!(&*gr.value, val);
     }
 
     #[tokio::test]
@@ -1857,7 +1857,7 @@ mod tests {
         let st = tctx_w.tlogger.commit_status(&w1).await.unwrap();
         assert_eq!(st.status, TxCommitStatus::Unknown);
         let gr = tctx_w.global.read(&key).await.unwrap();
-        assert_eq!(gr.value, v1);
+        assert_eq!(&*gr.value, v1);
         assert_eq!(gr.writer(), w1);
 
         // 4. A third client write-locks k and stays pending.
@@ -1893,7 +1893,7 @@ mod tests {
             tctx_v.tmon.clone(),
         );
         let rv = reader.read(&key, MAX_STALENESS).await.unwrap();
-        assert_eq!(rv.value, v1);
+        assert_eq!(&*rv.value, v1);
         assert_eq!(rv.version.writer, w1);
     }
 
@@ -2084,7 +2084,7 @@ mod tests {
         global
             .write(
                 &paths::collection_info(TEST_COLL),
-                COLL_INFO.to_vec(),
+                Arc::from(COLL_INFO),
                 Tags::new(),
             )
             .await

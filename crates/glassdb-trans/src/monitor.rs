@@ -185,7 +185,7 @@ impl Monitor {
         // the transaction log.
         if !tl.locks.is_empty() {
             tl.status = TxCommitStatus::Ok;
-            self.set_final_log(tl.clone()).await.map_err(|e| {
+            self.set_final_log(&tl).await.map_err(|e| {
                 // Preserve AlreadyFinalized so the commit path can recognize a
                 // wound (the log was already aborted out from under us).
                 // In-doubt outcomes are retried inside `set_final_log` because
@@ -235,7 +235,7 @@ impl Monitor {
         self.stop_tx_refresh(tid);
 
         let res = self
-            .set_final_log(TxLog::new(tid.clone(), TxCommitStatus::Aborted))
+            .set_final_log(&TxLog::new(tid.clone(), TxCommitStatus::Aborted))
             .await;
 
         let mut st = self.shard_for(tid).lock().unwrap();
@@ -468,9 +468,9 @@ impl Monitor {
     ) -> Result<TxCommitStatus, TransError> {
         let tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         let r = if expected.is_unset() {
-            self.inner.tl.set(tlog).await
+            self.inner.tl.set(&tlog).await
         } else {
-            self.inner.tl.set_if(tlog, expected).await
+            self.inner.tl.set_if(&tlog, expected).await
         };
         match r {
             Ok(_) => Ok(TxCommitStatus::Aborted),
@@ -524,15 +524,15 @@ impl Monitor {
         }
     }
 
-    async fn set_final_log(&self, tlog: TxLog) -> Result<(), TransError> {
-        let tid = tlog.id.clone();
+    async fn set_final_log(&self, tlog: &TxLog) -> Result<(), TransError> {
+        let tid = &tlog.id;
         if tid.is_unset() {
             return Err(TransError::Other("missing required tlog ID".into()));
         }
         let mut last_v = {
-            let st = self.shard_for(&tid).lock().unwrap();
+            let st = self.shard_for(tid).lock().unwrap();
             st.local_tx
-                .get(&tid)
+                .get(tid)
                 .map(|e| e.last_version.clone())
                 .unwrap_or_default()
         };
@@ -540,9 +540,9 @@ impl Monitor {
         let mut backoff = self.inner.retry.backoff();
         loop {
             let r = if last_v.is_unset() {
-                self.inner.tl.set(tlog.clone()).await
+                self.inner.tl.set(tlog).await
             } else {
-                self.inner.tl.set_if(tlog.clone(), &last_v).await
+                self.inner.tl.set_if(tlog, &last_v).await
             };
             match r {
                 Ok(_) => return Ok(()),
@@ -563,7 +563,7 @@ impl Monitor {
                     //     found `aborted`): a wound landed first -> surface as
                     //     `AlreadyFinalized` so the commit path treats it as a
                     //     wound.
-                    let st = self.inner.tl.commit_status(&tid).await?;
+                    let st = self.inner.tl.commit_status(tid).await?;
                     if st.status == tlog.status {
                         return Ok(());
                     }
@@ -621,9 +621,9 @@ impl Monitor {
             tl.timestamp = Some(start);
 
             let r = if last_version.is_unset() {
-                self.inner.tl.set(tl).await
+                self.inner.tl.set(&tl).await
             } else {
-                self.inner.tl.set_if(tl, &last_version).await
+                self.inner.tl.set_if(&tl, &last_version).await
             };
             match r {
                 Ok(v) => {
@@ -727,7 +727,7 @@ mod tests {
         let key = paths::from_key("example", b"key");
 
         t1.global
-            .write(&key, b"x".to_vec(), Tags::new())
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
             .await
             .unwrap();
 
@@ -743,11 +743,11 @@ mod tests {
 
         let cs = mon1.committed_value(&key, &tx).await.unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
-        assert_eq!(cs.value.value, b"val1");
+        assert_eq!(&*cs.value.value, b"val1");
         // From a remote monitor.
         let cs = mon2.committed_value(&key, &tx).await.unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
-        assert_eq!(cs.value.value, b"val1");
+        assert_eq!(&*cs.value.value, b"val1");
 
         // A key the transaction didn't write.
         let key2 = paths::from_key("example", b"key2");
@@ -816,7 +816,7 @@ mod tests {
         fn w(path: &str, value: &[u8]) -> TxWrite {
             TxWrite {
                 path: path.to_string(),
-                value: value.to_vec(),
+                value: Arc::from(value),
                 deleted: false,
                 prev_writer: TxId::default(),
             }
