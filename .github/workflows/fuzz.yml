@@ -1,0 +1,99 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # daily
+  workflow_dispatch: {}     # allow manual runs
+
+permissions:
+  contents: write           # push corpus commit to main
+  actions: read             # read previous run via gh
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0      # need history to diff against the previous run's commit
+
+    - name: Skip unless crates/ Rust changed since the previous run
+      id: changes
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        prev=$(gh run list --workflow fuzz.yml --branch "${{ github.ref_name }}" \
+          --status completed --limit 1 --json headSha --jq '.[0].headSha')
+        if [ -z "$prev" ]; then
+          echo "No previous completed run; fuzzing."
+          echo "run=true" >> "$GITHUB_OUTPUT"
+        elif git diff --name-only "$prev" "$GITHUB_SHA" -- crates | grep -qE '\.rs$'; then
+          echo "crates/ Rust files changed since $prev; fuzzing."
+          echo "run=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "No crates/ Rust changes since $prev; skipping."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install nightly Rust toolchain
+      if: steps.changes.outputs.run == 'true'
+      uses: dtolnay/rust-toolchain@nightly
+
+    - uses: Swatinem/rust-cache@v2
+      if: steps.changes.outputs.run == 'true'
+      with:
+        workspaces: |
+          . -> target
+          fuzz -> target
+
+    - name: Install cargo-fuzz
+      if: steps.changes.outputs.run == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-fuzz
+
+    - name: Fuzz 30 minutes total, then minimize
+      if: steps.changes.outputs.run == 'true'
+      run: |
+        n=$(cd fuzz && cargo +nightly fuzz list | wc -l)
+        per=$((1800 / n))
+        echo "Fuzzing $n target(s) for ${per}s each (~30 min total)"
+        if ! make fuzz FUZZ_TIME="$per"; then
+          echo "::error::fuzzing found a crash; see the uploaded fuzz-crashes artifact"
+          echo "To reproduce a downloaded crash file:"
+          echo "  cd fuzz && RUSTFLAGS=\"--cfg sim --cfg tokio_unstable\" cargo +nightly fuzz run <target> <crash-file>"
+          echo "Or replay on stable: drop the file into fuzz/corpus/<target>/ and run 'make test-sim'."
+          exit 1
+        fi
+        make fuzz-min
+
+    - name: Upload crash artifacts
+      if: failure() && steps.changes.outputs.run == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-crashes-${{ github.run_id }}
+        path: fuzz/artifacts/
+        if-no-files-found: ignore
+        retention-days: 30
+
+    - name: Commit and push corpus updates
+      if: steps.changes.outputs.run == 'true'
+      run: |
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add fuzz/corpus
+        if git diff --cached --quiet; then
+          echo "No corpus changes to commit."
+          exit 0
+        fi
+        git commit -m "ci(fuzz): update minimized corpus"
+        git push
