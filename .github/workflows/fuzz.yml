@@ -3,11 +3,15 @@ name: Fuzz
 on:
   schedule:
     - cron: '0 4 * * *'   # daily
-  workflow_dispatch: {}     # allow manual runs
+  workflow_dispatch:        # allow manual runs
+    inputs:
+      force:
+        description: 'Fuzz even if no Rust files changed since the last run'
+        type: boolean
+        default: false
 
 permissions:
   contents: write           # push corpus commit to main
-  actions: read             # read previous run via gh
 
 concurrency:
   group: fuzz
@@ -23,25 +27,34 @@ jobs:
 
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0      # need history to diff against the previous run's commit
+        fetch-depth: 0      # need full history to compare Rust vs corpus commits
 
-    - name: Skip unless crates/ Rust changed since the previous run
+    - name: Decide whether fuzzing is needed
       id: changes
-      env:
-        GH_TOKEN: ${{ github.token }}
-        GH_REPO: ${{ github.repository }}
       run: |
-        prev=$(gh run list --workflow fuzz.yml --branch "${{ github.ref_name }}" \
-          --status completed --limit 1 --json headSha --jq '.[0].headSha')
-        if [ -z "$prev" ]; then
-          echo "No previous completed run; fuzzing."
+        if [ "${{ inputs.force }}" = "true" ]; then
+          echo "Manual run with force=true; fuzzing regardless of changes."
           echo "run=true" >> "$GITHUB_OUTPUT"
-        elif git diff --name-only "$prev" "$GITHUB_SHA" -- crates | grep -qE '\.rs$'; then
-          echo "crates/ Rust files changed since $prev; fuzzing."
+          exit 0
+        fi
+        # The fuzz job commits the minimized corpus after every run, so the last
+        # corpus commit marks the last time fuzzing ran. Compare it against the
+        # last commit that touched any Rust file: skip only when the corpus was
+        # updated strictly after the latest Rust change (fuzzing already covered
+        # it). This depends solely on commit history, so it is immune to missing
+        # or expired previous workflow runs.
+        rust_commit=$(git log -1 --format=%H -- '*.rs')
+        corpus_commit=$(git log -1 --format=%H -- fuzz/corpus)
+        if [ -z "$rust_commit" ]; then
+          echo "No Rust files in history; fuzzing."
           echo "run=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "No crates/ Rust changes since $prev; skipping."
+        elif [ -n "$corpus_commit" ] && [ "$corpus_commit" != "$rust_commit" ] \
+            && git merge-base --is-ancestor "$rust_commit" "$corpus_commit"; then
+          echo "Corpus update ($corpus_commit) is newer than the last Rust change ($rust_commit); skipping."
           echo "run=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Rust changed since the last corpus update; fuzzing."
+          echo "run=true" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Install nightly Rust toolchain
@@ -55,11 +68,14 @@ jobs:
           . -> target
           fuzz -> target
 
+    # Build cargo-fuzz from source rather than using a prebuilt binary: the
+    # published musl binaries default their fuzz target to the triple they were
+    # compiled for (musl), which links libc statically and is incompatible with
+    # the sanitizer (rust-fuzz/cargo-fuzz#398). A source build targets the gnu
+    # host, so `cargo fuzz` picks the correct default target.
     - name: Install cargo-fuzz
       if: steps.changes.outputs.run == 'true'
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-fuzz
+      run: cargo install --locked cargo-fuzz
 
     - name: Fuzz 30 minutes total, then minimize
       if: steps.changes.outputs.run == 'true'
@@ -68,7 +84,7 @@ jobs:
         per=$((1800 / n))
         echo "Fuzzing $n target(s) for ${per}s each (~30 min total)"
         if ! make fuzz FUZZ_TIME="$per"; then
-          echo "::error::fuzzing found a crash; see the uploaded fuzz-crashes artifact"
+          echo "::error::fuzzing failed (build error or crash); if a crash, see the uploaded fuzz-crashes artifact"
           echo "To reproduce a downloaded crash file:"
           echo "  cd fuzz && RUSTFLAGS=\"--cfg sim --cfg tokio_unstable\" cargo +nightly fuzz run <target> <crash-file>"
           echo "Or replay on stable: drop the file into fuzz/corpus/<target>/ and run 'make test-sim'."

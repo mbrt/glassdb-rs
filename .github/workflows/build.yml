@@ -28,7 +28,7 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: Test all
+    - name: Unit tests
       run: make test
 
     - name: Test sim
