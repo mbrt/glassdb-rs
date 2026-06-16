@@ -2,11 +2,7 @@
 //! fake S3 server in [`crate::fake_server`] (the analog of the Go tests'
 //! `gofakes3` + `httptest.Server`).
 
-use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
-use aws_sdk_s3::config::{
-    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
-};
 use glassdb_backend::{
     Backend, BackendError, LAST_WRITER_TAG, Tags, Version, WriterId, encode_writer_tag,
 };
@@ -19,25 +15,12 @@ use crate::{Builder, S3Backend};
 // Backend construction
 // ---------------------------------------------------------------------------
 
-fn client_for(fake: &FakeS3) -> Client {
-    let conf = aws_sdk_s3::config::Builder::default()
-        .behavior_version(BehaviorVersion::latest())
-        .region(Region::new("us-east-1"))
-        .credentials_provider(Credentials::new("test", "test", None, None, "test"))
-        .endpoint_url(fake.url())
-        .force_path_style(true)
-        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
-        .build();
-    Client::from_conf(conf)
-}
-
 fn backend(fake: &FakeS3) -> S3Backend {
-    S3Backend::new(client_for(fake), "test")
+    fake.backend("test")
 }
 
 fn builder(fake: &FakeS3) -> Builder {
-    S3Backend::builder(client_for(fake), "test")
+    S3Backend::builder(fake.client(), "test")
 }
 
 /// A standard retryer that retries the same errors as the default (incl. 503
