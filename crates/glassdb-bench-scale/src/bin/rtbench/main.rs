@@ -36,9 +36,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use aws_sdk_s3::config::{
-    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
-};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use clap::Parser;
 use rand::rngs::StdRng;
@@ -47,7 +44,7 @@ use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
-use glassdb::s3::{FakeS3, FakeS3Options, plaintext_http_client, tuned_http_client};
+use glassdb::s3::{FakeS3, FakeS3Options, tuned_http_client};
 use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
@@ -247,16 +244,8 @@ async fn init_fakes3(args: &Args) -> Result<BackendSetup, Box<dyn Error>> {
     .await;
 
     let metrics = Arc::new(HttpMetrics::default());
-    let mut conf = aws_sdk_s3::config::Builder::default()
-        .behavior_version(BehaviorVersion::latest())
-        .region(Region::new("us-east-1"))
-        .credentials_provider(Credentials::new("test", "test", None, None, "test"))
-        .endpoint_url(fake.url())
-        .force_path_style(true)
-        // The fake does not validate checksums; match the unit-test client so
-        // the SDK does not add trailers the fake would reject.
-        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+    let mut conf = fake
+        .client_config()
         .interceptor(HttpCounter::new(metrics.clone()));
     if let Some(hc) = fakes3_http_client(&args.http_pool) {
         conf = conf.http_client(hc);
@@ -290,6 +279,17 @@ fn fakes3_http_client(pool: &str) -> Option<SharedHttpClient> {
         // "tuned": keep idle connections warm, mirroring `tuned_http_client`.
         _ => Some(plaintext_http_client(Some(Duration::from_secs(90)))),
     }
+}
+
+/// A plaintext (no-TLS) HTTP client whose `pool_idle_timeout` governs how long
+/// idle keep-alive connections are retained: a long value maximizes reuse, a
+/// very short one forces the pool to drop and re-open connections (churn). This
+/// is the TLS-free analog of the s3 backend's `tuned_http_client`, used to A/B
+/// the connection pool locally against the plaintext `fakes3` server.
+fn plaintext_http_client(pool_idle_timeout: Option<Duration>) -> SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .pool_idle_timeout(pool_idle_timeout)
+        .build_http()
 }
 
 /// Selects which simulated-latency profile the in-memory backend emulates,

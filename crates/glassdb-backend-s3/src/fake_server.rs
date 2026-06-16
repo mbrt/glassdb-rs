@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aws_sdk_s3::config::{
+    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
 use bytes::Bytes;
 use glassdb_backend::middleware::{DelayOptions, Latency};
 use http_body_util::{BodyExt, Full};
@@ -166,6 +169,35 @@ impl FakeS3 {
     /// Apply the next `n` PUTs but answer them with `500` (a lost ack).
     pub fn set_lost_ack(&self, n: i64) {
         self.state.lost_ack.lock().unwrap().remaining = n;
+    }
+
+    /// An [`aws_sdk_s3::config::Builder`] pre-wired to talk to this fake: its
+    /// loopback `endpoint_url`, dummy static credentials, a placeholder region,
+    /// path-style addressing, and checksum validation disabled (the fake rejects
+    /// the checksum trailers the SDK would otherwise add). Callers that need to
+    /// layer extra config (a custom `http_client`, request interceptors) start
+    /// from here and then `.build()`. For the common case use [`FakeS3::client`]
+    /// / [`FakeS3::backend`].
+    pub fn client_config(&self) -> aws_sdk_s3::config::Builder {
+        aws_sdk_s3::config::Builder::default()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(self.url())
+            .force_path_style(true)
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+    }
+
+    /// A ready [`aws_sdk_s3::Client`] wired to this fake with the SDK's default
+    /// HTTP connector (see [`FakeS3::client_config`] to customize the transport).
+    pub fn client(&self) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::from_conf(self.client_config().build())
+    }
+
+    /// A ready [`S3Backend`](crate::S3Backend) over this fake and `bucket`.
+    pub fn backend(&self, bucket: impl Into<String>) -> crate::S3Backend {
+        crate::S3Backend::new(self.client(), bucket)
     }
 }
 

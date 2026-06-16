@@ -34,7 +34,7 @@ pub use fake_server::{FakeS3, FakeS3Options};
 mod tests;
 mod tuned_http;
 
-pub use tuned_http::{plaintext_http_client, tuned_http_client};
+pub use tuned_http::tuned_http_client;
 
 /// Number of random bytes prepended to every object body to force a unique
 /// ETag on each write.

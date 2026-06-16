@@ -29,6 +29,9 @@ futures = "0.3.32"
 rand = "0.10.1"
 aws-config = "1.8.17"
 aws-sdk-s3 = "1.134.0"
+# Plaintext HTTP client for the fakes3 backend's connection-pool A/B knob
+# (`--http-pool`); the TLS variant for real S3 lives in glassdb-backend-s3.
+aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 
