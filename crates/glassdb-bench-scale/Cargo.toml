@@ -19,7 +19,7 @@ workspace = true
 #   backendbench  raw backend storage-op latencies (ported from Go
 #                 `hack/backendbench`).
 [dependencies]
-glassdb = { path = "../glassdb", features = ["s3", "gcs"] }
+glassdb = { path = "../glassdb", features = ["s3", "gcs", "s3-fake-server"] }
 glassdb-backend = { workspace = true }
 glassdb-concurr = { workspace = true }
 # A real tokio runtime drives the binaries.

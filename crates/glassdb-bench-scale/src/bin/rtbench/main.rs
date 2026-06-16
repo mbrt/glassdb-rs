@@ -33,8 +33,13 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use aws_sdk_s3::config::{
+    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
@@ -42,6 +47,7 @@ use tokio::runtime::Handle;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
+use glassdb::s3::{FakeS3, FakeS3Options, plaintext_http_client, tuned_http_client};
 use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
@@ -55,8 +61,10 @@ const DEADLOCK_NUM_WRITERS: usize = 5;
 #[derive(Parser)]
 #[command(about = "Measure GlassDB transaction performance under concurrency")]
 struct Args {
-    /// Backend type.
-    #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3"])]
+    /// Backend type. `fakes3` runs the real aws-sdk-s3 client against an
+    /// in-process fake S3 server with simulated S3 latency (no AWS account
+    /// required), so the real client transport can be profiled locally.
+    #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3", "fakes3"])]
     backend: String,
     /// Delay profile for the memory backend.
     #[arg(long, default_value = "gcs", value_parser = ["gcs", "s3"])]
@@ -114,6 +122,18 @@ struct Args {
     /// next run begins.
     #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
     run_cooldown: Duration,
+    /// Explicit concurrency points (number of Databases) for the rw9010 sweep,
+    /// e.g. `--db-list=20,30,40`. Overrides the default 1,5,10,..,max-dbs sweep
+    /// so a focused run can hammer just the concurrency band of interest, for a
+    /// much tighter iterate-and-measure loop when tuning S3 performance.
+    #[arg(long, value_delimiter = ',')]
+    db_list: Vec<usize>,
+    /// HTTP connection-pool strategy for the `s3` / `fakes3` backends. `tuned`
+    /// (default) keeps idle connections warm for reuse (the `tuned_http_client`
+    /// path); `default` uses the SDK's stock client; `churn` (fakes3 only) reaps
+    /// idle connections after 1ms to exaggerate connection churn.
+    #[arg(long, default_value = "tuned", value_parser = ["default", "tuned", "churn"])]
+    http_pool: String,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -123,24 +143,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         .build()?;
     let handle = rt.handle().clone();
 
-    let (backend, metrics) = rt.block_on(init_backend(&args))?;
+    let setup = rt.block_on(init_backend(&args))?;
 
     match args.test_name.as_str() {
-        "simple" => run_simple(&handle, backend)?,
-        "rw9010" => run_read_write_9010(&handle, &args, backend, metrics)?,
-        "deadlock" => run_deadlock(&handle, &args, backend)?,
+        "simple" => run_simple(&handle, setup.backend)?,
+        "rw9010" => run_read_write_9010(
+            &handle,
+            &args,
+            setup.backend,
+            setup.http,
+            setup.server_conns,
+        )?,
+        "deadlock" => run_deadlock(&handle, &args, setup.backend)?,
         other => return Err(format!("unknown test name {other:?}").into()),
     }
     Ok(())
+}
+
+/// What [`init_backend`] returns: the backend plus the optional client-side HTTP
+/// metrics and, for `fakes3`, the server-side accepted-connection counter that
+/// stands in for the `new-conns` column the SDK does not surface.
+struct BackendSetup {
+    backend: Arc<dyn Backend>,
+    http: Option<Arc<HttpMetrics>>,
+    server_conns: Option<Arc<AtomicU64>>,
 }
 
 // ---------------------------------------------------------------------------
 // Backend / Database setup
 // ---------------------------------------------------------------------------
 
-async fn init_backend(
-    args: &Args,
-) -> Result<(Arc<dyn Backend>, Option<Arc<HttpMetrics>>), Box<dyn Error>> {
+async fn init_backend(args: &Args) -> Result<BackendSetup, Box<dyn Error>> {
     match args.backend.as_str() {
         "memory" => {
             let mut delays = memory_delay_profile(args)?;
@@ -150,12 +183,20 @@ async fn init_backend(
             }
             let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
             let backend: Arc<dyn Backend> = Arc::new(DelayBackend::new(inner, delays));
-            Ok((backend, None))
+            Ok(BackendSetup {
+                backend,
+                http: None,
+                server_conns: None,
+            })
         }
         "gcs" => {
             let bucket = env_var("BUCKET")?;
             let backend: Arc<dyn Backend> = Arc::new(glassdb::gcs::GcsBackend::new(bucket));
-            Ok((backend, None))
+            Ok(BackendSetup {
+                backend,
+                http: None,
+                server_conns: None,
+            })
         }
         "s3" => {
             let bucket = env_var("BUCKET")?;
@@ -163,18 +204,91 @@ async fn init_backend(
             // The tuned HTTP client steers the SDK toward connection reuse
             // (rustls + ALPN-negotiated HTTP/2), so high-concurrency steps
             // don't pile DNS+TLS handshakes onto tokio's blocking pool.
-            let base = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .http_client(glassdb::s3::tuned_http_client())
-                .load()
-                .await;
+            let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+            if let Some(hc) = s3_http_client(&args.http_pool) {
+                loader = loader.http_client(hc);
+            }
+            let base = loader.load().await;
             let conf = aws_sdk_s3::config::Builder::from(&base)
                 .interceptor(HttpCounter::new(metrics.clone()))
                 .build();
             let client = aws_sdk_s3::Client::from_conf(conf);
             let backend: Arc<dyn Backend> = Arc::new(glassdb::s3::S3Backend::new(client, bucket));
-            Ok((backend, Some(metrics)))
+            Ok(BackendSetup {
+                backend,
+                http: Some(metrics),
+                server_conns: None,
+            })
         }
+        "fakes3" => init_fakes3(args).await,
         other => Err(format!("unknown backend type {other:?}").into()),
+    }
+}
+
+/// Wires the real aws-sdk-s3 client to an in-process [`FakeS3`] server with
+/// simulated S3 latency. This exercises the full client transport (SDK → smithy
+/// → hyper connection pool → loopback TCP) without an AWS account, so the
+/// connection-pool / head-of-line behavior under concurrency can be iterated on
+/// locally. The fake serves plain HTTP/1.1, so the client must too (see
+/// `--http-pool`); a TLS + ALPN-h2 listener for the exact `tuned_http_client`
+/// path is a possible follow-up.
+async fn init_fakes3(args: &Args) -> Result<BackendSetup, Box<dyn Error>> {
+    if !(args.delay_scale > 0.0 && args.delay_scale.is_finite()) {
+        return Err(format!("--delay-scale must be > 0, got {}", args.delay_scale).into());
+    }
+    let mut delays = s3_delays();
+    delays.scale = args.delay_scale;
+
+    let conns = Arc::new(AtomicU64::new(0));
+    let fake = FakeS3::start_with(FakeS3Options {
+        latency: Some(delays),
+        conn_counter: Some(conns.clone()),
+    })
+    .await;
+
+    let metrics = Arc::new(HttpMetrics::default());
+    let mut conf = aws_sdk_s3::config::Builder::default()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+        .endpoint_url(fake.url())
+        .force_path_style(true)
+        // The fake does not validate checksums; match the unit-test client so
+        // the SDK does not add trailers the fake would reject.
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+        .interceptor(HttpCounter::new(metrics.clone()));
+    if let Some(hc) = fakes3_http_client(&args.http_pool) {
+        conf = conf.http_client(hc);
+    }
+    let client = aws_sdk_s3::Client::from_conf(conf.build());
+    let backend: Arc<dyn Backend> = Arc::new(glassdb::s3::S3Backend::new(client, "bench"));
+    Ok(BackendSetup {
+        backend,
+        http: Some(metrics),
+        server_conns: Some(conns),
+    })
+}
+
+/// HTTP client override for the real `s3` backend. `tuned` returns the
+/// connection-reusing TLS client; everything else returns `None` (SDK default).
+fn s3_http_client(pool: &str) -> Option<SharedHttpClient> {
+    match pool {
+        "tuned" => Some(tuned_http_client()),
+        // "default" (and "churn", which only applies to the plaintext fake).
+        _ => None,
+    }
+}
+
+/// HTTP client override for the plaintext `fakes3` backend. `default` returns
+/// `None` (SDK stock client); the others return a plaintext client whose pool
+/// idle timeout governs connection reuse vs. churn.
+fn fakes3_http_client(pool: &str) -> Option<SharedHttpClient> {
+    match pool {
+        "default" => None,
+        "churn" => Some(plaintext_http_client(Some(Duration::from_millis(1)))),
+        // "tuned": keep idle connections warm, mirroring `tuned_http_client`.
+        _ => Some(plaintext_http_client(Some(Duration::from_secs(90)))),
     }
 }
 
@@ -641,11 +755,28 @@ struct DbResults {
     weak: Results,
 }
 
+/// The concurrency points (number of Databases) the rw9010 sweep visits:
+/// the explicit `--db-list` when given, otherwise the default
+/// `1,5,10,..,max-dbs` ramp.
+fn db_steps(args: &Args) -> Vec<usize> {
+    if !args.db_list.is_empty() {
+        return args.db_list.clone();
+    }
+    let mut v = vec![1usize];
+    let mut i = 5;
+    while i <= args.max_dbs {
+        v.push(i);
+        i += 5;
+    }
+    v
+}
+
 fn run_read_write_9010(
     handle: &Handle,
     args: &Args,
     backend: Arc<dyn Backend>,
     metrics: Option<Arc<HttpMetrics>>,
+    server_conns: Option<Arc<AtomicU64>>,
 ) -> Result<(), Box<dyn Error>> {
     eprintln!("Initialize keys");
     let keys = init_keys(handle, backend.clone(), args.num_keys)?;
@@ -681,15 +812,14 @@ fn run_read_write_9010(
         }
         eprintln!("Run {}/{num_runs}", run + 1);
         let mut rnd = StdRng::seed_from_u64(42);
-        let mut i = 0;
-        while i <= args.max_dbs {
-            let numdb = i.max(1);
+        for &numdb in &db_steps(args) {
             eprintln!("Testing {numdb} dbs");
             run_read_write_9010_step(
                 handle,
                 args,
                 &backend,
                 metrics.as_ref(),
+                server_conns.as_ref(),
                 &keys,
                 numdb,
                 &mut rnd,
@@ -698,7 +828,6 @@ fn run_read_write_9010(
                 &mut throughput,
                 &mut client,
             )?;
-            i += 5;
         }
     }
 
@@ -711,6 +840,7 @@ fn run_read_write_9010_step(
     args: &Args,
     backend: &Arc<dyn Backend>,
     metrics: Option<&Arc<HttpMetrics>>,
+    server_conns: Option<&Arc<AtomicU64>>,
     keys: &[Vec<u8>],
     numdb: usize,
     rnd: &mut StdRng,
@@ -720,6 +850,7 @@ fn run_read_write_9010_step(
     client: &mut impl Write,
 ) -> Result<(), Box<dyn Error>> {
     let http_before = metrics.map(|m| m.snapshot()).unwrap_or_default();
+    let conns_before = server_conns.map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
     let (user_before, sys_before) = cpu::process_cpu_time();
     let sampler = ThreadSampler::start();
     let wall_start = std::time::Instant::now();
@@ -729,9 +860,14 @@ fn run_read_write_9010_step(
     let wall = wall_start.elapsed();
     let (user_after, sys_after) = cpu::process_cpu_time();
     let peak_threads = sampler.stop_and_peak();
-    let http_delta = metrics
+    let mut http_delta = metrics
         .map(|m| m.snapshot().sub(http_before))
         .unwrap_or_default();
+    if let Some(c) = server_conns {
+        // The SDK does not surface new connections; the fake S3 server counts
+        // accepted TCP connections instead, so `new-conns` is meaningful here.
+        http_delta.new_conns = c.load(Ordering::Relaxed).saturating_sub(conns_before) as i64;
+    }
 
     dump_samples(samples, &results, numdb)?;
     dump_stats(stats, &results, numdb)?;

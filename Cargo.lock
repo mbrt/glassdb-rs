@@ -1434,6 +1434,7 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-util",
  "rand 0.10.1",
+ "rand_distr",
  "tokio",
 ]
 
