@@ -467,18 +467,43 @@ impl Monitor {
         expected: &backend::Version,
     ) -> Result<TxCommitStatus, TransError> {
         let tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
-        let r = if expected.is_unset() {
-            self.inner.tl.set(&tlog).await
-        } else {
-            self.inner.tl.set_if(&tlog, expected).await
-        };
-        match r {
-            Ok(_) => Ok(TxCommitStatus::Aborted),
-            Err(e) if e.is_precondition() => {
-                let st = self.inner.tl.commit_status(tid).await?;
-                Ok(st.status)
+        let mut expected = expected.clone();
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            let r = if expected.is_unset() {
+                self.inner.tl.set(&tlog).await
+            } else {
+                self.inner.tl.set_if(&tlog, &expected).await
+            };
+            match r {
+                Ok(_) => return Ok(TxCommitStatus::Aborted),
+                Err(e) if e.is_precondition() => {
+                    // The version moved under us (a commit, a pending-log
+                    // refresh, or another wounder). Report whatever status is
+                    // now durable.
+                    let st = self.inner.tl.commit_status(tid).await?;
+                    return Ok(st.status);
+                }
+                // In-doubt: the abort write may or may not have landed. Just
+                // like `set_final_log`, forcing a not-yet-final log to
+                // `aborted` is idempotent and convergent, so it is always safe
+                // to retry (ADR-009). This is what keeps a lost ack on a wound
+                // (or on an expired-tx abort) from escaping the locker as a
+                // `failed locking` error: a pre-commit outcome must be
+                // recovered in place, never surfaced to the caller. Re-read to
+                // decide: a final status resolves it (our own landed abort, a
+                // peer's, or a commit that won the race); a still-pending
+                // status means retry the CAS over the refreshed version.
+                Err(e) if e.is_unavailable() => {
+                    let st = self.inner.tl.commit_status(tid).await?;
+                    if st.status.is_final() {
+                        return Ok(st.status);
+                    }
+                    expected = st.version;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => Err(e.into()),
+            rt::sleep(backoff.next_delay()).await;
         }
     }
 

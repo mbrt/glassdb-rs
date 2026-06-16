@@ -673,11 +673,14 @@ impl Locker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
+    use glassdb_backend::{
+        Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId, memory::MemoryBackend,
+    };
     use glassdb_concurr::Background;
     use glassdb_data::paths;
     use glassdb_storage::{TLogger, TxCommitStatus, TxLog, TxWrite};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     struct TlCtx {
         global: Global,
@@ -1157,6 +1160,172 @@ mod tests {
         assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx_old.clone()]).await;
 
         // The younger transaction was wounded (aborted).
+        let status = tctx.monitor.tx_status(&tx_young).await.unwrap();
+        assert_eq!(status, TxCommitStatus::Aborted);
+    }
+
+    /// A [`Backend`] decorator that injects a single in-doubt (lost-ack) fault
+    /// on the first conditional write to `target`: the write is forwarded so it
+    /// really lands, but its acknowledgement is reported as
+    /// [`BackendError::Unavailable`]. This models the ADR-009 in-doubt outcome
+    /// (the op may or may not have applied) on a transaction-log write.
+    struct LostAckOnce {
+        inner: Arc<dyn Backend>,
+        target: String,
+        armed: AtomicBool,
+    }
+
+    impl LostAckOnce {
+        fn new(inner: Arc<dyn Backend>, target: String) -> Arc<Self> {
+            Arc::new(LostAckOnce {
+                inner,
+                target,
+                armed: AtomicBool::new(true),
+            })
+        }
+
+        /// Consumes the one-shot trap if `path` is the target. Returns whether
+        /// the lost-ack fault should fire for this write.
+        fn should_fire(&self, path: &str) -> bool {
+            path == self.target && self.armed.swap(false, Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Backend for LostAckOnce {
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            w: &WriterId,
+        ) -> Result<ReadReply, BackendError> {
+            self.inner.read_if_modified(path, w).await
+        }
+
+        async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+            self.inner.read(path).await
+        }
+
+        async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
+            self.inner.get_metadata(path).await
+        }
+
+        async fn set_tags_if(
+            &self,
+            path: &str,
+            expected: &Version,
+            tags: Tags,
+        ) -> Result<Metadata, BackendError> {
+            self.inner.set_tags_if(path, expected, tags).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            tags: Tags,
+        ) -> Result<Metadata, BackendError> {
+            self.inner.write(path, value, tags).await
+        }
+
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &Version,
+            tags: Tags,
+        ) -> Result<Metadata, BackendError> {
+            let fire = self.should_fire(path);
+            let m = self.inner.write_if(path, value, expected, tags).await?;
+            if fire {
+                return Err(BackendError::Unavailable(format!(
+                    "injected lost ack on write_if {path}"
+                )));
+            }
+            Ok(m)
+        }
+
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            tags: Tags,
+        ) -> Result<Metadata, BackendError> {
+            let fire = self.should_fire(path);
+            let m = self.inner.write_if_not_exists(path, value, tags).await?;
+            if fire {
+                return Err(BackendError::Unavailable(format!(
+                    "injected lost ack on write_if_not_exists {path}"
+                )));
+            }
+            Ok(m)
+        }
+
+        async fn delete(&self, path: &str) -> Result<(), BackendError> {
+            self.inner.delete(path).await
+        }
+
+        async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+            self.inner.delete_if(path, expected).await
+        }
+
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    /// Regression test: an in-doubt **wound** write must be recovered in place.
+    ///
+    /// When an older transaction wounds a younger holder, it forces the
+    /// younger tx's log to `aborted` with a conditional write. If that write
+    /// lands but its acknowledgement is lost (an in-doubt outcome on a real
+    /// object store, e.g. S3/GCS), the wound is a *pre-commit* operation and
+    /// must be recovered transparently: forcing a not-yet-final log to
+    /// `aborted` is idempotent (ADR-009), so re-reading the status resolves it.
+    ///
+    /// Before the fix, `try_abort_remote_tx` did not retry an in-doubt outcome,
+    /// so the wound escaped the locker as a stringified storage error. It
+    /// surfaced from `lock_validate` as
+    /// `Error::Internal("failed validation: failed locking: storage outcome
+    /// unknown (in doubt): Write(<prefix>/_t/<txid>): ...")` and failed lock
+    /// acquisition — exactly the benchmark failure this guards against.
+    #[tokio::test(start_paused = true)]
+    async fn wound_younger_holder_lost_ack_recovers() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let key = paths::from_key("example", b"key");
+
+        // The wound writes `aborted` to the younger tx's log object; arm a
+        // one-shot lost ack on exactly that path. The log doesn't exist yet
+        // (the holder only locked, never committed), so this is the first — and
+        // the targeted — write to it.
+        let tx_young = mk_tid(2, "young");
+        let tx_old = mk_tid(1, "old");
+        let wound_log = paths::from_transaction("test", &tx_young);
+        let backend = LostAckOnce::new(mem, wound_log);
+        let (locker, tctx) = new_test_locker(backend);
+
+        tctx.global
+            .write(&key, Arc::from(&b"x"[..]), Tags::new())
+            .await
+            .unwrap();
+
+        // A younger transaction holds the write lock.
+        tctx.monitor.begin_tx(&tx_young);
+        locker.lock_write(&key, &tx_young).await.unwrap();
+
+        // The older (higher-priority) transaction wounds the younger holder.
+        // The wound's abort-log write lands but loses its ack; the locker must
+        // recover in place and still acquire the lock without surfacing the
+        // in-doubt outcome.
+        tctx.monitor.begin_tx(&tx_old);
+        locker
+            .lock_write(&key, &tx_old)
+            .await
+            .expect("an in-doubt wound write must be recovered in place, not surfaced");
+
+        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx_old.clone()]).await;
+
+        // The younger transaction was still wounded (the abort landed despite
+        // the lost ack), so the outcome is correct, not merely unsurfaced.
         let status = tctx.monitor.tx_status(&tx_young).await.unwrap();
         assert_eq!(status, TxCommitStatus::Aborted);
     }
