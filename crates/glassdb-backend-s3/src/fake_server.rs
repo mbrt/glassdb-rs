@@ -40,7 +40,15 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rand_distr::{Distribution, StandardNormal};
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
+
+/// Listen backlog for the server socket, well above tokio's default of 1024.
+/// High concurrency in aws-bench open connections in bursts, which have issues
+/// with the default. A deep backlog absorbs that burst so a momentary accept
+/// stall does not drop SYNs, which the client would otherwise see as an
+/// intermittent `dispatch failure`. The kernel caps this at
+/// `net.core.somaxconn`.
+const LISTEN_BACKLOG: u32 = 8192;
 
 // ---------------------------------------------------------------------------
 // Public configuration
@@ -209,7 +217,12 @@ async fn serve(
     conns: Option<Arc<AtomicU64>>,
     addr_tx: std::sync::mpsc::Sender<std::net::SocketAddr>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let socket = TcpSocket::new_v4().expect("create fake-s3 socket");
+    socket.bind(addr).expect("bind fake-s3 socket");
+    let listener = socket
+        .listen(LISTEN_BACKLOG)
+        .expect("listen fake-s3 socket");
     addr_tx.send(listener.local_addr().unwrap()).unwrap();
     loop {
         let Ok((stream, _)) = listener.accept().await else {

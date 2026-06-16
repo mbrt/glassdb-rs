@@ -855,7 +855,18 @@ fn run_read_write_9010_step(
     let sampler = ThreadSampler::start();
     let wall_start = std::time::Instant::now();
 
-    let results = read_write_9010_all_dbs(handle, args, backend, keys, numdb, rnd)?;
+    let results = match read_write_9010_all_dbs(handle, args, backend, keys, numdb, rnd) {
+        Ok(r) => r,
+        Err(e) => {
+            // A transient backend/transport error (e.g. an occasional connection
+            // dispatch failure under high concurrency) must not discard the whole
+            // multi-step sweep: warn, skip this step's output, and let the sweep
+            // continue with the next concurrency point.
+            let _ = sampler.stop_and_peak();
+            eprintln!("WARNING: step num-db={numdb} failed, skipping: {e}");
+            return Ok(());
+        }
+    };
 
     let wall = wall_start.elapsed();
     let (user_after, sys_after) = cpu::process_cpu_time();
