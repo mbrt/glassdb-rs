@@ -19,8 +19,8 @@ standalone Rust port.
 
 ## Workspace structure
 
-The port is a Cargo workspace of nine internal crates (`publish = false`) that
-mirror Go's `internal/` and `backend/` package boundaries:
+The port is a Cargo workspace of nine crates that mirror Go's `internal/` and
+`backend/` package boundaries:
 
 ```
 glassdb-data → glassdb-backend → glassdb-storage → glassdb-trans → glassdb
@@ -28,6 +28,18 @@ glassdb-proto ─┘                  ↑                      ↑
 glassdb-concurr ──────────────────┴──────────────────────┘
 glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 ```
+
+| Crate | Responsibility |
+| --- | --- |
+| `glassdb-data` | `TxId`, `TxIdSet`, and order-preserving path encoding. |
+| `glassdb-proto` | `prost`-generated transaction-log protobuf messages. |
+| `glassdb-concurr` | Concurrency utilities: `Background`, `Retry`, `Dedup`. |
+| `glassdb-backend` | The `Backend` async trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger). |
+| `glassdb-backend-s3` | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature. |
+| `glassdb-backend-gcs` | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature. |
+| `glassdb-storage` | Byte-weighted LRU cache, value versioning, local/global caching, locker, and transaction logger. |
+| `glassdb-trans` | The transaction engine: monitor, reader, GC, distributed locker, and commit algorithm. |
+| `glassdb` | The public API: `Database`, `Collection`, `Transaction`, iterators, and `Stats`. |
 
 Rationale:
 

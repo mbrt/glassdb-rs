@@ -1,40 +1,40 @@
 # GlassDB (Rust)
 
-A stateless, ACID, serializable key/value store layered on top of object
-storage. Clients use GlassDB as a library and don't need to deploy or depend on
-any additional services — everything is built on top of object storage.
+Glass DB is a pure Rust key/value store on top of object storage (Amazon S3 or
+Google Cloud Storage) that is _stateless_ and supports _ACID transactions_.
+Clients import Glass DB as a library and don't need to deploy, nor depend on any
+additional services. Everything is built on top of object storage.
 
-This is the async (`tokio`-based) Rust implementation. It ships in-memory,
-Amazon S3, and Google Cloud Storage backends, plus latency/scheduler/logging
-middleware.
+This is the async (`tokio`-based) Rust implementation, ported from the original
+[Go project](https://github.com/mbrt/glassdb). The commit protocol and on-disk
+format is compatible with the original project.
+
+The interface is inspired by [BoltDB](https://github.com/boltdb/bolt) and
+Apple's [FoundationDB](https://github.com/apple/foundationdb).
 
 ## Status
+
+> [!WARNING]
+> This is still alpha software.
 
 - Runtime: async, built on `tokio`.
 - Backends: in-memory (`glassdb::backend::memory`), Amazon S3
   (`glassdb-backend-s3`, behind the `s3` feature), and Google Cloud Storage
   (`glassdb-backend-gcs`, behind the `gcs` feature).
-- Middleware decorators — latency injection, a deterministic scheduler, and a
-  `tracing` logger — live in `glassdb::backend::middleware`.
-- Encodings (path base64, `TxId` hex, protobuf transaction logs) and the commit
-  protocol are wire-compatible with the original GlassDB on-disk format.
 
-## Workspace layout
+Transactions _should_ be working correctly and performance could definitely
+improve. Interfaces and file formats are _not_ stable and can still change at
+any point.
 
-The code is a Cargo workspace of internal crates. Only the top-level `glassdb`
-crate is meant to be used directly.
+For a deep dive into the internals, see the [architecture
+doc](docs/architecture.md) and the companion [blog
+post](https://blog.mbrt.dev/posts/transactional-object-storage) (created for the
+Go version, but still relevant).
 
-| Crate | Responsibility |
-| --- | --- |
-| `glassdb-data` | `TxId`, `TxIdSet`, and order-preserving path encoding. |
-| `glassdb-proto` | `prost`-generated transaction-log protobuf messages. |
-| `glassdb-concurr` | Concurrency utilities: `Background`, `Retry`, `Dedup`. |
-| `glassdb-backend` | The `Backend` async trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger). |
-| `glassdb-backend-s3` | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature. |
-| `glassdb-backend-gcs` | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature. |
-| `glassdb-storage` | Byte-weighted LRU cache, value versioning, local/global caching, locker, and transaction logger. |
-| `glassdb-trans` | The transaction engine: monitor, reader, GC, distributed locker, and commit algorithm. |
-| `glassdb` | The public API: `Database`, `Collection`, `Transaction`, iterators, and `Stats`. |
+We support both [Google GCS](https://cloud.google.com/storage/) and [Amazon
+S3](https://aws.amazon.com/s3/). Adding [Azure Blob
+Storage](https://azure.microsoft.com/en-us/products/storage/blobs/) should be
+very easy.
 
 ## Quick start
 
@@ -100,18 +100,87 @@ Each cloud crate is tested against a pure-Rust in-process fake of its API (no
 Docker or live credentials required), mirroring the original `gofakes3` /
 fake-GCS test setup.
 
+## Why
+
+This project makes the following specific tradeoffs:
+
+* Optimizes for rare conflicts between transactions (optimistic locking).
+* Readers are rarely blocked.
+* Clients are completely stateless and ephemeral. For example, they can be
+  scaled down to zero. We avoid explicit coordination between clients (e.g.
+  there's no need for consensus messages).
+* Requires access to object storage (the lowest latency the better) with
+  requests preconditions (both Google GCS and AWS S3 meet the requirements).
+* Assumes that, when transactions race each other, it's better to be slow than
+  to be incorrect.
+* High throughput is better than low latency.
+* Allows stale reads if explicitly requested, but defaults to strong consistency
+  in all cases.
+* Values are in the range 1KB to 1MB.
+
+Glass DB makes sense in contexts where there are many writers that rarely write
+to the same keys or reads are more frequent than writes.
+
+Why rewrite in Rust? Because having proper [DST
+tests](#deterministic-simulated-time-in-tests) was proven impossible, and I
+found that to be a deal-breaker for a stable database project. With LLM-powered
+translation (and lots of review time), I found the porting appealing.
+
+### Example 1: User settings
+
+One example could be storing user settings. Every key is
+dedicated to one user and the value contains all the settings. This way we can
+update each user independently (and scale horizontally). In the rare case where
+two updates for the same user arrive concurrently, we _don't_ produce an
+inconsistent result but retry the transaction.
+
+### Example 2: Low frequency updates
+
+The application serves low traffic (e.g. one query per minute). What are the
+choices today?
+
+* Single machine / VM mostly idle.
+* "Serverless" function with a managed database (for example Google Cloud Run +
+  Cloud SQL, or fly.io).
+
+Neither seem cost effective in the scenario. We are talking about $10 a month,
+which is not huge, but can we do better?
+
+Yes. With Glass DB you only pay for each query and long term storage. In the
+case of GCS (as of 2023) we are talking about:
+
+* $0.020 per GB per month
+* $0.05 per 10k write / list ops
+* $0.004 per 10k read ops
+
+At a rate of one write per minute this would be around $2 a month. Less usage?
+Even less money.
+
+### Example 3: Analytics
+
+Data ingestion can usually be done in parallel and designed in such a way that
+different processes write independently.
+
+A compaction process can run in parallel to the ingestion, bringing the data in
+a shape better suited for the query layer.
+
+Compaction and ingestion are mostly independent, but we must make sure to be
+robust to crashes and restarts (avoiding e.g. double-counting or event
+duplicates). This can be ensured with transactions provided by Glass DB. If most
+transactions don't conflict with each other, the throughput will scale mostly
+linearly (See [Performance](#performance)).
+
+## Performance
+
+**TODO**
+
+See the [Go version](https://github.com/mbrt/glassdb) for now, which is very
+similar.
+
 ## Development
 
 ```bash
 cargo build --workspace
-cargo test --workspace
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Equivalent `Makefile` targets are also available:
-
-```bash
 make test     # fmt --check + clippy -D warnings + cargo test
 make test-sim # tests under the deterministic simulation executor (+ fuzz-corpus replay)
 make test-all # test + test-sim
@@ -119,16 +188,17 @@ make format   # cargo fmt --all
 make lint     # fmt --check + clippy -D warnings
 ```
 
-Building `glassdb-proto` requires the Protocol Buffers compiler (`protoc`).
+Updating `glassdb-proto` protos require the Protocol Buffers compiler
+(`protoc`).
 
-### Deterministic time in tests
+### Deterministic simulated time in tests
 
-Staleness and lock waits are driven by `tokio::time::Instant`, so tests can use
-`#[tokio::test(start_paused = true)]` (and `tokio::time::advance`) to make
-time-dependent paths deterministic and fast without real sleeps.
+GlassDB uses deterministic time combined with coverage-guided fuzz testing,
+inspired by FoundationDB, for stress test the implementation while producing
+reproducible failures. See [dst-approach](docs/dst-approach.md) for more
+details.
 
 ## Design notes
 
-See [PORTING.md](PORTING.md) for the design decisions behind the
-implementation (concurrency model, time/determinism, error handling, and
-encoding fidelity).
+See [PORTING.md](PORTING.md) for the design decisions behind the implementation
+(concurrency model, time/determinism, error handling, and encoding fidelity).
