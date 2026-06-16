@@ -1,0 +1,71 @@
+# release-plz configuration for the GlassDB workspace.
+#
+# release-plz is used only for the version bump: `hack/release.sh` runs
+# `release-plz update` (or `set-version`) to bump every published crate in
+# lockstep from the conventional-commit history and to keep the inter-crate
+# `version = "x.y.z"` path-dependency requirements in sync. The actual publish,
+# git tag, and GitHub release are done by the script with `cargo publish
+# --workspace`, `git tag`, and `gh` -- `release-plz release` is not used because
+# it is hard-coupled to a forge token / API even when git releases are disabled.
+#
+# The library crates are versioned in lockstep (one shared version, via
+# `version_group`), matching `version.workspace = true` in the root Cargo.toml.
+# The two `glassdb-bench-*` crates stay private (`publish = false` in their
+# manifests) and are not listed here.
+
+[workspace]
+# Opt-in model: only the [[package]] entries below are version-managed.
+release = false
+# No CHANGELOG.md is generated or committed; release notes come from the GitHub
+# release created by `hack/release.sh` (GitHub's native auto-generated notes).
+changelog_update = false
+
+# --- Published crates (lockstep via version_group = "glassdb") ---------------
+# A version bump to any one moves all nine to the same new version, and the
+# inter-crate `version = "x.y.z"` path-dependency requirements are updated
+# automatically.
+
+[[package]]
+name = "glassdb-concurr"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-proto"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-data"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-backend"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-backend-s3"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-backend-gcs"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-storage"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb-trans"
+release = true
+version_group = "glassdb"
+
+[[package]]
+name = "glassdb"
+release = true
+version_group = "glassdb"

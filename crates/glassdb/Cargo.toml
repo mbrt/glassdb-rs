@@ -3,7 +3,11 @@ name = "glassdb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+homepage.workspace = true
+description = "A stateless, ACID, serializable key/value store on top of object storage."
+keywords = ["database", "acid", "key-value", "object-storage", "transactions"]
+categories = ["database", "asynchronous"]
 
 [lints]
 workspace = true

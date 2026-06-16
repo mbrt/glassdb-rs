@@ -3,7 +3,8 @@ name = "glassdb-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+description = "Prost-generated data serialization protobuf for GlassDB (internal crate)."
 
 [features]
 # `regen` is an opt-in toggle for the `regen-proto` helper binary that

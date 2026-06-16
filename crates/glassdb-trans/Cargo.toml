@@ -3,7 +3,8 @@ name = "glassdb-trans"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+description = "Transaction engine for GlassDB (internal crate)."
 
 [lints]
 workspace = true

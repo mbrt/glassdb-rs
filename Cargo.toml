@@ -21,7 +21,8 @@ exclude = ["fuzz"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-publish = false
+repository = "https://github.com/mbrt/glassdb-rs"
+homepage = "https://github.com/mbrt/glassdb-rs"
 
 # `--cfg sim` activates the in-repo deterministic simulation executor (see
 # ADR-011). Declaring it here keeps `#[cfg(sim)]` attributes from tripping the
@@ -30,14 +31,14 @@ publish = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sim)'] }
 
 [workspace.dependencies]
-glassdb-data = { path = "crates/glassdb-data" }
-glassdb-proto = { path = "crates/glassdb-proto" }
-glassdb-concurr = { path = "crates/glassdb-concurr" }
-glassdb-backend = { path = "crates/glassdb-backend" }
-glassdb-backend-s3 = { path = "crates/glassdb-backend-s3" }
-glassdb-backend-gcs = { path = "crates/glassdb-backend-gcs" }
-glassdb-storage = { path = "crates/glassdb-storage" }
-glassdb-trans = { path = "crates/glassdb-trans" }
+glassdb-data = { path = "crates/glassdb-data", version = "0.1.0" }
+glassdb-proto = { path = "crates/glassdb-proto", version = "0.1.0" }
+glassdb-concurr = { path = "crates/glassdb-concurr", version = "0.1.0" }
+glassdb-backend = { path = "crates/glassdb-backend", version = "0.1.0" }
+glassdb-backend-s3 = { path = "crates/glassdb-backend-s3", version = "0.1.0" }
+glassdb-backend-gcs = { path = "crates/glassdb-backend-gcs", version = "0.1.0" }
+glassdb-storage = { path = "crates/glassdb-storage", version = "0.1.0" }
+glassdb-trans = { path = "crates/glassdb-trans", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

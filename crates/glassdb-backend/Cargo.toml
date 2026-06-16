@@ -3,7 +3,8 @@ name = "glassdb-backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+description = "Backend trait, in-memory backend, and middleware for GlassDB."
 
 [lints]
 workspace = true
