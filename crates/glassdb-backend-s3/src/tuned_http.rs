@@ -47,3 +47,19 @@ pub fn tuned_http_client() -> SharedHttpClient {
         .pool_idle_timeout(Duration::from_secs(90))
         .build_https()
 }
+
+/// A **plaintext** (no-TLS) HTTP client with a configurable connection-pool
+/// idle timeout. The TLS-free analog of [`tuned_http_client`], for talking to a
+/// local HTTP endpoint such as the in-process [`crate::FakeS3`] server (the SDK
+/// rejects a plaintext endpoint when given an HTTPS connector).
+///
+/// `pool_idle_timeout` controls how long idle keep-alive connections are
+/// retained: a long value (like [`tuned_http_client`]'s 90s) maximizes reuse;
+/// `None` keeps connections forever; a very short value forces the pool to drop
+/// and re-open connections, exaggerating connection churn. This is the knob to
+/// A/B locally when investigating the transport's behavior under concurrency.
+pub fn plaintext_http_client(pool_idle_timeout: Option<Duration>) -> SharedHttpClient {
+    Builder::new()
+        .pool_idle_timeout(pool_idle_timeout)
+        .build_http()
+}

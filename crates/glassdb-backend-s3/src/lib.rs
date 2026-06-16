@@ -22,11 +22,19 @@ use glassdb_backend::{
     encode_writer_tag,
 };
 
+// The in-process fake S3 server is compiled for this crate's own tests and,
+// when the `fake-server` feature is on, exposed as a reusable component (used by
+// the benchmarks to drive the real S3 transport against an in-memory server).
+#[cfg(any(test, feature = "fake-server"))]
+mod fake_server;
+#[cfg(feature = "fake-server")]
+pub use fake_server::{FakeS3, FakeS3Options};
+
 #[cfg(test)]
 mod tests;
 mod tuned_http;
 
-pub use tuned_http::tuned_http_client;
+pub use tuned_http::{plaintext_http_client, tuned_http_client};
 
 /// Number of random bytes prepended to every object body to force a unique
 /// ETag on each write.

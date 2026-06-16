@@ -180,31 +180,55 @@ CSVs are elsewhere (for example from a local `--backend=memory` or
 uv run hack/aws-bench/plot.py --input ./results-dir --out ./out
 ```
 
-## Reproducing locally with the fake backend (no AWS)
+## Reproducing locally with the fake backend (no AWS) 
 
-A real-S3 run can be reproduced locally with the in-memory backend wrapped in
-simulated S3 latencies and S3's documented per-prefix request-rate limit (see
-the [benchmarks section of PORTING.md](../../PORTING.md#benchmarks)). The model
-favors faithful *relative* behavior under algorithm changes over matching one
-run's absolute numbers, so expect the curves to track the shape, not every
-point. No AWS access is required:
+The `--backend=fakes3` runs the **real** aws-sdk-s3 client against an in-process
+fake S3 server (`glassdb::s3::FakeS3`, behind the `s3-fake-server` feature) with
+the same `s3` latency profile injected at the HTTP layer. That exercises the
+full transport (SDK → smithy → hyper connection pool → loopback TCP) with no AWS
+account, so transport changes can be iterated on locally.
 
 ```bash
 # rw9010 + deadlock at the same scale as the real run, into out-fake/.
 cargo run --release -p glassdb-bench-scale --bin rtbench -- \
-  --backend=memory --delays=s3 --test-name=rw9010 \
+  --backend=fakes3 --test-name=rw9010 \
   --max-dbs=50 --num-keys=50000 --duration=60s \
   --samples-out=hack/aws-bench/out-fake/samples.csv \
   --stats-out=hack/aws-bench/out-fake/stats.csv \
   --throughput-out=hack/aws-bench/out-fake/throughput.csv
 cargo run --release -p glassdb-bench-scale --bin rtbench -- \
-  --backend=memory --delays=s3 --test-name=deadlock \
+  --backend=fakes3 --test-name=deadlock \
   --duration=20s --deadlock-out=hack/aws-bench/out-fake/deadlock.csv
 
 # Compare fake vs real: prints per-concurrency fake/real ratios for throughput,
 # retries and deadlock p50/p90, and writes overlay PNGs into out-fake/.
 uv run hack/aws-bench/compare.py
 ```
+
+Hammer a particular concurrency band:
+
+```bash
+cargo run --release -p glassdb-bench-scale --bin rtbench -- \
+  --backend=fakes3 --test-name=rw9010 \
+  --db-list=20,30,40 --num-keys=5000 --duration=20s --delay-scale=0.2 \
+  --http-pool=tuned \
+  --samples-out=hack/aws-bench/out-fake/samples.csv \
+  --stats-out=hack/aws-bench/out-fake/stats.csv \
+  --throughput-out=hack/aws-bench/out-fake/throughput.csv \
+  --client-stats-out=hack/aws-bench/out-fake/client-stats.csv
+```
+
+`--http-pool` selects the client's connection-pool strategy so you can A/B it:
+`tuned` (default, keep idle connections warm), `default` (the SDK's stock
+client), or `churn` (reap idle connections after 1ms, exaggerating churn).
+
+> The fake serves plain HTTP/1.1, so the client talks plaintext. This reproduces
+> connection-pool and HOL behavior under latency, but not TLS-handshake cost.
+
+## In-memory backend
+
+Use `--backend=memory` together with `--delays=s3` to simulate the same behavior
+locally, without the HTTP transport.
 
 For quick iteration, scale down (e.g. `--max-dbs=5 --num-keys=500 --duration=10s`)
 and/or compress the simulated latencies with `--delay-scale` (e.g.

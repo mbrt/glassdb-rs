@@ -33,6 +33,9 @@ tracing = "0.1.44"
 default = []
 # Pull in the Amazon S3 backend (heavy AWS SDK dependency).
 s3 = ["dep:glassdb-backend-s3"]
+# Additionally expose the in-process fake S3 server (`glassdb::s3::FakeS3`) for
+# driving the real S3 transport against an in-memory server (benchmarks/tests).
+s3-fake-server = ["s3", "glassdb-backend-s3/fake-server"]
 # Pull in the Google Cloud Storage backend (reqwest/gcp_auth dependency).
 gcs = ["dep:glassdb-backend-gcs"]
 # Expose the deterministic-simulation workload harness (`glassdb::sim`) used by

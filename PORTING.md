@@ -339,7 +339,14 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
     flags and CSV schema as the Go tool (so the plotting scripts are shared),
     deterministic per-database/per-worker seeds, and a real-S3 client wired up via
     `aws_config` + a `BUCKET` env var (faithful to the Go tooling), or real GCS
-    via Application Default Credentials.
+    via Application Default Credentials. Two Rust-only additions aid S3
+    performance work: `--db-list` replaces the fixed `1,5,..,max` sweep with an
+    explicit concurrency set (a focused, tight measure loop), and
+    `--backend=fakes3` drives the real aws-sdk-s3 client against an in-process
+    fake S3 server (`glassdb-backend-s3`'s `fake-server` feature, exposed as
+    `glassdb::s3::FakeS3`) with the `s3` latency profile injected at the HTTP
+    layer — reproducing the *client transport* (connection pool, head-of-line
+    blocking) that the in-memory `--delays=s3` path cannot, with no AWS account.
   - `backendbench` — raw backend-operation latencies (`WriteSame`,
     `WriteFailPre`, `Read`, `ReadUnchanged`, `SetMetaSame`, `GetMeta`).
 - **`glassdb-bench-score` crate** — lightweight, in-memory local benchmarks (no
