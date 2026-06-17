@@ -38,35 +38,6 @@ pub enum TransError {
 
 impl From<BackendError> for TransError {
     fn from(e: BackendError) -> Self {
-        TransError::Storage(StorageError::Backend(e))
-    }
-}
-
-impl TransError {
-    /// Reports whether this is the retry sentinel.
-    pub fn is_retry(&self) -> bool {
-        matches!(self, TransError::Retry)
-    }
-
-    /// Reports whether the transaction was wounded under the wound-wait rule.
-    pub fn is_wounded(&self) -> bool {
-        matches!(self, TransError::Wounded)
-    }
-
-    /// Reports whether the underlying cause is a not-found error.
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, TransError::Storage(s) if s.is_not_found())
-    }
-
-    /// Reports whether the underlying cause is a precondition-failed error.
-    pub fn is_precondition(&self) -> bool {
-        matches!(self, TransError::Storage(s) if s.is_precondition())
-    }
-
-    /// Reports whether the underlying cause is an in-doubt (unknown-outcome)
-    /// error: the operation may or may not have been applied, so the
-    /// transaction must not be retried transparently.
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, TransError::Storage(s) if s.is_unavailable())
+        TransError::Storage(e.into())
     }
 }

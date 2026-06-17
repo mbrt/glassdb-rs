@@ -89,7 +89,7 @@ async fn single_rmw(db: &Database) -> Result<Sample, Error> {
         db.tx(|tx| async move {
             let v = match tx.read(coll, key).await {
                 Ok(v) => v,
-                Err(e) if e.is_not_found() => Vec::new(),
+                Err(Error::NotFound) => Vec::new(),
                 Err(e) => return Err(e),
             };
             tx.write(coll, key, &write_int(read_int(&v) + 1))
@@ -115,7 +115,7 @@ async fn multi_rmw(db: &Database) -> Result<Sample, Error> {
             for (k, rv) in keys.iter().zip(vals) {
                 let v = match rv {
                     Ok(v) => v,
-                    Err(e) if e.is_not_found() => Vec::new(),
+                    Err(Error::NotFound) => Vec::new(),
                     Err(e) => return Err(e),
                 };
                 tx.write(coll, k, &write_int(read_int(&v) + 1))?;

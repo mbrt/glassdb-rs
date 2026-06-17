@@ -111,7 +111,7 @@ impl TLogger {
     pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
         match self.read_tags(id).await {
             Ok(ts) => Ok(ts),
-            Err(e) if e.is_not_found() => Ok(TxStatus {
+            Err(StorageError::NotFound) => Ok(TxStatus {
                 status: TxCommitStatus::Unknown,
                 last_update: UNIX_EPOCH,
                 version: backend::Version::default(),
@@ -211,7 +211,7 @@ impl TLogger {
             .await
         {
             Ok(()) => Ok(()),
-            Err(e) if e.is_not_found() => Ok(()),
+            Err(StorageError::NotFound) => Ok(()),
             Err(e) => Err(e),
         }
     }

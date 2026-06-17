@@ -44,30 +44,6 @@ pub enum Error {
     Internal(String),
 }
 
-impl Error {
-    /// Reports whether this is a not-found error (mirrors `backend.ErrNotFound`).
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::NotFound)
-    }
-
-    /// Reports whether this is a precondition-failed error.
-    pub fn is_precondition(&self) -> bool {
-        matches!(self, Error::Precondition)
-    }
-
-    /// Reports whether the transaction was aborted.
-    pub fn is_aborted(&self) -> bool {
-        matches!(self, Error::Aborted)
-    }
-
-    /// Reports whether the transaction's outcome is unknown (in doubt). Such a
-    /// transaction may or may not have committed; the engine does not retry it
-    /// transparently, leaving the decision to the caller.
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, Error::InDoubt(_))
-    }
-}
-
 impl From<BackendError> for Error {
     fn from(e: BackendError) -> Self {
         match e {
@@ -82,8 +58,9 @@ impl From<BackendError> for Error {
 impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         match e {
-            StorageError::Backend(b) => b.into(),
-            StorageError::KeyNotFound => Error::NotFound,
+            StorageError::NotFound | StorageError::KeyNotFound => Error::NotFound,
+            StorageError::Precondition => Error::Precondition,
+            StorageError::Unavailable(s) => Error::InDoubt(s),
             StorageError::Other(s) => Error::Internal(s),
         }
     }

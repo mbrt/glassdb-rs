@@ -46,25 +46,6 @@ pub enum BackendError {
     Other(String),
 }
 
-impl BackendError {
-    /// Reports whether this is a not-found error.
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, BackendError::NotFound)
-    }
-
-    /// Reports whether this is a precondition-failed error.
-    pub fn is_precondition(&self) -> bool {
-        matches!(self, BackendError::Precondition)
-    }
-
-    /// Reports whether the operation's outcome is unknown (in doubt). Such an
-    /// operation may or may not have taken effect and must not be blindly
-    /// retried if it is not idempotent.
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, BackendError::Unavailable(_))
-    }
-}
-
 /// Key-value metadata pairs associated with an object. A `BTreeMap` is used so
 /// iteration order is deterministic.
 pub type Tags = BTreeMap<String, String>;

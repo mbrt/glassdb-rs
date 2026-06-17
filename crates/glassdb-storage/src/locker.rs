@@ -430,9 +430,7 @@ impl Locker {
             match update.typ {
                 LockType::None => return Ok(()),
                 LockType::Read | LockType::Write => {
-                    return Err(StorageError::Backend(
-                        glassdb_backend::BackendError::NotFound,
-                    ));
+                    return Err(StorageError::NotFound);
                 }
                 _ => {}
             }

@@ -14,7 +14,8 @@ use glassdb_backend::{self as backend, Metadata};
 use glassdb_concurr::{Background, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version, tags_lock_info,
+    Global, Local, LockType, PathLock, StorageError, TValue, TxLog, TxWrite, Version,
+    tags_lock_info,
 };
 
 use crate::error::TransError;
@@ -678,7 +679,7 @@ impl Algo {
 
         let mut meta = match self.reader.get_metadata(&read.path, MAX_STALE).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => return Err(TransError::NoSingleWrite),
+            Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
             Err(e) => {
                 return Err(TransError::Other(format!(
                     "getting metadata for {:?}: {e}",
@@ -690,7 +691,7 @@ impl Algo {
         // Try validating twice without retrying the whole transaction.
         for _ in 0..2 {
             if let Err(e) = self.check_read_version_unlocked(read_version, &meta) {
-                if e.is_retry() {
+                if matches!(e, TransError::Retry) {
                     self.local
                         .mark_value_outdated(&write.path, read_version.to_storage_version());
                 }
@@ -717,11 +718,11 @@ impl Algo {
                 .await
             {
                 Ok(()) => return Ok(()),
-                Err(e) if e.is_precondition() => {
+                Err(StorageError::Precondition) => {
                     // Raced: refresh metadata with a strong read and retry.
                     meta = match self.global.get_metadata(&read.path).await {
                         Ok(m) => m,
-                        Err(e) if e.is_not_found() => return Err(TransError::NoSingleWrite),
+                        Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
                         Err(e) => {
                             return Err(TransError::Other(format!(
                                 "getting metadata for {:?}: {e}",
@@ -778,7 +779,7 @@ impl Algo {
     async fn validate_read(&self, item: &mut PathState) -> Result<(), TransError> {
         let meta = match self.global.get_metadata(&item.path).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => {
+            Err(StorageError::NotFound) => {
                 item.result = VResult::Retry;
                 return Ok(());
             }
@@ -895,7 +896,7 @@ impl Algo {
     async fn validate_read_not_found(&self, item: &mut PathState) -> Result<(), TransError> {
         let meta = match self.global.get_metadata(&item.path).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => {
+            Err(StorageError::NotFound) => {
                 item.result = VResult::Ok;
                 return Ok(());
             }
@@ -1158,7 +1159,7 @@ impl Algo {
         };
 
         if let Err(e) = lock_res {
-            if e.is_not_found() {
+            if matches!(e, TransError::Storage(StorageError::NotFound)) {
                 if item.has_read() {
                     item.result = VResult::Retry;
                     return Ok(());
@@ -1197,7 +1198,7 @@ impl Algo {
                     item.result = VResult::Ok;
                     Ok(())
                 }
-                Err(e) if e.is_precondition() => {
+                Err(TransError::Storage(StorageError::Precondition)) => {
                     item.result = VResult::Retry;
                     Ok(())
                 }
@@ -1205,7 +1206,7 @@ impl Algo {
             }
         } else if item.has_read() && !item.has_write() {
             match self.global.get_metadata(&item.path).await {
-                Err(e) if e.is_not_found() => {
+                Err(StorageError::NotFound) => {
                     item.result = VResult::Ok;
                     Ok(())
                 }
@@ -1213,7 +1214,7 @@ impl Algo {
                 Ok(_) => {
                     // The item exists now; lock read and validate.
                     match self.locker.lock_read(&item.path, &tx.id).await {
-                        Err(e) if e.is_not_found() => {
+                        Err(TransError::Storage(StorageError::NotFound)) => {
                             item.result = VResult::Ok;
                             Ok(())
                         }
@@ -1231,7 +1232,7 @@ impl Algo {
                     item.result = VResult::Ok;
                     Ok(())
                 }
-                Err(e) if e.is_precondition() => {
+                Err(TransError::Storage(StorageError::Precondition)) => {
                     // Found now; lock it in write instead.
                     self.locker.lock_write(&item.path, &tx.id).await?;
                     item.result = VResult::Ok;
@@ -1525,7 +1526,7 @@ mod tests {
         let reader = Reader::new(tctx.local.clone(), tctx.global.clone(), tctx.tmon.clone());
         match reader.read(path, MAX_STALENESS).await {
             Ok(rv) => ra_found(path, rv.version.writer),
-            Err(e) if e.is_not_found() => ra_not_found(path),
+            Err(StorageError::NotFound) => ra_not_found(path),
             Err(e) => panic!("reading {path}: {e:?}"),
         }
     }
@@ -1662,7 +1663,10 @@ mod tests {
             writes: vec![wa(&keyp, val)],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let gr = tctx.global.read(&keyp).await.unwrap();
         tm.reset(
@@ -1738,7 +1742,10 @@ mod tests {
             writes: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let r = do_read(&tctx, &keyp).await;
         tm.reset(
@@ -1810,7 +1817,10 @@ mod tests {
             writes: vec![wa(&keyp, b"v2")],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let ra = do_read(&tctx, &keyp).await;
         tm.reset(
@@ -1876,7 +1886,10 @@ mod tests {
             writes: Vec::new(),
         });
         let err = tm_victim.commit(&mut hv).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
         tm_victim.end(&mut hv).await.unwrap();
 
         // 6. The third client releases its lock; k is unlocked at v1@W1.
@@ -1964,7 +1977,10 @@ mod tests {
             writes: vec![wa(&keys[0], b"1"), wa(&keys[1], b"1")],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let reads = do_reads(&tctx, &[&keys[1], &keys[2]]).await;
         commit_writes(&tm2, vec![wa(&keys[2], b"y")]).await;
@@ -1977,7 +1993,10 @@ mod tests {
             },
         );
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         tm.end(&mut h).await.unwrap();
 
@@ -2014,7 +2033,10 @@ mod tests {
             let writes: Vec<WriteAccess> = keys.iter().map(|k| wa(k, b"1")).collect();
             let mut h = tm.begin(Data { reads, writes });
             let err = tm.commit(&mut h).await.unwrap_err();
-            assert!(err.is_retry(), "[{num_writes}] expected retry, got {err:?}");
+            assert!(
+                matches!(err, TransError::Retry),
+                "[{num_writes}] expected retry, got {err:?}"
+            );
 
             tm.end(&mut h).await.unwrap();
 
@@ -2050,7 +2072,10 @@ mod tests {
             writes: vec![wa(&keyp, b"tmpw")],
         });
         let err = tm.commit(&mut h1).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let info = lock_info(&tctx, &keyp).await;
         assert_eq!(info.typ, LockType::Write);
@@ -2062,7 +2087,10 @@ mod tests {
             writes: Vec::new(),
         });
         let err = tm.commit(&mut h2).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let ra2 = do_read(&tctx, &keyp).await;
         assert_eq!(ra2.version.as_ref().unwrap().last_writer, *wh.id());
@@ -2190,7 +2218,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(180)).await;
 
         let err = tctx.tlogger.get(&tid).await.unwrap_err();
-        assert!(err.is_not_found(), "expected log deleted, got {err:?}");
+        assert!(
+            matches!(err, StorageError::NotFound),
+            "expected log deleted, got {err:?}"
+        );
 
         drop(bg);
     }

@@ -60,7 +60,7 @@ async fn main() -> Result<(), glassdb::Error> {
     db.tx(|tx| async move {
         let cur = match tx.read(users, b"counter").await {
             Ok(v) => v,
-            Err(e) if e.is_not_found() => b"0".to_vec(),
+            Err(glassdb::Error::NotFound) => b"0".to_vec(),
             Err(e) => return Err(e),
         };
         let next = String::from_utf8_lossy(&cur).parse::<i64>().unwrap_or(0) + 1;

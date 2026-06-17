@@ -218,7 +218,7 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
     db.tx(|tx| async move {
         let cur = match tx.read(coll, key).await {
             Ok(v) => read_int(&v),
-            Err(e) if e.is_not_found() => 0,
+            Err(Error::NotFound) => 0,
             Err(e) => return Err(e),
         };
         tx.write(coll, key, &write_int(cur + 1))
@@ -255,7 +255,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 
     let res = increment(&db, &coll, b"k").await;
     assert!(
-        matches!(res, Err(ref e) if e.is_unavailable()),
+        matches!(res, Err(Error::InDoubt(_))),
         "expected an in-doubt error, got {res:?}"
     );
 

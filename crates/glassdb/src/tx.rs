@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::paths;
-use glassdb_storage::{Global, Local, MAX_STALENESS};
+use glassdb_storage::{Global, Local, MAX_STALENESS, StorageError};
 use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
 
 use crate::collection::Collection;
@@ -64,7 +64,7 @@ impl Transaction {
         }
 
         match self.reader.read(&p, MAX_STALENESS).await {
-            Err(e) if e.is_not_found() => {
+            Err(StorageError::NotFound) => {
                 let mut inner = self.inner.lock().unwrap();
                 inner.reads.insert(p, ReadState::NotFound);
                 Err(Error::NotFound)

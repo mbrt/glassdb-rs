@@ -33,7 +33,7 @@ async fn read_int_from_tx(
 ) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
-        Err(e) if e.is_not_found() => Ok(0),
+        Err(Error::NotFound) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -73,7 +73,7 @@ async fn read_only(db: &Database, coll: &Collection, keys: &[&[u8]]) -> Result<(
         for k in keys {
             match tx.read(coll, k).await {
                 Ok(v) => assert!(read_int(&v) >= 0, "negative value for {k:?}"),
-                Err(e) if e.is_not_found() => {}
+                Err(Error::NotFound) => {}
                 Err(e) => return Err(e),
             }
         }

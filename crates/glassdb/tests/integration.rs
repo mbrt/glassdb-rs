@@ -31,7 +31,7 @@ async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         // Treat a missing value as zero (i.e. initialize it).
-        Err(e) if e.is_not_found() => Ok(0),
+        Err(Error::NotFound) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -79,7 +79,10 @@ async fn delete() {
     coll.delete(key).await.unwrap();
 
     let err = coll.read(key).await.unwrap_err();
-    assert!(err.is_not_found(), "expected not-found, got {err:?}");
+    assert!(
+        matches!(err, Error::NotFound),
+        "expected not-found, got {err:?}"
+    );
 
     let stats = db.stats();
     assert_eq!(stats.tx_n, 3);
@@ -139,7 +142,7 @@ async fn read_deleted_from_another() {
             let k1 = tx.read(db1coll, key1).await?;
             let found = match tx.read(db1coll, key2).await {
                 Ok(_) => true,
-                Err(e) if e.is_not_found() => false,
+                Err(Error::NotFound) => false,
                 Err(e) => return Err(e),
             };
             Ok((k1, found))

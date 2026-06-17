@@ -10,7 +10,7 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{Global, Local, TLogger};
-use glassdb_trans::{Algo, Gc, Locker, Monitor};
+use glassdb_trans::{Algo, Gc, Locker, Monitor, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -413,7 +413,7 @@ impl DbInner {
                     }
                     let h = handle.as_mut().unwrap();
                     match self.algo.validate_reads(h).await {
-                        Err(e) if e.is_retry() => {
+                        Err(TransError::Retry) => {
                             tx.reset();
                             stats.tx_retries += 1;
                             continue;
@@ -430,7 +430,7 @@ impl DbInner {
             };
             match commit_res {
                 Ok(()) => break Ok(value),
-                Err(e) if e.is_wounded() => {
+                Err(TransError::Wounded) => {
                     // A higher-priority transaction aborted us. Release whatever
                     // we were holding and restart with a fresh ID that preserves
                     // our priority, so we are not starved on the retry.
@@ -448,7 +448,7 @@ impl DbInner {
                     stats.tx_retries += 1;
                     continue;
                 }
-                Err(e) if e.is_retry() => {
+                Err(TransError::Retry) => {
                     tx.reset();
                     stats.tx_retries += 1;
                     continue;
