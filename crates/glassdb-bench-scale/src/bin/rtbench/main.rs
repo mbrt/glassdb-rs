@@ -794,7 +794,7 @@ fn run_read_write_9010(
     let mut client = create_csv(
         &args.client_stats_out,
         "num-db,wall-ms,num-cpu,cpu-user-ms,cpu-sys-ms,cpu-util-pct,\
-         http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-goroutines\n",
+         http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-goroutines,tx-failures\n",
     )?;
 
     // Deterministic random source, for reproducibility. Re-seeded from the
@@ -855,13 +855,14 @@ fn run_read_write_9010_step(
     let sampler = ThreadSampler::start();
     let wall_start = std::time::Instant::now();
 
-    let results = match read_write_9010_all_dbs(handle, args, backend, keys, numdb, rnd) {
+    let (results, failures) = match read_write_9010_all_dbs(handle, args, backend, keys, numdb, rnd)
+    {
         Ok(r) => r,
         Err(e) => {
-            // A transient backend/transport error (e.g. an occasional connection
-            // dispatch failure under high concurrency) must not discard the whole
-            // multi-step sweep: warn, skip this step's output, and let the sweep
-            // continue with the next concurrency point.
+            // Individual failed transactions are counted and dropped, not
+            // propagated. Reaching here means an unexpected fatal error (e.g. a
+            // worker panic): warn and skip just this concurrency point rather
+            // than discarding the whole sweep.
             let _ = sampler.stop_and_peak();
             eprintln!("WARNING: step num-db={numdb} failed, skipping: {e}");
             return Ok(());
@@ -891,6 +892,7 @@ fn run_read_write_9010_step(
         sys_after - sys_before,
         http_delta,
         peak_threads,
+        failures,
     )?;
     Ok(())
 }
@@ -902,7 +904,7 @@ fn read_write_9010_all_dbs(
     keys: &[Vec<u8>],
     numdb: usize,
     rnd: &mut StdRng,
-) -> Result<Vec<DbResults>, Box<dyn Error>> {
+) -> Result<(Vec<DbResults>, u64), Box<dyn Error>> {
     // One seed per Database, derived up front from the shared source.
     let seeds: Vec<u64> = (0..numdb).map(|_| rnd.random()).collect();
 
@@ -917,6 +919,10 @@ fn read_write_9010_all_dbs(
         db_bench.start();
     }
     let keys: Arc<[Vec<u8>]> = Arc::from(keys);
+    // Counts transactions that errored out during the step (shared across all
+    // workers). Such transactions are dropped from the latency samples but
+    // tracked here so the failure noise is reported per step.
+    let failures = Arc::new(AtomicU64::new(0));
 
     // Run every worker of every Database concurrently as spawned tasks, so the shared
     // runtime multiplexes them over its worker threads.
@@ -930,7 +936,13 @@ fn read_write_9010_all_dbs(
             let db = db.clone();
             let db_bench = benches[di].clone();
             let keys = keys.clone();
-            worker_handles.push(handle.spawn(read_write_9010_worker(db, db_bench, keys, wseed)));
+            worker_handles.push(handle.spawn(read_write_9010_worker(
+                db,
+                db_bench,
+                keys,
+                failures.clone(),
+                wseed,
+            )));
         }
     }
     let run = handle.block_on(join_tasks(worker_handles));
@@ -952,13 +964,14 @@ fn read_write_9010_all_dbs(
     }
 
     run?;
-    Ok(results)
+    Ok((results, failures.load(Ordering::Relaxed)))
 }
 
 async fn read_write_9010_worker(
     db: Database,
     db_bench: Arc<DbBench>,
     keys: Arc<[Vec<u8>]>,
+    failures: Arc<AtomicU64>,
     seed: u64,
 ) -> Result<(), GError> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -973,25 +986,30 @@ async fn read_write_9010_worker(
             // span the transaction future.
             let i0 = rng.random_range(0..keys.len());
             let i1 = rng.random_range(0..keys.len());
-            match tt {
+            let res = match tt {
                 TransactionType::Write => {
                     db_bench
                         .write
                         .measure(|| write_tx(&db, &coll, &keys[i0], &keys[i1]))
-                        .await?;
+                        .await
                 }
                 TransactionType::ReadStrong => {
                     db_bench
                         .strong
                         .measure(|| read_tx(&db, &coll, &keys[i0], &keys[i1]))
-                        .await?;
+                        .await
                 }
                 TransactionType::ReadWeak => {
                     db_bench
                         .weak
                         .measure(|| weak_read_tx(&coll, &keys[i0]))
-                        .await?;
+                        .await
                 }
+            };
+            if res.is_err() {
+                // Count transaction failures but keep going, so the step's overall
+                // progress is not derailed by individual errors.
+                failures.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1224,6 +1242,7 @@ fn dump_client_stats(
     cpu_sys: Duration,
     http: HttpSnapshot,
     peak_threads: usize,
+    failures: u64,
 ) -> Result<(), Box<dyn Error>> {
     let num_cpu = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1241,13 +1260,13 @@ fn dump_client_stats(
     eprintln!(
         "clientmetrics num-db={numdb} cpu-util={util_pct:.0}% (user={cpu_user:?} sys={cpu_sys:?} \
          wall={wall:?} cores={num_cpu}) http-req={} ({req_per_sec:.0}/s) throttle={} 5xx={} \
-         new-conns={} peak-threads={peak_threads}",
+         new-conns={} peak-threads={peak_threads} tx-fail={failures}",
         http.requests, http.throttle, http.server_err, http.new_conns,
     );
 
     writeln!(
         out,
-        "{numdb},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},{},{},{},{},{},{peak_threads}",
+        "{numdb},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},{},{},{},{},{},{peak_threads},{failures}",
         wall.as_secs_f64() * 1000.0,
         cpu_user.as_secs_f64() * 1000.0,
         cpu_sys.as_secs_f64() * 1000.0,
