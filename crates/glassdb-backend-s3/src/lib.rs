@@ -595,9 +595,25 @@ where
         Some(404) => BackendError::NotFound,
         Some(412) | Some(409) => BackendError::Precondition,
         _ => BackendError::Other(format!(
-            "{op}({path}): code={code:?} status={status:?}: {e}"
+            "{op}({path}): code={code:?} status={status:?}: {}",
+            error_chain(&e)
         )),
     }
+}
+
+/// Renders an error together with its full `source()` chain. `SdkError`'s own
+/// `Display` is terse (e.g. just "dispatch failure"); the real cause (connection
+/// reset, connect timeout, refused, ...) lives in the source chain, so flatten
+/// it into the message for diagnostics.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        let _ = write!(s, ": {c}");
+        src = c.source();
+    }
+    s
 }
 
 /// Reports whether `e` is a 409 `ConditionalRequestConflict`, which S3 returns
