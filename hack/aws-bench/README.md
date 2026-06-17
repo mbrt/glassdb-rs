@@ -188,6 +188,17 @@ the same `s3` latency profile injected at the HTTP layer. That exercises the
 full transport (SDK → smithy → hyper connection pool → loopback TCP) with no AWS
 account, so transport changes can be iterated on locally.
 
+> **Raise the open-file limit first.** The fake server is in-process, so every
+> loopback connection consumes **two** file descriptors in the same process
+> (the client socket and the server-accepted socket). A high-concurrency step
+> opens hundreds of connections, which blows past the default soft limit of
+> `1024` and surfaces as `dispatch failure: ... Too many open files (os error
+> 24)` (counted as `tx-fail`). Raise it before running:
+>
+> ```bash
+> ulimit -n 1048576
+> ```
+
 ```bash
 # rw9010 + deadlock at the same scale as the real run, into out-fake/.
 cargo run --release -p glassdb-bench-scale --bin rtbench -- \

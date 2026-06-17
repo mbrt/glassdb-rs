@@ -1264,6 +1264,15 @@ fn dump_client_stats(
         http.requests, http.throttle, http.server_err, http.new_conns,
     );
 
+    if failures > 0 {
+        eprintln!(
+            "WARNING: num-db={numdb} saw {failures} failed transactions, dropped \
+             from latency stats — this step is unreliable. The likely cause is a \
+             either CPU-contention, or low open-file limits. See \
+             hack/aws-bench/README.md)"
+        );
+    }
+
     writeln!(
         out,
         "{numdb},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},{},{},{},{},{},{peak_threads},{failures}",
