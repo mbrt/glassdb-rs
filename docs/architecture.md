@@ -407,6 +407,15 @@ of updating a single key. (The change-detection fix that keeps this path
 lost-update-safe is documented in
 [ADR-007](adr/007-single-rw-cache-lost-update.md).)
 
+If the conditional write's outcome is in doubt (`Unavailable` — it may or may
+not have landed), the fast path re-issues the *same* write unchanged. The write
+is idempotent under its own precondition, so the retry lands only if the object
+is still untouched (recovering an in-doubt write that never landed) and is
+rejected by the precondition otherwise. Only an irreducible in-doubt — a
+precondition seen after a re-issue, where our earlier attempt may have committed
+— surfaces to the caller as `Error::InDoubt`. See
+[ADR-009](adr/009-in-doubt-conditional-writes.md).
+
 #### Retry with locks held
 
 When a transaction fails validation and must retry, it does so with its locks

@@ -29,6 +29,13 @@ const BACKGROUND_CONCURRENCY: usize = 3;
 const LOCK_LATENCY: Duration = Duration::from_millis(90);
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many times the single-RW fast path re-issues the *same* conditional
+/// write after an in-doubt (`Unavailable`) outcome before surfacing the
+/// uncertainty. The write is idempotent under its own precondition, so a retry
+/// either lands (nothing changed) or fails the precondition (a change already
+/// happened), which bounds the loop in practice; this is just the cap for a
+/// persistently-unavailable backend.
+const SINGLE_RW_INDOUBT_RETRIES: usize = 2;
 
 /// Converts a wall-clock instant to UnixNano, used to derive a transaction's
 /// wound-wait priority. The `SystemTime`->`u64` conversion lives here in `trans`
@@ -697,29 +704,14 @@ impl Algo {
                 }
                 return Err(e);
             }
-            let slocker = glassdb_storage::Locker::new(self.global.clone());
-            let update = glassdb_storage::LockUpdate {
-                typ: LockType::None,
-                writer: tx.id.clone(),
-                value: match &write.op {
-                    WriteOp::Put(value) => TValue {
-                        value: value.clone(),
-                        ..Default::default()
-                    },
-                    WriteOp::Delete => TValue {
-                        deleted: true,
-                        ..Default::default()
-                    },
-                },
-                ..Default::default()
-            };
-            match slocker
-                .update_lock(&read.path, &meta.version, &update)
+            match self
+                .write_single_rw(&read.path, &meta.version, &tx.id, &write)
                 .await
             {
                 Ok(()) => return Ok(()),
                 Err(StorageError::Precondition) => {
-                    // Raced: refresh metadata with a strong read and retry.
+                    // Raced (and not in-doubt): refresh metadata with a strong
+                    // read and retry.
                     meta = match self.global.get_metadata(&read.path).await {
                         Ok(m) => m,
                         Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
@@ -731,6 +723,9 @@ impl Algo {
                         }
                     };
                 }
+                // An `Unavailable` here is the genuine in-doubt outcome (a retry
+                // hit a precondition, so our earlier attempt may have committed)
+                // and surfaces to the caller as `Error::InDoubt`.
                 Err(e) => return Err(e.into()),
             }
         }
@@ -739,6 +734,76 @@ impl Algo {
         self.local
             .mark_value_outdated(&read.path, read_version.to_storage_version());
         Err(TransError::Retry)
+    }
+
+    /// Issues the single-RW fast-path conditional write, re-issuing the same
+    /// write on an in-doubt (`Unavailable`) outcome.
+    ///
+    /// The conditional write (`write_if`, via the storage locker) is idempotent
+    /// under its own precondition, so re-issuing it unchanged — same expected
+    /// version, same value — cannot double-apply: it either lands (the object
+    /// was still at `expected` because no writer changed it, so it is applied
+    /// exactly once) or fails the precondition because a change already
+    /// happened. Re-reads are not needed and actually harmful; the precondition
+    /// is what enforces "only when nothing changed".
+    ///
+    /// A precondition *after* we re-issued an in-doubt write is itself
+    /// in-doubt: our earlier attempt may have committed, and with no
+    /// transaction log that is indistinguishable from a genuine conflict, so it
+    /// is reported as `Unavailable`. A precondition on the very first attempt
+    /// is a clean conflict and is returned as `Precondition` for the caller to
+    /// retry.
+    async fn write_single_rw(
+        &self,
+        key: &str,
+        expected: &backend::Version,
+        id: &TxId,
+        write: &WriteAccess,
+    ) -> Result<(), StorageError> {
+        let slocker = glassdb_storage::Locker::new(self.global.clone());
+        let update = glassdb_storage::LockUpdate {
+            typ: LockType::None,
+            writer: id.clone(),
+            value: match &write.op {
+                WriteOp::Put(value) => TValue {
+                    value: value.clone(),
+                    ..Default::default()
+                },
+                WriteOp::Delete => TValue {
+                    deleted: true,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+
+        let mut in_doubt: Option<String> = None;
+        for _ in 0..=SINGLE_RW_INDOUBT_RETRIES {
+            match slocker.update_lock(key, expected, &update).await {
+                Ok(()) => return Ok(()),
+                Err(StorageError::Precondition) => {
+                    return match in_doubt {
+                        // A precondition after re-issuing an in-doubt write:
+                        // our earlier attempt may have committed.
+                        // Indistinguishable from a genuine conflict, so surface
+                        // the uncertainty.
+                        Some(reason) => Err(StorageError::Unavailable(reason)),
+                        // Clean conflict on a fresh attempt.
+                        None => Err(StorageError::Precondition),
+                    };
+                }
+                Err(StorageError::Unavailable(reason)) => {
+                    // The outcome is unknown. Re-issue the same conditional
+                    // write unchanged; it is idempotent under its precondition.
+                    in_doubt = Some(reason);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(StorageError::Unavailable(in_doubt.unwrap_or_else(|| {
+            "single read-write conditional write retries exhausted".into()
+        })))
     }
 
     async fn validate_readonly(

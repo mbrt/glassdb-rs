@@ -96,14 +96,29 @@ recover it on its own**:
    not retried by the locker. This recovery never escalates into a
    whole-transaction retry that would needlessly re-run the user's closure.
 
-5. **Only the single-RW fast path surfaces in-doubt to the caller.** The fast
-   path is logless: its value write is the commit point, and a lost ack
-   followed by a re-observed precondition is indistinguishable from a genuine
-   conflict from outside the writer. `Database::tx`'s loop only re-runs on
-   `retry`/`wounded`; an `Unavailable` from the fast-path CAS breaks out as
-   `Error::InDoubt`. The transaction may or may not have committed; the
-   caller decides whether to retry (with its own idempotency) or accept the
-   uncertainty.
+5. **The single-RW fast path first re-issues the idempotent CAS, then surfaces
+   only the irreducible in-doubt.** The fast path is logless: its value write is
+   the commit point. On an `Unavailable` outcome the engine re-issues the *same*
+   conditional write unchanged (same expected version, same value). That write
+   is idempotent under its own precondition — no re-read is needed, the
+   precondition is what enforces "only when nothing changed":
+   - it **lands** (`Ok`) only when the object is still at the expected version
+     (no writer changed it, so our earlier attempt did not land either): the
+     value is applied exactly once and the transaction commits. This recovers
+     the common in-doubt case where the write never landed (e.g. the backend
+     exhausted its retry budget on transient errors);
+   - it fails the **precondition** when a change already happened. A precondition
+     seen *after* an in-doubt attempt is itself in-doubt: our earlier attempt may
+     have committed, and with no transaction log that is indistinguishable from a
+     genuine conflict from outside the writer, so it is reported as `Unavailable`.
+
+   `Database::tx`'s loop only re-runs on `retry`/`wounded`; an `Unavailable` that
+   the fast path could not resolve breaks out as `Error::InDoubt`. The
+   transaction may or may not have committed; the caller decides whether to retry
+   (with its own idempotency) or accept the uncertainty. Re-issuing the CAS is
+   safe — it cannot double-apply — because a write that already landed changed the
+   object's version, so the precondition rejects the retry rather than applying it
+   a second time.
 
 This let us **keep the single-RW fast path**: it stays a logless CAS, and its one
 unsafe interleaving (lost ack + re-observed precondition) is reported as in-doubt
@@ -151,10 +166,13 @@ log, so GC does not widen the in-doubt window.
 
 - `crates/glassdb/tests/in_doubt.rs` — database/engine level. The `FaultBackend`
   middleware injects a lost ack on a landed conditional write and asserts: the
-  single-RW path surfaces `Unavailable` without double-applying; the logged
-  path recovers transparently (engine retries the log write and recognizes its
-  own landed log via `Precondition`); a *clean* conflict still retries
-  transparently on the fast path.
+  single-RW path surfaces `Unavailable` without double-applying (the re-issued
+  CAS hits a real precondition because the earlier attempt landed); an in-doubt
+  outcome on a write that did *not* land is recovered transparently by re-issuing
+  the idempotent CAS, committing exactly once; the logged path recovers
+  transparently (engine retries the log write and recognizes its own landed log
+  via `Precondition`); a *clean* conflict still retries transparently on the fast
+  path.
 - `crates/glassdb-backend/src/middleware/fault.rs` — the `FaultBackend` lost-ack
   path (`active_eventually_injects_faults`, `same_seed_same_fault_sequence`).
 - `crates/glassdb-backend-s3/src/tests.rs` — the in-process fake injects
