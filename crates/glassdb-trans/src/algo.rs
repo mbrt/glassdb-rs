@@ -14,7 +14,8 @@ use glassdb_backend::{self as backend, Metadata};
 use glassdb_concurr::{Background, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Global, Local, LockType, PathLock, TValue, TxLog, TxWrite, Version, tags_lock_info,
+    Global, Local, LockType, PathLock, StorageError, TValue, TxLog, TxWrite, Version,
+    tags_lock_info,
 };
 
 use crate::error::TransError;
@@ -28,6 +29,13 @@ const BACKGROUND_CONCURRENCY: usize = 3;
 const LOCK_LATENCY: Duration = Duration::from_millis(90);
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many times the single-RW fast path re-issues the *same* conditional
+/// write after an in-doubt (`Unavailable`) outcome before surfacing the
+/// uncertainty. The write is idempotent under its own precondition, so a retry
+/// either lands (nothing changed) or fails the precondition (a change already
+/// happened), which bounds the loop in practice; this is just the cap for a
+/// persistently-unavailable backend.
+const SINGLE_RW_INDOUBT_RETRIES: usize = 2;
 
 /// Converts a wall-clock instant to UnixNano, used to derive a transaction's
 /// wound-wait priority. The `SystemTime`->`u64` conversion lives here in `trans`
@@ -329,6 +337,14 @@ fn is_single_rw(data: &Data) -> bool {
         return false;
     }
     if data.reads[0].path != data.writes[0].path {
+        return false;
+    }
+    // A delete cannot take the logless fast path: it would issue a conditional
+    // delete while holding no lock, which the storage locker rejects (it only
+    // deletes as the unlock step of a write/create lock). Route deletes through
+    // the locked commit path, which handles them correctly (write-lock the key
+    // plus the collection lock for phantom prevention, then delete on unlock).
+    if data.writes[0].is_delete() {
         return false;
     }
     data.reads[0].version.is_some()
@@ -678,7 +694,7 @@ impl Algo {
 
         let mut meta = match self.reader.get_metadata(&read.path, MAX_STALE).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => return Err(TransError::NoSingleWrite),
+            Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
             Err(e) => {
                 return Err(TransError::Other(format!(
                     "getting metadata for {:?}: {e}",
@@ -690,38 +706,23 @@ impl Algo {
         // Try validating twice without retrying the whole transaction.
         for _ in 0..2 {
             if let Err(e) = self.check_read_version_unlocked(read_version, &meta) {
-                if e.is_retry() {
+                if matches!(e, TransError::Retry) {
                     self.local
                         .mark_value_outdated(&write.path, read_version.to_storage_version());
                 }
                 return Err(e);
             }
-            let slocker = glassdb_storage::Locker::new(self.global.clone());
-            let update = glassdb_storage::LockUpdate {
-                typ: LockType::None,
-                writer: tx.id.clone(),
-                value: match &write.op {
-                    WriteOp::Put(value) => TValue {
-                        value: value.clone(),
-                        ..Default::default()
-                    },
-                    WriteOp::Delete => TValue {
-                        deleted: true,
-                        ..Default::default()
-                    },
-                },
-                ..Default::default()
-            };
-            match slocker
-                .update_lock(&read.path, &meta.version, &update)
+            match self
+                .write_single_rw(&read.path, &meta.version, &tx.id, &write)
                 .await
             {
                 Ok(()) => return Ok(()),
-                Err(e) if e.is_precondition() => {
-                    // Raced: refresh metadata with a strong read and retry.
+                Err(StorageError::Precondition) => {
+                    // Raced (and not in-doubt): refresh metadata with a strong
+                    // read and retry.
                     meta = match self.global.get_metadata(&read.path).await {
                         Ok(m) => m,
-                        Err(e) if e.is_not_found() => return Err(TransError::NoSingleWrite),
+                        Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
                         Err(e) => {
                             return Err(TransError::Other(format!(
                                 "getting metadata for {:?}: {e}",
@@ -730,6 +731,9 @@ impl Algo {
                         }
                     };
                 }
+                // An `Unavailable` here is the genuine in-doubt outcome (a retry
+                // hit a precondition, so our earlier attempt may have committed)
+                // and surfaces to the caller as `Error::InDoubt`.
                 Err(e) => return Err(e.into()),
             }
         }
@@ -738,6 +742,76 @@ impl Algo {
         self.local
             .mark_value_outdated(&read.path, read_version.to_storage_version());
         Err(TransError::Retry)
+    }
+
+    /// Issues the single-RW fast-path conditional write, re-issuing the same
+    /// write on an in-doubt (`Unavailable`) outcome.
+    ///
+    /// The conditional write (`write_if`, via the storage locker) is idempotent
+    /// under its own precondition, so re-issuing it unchanged — same expected
+    /// version, same value — cannot double-apply: it either lands (the object
+    /// was still at `expected` because no writer changed it, so it is applied
+    /// exactly once) or fails the precondition because a change already
+    /// happened. Re-reads are not needed and actually harmful; the precondition
+    /// is what enforces "only when nothing changed".
+    ///
+    /// A precondition *after* we re-issued an in-doubt write is itself
+    /// in-doubt: our earlier attempt may have committed, and with no
+    /// transaction log that is indistinguishable from a genuine conflict, so it
+    /// is reported as `Unavailable`. A precondition on the very first attempt
+    /// is a clean conflict and is returned as `Precondition` for the caller to
+    /// retry.
+    async fn write_single_rw(
+        &self,
+        key: &str,
+        expected: &backend::Version,
+        id: &TxId,
+        write: &WriteAccess,
+    ) -> Result<(), StorageError> {
+        let slocker = glassdb_storage::Locker::new(self.global.clone());
+        let update = glassdb_storage::LockUpdate {
+            typ: LockType::None,
+            writer: id.clone(),
+            value: match &write.op {
+                WriteOp::Put(value) => TValue {
+                    value: value.clone(),
+                    ..Default::default()
+                },
+                WriteOp::Delete => TValue {
+                    deleted: true,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+
+        let mut in_doubt: Option<String> = None;
+        for _ in 0..=SINGLE_RW_INDOUBT_RETRIES {
+            match slocker.update_lock(key, expected, &update).await {
+                Ok(()) => return Ok(()),
+                Err(StorageError::Precondition) => {
+                    return match in_doubt {
+                        // A precondition after re-issuing an in-doubt write:
+                        // our earlier attempt may have committed.
+                        // Indistinguishable from a genuine conflict, so surface
+                        // the uncertainty.
+                        Some(reason) => Err(StorageError::Unavailable(reason)),
+                        // Clean conflict on a fresh attempt.
+                        None => Err(StorageError::Precondition),
+                    };
+                }
+                Err(StorageError::Unavailable(reason)) => {
+                    // The outcome is unknown. Re-issue the same conditional
+                    // write unchanged; it is idempotent under its precondition.
+                    in_doubt = Some(reason);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(StorageError::Unavailable(in_doubt.unwrap_or_else(|| {
+            "single read-write conditional write retries exhausted".into()
+        })))
     }
 
     async fn validate_readonly(
@@ -778,7 +852,7 @@ impl Algo {
     async fn validate_read(&self, item: &mut PathState) -> Result<(), TransError> {
         let meta = match self.global.get_metadata(&item.path).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => {
+            Err(StorageError::NotFound) => {
                 item.result = VResult::Retry;
                 return Ok(());
             }
@@ -895,7 +969,7 @@ impl Algo {
     async fn validate_read_not_found(&self, item: &mut PathState) -> Result<(), TransError> {
         let meta = match self.global.get_metadata(&item.path).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => {
+            Err(StorageError::NotFound) => {
                 item.result = VResult::Ok;
                 return Ok(());
             }
@@ -1158,7 +1232,7 @@ impl Algo {
         };
 
         if let Err(e) = lock_res {
-            if e.is_not_found() {
+            if matches!(e, TransError::Storage(StorageError::NotFound)) {
                 if item.has_read() {
                     item.result = VResult::Retry;
                     return Ok(());
@@ -1197,7 +1271,7 @@ impl Algo {
                     item.result = VResult::Ok;
                     Ok(())
                 }
-                Err(e) if e.is_precondition() => {
+                Err(TransError::Storage(StorageError::Precondition)) => {
                     item.result = VResult::Retry;
                     Ok(())
                 }
@@ -1205,7 +1279,7 @@ impl Algo {
             }
         } else if item.has_read() && !item.has_write() {
             match self.global.get_metadata(&item.path).await {
-                Err(e) if e.is_not_found() => {
+                Err(StorageError::NotFound) => {
                     item.result = VResult::Ok;
                     Ok(())
                 }
@@ -1213,7 +1287,7 @@ impl Algo {
                 Ok(_) => {
                     // The item exists now; lock read and validate.
                     match self.locker.lock_read(&item.path, &tx.id).await {
-                        Err(e) if e.is_not_found() => {
+                        Err(TransError::Storage(StorageError::NotFound)) => {
                             item.result = VResult::Ok;
                             Ok(())
                         }
@@ -1231,7 +1305,7 @@ impl Algo {
                     item.result = VResult::Ok;
                     Ok(())
                 }
-                Err(e) if e.is_precondition() => {
+                Err(TransError::Storage(StorageError::Precondition)) => {
                     // Found now; lock it in write instead.
                     self.locker.lock_write(&item.path, &tx.id).await?;
                     item.result = VResult::Ok;
@@ -1525,7 +1599,7 @@ mod tests {
         let reader = Reader::new(tctx.local.clone(), tctx.global.clone(), tctx.tmon.clone());
         match reader.read(path, MAX_STALENESS).await {
             Ok(rv) => ra_found(path, rv.version.writer),
-            Err(e) if e.is_not_found() => ra_not_found(path),
+            Err(StorageError::NotFound) => ra_not_found(path),
             Err(e) => panic!("reading {path}: {e:?}"),
         }
     }
@@ -1662,7 +1736,10 @@ mod tests {
             writes: vec![wa(&keyp, val)],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let gr = tctx.global.read(&keyp).await.unwrap();
         tm.reset(
@@ -1738,7 +1815,10 @@ mod tests {
             writes: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let r = do_read(&tctx, &keyp).await;
         tm.reset(
@@ -1810,7 +1890,10 @@ mod tests {
             writes: vec![wa(&keyp, b"v2")],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let ra = do_read(&tctx, &keyp).await;
         tm.reset(
@@ -1876,7 +1959,10 @@ mod tests {
             writes: Vec::new(),
         });
         let err = tm_victim.commit(&mut hv).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
         tm_victim.end(&mut hv).await.unwrap();
 
         // 6. The third client releases its lock; k is unlocked at v1@W1.
@@ -1964,7 +2050,10 @@ mod tests {
             writes: vec![wa(&keys[0], b"1"), wa(&keys[1], b"1")],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let reads = do_reads(&tctx, &[&keys[1], &keys[2]]).await;
         commit_writes(&tm2, vec![wa(&keys[2], b"y")]).await;
@@ -1977,7 +2066,10 @@ mod tests {
             },
         );
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         tm.end(&mut h).await.unwrap();
 
@@ -2014,7 +2106,10 @@ mod tests {
             let writes: Vec<WriteAccess> = keys.iter().map(|k| wa(k, b"1")).collect();
             let mut h = tm.begin(Data { reads, writes });
             let err = tm.commit(&mut h).await.unwrap_err();
-            assert!(err.is_retry(), "[{num_writes}] expected retry, got {err:?}");
+            assert!(
+                matches!(err, TransError::Retry),
+                "[{num_writes}] expected retry, got {err:?}"
+            );
 
             tm.end(&mut h).await.unwrap();
 
@@ -2050,7 +2145,10 @@ mod tests {
             writes: vec![wa(&keyp, b"tmpw")],
         });
         let err = tm.commit(&mut h1).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let info = lock_info(&tctx, &keyp).await;
         assert_eq!(info.typ, LockType::Write);
@@ -2062,7 +2160,10 @@ mod tests {
             writes: Vec::new(),
         });
         let err = tm.commit(&mut h2).await.unwrap_err();
-        assert!(err.is_retry(), "expected retry, got {err:?}");
+        assert!(
+            matches!(err, TransError::Retry),
+            "expected retry, got {err:?}"
+        );
 
         let ra2 = do_read(&tctx, &keyp).await;
         assert_eq!(ra2.version.as_ref().unwrap().last_writer, *wh.id());
@@ -2190,7 +2291,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(180)).await;
 
         let err = tctx.tlogger.get(&tid).await.unwrap_err();
-        assert!(err.is_not_found(), "expected log deleted, got {err:?}");
+        assert!(
+            matches!(err, StorageError::NotFound),
+            "expected log deleted, got {err:?}"
+        );
 
         drop(bg);
     }

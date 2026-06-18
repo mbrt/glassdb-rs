@@ -50,12 +50,8 @@ impl Global {
                 let mut reply = backend::ReadReply::default();
                 match self.backend.read_if_modified(key, &writer).await {
                     Ok(r) => reply = r,
-                    Err(err) => {
-                        if !err.is_precondition() {
-                            return Err(StorageError::Backend(err));
-                        }
-                        modified = false;
-                    }
+                    Err(backend::BackendError::Precondition) => modified = false,
+                    Err(err) => return Err(err.into()),
                 }
                 if modified {
                     let meta = Arc::new(Metadata {

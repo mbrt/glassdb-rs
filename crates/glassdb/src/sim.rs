@@ -162,7 +162,7 @@ fn key_name(k: usize) -> Vec<u8> {
 async fn read_int_from_tx(tx: &crate::Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
-        Err(e) if e.is_not_found() => Ok(0),
+        Err(Error::NotFound) => Ok(0),
         Err(e) => Err(e),
     }
 }

@@ -65,7 +65,7 @@ fn read_int(b: &[u8]) -> i64 {
 async fn read_int_or_zero(tx: &Transaction, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
     match tx.read(coll, key).await {
         Ok(v) => Ok(read_int(&v)),
-        Err(e) if e.is_not_found() => Ok(0),
+        Err(Error::NotFound) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -122,7 +122,7 @@ async fn multi_rmw(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
         for (k, rv) in keys.iter().zip(vals) {
             let val = match rv {
                 Ok(v) => read_int(&v),
-                Err(e) if e.is_not_found() => 0,
+                Err(Error::NotFound) => 0,
                 Err(e) => return Err(e),
             };
             tx.write(coll, k, &write_int(val + 1))?;

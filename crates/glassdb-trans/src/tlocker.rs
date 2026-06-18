@@ -188,7 +188,7 @@ impl LockerCore {
     async fn fetch_lock_info(&self, key: &str) -> Result<LockData, StorageError> {
         let meta = match self.reader().get_metadata(key, META_MAX_STALENESS).await {
             Ok(m) => m,
-            Err(e) if e.is_not_found() => {
+            Err(StorageError::NotFound) => {
                 return Ok(LockData {
                     info: LockInfo {
                         typ: LockType::None,
@@ -274,8 +274,9 @@ impl Worker<LockReq, StorageError> for LockerWorker {
                     //     surfacing the uncertainty — only the commit point
                     //     must surface in-doubt (ADR-009), where a blind retry
                     //     could double-apply a durable write.
-                    let stale = e.is_precondition() && req.typ != LockType::Create;
-                    if stale || e.is_unavailable() {
+                    let stale =
+                        matches!(e, StorageError::Precondition) && req.typ != LockType::Create;
+                    if stale || matches!(e, StorageError::Unavailable(_)) {
                         let _ = self.core.global.get_metadata(key).await;
                         continue;
                     }
@@ -594,16 +595,12 @@ impl Locker {
         let (err, lock_updated, final_lt): (Result<(), TransError>, bool, LockType) = match res {
             Ok(()) => (Ok(()), true, lt),
             Err(DedupError::Work(e)) => {
-                if e.is_precondition() {
-                    (Err(TransError::Storage((*e).clone())), false, lt)
+                if matches!(*e, StorageError::Precondition) {
+                    (Err((*e).clone().into()), false, lt)
                 } else {
                     // On any other error (incl. timeout) we don't know the
                     // outcome. Be conservative and mark the lock unknown.
-                    (
-                        Err(TransError::Storage((*e).clone())),
-                        true,
-                        LockType::Unknown,
-                    )
+                    (Err((*e).clone().into()), true, LockType::Unknown)
                 }
             }
             Err(DedupError::Cancelled) => (
@@ -742,7 +739,7 @@ mod tests {
 
             locker.unlock(&key, &tx).await.unwrap();
             let err = tctx.global.get_metadata(&key).await.unwrap_err();
-            assert!(err.is_not_found());
+            assert!(matches!(err, StorageError::NotFound));
         }
 
         // Lock, commit, unlock writes the value.
@@ -775,7 +772,10 @@ mod tests {
             .unwrap();
 
         let err = locker.lock_create(&key, &tx).await.unwrap_err();
-        assert!(err.is_precondition(), "expected precondition, got {err:?}");
+        assert!(
+            matches!(err, TransError::Storage(StorageError::Precondition)),
+            "expected precondition, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -869,7 +869,10 @@ mod tests {
         let txr = TxId::from_bytes(b"txr".to_vec());
         tctx.monitor.begin_tx(&txr);
         let err = locker.lock_read(&key, &txr).await.unwrap_err();
-        assert!(err.is_not_found(), "expected not-found, got {err:?}");
+        assert!(
+            matches!(err, TransError::Storage(StorageError::NotFound)),
+            "expected not-found, got {err:?}"
+        );
     }
 
     #[tokio::test]

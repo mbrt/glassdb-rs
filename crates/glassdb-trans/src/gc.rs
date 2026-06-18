@@ -93,7 +93,7 @@ impl Gc {
 mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_storage::{Global, Local, TxCommitStatus, TxLog};
+    use glassdb_storage::{Global, Local, StorageError, TxCommitStatus, TxLog};
 
     #[tokio::test(start_paused = true)]
     async fn gc_deletes_scheduled_log() {
@@ -116,6 +116,9 @@ mod tests {
         // Wait for several cleanup intervals; the log should be deleted.
         tokio::time::sleep(CLEANUP_INTERVAL * 3).await;
         let err = tl.get(&tid).await.unwrap_err();
-        assert!(err.is_not_found(), "expected not-found, got {err:?}");
+        assert!(
+            matches!(err, StorageError::NotFound),
+            "expected not-found, got {err:?}"
+        );
     }
 }

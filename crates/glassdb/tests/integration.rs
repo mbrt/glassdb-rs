@@ -31,7 +31,7 @@ async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<
     match tx.read(c, k).await {
         Ok(v) => Ok(read_int(&v)),
         // Treat a missing value as zero (i.e. initialize it).
-        Err(e) if e.is_not_found() => Ok(0),
+        Err(Error::NotFound) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -79,12 +79,51 @@ async fn delete() {
     coll.delete(key).await.unwrap();
 
     let err = coll.read(key).await.unwrap_err();
-    assert!(err.is_not_found(), "expected not-found, got {err:?}");
+    assert!(
+        matches!(err, Error::NotFound),
+        "expected not-found, got {err:?}"
+    );
 
     let stats = db.stats();
     assert_eq!(stats.tx_n, 3);
     assert_eq!(stats.tx_writes, 2);
     assert!(stats.tx_retries <= 1);
+}
+
+/// Regression: reading a found key and deleting that same key in one
+/// transaction must commit. Such a transaction is shaped like a single
+/// read-write, but the logless fast path cannot perform a delete (it would
+/// issue a conditional delete while holding no lock, which the storage locker
+/// rejects). Deletes must therefore route through the locked commit path. This
+/// failed with an internal error before deletes were excluded from the fast
+/// path.
+#[tokio::test(start_paused = true)]
+async fn read_then_delete_single_tx() {
+    let db = init_db(mem()).await;
+    let key = b"key1";
+    let val = b"value1";
+
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+    coll.write(key, val).await.unwrap();
+
+    // Read the existing value, then delete the same key, in one transaction.
+    let coll = &coll;
+    let prev = db
+        .tx(|tx| async move {
+            let v = tx.read(coll, key).await?;
+            tx.delete(coll, key)?;
+            Ok(v)
+        })
+        .await
+        .expect("a single read-then-delete transaction must commit");
+    assert_eq!(prev, val);
+
+    let err = coll.read(key).await.unwrap_err();
+    assert!(
+        matches!(err, Error::NotFound),
+        "expected not-found after delete, got {err:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -139,7 +178,7 @@ async fn read_deleted_from_another() {
             let k1 = tx.read(db1coll, key1).await?;
             let found = match tx.read(db1coll, key2).await {
                 Ok(_) => true,
-                Err(e) if e.is_not_found() => false,
+                Err(Error::NotFound) => false,
                 Err(e) => return Err(e),
             };
             Ok((k1, found))

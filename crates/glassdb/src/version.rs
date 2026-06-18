@@ -16,12 +16,12 @@ const DB_VERSION_TAG: &str = "version";
 pub(crate) async fn check_or_create_db_meta(b: &Arc<dyn Backend>, name: &str) -> Result<(), Error> {
     match check_db_version(b, name).await {
         Ok(()) => return Ok(()),
-        Err(e) if !e.is_not_found() => return Err(e),
-        Err(_) => {}
+        Err(Error::NotFound) => {}
+        Err(e) => return Err(e),
     }
     match set_db_metadata(b, name).await {
         Ok(()) => Ok(()),
-        Err(e) if e.is_precondition() => {
+        Err(Error::Precondition) => {
             // We raced against another instance; re-check the metadata.
             check_db_version(b, name).await
         }

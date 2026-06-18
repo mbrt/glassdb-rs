@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime};
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
-use glassdb_storage::{Local, MAX_STALENESS, TLogger, TValue, TxCommitStatus, TxLog, Version};
+use glassdb_storage::{
+    Local, MAX_STALENESS, StorageError, TLogger, TValue, TxCommitStatus, TxLog, Version,
+};
 use tokio::sync::oneshot;
 
 use crate::error::TransError;
@@ -477,7 +479,7 @@ impl Monitor {
             };
             match r {
                 Ok(_) => return Ok(TxCommitStatus::Aborted),
-                Err(e) if e.is_precondition() => {
+                Err(StorageError::Precondition) => {
                     // The version moved under us (a commit, a pending-log
                     // refresh, or another wounder). Report whatever status is
                     // now durable.
@@ -494,7 +496,7 @@ impl Monitor {
                 // decide: a final status resolves it (our own landed abort, a
                 // peer's, or a commit that won the race); a still-pending
                 // status means retry the CAS over the refreshed version.
-                Err(e) if e.is_unavailable() => {
+                Err(StorageError::Unavailable(_)) => {
                     let st = self.inner.tl.commit_status(tid).await?;
                     if st.status.is_final() {
                         return Ok(st.status);
@@ -571,7 +573,7 @@ impl Monitor {
             };
             match r {
                 Ok(_) => return Ok(()),
-                Err(e) if e.is_precondition() => {
+                Err(StorageError::Precondition) => {
                     // The version moved under us. Possible races: our own
                     // `refresh_pending` advancing the pending log, a wound
                     // from another client writing `aborted`, or our own
@@ -603,7 +605,7 @@ impl Monitor {
                 // that converges on our intent (us or a wound to `aborted`),
                 // and the precondition branch above resolves the matching /
                 // mismatched final outcomes correctly.
-                Err(e) if e.is_unavailable() => {}
+                Err(StorageError::Unavailable(_)) => {}
                 Err(e) => return Err(e.into()),
             }
             rt::sleep(backoff.next_delay()).await;

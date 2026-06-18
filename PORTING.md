@@ -19,8 +19,8 @@ standalone Rust port.
 
 ## Workspace structure
 
-The port is a Cargo workspace of nine internal crates (`publish = false`) that
-mirror Go's `internal/` and `backend/` package boundaries:
+The port is a Cargo workspace of nine crates that mirror Go's `internal/` and
+`backend/` package boundaries:
 
 ```
 glassdb-data → glassdb-backend → glassdb-storage → glassdb-trans → glassdb
@@ -28,6 +28,18 @@ glassdb-proto ─┘                  ↑                      ↑
 glassdb-concurr ──────────────────┴──────────────────────┘
 glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 ```
+
+| Crate | Responsibility |
+| --- | --- |
+| `glassdb-data` | `TxId`, `TxIdSet`, and order-preserving path encoding. |
+| `glassdb-proto` | `prost`-generated transaction-log protobuf messages. |
+| `glassdb-concurr` | Concurrency utilities: `Background`, `Retry`, `Dedup`. |
+| `glassdb-backend` | The `Backend` async trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger). |
+| `glassdb-backend-s3` | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature. |
+| `glassdb-backend-gcs` | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature. |
+| `glassdb-storage` | Byte-weighted LRU cache, value versioning, local/global caching, locker, and transaction logger. |
+| `glassdb-trans` | The transaction engine: monitor, reader, GC, distributed locker, and commit algorithm. |
+| `glassdb` | The public API: `Database`, `Collection`, `Transaction`, iterators, and `Stats`. |
 
 Rationale:
 
@@ -145,19 +157,27 @@ lock waits, GC delays — be driven deterministically under
 
 Go drives control flow with `errors.Is(err, ErrRetry / ErrNotFound /
 ErrPrecondition / …)`. Rust replaces these with typed `thiserror` enums, one per
-layer, and preserves the exact matching semantics via `is_*` predicates:
+layer, matched directly (`matches!(e, BackendError::NotFound)` rather than Go's
+`is_*` predicate helpers):
 
-- `BackendError`: `NotFound`, `Precondition`, `Other`. (Go's `ctx.Err()` has no
-  equivalent: a dropped future is the cancel; backends never observe a context.)
-- `StorageError`: wraps `BackendError`, plus `KeyNotFound`; `is_not_found` /
-  `is_precondition` delegate to the backend.
+- `BackendError`: `NotFound`, `Precondition`, `Unavailable` (in-doubt outcome,
+  see ADR-009), `Other`. (Go's `ctx.Err()` has no equivalent: a dropped future is
+  the cancel; backends never observe a context.)
+- `StorageError`: the cross-cutting storage outcomes as flat variants —
+  `NotFound`, `Precondition`, `Unavailable`, plus `KeyNotFound` (a tx-log miss,
+  distinct from a backend object miss) and `Other`. `From<BackendError>`
+  normalizes the backend variants here so callers match `StorageError::NotFound`
+  directly instead of unwrapping a nested backend error.
 - `TransError`: the engine's control-flow errors — `Retry` (Go `ErrRetry`),
   `AlreadyFinalized`, `Wounded` (Go `ErrWounded`; a wound-wait abort, consumed by
   the database retry loop which restarts the victim with a renewed ID), and the
   **internal** `ValidateRetry` (Go `errValidateRetry`) and
-  `LockTimeout` / `NoSingleWrite`. There is no `Cancelled` variant.
+  `LockTimeout` / `NoSingleWrite`. Storage/backend failures stay wrapped in
+  `Storage(StorageError)`; the few call sites that need a specific storage
+  outcome match through it (e.g. `TransError::Storage(StorageError::NotFound)`).
+  There is no `Cancelled` variant.
 - `glassdb::Error`: the public surface — `NotFound`, `Aborted`, `Precondition`,
-  `AlreadyFinalized`, `Other`.
+  `AlreadyFinalized`, `InDoubt`, `ShuttingDown`, `InvalidInput`, `Internal`.
 
 Each layer converts into the next with `From`, mapping sentinels losslessly.
 Care was taken that **internal** control-flow errors never leak: e.g.

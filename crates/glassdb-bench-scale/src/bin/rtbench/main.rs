@@ -534,7 +534,7 @@ fn independent_single_rmw(
                             db.tx(|tx| async move {
                                 let v = match tx.read(coll, b"key").await {
                                     Ok(v) => v,
-                                    Err(e) if e.is_not_found() => Vec::new(),
+                                    Err(GError::NotFound) => Vec::new(),
                                     Err(e) => return Err(e),
                                 };
                                 tx.write(coll, b"key", &v)
@@ -585,7 +585,7 @@ fn independent_multi_rmw(
                                 for (k, rv) in keys.iter().zip(vals) {
                                     let v = match rv {
                                         Ok(v) => v,
-                                        Err(e) if e.is_not_found() => Vec::new(),
+                                        Err(GError::NotFound) => Vec::new(),
                                         Err(e) => return Err(e),
                                     };
                                     tx.write(coll, k, &v)?;

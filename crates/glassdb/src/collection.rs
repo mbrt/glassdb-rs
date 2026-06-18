@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use glassdb_backend::Tags;
 use glassdb_data::paths;
+use glassdb_storage::StorageError;
 use glassdb_trans::Reader;
 
 use crate::db::DbInner;
@@ -37,7 +38,7 @@ impl Collection {
                 match tx.read(self, key).await {
                     Ok(v) => Ok(Some(v)),
                     // We must still validate the transaction even when not found.
-                    Err(e) if e.is_not_found() => Ok(None),
+                    Err(Error::NotFound) => Ok(None),
                     Err(e) => Err(e),
                 }
             })
@@ -104,8 +105,8 @@ impl Collection {
         let p = paths::collection_info(&self.prefix);
         match self.db.global.get_metadata(&p).await {
             Ok(_) => return Ok(()),
-            Err(e) if !e.is_not_found() => return Err(e.into()),
-            Err(_) => {}
+            Err(StorageError::NotFound) => {}
+            Err(e) => return Err(e.into()),
         }
         match self
             .db
@@ -115,7 +116,7 @@ impl Collection {
         {
             Ok(_) => Ok(()),
             // Created concurrently; assume it's there.
-            Err(e) if e.is_precondition() => Ok(()),
+            Err(StorageError::Precondition) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

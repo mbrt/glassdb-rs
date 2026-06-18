@@ -39,6 +39,10 @@ enum Action {
     /// Return a clean `Precondition` without applying the op: a genuine conflict
     /// that never landed.
     Precondition,
+    /// Return `Unavailable` *without* applying the op: an in-doubt outcome for a
+    /// write that never landed (e.g. the backend exhausted its retry budget on
+    /// transient errors).
+    Unavailable,
 }
 
 /// Decides, for a conditional write, whether (and how) to fault it. Receives the
@@ -120,6 +124,7 @@ impl Backend for FaultBackend {
     ) -> Result<Metadata, BackendError> {
         match self.intercept("set_tags_if", path, &tags) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
+            Some(Action::Unavailable) => Err(not_applied("set_tags_if")),
             Some(Action::LostAck) => match self.inner.set_tags_if(path, expected, tags).await {
                 Ok(_) => Err(lost_ack("set_tags_if")),
                 Err(e) => Err(e),
@@ -147,6 +152,7 @@ impl Backend for FaultBackend {
     ) -> Result<Metadata, BackendError> {
         match self.intercept("write_if", path, &tags) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
+            Some(Action::Unavailable) => Err(not_applied("write_if")),
             Some(Action::LostAck) => match self.inner.write_if(path, value, expected, tags).await {
                 Ok(_) => Err(lost_ack("write_if")),
                 Err(e) => Err(e),
@@ -163,6 +169,7 @@ impl Backend for FaultBackend {
     ) -> Result<Metadata, BackendError> {
         match self.intercept("write_if_not_exists", path, &tags) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
+            Some(Action::Unavailable) => Err(not_applied("write_if_not_exists")),
             Some(Action::LostAck) => {
                 match self.inner.write_if_not_exists(path, value, tags).await {
                     Ok(_) => Err(lost_ack("write_if_not_exists")),
@@ -180,6 +187,7 @@ impl Backend for FaultBackend {
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         match self.intercept("delete_if", path, &Tags::new()) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
+            Some(Action::Unavailable) => Err(not_applied("delete_if")),
             Some(Action::LostAck) => match self.inner.delete_if(path, expected).await {
                 Ok(()) => Err(lost_ack("delete_if")),
                 Err(e) => Err(e),
@@ -195,6 +203,10 @@ impl Backend for FaultBackend {
 
 fn lost_ack(op: &str) -> BackendError {
     BackendError::Unavailable(format!("injected lost ack on a landed {op}"))
+}
+
+fn not_applied(op: &str) -> BackendError {
+    BackendError::Unavailable(format!("injected in-doubt without applying {op}"))
 }
 
 fn write_int(n: i64) -> Vec<u8> {
@@ -218,7 +230,7 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
     db.tx(|tx| async move {
         let cur = match tx.read(coll, key).await {
             Ok(v) => read_int(&v),
-            Err(e) if e.is_not_found() => 0,
+            Err(Error::NotFound) => 0,
             Err(e) => return Err(e),
         };
         tx.write(coll, key, &write_int(cur + 1))
@@ -255,7 +267,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 
     let res = increment(&db, &coll, b"k").await;
     assert!(
-        matches!(res, Err(ref e) if e.is_unavailable()),
+        matches!(res, Err(Error::InDoubt(_))),
         "expected an in-doubt error, got {res:?}"
     );
 
@@ -266,6 +278,45 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
         got, 11,
         "value must be applied at most once (no double-apply)"
     );
+}
+
+/// The single-RW fast path: an in-doubt outcome on a conditional write that did
+/// *not* land (e.g. the backend exhausted its retry budget on transient errors)
+/// must be recovered transparently. The conditional write is idempotent under
+/// its own precondition, so the engine re-issues the *same* write unchanged: the
+/// object is still untouched, so the retry lands and commits exactly once — no
+/// `Error::InDoubt` is surfaced, and no double-apply happens.
+#[tokio::test(start_paused = true)]
+async fn single_rw_in_doubt_not_landed_retries_and_commits() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = FaultBackend::new(mem);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"c");
+    coll.create().await.unwrap();
+
+    // Seed the key so the read finds a value and the commit takes the single-RW
+    // fast path (which requires a found read version).
+    seed(&coll, b"k", 10).await;
+
+    // Trap the fast path's value write (a `write_if` on a key path `/_k/`):
+    // report it as in-doubt *without* applying it, modelling a write that never
+    // landed. The trap is one-shot, so the engine's idempotent re-issue lands.
+    backend.arm(Box::new(|kind, path, _tags| {
+        if kind == "write_if" && path.contains("/_k/") {
+            Some(Action::Unavailable)
+        } else {
+            None
+        }
+    }));
+
+    increment(&db, &coll, b"k")
+        .await
+        .expect("an in-doubt write that did not land must be retried, not surfaced");
+
+    // The retry landed exactly once: 11, never 12 (double-apply) and never
+    // unchanged (lost write).
+    let got = read_int(&coll.read(b"k").await.unwrap());
+    assert_eq!(got, 11, "the increment must be applied exactly once");
 }
 
 /// The logged (multi-write) path: when the *committed* transaction-log write —
