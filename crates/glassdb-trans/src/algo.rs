@@ -339,6 +339,14 @@ fn is_single_rw(data: &Data) -> bool {
     if data.reads[0].path != data.writes[0].path {
         return false;
     }
+    // A delete cannot take the logless fast path: it would issue a conditional
+    // delete while holding no lock, which the storage locker rejects (it only
+    // deletes as the unlock step of a write/create lock). Route deletes through
+    // the locked commit path, which handles them correctly (write-lock the key
+    // plus the collection lock for phantom prevention, then delete on unlock).
+    if data.writes[0].is_delete() {
+        return false;
+    }
     data.reads[0].version.is_some()
 }
 

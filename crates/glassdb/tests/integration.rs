@@ -90,6 +90,42 @@ async fn delete() {
     assert!(stats.tx_retries <= 1);
 }
 
+/// Regression: reading a found key and deleting that same key in one
+/// transaction must commit. Such a transaction is shaped like a single
+/// read-write, but the logless fast path cannot perform a delete (it would
+/// issue a conditional delete while holding no lock, which the storage locker
+/// rejects). Deletes must therefore route through the locked commit path. This
+/// failed with an internal error before deletes were excluded from the fast
+/// path.
+#[tokio::test(start_paused = true)]
+async fn read_then_delete_single_tx() {
+    let db = init_db(mem()).await;
+    let key = b"key1";
+    let val = b"value1";
+
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+    coll.write(key, val).await.unwrap();
+
+    // Read the existing value, then delete the same key, in one transaction.
+    let coll = &coll;
+    let prev = db
+        .tx(|tx| async move {
+            let v = tx.read(coll, key).await?;
+            tx.delete(coll, key)?;
+            Ok(v)
+        })
+        .await
+        .expect("a single read-then-delete transaction must commit");
+    assert_eq!(prev, val);
+
+    let err = coll.read(key).await.unwrap_err();
+    assert!(
+        matches!(err, Error::NotFound),
+        "expected not-found after delete, got {err:?}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn read_from_another() {
     let b = mem();
