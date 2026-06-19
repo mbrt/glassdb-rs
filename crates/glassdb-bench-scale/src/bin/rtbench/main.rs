@@ -20,6 +20,7 @@
 
 mod clientmetrics;
 mod cpu;
+mod slowdns;
 
 // musl's default allocator serializes multi-threaded allocation on a coarse
 // lock, which collapses into a futex/`sys`-CPU storm under the benchmark's
@@ -32,6 +33,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -131,6 +133,20 @@ struct Args {
     /// idle connections after 1ms to exaggerate connection churn.
     #[arg(long, default_value = "tuned", value_parser = ["default", "tuned", "churn"])]
     http_pool: String,
+    /// For the `fakes3` backend only: inject this much `getaddrinfo` latency on
+    /// tokio's blocking pool for every connection (`0s` = off). This reproduces
+    /// the real-S3 blocking-pool storm locally — plain loopback resolves IP
+    /// literals instantly, so the pool never fills. Pair with a high `--db-list`
+    /// to cross the knee where concurrent resolutions exceed the 512-thread
+    /// blocking pool and throughput collapses.
+    #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
+    dns_latency: Duration,
+    /// For the `fakes3` backend with `--dns-latency` only: cache the resolved
+    /// address after the first lookup instead of re-resolving per connection.
+    /// This models the production `CachingDnsResolver` fix, so the blocking-pool
+    /// storm and throughput collapse should disappear.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    dns_cache: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -247,7 +263,24 @@ async fn init_fakes3(args: &Args) -> Result<BackendSetup, Box<dyn Error>> {
     let mut conf = fake
         .client_config()
         .interceptor(HttpCounter::new(metrics.clone()));
-    if let Some(hc) = fakes3_http_client(&args.http_pool) {
+    if args.dns_latency > Duration::ZERO {
+        // Point the SDK at a *hostname* (not the IP literal the fake reports) so
+        // hyper actually invokes the DNS resolver, then resolve it through a
+        // blocking-pool sleep. This is the one path that reproduces the real-S3
+        // storm locally; see slowdns.rs.
+        let addr: SocketAddr = fake
+            .url()
+            .trim_start_matches("http://")
+            .parse()
+            .map_err(|e| format!("parse fake-s3 address: {e}"))?;
+        conf = conf
+            .endpoint_url(format!("http://fakehost.invalid:{}", addr.port()))
+            .http_client(slowdns::sleepy_dns_http_client(
+                args.dns_latency,
+                addr,
+                args.dns_cache,
+            ));
+    } else if let Some(hc) = fakes3_http_client(&args.http_pool) {
         conf = conf.http_client(hc);
     }
     let client = aws_sdk_s3::Client::from_conf(conf.build());
