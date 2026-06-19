@@ -1452,12 +1452,10 @@ dependencies = [
  "glassdb",
  "glassdb-backend",
  "glassdb-concurr",
- "hyper-util",
  "libc",
  "mimalloc",
  "rand 0.10.1",
  "tokio",
- "tower-service",
 ]
 
 [[package]]
