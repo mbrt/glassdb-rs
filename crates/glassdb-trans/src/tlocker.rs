@@ -214,8 +214,8 @@ impl LockerCore {
     ) -> Result<Vec<TxPathState>, StorageError> {
         if info.typ == LockType::Create || info.typ == LockType::Write {
             let tx = info.locked_by[0].clone();
-            let tv = self.tmon.committed_value(key, &tx).await.map_err(|_| {
-                StorageError::Other(format!("getting committed value from tx {tx}"))
+            let tv = self.tmon.committed_value(key, &tx).await.map_err(|e| {
+                trans_to_storage(e).context(format!("getting committed value from tx {tx}"))
             })?;
             return Ok(vec![TxPathState {
                 tx,
@@ -227,11 +227,10 @@ impl LockerCore {
         // For read locks, the tx status is enough; avoid fetching values.
         let mut txs = Vec::new();
         for tx in &info.locked_by {
-            let status = self
-                .tmon
-                .tx_status(tx)
-                .await
-                .map_err(|_| StorageError::Other(format!("getting tx status for {tx}")))?;
+            let status =
+                self.tmon.tx_status(tx).await.map_err(|e| {
+                    trans_to_storage(e).context(format!("getting tx status for {tx}"))
+                })?;
             txs.push(TxPathState {
                 tx: tx.clone(),
                 status,
@@ -389,7 +388,7 @@ impl Drop for PushGuard {
 fn trans_to_storage(e: TransError) -> StorageError {
     match e {
         TransError::Storage(s) => s,
-        other => StorageError::Other(other.to_string()),
+        other => StorageError::other(other.to_string()),
     }
 }
 
@@ -604,7 +603,7 @@ impl Locker {
                 }
             }
             Err(DedupError::Cancelled) => (
-                Err(TransError::Other("dedup shutdown".into())),
+                Err(TransError::other("dedup shutdown")),
                 true,
                 LockType::Unknown,
             ),

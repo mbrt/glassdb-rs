@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use glassdb_backend::{
-    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
+    Backend, BackendError, Cause, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
     encode_writer_tag,
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -65,13 +65,13 @@ impl TokenProvider for AdcTokenProvider {
             .get_or_try_init(|| async {
                 gcp_auth::provider()
                     .await
-                    .map_err(|e| BackendError::Other(format!("gcs auth provider: {e}")))
+                    .map_err(|e| BackendError::with_source("gcs auth provider", e))
             })
             .await?;
         let token = provider
             .token(&[GCS_SCOPE])
             .await
-            .map_err(|e| BackendError::Other(format!("gcs auth token: {e}")))?;
+            .map_err(|e| BackendError::with_source("gcs auth token", e))?;
         Ok(token.as_str().to_string())
     }
 }
@@ -155,7 +155,7 @@ impl GcsBackend {
         let rb = self.authorize(rb).await?;
         rb.send()
             .await
-            .map_err(|e| BackendError::Other(format!("gcs request: {e}")))
+            .map_err(|e| BackendError::with_source("gcs request", e))
     }
 
     /// Sends a *conditional* request and maps its outcome with the in-doubt
@@ -170,7 +170,7 @@ impl GcsBackend {
     async fn send_conditional(
         &self,
         rb: RequestBuilder,
-        op: &str,
+        op: &'static str,
         path: &str,
     ) -> Result<reqwest::Response, BackendError> {
         let rb = self.authorize(rb).await?;
@@ -225,7 +225,7 @@ impl GcsBackend {
             let contents = resp
                 .bytes()
                 .await
-                .map_err(|e| BackendError::Other(format!("Read({path}): reading body: {e}")))?
+                .map_err(|e| BackendError::with_source(format!("Read({path}): reading body"), e))?
                 .to_vec();
             return Ok(ReadReply {
                 contents,
@@ -233,7 +233,7 @@ impl GcsBackend {
                 tags: attrs.tags(),
             });
         }
-        Err(BackendError::Other(format!(
+        Err(BackendError::other(format!(
             "Read({path}): too many concurrent writes during read"
         )))
     }
@@ -497,18 +497,48 @@ fn parse_token(v: &Version) -> Result<(String, String), BackendError> {
     }
 }
 
+/// A structured diagnostic for a GCS request that returned an unsuccessful HTTP
+/// status without mapping to a dedicated [`BackendError`] classification.
+#[derive(Debug, thiserror::Error)]
+#[error("{op}({path}): gcs status {status}")]
+struct GcsStatusError {
+    op: &'static str,
+    path: String,
+    status: u16,
+}
+
+impl GcsStatusError {
+    fn new(op: &'static str, path: &str, status: StatusCode) -> Self {
+        GcsStatusError {
+            op,
+            path: path.to_string(),
+            status: status.as_u16(),
+        }
+    }
+
+    /// Flattens the structured status error into the shared catch-all, keeping
+    /// the typed error inspectable via [`std::error::Error::source`].
+    fn into_backend_error(self) -> BackendError {
+        // An inherent method rather than a `From` impl on purpose: adding
+        // another `From<_> for BackendError` would make `?`/`Ok(())` inference
+        // ambiguous at call sites that rely on `BackendError` being the only
+        // inferable error type.
+        BackendError::Other {
+            msg: self.to_string(),
+            source: Some(Cause::new(self)),
+        }
+    }
+}
+
 /// Maps a GCS HTTP status onto a [`BackendError`].
-fn check_status(status: StatusCode, op: &str, path: &str) -> Result<(), BackendError> {
+fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), BackendError> {
     if status.is_success() {
         return Ok(());
     }
     match status {
         StatusCode::NOT_FOUND => Err(BackendError::NotFound),
         StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => Err(BackendError::Precondition),
-        s => Err(BackendError::Other(format!(
-            "{op}({path}): gcs status {}",
-            s.as_u16()
-        ))),
+        s => Err(GcsStatusError::new(op, path, s).into_backend_error()),
     }
 }
 
@@ -516,7 +546,7 @@ fn check_status(status: StatusCode, op: &str, path: &str) -> Result<(), BackendE
 /// `409` is a genuine precondition (the atomic write did not take effect); a
 /// `5xx` leaves the write in doubt, since GCS may have applied it before
 /// failing, so it is reported as `Unavailable`.
-fn check_conditional_status(status: StatusCode, op: &str, path: &str) -> BackendError {
+fn check_conditional_status(status: StatusCode, op: &'static str, path: &str) -> BackendError {
     match status {
         StatusCode::NOT_FOUND => BackendError::NotFound,
         StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => BackendError::Precondition,
@@ -524,7 +554,7 @@ fn check_conditional_status(status: StatusCode, op: &str, path: &str) -> Backend
             "{op}({path}): conditional write outcome unknown (gcs status {})",
             s.as_u16()
         )),
-        s => BackendError::Other(format!("{op}({path}): gcs status {}", s.as_u16())),
+        s => GcsStatusError::new(op, path, s).into_backend_error(),
     }
 }
 
@@ -536,7 +566,7 @@ async fn parse_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, BackendError> {
     resp.json::<T>()
         .await
-        .map_err(|e| BackendError::Other(format!("{op}({path}): decoding response: {e}")))
+        .map_err(|e| BackendError::with_source(format!("{op}({path}): decoding response"), e))
 }
 
 /// Builds the JSON metadata part of a multipart upload.

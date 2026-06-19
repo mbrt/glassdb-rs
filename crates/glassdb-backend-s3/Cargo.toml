@@ -15,6 +15,7 @@ aws-smithy-runtime-api = { version = "1.12.3", default-features = false, feature
 glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
 rand = "0.10.1"
+thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "macros", "time"] }
 # In-process fake S3 server (the `fake-server` feature). These mirror the
 # dev-dependencies below so the same code compiles both under `cargo test` and

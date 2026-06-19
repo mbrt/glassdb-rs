@@ -69,7 +69,7 @@ impl Transaction {
                 inner.reads.insert(p, ReadState::NotFound);
                 Err(Error::NotFound)
             }
-            Err(e) => Err(Error::Internal(format!("reading from storage: {e}"))),
+            Err(e) => Err(Error::with_source("reading from storage", e)),
             Ok(rv) => {
                 let mut inner = self.inner.lock().unwrap();
                 inner

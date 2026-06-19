@@ -128,7 +128,7 @@ impl TLogger {
             pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
             pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
             pb::transaction_log::Status::Default => {
-                return Err(StorageError::Other("unknown commit status".into()));
+                return Err(StorageError::other("unknown commit status"));
             }
         };
         let mut res = TxLog {
@@ -263,12 +263,12 @@ fn write_deleted(w: &pb::Write) -> bool {
 
 fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
     pb::TransactionLog::decode(buf)
-        .map_err(|e| StorageError::Other(format!("unmarshalling transaction log: {e}")))
+        .map_err(|e| StorageError::with_source("unmarshalling transaction log", e))
 }
 
 fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
     if l.id.is_unset() {
-        return Err(StorageError::Other("empty transaction ID".into()));
+        return Err(StorageError::other("empty transaction ID"));
     }
     let mut coll_writes: BTreeMap<String, pb::CollectionWrites> = BTreeMap::new();
 
@@ -284,7 +284,7 @@ fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
         TxCommitStatus::Aborted => pb::transaction_log::Status::Aborted,
         TxCommitStatus::Pending => pb::transaction_log::Status::Pending,
         TxCommitStatus::Unknown => {
-            return Err(StorageError::Other("unsupported commit status".into()));
+            return Err(StorageError::other("unsupported commit status"));
         }
     };
 
@@ -300,9 +300,10 @@ fn marshal_write(
     coll_writes: &mut BTreeMap<String, pb::CollectionWrites>,
     e: &TxWrite,
 ) -> Result<(), StorageError> {
-    let pr = paths::parse(&e.path).map_err(|e| StorageError::Other(e.to_string()))?;
+    let pr = paths::parse(&e.path)
+        .map_err(|err| StorageError::with_source("parsing transaction-log write path", err))?;
     if pr.typ != paths::Type::Key {
-        return Err(StorageError::Other(format!(
+        return Err(StorageError::other(format!(
             "expected 'key' path, got path {:?}",
             e.path
         )));
@@ -333,7 +334,8 @@ fn marshal_lock(
     e: &PathLock,
 ) -> Result<(), StorageError> {
     let lt = lock_type_to_proto(e.typ);
-    let pr = paths::parse(&e.path).map_err(|e| StorageError::Other(e.to_string()))?;
+    let pr = paths::parse(&e.path)
+        .map_err(|err| StorageError::with_source("parsing transaction-log lock path", err))?;
 
     let coll = coll_writes
         .entry(pr.prefix.clone())
@@ -394,23 +396,23 @@ fn log_tags(l: &TxLog, ts: SystemTime) -> Tags {
 fn parse_log_tags(t: &Tags) -> Result<TxStatus, StorageError> {
     let st = t
         .get(COMMIT_STATUS_TAG)
-        .ok_or_else(|| StorageError::Other("commit-status tag not found in tx log".into()))?;
+        .ok_or_else(|| StorageError::other("commit-status tag not found in tx log"))?;
     let status = match st.as_str() {
         COMMIT_STATUS_OK => TxCommitStatus::Ok,
         COMMIT_STATUS_ABORTED => TxCommitStatus::Aborted,
         COMMIT_STATUS_PENDING => TxCommitStatus::Pending,
         other => {
-            return Err(StorageError::Other(format!(
+            return Err(StorageError::other(format!(
                 "unknown commit-status tag {other:?}"
             )));
         }
     };
     let ts = t
         .get(TIMESTAMP_TAG)
-        .ok_or_else(|| StorageError::Other("timestamp tag not found in tx log".into()))?;
+        .ok_or_else(|| StorageError::other("timestamp tag not found in tx log"))?;
     let unix_milli: i64 = ts
         .parse()
-        .map_err(|e| StorageError::Other(format!("parsing timestamp tag {ts:?}: {e}")))?;
+        .map_err(|e| StorageError::with_source(format!("parsing timestamp tag {ts:?}"), e))?;
 
     Ok(TxStatus {
         status,

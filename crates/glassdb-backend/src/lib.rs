@@ -19,12 +19,41 @@ pub use stats::{BackendStats, StatsBackend};
 /// The tag key recording the transaction ID of the most recent writer.
 pub const LAST_WRITER_TAG: &str = "last-writer";
 
+/// A type-erased, cheaply cloneable underlying cause.
+#[derive(Clone)]
+pub struct Cause(Arc<dyn std::error::Error + Send + Sync + 'static>);
+
+impl Cause {
+    /// Wraps an error as a cause.
+    pub fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Cause(Arc::new(source))
+    }
+}
+
+impl std::fmt::Debug for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Cause {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 /// Errors returned by backend operations.
 ///
 /// Cancellation is not modeled as an error: backend futures are cancelled by
 /// being dropped (via `tokio::time::timeout`, `select!`, or
 /// `JoinHandle::abort`), and a dropped future simply returns nothing.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum BackendError {
     /// The object does not exist.
     #[error("object not found")]
@@ -41,9 +70,35 @@ pub enum BackendError {
     /// must *not* be blindly retried; the caller decides how to proceed.
     #[error("storage outcome unknown (in doubt): {0}")]
     Unavailable(String),
-    /// Any other backend error.
-    #[error("{0}")]
-    Other(String),
+    /// Any other backend error, with an optional underlying cause.
+    #[error("{msg}")]
+    Other {
+        msg: String,
+        #[source]
+        source: Option<Cause>,
+    },
+}
+
+impl BackendError {
+    /// Builds an [`BackendError::Other`] from a message, with no underlying cause.
+    pub fn other(msg: impl Into<String>) -> Self {
+        BackendError::Other {
+            msg: msg.into(),
+            source: None,
+        }
+    }
+
+    /// Builds an [`BackendError::Other`] that wraps an underlying cause, kept in
+    /// the [`std::error::Error::source`] chain.
+    pub fn with_source(
+        msg: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        BackendError::Other {
+            msg: msg.into(),
+            source: Some(Cause::new(source)),
+        }
+    }
 }
 
 /// Key-value metadata pairs associated with an object. A `BTreeMap` is used so

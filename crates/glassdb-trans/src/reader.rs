@@ -126,7 +126,7 @@ impl Reader {
                     info.last_writer.clone()
                 }
                 Ok(TxCommitStatus::Unknown) => {
-                    return Err(StorageError::Other("unknown tx commit status".into()));
+                    return Err(StorageError::other("unknown tx commit status"));
                 }
                 Err(_) => return Err(BackendError::NotFound.into()),
             }

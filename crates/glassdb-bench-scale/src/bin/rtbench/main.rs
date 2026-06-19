@@ -689,7 +689,7 @@ async fn join_tasks(
             Ok(Err(e)) if result.is_ok() => result = Err(e),
             Ok(Err(_)) => {}
             Err(_) if result.is_ok() => {
-                result = Err(GError::Internal("worker task panicked".into()));
+                result = Err(GError::internal("worker task panicked"));
             }
             Err(_) => {}
         }

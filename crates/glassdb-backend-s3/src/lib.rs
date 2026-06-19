@@ -18,7 +18,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use glassdb_backend::{
-    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
+    Backend, BackendError, Cause, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
     encode_writer_tag,
 };
 
@@ -126,7 +126,7 @@ impl S3Backend {
 
     /// Awaits an S3 operation and maps SDK errors. Cancellation is by
     /// dropping the surrounding future.
-    async fn run<F, T, E>(op: &str, path: &str, fut: F) -> Result<T, BackendError>
+    async fn run<F, T, E>(op: &'static str, path: &str, fut: F) -> Result<T, BackendError>
     where
         F: Future<Output = Result<T, SdkError<E>>>,
         E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
@@ -329,7 +329,9 @@ impl Backend for S3Backend {
             .body
             .collect()
             .await
-            .map_err(|e| BackendError::Other(format!("Read({path}): reading object body: {e}")))?
+            .map_err(|e| {
+                BackendError::with_source(format!("Read({path}): reading object body"), e)
+            })?
             .to_vec();
         Ok(ReadReply {
             contents: read_body(path, stored)?,
@@ -381,7 +383,7 @@ impl Backend for S3Backend {
         .await?;
         let mut merged = tags_from_meta(out.metadata());
         let stored = out.body.collect().await.map_err(|e| {
-            BackendError::Other(format!("SetTagsIf({path}): reading object body: {e}"))
+            BackendError::with_source(format!("SetTagsIf({path}): reading object body"), e)
         })?;
         let value = read_body(path, stored.to_vec())?;
         for (k, v) in tags {
@@ -550,7 +552,7 @@ fn add_nonce(value: &[u8]) -> Vec<u8> {
 /// Strips the leading nonce from a stored object body.
 fn read_body(path: &str, stored: Vec<u8>) -> Result<Vec<u8>, BackendError> {
     if stored.len() < NONCE_SIZE {
-        return Err(BackendError::Other(format!(
+        return Err(BackendError::other(format!(
             "Read({path}): object body too short ({} bytes) to contain nonce",
             stored.len()
         )));
@@ -575,8 +577,42 @@ fn tags_from_meta(meta: Option<&HashMap<String, String>>) -> Tags {
     }
 }
 
+/// A structured diagnostic for an S3 request that failed without mapping to a
+/// dedicated [`BackendError`] classification.
+///
+/// The request coordinates are kept as typed fields rather than interpolated
+/// ad-hoc at each call site: the failure has a single `Display` definition,
+/// renders its structure under `{:?}`, and preserves the SDK error with its
+/// full `source()` chain as the underlying cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{op}({path}): code={code:?} status={status:?}")]
+struct S3RequestError {
+    op: &'static str,
+    path: String,
+    code: Option<String>,
+    status: Option<u16>,
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl S3RequestError {
+    /// Flattens the structured S3 error into the shared catch-all: the message
+    /// is the structured `Display`, and the typed error (with the SDK error in
+    /// its chain) is kept via [`std::error::Error::source`].
+    fn into_backend_error(self) -> BackendError {
+        // This is an inherent method rather than a `From` impl on purpose:
+        // adding another `From<_> for BackendError` would make `?`/`Ok(())`
+        // inference ambiguous at call sites that rely on `BackendError` being
+        // the only inferable error type.
+        BackendError::Other {
+            msg: self.to_string(),
+            source: Some(Cause::new(self)),
+        }
+    }
+}
+
 /// Maps an S3 SDK error onto a [`BackendError`].
-fn annotate<E>(op: &str, path: &str, e: SdkError<E>) -> BackendError
+fn annotate<E>(op: &'static str, path: &str, e: SdkError<E>) -> BackendError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
@@ -594,26 +630,15 @@ where
     match status {
         Some(404) => BackendError::NotFound,
         Some(412) | Some(409) => BackendError::Precondition,
-        _ => BackendError::Other(format!(
-            "{op}({path}): code={code:?} status={status:?}: {}",
-            error_chain(&e)
-        )),
+        _ => S3RequestError {
+            op,
+            path: path.to_string(),
+            code,
+            status,
+            source: Box::new(e),
+        }
+        .into_backend_error(),
     }
-}
-
-/// Renders an error together with its full `source()` chain. `SdkError`'s own
-/// `Display` is terse (e.g. just "dispatch failure"); the real cause (connection
-/// reset, connect timeout, refused, ...) lives in the source chain, so flatten
-/// it into the message for diagnostics.
-fn error_chain(e: &dyn std::error::Error) -> String {
-    use std::fmt::Write;
-    let mut s = e.to_string();
-    let mut src = e.source();
-    while let Some(c) = src {
-        let _ = write!(s, ": {c}");
-        src = c.source();
-    }
-    s
 }
 
 /// Reports whether `e` is a 409 `ConditionalRequestConflict`, which S3 returns

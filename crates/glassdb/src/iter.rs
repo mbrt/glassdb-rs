@@ -36,16 +36,17 @@ impl Iterator for KeysIter {
                 Ok(r) if r.typ == paths::Type::Key => self.prefix = format!("{}/", r.prefix),
                 Ok(r) => {
                     self.done = true;
-                    return Some(Err(Error::Internal(format!(
+                    return Some(Err(Error::internal(format!(
                         "got path type {:?}, expected Key",
                         r.typ
                     ))));
                 }
                 Err(e) => {
                     self.done = true;
-                    return Some(Err(Error::Internal(format!(
-                        "parsing path {backend_path:?}: {e}"
-                    ))));
+                    return Some(Err(Error::with_source(
+                        format!("parsing path {backend_path:?}"),
+                        e,
+                    )));
                 }
             }
         }
@@ -56,7 +57,10 @@ impl Iterator for KeysIter {
             Ok(k) => Some(Ok(k)),
             Err(e) => {
                 self.done = true;
-                Some(Err(Error::Internal(e.to_string())))
+                Some(Err(Error::with_source(
+                    format!("decoding key from path {trimmed:?}"),
+                    e,
+                )))
             }
         }
     }
@@ -94,16 +98,17 @@ impl Iterator for CollectionsIter {
                 Ok(r) if r.typ == paths::Type::Collection => self.prefix = format!("{}/", r.prefix),
                 Ok(r) => {
                     self.done = true;
-                    return Some(Err(Error::Internal(format!(
+                    return Some(Err(Error::internal(format!(
                         "got path type {:?}, expected Collection",
                         r.typ
                     ))));
                 }
                 Err(e) => {
                     self.done = true;
-                    return Some(Err(Error::Internal(format!(
-                        "parsing path {backend_path:?}: {e}"
-                    ))));
+                    return Some(Err(Error::with_source(
+                        format!("parsing path {backend_path:?}"),
+                        e,
+                    )));
                 }
             }
         }
@@ -114,7 +119,10 @@ impl Iterator for CollectionsIter {
             Ok(c) => Some(Ok(c)),
             Err(e) => {
                 self.done = true;
-                Some(Err(Error::Internal(e.to_string())))
+                Some(Err(Error::with_source(
+                    format!("decoding collection from path {trimmed:?}"),
+                    e,
+                )))
             }
         }
     }

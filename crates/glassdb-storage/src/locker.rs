@@ -38,7 +38,7 @@ impl LockType {
             LockType::Read => Ok(LOCK_TAG_READ),
             LockType::Write => Ok(LOCK_TAG_WRITE),
             LockType::Create => Ok(LOCK_TAG_CREATE),
-            LockType::Unknown => Err(StorageError::Other("unknown lock type".into())),
+            LockType::Unknown => Err(StorageError::other("unknown lock type")),
         }
     }
 }
@@ -136,15 +136,15 @@ impl LockInfo {
     pub fn valid(&self) -> Result<(), StorageError> {
         if self.locked_by.is_empty() {
             if self.typ != LockType::None {
-                return Err(StorageError::Other(
-                    "got zero lockers, but lock type is not none".into(),
+                return Err(StorageError::other(
+                    "got zero lockers, but lock type is not none",
                 ));
             }
             return Ok(());
         }
         if self.locked_by.len() > 1 && (self.typ == LockType::Create || self.typ == LockType::Write)
         {
-            return Err(StorageError::Other(format!(
+            return Err(StorageError::other(format!(
                 "got {} lockers with writer lock",
                 self.locked_by.len()
             )));
@@ -243,7 +243,7 @@ fn compute_unlock_update(
 
     for tx in &curr.locked_by {
         let v = find_tx_path_state(txs, tx)
-            .ok_or_else(|| StorageError::Other(format!("missing state for tx {tx}")))?;
+            .ok_or_else(|| StorageError::other(format!("missing state for tx {tx}")))?;
         if !v.status.is_final() && !unlocker_set.contains(tx) {
             update.lockers.push(tx.clone());
             continue;
@@ -271,10 +271,10 @@ fn compute_lock_update_inner(
     lockers: &[TxId],
 ) -> Result<LockOps, StorageError> {
     if lt == LockType::Unknown || lt == LockType::None {
-        return Err(StorageError::Other(format!("cannot lock with type {lt:?}")));
+        return Err(StorageError::other(format!("cannot lock with type {lt:?}")));
     }
     if is_writer_type(lt) && lockers.len() != 1 {
-        return Err(StorageError::Other(format!(
+        return Err(StorageError::other(format!(
             "cannot lock in write with {} lockers",
             lockers.len()
         )));
@@ -366,7 +366,7 @@ pub fn tags_lock_info(tags: &Tags) -> Result<LockInfo, StorageError> {
             LOCK_TAG_WRITE => LockType::Write,
             LOCK_TAG_CREATE => LockType::Create,
             LOCK_TAG_NONE | "" => LockType::None,
-            other => return Err(StorageError::Other(format!("unknown lock type {other:?}"))),
+            other => return Err(StorageError::other(format!("unknown lock type {other:?}"))),
         };
     }
     if let Some(v) = tags.get(LOCKED_BY_TAG)
@@ -374,7 +374,7 @@ pub fn tags_lock_info(tags: &Tags) -> Result<LockInfo, StorageError> {
     {
         for lt in v.split(',') {
             let d = tag_to_tid(lt)
-                .map_err(|e| StorageError::Other(format!("invalid locked-by tag: {e}")))?;
+                .map_err(|e| StorageError::with_source("invalid locked-by tag", e))?;
             res.locked_by.push(d);
         }
     }
@@ -446,7 +446,7 @@ impl Locker {
     ) -> Option<Result<(), StorageError>> {
         if update.typ == LockType::None && update.value.deleted {
             if update.prev_type != LockType::Create && update.prev_type != LockType::Write {
-                return Some(Err(StorageError::Other(format!(
+                return Some(Err(StorageError::other(format!(
                     "cannot delete from unlock type {:?}",
                     update.prev_type
                 ))));

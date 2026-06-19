@@ -274,8 +274,19 @@ async fn nop_retryer_surfaces_slow_down() {
     fake.set_slowdown(1, Some(Method::PUT));
 
     let err = b.write("k", b"v".to_vec(), Tags::new()).await.unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("SlowDown"), "got: {msg}");
+    // An unclassified S3 failure is rendered through the structured request
+    // error, so the request coordinates surface as typed fields under `{:?}`
+    // (op/path/code/status), and the SDK error is kept as the underlying cause.
+    let dbg = format!("{err:?}");
+    assert!(dbg.contains(r#"op: "Write""#), "got: {dbg}");
+    assert!(dbg.contains(r#"code: Some("SlowDown")"#), "got: {dbg}");
+    assert!(dbg.contains("status: Some(503)"), "got: {dbg}");
+
+    use std::error::Error as _;
+    assert!(
+        err.source().is_some(),
+        "SDK error should be kept as the cause"
+    );
 }
 
 // In-doubt contract (ADR-009): a conditional write whose ack is lost must NOT be

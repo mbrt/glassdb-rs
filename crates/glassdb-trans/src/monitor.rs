@@ -187,18 +187,16 @@ impl Monitor {
         // the transaction log.
         if !tl.locks.is_empty() {
             tl.status = TxCommitStatus::Ok;
-            self.set_final_log(&tl).await.map_err(|e| {
-                // Preserve AlreadyFinalized so the commit path can recognize a
-                // wound (the log was already aborted out from under us).
-                // In-doubt outcomes are retried inside `set_final_log` because
-                // the log is keyed by tx id and the write is idempotent.
-                match e {
-                    TransError::AlreadyFinalized => TransError::AlreadyFinalized,
-                    other => TransError::Other(format!("writing tx log: {other}")),
-                }
-            })?;
+            // `context` preserves the `AlreadyFinalized` sentinel so the commit
+            // path can recognize a wound (the log was already aborted out from
+            // under us), as well as any classification of an escaping error.
+            // In-doubt outcomes are normally retried inside `set_final_log`
+            // because the log is keyed by tx id and the write is idempotent.
+            self.set_final_log(&tl)
+                .await
+                .map_err(|e| e.context("writing tx log"))?;
         } else if tl.writes.len() > 1 {
-            return Err(TransError::Other(format!(
+            return Err(TransError::other(format!(
                 "got {} writes with no locks; this is a bug",
                 tl.writes.len()
             )));
@@ -263,10 +261,9 @@ impl Monitor {
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
     pub async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
-        let cs =
-            self.inner.tl.commit_status(tid).await.map_err(|e| {
-                TransError::Other(format!("reading status of wound target {tid}: {e}"))
-            })?;
+        let cs = self.inner.tl.commit_status(tid).await.map_err(|e| {
+            TransError::Storage(e.context(format!("reading status of wound target {tid}")))
+        })?;
         if cs.status.is_final() {
             // Already committed or aborted: nothing left to wound.
             self.mark_local_aborted(tid, cs.status);
@@ -401,7 +398,7 @@ impl Monitor {
             .tl
             .get(tid)
             .await
-            .map_err(|e| TransError::Other(format!("getting TID {tid}: {e}")))?;
+            .map_err(|e| TransError::Storage(e.context(format!("getting TID {tid}"))))?;
         for entry in &tl.writes {
             if entry.path == key {
                 return Ok(KeyCommitStatus {
@@ -544,7 +541,7 @@ impl Monitor {
             if !alive {
                 return (
                     s,
-                    Some(TransError::Other("no live waiters; abandoning poll".into())),
+                    Some(TransError::other("no live waiters; abandoning poll")),
                 );
             }
             rt::sleep(backoff.next_delay()).await;
@@ -554,7 +551,7 @@ impl Monitor {
     async fn set_final_log(&self, tlog: &TxLog) -> Result<(), TransError> {
         let tid = &tlog.id;
         if tid.is_unset() {
-            return Err(TransError::Other("missing required tlog ID".into()));
+            return Err(TransError::other("missing required tlog ID"));
         }
         let mut last_v = {
             let st = self.shard_for(tid).lock().unwrap();

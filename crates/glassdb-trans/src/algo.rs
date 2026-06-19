@@ -229,9 +229,10 @@ impl PathState {
         if !self.read_not_found() {
             return Ok(res);
         }
-        let pr = paths::parse(&self.path).map_err(|e| TransError::Other(e.to_string()))?;
+        let pr = paths::parse(&self.path)
+            .map_err(|e| TransError::with_source("parsing path while locking", e))?;
         if pr.typ != paths::Type::Key {
-            return Err(TransError::Other(format!(
+            return Err(TransError::other(format!(
                 "expected only keys while locking, got path {:?}",
                 self.path
             )));
@@ -399,9 +400,10 @@ fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransErr
             // locks.
             continue;
         }
-        let pr = paths::parse(&info.path).map_err(|e| TransError::Other(e.to_string()))?;
+        let pr = paths::parse(&info.path)
+            .map_err(|e| TransError::with_source("parsing path while locking", e))?;
         if pr.typ != paths::Type::Key {
-            return Err(TransError::Other(format!(
+            return Err(TransError::other(format!(
                 "expected only keys while locking, got path {:?}",
                 info.path
             )));
@@ -544,10 +546,7 @@ impl Algo {
                 // `Ok` internally.
                 return Err(TransError::Wounded);
             }
-            return Err(TransError::Other(format!(
-                "committing writes for tx {}: {e}",
-                tx.id
-            )));
+            return Err(e.context(format!("committing writes for tx {}", tx.id)));
         }
         tx.status = Status::Committed;
         self.async_cleanup(tx);
@@ -571,8 +570,8 @@ impl Algo {
             tx.status = Status::Validating;
         }
         if !tx.data.writes.is_empty() {
-            return Err(TransError::Other(
-                "cannot validate only reads when writes are present".into(),
+            return Err(TransError::other(
+                "cannot validate only reads when writes are present",
             ));
         }
         let mut vstate = init_validation(tx);
@@ -696,10 +695,9 @@ impl Algo {
             Ok(m) => m,
             Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
             Err(e) => {
-                return Err(TransError::Other(format!(
-                    "getting metadata for {:?}: {e}",
-                    read.path
-                )));
+                return Err(TransError::Storage(
+                    e.context(format!("getting metadata for {:?}", read.path)),
+                ));
             }
         };
 
@@ -724,10 +722,9 @@ impl Algo {
                         Ok(m) => m,
                         Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
                         Err(e) => {
-                            return Err(TransError::Other(format!(
-                                "getting metadata for {:?}: {e}",
-                                read.path
-                            )));
+                            return Err(TransError::Storage(
+                                e.context(format!("getting metadata for {:?}", read.path)),
+                            ));
                         }
                     };
                 }
@@ -879,7 +876,7 @@ impl Algo {
         read_from: &TxId,
     ) -> Result<(), TransError> {
         if li.locked_by.len() != 1 {
-            return Err(TransError::Other(format!(
+            return Err(TransError::other(format!(
                 "bad lock: {:?} with {} lockers",
                 li.typ,
                 li.locked_by.len()
@@ -909,7 +906,7 @@ impl Algo {
                 expected_writer = li.last_writer.clone();
             }
             glassdb_storage::TxCommitStatus::Unknown => {
-                return Err(TransError::Other("unknown tx commit status".into()));
+                return Err(TransError::other("unknown tx commit status"));
             }
         }
 
@@ -982,7 +979,7 @@ impl Algo {
             return Ok(());
         }
         if li.locked_by.len() != 1 {
-            return Err(TransError::Other(format!(
+            return Err(TransError::other(format!(
                 "bad lock: {:?} with {} lockers",
                 li.typ,
                 li.locked_by.len()
@@ -996,7 +993,7 @@ impl Algo {
                 li.last_writer.clone()
             }
             glassdb_storage::TxCommitStatus::Unknown => {
-                return Err(TransError::Other("unknown tx commit status".into()));
+                return Err(TransError::other("unknown tx commit status"));
             }
         };
 
@@ -1045,10 +1042,10 @@ impl Algo {
         let validate = async {
             self.lock_collections(vstate, tx)
                 .await
-                .map_err(|e| TransError::Other(format!("locking collections: {e}")))?;
+                .map_err(|e| e.context("locking collections"))?;
             self.lock_validate(vstate, tx)
                 .await
-                .map_err(|e| TransError::Other(format!("failed validation: {e}")))?;
+                .map_err(|e| e.context("failed validation"))?;
             Ok::<_, TransError>(())
         };
         // Bound the locking work to break deadlocks. Dropping the validate
@@ -1082,9 +1079,9 @@ impl Algo {
             .run_indexed(colocks.len(), |i| {
                 let cl = colocks[i].clone();
                 async move {
-                    self.lock_path(&cl.path, cl.typ, tx).await.map_err(|e| {
-                        TransError::Other(format!("locking collection {:?}: {e}", cl.path))
-                    })
+                    self.lock_path(&cl.path, cl.typ, tx)
+                        .await
+                        .map_err(|e| e.context(format!("locking collection {:?}", cl.path)))
                 }
             })
             .await;
@@ -1099,10 +1096,7 @@ impl Algo {
         if !self.already_locked(vstate, tx) {
             // We need to lock in the right order, so first unlock everything.
             self.unlock_all(tx).await.map_err(|e| {
-                TransError::Other(format!(
-                    "unlocking before serial validate for tx {}: {e}",
-                    tx.id
-                ))
+                e.context(format!("unlocking before serial validate for tx {}", tx.id))
             })?;
             for item in &mut vstate.paths {
                 item.result = VResult::Unknown;
@@ -1114,9 +1108,9 @@ impl Algo {
         if !colocks.is_empty() {
             colocks.sort_by(|a, b| a.path.cmp(&b.path));
             for cl in &colocks {
-                self.lock_path(&cl.path, cl.typ, tx).await.map_err(|e| {
-                    TransError::Other(format!("locking collection {:?}: {e}", cl.path))
-                })?;
+                self.lock_path(&cl.path, cl.typ, tx)
+                    .await
+                    .map_err(|e| e.context(format!("locking collection {:?}", cl.path)))?;
             }
         }
 
@@ -1244,7 +1238,7 @@ impl Algo {
                 item.result = VResult::NeedsCLock;
                 return Ok(());
             }
-            return Err(TransError::Other(format!("failed locking: {e}")));
+            return Err(e.context("failed locking"));
         }
         if !item.has_read() {
             item.result = VResult::Ok;
@@ -1323,11 +1317,11 @@ impl Algo {
             LockType::Read => self.locker.lock_read(path, &tx.id).await,
             LockType::Write => self.locker.lock_write(path, &tx.id).await,
             LockType::Create => self.locker.lock_create(path, &tx.id).await,
-            other => Err(TransError::Other(format!(
+            other => Err(TransError::other(format!(
                 "unsupported lock type {other:?}"
             ))),
         }
-        .map_err(|e| TransError::Other(format!("locking path {path:?}: {e}")))
+        .map_err(|e| e.context(format!("locking path {path:?}")))
     }
 
     fn update_local_cache(&self, vstate: &ValidationState) {
@@ -1342,11 +1336,13 @@ impl Algo {
     async fn commit_writes(&self, writes: &[WriteAccess], id: &TxId) -> Result<(), TransError> {
         let mut tl = to_log(id.clone(), writes);
         tl.locks = self.locker.locked_paths(id);
-        self.mon.commit_tx(tl).await.map_err(|e| match e {
-            // Preserve AlreadyFinalized so the commit path can map it to a wound.
-            TransError::AlreadyFinalized => TransError::AlreadyFinalized,
-            other => TransError::Other(format!("creating transaction object: {other}")),
-        })
+        // `context` preserves the `AlreadyFinalized` sentinel (so the commit
+        // path can map it to a wound) and any in-doubt outcome, instead of
+        // collapsing them into a generic error.
+        self.mon
+            .commit_tx(tl)
+            .await
+            .map_err(|e| e.context("creating transaction object"))
     }
 
     fn update_local(&self, w: &WriteAccess, tid: &TxId) {
@@ -1371,17 +1367,14 @@ impl Algo {
                 async move {
                     match self.locker.unlock(&pl.path, &tx.id).await {
                         Ok(()) => Ok(None::<TransError>),
-                        Err(e) => Ok(Some(TransError::Other(format!(
-                            "unlocking {:?}: {e}",
-                            pl.path
-                        )))),
+                        Err(e) => Ok(Some(e.context(format!("unlocking {:?}", pl.path)))),
                     }
                 }
             })
             .await;
         let errs: Vec<TransError> = outs.into_iter().flatten().flatten().collect();
         if !errs.is_empty() {
-            return Err(TransError::Other(format!(
+            return Err(TransError::other(format!(
                 "unlocking all for tx {}: {} errors",
                 tx.id,
                 errs.len()

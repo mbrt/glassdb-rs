@@ -767,3 +767,30 @@ async fn clean_conflict_still_precondition() {
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition), "got {err:?}");
 }
+
+#[test]
+fn unclassified_status_produces_structured_error() {
+    use crate::{check_conditional_status, check_status};
+    use std::error::Error as _;
+
+    // A non-success status that maps to no dedicated classification renders
+    // through the structured `GcsStatusError`: op/path/status surface as typed
+    // fields under `{:?}` rather than only inside a formatted message, and the
+    // typed error is kept as the cause.
+    let err = check_status(reqwest::StatusCode::FORBIDDEN, "Read", "k").unwrap_err();
+    assert!(matches!(err, BackendError::Other { .. }));
+    let dbg = format!("{err:?}");
+    assert!(dbg.contains(r#"op: "Read""#), "got: {dbg}");
+    assert!(dbg.contains(r#"path: "k""#), "got: {dbg}");
+    assert!(dbg.contains("status: 403"), "got: {dbg}");
+    assert!(err.source().is_some(), "structured error kept as the cause");
+
+    // A conditional request keeps the same structured mapping for a non-5xx,
+    // non-precondition status...
+    let err = check_conditional_status(reqwest::StatusCode::FORBIDDEN, "Write", "k");
+    assert!(matches!(err, BackendError::Other { .. }));
+
+    // ...while a 5xx stays an in-doubt `Unavailable` (ADR-009).
+    let err = check_conditional_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "Write", "k");
+    assert!(matches!(err, BackendError::Unavailable(_)));
+}

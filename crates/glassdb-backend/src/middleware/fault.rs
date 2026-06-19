@@ -324,7 +324,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let err = fb.read("missing").await.unwrap_err();
 
-        assert_eq!(err, BackendError::NotFound);
+        assert!(matches!(err, BackendError::NotFound));
         assert_eq!(start.elapsed(), Duration::from_millis(5));
     }
 
@@ -346,7 +346,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, BackendError::Unavailable(msg) if msg.contains("dropped request")));
-        assert_eq!(mem.read("p").await.unwrap_err(), BackendError::NotFound);
+        assert!(matches!(
+            mem.read("p").await.unwrap_err(),
+            BackendError::NotFound
+        ));
     }
 
     #[tokio::test]
