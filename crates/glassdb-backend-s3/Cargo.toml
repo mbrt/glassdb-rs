@@ -14,8 +14,15 @@ aws-smithy-http-client = { version = "1.1.13", default-features = false, feature
 aws-smithy-runtime-api = { version = "1.12.3", default-features = false, features = ["client"] }
 glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
+# Pure-Rust async DNS resolver. The tuned HTTP client resolves through this
+# instead of hyper's default `getaddrinfo`-on-the-blocking-pool resolver, so a
+# burst of new connections cannot saturate tokio's blocking pool. hickory also
+# caches responses (honoring their TTL). Default features only (plaintext
+# UDP/TCP + system resolv.conf); no DoT/DoH/QUIC/DNSSEC.
+hickory-resolver = "0.26.1"
 rand = "0.10.1"
 tokio = { version = "1.52.3", features = ["rt", "macros", "time"] }
+tracing = "0.1.44"
 # In-process fake S3 server (the `fake-server` feature). These mirror the
 # dev-dependencies below so the same code compiles both under `cargo test` and
 # when a downstream crate (e.g. the benchmarks) turns the feature on.

@@ -30,7 +30,7 @@ mod fake_server;
 #[cfg(feature = "fake-server")]
 pub use fake_server::{FakeS3, FakeS3Options};
 
-mod caching_dns;
+mod dns;
 #[cfg(test)]
 mod tests;
 mod tuned_http;
