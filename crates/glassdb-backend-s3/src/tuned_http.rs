@@ -7,6 +7,15 @@
 //! steers the SDK toward connection reuse, so handshake cost is paid once and
 //! ALPN negotiates HTTP/2 with S3 on top of the reused connection.
 //!
+//! Connection reuse alone is not enough: under a burst of fresh connections
+//! (cold ramp, HTTP/2 stream saturation, or retries under `503 SlowDown`) hyper
+//! resolves the endpoint host with a blocking `getaddrinfo` *per connection* on
+//! tokio's blocking pool. A few hundred concurrent ops saturate the 512-thread
+//! pool, and throughput collapses. The client therefore resolves DNS through
+//! [`AsyncDnsResolver`], which looks up names on the tokio reactor (never the
+//! blocking pool) and caches responses, so connection bursts cannot saturate
+//! the pool.
+//!
 //! The function is intentionally a free helper rather than baked into
 //! [`crate::S3Backend::new`]: it composes with `aws_config`'s loader so callers
 //! can layer their own interceptors, credentials, or region selection on top
@@ -16,6 +25,8 @@ use std::time::Duration;
 
 use aws_smithy_http_client::{Builder, tls};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
+
+use crate::dns::AsyncDnsResolver;
 
 /// HTTP client tuned for high-concurrency S3 workloads: rustls (aws-lc crypto
 /// provider) plus hyper's default 90-second idle pool, so the SDK keeps
@@ -40,10 +51,19 @@ use aws_smithy_runtime_api::client::http::SharedHttpClient;
 /// # }
 /// ```
 pub fn tuned_http_client() -> SharedHttpClient {
-    Builder::new()
+    let builder = Builder::new()
         .tls_provider(tls::Provider::Rustls(
             tls::rustls_provider::CryptoMode::AwsLc,
         ))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build_https()
+        .pool_idle_timeout(Duration::from_secs(90));
+    match AsyncDnsResolver::from_system() {
+        Ok(resolver) => builder.build_with_resolver(resolver),
+        // Loading the system DNS config should not fail in practice; if it does,
+        // fall back to the SDK's default resolver rather than failing client
+        // construction. The blocking-pool risk only returns in that rare case.
+        Err(e) => {
+            tracing::warn!(error = %e, "async DNS resolver unavailable; using default resolver");
+            builder.build_https()
+        }
+    }
 }

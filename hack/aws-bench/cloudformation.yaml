@@ -278,7 +278,7 @@ Resources:
           # script aggregates them into tighter percentile bands.
           ./rtbench --backend=s3 --test-name=rw9010 \
             --max-dbs=${MaxDBs} --num-keys=${NumKeys} --duration=${RunDuration} \
-            --num-runs=3 --run-cooldown=60s \
+            --num-runs=1 --run-cooldown=60s \
             --samples-out=out/samples.csv \
             --stats-out=out/stats.csv \
             --throughput-out=out/throughput.csv \
@@ -286,7 +286,7 @@ Resources:
 
           ./rtbench --backend=s3 --test-name=deadlock \
             --duration=${DeadlockDuration} \
-            --num-runs=3 --run-cooldown=60s \
+            --num-runs=1 --run-cooldown=60s \
             --deadlock-out=out/deadlock.csv
 
           aws s3 cp out/ "s3://$BUCKET/$OUT/" --recursive
