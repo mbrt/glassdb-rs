@@ -53,9 +53,12 @@ impl Collection {
             self.db.local.clone(),
             self.db.global.clone(),
             self.db.tmon.clone(),
+            self.db.retry,
         );
-        let rv = r.read(&p, max_staleness).await?;
-        Ok(rv.value.to_vec())
+        match r.read(&p, max_staleness).await {
+            Ok(rv) => Ok(rv.value.to_vec()),
+            Err(e) => Err(Error::from_read(e)),
+        }
     }
 
     /// Writes `value` for `key` within a transaction.
@@ -103,10 +106,13 @@ impl Collection {
     /// Ensures the collection exists in the backend, creating it if necessary.
     pub async fn create(&self) -> Result<(), Error> {
         let p = paths::collection_info(&self.prefix);
+        // The existence probe is a pure read, so an outage is retry-safe
+        // `Unavailable`. The conditional create below is a mutation, so it keeps
+        // the conservative `Unavailable -> InDoubt` mapping of `From`.
         match self.db.global.get_metadata(&p).await {
             Ok(_) => return Ok(()),
             Err(StorageError::NotFound) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(Error::from_read(e)),
         }
         match self
             .db
@@ -124,14 +130,24 @@ impl Collection {
     /// Returns an iterator over the keys in the collection.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
         let keys_prefix = paths::keys_prefix(&self.prefix);
-        let items = self.db.global.list(&keys_prefix).await?;
+        let items = self
+            .db
+            .global
+            .list(&keys_prefix)
+            .await
+            .map_err(Error::from_read)?;
         Ok(KeysIter::new(items))
     }
 
     /// Returns an iterator over the sub-collections in this collection.
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
         let cprefix = paths::collections_prefix(&self.prefix);
-        let items = self.db.global.list(&cprefix).await?;
+        let items = self
+            .db
+            .global
+            .list(&cprefix)
+            .await
+            .map_err(Error::from_read)?;
         Ok(CollectionsIter::new(items))
     }
 }

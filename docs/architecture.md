@@ -158,12 +158,16 @@ compare-and-swap (CAS) semantics.
 
 - `NotFound` — object does not exist.
 - `Precondition` — conditional operation failed (version mismatch).
-- `Unavailable(_)` — the operation's outcome is _in doubt_: the request may or
-  may not have been applied (e.g. a conditional write whose acknowledgement was
-  lost and whose retry then saw a precondition failure, or an outage that
-  exhausts the retry budget). Because the outcome is unknown, a non-idempotent
-  operation must not be blindly retried. See
-  [ADR-009](adr/009-in-doubt-conditional-writes.md).
+- `Unavailable(_)` — the operation could not be confirmed. For a *conditional
+  write* this means the outcome is _in doubt_: it may or may not have been
+  applied (e.g. an acknowledgement was lost and the retry then saw a precondition
+  failure, or an outage exhausted the retry budget), so a non-idempotent
+  operation must not be blindly retried
+  ([ADR-009](adr/009-in-doubt-conditional-writes.md)). For an *idempotent*
+  request (read, `get_metadata`, unconditional write/delete, list) it is just a
+  transient failure (`5xx`, timeout, transport error) that is always safe to
+  retry; the engine retries reads in place and surfaces an unrecoverable one as
+  `Error::Unavailable` ([ADR-015](adr/015-read-unavailability.md)).
 - `Other(_)` — any other backend error.
 
 `is_not_found`, `is_precondition`, and `is_unavailable` predicates preserve
@@ -389,6 +393,13 @@ If a transaction only reads, it can skip locking entirely on the happy path:
    written.
 4. If verification fails (concurrent write detected): retry once with the full
    locking protocol as a fallback.
+
+A read is idempotent, so a transient backend outage (`Unavailable`) during a
+read is retried in place with backoff by the reader — recovering a blip
+transparently without re-running the user closure. A sustained outage surfaces as
+`Error::Unavailable` (distinct from the in-doubt `Error::InDoubt`, which only a
+mutation can produce), which the caller may safely retry. See
+[ADR-015](adr/015-read-unavailability.md).
 
 This makes read-heavy workloads very efficient — the happy path requires only
 one value read plus one metadata read per key, with zero writes.

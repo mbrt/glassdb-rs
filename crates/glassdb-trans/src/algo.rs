@@ -457,8 +457,8 @@ impl Algo {
         mon: Monitor,
         gc: Gc,
         background: Option<Weak<Background>>,
+        reader: Reader,
     ) -> Self {
-        let reader = Reader::new(local.clone(), global.clone(), mon.clone());
         Algo {
             global,
             local,
@@ -1506,6 +1506,7 @@ const MAX_STALE: Duration = glassdb_storage::MAX_STALENESS;
 mod tests {
     use super::*;
     use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
+    use glassdb_concurr::RetryConfig;
     use glassdb_data::TxId;
     use glassdb_storage::{LockType, MAX_STALENESS, TLogger, TxCommitStatus};
 
@@ -1532,7 +1533,13 @@ mod tests {
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
-        let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
+        let reader = Reader::new(
+            local.clone(),
+            global.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+        );
+        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
         let gc = Gc::new(bg_weak.clone(), tlogger.clone());
 
         global
@@ -1552,6 +1559,7 @@ mod tests {
             tmon.clone(),
             gc,
             None,
+            reader,
         );
         (
             algo,
@@ -1589,7 +1597,12 @@ mod tests {
     }
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
-        let reader = Reader::new(tctx.local.clone(), tctx.global.clone(), tctx.tmon.clone());
+        let reader = Reader::new(
+            tctx.local.clone(),
+            tctx.global.clone(),
+            tctx.tmon.clone(),
+            RetryConfig::default(),
+        );
         match reader.read(path, MAX_STALENESS).await {
             Ok(rv) => ra_found(path, rv.version.writer),
             Err(StorageError::NotFound) => ra_not_found(path),
@@ -1970,6 +1983,7 @@ mod tests {
             tctx_v.local.clone(),
             tctx_v.global.clone(),
             tctx_v.tmon.clone(),
+            RetryConfig::default(),
         );
         let rv = reader.read(&key, MAX_STALENESS).await.unwrap();
         assert_eq!(&*rv.value, v1);
@@ -2172,7 +2186,13 @@ mod tests {
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
-        let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
+        let reader = Reader::new(
+            local.clone(),
+            global.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+        );
+        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
         let gc = Gc::new(bg_weak.clone(), tlogger.clone());
 
         global
@@ -2191,6 +2211,7 @@ mod tests {
             tmon.clone(),
             gc.clone(),
             Some(bg_weak),
+            reader,
         );
         (
             algo,

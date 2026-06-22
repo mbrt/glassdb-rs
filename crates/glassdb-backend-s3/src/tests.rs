@@ -289,6 +289,31 @@ async fn nop_retryer_surfaces_slow_down() {
     );
 }
 
+// Transient read unavailability (ADR-009): a read is idempotent, so a transient
+// failure the SDK retryer does not ride over (here a `503 SlowDown` with retries
+// disabled) must surface as retryable `Unavailable`, letting the engine recover
+// it in place — not as the generic `Other` the pre-fix code produced for a 503
+// on a read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_transient_failure_surfaces_unavailable() {
+    let fake = FakeS3::start().await;
+    let b = builder(&fake).disable_retries().build();
+
+    // Seed via PUT (not throttled), then throttle the next GET.
+    b.write("k", b"v".to_vec(), Tags::new()).await.unwrap();
+    fake.set_slowdown(1, Some(Method::GET));
+
+    let err = b.read("k").await.unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unavailable(_)),
+        "a 503 on an idempotent read must be Unavailable, got {err:?}"
+    );
+
+    // The object is intact; once the throttle clears the read succeeds.
+    let r = b.read("k").await.unwrap();
+    assert_eq!(r.contents, b"v");
+}
+
 // In-doubt contract (ADR-009): a conditional write whose ack is lost must NOT be
 // reported as a confident `Precondition`. Object storage has no at-most-once
 // request id, so when the SDK (or any layer) re-sends a conditional PUT whose

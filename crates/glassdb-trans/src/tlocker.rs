@@ -18,7 +18,7 @@ use glassdb_concurr::{
 };
 use glassdb_data::{TxId, TxIdSet, set_union};
 use glassdb_storage::{
-    Global, Local, LockInfo, LockRequest, LockType, LockUpdate, Locker as StorageLocker, PathLock,
+    Global, LockInfo, LockRequest, LockType, LockUpdate, Locker as StorageLocker, PathLock,
     StorageError, TValue, TxPathState, compute_lock_update, tags_lock_info,
 };
 
@@ -123,16 +123,12 @@ struct LockData {
 /// The shared, lock-independent pieces used by the dedup worker.
 #[derive(Clone)]
 struct LockerCore {
-    local: Local,
     global: Global,
     tmon: Monitor,
+    reader: Reader,
 }
 
 impl LockerCore {
-    fn reader(&self) -> Reader {
-        Reader::new(self.local.clone(), self.global.clone(), self.tmon.clone())
-    }
-
     async fn do_lock_op(&self, key: &str, req: &LockRequest) -> Result<LockOpResult, StorageError> {
         // A pure create request is self-checking: `write_if_not_exists` fails
         // with a precondition error if the object already exists, so the
@@ -186,7 +182,7 @@ impl LockerCore {
     }
 
     async fn fetch_lock_info(&self, key: &str) -> Result<LockData, StorageError> {
-        let meta = match self.reader().get_metadata(key, META_MAX_STALENESS).await {
+        let meta = match self.reader.get_metadata(key, META_MAX_STALENESS).await {
             Ok(m) => m,
             Err(StorageError::NotFound) => {
                 return Ok(LockData {
@@ -420,12 +416,13 @@ struct LockerState {
 }
 
 impl Locker {
-    /// Creates a locker over local/global storage and the transaction monitor.
-    pub fn new(local: Local, global: Global, tmon: Monitor) -> Self {
+    /// Creates a locker over global storage, the transaction monitor, and a
+    /// reader.
+    pub fn new(global: Global, tmon: Monitor, reader: Reader) -> Self {
         let core = LockerCore {
-            local,
             global,
             tmon: tmon.clone(),
+            reader,
         };
         let stats = Arc::new(Stats::default());
         let worker = LockerWorker {
@@ -672,9 +669,9 @@ mod tests {
     use glassdb_backend::{
         Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId, memory::MemoryBackend,
     };
-    use glassdb_concurr::Background;
+    use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
-    use glassdb_storage::{TLogger, TxCommitStatus, TxLog, TxWrite};
+    use glassdb_storage::{Local, TLogger, TxCommitStatus, TxLog, TxWrite};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -692,7 +689,8 @@ mod tests {
         let tl = TLogger::new(global.clone(), local.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(local.clone(), tl, Arc::downgrade(&bg));
-        let locker = Locker::new(local, global.clone(), mon.clone());
+        let reader = Reader::new(local, global.clone(), mon.clone(), RetryConfig::default());
+        let locker = Locker::new(global.clone(), mon.clone(), reader);
         (
             locker,
             TlCtx {

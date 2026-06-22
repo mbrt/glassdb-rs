@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use glassdb_concurr::RetryConfig;
 use glassdb_data::paths;
 use glassdb_storage::{Global, Local, MAX_STALENESS, StorageError};
 use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
@@ -69,7 +70,10 @@ impl Transaction {
                 inner.reads.insert(p, ReadState::NotFound);
                 Err(Error::NotFound)
             }
-            Err(e) => Err(Error::with_source("reading from storage", e)),
+            // A read is side-effect-free; `from_read` centralizes the mapping
+            // (notably a sustained outage becomes the retry-safe
+            // `Error::Unavailable` rather than `InDoubt`).
+            Err(e) => Err(Error::from_read(e)),
             Ok(rv) => {
                 let mut inner = self.inner.lock().unwrap();
                 inner
@@ -114,9 +118,14 @@ impl Transaction {
         Err(Error::Aborted)
     }
 
-    pub(crate) fn new(global: Global, local: Local, tmon: glassdb_trans::Monitor) -> Self {
+    pub(crate) fn new(
+        global: Global,
+        local: Local,
+        tmon: glassdb_trans::Monitor,
+        retry: RetryConfig,
+    ) -> Self {
         Transaction {
-            reader: Reader::new(local, global, tmon),
+            reader: Reader::new(local, global, tmon, retry),
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }
     }

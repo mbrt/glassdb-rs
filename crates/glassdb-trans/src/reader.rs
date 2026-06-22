@@ -7,11 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{BackendError, Metadata};
+use glassdb_concurr::{RetryConfig, rt};
 use glassdb_storage::{
     Global, Local, LockType, StorageError, TxCommitStatus, Version, tags_lock_info,
 };
 
 use crate::monitor::Monitor;
+
+/// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
+/// outcome before the error is surfaced. Reads are idempotent (ADR-009), so
+/// re-reading is always safe; this recovers transient backend unavailability in
+/// place, mirroring the commit-side in-place retries. The cap keeps a sustained
+/// outage from looping forever — it surfaces as `Unavailable` for the caller to
+/// classify — while a caller `timeout` still bounds the total wait by dropping
+/// the future.
+const READ_UNAVAILABLE_RETRIES: usize = 5;
 
 /// The result of reading a key: the raw value and its storage version.
 #[derive(Debug, Clone, Default)]
@@ -26,20 +36,43 @@ pub struct Reader {
     local: Local,
     global: Global,
     tmon: Monitor,
+    retry: RetryConfig,
 }
 
 impl Reader {
     /// Creates a reader over local/global storage and a monitor.
-    pub fn new(local: Local, global: Global, tmon: Monitor) -> Self {
+    pub fn new(local: Local, global: Global, tmon: Monitor, retry: RetryConfig) -> Self {
         Reader {
             local,
             global,
             tmon,
+            retry,
         }
     }
 
     /// Reads the value for `key`, accepting cached values up to `max_stale`.
+    ///
+    /// A read is idempotent, so a transient in-doubt (`Unavailable`) outcome is
+    /// retried in place with exponential backoff up to
+    /// [`READ_UNAVAILABLE_RETRIES`] times. A persistent outage surfaces the last
+    /// `Unavailable` error for the caller to classify; the caller cancels by
+    /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
     pub async fn read(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
+        let mut backoff = self.retry.backoff();
+        for _ in 0..READ_UNAVAILABLE_RETRIES {
+            match self.read_once(key, max_stale).await {
+                Err(StorageError::Unavailable(_)) => rt::sleep(backoff.next_delay()).await,
+                other => return other,
+            }
+        }
+        // Final attempt: surface whatever it returns, including a persistent
+        // `Unavailable` that the caller maps to `Error::Unavailable`.
+        self.read_once(key, max_stale).await
+    }
+
+    /// A single read attempt: local cache then global storage, resolving
+    /// create-locked keys. Wrapped by [`Reader::read`] for in-place retries.
+    async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
         if let Some(lr) = self.local.read(key, max_stale)
             && !lr.outdated
         {

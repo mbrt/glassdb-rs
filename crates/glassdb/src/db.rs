@@ -10,7 +10,7 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{Global, Local, TLogger};
-use glassdb_trans::{Algo, Gc, Locker, Monitor, TransError};
+use glassdb_trans::{Algo, Gc, Locker, Monitor, Reader, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -123,7 +123,8 @@ impl DatabaseBuilder {
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
         let tmon = Monitor::with_config(local.clone(), tl.clone(), bg_weak.clone(), clock, retry);
-        let locker = Locker::new(local.clone(), global.clone(), tmon.clone());
+        let reader = Reader::new(local.clone(), global.clone(), tmon.clone(), retry);
+        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
         let gc = Gc::new(bg_weak.clone(), tl);
         gc.start();
         let algo = Algo::new(
@@ -133,6 +134,7 @@ impl DatabaseBuilder {
             tmon.clone(),
             gc,
             Some(bg_weak),
+            reader,
         );
 
         let inner = Arc::new(DbInner {
@@ -142,6 +144,7 @@ impl DatabaseBuilder {
             global,
             tmon,
             algo,
+            retry,
             stats: Mutex::new(Stats::default()),
             shutting_down: AtomicBool::new(false),
             tx_in_flight: AtomicUsize::new(0),
@@ -159,6 +162,7 @@ pub(crate) struct DbInner {
     pub(crate) global: Global,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
+    pub(crate) retry: RetryConfig,
     stats: Mutex<Stats>,
     // Graceful-shutdown bookkeeping. `shutting_down` flips first so any
     // subsequent `Database::tx` call rejects with `Error::ShuttingDown`. In-flight
@@ -359,7 +363,12 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let tx = Transaction::new(self.global.clone(), self.local.clone(), self.tmon.clone());
+        let tx = Transaction::new(
+            self.global.clone(),
+            self.local.clone(),
+            self.tmon.clone(),
+            self.retry,
+        );
         let mut handle = None;
         // RAII safety net: if this future is dropped between `algo.begin` and
         // `algo.end` (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),

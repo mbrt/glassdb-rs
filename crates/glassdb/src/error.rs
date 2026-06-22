@@ -32,6 +32,12 @@ pub enum Error {
     /// uncertainty.
     #[error("transaction outcome unknown (in doubt): {0}")]
     InDoubt(String),
+    /// A read (or other idempotent operation) could not complete because
+    /// storage was unavailable, even after the engine exhausted its in-place
+    /// retries. Unlike [`Error::InDoubt`], no mutation is in question — a read
+    /// has no side effects — so the operation is always safe to retry.
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
     /// The database is shutting down and is no longer accepting new
     /// transactions. Existing in-flight transactions are allowed to complete.
     #[error("database is shutting down")]
@@ -67,6 +73,28 @@ impl Error {
         Error::Internal {
             msg: msg.into(),
             source: Some(Cause::new(source)),
+        }
+    }
+
+    /// Maps a storage error produced by a side-effect-free (idempotent) read
+    /// into the public error.
+    ///
+    /// This is the single place the read paths convert their errors, so the
+    /// read-vs-commit distinction lives here rather than being duplicated at
+    /// every call site. The only difference from the blanket [`From`] is the
+    /// `Unavailable` arm: a read puts no mutation in question, so a sustained
+    /// outage is the matchable, retry-safe [`Error::Unavailable`] instead of
+    /// [`Error::InDoubt`].
+    ///
+    /// It must be used *only* for genuine reads. Operations that flow through
+    /// the commit path — including reads that confirm a pending write, such as
+    /// re-reading a transaction's commit status — must keep the conservative
+    /// `Unavailable -> InDoubt` mapping of [`From`], because there a failed read
+    /// inherits the uncertainty of the mutation it was confirming.
+    pub(crate) fn from_read(e: StorageError) -> Self {
+        match e {
+            StorageError::Unavailable(s) => Error::Unavailable(s),
+            other => other.into(),
         }
     }
 }
@@ -153,5 +181,17 @@ mod tests {
         let err = Error::with_source("reading from storage", cause());
         assert_eq!(err.to_string(), "reading from storage");
         assert_eq!(err.source().unwrap().to_string(), "disk on fire");
+    }
+
+    #[test]
+    fn unavailable_displays_its_message() {
+        // The read path surfaces a sustained outage as `Unavailable`, distinct
+        // from the in-doubt mutation case, carrying a human-readable breadcrumb.
+        let err = Error::Unavailable("reading k: gcs status 503".into());
+        assert_eq!(
+            err.to_string(),
+            "storage unavailable: reading k: gcs status 503"
+        );
+        assert!(err.source().is_none());
     }
 }

@@ -151,11 +151,18 @@ impl GcsBackend {
     }
 
     /// Sends `rb`. Cancellation is by dropping the surrounding future.
+    ///
+    /// Only idempotent operations go through `send` (reads, `get_metadata`,
+    /// unconditional write/delete, and list); conditional writes use
+    /// [`Self::send_conditional`]. A transport failure on an idempotent request
+    /// is therefore always safe to retry, so it is reported as `Unavailable`
+    /// rather than a generic `Other` (ADR-009), letting the engine recover a
+    /// transient outage in place.
     async fn send(&self, rb: RequestBuilder) -> Result<reqwest::Response, BackendError> {
         let rb = self.authorize(rb).await?;
         rb.send()
             .await
-            .map_err(|e| BackendError::with_source("gcs request", e))
+            .map_err(|e| BackendError::Unavailable(format!("gcs request transport failure: {e}")))
     }
 
     /// Sends a *conditional* request and maps its outcome with the in-doubt
@@ -531,6 +538,12 @@ impl GcsStatusError {
 }
 
 /// Maps a GCS HTTP status onto a [`BackendError`].
+///
+/// Used only for idempotent requests (reads, `get_metadata`, unconditional
+/// write/delete, list); conditional writes use [`check_conditional_status`].
+/// A `5xx` on an idempotent request is a transient outage that is always safe
+/// to retry (ADR-009), so it surfaces as `Unavailable` rather than a generic
+/// `Other`.
 fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), BackendError> {
     if status.is_success() {
         return Ok(());
@@ -538,6 +551,10 @@ fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), 
     match status {
         StatusCode::NOT_FOUND => Err(BackendError::NotFound),
         StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => Err(BackendError::Precondition),
+        s if s.is_server_error() => Err(BackendError::Unavailable(format!(
+            "{op}({path}): transient server error (gcs status {})",
+            s.as_u16()
+        ))),
         s => Err(GcsStatusError::new(op, path, s).into_backend_error()),
     }
 }

@@ -40,6 +40,8 @@ struct FakeState {
     store: Mutex<Store>,
     /// Number of inserts to apply but answer with `500` (a lost ack).
     lost_ack: Mutex<i64>,
+    /// Number of object GETs to answer with `500` (a transient read outage).
+    read_fault: Mutex<i64>,
 }
 
 struct FakeGcs {
@@ -55,6 +57,7 @@ impl FakeGcs {
                 gen_ctr: 1,
             }),
             lost_ack: Mutex::new(0),
+            read_fault: Mutex::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -93,6 +96,12 @@ impl FakeGcs {
     /// Apply the next `n` inserts but answer them with `500` (a lost ack).
     fn set_lost_ack(&self, n: i64) {
         *self.state.lost_ack.lock().unwrap() = n;
+    }
+
+    /// Answer the next `n` object metadata GETs with `500` (a transient read
+    /// outage), without touching the stored object.
+    fn set_read_fault(&self, n: i64) {
+        *self.state.read_fault.lock().unwrap() = n;
     }
 }
 
@@ -204,6 +213,15 @@ fn insert(
 }
 
 fn get_attrs(state: &FakeState, name: &str) -> Response<Full<Bytes>> {
+    {
+        // Transient read-outage injection: the object is untouched, but the GET
+        // is answered with a 500, modelling a recoverable backend blip.
+        let mut rf = state.read_fault.lock().unwrap();
+        if *rf > 0 {
+            *rf -= 1;
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "backendError");
+        }
+    }
     let store = state.store.lock().unwrap();
     match store.objects.get(name) {
         Some(o) => json_response(StatusCode::OK, resource_json(name, o)),
@@ -766,6 +784,52 @@ async fn clean_conflict_still_precondition() {
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition), "got {err:?}");
+}
+
+// Transient read unavailability: a read is idempotent, so a `5xx` (or transport
+// error) on an idempotent request is always safe to retry (ADR-009). The backend
+// classifies it as `Unavailable` rather than a generic `Other`, so the engine
+// can recover the outage in place.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_server_error_surfaces_unavailable() {
+    let fake = FakeGcs::start().await;
+    let b = backend(&fake);
+    b.write("k", b"v".to_vec(), Tags::new()).await.unwrap();
+
+    // The object stays durable, but the next metadata GET answers 500.
+    fake.set_read_fault(1);
+    let err = b.read("k").await.unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unavailable(_)),
+        "a 5xx on an idempotent read must be Unavailable, got {err:?}"
+    );
+
+    // Once the transient fault clears, the read succeeds against the durable
+    // object — the failure never destroyed any data.
+    let r = b.read("k").await.unwrap();
+    assert_eq!(r.contents, b"v");
+}
+
+#[test]
+fn read_5xx_is_unavailable() {
+    use crate::check_status;
+
+    // A `5xx` on an idempotent request maps to retryable `Unavailable`...
+    for s in [
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        reqwest::StatusCode::BAD_GATEWAY,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let err = check_status(s, "Read", "k").unwrap_err();
+        assert!(
+            matches!(err, BackendError::Unavailable(_)),
+            "status {s} should be Unavailable, got {err:?}"
+        );
+    }
+    // ...but a non-5xx unclassified status stays a generic `Other`.
+    let err = check_status(reqwest::StatusCode::FORBIDDEN, "Read", "k").unwrap_err();
+    assert!(matches!(err, BackendError::Other { .. }), "got {err:?}");
 }
 
 #[test]

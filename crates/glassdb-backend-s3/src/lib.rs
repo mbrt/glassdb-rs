@@ -124,14 +124,18 @@ impl S3Backend {
         aws_sdk_s3::config::Builder::default().retry_config(self.retry.clone())
     }
 
-    /// Awaits an S3 operation and maps SDK errors. Cancellation is by
+    /// Awaits an idempotent S3 operation and maps SDK errors. Used for reads,
+    /// HEADs, and the GET behind `set_tags_if` — never for the conditional-write
+    /// loop, which classifies its own outcomes (see [`S3Backend::put`]). Because
+    /// the request is idempotent, transient failures are surfaced as
+    /// `Unavailable` (retryable) via [`annotate_read`]. Cancellation is by
     /// dropping the surrounding future.
     async fn run<F, T, E>(op: &'static str, path: &str, fut: F) -> Result<T, BackendError>
     where
         F: Future<Output = Result<T, SdkError<E>>>,
         E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
     {
-        fut.await.map_err(|e| annotate(op, path, e))
+        fut.await.map_err(|e| annotate_read(op, path, e))
     }
 
     /// Issues a single PutObject with the given retryer, returning the new
@@ -609,6 +613,28 @@ impl S3RequestError {
             source: Some(Cause::new(self)),
         }
     }
+}
+
+/// Maps an S3 SDK error from an *idempotent* request (reads, HEAD, the GET
+/// behind `set_tags_if`) onto a [`BackendError`].
+///
+/// A transient failure — throttle (`503`/`429`), timeout, dispatch failure, or
+/// `5xx` — is always safe to retry on an idempotent request (ADR-009), so it is
+/// classified as `Unavailable` (retryable in place by the engine) rather than a
+/// generic `Other`. Definitive outcomes (404 -> `NotFound`, 412/409 ->
+/// `Precondition`) keep their meaning via [`annotate`]. This is intentionally
+/// distinct from the conditional-write path, which must not treat a transient
+/// failure that never landed as in-doubt.
+fn annotate_read<E>(op: &'static str, path: &str, e: SdkError<E>) -> BackendError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    if is_throttle(&e) || is_ambiguous(&e) {
+        return BackendError::Unavailable(format!(
+            "{op}({path}): transient backend failure, retryable"
+        ));
+    }
+    annotate(op, path, e)
 }
 
 /// Maps an S3 SDK error onto a [`BackendError`].
