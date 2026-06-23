@@ -1,5 +1,9 @@
 # GlassDB (Rust)
 
+[<img alt="crates.io" src="https://img.shields.io/crates/v/glassdb.svg?style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/glassdb)
+[<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-glassdb-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/glassdb)
+[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/mbrt/glassdb-rs/build.yml?style=for-the-badge" height="20">](https://github.com/mbrt/glassdb-rs/actions?query=branch%3Amain)
+
 Glass DB is a pure Rust key/value store on top of object storage (Amazon S3 or
 Google Cloud Storage) that is _stateless_ and supports _ACID transactions_.
 Clients import Glass DB as a library and don't need to deploy, nor depend on any
