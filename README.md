@@ -55,7 +55,7 @@ async fn main() -> Result<(), glassdb::Error> {
     assert_eq!(v, b"hello");
 
     // Multi-key serializable transaction with automatic conflict retries.
-    // `tx` is an owned handle; write the body as `|tx| async move { ... }`.
+    // `tx` is an owned handle.
     let users = &users;
     db.tx(|tx| async move {
         let cur = match tx.read(users, b"counter").await {
@@ -172,10 +172,95 @@ linearly (See [Performance](#performance)).
 
 ## Performance
 
-**TODO**
+We are obviously bound by object storage's latencies which are typically:
 
-See the [Go version](https://github.com/mbrt/glassdb) for now, which is very
-similar.
+Operation | Size     | Mean (ms) | Std Dev (ms) | Median (ms) | 90th % (ms)
+----------|----------|-----------|--------------|-------------|------------
+Download  |    1 KiB |      57.4 |          6.6 |       56.8  |       64.8
+Download  |  100 KiB |      55.4 |          6.7 |       53.3  |       63.1
+Download  |    1 MiB |      56.7 |          3.8 |       57.7  |       59.9
+Metadata  |    1 KiB |      31.5 |          8.0 |       28.1  |       41.3
+Upload    |    1 KiB |      70.4 |         17.3 |       64.7  |       88.8
+Upload    |  100 KiB |      88.9 |         14.6 |       83.1  |      105.0
+Upload    |    1 MiB |     117.5 |         12.6 |      115.9  |      131.0
+
+This is a lot slower than most databases, but still has a few advantages:
+
+1. Throughput: we can leverage object storage scalability by reading and writing
+   many objects in parallel. In this way we can perform many transactions per
+   second (scale linearly). We would only be limited by bandwidth (see [GCS
+   quotas](https://cloud.google.com/storage/quotas#bandwidth)).
+
+1. Size scalability: object storage scales to petabytes and probably more, as
+   cloud providers keep working on making them faster and more scalable.
+
+See how this translates in a dataset of 50k keys, where we vary the number of
+concurrent clients. Each client DB is performing 10 transactions in parallel,
+split in this way:
+
+* 10% updates (i.e. read + write) two separate random keys.
+* 60% strong reads to two separate random keys.
+* 30% weak reads to one random key (max staleness of 10s).
+
+For example, with 5 concurrent DBs we would have 50 parallel transactions at
+every moment.
+
+We did all the tests below by using Google Cloud Storage as a backend.
+
+### Throughput
+
+Glass DB's throughput scales mostly linearly with the number of concurrent
+clients and transactions:
+
+![](docs/img/tx-throughput.png)
+
+The graph shows separately the three different types of transactions, where the
+bold line is the median number of transactions per second and the error band
+includes the 10th and 90th percentiles.
+
+As you can see the median throughput increases linearly (better for reads than
+for writes), touching 2.5k transactions per second with 500 concurrent clients.
+
+To note also the slight performance degradation at the 10th percentile with more
+than 30 concurrent DBs. This is due to the increased probability of conflicts
+between transactions (e.g. when writers race each other).
+
+See the transaction retries below, hurting performance at the higher
+percentiles:
+
+![](docs/img/retries.png)
+
+Since each transaction operates on multiple keys, here is for completeness the
+graph of those. Each operation is a key being read or written:
+
+![](docs/img/ops-latency.png)
+
+It's interesting to see that weak reads are losing against strong reads in this
+benchmark, for several reasons:
+
+* Given the uniform distribution of reads, it's unlikely that a weak read will
+  hit the same key twice within the 10 seconds allowed staleness time frame.
+* Weak reads are currently translated into strong reads when the value is not
+  present in cache.
+* Strong reads operate on two keys in the same transactions, weak reads are a
+  "single shot".
+
+Taken all together this means that weak reads in this case translate mostly into
+strong reads on a single key. These tend to perform worse (in terms of
+throughput) than reading two keys per transactions, because they can be done in
+parallel. The advantage of weak reads in this case comes with less sensitivity
+to retries, as you can see from the lower variability at higher percentiles.
+
+### Latency
+
+Latency is not Glass DB's forte, but you can see below that it stays mostly flat
+as we increase the number of concurrent clients and transactions:
+
+![](docs/img/tx-latency.png)
+
+Here the effects of the retries is more noticeable at higher percentiles, as
+expected. Some transactions will start taking longer, as they have to drop their
+work and restart after a conflict.
 
 ## Development
 
@@ -183,9 +268,7 @@ similar.
 cargo build --workspace
 make test     # fmt --check + clippy -D warnings + cargo test
 make test-sim # tests under the deterministic simulation executor (+ fuzz-corpus replay)
-make test-all # test + test-sim
-make format   # cargo fmt --all
-make lint     # fmt --check + clippy -D warnings
+make fuzz     # fuzz testing under DST. See Makefile for longer sweeps
 ```
 
 Updating `glassdb-proto` protos require the Protocol Buffers compiler
@@ -200,5 +283,7 @@ details.
 
 ## Design notes
 
-See [PORTING.md](PORTING.md) for the design decisions behind the implementation
-(concurrency model, time/determinism, error handling, and encoding fidelity).
+See [architecture.md](docs/architecture.md) for the design decisions behind the
+implementation (concurrency model, time/determinism, error handling, and
+encoding fidelity), and [PORTING.md](PORTING.md) for the Go porting related
+tradeoffs.
