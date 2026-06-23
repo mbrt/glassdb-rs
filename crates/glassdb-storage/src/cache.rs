@@ -4,10 +4,10 @@
 //! The cache is partitioned into independent shards, each with its own lock and
 //! byte budget, to reduce lock contention on this hot DB-level structure.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use glassdb_concurr::shard::{self, Sharded};
+use hashlink::LinkedHashMap;
 
 /// Implemented by cached values to report their size in bytes.
 pub trait Weighable {
@@ -17,27 +17,17 @@ pub trait Weighable {
 struct Inner<V> {
     max_size_b: usize,
     curr_size_b: usize,
-    map: HashMap<String, V>,
-    /// Most-recently-used at index 0, least-recently-used at the end.
-    order: Vec<String>,
+    /// Entries in LRU order: the front is least-recently-used, the back is
+    /// most-recently-used. The linked list gives O(1) recency refresh and
+    /// eviction, and eviction follows that list order (not the hash buckets),
+    /// so behavior is independent of the hasher.
+    map: LinkedHashMap<String, V>,
 }
 
 impl<V: Weighable + Clone> Inner<V> {
-    fn move_to_front(&mut self, key: &str) {
-        if let Some(pos) = self.order.iter().position(|k| k == key)
-            && pos != 0
-        {
-            let k = self.order.remove(pos);
-            self.order.insert(0, k);
-        }
-    }
-
     fn delete_entry(&mut self, key: &str) {
         if let Some(v) = self.map.remove(key) {
             self.curr_size_b = self.curr_size_b.saturating_sub(v.size_b());
-            if let Some(pos) = self.order.iter().position(|k| k == key) {
-                self.order.remove(pos);
-            }
         }
     }
 
@@ -49,15 +39,13 @@ impl<V: Weighable + Clone> Inner<V> {
             // immediately, defeating the write and breaking callers that read
             // back their own writes. Overshoot is bounded to one entry per
             // shard.
-            if self.order.len() <= 1 {
+            if self.map.len() <= 1 {
                 return;
             }
-            let Some(key) = self.order.pop() else {
+            let Some((_, v)) = self.map.pop_front() else {
                 return;
             };
-            if let Some(v) = self.map.remove(&key) {
-                self.curr_size_b = self.curr_size_b.saturating_sub(v.size_b());
-            }
+            self.curr_size_b = self.curr_size_b.saturating_sub(v.size_b());
         }
     }
 }
@@ -75,20 +63,16 @@ impl<V: Weighable + Clone> CacheShard<V> {
             inner: Mutex::new(Inner {
                 max_size_b,
                 curr_size_b: 0,
-                map: HashMap::new(),
-                order: Vec::new(),
+                map: LinkedHashMap::new(),
             }),
         }
     }
 
     fn get(&self, key: &str) -> Option<V> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.map.contains_key(key) {
-            inner.move_to_front(key);
-            inner.map.get(key).cloned()
-        } else {
-            None
-        }
+        // `to_back` moves the entry to the most-recently-used position and
+        // returns it to clone.
+        inner.map.to_back(key).cloned()
     }
 
     fn set(&self, key: &str, val: V) {
@@ -100,33 +84,23 @@ impl<V: Weighable + Clone> CacheShard<V> {
         F: FnOnce(Option<V>) -> Option<V>,
     {
         let mut inner = self.inner.lock().unwrap();
-        if inner.map.contains_key(key) {
-            inner.move_to_front(key);
-            let old = inner.map.get(key).cloned().unwrap();
-            let old_size = old.size_b();
-            match f(Some(old)) {
-                None => {
-                    inner.delete_entry(key);
-                    return;
-                }
-                Some(newv) => {
-                    let new_size = newv.size_b();
-                    inner.curr_size_b =
-                        (inner.curr_size_b as i64 + new_size as i64 - old_size as i64) as usize;
-                    inner.map.insert(key.to_string(), newv);
-                }
+        let old = inner.map.get(key).cloned();
+        let old_size = old.as_ref().map_or(0, Weighable::size_b);
+        match f(old) {
+            None => {
+                // Remove an existing entry, or leave an absent one absent.
+                inner.delete_entry(key);
             }
-        } else {
-            match f(None) {
-                None => return,
-                Some(newv) => {
-                    inner.curr_size_b += newv.size_b();
-                    inner.order.insert(0, key.to_string());
-                    inner.map.insert(key.to_string(), newv);
-                }
+            Some(newv) => {
+                let new_size = newv.size_b();
+                inner.curr_size_b =
+                    (inner.curr_size_b as i64 + new_size as i64 - old_size as i64) as usize;
+                // `insert` appends at the back (most-recently-used) and, for an
+                // existing key, moves it there while replacing the value.
+                inner.map.insert(key.to_string(), newv);
+                inner.remove_oldest();
             }
         }
-        inner.remove_oldest();
     }
 
     fn delete(&self, key: &str) {
