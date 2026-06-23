@@ -15,10 +15,20 @@ glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
 glassdb-data = { version = "0.1.0", path = "../glassdb-data" }
 glassdb-proto = { version = "0.1.0", path = "../glassdb-proto" }
+hashlink = "0.12.0"
 prost = "0.14.3"
 prost-types = "0.14.3"
 thiserror = "2.0.18"
 tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
+
+# Cache microbenchmarks. `harness = false` lets criterion own `main`; `test =
+# false` keeps `cargo test` (and the test-sim run) from executing it — run it
+# with `cargo bench`.
+[[bench]]
+name = "cache"
+harness = false
+test = false
