@@ -33,7 +33,9 @@
 #   --version X.Y.Z  set an exact version instead of the auto-computed bump
 #
 # Environment / tools:
-#   CARGO_REGISTRY_TOKEN  crates.io token (real releases only)
+#   CARGO_REGISTRY_TOKEN  crates.io token used by `cargo publish` (real releases);
+#                         optional if you've already run `cargo login`. If absent
+#                         and not logged in, `cargo publish` just fails.
 #   gh                    GitHub CLI, authenticated (for the GitHub release)
 #   release-plz           auto-installed via `cargo install` if missing
 
@@ -50,6 +52,12 @@ usage() {
 die() {
 	echo "error: $*" >&2
 	exit 1
+}
+
+# The published crates, one per line, read from release-plz.toml -- the single
+# source of truth for the published package set (see its [[package]] entries).
+published_pkgs() {
+	grep -E '^name = ' release-plz.toml | sed -E 's/^name = "([^"]+)".*/\1/'
 }
 
 DRY_RUN=true
@@ -91,8 +99,6 @@ if ! command -v release-plz >/dev/null 2>&1; then
 fi
 
 if [ "$DRY_RUN" = false ]; then
-	[ -n "${CARGO_REGISTRY_TOKEN:-}" ] ||
-		die "CARGO_REGISTRY_TOKEN is not set (needed to publish to crates.io)"
 	git remote get-url origin >/dev/null 2>&1 ||
 		die "no 'origin' git remote (needed to push the commit, tag, and release)"
 	git fetch --quiet origin main || die "git fetch origin main failed"
@@ -120,9 +126,8 @@ fi
 
 echo "==> bumping versions"
 if [ -n "$FORCE_VERSION" ]; then
-	# Force an exact version on every published crate (lockstep). The package
-	# list is read from release-plz.toml so it stays the single source of truth.
-	mapfile -t pkgs < <(grep -E '^name = ' release-plz.toml | sed -E 's/^name = "([^"]+)".*/\1/')
+	# Force an exact version on every published crate (lockstep).
+	mapfile -t pkgs < <(published_pkgs)
 	[ "${#pkgs[@]}" -gt 0 ] || die "no published packages found in release-plz.toml"
 	specs=()
 	for p in "${pkgs[@]}"; do
@@ -144,6 +149,17 @@ git --no-pager diff -- '**/Cargo.toml' Cargo.toml Cargo.lock || true
 # --- Dry run stops here -----------------------------------------------------
 
 if [ "$DRY_RUN" = true ]; then
+	# Verification reuses cached builds keyed by package id (name + version),
+	# not source contents. An earlier dry-run at this same version can leave a
+	# stale compiled crate that `cargo publish` silently reuses, so the verify
+	# may pass or fail against outdated code. Drop just the workspace crates'
+	# artifacts (third-party deps stay cached) to force a recompile from source.
+	echo "==> dry run: cleaning workspace crate artifacts before verify"
+	clean_args=()
+	while IFS= read -r p; do clean_args+=(--package "$p"); done < <(published_pkgs)
+	[ "${#clean_args[@]}" -gt 0 ] || die "no published packages found in release-plz.toml"
+	cargo clean "${clean_args[@]}"
+
 	echo "==> dry run: cargo publish --workspace --dry-run"
 	cargo publish --workspace --dry-run --allow-dirty
 	echo "==> reverting working-tree changes from dry run"
