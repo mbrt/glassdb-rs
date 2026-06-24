@@ -19,17 +19,24 @@ collection acting as a content-CAS coordination directory in place of per-object
 tags. No object tags anywhere.
 
 - **Objects** —
-  - *Collection root* (`_i`): existence + the constant shard count.
+  - *Collection root* (`_i`): existence + constant shard count + subcollection
+    list. The membership-coordination point — create/delete lock it; listing
+    OCC-validates it (read-lock under contention).
   - *Shard* (`_s/<i>`, `C` per collection): lock table + MVCC version index +
-    key directory; the unit of CAS (`If-Match`).
+    per-shard key directory; the unit of CAS (`If-Match`). Read/write of an
+    existing key touches only its shard.
   - *Transaction* (`_t/<txid>`): unified; pending (small: lease + lock
     intentions) → committed (fat: value map) → aborted.
 - **Protocol** — execute → validate+lock (one shard GET + one CAS per shard) →
   commit (CAS the transaction object to committed, attaching values) → async
   per-shard write-back (publish current-writer pointers + release locks).
+- **Membership** — key create/delete write-lock the collection root (phantom
+  prevention) and CAS the key's shard; listing OCC-validates the root version and
+  enumerates, falling back to a root read lock under contention. Subcollections
+  are listed from the root.
 - **Reads** — shard (conditional GET) → current-writer txid → value from the
-  immutable transaction object (cacheable indefinitely). Read-only stays
-  lock-free.
+  immutable transaction object (cacheable indefinitely). Read/write of an
+  existing key needs no root lock; read-only stays lock-free.
 - **GC** — mark-sweep; live set = `current-writer ∪ locked-by` across shards.
 - **Backend trait** — `read / write / write_if / write_if_not_exists / delete /
   list` (tags, nonce, `set_tags_if`, `read_if_modified`, `delete_if` all gone).
@@ -42,8 +49,8 @@ per-decision ADRs.
 - Full redesign; format **replaced wholesale** (S3 + GCS); Go on-disk
   compatibility dropped.
 - Values live **only in unified transaction objects**.
-- **Fixed compile-time `C`** shards per collection (not configurable);
-  split-resharding deferred to v2.
+- **Fixed compile-time `C`** shards per collection (`C = 1024`, not
+  configurable); split-resharding deferred to v2.
 - **Mark-sweep GC** in the MVP; explicit liveness counter and compaction
   deferred.
 
@@ -70,27 +77,33 @@ per-decision ADRs.
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 017).
+Each design decision becomes its own ADR (next free number is 018).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
-  layout.** The umbrella decision: move coordination state from tags
+  layout.** ✅ Written. The umbrella decision: move coordination state from tags
   into content; MVCC + S2PL on a sharded directory; the three-object model;
   wholesale format replacement.
-- **ADR-017 — Sharded coordination directory.** Shards as lock table + version
-  index + key directory; fixed compile-time `C`; key→shard hashing; resharding
-  deferred. Phantom prevention via shard CAS (replaces the collection-info lock).
-- **ADR-018 — Values in unified transaction objects.** Why values live in the
+- **[ADR-017](adr/017-shard-object.md) — Shard object: model, mapping,
+  encoding.** ✅ Written. The shard's data model (per-key lock state +
+  current-writer + tombstone), key→shard mapping (`C = 1024`, FNV-1a), the `_s`
+  path, the protobuf encoding, and the pure read-side lookup. Deliberately inert
+  (no mutation policy, no I/O) so it can be implemented and unit-tested in
+  isolation — the first verifiable increment.
+- **ADR-018 — Collection root & membership.** Collection root as the lock for
+  key create/delete and the OCC token for listing (read-lock fallback), and the
+  home of the subcollection list; cross-shard snapshot consistency.
+- **ADR-019 — Values in unified transaction objects.** Why values live in the
   transaction object; why it stays unified (status + values) rather than split;
   the pending → committed → aborted lifecycle and the commit point.
-- **ADR-019 — Commit & write-back protocol.** Validate+lock as per-shard CAS,
+- **ADR-020 — Commit & write-back protocol.** Validate+lock as per-shard CAS,
   commit CAS, async per-shard write-back; the cross-shard non-atomicity argument.
-- **ADR-020 — Wound-wait & leases at shard granularity.** How wound/expiry
+- **ADR-021 — Wound-wait & leases at shard granularity.** How wound/expiry
   relocate from log tags to the transaction object; interplay with `locked-by` in
   shards. Re-frames [ADR-002](adr/002-wound-wait-locking.md) for the new layout.
-- **ADR-021 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
+- **ADR-022 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
   locked-by`; the commit→write-back gap; deferral of the explicit counter and
   compaction.
-- **ADR-022 — Slimmed `Backend` trait.** The reduced surface; removal of tags /
+- **ADR-023 — Slimmed `Backend` trait.** The reduced surface; removal of tags /
   nonce / `delete_if`; content CAS as the only coordination primitive. Relates to
   [ADR-009](adr/009-in-doubt-conditional-writes.md) for in-doubt parity at the
   new CAS sites.
@@ -99,16 +112,16 @@ Each design decision becomes its own ADR (next free number is 017).
 
 Group A — layout & encoding:
 
-- [ ] Concrete value of the constant `C` (working proposal: `1024`; ~50 keys/
-      shard and a few-KB shards at the 50k-key benchmark; ceiling ≈ 256k keys at
-      a ~256-key/shard soft cap). The one number to bikeshed.
-- [ ] Key→shard hash function (deterministic & stable across processes and under
-      `--cfg sim`; non-crypto, over raw key bytes).
-- [ ] On-disk encoding of shards (entry layout, ordering, size budget per shard).
+- [x] Concrete value of the constant `C` — `1024` (ADR-017).
+- [x] Key→shard hash function — FNV-1a over raw key bytes, masked to `C`
+      (ADR-017).
+- [x] On-disk encoding of shards — protobuf, entries sorted by key, golden-
+      anchored (ADR-017).
+- [x] Path type marker for shards — `_s` (ADR-017).
 - [ ] On-disk encoding of the unified transaction object (pending vs committed
       forms; value-map representation; reuse `glassdb-proto` or a new schema?).
-- [ ] Collection-root format and how the shard count is recorded/validated.
-- [ ] Path type markers for shards (`_s`?) and any changes to `paths` encoding.
+- [ ] Collection-root format: shard count, subcollection list, and membership
+      lock/version state; how the shard count is recorded/validated (ADR-018).
 
 Group B — protocol details:
 
@@ -124,13 +137,20 @@ Group B — protocol details:
       commit CAS, write-once blob) — confirm ADR-009 reasoning carries over.
 - [ ] Single-RW and read-only fast-path shapes in the new layout.
 
-Group C — listing, snapshots, phantoms:
+Group C — listing, snapshots, phantoms (the collection root is the coordination
+point; see ADR-018):
 
-- [ ] `list` / iteration: reading the `C` shards and unioning key directories;
-      cross-shard snapshot consistency (read-set validation, cf. the cycle
-      observer).
-- [ ] Phantom prevention: create/delete as shard CAS; interaction with the
-      collection root.
+- [ ] Where the key directory physically lives: per-shard (listing reads the `C`
+      shards and unions them) vs centralized in the root. Working assumption:
+      sharded, with the root version as the single OCC token for membership
+      changes.
+- [ ] `list` / iteration: OCC-validate the root version, enumerate, fall back to
+      a root read lock under contention; cross-shard snapshot consistency
+      (read-set validation, cf. the cycle observer).
+- [ ] Create/delete: write-lock the root (phantom prevention) + CAS the key's
+      shard; how the root version bumps to invalidate concurrent listers.
+- [ ] Subcollection list in the root: encoding and create/delete/list semantics
+      for nested collections.
 
 Group D — GC & lifecycle:
 
