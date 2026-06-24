@@ -40,12 +40,17 @@ Three object kinds (details in the follow-on ADRs):
 - **Shard** — a fixed number `C` of objects per collection form the coordination
   directory. Each shard owns a hash-range of keys and is simultaneously the
   **lock table**, the **MVCC version index** (current-writer txid per key), and
-  the **key directory**. It is the unit of CAS.
+  the **per-shard key directory** (which of its keys exist). It is the unit of
+  CAS; reading or writing an *existing* key touches only its shard.
 - **Transaction object** — unified; small while pending (lease + lock
   intentions), fat once committed (it then carries the transaction's written
   values). Values live *only* here; there are no per-key value objects.
-- **Collection root** — small; records collection existence and the (constant)
-  shard count.
+- **Collection root** — small; records collection existence, the (constant)
+  shard count, and the **list of subcollections**. It is the
+  **membership-coordination point**: key creation and deletion take a write lock
+  on it so the key set changes consistently (phantom prevention), and key /
+  subcollection listing validates against its version optimistically, taking a
+  read lock only under contention.
 
 Isolation remains **strict serializable**, enforced by the same S2PL +
 wound-wait protocol ([ADR-002](002-wound-wait-locking.md)) relocated to shard
@@ -80,6 +85,10 @@ and the overall effort, staging, and open questions are tracked in
   shard for the current writer, then materializes the value from that immutable
   transaction object. Co-located keys share one shard read, and immutable value
   blobs are cacheable indefinitely.
+- Key creation and deletion serialize on the collection root (the membership
+  lock), as in the current design; reads and writes of *existing* keys do not, so
+  the hot path is unaffected. Listing is optimistic against the root version,
+  with a read-lock fallback under contention.
 - Garbage collection becomes a reachability problem — a transaction object is
   live while any shard references its txid — handled by mark-sweep in the MVP.
 - Dropping Go format compatibility means regenerating the golden vectors and
