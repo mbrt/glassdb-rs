@@ -77,7 +77,7 @@ per-decision ADRs.
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 019).
+Each design decision becomes its own ADR (next free number is 020).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -97,9 +97,13 @@ Each design decision becomes its own ADR (next free number is 019).
   its version (read-lock fallback). Key directory stays sharded; the root version
   summarizes the whole cross-shard membership read set. Atomic sequencing deferred
   to ADR-020.
-- **ADR-019 — Values in unified transaction objects.** Why values live in the
-  transaction object; why it stays unified (status + values) rather than split;
-  the pending → committed → aborted lifecycle and the commit point.
+- **[ADR-019](adr/019-unified-transaction-object.md) — Values in unified
+  transaction objects.** ✅ Written. Values live only in the `_t/<txid>` object
+  (shards point via `current_writer`); the object is unified (status + values, no
+  split), with a pending (lease + lock intentions) → committed (fat value map) →
+  aborted lifecycle whose commit point is the single flip-to-committed CAS.
+  Encoding evolves `TransactionLog`. Sequencing deferred to ADR-020, lease to
+  ADR-021.
 - **ADR-020 — Commit & write-back protocol.** Validate+lock as per-shard CAS,
   commit CAS, async per-shard write-back; the cross-shard non-atomicity argument.
 - **ADR-021 — Wound-wait & leases at shard granularity.** How wound/expiry
@@ -123,8 +127,9 @@ Group A — layout & encoding:
 - [x] On-disk encoding of shards — protobuf, entries sorted by key, golden-
       anchored (ADR-017).
 - [x] Path type marker for shards — `_s` (ADR-017).
-- [ ] On-disk encoding of the unified transaction object (pending vs committed
-      forms; value-map representation; reuse `glassdb-proto` or a new schema?).
+- [x] On-disk encoding of the unified transaction object (pending vs committed
+      forms; value-map representation; evolve the `glassdb-proto` `TransactionLog`
+      message) — ADR-019; lease field pinned by ADR-021.
 - [x] Collection-root format: shard count, subcollection list, and membership
       lock/version state; how the shard count is recorded/validated (ADR-018).
 
