@@ -2,7 +2,12 @@
 
 ## Status
 
-Proposed
+Accepted — implemented. `glassdb-data::shard` (`SHARD_COUNT`, `shard_index`,
+`shard_path`) and `glassdb-data::paths` (`_s` marker, `from_shard` / `to_shard` /
+`shards_prefix`); the `Shard` / `ShardEntry` type with protobuf encode/decode and
+`lookup` in `glassdb-storage::shard` (proto message in
+`glassdb-proto/proto/transaction.proto`). Covered by round-trip, determinism,
+distribution, and golden-vector tests.
 
 ## Context
 

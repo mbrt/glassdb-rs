@@ -13,10 +13,12 @@ pub enum Type {
     Collection,
     Transaction,
     CollectionInfo,
+    Shard,
 }
 
 impl Type {
-    /// Returns the path type marker string (`_k`, `_c`, `_t`, `_i`, or `""`).
+    /// Returns the path type marker string (`_k`, `_c`, `_t`, `_i`, `_s`, or
+    /// `""`).
     pub fn as_str(self) -> &'static str {
         match self {
             Type::Unknown => "",
@@ -24,6 +26,7 @@ impl Type {
             Type::Collection => "_c",
             Type::Transaction => "_t",
             Type::CollectionInfo => "_i",
+            Type::Shard => "_s",
         }
     }
 }
@@ -117,6 +120,42 @@ pub fn to_transaction(suffix: &str) -> Result<TxId, PathError> {
     Ok(TxId::from_bytes(decode(Type::Transaction, suffix)?))
 }
 
+/// Returns the storage path for shard `index` under `prefix`.
+///
+/// The index is a fixed-width zero-padded decimal so shard paths are a stable,
+/// lexicographically ordered function of the index (ADR-017).
+pub fn from_shard(prefix: &str, index: u32) -> String {
+    debug_assert!(
+        index < crate::shard::SHARD_COUNT,
+        "shard index {index} out of range"
+    );
+    format!(
+        "{}/{}/{:0width$}",
+        prefix,
+        Type::Shard.as_str(),
+        index,
+        width = crate::shard::SHARD_INDEX_WIDTH
+    )
+}
+
+/// Decodes a shard index from a storage path suffix (e.g. `_s/0042`).
+pub fn to_shard(suffix: &str) -> Result<u32, PathError> {
+    let pfx = format!("{}/", Type::Shard.as_str());
+    let rest = suffix
+        .strip_prefix(&pfx)
+        .ok_or_else(|| PathError::WrongPrefix {
+            suffix: suffix.to_string(),
+            expected: Type::Shard.as_str().to_string(),
+        })?;
+    rest.parse()
+        .map_err(|_| PathError::Parse(suffix.to_string()))
+}
+
+/// Returns the listing prefix for all shards under `prefix`.
+pub fn shards_prefix(prefix: &str) -> String {
+    typed_prefix(prefix, Type::Shard)
+}
+
 /// Splits a storage path into its prefix, type, and suffix components.
 pub fn parse(p: &str) -> Result<ParseResult, PathError> {
     if is_collection_info(p) {
@@ -135,6 +174,7 @@ pub fn parse(p: &str) -> Result<ParseResult, PathError> {
         "_k" => Type::Key,
         "_c" => Type::Collection,
         "_t" => Type::Transaction,
+        "_s" => Type::Shard,
         _ => Type::Unknown,
     };
     Ok(ParseResult {
@@ -216,6 +256,30 @@ mod tests {
     fn keys_prefix_format() {
         assert_eq!(keys_prefix("db/coll"), "db/coll/_k/");
         assert_eq!(collections_prefix("db/coll"), "db/coll/_c/");
+        assert_eq!(shards_prefix("db/coll"), "db/coll/_s/");
+    }
+
+    #[test]
+    fn shard_round_trip() {
+        let p = from_shard("db/coll", 42);
+        assert_eq!(p, "db/coll/_s/0042");
+        let r = parse(&p).unwrap();
+        assert_eq!(r.prefix, "db/coll");
+        assert_eq!(r.typ, Type::Shard);
+        assert_eq!(r.suffix, "0042");
+        assert_eq!(to_shard(&format!("_s/{}", r.suffix)).unwrap(), 42);
+    }
+
+    #[test]
+    fn to_shard_errors() {
+        assert!(matches!(
+            to_shard("_k/0042"),
+            Err(PathError::WrongPrefix { .. })
+        ));
+        assert!(matches!(
+            to_shard("_s/notanumber"),
+            Err(PathError::Parse(_))
+        ));
     }
 
     // Golden vectors produced by the Go implementation, to guarantee

@@ -51,3 +51,23 @@ message Lock {
     string suffix = 1;
     LockType lock_type = 2;
 }
+
+// A shard object: the coordination directory (lock table, MVCC current-writer
+// index, and key directory) for the keys that map to it. See ADR-017.
+message Shard {
+    repeated ShardEntry entries = 1;
+}
+
+message ShardEntry {
+    // Raw user key bytes; also the entry's sort key.
+    bytes key = 1;
+    // Lock currently held on the key.
+    Lock.LockType lock_type = 2;
+    // Transactions holding the lock (more than one only for read locks).
+    repeated bytes locked_by = 3;
+    // Transaction object holding the committed value (the MVCC pointer); empty
+    // if the key has no committed value yet.
+    bytes current_writer = 4;
+    // Tombstone flag.
+    bool deleted = 5;
+}
