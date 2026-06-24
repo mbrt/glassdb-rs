@@ -77,7 +77,7 @@ per-decision ADRs.
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 018).
+Each design decision becomes its own ADR (next free number is 019).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -90,9 +90,13 @@ Each design decision becomes its own ADR (next free number is 018).
   Deliberately inert (no mutation policy, no I/O) so it can be implemented and
   unit-tested in isolation — the first verifiable increment. Landed in
   `glassdb-data::shard` / `paths` and `glassdb-storage::shard`.
-- **ADR-018 — Collection root & membership.** Collection root as the lock for
-  key create/delete and the OCC token for listing (read-lock fallback), and the
-  home of the subcollection list; cross-shard snapshot consistency.
+- **[ADR-018](adr/018-collection-root-membership.md) — Collection root &
+  membership.** ✅ Written. Collection root (`_i`, `CollectionRoot` protobuf:
+  shard count + subcollection list + membership lock) as the membership-
+  coordination point: create/delete take its write lock, listing OCC-validates
+  its version (read-lock fallback). Key directory stays sharded; the root version
+  summarizes the whole cross-shard membership read set. Atomic sequencing deferred
+  to ADR-020.
 - **ADR-019 — Values in unified transaction objects.** Why values live in the
   transaction object; why it stays unified (status + values) rather than split;
   the pending → committed → aborted lifecycle and the commit point.
@@ -121,7 +125,7 @@ Group A — layout & encoding:
 - [x] Path type marker for shards — `_s` (ADR-017).
 - [ ] On-disk encoding of the unified transaction object (pending vs committed
       forms; value-map representation; reuse `glassdb-proto` or a new schema?).
-- [ ] Collection-root format: shard count, subcollection list, and membership
+- [x] Collection-root format: shard count, subcollection list, and membership
       lock/version state; how the shard count is recorded/validated (ADR-018).
 
 Group B — protocol details:
@@ -141,17 +145,17 @@ Group B — protocol details:
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):
 
-- [ ] Where the key directory physically lives: per-shard (listing reads the `C`
-      shards and unions them) vs centralized in the root. Working assumption:
-      sharded, with the root version as the single OCC token for membership
-      changes.
-- [ ] `list` / iteration: OCC-validate the root version, enumerate, fall back to
-      a root read lock under contention; cross-shard snapshot consistency
-      (read-set validation, cf. the cycle observer).
-- [ ] Create/delete: write-lock the root (phantom prevention) + CAS the key's
-      shard; how the root version bumps to invalidate concurrent listers.
-- [ ] Subcollection list in the root: encoding and create/delete/list semantics
-      for nested collections.
+- [x] Where the key directory physically lives: per-shard (listing reads the `C`
+      shards and unions them), with the root version as the single OCC token for
+      membership changes (ADR-018).
+- [x] `list` / iteration: OCC-validate the root version, enumerate, fall back to
+      a root read lock under contention; cross-shard snapshot consistency via the
+      root version summarizing the membership read set (ADR-018).
+- [x] Create/delete: write-lock the root (phantom prevention) + CAS the key's
+      shard; every membership change writes the root, so its version bumps to
+      invalidate concurrent listers (ADR-018).
+- [x] Subcollection list in the root: authoritative directory, OCC-listed; add/
+      remove under the root membership write lock (ADR-018; teardown → ADR-022).
 
 Group D — GC & lifecycle:
 
