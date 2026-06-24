@@ -84,11 +84,12 @@ Each design decision becomes its own ADR (next free number is 018).
   into content; MVCC + S2PL on a sharded directory; the three-object model;
   wholesale format replacement.
 - **[ADR-017](adr/017-shard-object.md) — Shard object: model, mapping,
-  encoding.** ✅ Written. The shard's data model (per-key lock state +
-  current-writer + tombstone), key→shard mapping (`C = 1024`, FNV-1a), the `_s`
-  path, the protobuf encoding, and the pure read-side lookup. Deliberately inert
-  (no mutation policy, no I/O) so it can be implemented and unit-tested in
-  isolation — the first verifiable increment.
+  encoding.** ✅ Written & implemented. The shard's data model (per-key lock
+  state + current-writer + tombstone), key→shard mapping (`C = 1024`, FNV-1a),
+  the `_s` path, the protobuf encoding, and the pure read-side lookup.
+  Deliberately inert (no mutation policy, no I/O) so it can be implemented and
+  unit-tested in isolation — the first verifiable increment. Landed in
+  `glassdb-data::shard` / `paths` and `glassdb-storage::shard`.
 - **ADR-018 — Collection root & membership.** Collection root as the lock for
   key create/delete and the OCC token for listing (read-lock fallback), and the
   home of the subcollection list; cross-shard snapshot consistency.
