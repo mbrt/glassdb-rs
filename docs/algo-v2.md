@@ -77,7 +77,7 @@ per-decision ADRs.
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 021).
+Each design decision becomes its own ADR (next free number is 022).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -111,9 +111,16 @@ Each design decision becomes its own ADR (next free number is 021).
   writer / help-forward resolution; cross-shard non-atomicity gated on the commit
   object; serial sorted-by-path deadlock fallback; in-doubt parity at every CAS
   site; read-only and single-RW fast paths. Lease → ADR-021, GC → ADR-022.
-- **ADR-021 — Wound-wait & leases at shard granularity.** How wound/expiry
-  relocate from log tags to the transaction object; interplay with `locked-by` in
-  shards. Re-frames [ADR-002](adr/002-wound-wait-locking.md) for the new layout.
+- **[ADR-021](adr/021-wound-wait-leases-shard.md) — Wound-wait & leases at shard
+  granularity.** ✅ Written. The lease is the transaction object's existing
+  `timestamp` (no new field): last-refresh while pending, commit-time once
+  committed, expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`. Reclaiming a
+  conflicting `locked-by` entry combines wound-wait priority with the lease (wound
+  if older *or* expired), uniformly for shard entries and the root membership lock;
+  missing objects get the relocated `handle_unknown_tx` grace period. Discovery is
+  lazy via `locked-by` (no pending registry); reads never consult the lease; abort
+  CAS keeps ADR-009 in-doubt parity. Re-frames
+  [ADR-002](adr/002-wound-wait-locking.md) for the new layout.
 - **ADR-022 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
   locked-by`; the commit→write-back gap; deferral of the explicit counter and
   compaction.
@@ -147,9 +154,10 @@ Group B — protocol details:
       help-forward) (ADR-020).
 - [x] Deadlock fallback: serial sorted-by-object-path locking; equal-priority via
       the serial path (ADR-020, reusing ADR-002).
-- [ ] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
-      timeout constants (ADR-021). Creation point (pending object at prepare) is
-      ADR-020.
+- [x] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
+      timeout constants — lease is the object `timestamp`, refresh every
+      `PENDING_TX_TIMEOUT/2`, reclaim if older-or-expired (ADR-021). Creation point
+      (pending object at prepare) is ADR-020.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS, single-RW) — ADR-009
       carries over (ADR-020).
@@ -173,8 +181,9 @@ point; see ADR-018):
 Group D — GC & lifecycle:
 
 - [ ] Mark-sweep trigger cadence, batching, and bounds (LIST/read cost).
-- [ ] Safety horizon to avoid sweeping in-flight transactions; interaction with
-      leases.
+- [ ] Safety horizon to avoid sweeping in-flight transactions (ADR-021 settles the
+      lease side: a non-expired pending object is live/reachable and must not be
+      swept; remaining cadence/horizon spec is ADR-022).
 - [ ] Defer/spec compaction (v2) and the explicit liveness-counter object.
 
 Group E — backends:
@@ -194,9 +203,11 @@ Group F — testing & migration:
 
 Group G — open questions to resolve before/within ADRs:
 
-- [ ] Does the unified transaction object ever need a `list`-discoverable pending
+- [x] Does the unified transaction object ever need a `list`-discoverable pending
       registry, or are shard `locked-by` entries sufficient to discover all live
-      transactions for GC and recovery?
+      transactions for GC and recovery? — No registry; `locked-by` entries suffice,
+      with lazy contention-driven reclamation and GC for the uncontended remainder
+      (ADR-021).
 - [ ] Behavior under a hot shard hitting S3's per-prefix PUT ceiling — accept as
       a documented limit for the MVP, or spread shard paths to mitigate?
 - [ ] Whether the collection root and shards should share a fate (created
