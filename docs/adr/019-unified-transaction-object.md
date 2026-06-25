@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed
+Accepted — implemented (`glassdb-storage::txobject` codec + the `glassdb-trans::v2`
+engine)
 
 ## Context
 

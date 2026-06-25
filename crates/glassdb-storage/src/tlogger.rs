@@ -123,47 +123,7 @@ impl TLogger {
     /// Reads and parses the full transaction log for `id`.
     pub async fn get(&self, id: &TxId) -> Result<TxLog, StorageError> {
         let tr = self.read_log(id).await?;
-        let status = match tr.status() {
-            pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
-            pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
-            pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
-            pb::transaction_log::Status::Default => {
-                return Err(StorageError::other("unknown commit status"));
-            }
-        };
-        let mut res = TxLog {
-            id: id.clone(),
-            timestamp: tr.timestamp.map(proto_ts_to_system),
-            status,
-            writes: Vec::new(),
-            locks: Vec::new(),
-        };
-
-        for cw in &tr.writes {
-            for w in &cw.writes {
-                res.writes.push(TxWrite {
-                    path: gopath::join(&[&cw.prefix, &w.suffix]),
-                    value: write_value(w),
-                    deleted: write_deleted(w),
-                    prev_writer: TxId::from_bytes(w.prev_tid.clone()),
-                });
-            }
-            if let Some(locks) = &cw.locks {
-                if locks.collection_lock != pb::lock::LockType::None as i32 {
-                    res.locks.push(PathLock {
-                        path: paths::collection_info(&cw.prefix),
-                        typ: parse_lock_type(locks.collection_lock),
-                    });
-                }
-                for l in &locks.locks {
-                    res.locks.push(PathLock {
-                        path: gopath::join(&[&cw.prefix, &l.suffix]),
-                        typ: parse_lock_type(l.lock_type),
-                    });
-                }
-            }
-        }
-        Ok(res)
+        decode_tx_log_from_proto(id, &tr)
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
@@ -266,7 +226,64 @@ fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
         .map_err(|e| StorageError::with_source("unmarshalling transaction log", e))
 }
 
-fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
+/// Decodes a transaction-log protobuf body into a [`TxLog`]. The status and
+/// timestamp are taken from the body (not tags), which is what the v2 unified
+/// transaction object relies on (ADR-019). Shared by [`TLogger::get`] and the
+/// v2 [`crate::txobject`] codec.
+pub(crate) fn decode_tx_log(id: &TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
+    decode_tx_log_from_proto(id, &parse_log(buf)?)
+}
+
+fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog, StorageError> {
+    let status = match tr.status() {
+        pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
+        pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
+        pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
+        pb::transaction_log::Status::Default => {
+            return Err(StorageError::other("unknown commit status"));
+        }
+    };
+    let mut res = TxLog {
+        id: id.clone(),
+        timestamp: tr.timestamp.map(proto_ts_to_system),
+        status,
+        writes: Vec::new(),
+        locks: Vec::new(),
+    };
+
+    for cw in &tr.writes {
+        for w in &cw.writes {
+            res.writes.push(TxWrite {
+                path: gopath::join(&[&cw.prefix, &w.suffix]),
+                value: write_value(w),
+                deleted: write_deleted(w),
+                prev_writer: TxId::from_bytes(w.prev_tid.clone()),
+            });
+        }
+        if let Some(locks) = &cw.locks {
+            // A collection lock is present only when set to a real lock type. The
+            // proto default is UNKNOWN(0) (e.g. the empty `CollectionLocks` a
+            // key-only write group carries), which must not decode as a spurious
+            // collection lock.
+            let clt = locks.collection_lock;
+            if clt != pb::lock::LockType::None as i32 && clt != pb::lock::LockType::Unknown as i32 {
+                res.locks.push(PathLock {
+                    path: paths::collection_info(&cw.prefix),
+                    typ: parse_lock_type(clt),
+                });
+            }
+            for l in &locks.locks {
+                res.locks.push(PathLock {
+                    path: gopath::join(&[&cw.prefix, &l.suffix]),
+                    typ: parse_lock_type(l.lock_type),
+                });
+            }
+        }
+    }
+    Ok(res)
+}
+
+pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
     if l.id.is_unset() {
         return Err(StorageError::other("empty transaction ID"));
     }

@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed
+Accepted — implemented (`glassdb-storage::CollectionRoot` + the `glassdb-trans::v2`
+membership protocol)
 
 ## Context
 

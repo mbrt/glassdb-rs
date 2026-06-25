@@ -9,8 +9,10 @@ mod error;
 mod global;
 mod local;
 mod locker;
+mod root;
 mod shard;
 mod tlogger;
+pub mod txobject;
 mod version;
 
 pub use cache::{Cache, Weighable};
@@ -21,6 +23,7 @@ pub use locker::{
     LockInfo, LockOps, LockRequest, LockType, LockUpdate, Locker, TValue, TxPathState,
     compute_lock_update, last_writer_from_tags, tags_lock_info,
 };
+pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use tlogger::{PathLock, TLogger, TxCommitStatus, TxLog, TxStatus, TxWrite};
 pub use version::{Version, version_from_meta};

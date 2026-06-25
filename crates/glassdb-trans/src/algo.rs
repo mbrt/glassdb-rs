@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures::StreamExt;
 use glassdb_backend::{self as backend, Metadata};
@@ -36,16 +36,6 @@ const BG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// happened), which bounds the loop in practice; this is just the cap for a
 /// persistently-unavailable backend.
 const SINGLE_RW_INDOUBT_RETRIES: usize = 2;
-
-/// Converts a wall-clock instant to UnixNano, used to derive a transaction's
-/// wound-wait priority. The `SystemTime`->`u64` conversion lives here in `trans`
-/// (rather than in the pure `data` crate) so the priority can be sourced from
-/// the monitor's clock, which is anchored to tokio's virtual time in tests.
-fn now_unix_nanos(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -488,7 +478,7 @@ impl Algo {
     /// drawn from the seeded executor RNG and the anchored clock
     /// respectively, so wound-wait priorities replay byte-for-byte.
     pub fn begin(&self, d: Data) -> Handle {
-        let id = TxId::new_at(now_unix_nanos(self.mon.clock_now()));
+        let id = TxId::new_at(self.mon.clock_now());
         Handle {
             data: d,
             status: Status::New,

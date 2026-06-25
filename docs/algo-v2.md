@@ -75,6 +75,32 @@ per-decision ADRs.
 5. S3 + GCS backends on the shrunk trait; benchmarks to find the false-sharing
    knee and confirm the S3 win.
 
+## Implementation status
+
+A minimal, correctness-first engine for ADR-016…021 lives in
+[`glassdb-trans::v2`](../crates/glassdb-trans/src/v2.rs), built **alongside** the
+v1 engine (so the existing suite stays green) and verified end-to-end on the
+in-memory backend (`crates/glassdb-trans/tests/v2_engine.rs`): single-key
+get/put/delete, multi-key transactions, optimistic list, and the
+serializability stress tests (concurrent counter, cross-shard transfer
+invariant, same-shard merge, wound-wait progress).
+
+Data layer landed in `glassdb-storage`: `Shard` (ADR-017), `CollectionRoot`
+(ADR-018), and the `txobject` codec over `TransactionLog` (ADR-019), each
+golden-anchored.
+
+The minimal engine deliberately defers (see the `TODO`s in `v2.rs`):
+- **Leases / crash recovery (ADR-021)** — only *live* lock conflicts are
+  reclaimed; a crashed transaction's locks linger (no refresh/expiry yet).
+- **GC (ADR-022)** — synchronous write-back; aborted/unreferenced transaction
+  objects and empty shard entries are never swept.
+- **Performance** — no cache, no batched/async write-back, no proactive lock
+  release on abort, a fresh pending object per attempt.
+- **Equal-priority deadlock** — a byte tiebreak stands in for the serial
+  sorted-by-path fallback (correct for distinct priorities).
+- **Cutover** — re-point the DST oracles at this engine, then retire v1 and slim
+  the `Backend` trait (ADR-023).
+
 ## Planned ADRs
 
 Each design decision becomes its own ADR (next free number is 022).
@@ -91,28 +117,33 @@ Each design decision becomes its own ADR (next free number is 022).
   unit-tested in isolation — the first verifiable increment. Landed in
   `glassdb-data::shard` / `paths` and `glassdb-storage::shard`.
 - **[ADR-018](adr/018-collection-root-membership.md) — Collection root &
-  membership.** ✅ Written. Collection root (`_i`, `CollectionRoot` protobuf:
+  membership.** ✅ Written & implemented (data layer + engine). Collection root
+  (`_i`, `CollectionRoot` protobuf:
   shard count + subcollection list + membership lock) as the membership-
   coordination point: create/delete take its write lock, listing OCC-validates
   its version (read-lock fallback). Key directory stays sharded; the root version
   summarizes the whole cross-shard membership read set. Atomic sequencing deferred
   to ADR-020.
 - **[ADR-019](adr/019-unified-transaction-object.md) — Values in unified
-  transaction objects.** ✅ Written. Values live only in the `_t/<txid>` object
+  transaction objects.** ✅ Written & implemented (data layer + engine). Values
+  live only in the `_t/<txid>` object
   (shards point via `current_writer`); the object is unified (status + values, no
   split), with a pending (lease + lock intentions) → committed (fat value map) →
   aborted lifecycle whose commit point is the single flip-to-committed CAS.
   Encoding evolves `TransactionLog`. Sequencing deferred to ADR-020, lease to
   ADR-021.
 - **[ADR-020](adr/020-commit-write-back-protocol.md) — Commit & write-back
-  protocol.** ✅ Written. Five phases (execute → prepare pending object →
+  protocol.** ✅ Written & minimally implemented (`glassdb-trans::v2`). Five
+  phases (execute → prepare pending object →
   validate-and-lock as one RMW CAS per shard → commit flip CAS → async idempotent
   per-shard write-back). Shard-CAS contention vs lock conflict; effective-current-
   writer / help-forward resolution; cross-shard non-atomicity gated on the commit
   object; serial sorted-by-path deadlock fallback; in-doubt parity at every CAS
   site; read-only and single-RW fast paths. Lease → ADR-021, GC → ADR-022.
 - **[ADR-021](adr/021-wound-wait-leases-shard.md) — Wound-wait & leases at shard
-  granularity.** ✅ Written. The lease is the transaction object's existing
+  granularity.** ✅ Written; wound-wait implemented, **leases not yet**
+  (`glassdb-trans::v2`, crash recovery is the open follow-up). The lease is the
+  transaction object's existing
   `timestamp` (no new field): last-refresh while pending, commit-time once
   committed, expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`. Reclaiming a
   conflicting `locked-by` entry combines wound-wait priority with the lease (wound

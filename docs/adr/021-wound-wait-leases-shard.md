@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed
+Partially implemented — wound-wait is live in `glassdb-trans::v2`; leases /
+expiry (crash recovery) are the remaining follow-up
 
 ## Context
 
