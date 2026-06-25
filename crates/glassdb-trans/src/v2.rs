@@ -15,26 +15,38 @@
 //! `current_writer` pointers and releases locks (write-back).
 //!
 //! Concurrency control (ADR-002 / ADR-021): strict two-phase locking with
-//! wound-wait. The "wait" of wound-wait is realised as **abort-and-retry with a
-//! preserved-or-fresh priority**: a transaction that meets an
-//! older-or-equal live holder aborts and retries (so it never holds locks while
-//! blocked, which also makes the protocol deadlock-free), while an older
-//! transaction wounds the younger holder (CAS its object pending → aborted) and
-//! proceeds. Committed holders are resolved by help-forward; aborted holders are
-//! cleared lazily by the next contender.
+//! wound-wait, and leases for crash recovery. The "wait" of wound-wait is
+//! realised as **abort-and-retry with a preserved priority**: a transaction that
+//! meets an older live holder it cannot reclaim aborts and retries with the same
+//! priority (so it never holds locks while blocked, which also makes the protocol
+//! deadlock-free), while a transaction that **outranks** the holder *or* finds
+//! the holder's **lease expired** wounds it (CAS its object pending → aborted)
+//! and proceeds. Committed holders are resolved by help-forward; aborted holders
+//! are cleared lazily by the next contender.
+//!
+//! Leases (ADR-021): the pending object's `timestamp` is the lease. A holder is
+//! reclaimable once `now > timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`,
+//! which is what lets a *younger* transaction reclaim a *dead older* holder it
+//! would otherwise wait on forever. The clock is the injectable [`Clock`],
+//! anchored to virtual time in tests so expiry is deterministic. No background
+//! refresher is needed (unlike v1): a v2 transaction never blocks while holding
+//! locks (it aborts-and-retries instead), so a *pending* object never lingers
+//! long enough to expire while live, and a *committed* object never expires.
 //!
 //! Deliberate simplifications, each a follow-up:
-//! - TODO(ADR-021 leases): no lease/refresh, so a *crashed* transaction's locks
-//!   are never reclaimed (only live conflicts are). Recovery/crash tests need
-//!   this. The lease is the pending object's timestamp, already written here.
 //! - TODO(ADR-022 GC): aborted/unreferenced transaction objects and empty shard
-//!   entries are never collected; write-back is synchronous (no mark-sweep).
+//!   entries are never collected; write-back is synchronous (no mark-sweep). A
+//!   `locked_by` entry pointing at a *missing* object is therefore dropped rather
+//!   than given the `handle_unknown_tx` grace period — safe only until GC can
+//!   delete a still-referenced object.
 //! - TODO(perf): no caching layer (every read hits the backend), no batched or
 //!   async write-back, no proactive lock release on abort, fresh pending object
 //!   per attempt. Performance is explicitly out of scope for v1.
-//! - TODO(ADR-020 serial fallback): equal-priority deadlocks rely on a byte
-//!   tiebreaker rather than the serial sorted-by-path re-acquisition; correct for
-//!   distinct priorities, best-effort under a frozen clock.
+//! - The serial sorted-by-path deadlock fallback of ADR-020 is intentionally
+//!   omitted: v2 realises "wait" as abort-and-retry, so it never holds-and-waits
+//!   and cannot deadlock. Equal priorities are broken by a deterministic byte
+//!   tiebreak; the loser aborts and retries with a fresh prefix, so the pair
+//!   makes progress without serial re-acquisition.
 //! - TODO(cutover): re-point the DST oracles (serializability, cycle ring) at
 //!   this engine, then retire the v1 tag-based engine and slim the `Backend`
 //!   trait (ADR-023).
@@ -42,10 +54,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use glassdb_backend::{Backend, BackendError, Tags, Version};
-use glassdb_concurr::{RetryConfig, rt};
+use glassdb_concurr::{Clock, RetryConfig, rt};
 use glassdb_data::shard::{SHARD_COUNT, shard_index};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
@@ -60,6 +72,20 @@ const MAX_ATTEMPTS: usize = 200;
 /// Maximum inner CAS retries on a single shard/root before treating the
 /// operation as conflicted and restarting the transaction.
 const CAS_RETRIES: usize = 50;
+/// A pending transaction's lease term (ADR-021): a holder is considered dead
+/// once `now > lease_timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`. Reused
+/// verbatim from the v1 monitor so wound/expiry timing stays identical.
+const PENDING_TX_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
+
+/// Reports whether a pending transaction whose lease was last refreshed at
+/// `lease` is expired as of `now` (ADR-021). Mirrors v1's `monitor::is_expired`.
+fn is_expired(lease: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(lease + MAX_CLOCK_SKEW) {
+        Ok(d) => d > PENDING_TX_TIMEOUT,
+        Err(_) => false,
+    }
+}
 
 /// A staged write within a transaction.
 #[derive(Debug, Clone)]
@@ -95,6 +121,10 @@ struct CollInner {
     backend: Arc<dyn Backend>,
     /// Storage path prefix for this collection's objects (e.g. `db/users`).
     prefix: String,
+    /// Source of wall-clock time for transaction priorities and lease expiry.
+    /// Real in production; anchored to virtual time in tests so lease/wound
+    /// timing is deterministic (ADR-021).
+    clock: Clock,
 }
 
 impl std::fmt::Debug for Collection {
@@ -135,10 +165,21 @@ impl Collection {
         backend: Arc<dyn Backend>,
         prefix: impl Into<String>,
     ) -> Result<Self, TransError> {
+        Self::create_with_clock(backend, prefix, Clock::real()).await
+    }
+
+    /// Like [`Collection::create`] but with an explicit [`Clock`]. Tests pass an
+    /// anchored clock so lease expiry and wound-wait timing are deterministic.
+    pub async fn create_with_clock(
+        backend: Arc<dyn Backend>,
+        prefix: impl Into<String>,
+        clock: Clock,
+    ) -> Result<Self, TransError> {
         let coll = Collection {
             inner: Arc::new(CollInner {
                 backend,
                 prefix: prefix.into(),
+                clock,
             }),
         };
         let root = CollectionRoot::new(SHARD_COUNT);
@@ -158,10 +199,21 @@ impl Collection {
         backend: Arc<dyn Backend>,
         prefix: impl Into<String>,
     ) -> Result<Self, TransError> {
+        Self::open_with_clock(backend, prefix, Clock::real()).await
+    }
+
+    /// Like [`Collection::open`] but with an explicit [`Clock`] (see
+    /// [`Collection::create_with_clock`]).
+    pub async fn open_with_clock(
+        backend: Arc<dyn Backend>,
+        prefix: impl Into<String>,
+        clock: Clock,
+    ) -> Result<Self, TransError> {
         let coll = Collection {
             inner: Arc::new(CollInner {
                 backend,
                 prefix: prefix.into(),
+                clock,
             }),
         };
         match coll.backend().read(&coll.root_path()).await {
@@ -174,6 +226,10 @@ impl Collection {
 
     fn backend(&self) -> &Arc<dyn Backend> {
         &self.inner.backend
+    }
+
+    fn clock(&self) -> &Clock {
+        &self.inner.clock
     }
 
     fn prefix(&self) -> &str {
@@ -238,9 +294,13 @@ impl Collection {
         F: Fn(Tx) -> Fut,
         Fut: Future<Output = Result<T, TransError>>,
     {
+        // Mint the priority once and preserve it across retries via `renew`
+        // (same timestamp, fresh prefix): a wounded transaction keeps its
+        // wound-wait rank so it cannot be starved by a stream of newer peers
+        // (ADR-002), while the fresh prefix lands its retry in a new partition.
+        let mut id = TxId::new_at(self.clock().now());
         let mut backoff = RetryConfig::default().backoff();
         for _ in 0..MAX_ATTEMPTS {
-            let id = TxId::new_at(rt::system_now());
             let tx = Tx::new(self.clone());
             let value = f(tx.clone()).await?;
             let (reads, writes) = tx.snapshot();
@@ -253,6 +313,7 @@ impl Collection {
             if committed {
                 return Ok(value);
             }
+            id = id.renew();
             rt::sleep(backoff.next_delay()).await;
         }
         Err(retry_exhausted())
@@ -346,6 +407,18 @@ impl Collection {
             }
             Err(BackendError::NotFound) => Ok((TxCommitStatus::Unknown, None)),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Reads a holder's status together with its lease timestamp (ADR-021);
+    /// a missing object resolves to `(Unknown, None)`.
+    async fn tx_status_lease(
+        &self,
+        id: &TxId,
+    ) -> Result<(TxCommitStatus, Option<SystemTime>), TransError> {
+        match self.read_tx_object(id).await? {
+            Some(o) => Ok((o.status, o.timestamp)),
+            None => Ok((TxCommitStatus::Unknown, None)),
         }
     }
 
@@ -541,7 +614,7 @@ impl Collection {
         reads: &HashMap<Vec<u8>, ReadRecord>,
         writes: &BTreeMap<Vec<u8>, WriteOp>,
     ) -> Result<bool, TransError> {
-        let ts = rt::system_now();
+        let ts = self.clock().now();
         let pending_v = self.create_pending(id, ts).await?;
 
         // Group accessed keys by shard.
@@ -699,24 +772,28 @@ impl Collection {
         // Resolve existing holders (other than us). Committed holders are
         // help-forwarded (their value published as current_writer, their lock
         // released); aborted/missing holders are dropped; pending holders remain
-        // as live conflicts.
+        // as live conflicts, carrying their lease so expiry can reclaim a dead
+        // one (ADR-021).
         let key_path = self.key_path(key);
-        let mut pending: Vec<TxId> = Vec::new();
+        let mut pending: Vec<(TxId, Option<SystemTime>)> = Vec::new();
         for holder in e.locked_by.clone() {
             if &holder == id {
                 continue;
             }
-            let (status, _) = self.tx_status(&holder).await?;
-            match status {
-                TxCommitStatus::Ok => {
-                    if let Some(obj) = self.read_tx_object(&holder).await?
-                        && let Some(w) = txobject::find_write(&obj, &key_path)
+            let obj = self.read_tx_object(&holder).await?;
+            match obj.as_ref().map(|o| o.status) {
+                Some(TxCommitStatus::Ok) => {
+                    if let Some(o) = &obj
+                        && let Some(w) = txobject::find_write(o, &key_path)
                     {
                         e.current_writer = Some(holder.clone());
                         e.deleted = w.deleted;
                     }
                 }
-                TxCommitStatus::Pending => pending.push(holder),
+                Some(TxCommitStatus::Pending) => {
+                    let lease = obj.as_ref().and_then(|o| o.timestamp);
+                    pending.push((holder, lease));
+                }
                 // Aborted / Unknown(missing): drop.
                 _ => {}
             }
@@ -741,9 +818,9 @@ impl Collection {
             && !matches!(e.lock_type, LockType::Write | LockType::Create);
 
         if !compatible {
-            // Must clear every remaining pending holder via wound-wait.
-            for holder in &pending {
-                if !self.win_wound_wait(id, holder, ts).await? {
+            // Must clear every remaining pending holder via wound-wait + lease.
+            for (holder, lease) in &pending {
+                if !self.try_reclaim(id, holder, *lease, ts).await? {
                     return Ok(None);
                 }
             }
@@ -758,10 +835,13 @@ impl Collection {
 
         match desired {
             Desired::Read => {
-                if !pending.contains(id) && !e.locked_by.contains(id) {
-                    pending.push(id.clone());
+                // Share with the surviving (compatible) read holders, then add
+                // ourselves.
+                let mut holders: Vec<TxId> = pending.into_iter().map(|(h, _)| h).collect();
+                if !holders.contains(id) {
+                    holders.push(id.clone());
                 }
-                e.locked_by = pending;
+                e.locked_by = holders;
                 e.lock_type = LockType::Read;
             }
             Desired::Put | Desired::Delete => {
@@ -778,19 +858,24 @@ impl Collection {
         Ok(Some((e, membership)))
     }
 
-    /// Wound-wait decision against a live pending `holder`: returns whether *we*
-    /// win (the holder is now aborted, so we may take the lock). A loss means we
-    /// must restart.
-    async fn win_wound_wait(
+    /// Reclaim decision against a live pending `holder` (ADR-021): `id` may take
+    /// the lock if it **outranks** the holder by wound-wait priority *or* the
+    /// holder's **lease has expired** (the latter is what reclaims a crashed
+    /// holder a younger transaction would otherwise wait on forever). When it
+    /// may, it wounds the holder (CAS pending → aborted) and returns whether the
+    /// holder is now aborted. `false` means `id` must restart.
+    async fn try_reclaim(
         &self,
         id: &TxId,
         holder: &TxId,
-        ts: SystemTime,
+        lease: Option<SystemTime>,
+        now: SystemTime,
     ) -> Result<bool, TransError> {
-        if !should_wound(id, holder) {
+        let expired = lease.is_some_and(|l| is_expired(l, now));
+        if !should_wound(id, holder) && !expired {
             return Ok(false);
         }
-        Ok(self.wound(holder, ts).await? == TxCommitStatus::Aborted)
+        Ok(self.wound(holder, now).await? == TxCommitStatus::Aborted)
     }
 
     /// Acquires the collection root's membership write lock (ADR-018), with the
@@ -799,21 +884,22 @@ impl Collection {
     async fn lock_root(&self, id: &TxId, ts: SystemTime) -> Result<bool, TransError> {
         for _ in 0..CAS_RETRIES {
             let (mut root, ver) = self.read_root().await?;
-            let mut pending: Vec<TxId> = Vec::new();
+            let mut pending: Vec<(TxId, Option<SystemTime>)> = Vec::new();
             for holder in root.membership_locked_by().to_vec() {
                 if &holder == id {
                     continue;
                 }
                 // Committed/aborted/missing membership holders are simply
                 // released (their root write-back is idempotent); only pending
-                // ones are live conflicts.
-                if self.tx_status(&holder).await?.0 == TxCommitStatus::Pending {
-                    pending.push(holder);
+                // ones are live conflicts, carrying their lease for expiry.
+                let (status, lease) = self.tx_status_lease(&holder).await?;
+                if status == TxCommitStatus::Pending {
+                    pending.push((holder, lease));
                 }
             }
             let mut lost = false;
-            for holder in &pending {
-                if !self.win_wound_wait(id, holder, ts).await? {
+            for (holder, lease) in &pending {
+                if !self.try_reclaim(id, holder, *lease, ts).await? {
                     lost = true;
                     break;
                 }
@@ -967,9 +1053,10 @@ impl Tx {
 
 /// Wound-wait priority decision: an older transaction wounds a younger holder.
 /// Equal priorities (same timestamp) fall back to a deterministic byte tiebreak
-/// so exactly one side wins a given encounter.
-/// TODO(ADR-020): replace the tiebreak with the serial sorted-by-path fallback
-/// for full correctness under a frozen clock.
+/// so exactly one side wins a given encounter. This replaces v1's serial
+/// sorted-by-path fallback: because v2 realises "wait" as abort-and-retry (the
+/// loser never holds-and-waits), a deterministic tiebreak plus a fresh prefix on
+/// the loser's retry is enough for progress without serial re-acquisition.
 fn should_wound(me: &TxId, holder: &TxId) -> bool {
     if me.older(holder) {
         return true;

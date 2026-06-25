@@ -2,8 +2,11 @@
 
 ## Status
 
-Accepted — minimally implemented (`glassdb-trans::v2`; synchronous write-back, no
-GC/cache yet)
+Accepted — implemented in `glassdb-trans::v2`, with two deliberate
+simplifications: write-back is **synchronous** (not yet async/batched; GC and
+caching are ADR-022/perf follow-ups), and the **serial sorted-by-path deadlock
+fallback is omitted** because v2 realises "wait" as abort-and-retry, which cannot
+deadlock (see [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback)).
 
 ## Context
 
@@ -170,6 +173,17 @@ that wound-wait cannot order fall through to this serial path, exactly as in v1.
 The mechanism is unchanged; only the lock targets differ (shards + root instead of
 per-key objects), so there are typically _fewer_ objects to sort and lock, at the
 cost of coarser conflicts.
+
+> **v2 deviation (implementation):** the `glassdb-trans::v2` engine **omits the
+> serial fallback** and never holds-and-waits. A transaction that meets a holder
+> it cannot reclaim (a live, higher-or-equal-priority, non-expired peer) aborts
+> immediately, releasing its locks, and retries with its priority preserved
+> (`TxId::renew`). Because no transaction ever blocks while holding a lock, there
+> is no hold-and-wait and therefore no deadlock to break — so the serial
+> sorted-by-path re-acquisition is unnecessary. Equal priorities are resolved by
+> a deterministic byte tiebreak; the loser aborts and retries with a fresh
+> prefix, so the pair still makes progress. This trades the (rare) extra restarts
+> of a hot conflict for a much simpler protocol with no lock-timeout budget.
 
 ### In-doubt outcomes at the new CAS sites
 

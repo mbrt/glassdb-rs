@@ -4,11 +4,16 @@
 //! and unified transaction objects, with strict-serializable wound-wait.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
+use glassdb_backend::{Backend, Tags};
+use glassdb_concurr::Clock;
 use glassdb_data::shard::shard_index;
-use glassdb_storage::StorageError;
+use glassdb_data::{TxId, paths};
+use glassdb_storage::{
+    CollectionRoot, LockType, Shard, ShardEntry, StorageError, TxCommitStatus, TxLog, txobject,
+};
 use glassdb_trans::TransError;
 use glassdb_trans::v2::Collection;
 
@@ -255,4 +260,82 @@ async fn cross_shard_transfer_preserves_invariant() {
     auditor.await.unwrap();
     assert_eq!(parse_u64(c.get(b"acct-a").await.unwrap()), 80);
     assert_eq!(parse_u64(c.get(b"acct-b").await.unwrap()), 20);
+}
+
+// Crash recovery (ADR-021): a transaction that installed locks (a shard entry +
+// the collection-root membership lock) and then *crashed* before committing
+// leaves a pending transaction object whose lease eventually expires. A younger
+// writer — which loses the wound-wait priority race against the older crashed
+// holder — must still reclaim the locks once the lease expires, rather than wait
+// forever. Time is anchored to tokio's (paused) clock so expiry is deterministic.
+#[tokio::test(start_paused = true)]
+async fn expired_lease_is_reclaimed_after_crash() {
+    let backend = backend();
+    let clock = Clock::anchored();
+    let coll = Collection::create_with_clock(backend.clone(), "db/c", clock.clone())
+        .await
+        .unwrap();
+    let prefix = "db/c";
+
+    // A crashed transaction: an *older* priority and a lease as of "now".
+    let key = b"k".to_vec();
+    let lease = clock.now();
+    let dead = TxId::new_at(lease);
+
+    // Its pending transaction object (the lease anchor).
+    let dead_obj = TxLog {
+        id: dead.clone(),
+        timestamp: Some(lease),
+        status: TxCommitStatus::Pending,
+        writes: Vec::new(),
+        locks: Vec::new(),
+    };
+    backend
+        .write(
+            &paths::from_transaction(prefix, &dead),
+            txobject::encode(&dead_obj).unwrap(),
+            Tags::new(),
+        )
+        .await
+        .unwrap();
+
+    // Its create-lock on the key's shard entry.
+    let entry = ShardEntry {
+        key: key.clone(),
+        lock_type: LockType::Create,
+        locked_by: vec![dead.clone()],
+        current_writer: None,
+        deleted: false,
+    };
+    backend
+        .write(
+            &paths::from_shard(prefix, shard_index(&key)),
+            Shard::from_entries([entry]).encode(),
+            Tags::new(),
+        )
+        .await
+        .unwrap();
+
+    // Its membership write-lock on the collection root.
+    let root_path = paths::collection_info(prefix);
+    let r = backend.read(&root_path).await.unwrap();
+    let mut root = CollectionRoot::decode(&r.contents).unwrap();
+    root.set_membership_lock(LockType::Write, [dead.clone()]);
+    backend
+        .write(&root_path, root.encode(), Tags::new())
+        .await
+        .unwrap();
+
+    // While the lease is live, the pending writer's value is not effective, so
+    // the key reads as absent — but the lock is held, so it cannot be reclaimed
+    // by priority alone (the writer below is younger).
+    assert_eq!(coll.get(&key).await.unwrap(), None);
+
+    // Advance past the lease term (PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW).
+    tokio::time::advance(Duration::from_secs(60)).await;
+
+    // The younger writer reclaims the expired holder's shard + root locks and
+    // commits.
+    coll.put(&key, b"v".to_vec()).await.unwrap();
+    assert_eq!(coll.get(&key).await.unwrap(), Some(b"v".to_vec()));
 }

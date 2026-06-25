@@ -77,27 +77,41 @@ per-decision ADRs.
 
 ## Implementation status
 
-A minimal, correctness-first engine for ADR-016…021 lives in
+A correctness-first engine for ADR-016…021 lives in
 [`glassdb-trans::v2`](../crates/glassdb-trans/src/v2.rs), built **alongside** the
 v1 engine (so the existing suite stays green) and verified end-to-end on the
 in-memory backend (`crates/glassdb-trans/tests/v2_engine.rs`): single-key
-get/put/delete, multi-key transactions, optimistic list, and the
-serializability stress tests (concurrent counter, cross-shard transfer
-invariant, same-shard merge, wound-wait progress).
+get/put/delete, multi-key transactions, optimistic list, the serializability
+stress tests (concurrent counter, cross-shard transfer invariant, same-shard
+merge, wound-wait progress), and **crash recovery** (an expired-lease holder's
+shard + root locks are reclaimed by a younger writer).
 
 Data layer landed in `glassdb-storage`: `Shard` (ADR-017), `CollectionRoot`
 (ADR-018), and the `txobject` codec over `TransactionLog` (ADR-019), each
 golden-anchored.
 
-The minimal engine deliberately defers (see the `TODO`s in `v2.rs`):
-- **Leases / crash recovery (ADR-021)** — only *live* lock conflicts are
-  reclaimed; a crashed transaction's locks linger (no refresh/expiry yet).
+ADR-016…021 are now behavior-complete: validate-and-lock, wound-wait with
+**lease expiry** (crash recovery), the commit flip, and synchronous write-back,
+all over content CAS on shards / root / transaction objects, with priority
+preserved across retries (`TxId::renew`).
+
+Two designed mechanisms are intentionally **superseded** rather than ported,
+because v2 realises "wait" as abort-and-retry (a transaction never blocks while
+holding locks):
+- **No background lease refresher (ADR-021)** — a *pending* object never lingers
+  long enough to expire while live (its lock window is a few synchronous CAS
+  round-trips), and a *committed* object never expires.
+- **No serial sorted-by-path deadlock fallback (ADR-020)** — abort-and-retry
+  cannot deadlock; equal priorities are broken by a deterministic byte tiebreak,
+  the loser retrying with a fresh prefix.
+
+The engine deliberately defers (see the `TODO`s in `v2.rs`):
 - **GC (ADR-022)** — synchronous write-back; aborted/unreferenced transaction
-  objects and empty shard entries are never swept.
+  objects and empty shard entries are never swept. A `locked_by` entry pointing
+  at a *missing* object is dropped rather than given the `handle_unknown_tx`
+  grace period (safe only until GC can delete a still-referenced object).
 - **Performance** — no cache, no batched/async write-back, no proactive lock
   release on abort, a fresh pending object per attempt.
-- **Equal-priority deadlock** — a byte tiebreak stands in for the serial
-  sorted-by-path fallback (correct for distinct priorities).
 - **Cutover** — re-point the DST oracles at this engine, then retire v1 and slim
   the `Backend` trait (ADR-023).
 
@@ -133,25 +147,27 @@ Each design decision becomes its own ADR (next free number is 022).
   Encoding evolves `TransactionLog`. Sequencing deferred to ADR-020, lease to
   ADR-021.
 - **[ADR-020](adr/020-commit-write-back-protocol.md) — Commit & write-back
-  protocol.** ✅ Written & minimally implemented (`glassdb-trans::v2`). Five
+  protocol.** ✅ Written & implemented (`glassdb-trans::v2`). Five
   phases (execute → prepare pending object →
-  validate-and-lock as one RMW CAS per shard → commit flip CAS → async idempotent
+  validate-and-lock as one RMW CAS per shard → commit flip CAS → idempotent
   per-shard write-back). Shard-CAS contention vs lock conflict; effective-current-
   writer / help-forward resolution; cross-shard non-atomicity gated on the commit
-  object; serial sorted-by-path deadlock fallback; in-doubt parity at every CAS
-  site; read-only and single-RW fast paths. Lease → ADR-021, GC → ADR-022.
+  object; in-doubt parity at every CAS site; read-only and single-RW fast paths.
+  The serial sorted-by-path deadlock fallback is **superseded by abort-and-retry**
+  (deadlock-free by construction). Write-back is still synchronous; GC → ADR-022.
 - **[ADR-021](adr/021-wound-wait-leases-shard.md) — Wound-wait & leases at shard
-  granularity.** ✅ Written; wound-wait implemented, **leases not yet**
-  (`glassdb-trans::v2`, crash recovery is the open follow-up). The lease is the
-  transaction object's existing
+  granularity.** ✅ Written & implemented (`glassdb-trans::v2`: wound-wait +
+  lease expiry / crash recovery). The lease is the transaction object's existing
   `timestamp` (no new field): last-refresh while pending, commit-time once
   committed, expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`. Reclaiming a
   conflicting `locked-by` entry combines wound-wait priority with the lease (wound
-  if older *or* expired), uniformly for shard entries and the root membership lock;
-  missing objects get the relocated `handle_unknown_tx` grace period. Discovery is
-  lazy via `locked-by` (no pending registry); reads never consult the lease; abort
-  CAS keeps ADR-009 in-doubt parity. Re-frames
-  [ADR-002](adr/002-wound-wait-locking.md) for the new layout.
+  if older *or* expired), uniformly for shard entries and the root membership lock.
+  Discovery is lazy via `locked-by` (no pending registry); reads never consult the
+  lease; abort CAS keeps ADR-009 in-doubt parity. Re-frames
+  [ADR-002](adr/002-wound-wait-locking.md) for the new layout. Two parts are
+  superseded/deferred: **no background refresher** (v2 never blocks while holding
+  locks, so a live pending object cannot expire), and the **`handle_unknown_tx`
+  grace period** for a missing object is deferred to GC (ADR-022).
 - **ADR-022 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
   locked-by`; the commit→write-back gap; deferral of the explicit counter and
   compaction.
@@ -183,12 +199,16 @@ Group B — protocol details:
 - [x] Resolution of the "effective current writer" when a committed-but-not-
       written-back write-lock holder exists (relocated `validate_locked_read` +
       help-forward) (ADR-020).
-- [x] Deadlock fallback: serial sorted-by-object-path locking; equal-priority via
-      the serial path (ADR-020, reusing ADR-002).
+- [x] Deadlock fallback: superseded in v2 by abort-and-retry (no hold-and-wait,
+      so deadlock-free); equal priorities broken by a deterministic byte tiebreak
+      with priority preserved on retry (`TxId::renew`). The serial sorted-by-path
+      path of ADR-020 is documented but not needed by the v2 engine.
 - [x] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
-      timeout constants — lease is the object `timestamp`, refresh every
-      `PENDING_TX_TIMEOUT/2`, reclaim if older-or-expired (ADR-021). Creation point
-      (pending object at prepare) is ADR-020.
+      timeout constants — lease is the object `timestamp`, reclaim if older-or-
+      expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW` (ADR-021). Implemented in
+      `glassdb-trans::v2`; the background refresher is unnecessary there (v2 never
+      blocks while holding locks). Creation point (pending object at prepare) is
+      ADR-020.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS, single-RW) — ADR-009
       carries over (ADR-020).
