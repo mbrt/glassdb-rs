@@ -2,8 +2,14 @@
 
 ## Status
 
-Partially implemented — wound-wait is live in `glassdb-trans::v2`; leases /
-expiry (crash recovery) are the remaining follow-up
+Accepted — implemented in `glassdb-trans::v2` (wound-wait + lease expiry /
+crash recovery). One deliberate deviation from the design below: **no background
+lease refresher** is implemented, because v2 realises "wait" as abort-and-retry
+and so never holds locks while blocked — a *pending* object therefore never
+lingers long enough to expire while its owner is live, and a *committed* object
+never expires. See [Consequences](#consequences). The `handle_unknown_tx` grace
+period for a lock that references a *missing* object is likewise deferred to GC
+(ADR-022), the only thing that can delete a still-referenced object.
 
 ## Context
 
@@ -69,6 +75,18 @@ version, until it commits or aborts. The pending object is small (no values), so
 refresh is cheap. If a refresh CAS finds the object already `aborted`, the
 transaction was wounded: the refresher stops and the owner's commit will fail.
 This is `refresh_pending`, relocated to the transaction object.
+
+> **v2 deviation (implementation):** the `glassdb-trans::v2` engine does **not**
+> run a refresher. v1 needs one because a transaction can _wait_ (block) while
+> holding locks for an unbounded time. v2 instead realises "wait" as
+> abort-and-retry (see [ADR-020](020-commit-write-back-protocol.md)): a
+> transaction either acquires every lock without blocking and commits, or it
+> aborts and releases. So the window in which a *pending* object holds locks is
+> bounded by a handful of synchronous CAS round-trips — far below
+> `PENDING_TX_TIMEOUT` — and a live owner is never falsely reclaimed. Once
+> committed (the point after which write-back runs), the object never expires.
+> The refresher is therefore unnecessary unless a future change reintroduces
+> blocking-while-holding.
 
 ### Reclaiming a conflicting lock — the interplay with `locked_by`
 
