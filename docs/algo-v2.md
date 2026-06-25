@@ -77,7 +77,7 @@ per-decision ADRs.
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 020).
+Each design decision becomes its own ADR (next free number is 021).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -104,8 +104,13 @@ Each design decision becomes its own ADR (next free number is 020).
   aborted lifecycle whose commit point is the single flip-to-committed CAS.
   Encoding evolves `TransactionLog`. Sequencing deferred to ADR-020, lease to
   ADR-021.
-- **ADR-020 — Commit & write-back protocol.** Validate+lock as per-shard CAS,
-  commit CAS, async per-shard write-back; the cross-shard non-atomicity argument.
+- **[ADR-020](adr/020-commit-write-back-protocol.md) — Commit & write-back
+  protocol.** ✅ Written. Five phases (execute → prepare pending object →
+  validate-and-lock as one RMW CAS per shard → commit flip CAS → async idempotent
+  per-shard write-back). Shard-CAS contention vs lock conflict; effective-current-
+  writer / help-forward resolution; cross-shard non-atomicity gated on the commit
+  object; serial sorted-by-path deadlock fallback; in-doubt parity at every CAS
+  site; read-only and single-RW fast paths. Lease → ADR-021, GC → ADR-022.
 - **ADR-021 — Wound-wait & leases at shard granularity.** How wound/expiry
   relocate from log tags to the transaction object; interplay with `locked-by` in
   shards. Re-frames [ADR-002](adr/002-wound-wait-locking.md) for the new layout.
@@ -135,17 +140,20 @@ Group A — layout & encoding:
 
 Group B — protocol details:
 
-- [ ] Exact validate+lock CAS algorithm for multiple keys per shard (validate
-      all, lock all, retry-with-locks-held semantics).
-- [ ] Resolution of the "effective current writer" when a committed-but-not-
-      written-back write-lock holder exists (the relocated `validate_locked_read`
-      logic).
-- [ ] Deadlock fallback: serial sorted-by-shard locking; equal-priority handling.
-- [ ] Lease creation point (pending object at first lock), refresh cadence, and
-      the expiry/wound CAS sequence; reuse of existing timeout constants.
-- [ ] In-doubt (`Unavailable`) handling parity at the new CAS sites (shard CAS,
-      commit CAS, write-once blob) — confirm ADR-009 reasoning carries over.
-- [ ] Single-RW and read-only fast-path shapes in the new layout.
+- [x] Exact validate+lock CAS algorithm for multiple keys per shard: one RMW CAS
+      per shard, merge-on-retry, retry-with-locks-held (ADR-020).
+- [x] Resolution of the "effective current writer" when a committed-but-not-
+      written-back write-lock holder exists (relocated `validate_locked_read` +
+      help-forward) (ADR-020).
+- [x] Deadlock fallback: serial sorted-by-object-path locking; equal-priority via
+      the serial path (ADR-020, reusing ADR-002).
+- [ ] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
+      timeout constants (ADR-021). Creation point (pending object at prepare) is
+      ADR-020.
+- [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
+      create, shard lock CAS, commit CAS, write-back CAS, single-RW) — ADR-009
+      carries over (ADR-020).
+- [x] Single-RW and read-only fast-path shapes in the new layout (ADR-020).
 
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):
