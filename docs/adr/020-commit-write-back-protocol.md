@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed
+Accepted — minimally implemented (`glassdb-trans::v2`; synchronous write-back, no
+GC/cache yet)
 
 ## Context
 

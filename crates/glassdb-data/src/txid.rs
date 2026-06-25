@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Fills `b` with random bytes.
 ///
@@ -61,9 +62,16 @@ impl TxId {
         TxId(b.into())
     }
 
-    /// Builds a transaction ID from a random prefix and an explicit UnixNano
-    /// timestamp, which determines its wound-wait priority.
-    pub fn new_at(unix_nanos: u64) -> Self {
+    /// Builds a transaction ID from a random prefix and an explicit instant,
+    /// whose UnixNano timestamp determines the wound-wait priority. The caller
+    /// supplies the instant (typically the monitor's clock), so the `data` crate
+    /// never sources time itself. Instants at or before the Unix epoch saturate
+    /// to priority zero (the highest priority).
+    pub fn new_at(t: SystemTime) -> Self {
+        let unix_nanos = t
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         let mut b = vec![0u8; TX_ID_LEN];
         fill_random(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
@@ -289,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn new_at_layout() {
         let nanos = 1_700_000_000_000_000_000u64;
-        let id = TxId::new_at(nanos);
+        let id = TxId::new_at(UNIX_EPOCH + std::time::Duration::from_nanos(nanos));
         assert_eq!(id.as_bytes().len(), 16);
         assert_eq!(id.priority(), nanos);
     }
@@ -335,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn renew_preserves_priority() {
-        let orig = TxId::new_at(123_456_789_000u64);
+        let orig = TxId::new_at(UNIX_EPOCH + std::time::Duration::from_nanos(123_456_789_000));
         let renewed = orig.renew();
         assert_eq!(renewed.as_bytes().len(), 16);
         assert_eq!(orig.priority(), renewed.priority());

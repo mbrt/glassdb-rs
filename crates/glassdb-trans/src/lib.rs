@@ -7,6 +7,7 @@ mod gc;
 mod monitor;
 mod reader;
 mod tlocker;
+pub mod v2;
 
 pub use algo::{Algo, Data, Handle, ReadAccess, ReadVersion, WriteAccess};
 pub use error::TransError;

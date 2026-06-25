@@ -150,3 +150,24 @@ pub struct ShardEntry {
     #[prost(bool, tag = "5")]
     pub deleted: bool,
 }
+/// The collection root object: collection existence, the (constant) shard count,
+/// the subcollection directory, and the membership lock that serializes
+/// create/delete against listing. See ADR-018.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CollectionRoot {
+    /// The shard count C this collection was created with. Part of the on-disk
+    /// format; validated against the compile-time SHARD_COUNT on open.
+    #[prost(uint32, tag = "1")]
+    pub shard_count: u32,
+    /// Child collection names (raw bytes), the subcollection directory; sorted so
+    /// the encoding is canonical.
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub subcollections: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Membership lock serializing create/delete (write) against listing (read).
+    #[prost(enumeration = "lock::LockType", tag = "3")]
+    pub membership_lock: i32,
+    /// Transactions holding the membership lock (more than one only for read
+    /// locks); sorted so the encoding is canonical.
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub membership_locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}

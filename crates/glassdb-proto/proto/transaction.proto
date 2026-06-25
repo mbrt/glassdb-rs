@@ -71,3 +71,20 @@ message ShardEntry {
     // Tombstone flag.
     bool deleted = 5;
 }
+
+// The collection root object: collection existence, the (constant) shard count,
+// the subcollection directory, and the membership lock that serializes
+// create/delete against listing. See ADR-018.
+message CollectionRoot {
+    // The shard count C this collection was created with. Part of the on-disk
+    // format; validated against the compile-time SHARD_COUNT on open.
+    uint32 shard_count = 1;
+    // Child collection names (raw bytes), the subcollection directory; sorted so
+    // the encoding is canonical.
+    repeated bytes subcollections = 2;
+    // Membership lock serializing create/delete (write) against listing (read).
+    Lock.LockType membership_lock = 3;
+    // Transactions holding the membership lock (more than one only for read
+    // locks); sorted so the encoding is canonical.
+    repeated bytes membership_locked_by = 4;
+}
