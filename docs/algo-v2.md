@@ -95,15 +95,28 @@ ADR-016…021 are now behavior-complete: validate-and-lock, wound-wait with
 all over content CAS on shards / root / transaction objects, with priority
 preserved across retries (`TxId::renew`).
 
-Two designed mechanisms are intentionally **superseded** rather than ported,
-because v2 realises "wait" as abort-and-retry (a transaction never blocks while
-holding locks):
+Lock acquisition keeps ADR-020's two modes, with "wait" realised — **for the MVP
+only** — as release-and-retry (a transaction never blocks while holding locks).
+When the engine is ported onto v1's logic and data structures this reverts to
+**hold-and-wait** (locks preserved across retries, deadlock-timeout → serial,
+lease refresh); see [ADR-020 § MVP vs. v1](adr/020-commit-write-back-protocol.md#mvp-vs-the-v1-hold-and-wait-model).
+- **Parallel by default** — all touched shards are locked concurrently (then the
+  root last). On an unwinnable conflict the transaction aborts and retries with
+  its priority preserved. Deadlock-/livelock-free for distinct priorities.
+- **Serial sorted fallback (ADR-020)** — after `SERIAL_FALLBACK_AFTER` failed
+  attempts a transaction locks shards one at a time in ascending index order.
+  Two *equal-priority* transactions can livelock the parallel path (each grabs a
+  different shard first); under the single global lock order they instead queue
+  on the lowest shard, where first-CAS-wins picks a winner that always finishes.
+  Wound-wait uses **no prefix tiebreak** (it would flip under `renew` and
+  reintroduce the livelock); equal priorities are resolved only by this fallback.
+
+One designed mechanism is intentionally **not ported for the MVP**, because in
+release-and-retry a transaction aborts rather than blocks while holding locks:
 - **No background lease refresher (ADR-021)** — a *pending* object never lingers
   long enough to expire while live (its lock window is a few synchronous CAS
-  round-trips), and a *committed* object never expires.
-- **No serial sorted-by-path deadlock fallback (ADR-020)** — abort-and-retry
-  cannot deadlock; equal priorities are broken by a deterministic byte tiebreak,
-  the loser retrying with a fresh prefix.
+  round-trips), and a *committed* object never expires. The refresher **returns**
+  with the v1 hold-and-wait port.
 
 The engine deliberately defers (see the `TODO`s in `v2.rs`):
 - **GC (ADR-022)** — synchronous write-back; aborted/unreferenced transaction
@@ -153,8 +166,11 @@ Each design decision becomes its own ADR (next free number is 022).
   per-shard write-back). Shard-CAS contention vs lock conflict; effective-current-
   writer / help-forward resolution; cross-shard non-atomicity gated on the commit
   object; in-doubt parity at every CAS site; read-only and single-RW fast paths.
-  The serial sorted-by-path deadlock fallback is **superseded by abort-and-retry**
-  (deadlock-free by construction). Write-back is still synchronous; GC → ADR-022.
+  Lock acquisition is **parallel by default** with a **serial sorted-by-index
+  fallback** after `SERIAL_FALLBACK_AFTER` failed attempts; both abort-and-retry
+  rather than block (the serial path's single global lock order is what gives
+  equal-priority transactions progress, with no prefix tiebreak). Write-back is
+  still synchronous; GC → ADR-022.
 - **[ADR-021](adr/021-wound-wait-leases-shard.md) — Wound-wait & leases at shard
   granularity.** ✅ Written & implemented (`glassdb-trans::v2`: wound-wait +
   lease expiry / crash recovery). The lease is the transaction object's existing
@@ -199,10 +215,14 @@ Group B — protocol details:
 - [x] Resolution of the "effective current writer" when a committed-but-not-
       written-back write-lock holder exists (relocated `validate_locked_read` +
       help-forward) (ADR-020).
-- [x] Deadlock fallback: superseded in v2 by abort-and-retry (no hold-and-wait,
-      so deadlock-free); equal priorities broken by a deterministic byte tiebreak
-      with priority preserved on retry (`TxId::renew`). The serial sorted-by-path
-      path of ADR-020 is documented but not needed by the v2 engine.
+- [x] Deadlock/livelock fallback: parallel locking by default; after
+      `SERIAL_FALLBACK_AFTER` failed attempts, serial sorted-by-shard-index
+      acquisition (ADR-020). Both abort-and-retry rather than block; the serial
+      path's single global lock order (first-CAS-wins on the lowest shard) is what
+      gives equal-priority transactions progress. Wound-wait uses **no prefix
+      tiebreak** (it would flip under `TxId::renew` and livelock); priority is
+      preserved on retry. Regression-tested in `v2.rs` (`should_wound`) and
+      `v2_engine.rs` (cross-shard liveness).
 - [x] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
       timeout constants — lease is the object `timestamp`, reclaim if older-or-
       expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW` (ADR-021). Implemented in

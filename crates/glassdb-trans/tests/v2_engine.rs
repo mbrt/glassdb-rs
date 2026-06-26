@@ -262,6 +262,58 @@ async fn cross_shard_transfer_preserves_invariant() {
     assert_eq!(parse_u64(c.get(b"acct-b").await.unwrap()), 20);
 }
 
+// Many transactions each writing the *same two cross-shard keys* must all
+// commit (liveness under the parallel-locking + serial-fallback machinery), and
+// the result must be atomic across shards: both keys reflect the same winning
+// transaction. This exercises the multi-shard lock path that the serial fallback
+// (ADR-020) protects from livelock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_cross_shard_writers_stay_atomic() {
+    let c = new_collection().await;
+    let k1 = b"x".to_vec();
+    let s1 = shard_index(&k1);
+    // Find a second key that lands in a different shard.
+    let mut k2 = None;
+    for i in 0..100_000u64 {
+        let cand = format!("y{i}");
+        if shard_index(cand.as_bytes()) != s1 {
+            k2 = Some(cand.into_bytes());
+            break;
+        }
+    }
+    let k2 = k2.expect("a cross-shard key exists");
+    assert_ne!(shard_index(&k1), shard_index(&k2));
+
+    const N: u64 = 12;
+    let mut handles = Vec::new();
+    for i in 1..=N {
+        let c = c.clone();
+        let k1 = k1.clone();
+        let k2 = k2.clone();
+        handles.push(tokio::spawn(async move {
+            c.transact(move |tx| {
+                let k1 = k1.clone();
+                let k2 = k2.clone();
+                async move {
+                    tx.put(&k1, u64_bytes(i));
+                    tx.put(&k2, u64_bytes(i));
+                    Ok(())
+                }
+            })
+            .await
+        }));
+    }
+    // Every transaction must commit — no livelock/hang.
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+    // Cross-shard atomicity: both keys carry the same winning transaction's value.
+    let v1 = parse_u64(c.get(&k1).await.unwrap());
+    let v2 = parse_u64(c.get(&k2).await.unwrap());
+    assert_eq!(v1, v2, "cross-shard writes not atomic: {v1} != {v2}");
+    assert!((1..=N).contains(&v1), "unexpected final value {v1}");
+}
+
 // Crash recovery (ADR-021): a transaction that installed locks (a shard entry +
 // the collection-root membership lock) and then *crashed* before committing
 // leaves a pending transaction object whose lease eventually expires. A younger

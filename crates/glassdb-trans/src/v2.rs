@@ -14,24 +14,33 @@
 //! transaction object to committed (the commit point), then publishes
 //! `current_writer` pointers and releases locks (write-back).
 //!
-//! Concurrency control (ADR-002 / ADR-021): strict two-phase locking with
-//! wound-wait, and leases for crash recovery. The "wait" of wound-wait is
-//! realised as **abort-and-retry with a preserved priority**: a transaction that
-//! meets an older live holder it cannot reclaim aborts and retries with the same
-//! priority (so it never holds locks while blocked, which also makes the protocol
-//! deadlock-free), while a transaction that **outranks** the holder *or* finds
-//! the holder's **lease expired** wounds it (CAS its object pending → aborted)
-//! and proceeds. Committed holders are resolved by help-forward; aborted holders
-//! are cleared lazily by the next contender.
+//! Concurrency control (ADR-002 / ADR-020 / ADR-021): strict two-phase locking
+//! with wound-wait, and leases for crash recovery.
+//!
+//! Lock acquisition has two modes (ADR-020). The default **parallel** path locks
+//! every touched shard concurrently (one RTT for the whole set). On any conflict
+//! it cannot win, a transaction **aborts and retries with its priority preserved**
+//! (`TxId::renew`: same timestamp, fresh prefix) — it never blocks while holding
+//! locks, so it cannot deadlock. A transaction that **outranks** a holder *or*
+//! finds the holder's **lease expired** wounds it (CAS pending → aborted) and
+//! proceeds; committed holders are help-forwarded; aborted holders are cleared
+//! lazily. Two *equal-priority* transactions, though, can **livelock** in the
+//! parallel path — each may grab a different shard first and then abort on the
+//! other — so after [`SERIAL_FALLBACK_AFTER`] failed attempts a transaction
+//! escalates to the **serial** fallback: it locks shards one at a time in
+//! ascending index order (then the root). With a single global lock order every
+//! contender queues on the lowest shard and exactly one wins it (first-CAS-wins),
+//! which guarantees progress without any prefix tiebreak (a tiebreak would flip
+//! under `renew` and reintroduce the livelock — see [`should_wound`]).
 //!
 //! Leases (ADR-021): the pending object's `timestamp` is the lease. A holder is
 //! reclaimable once `now > timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`,
 //! which is what lets a *younger* transaction reclaim a *dead older* holder it
 //! would otherwise wait on forever. The clock is the injectable [`Clock`],
 //! anchored to virtual time in tests so expiry is deterministic. No background
-//! refresher is needed (unlike v1): a v2 transaction never blocks while holding
-//! locks (it aborts-and-retries instead), so a *pending* object never lingers
-//! long enough to expire while live, and a *committed* object never expires.
+//! refresher is needed (unlike v1): in *both* modes a transaction aborts rather
+//! than blocks on a conflict, so a *pending* object never lingers long enough to
+//! expire while live, and a *committed* object never expires.
 //!
 //! Deliberate simplifications, each a follow-up:
 //! - TODO(ADR-022 GC): aborted/unreferenced transaction objects and empty shard
@@ -42,11 +51,6 @@
 //! - TODO(perf): no caching layer (every read hits the backend), no batched or
 //!   async write-back, no proactive lock release on abort, fresh pending object
 //!   per attempt. Performance is explicitly out of scope for v1.
-//! - The serial sorted-by-path deadlock fallback of ADR-020 is intentionally
-//!   omitted: v2 realises "wait" as abort-and-retry, so it never holds-and-waits
-//!   and cannot deadlock. Equal priorities are broken by a deterministic byte
-//!   tiebreak; the loser aborts and retries with a fresh prefix, so the pair
-//!   makes progress without serial re-acquisition.
 //! - TODO(cutover): re-point the DST oracles (serializability, cycle ring) at
 //!   this engine, then retire the v1 tag-based engine and slim the `Backend`
 //!   trait (ADR-023).
@@ -56,6 +60,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use futures::future::join_all;
 use glassdb_backend::{Backend, BackendError, Tags, Version};
 use glassdb_concurr::{Clock, RetryConfig, rt};
 use glassdb_data::shard::{SHARD_COUNT, shard_index};
@@ -72,6 +77,13 @@ const MAX_ATTEMPTS: usize = 200;
 /// Maximum inner CAS retries on a single shard/root before treating the
 /// operation as conflicted and restarting the transaction.
 const CAS_RETRIES: usize = 50;
+/// Number of parallel-locking attempts before a transaction escalates to the
+/// serial sorted-locking fallback (ADR-020). The parallel path is fast but can
+/// *livelock* two equal-priority transactions that each grab a different shard
+/// first (mutual abort); after this many failures the transaction switches to
+/// sorted acquisition, where first-CAS-wins on the lowest contended shard
+/// guarantees one of them always makes progress.
+const SERIAL_FALLBACK_AFTER: usize = 3;
 /// A pending transaction's lease term (ADR-021): a holder is considered dead
 /// once `now > lease_timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`. Reused
 /// verbatim from the v1 monitor so wound/expiry timing stays identical.
@@ -300,15 +312,18 @@ impl Collection {
         // (ADR-002), while the fresh prefix lands its retry in a new partition.
         let mut id = TxId::new_at(self.clock().now());
         let mut backoff = RetryConfig::default().backoff();
-        for _ in 0..MAX_ATTEMPTS {
+        for attempt in 0..MAX_ATTEMPTS {
             let tx = Tx::new(self.clone());
             let value = f(tx.clone()).await?;
             let (reads, writes) = tx.snapshot();
 
+            // Escalate to the serial sorted-locking fallback once the parallel
+            // path has failed enough times to suspect a livelock (ADR-020).
+            let serial = attempt >= SERIAL_FALLBACK_AFTER;
             let committed = if writes.is_empty() {
                 self.validate_readonly(&reads).await?
             } else {
-                self.commit_once(&id, &reads, &writes).await?
+                self.commit_once(&id, &reads, &writes, serial).await?
             };
             if committed {
                 return Ok(value);
@@ -607,17 +622,21 @@ impl Collection {
     }
 
     /// One commit attempt. Returns `true` if committed, `false` if the
-    /// transaction must restart.
+    /// transaction must restart. `serial` selects the sorted sequential
+    /// acquisition fallback over the default parallel locking (ADR-020).
     async fn commit_once(
         &self,
         id: &TxId,
         reads: &HashMap<Vec<u8>, ReadRecord>,
         writes: &BTreeMap<Vec<u8>, WriteOp>,
+        serial: bool,
     ) -> Result<bool, TransError> {
         let ts = self.clock().now();
         let pending_v = self.create_pending(id, ts).await?;
 
-        // Group accessed keys by shard.
+        // Group accessed keys by shard. The `BTreeMap` keeps shards in ascending
+        // index order, which is the global lock order the serial fallback relies
+        // on for deadlock/livelock freedom.
         let mut groups: BTreeMap<u32, ShardGroup> = BTreeMap::new();
         for (k, op) in writes {
             groups
@@ -636,19 +655,21 @@ impl Collection {
             }
         }
 
-        // Validate + lock each shard (S2PL acquisition).
-        let mut membership = false;
-        for (idx, group) in &groups {
-            match self.lock_shard(id, *idx, group, reads, ts).await? {
-                ShardOutcome::Locked { membership: m } => membership |= m,
-                ShardOutcome::Retry => {
-                    self.mark_aborted(id, ts).await;
-                    return Ok(false);
-                }
+        // Validate + lock the shards (S2PL acquisition). The default path locks
+        // every shard in parallel (one RTT for the whole set); the serial
+        // fallback locks them one at a time in ascending index order so that
+        // equal-priority contenders all queue on the lowest shard and exactly
+        // one wins it (first-CAS-wins), guaranteeing progress.
+        let membership = match self.lock_shards(id, &groups, reads, ts, serial).await? {
+            Some(m) => m,
+            None => {
+                self.mark_aborted(id, ts).await;
+                return Ok(false);
             }
-        }
+        };
 
-        // Membership changes also lock the collection root (ADR-018).
+        // Membership changes also lock the collection root (ADR-018); the root is
+        // the highest object in the lock order, so it is always taken last.
         if membership && !self.lock_root(id, ts).await? {
             self.mark_aborted(id, ts).await;
             return Ok(false);
@@ -664,6 +685,45 @@ impl Collection {
         // TODO: Make this async and best-effort.
         self.write_back(id, &groups, membership).await?;
         Ok(true)
+    }
+
+    /// Acquires the locks for every touched shard, returning `Some(membership)`
+    /// on success or `None` if the transaction must restart. The default path
+    /// locks all shards concurrently; the serial fallback locks them one at a
+    /// time in ascending shard-index order (the global lock order).
+    async fn lock_shards(
+        &self,
+        id: &TxId,
+        groups: &BTreeMap<u32, ShardGroup>,
+        reads: &HashMap<Vec<u8>, ReadRecord>,
+        ts: SystemTime,
+        serial: bool,
+    ) -> Result<Option<bool>, TransError> {
+        if serial {
+            let mut membership = false;
+            for (idx, group) in groups {
+                match self.lock_shard(id, *idx, group, reads, ts).await? {
+                    ShardOutcome::Locked { membership: m } => membership |= m,
+                    ShardOutcome::Retry => return Ok(None),
+                }
+            }
+            Ok(Some(membership))
+        } else {
+            let outcomes = join_all(
+                groups
+                    .iter()
+                    .map(|(idx, group)| self.lock_shard(id, *idx, group, reads, ts)),
+            )
+            .await;
+            let mut membership = false;
+            for outcome in outcomes {
+                match outcome? {
+                    ShardOutcome::Locked { membership: m } => membership |= m,
+                    ShardOutcome::Retry => return Ok(None),
+                }
+            }
+            Ok(Some(membership))
+        }
     }
 
     /// Validates reads and installs this transaction's locks in one shard, with
@@ -1051,20 +1111,16 @@ impl Tx {
     }
 }
 
-/// Wound-wait priority decision: an older transaction wounds a younger holder.
-/// Equal priorities (same timestamp) fall back to a deterministic byte tiebreak
-/// so exactly one side wins a given encounter. This replaces v1's serial
-/// sorted-by-path fallback: because v2 realises "wait" as abort-and-retry (the
-/// loser never holds-and-waits), a deterministic tiebreak plus a fresh prefix on
-/// the loser's retry is enough for progress without serial re-acquisition.
+/// Wound-wait priority decision: a strictly-older transaction wounds a younger
+/// holder (ADR-002). Equal-priority transactions are deliberately **not** ordered
+/// — neither wounds the other — exactly like [`TxId::older`]. A prefix-based
+/// tiebreak must not be used here: because a retry mints a fresh prefix
+/// ([`TxId::renew`]), a prefix tiebreak would flip the winner on every retry and
+/// let two equal-priority transactions wound each other forever (livelock). The
+/// equal-priority case is instead resolved by the serial sorted-locking fallback
+/// (first-CAS-wins on the lowest contended shard); see [`Collection::commit_once`].
 fn should_wound(me: &TxId, holder: &TxId) -> bool {
-    if me.older(holder) {
-        return true;
-    }
-    if holder.older(me) {
-        return false;
-    }
-    me.as_bytes() < holder.as_bytes()
+    me.older(holder)
 }
 
 /// The terminal error when a transaction exhausts [`MAX_ATTEMPTS`]. Wound-wait
@@ -1072,4 +1128,39 @@ fn should_wound(me: &TxId, holder: &TxId) -> bool {
 /// (or a bug); reuses [`TransError::Other`] rather than a bespoke variant.
 fn retry_exhausted() -> TransError {
     TransError::other("transaction retry budget exhausted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for the equal-priority livelock: two transactions sharing a
+    // timestamp must NOT wound each other. A prefix-based tiebreak here, combined
+    // with `TxId::renew` minting a fresh prefix on every retry, would flip the
+    // winner each round and let the pair wound each other forever. Equal
+    // priorities are resolved by the serial sorted-locking fallback instead.
+    #[test]
+    fn equal_priority_transactions_do_not_wound_each_other() {
+        let a = TxId::with_priority(100, b"aaaaaaaa");
+        let b = TxId::with_priority(100, b"zzzzzzzz");
+        assert!(!should_wound(&a, &b));
+        assert!(!should_wound(&b, &a));
+    }
+
+    #[test]
+    fn older_transaction_wounds_younger_only() {
+        let older = TxId::with_priority(100, b"zzzzzzzz");
+        let younger = TxId::with_priority(200, b"aaaaaaaa");
+        assert!(should_wound(&older, &younger));
+        assert!(!should_wound(&younger, &older));
+    }
+
+    #[test]
+    fn lease_expiry_window() {
+        let lease = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let fresh = lease + Duration::from_secs(10);
+        let past = lease + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW + Duration::from_secs(1);
+        assert!(!is_expired(lease, fresh));
+        assert!(is_expired(lease, past));
+    }
 }

@@ -2,11 +2,19 @@
 
 ## Status
 
-Accepted — implemented in `glassdb-trans::v2`, with two deliberate
-simplifications: write-back is **synchronous** (not yet async/batched; GC and
-caching are ADR-022/perf follow-ups), and the **serial sorted-by-path deadlock
-fallback is omitted** because v2 realises "wait" as abort-and-retry, which cannot
-deadlock (see [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback)).
+Accepted — implemented in `glassdb-trans::v2`. Shard locking runs **in parallel
+by default** and falls back to **serial sorted-by-path acquisition** after a few
+failed attempts (see [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback)).
+
+Two deliberate simplifications remain, both **MVP-only**:
+
+- The conflict-resolution model is **release-and-retry**, not hold-and-wait. This
+  keeps the MVP simple and refresher-free; when the engine is ported onto v1's
+  logic and data structures it becomes **hold-and-wait again** (locks preserved
+  across retries, deadlock-timeout → serial fallback, lease refresh). See
+  [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback).
+- Write-back is **synchronous** (not yet async/batched; GC and caching are
+  ADR-022/perf follow-ups).
 
 ## Context
 
@@ -174,16 +182,63 @@ The mechanism is unchanged; only the lock targets differ (shards + root instead 
 per-key objects), so there are typically _fewer_ objects to sort and lock, at the
 cost of coarser conflicts.
 
-> **v2 deviation (implementation):** the `glassdb-trans::v2` engine **omits the
-> serial fallback** and never holds-and-waits. A transaction that meets a holder
-> it cannot reclaim (a live, higher-or-equal-priority, non-expired peer) aborts
-> immediately, releasing its locks, and retries with its priority preserved
-> (`TxId::renew`). Because no transaction ever blocks while holding a lock, there
-> is no hold-and-wait and therefore no deadlock to break — so the serial
-> sorted-by-path re-acquisition is unnecessary. Equal priorities are resolved by
-> a deterministic byte tiebreak; the loser aborts and retries with a fresh
-> prefix, so the pair still makes progress. This trades the (rare) extra restarts
-> of a hot conflict for a much simpler protocol with no lock-timeout budget.
+> **MVP realisation (`glassdb-trans::v2`):** the current engine keeps the two-mode
+> structure above but realises "wait" as **release-and-retry** rather than
+> hold-and-wait, so no transaction ever holds locks while blocked. This is a
+> deliberate **MVP simplification** — see [the migration note](#mvp-vs-the-v1-hold-and-wait-model)
+> below for why and what replaces it.
+>
+> - **Default (parallel) path.** All touched shards are locked concurrently (one
+>   RTT for the whole set), then the root last (it is the highest object in the
+>   lock order). A transaction that meets a holder it cannot reclaim — a live,
+>   non-expired peer that does **not** lose wound-wait to it — aborts immediately,
+>   releases its locks, and retries with its priority preserved (`TxId::renew`:
+>   same timestamp, fresh prefix). For *distinct* priorities this is deadlock- and
+>   livelock-free: the strictly-older transaction always wounds the younger and
+>   makes progress. Two *equal-priority* transactions, however, can **livelock**
+>   here — each may grab a different shard first and then abort on the other.
+> - **Serial fallback.** After a few failed attempts (`SERIAL_FALLBACK_AFTER`) a
+>   transaction escalates to locking shards one at a time in **ascending shard
+>   index order** (then the root). Under this single global order every contender
+>   queues on the lowest contended shard, and whoever CASes its lock there first
+>   wins it while the others abort; the winner is never wounded by an equal peer,
+>   so it acquires the rest and commits. This guarantees global progress (the
+>   holder of the highest-ordered lock always finds everything above it free), so
+>   equal-priority transactions cannot livelock.
+>
+> Because acquisition never blocks while holding locks, the bounded "deadlock
+> budget / release-and-retry" of the design above is realised directly by the
+> retry loop, and there is **no prefix tiebreak** in wound-wait: a tiebreak would
+> flip under `renew` and reintroduce the equal-priority livelock the serial path
+> exists to prevent (see `should_wound` in `v2.rs`). Write-back remains synchronous
+> (GC/async batching → ADR-022/perf).
+
+#### MVP vs. the v1 hold-and-wait model
+
+The release-and-retry realisation above is an **MVP-only** choice. It trades the
+efficiency of holding locks across retries for a much smaller, refresher-free,
+DST-friendly engine while the new shard/transaction-object layout is validated end
+to end. Its costs are real: on a conflict the whole transaction body is re-run and
+every shard is re-CAS'd, and each `TxId::renew` orphans an aborted transaction
+object (GC debt) until ADR-022 lands.
+
+When the engine is ported onto **v1's logic and data structures** it reverts to
+**hold-and-wait**, exactly as the design body above (and v1) describe:
+
+- a transaction **keeps** the locks it has acquired and **waits** for a conflicting
+  holder instead of aborting (wound-wait: older wounds younger, younger/equal
+  waits), so work already done is not thrown away;
+- the parallel attempt is bounded by a **deadlock timeout**; only on timeout does
+  it release and re-acquire in the sorted serial order;
+- a transaction that waits while holding locks runs the **lease refresher**
+  ([ADR-021](021-wound-wait-leases-shard.md)) so its held locks are not falsely
+  reclaimed.
+
+This restores v1's behaviour; the only reason it is not in the MVP is that, on a
+backend with no wait/notify primitive, "wait" degrades to polling, so the
+simplicity of release-and-retry is the better starting point. The serial fallback,
+wound-wait, and lease-expiry semantics are identical across both models — only the
+conflict action (release vs. wait) changes.
 
 ### In-doubt outcomes at the new CAS sites
 
