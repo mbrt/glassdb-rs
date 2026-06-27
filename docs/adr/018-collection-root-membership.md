@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted — implemented (`glassdb-storage::CollectionRoot` + the `glassdb-trans::v2`
-membership protocol)
+Accepted — implemented (`glassdb-storage::CollectionRoot` + the membership
+protocol in the transaction engine)
 
 ## Context
 

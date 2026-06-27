@@ -678,7 +678,7 @@ fn notify_waiters(st: &mut State, tid: &TxId, res: WaitTxResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
+    use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
     use glassdb_storage::{Global, LockType, PathLock, TxWrite};
 
@@ -752,10 +752,7 @@ mod tests {
         let (mon2, _t2) = new_test_monitor(b.clone());
         let key = paths::from_key("example", b"key");
 
-        t1.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
+        t1.global.write(&key, Arc::from(&b"x"[..])).await.unwrap();
 
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);

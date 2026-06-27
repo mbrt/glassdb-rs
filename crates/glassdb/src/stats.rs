@@ -24,10 +24,6 @@ pub struct Stats {
     /// Number of retried transactions.
     pub tx_retries: u64,
 
-    /// Number of metadata reads.
-    pub meta_reads: u64,
-    /// Number of metadata writes.
-    pub meta_writes: u64,
     /// Number of object reads.
     pub obj_reads: u64,
     /// Number of object writes.
@@ -43,16 +39,12 @@ impl Stats {
         self.tx_reads += other.tx_reads;
         self.tx_writes += other.tx_writes;
         self.tx_retries += other.tx_retries;
-        self.meta_reads += other.meta_reads;
-        self.meta_writes += other.meta_writes;
         self.obj_reads += other.obj_reads;
         self.obj_writes += other.obj_writes;
         self.obj_lists += other.obj_lists;
     }
 
     pub(crate) fn add_backend(&mut self, b: &BackendStats) {
-        self.meta_reads += b.meta_reads;
-        self.meta_writes += b.meta_writes;
         self.obj_reads += b.obj_reads;
         self.obj_writes += b.obj_writes;
         self.obj_lists += b.obj_lists;
@@ -69,8 +61,6 @@ impl Sub for Stats {
             tx_reads: self.tx_reads.saturating_sub(other.tx_reads),
             tx_writes: self.tx_writes.saturating_sub(other.tx_writes),
             tx_retries: self.tx_retries.saturating_sub(other.tx_retries),
-            meta_reads: self.meta_reads.saturating_sub(other.meta_reads),
-            meta_writes: self.meta_writes.saturating_sub(other.meta_writes),
             obj_reads: self.obj_reads.saturating_sub(other.obj_reads),
             obj_writes: self.obj_writes.saturating_sub(other.obj_writes),
             obj_lists: self.obj_lists.saturating_sub(other.obj_lists),

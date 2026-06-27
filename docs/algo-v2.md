@@ -77,14 +77,12 @@ per-decision ADRs.
 
 ## Implementation status
 
-A correctness-first engine for ADR-016…021 lives in
-[`glassdb-trans::v2`](../crates/glassdb-trans/src/v2.rs), built **alongside** the
-v1 engine (so the existing suite stays green) and verified end-to-end on the
-in-memory backend (`crates/glassdb-trans/tests/v2_engine.rs`): single-key
-get/put/delete, multi-key transactions, optimistic list, the serializability
-stress tests (concurrent counter, cross-shard transfer invariant, same-shard
-merge, wound-wait progress), and **crash recovery** (an expired-lease holder's
-shard + root locks are reclaimed by a younger writer).
+A correctness-first engine for ADR-016…021 is implemented in `glassdb-trans` and
+verified end-to-end on the in-memory backend: single-key get/put/delete,
+multi-key transactions, optimistic list, the serializability stress tests
+(concurrent counter, cross-shard transfer invariant, same-shard merge,
+wound-wait progress), and **crash recovery** (an expired-lease holder's shard +
+root locks are reclaimed by a younger writer).
 
 Data layer landed in `glassdb-storage`: `Shard` (ADR-017), `CollectionRoot`
 (ADR-018), and the `txobject` codec over `TransactionLog` (ADR-019), each
@@ -118,15 +116,16 @@ release-and-retry a transaction aborts rather than blocks while holding locks:
   round-trips), and a *committed* object never expires. The refresher **returns**
   with the v1 hold-and-wait port.
 
-The engine deliberately defers (see the `TODO`s in `v2.rs`):
+The engine deliberately defers:
 - **GC (ADR-022)** — synchronous write-back; aborted/unreferenced transaction
   objects and empty shard entries are never swept. A `locked_by` entry pointing
   at a *missing* object is dropped rather than given the `handle_unknown_tx`
   grace period (safe only until GC can delete a still-referenced object).
 - **Performance** — no cache, no batched/async write-back, no proactive lock
   release on abort, a fresh pending object per attempt.
-- **Cutover** — re-point the DST oracles at this engine, then retire v1 and slim
-  the `Backend` trait (ADR-023).
+
+The **cutover** is done: the DST oracles run on this engine, v1 is retired, and
+the `Backend` trait is slimmed (ADR-023).
 
 ## Planned ADRs
 
@@ -160,7 +159,7 @@ Each design decision becomes its own ADR (next free number is 022).
   Encoding evolves `TransactionLog`. Sequencing deferred to ADR-020, lease to
   ADR-021.
 - **[ADR-020](adr/020-commit-write-back-protocol.md) — Commit & write-back
-  protocol.** ✅ Written & implemented (`glassdb-trans::v2`). Five
+  protocol.** ✅ Written & implemented. Five
   phases (execute → prepare pending object →
   validate-and-lock as one RMW CAS per shard → commit flip CAS → idempotent
   per-shard write-back). Shard-CAS contention vs lock conflict; effective-current-
@@ -173,8 +172,8 @@ Each design decision becomes its own ADR (next free number is 022).
   equal-priority transactions progress, with no prefix tiebreak). Write-back is
   still synchronous; GC → ADR-022.
 - **[ADR-021](adr/021-wound-wait-leases-shard.md) — Wound-wait & leases at shard
-  granularity.** ✅ Written & implemented (`glassdb-trans::v2`: wound-wait +
-  lease expiry / crash recovery). The lease is the transaction object's existing
+  granularity.** ✅ Written & implemented (wound-wait + lease expiry / crash
+  recovery). The lease is the transaction object's existing
   `timestamp` (no new field): last-refresh while pending, commit-time once
   committed, expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`. Reclaiming a
   conflicting `locked-by` entry combines wound-wait priority with the lease (wound
@@ -182,14 +181,14 @@ Each design decision becomes its own ADR (next free number is 022).
   Discovery is lazy via `locked-by` (no pending registry); reads never consult the
   lease; abort CAS keeps ADR-009 in-doubt parity. Re-frames
   [ADR-002](adr/002-wound-wait-locking.md) for the new layout. Two parts are
-  superseded/deferred: **no background refresher** (v2 never blocks while holding
-  locks, so a live pending object cannot expire), and the **`handle_unknown_tx`
+  superseded/deferred: **no background refresher** (the engine never blocks while
+  holding locks, so a live pending object cannot expire), and the **`handle_unknown_tx`
   grace period** for a missing object is deferred to GC (ADR-022).
 - **ADR-022 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
   locked-by`; the commit→write-back gap; deferral of the explicit counter and
   compaction.
 - **[ADR-023](adr/023-slimmed-backend-trait.md) — Slimmed `Backend` trait.** ✅
-  Written (design). The reduced seven-method surface (`read`, `read_if_modified`,
+  Written & implemented. The reduced seven-method surface (`read`, `read_if_modified`,
   `write`, `write_if`, `write_if_not_exists`, `delete`, `list`); removal of tags /
   nonce / `set_tags_if` / `get_metadata` / `delete_if`; content CAS as the only
   coordination primitive. `read_if_modified` is **re-keyed from the writer tag to
@@ -228,13 +227,13 @@ Group B — protocol details:
       path's single global lock order (first-CAS-wins on the lowest shard) is what
       gives equal-priority transactions progress. Wound-wait uses **no prefix
       tiebreak** (it would flip under `TxId::renew` and livelock); priority is
-      preserved on retry. Regression-tested in `v2.rs` (`should_wound`) and
-      `v2_engine.rs` (cross-shard liveness).
+      preserved on retry. Regression-tested for the wound decision and
+      cross-shard liveness.
 - [x] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
       timeout constants — lease is the object `timestamp`, reclaim if older-or-
       expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW` (ADR-021). Implemented in
-      `glassdb-trans::v2`; the background refresher is unnecessary there (v2 never
-      blocks while holding locks). Creation point (pending object at prepare) is
+      the transaction engine; the background refresher is unnecessary there (the
+      engine never blocks while holding locks). Creation point (pending object at prepare) is
       ADR-020.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
@@ -270,9 +269,11 @@ Group D — GC & lifecycle:
 
 Group E — backends:
 
-- [ ] Final `Backend` trait signature and error semantics on the reduced surface
-      — specified by [ADR-023](adr/023-slimmed-backend-trait.md) (seven methods;
-      content CAS only; ADR-009 in-doubt parity).
+- [x] Final `Backend` trait signature and error semantics on the reduced surface
+      — [ADR-023](adr/023-slimmed-backend-trait.md) implemented: seven methods
+      (`read`, `read_if_modified`, `write`, `write_if`, `write_if_not_exists`,
+      `delete`, `list`); content CAS only; ADR-009 in-doubt parity
+      (`glassdb-backend`).
 - [ ] Cache tagless coordination objects via version/ETag-conditional reads.
       Today `ShardStore` full-fetches every shard/root read (the writer-tag
       `read_if_modified` is unusable on these tagless objects). **Designed in
@@ -283,14 +284,23 @@ Group E — backends:
       write, which is exactly when to invalidate. This is what makes the "shard
       (conditional GET)" in *Direction at a glance* real. See the `TODO(perf)` in
       `glassdb-storage::shardstore`.
-- [ ] S3 mapping (drop nonce/tags; conditional writes; remove `delete_if`).
-- [ ] GCS mapping (content CAS via generation `If-Match`; drop metadata patch).
-- [ ] In-memory backend semantics for the new trait (and DST fault injection).
+- [x] S3 mapping — `S3Backend` on the slimmed trait: `If-Match` /
+      `If-None-Match` conditional writes, ETag versions, no nonce/tags and
+      `delete_if` removed (`glassdb-backend-s3`).
+- [x] GCS mapping — `GcsBackend` on the slimmed trait: content CAS via
+      generation `ifGenerationMatch` (and `ifGenerationNotMatch` for
+      create/`read_if_modified`); no metadata patch (`glassdb-backend-gcs`).
+- [x] In-memory backend semantics for the new trait (`MemoryBackend`) plus DST
+      fault injection (the `fault` middleware).
 
 Group F — testing & migration:
 
-- [ ] Re-point DST oracles (serializability, cycle ring) at the new layout.
-- [ ] Regenerate golden vectors and `RecordingBackend` byte-stream expectations.
+- [x] Re-point DST oracles (serializability, cycle ring) at the new layout — the
+      `glassdb` DB is cut over to the v2 engine, so `concurrent_sim` /
+      `cycle_sim` / `fuzz_corpus` run against the sharded layout.
+- [x] Regenerate golden vectors and `RecordingBackend` byte-stream expectations —
+      golden encodings anchor the v2 shard / root / transaction-object formats
+      and `RecordingBackend` records the slimmed-trait op stream.
 - [ ] Benchmark plan to locate the false-sharing knee vs `C` and confirm the S3
       win.
 - [ ] Update `README.md`, `architecture.md`, `PORTING.md` once the layout lands.

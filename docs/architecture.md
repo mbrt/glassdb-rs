@@ -83,7 +83,7 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
 | `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `monitor.rs`, `reader.rs`, `gc.rs`                  | Transaction engine: commit algorithm, distributed locker, lifecycle monitor, read path, log GC                                                |
-| `glassdb-storage`     | `global.rs`, `local.rs`, `locker.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Backend read/write-through cache, local cache with staleness, lock-state encoding, transaction-log persistence, version tracking, generic LRU |
+| `glassdb-storage`     | `global.rs`, `local.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs`   | Backend read/write-through cache, local cache with staleness, lock-state value type, transaction-log persistence, version tracking, generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`, `gopath.rs`                              | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
@@ -106,53 +106,50 @@ returned future:
 pub trait Backend: Send + Sync {
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError>;
     async fn read_if_modified(
-        &self, path: &str, expected_writer: &WriterId,
+        &self, path: &str, expected: &Version,
     ) -> Result<ReadReply, BackendError>;
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError>;
-    async fn set_tags_if(
-        &self, path: &str, expected: &Version, tags: Tags,
-    ) -> Result<Metadata, BackendError>;
-    async fn write(&self, path: &str, value: Vec<u8>, tags: Tags)
-        -> Result<Metadata, BackendError>;
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError>;
     async fn write_if(
-        &self, path: &str, value: Vec<u8>, expected: &Version, tags: Tags,
-    ) -> Result<Metadata, BackendError>;
+        &self, path: &str, value: Vec<u8>, expected: &Version,
+    ) -> Result<Version, BackendError>;
     async fn write_if_not_exists(
-        &self, path: &str, value: Vec<u8>, tags: Tags,
-    ) -> Result<Metadata, BackendError>;
+        &self, path: &str, value: Vec<u8>,
+    ) -> Result<Version, BackendError>;
     async fn delete(&self, path: &str) -> Result<(), BackendError>;
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError>;
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError>;
 }
 ```
+
+This is the slimmed, content-CAS-only surface of
+[ADR-023](adr/023-slimmed-backend-trait.md): seven methods, each mapping to a
+primitive S3 and GCS both provide natively. All coordination state lives in
+object *content* and is mutated *only* by content CAS — there are no tags,
+metadata, or writer ids.
 
 ### Key concepts
 
 **Versions.** Every object has an opaque CAS token (`Version { token: Arc<str> }`),
 assigned by the backend and used only for conditional operations. The format is
-backend-specific: GCS encodes `"{generation}/{metageneration}"`, while S3 uses
-the object's ETag. Consumers never interpret it — they pass it back unchanged to
-`write_if` / `set_tags_if` / `delete_if`.
+backend-specific: GCS encodes the object `generation`, while S3 uses the
+object's ETag. Consumers never interpret it — they pass it back unchanged to
+`write_if` / `read_if_modified`.
 
-**Change detection.** To decide whether a value changed since it was read, the
-algorithm compares the `last-writer` tag (the transaction that last wrote the
-key) rather than the storage version. `read_if_modified` takes the expected
-writer (`WriterId`) and returns `Precondition` when it still matches. This keeps
-the backend abstraction independent of GCS-style monotonic versions and is what
-allows the single-object S3 layout (see the Cloud backends section of
-[PORTING.md](../PORTING.md)).
+**Change detection.** All coordination state lives in object *content* and
+changes only by content CAS, so an object's version (ETag / generation) changes
+on exactly every write — precisely when a cached copy must be invalidated. To
+revalidate a cached object the cache issues a *version-conditional* read:
+`read_if_modified` takes the expected `Version` and returns `Precondition` when
+the stored version still matches (the body is not re-transferred), or the full
+object when it changed. This maps to a native conditional GET on every backend
+(`If-None-Match` on S3, `ifGenerationNotMatch` on GCS) and lets a hot, unchanged
+shard revalidate without a body transfer
+([ADR-023](adr/023-slimmed-backend-trait.md)).
 
-**Tags.** Key-value string pairs stored in object metadata (`Tags` is a
-`BTreeMap<String, String>`, so iteration order is deterministic). GlassDB uses
-tags to store lock state (`lock-type`, `locked-by`, `last-writer`) without
-modifying the object's contents. Tags can be updated atomically and
-conditionally via `set_tags_if`.
-
-**Conditional operations.** `write_if`, `write_if_not_exists`, `set_tags_if`,
-and `delete_if` all take an expected version and fail with
-`BackendError::Precondition` if the object has been modified since. This is the
-fundamental building block for distributed coordination — it provides
-compare-and-swap (CAS) semantics.
+**Conditional operations.** `write_if` and `write_if_not_exists` take an
+expected version (or "must not exist") and fail with
+`BackendError::Precondition` if the object has been modified since. This content
+compare-and-swap (CAS) is the only coordination primitive — the fundamental
+building block for distributed coordination.
 
 **Error semantics** (`BackendError`):
 
@@ -164,8 +161,8 @@ compare-and-swap (CAS) semantics.
   failure, or an outage exhausted the retry budget), so a non-idempotent
   operation must not be blindly retried
   ([ADR-009](adr/009-in-doubt-conditional-writes.md)). For an *idempotent*
-  request (read, `get_metadata`, unconditional write/delete, list) it is just a
-  transient failure (`5xx`, timeout, transport error) that is always safe to
+  request (read, `read_if_modified`, unconditional write/delete, list) it is just
+  a transient failure (`5xx`, timeout, transport error) that is always safe to
   retry; the engine retries reads in place and surfaces an unrecoverable one as
   `Error::Unavailable` ([ADR-015](adr/015-read-unavailability.md)).
 - `Other(_)` — any other backend error.
@@ -177,8 +174,8 @@ the original sentinel-error matching semantics.
 
 | Backend                       | Purpose             | Notes                                                                                                                                              |
 | ----------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `glassdb-backend-gcs`         | Production          | GCS JSON API over `reqwest`; encodes `generation`/`metageneration` in the version token and stores tags in object custom metadata                  |
-| `glassdb-backend-s3`          | Production          | One S3 object per key (`aws-sdk-s3`); user value with an 8-byte nonce in the body, tags in `x-amz-meta-*` user metadata, ETag as the version token |
+| `glassdb-backend-gcs`         | Production          | GCS JSON API over `reqwest`; encodes the object `generation` in the version token; `read_if_modified` via `ifGenerationNotMatch`                    |
+| `glassdb-backend-s3`          | Production          | One object per path (`aws-sdk-s3`); stores the value verbatim as the body, ETag as the version token; `read_if_modified` via `If-None-Match`        |
 | `glassdb-backend::memory`     | Testing             | In-process `MemoryBackend` simulating GCS semantics                                                                                                |
 | `glassdb-backend::middleware` | Debugging / testing | Wrappers for logging, latency injection, byte-driven scheduling, fault injection, and op-stream recording                                          |
 
@@ -498,16 +495,16 @@ GlassDB uses a three-layer caching architecture to minimize backend calls:
 ┌───────────────────────────────────────┐
 │         Local Cache (per-DB)          │
 │  Staleness tracking, outdated flags   │
-│  Separate caches for values & metadata│
+│  Caches values keyed by their version │
 └─────────────────┬─────────────────────┘
                   │ cache miss or stale
                   ▼
 ┌───────────────────────────────────────┐
 │     Global Cache (read-through)       │
 │  Uses read_if_modified to avoid full  │
-│  downloads if the writer is unchanged │
+│  downloads if the version is unchanged│
 └─────────────────┬─────────────────────┘
-                  │ writer changed or absent
+                  │ version changed or absent
                   ▼
 ┌───────────────────────────────────────┐
 │         Backend (Object Storage)      │
@@ -519,16 +516,16 @@ cache (default 512 MiB, configurable via `DatabaseBuilder::cache_size`). Entries
 are evicted least-recently-used first when the total size exceeds the limit.
 
 **Local Cache** (`glassdb-storage/src/local.rs`). Wraps the LRU cache with
-staleness awareness. Each entry tracks when it was last updated and whether it
-has been marked outdated (e.g., because a concurrent transaction invalidated
-it). Separate entries are maintained for values and metadata. Relative staleness
-uses `tokio::time::Instant` so it stays deterministic under paused time (see
+staleness awareness. Each entry stores a value with its backend `Version` and
+tracks when it was last updated and whether it has been marked outdated (e.g.,
+because a concurrent transaction invalidated it). Relative staleness uses
+`tokio::time::Instant` so it stays deterministic under paused time (see
 [PORTING.md](../PORTING.md), "Time and determinism").
 
 **Global Cache** (`glassdb-storage/src/global.rs`). A read-through and
-write-through layer over the backend. On reads, it uses `read_if_modified` to
-avoid re-downloading objects whose `last-writer` hasn't changed. On writes, it
-updates the local cache with the new value and version immediately.
+write-through layer over the backend. On reads, it uses the version-conditional
+`read_if_modified` to avoid re-downloading objects whose version hasn't changed.
+On writes, it updates the local cache with the new value and version immediately.
 
 After a transaction commits, its written values are cached locally. Subsequent
 transactions on the same client can read them without hitting the backend,
@@ -582,15 +579,14 @@ The `Version` type in `glassdb-storage/src/version.rs` combines two sources of
 truth:
 
 - **Backend version** (`backend::Version`): the opaque CAS token assigned by
-  object storage, used for conditional operations.
-- **Local writer** (`data::TxId`): the transaction that last wrote the value,
-  taken from the `last-writer` tag (or tracked locally for not-yet-committed
-  writes).
+  object storage, used for conditional operations and for cache revalidation via
+  the version-conditional `read_if_modified`.
+- **Writer** (`data::TxId`): the transaction that last wrote the value. In v2 it
+  is read from the committed transaction object's body (ADR-019), not from a tag.
 
 During validation, the algorithm detects concurrent modifications by comparing
-the last writer against what it observed when reading (`equal_meta_contents`).
-The backend version is used purely as the CAS token for the conditional write
-that takes the lock.
+the observed writer/version against the current state. The backend version is
+the CAS token for the conditional write that takes the lock.
 
 ## Garbage Collection
 

@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use glassdb_backend::Backend;
 use glassdb_data::paths;
 use glassdb_data::shard::SHARD_COUNT;
 use glassdb_storage::CollectionRoot;
@@ -126,10 +127,10 @@ impl Collection {
     pub async fn keys(&self) -> Result<KeysIter, Error> {
         let shard_paths = self
             .db
-            .global
+            .backend
             .list(&paths::shards_prefix(&self.prefix))
             .await
-            .map_err(Error::from_read)?;
+            .map_err(|e| Error::from_read(e.into()))?;
         let store = &self.db.shards;
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for sp in shard_paths {
@@ -159,10 +160,10 @@ impl Collection {
         let cprefix = paths::collections_prefix(&self.prefix);
         let items = self
             .db
-            .global
+            .backend
             .list(&cprefix)
             .await
-            .map_err(Error::from_read)?;
+            .map_err(|e| Error::from_read(e.into()))?;
         Ok(CollectionsIter::new(items))
     }
 }

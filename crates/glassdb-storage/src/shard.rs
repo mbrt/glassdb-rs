@@ -16,7 +16,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::locker::LockType;
+use crate::lock::LockType;
 
 /// One key's coordination state within a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]

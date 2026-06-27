@@ -785,7 +785,7 @@ fn run_read_write_9010(
     let mut samples = create_csv(&args.samples_out, "num-db,db,tx-type,ops,latency\n")?;
     let mut stats = create_csv(
         &args.stats_out,
-        "num-db,db,num-tx,num-retries,obj-write,obj-read,meta-write,meta-read\n",
+        "num-db,db,num-tx,num-retries,obj-write,obj-read\n",
     )?;
     let mut throughput = create_csv(
         &args.throughput_out,
@@ -1197,13 +1197,8 @@ fn dump_stats(
     for (i, res) in results.iter().enumerate() {
         writeln!(
             out,
-            "{numdb},{i},{},{},{},{},{},{}",
-            res.stats.tx_n,
-            res.stats.tx_retries,
-            res.stats.obj_writes,
-            res.stats.obj_reads,
-            res.stats.meta_writes,
-            res.stats.meta_reads,
+            "{numdb},{i},{},{},{},{}",
+            res.stats.tx_n, res.stats.tx_retries, res.stats.obj_writes, res.stats.obj_reads,
         )?;
     }
     Ok(())

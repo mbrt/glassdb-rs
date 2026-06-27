@@ -36,22 +36,18 @@ const LOG_PATH: &str = "hack/autoresearch/log.md";
 
 /// Converts backend operation counts into a single cost. The values are the
 /// mean object-storage latencies (in milliseconds): object read ~57ms, object
-/// write ~70ms, metadata ~31ms. List is treated as a metadata-class operation.
+/// write ~70ms. List is treated as a metadata-class operation (~31ms).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Weights {
     obj_read: f64,
     obj_write: f64,
-    meta_read: f64,
-    meta_write: f64,
     obj_list: f64,
 }
 
 const WEIGHTS: Weights = Weights {
     obj_read: 57.0,
     obj_write: 70.0,
-    meta_read: 31.0,
-    meta_write: 31.0,
     obj_list: 31.0,
 };
 
@@ -59,8 +55,6 @@ impl Weights {
     fn cost(&self, s: &Stats) -> f64 {
         self.obj_read * s.obj_reads as f64
             + self.obj_write * s.obj_writes as f64
-            + self.meta_read * s.meta_reads as f64
-            + self.meta_write * s.meta_writes as f64
             + self.obj_list * s.obj_lists as f64
     }
 }
@@ -73,8 +67,6 @@ struct WorkloadResult {
     txn: u64,
     obj_reads: u64,
     obj_writes: u64,
-    meta_reads: u64,
-    meta_writes: u64,
     obj_lists: u64,
     retries: u64,
     cost_per_tx: f64,
@@ -205,8 +197,6 @@ fn to_result(s: Sample) -> Result<WorkloadResult, Box<dyn Error>> {
         txn,
         obj_reads: s.stats.obj_reads,
         obj_writes: s.stats.obj_writes,
-        meta_reads: s.stats.meta_reads,
-        meta_writes: s.stats.meta_writes,
         obj_lists: s.stats.obj_lists,
         retries: s.stats.tx_retries,
         cost_per_tx: WEIGHTS.cost(&s.stats) / n,

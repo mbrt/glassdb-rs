@@ -1,12 +1,12 @@
 //! Transaction-log persistence. Ported from the Go
-//! `internal/storage/tlogger.go`. Logs are protobuf bodies with commit-status
-//! and timestamp tags.
+//! `internal/storage/tlogger.go`. Logs are protobuf bodies; the commit status
+//! and timestamp live in the body itself (ADR-019/ADR-023), not in object tags.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use glassdb_backend::{self as backend, Tags};
+use glassdb_backend as backend;
 use glassdb_concurr::rt;
 use glassdb_data::{TxId, gopath, paths};
 use glassdb_proto as pb;
@@ -15,7 +15,7 @@ use prost::Message;
 use crate::error::StorageError;
 use crate::global::Global;
 use crate::local::{Local, MAX_STALENESS};
-use crate::locker::LockType;
+use crate::lock::LockType;
 
 /// The commit state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,12 +33,6 @@ impl TxCommitStatus {
         matches!(self, TxCommitStatus::Ok | TxCommitStatus::Aborted)
     }
 }
-
-const COMMIT_STATUS_TAG: &str = "commit-status";
-const TIMESTAMP_TAG: &str = "timestamp";
-const COMMIT_STATUS_OK: &str = "committed";
-const COMMIT_STATUS_ABORTED: &str = "aborted";
-const COMMIT_STATUS_PENDING: &str = "pending";
 
 /// The full contents of a transaction log entry.
 #[derive(Debug, Clone)]
@@ -71,6 +65,17 @@ pub struct TxWrite {
     pub value: Arc<[u8]>,
     pub deleted: bool,
     pub prev_writer: TxId,
+}
+
+/// A value written by a transaction, including whether it was a deletion or was
+/// not written at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TValue {
+    pub value: Arc<[u8]>,
+    pub deleted: bool,
+    /// True when the transaction committed but did not write this value (e.g.
+    /// read-only lock).
+    pub not_written: bool,
 }
 
 /// The commit status of a transaction along with its timestamp and version.
@@ -107,10 +112,21 @@ impl TLogger {
     }
 
     /// Returns the commit status of transaction `id`, using the cache when
-    /// possible.
+    /// possible. The status and timestamp are read from the transaction object
+    /// body (ADR-019); an absent object means the transaction is unknown.
     pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
-        match self.read_tags(id).await {
-            Ok(ts) => Ok(ts),
+        let p = paths::from_transaction(&self.prefix, id);
+        // A finalized (committed/aborted) log is immutable, so a fresh cached
+        // copy can answer without a backend revalidation round-trip.
+        if let Some(lr) = self.local.read(&p, MAX_STALENESS)
+            && !lr.outdated
+            && let Ok(ts) = decode_status(&lr.value, lr.version.b.clone())
+            && ts.status.is_final()
+        {
+            return Ok(ts);
+        }
+        match self.global.read(&p).await {
+            Ok(gr) => decode_status(&gr.value, gr.version.b),
             Err(StorageError::NotFound) => Ok(TxStatus {
                 status: TxCommitStatus::Unknown,
                 last_update: UNIX_EPOCH,
@@ -130,16 +146,12 @@ impl TLogger {
     pub async fn set(&self, l: &TxLog) -> Result<backend::Version, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let buf = marshal_log(l, ts)?;
-        let tags = log_tags(l, ts);
-        let m = self
-            .global
+        self.global
             .write_if_not_exists(
                 &paths::from_transaction(&self.prefix, &l.id),
                 Arc::from(buf),
-                tags,
             )
-            .await?;
-        Ok(m.version.clone())
+            .await
     }
 
     /// Updates the log only if its current version matches `expected`.
@@ -150,17 +162,13 @@ impl TLogger {
     ) -> Result<backend::Version, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let buf = marshal_log(l, ts)?;
-        let tags = log_tags(l, ts);
-        let m = self
-            .global
+        self.global
             .write_if(
                 &paths::from_transaction(&self.prefix, &l.id),
                 Arc::from(buf),
                 expected,
-                tags,
             )
-            .await?;
-        Ok(m.version.clone())
+            .await
     }
 
     /// Removes the log for `id`, ignoring not-found errors.
@@ -178,35 +186,20 @@ impl TLogger {
 
     async fn read_log(&self, id: &TxId) -> Result<pb::TransactionLog, StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
-        if let Some(lr) = self.local.read(&p, MAX_STALENESS) {
+        // A finalized log is immutable, so a fresh cached copy is authoritative.
+        // A pending log can still change, so fall through to a read-through that
+        // revalidates via the version-conditional GET (the ETag changes on every
+        // content write — refresh or finalization — ADR-023).
+        if let Some(lr) = self.local.read(&p, MAX_STALENESS)
+            && !lr.outdated
+        {
             let log = parse_log(&lr.value)?;
             if log.status() != pb::transaction_log::Status::Pending {
                 return Ok(log);
             }
-            // Pending logs can't be trusted from the cache: tx-log writes change
-            // content but not the last-writer tag, so writer-based
-            // ReadIfModified wouldn't detect the change. Mark outdated so
-            // global.read bypasses ReadIfModified.
-            self.local.mark_value_outdated(&p, lr.version);
         }
         let gr = self.global.read(&p).await?;
         parse_log(&gr.value)
-    }
-
-    async fn read_tags(&self, id: &TxId) -> Result<TxStatus, StorageError> {
-        let p = paths::from_transaction(&self.prefix, id);
-        if let Some(lm) = self.local.get_meta(&p, MAX_STALENESS) {
-            let mut ts = parse_log_tags(&lm.m.tags)?;
-            ts.version = lm.m.version.clone();
-            if ts.status != TxCommitStatus::Pending {
-                return Ok(ts);
-            }
-            // Pending: the cached value could be stale, read globally.
-        }
-        let gm = self.global.get_metadata(&p).await?;
-        let mut ts = parse_log_tags(&gm.tags)?;
-        ts.version = gm.version.clone();
-        Ok(ts)
     }
 }
 
@@ -394,48 +387,25 @@ fn parse_lock_type(t: i32) -> LockType {
     }
 }
 
-fn log_tags(l: &TxLog, ts: SystemTime) -> Tags {
-    let status = match l.status {
-        TxCommitStatus::Ok => COMMIT_STATUS_OK,
-        TxCommitStatus::Pending => COMMIT_STATUS_PENDING,
-        _ => COMMIT_STATUS_ABORTED,
-    };
-    let ts = ts
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let mut tags = Tags::new();
-    tags.insert(COMMIT_STATUS_TAG.to_string(), status.to_string());
-    tags.insert(TIMESTAMP_TAG.to_string(), ts.to_string());
-    tags
-}
-
-fn parse_log_tags(t: &Tags) -> Result<TxStatus, StorageError> {
-    let st = t
-        .get(COMMIT_STATUS_TAG)
-        .ok_or_else(|| StorageError::other("commit-status tag not found in tx log"))?;
-    let status = match st.as_str() {
-        COMMIT_STATUS_OK => TxCommitStatus::Ok,
-        COMMIT_STATUS_ABORTED => TxCommitStatus::Aborted,
-        COMMIT_STATUS_PENDING => TxCommitStatus::Pending,
-        other => {
-            return Err(StorageError::other(format!(
-                "unknown commit-status tag {other:?}"
-            )));
+/// Decodes a transaction object body into its commit status and timestamp,
+/// pairing them with the object's backend `version`. The status and timestamp
+/// live in the proto body itself (ADR-019), so this is the v2 replacement for
+/// the v1 tag read.
+fn decode_status(buf: &[u8], version: backend::Version) -> Result<TxStatus, StorageError> {
+    let tr = parse_log(buf)?;
+    let status = match tr.status() {
+        pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
+        pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
+        pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
+        pb::transaction_log::Status::Default => {
+            return Err(StorageError::other("unknown commit status in tx log"));
         }
     };
-    let ts = t
-        .get(TIMESTAMP_TAG)
-        .ok_or_else(|| StorageError::other("timestamp tag not found in tx log"))?;
-    let unix_milli: i64 = ts
-        .parse()
-        .map_err(|e| StorageError::with_source(format!("parsing timestamp tag {ts:?}"), e))?;
-
+    let last_update = tr.timestamp.map(proto_ts_to_system).unwrap_or(UNIX_EPOCH);
     Ok(TxStatus {
         status,
-        // Matches Go's time.Unix(unixMilli/1000, 0): second precision only.
-        last_update: UNIX_EPOCH + Duration::from_secs((unix_milli / 1000) as u64),
-        version: backend::Version::default(),
+        last_update,
+        version,
     })
 }
 

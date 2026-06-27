@@ -95,12 +95,10 @@ async fn report_stats<F: AsyncFnMut()>(label: &str, db: &Database, mut body: F) 
     let s = db.stats() - start;
     let n = STATS_ITERS.max(1) as f64;
     println!(
-        "  stats {label}: retries/op={:.3} w/op={:.2} r/op={:.2} metaw/op={:.2} metar/op={:.2}",
+        "  stats {label}: retries/op={:.3} w/op={:.2} r/op={:.2}",
         s.tx_retries as f64 / n,
         s.obj_writes as f64 / n,
         s.obj_reads as f64 / n,
-        s.meta_writes as f64 / n,
-        s.meta_reads as f64 / n,
     );
 }
 

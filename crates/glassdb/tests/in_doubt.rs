@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use glassdb::backend::{Backend, BackendError, ReadReply, Version};
 use glassdb::{Collection, Database, Error};
+use glassdb_storage::TxCommitStatus;
 
 /// What the [`FaultBackend`] should do when its trap matches a conditional write.
 #[derive(Clone, Copy)]
@@ -46,8 +47,17 @@ enum Action {
 }
 
 /// Decides, for a conditional write, whether (and how) to fault it. Receives the
-/// op kind, the storage path, and the tags being written.
-type Trap = Box<dyn Fn(&str, &str, &Tags) -> Option<Action> + Send + Sync>;
+/// op kind, the storage path, and the object body being written.
+type Trap = Box<dyn Fn(&str, &str, &[u8]) -> Option<Action> + Send + Sync>;
+
+/// Reports whether `body` is a transaction object that has committed. With the
+/// slimmed tagless backend (ADR-023) the commit status lives in the object body,
+/// so the harness decodes it instead of reading a `commit-status` tag.
+fn is_committed_tx_log(body: &[u8]) -> bool {
+    glassdb_storage::txobject::decode(&glassdb_data::TxId::default(), body)
+        .map(|l| l.status == TxCommitStatus::Ok)
+        .unwrap_or(false)
+}
 
 /// A [`Backend`] decorator that injects a single, targeted conditional-write
 /// fault. Reads and unconditional writes pass straight through. Every observed
@@ -83,14 +93,12 @@ impl FaultBackend {
 
     /// Records the conditional write and, if the armed trap matches, consumes it
     /// and returns the action to take.
-    fn intercept(&self, kind: &str, path: &str, tags: &Tags) -> Option<Action> {
-        let is_committed_log = path.contains("/_t/")
-            && tags.get("commit-status").map(String::as_str) == Some("committed");
-        if is_committed_log {
+    fn intercept(&self, kind: &str, path: &str, value: &[u8]) -> Option<Action> {
+        if path.contains("/_t/") && is_committed_tx_log(value) {
             self.committed_log_writes.fetch_add(1, Ordering::SeqCst);
         }
         let mut t = self.trap.lock().unwrap();
-        let action = t.as_ref().and_then(|trap| trap(kind, path, tags));
+        let action = t.as_ref().and_then(|trap| trap(kind, path, value));
         if action.is_some() {
             *t = None;
         }
@@ -103,44 +111,18 @@ impl Backend for FaultBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected_writer: &WriterId,
+        expected: &Version,
     ) -> Result<ReadReply, BackendError> {
-        self.inner.read_if_modified(path, expected_writer).await
+        self.inner.read_if_modified(path, expected).await
     }
 
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
-        &self,
-        path: &str,
-        expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        match self.intercept("set_tags_if", path, &tags) {
-            Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::Unavailable) => Err(not_applied("set_tags_if")),
-            Some(Action::LostAck) => match self.inner.set_tags_if(path, expected, tags).await {
-                Ok(_) => Err(lost_ack("set_tags_if")),
-                Err(e) => Err(e),
-            },
-            None => self.inner.set_tags_if(path, expected, tags).await,
-        }
-    }
-
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         // Unconditional overwrite: idempotent, never faulted.
-        self.inner.write(path, value, tags).await
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -148,16 +130,15 @@ impl Backend for FaultBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        match self.intercept("write_if", path, &tags) {
+    ) -> Result<Version, BackendError> {
+        match self.intercept("write_if", path, &value) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
             Some(Action::Unavailable) => Err(not_applied("write_if")),
-            Some(Action::LostAck) => match self.inner.write_if(path, value, expected, tags).await {
+            Some(Action::LostAck) => match self.inner.write_if(path, value, expected).await {
                 Ok(_) => Err(lost_ack("write_if")),
                 Err(e) => Err(e),
             },
-            None => self.inner.write_if(path, value, expected, tags).await,
+            None => self.inner.write_if(path, value, expected).await,
         }
     }
 
@@ -165,35 +146,20 @@ impl Backend for FaultBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        match self.intercept("write_if_not_exists", path, &tags) {
+    ) -> Result<Version, BackendError> {
+        match self.intercept("write_if_not_exists", path, &value) {
             Some(Action::Precondition) => Err(BackendError::Precondition),
             Some(Action::Unavailable) => Err(not_applied("write_if_not_exists")),
-            Some(Action::LostAck) => {
-                match self.inner.write_if_not_exists(path, value, tags).await {
-                    Ok(_) => Err(lost_ack("write_if_not_exists")),
-                    Err(e) => Err(e),
-                }
-            }
-            None => self.inner.write_if_not_exists(path, value, tags).await,
+            Some(Action::LostAck) => match self.inner.write_if_not_exists(path, value).await {
+                Ok(_) => Err(lost_ack("write_if_not_exists")),
+                Err(e) => Err(e),
+            },
+            None => self.inner.write_if_not_exists(path, value).await,
         }
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        match self.intercept("delete_if", path, &Tags::new()) {
-            Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::Unavailable) => Err(not_applied("delete_if")),
-            Some(Action::LostAck) => match self.inner.delete_if(path, expected).await {
-                Ok(()) => Err(lost_ack("delete_if")),
-                Err(e) => Err(e),
-            },
-            None => self.inner.delete_if(path, expected).await,
-        }
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
@@ -265,7 +231,7 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 
     // Trap the fast path's value write (a `write_if` on a key path `/_k/`): let
     // it land, then report the ack as lost.
-    backend.arm(Box::new(|kind, path, _tags| {
+    backend.arm(Box::new(|kind, path, _value| {
         if kind == "write_if" && path.contains("/_k/") {
             Some(Action::LostAck)
         } else {
@@ -314,7 +280,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     // Trap the fast path's value write (a `write_if` on a key path `/_k/`):
     // report it as in-doubt *without* applying it, modelling a write that never
     // landed. The trap is one-shot, so the engine's idempotent re-issue lands.
-    backend.arm(Box::new(|kind, path, _tags| {
+    backend.arm(Box::new(|kind, path, _value| {
         if kind == "write_if" && path.contains("/_k/") {
             Some(Action::Unavailable)
         } else {
@@ -361,9 +327,8 @@ async fn logged_commit_lost_ack_retries_transparently() {
     // Trap the commit point: the transaction log written as committed (a write
     // to a `/_t/` path tagged `commit-status=committed`). Let it land, then lose
     // the ack.
-    backend.arm(Box::new(|_kind, path, tags| {
-        let committed = path.contains("/_t/")
-            && tags.get("commit-status").map(String::as_str) == Some("committed");
+    backend.arm(Box::new(|_kind, path, value| {
+        let committed = path.contains("/_t/") && is_committed_tx_log(value);
         committed.then_some(Action::LostAck)
     }));
 
@@ -414,7 +379,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // Trap the first shard lock CAS (a `write_if` on a shard path `/_s/` — how a
     // lock is installed in v2). Let it land, then lose the ack: the lock is
     // actually applied but the locker observes `Unavailable`.
-    backend.arm(Box::new(|kind, path, _tags| {
+    backend.arm(Box::new(|kind, path, _value| {
         if kind == "write_if" && path.contains("/_s/") {
             Some(Action::LostAck)
         } else {
@@ -462,7 +427,7 @@ async fn clean_conflict_on_single_rw_still_commits() {
     // Inject one clean precondition on the first fast-path value write, without
     // applying it: a genuine conflict that never landed. The fast path should
     // re-read and retry, and the second attempt (trap consumed) commits.
-    backend.arm(Box::new(|kind, path, _tags| {
+    backend.arm(Box::new(|kind, path, _value| {
         if kind == "write_if" && path.contains("/_k/") {
             Some(Action::Precondition)
         } else {

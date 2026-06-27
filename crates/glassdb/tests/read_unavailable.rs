@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use glassdb::backend::{Backend, BackendError, ReadReply, Version};
 use glassdb::{Database, Error};
 
 /// A [`Backend`] decorator that injects `BackendError::Unavailable` on reads of
@@ -89,12 +89,12 @@ impl Backend for FaultReadBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected_writer: &WriterId,
+        expected: &Version,
     ) -> Result<ReadReply, BackendError> {
         if let Some(e) = self.maybe_fault(path) {
             return Err(e);
         }
-        self.inner.read_if_modified(path, expected_writer).await
+        self.inner.read_if_modified(path, expected).await
     }
 
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
@@ -104,29 +104,8 @@ impl Backend for FaultReadBackend {
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        if let Some(e) = self.maybe_fault(path) {
-            return Err(e);
-        }
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
-        &self,
-        path: &str,
-        expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.set_tags_if(path, expected, tags).await
-    }
-
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.write(path, value, tags).await
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -134,26 +113,20 @@ impl Backend for FaultReadBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.write_if(path, value, expected, tags).await
+    ) -> Result<Version, BackendError> {
+        self.inner.write_if(path, value, expected).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.write_if_not_exists(path, value, tags).await
+    ) -> Result<Version, BackendError> {
+        self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        self.inner.delete_if(path, expected).await
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {

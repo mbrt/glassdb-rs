@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted — implemented in `glassdb-trans::v2`. Shard locking runs **in parallel
-by default** and falls back to **serial sorted-by-path acquisition** after a few
+Accepted — implemented. Shard locking runs **in parallel by default** and falls
+back to **serial sorted-by-path acquisition** after a few
 failed attempts (see [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback)).
 
 Two deliberate simplifications remain, both **MVP-only**:
@@ -182,7 +182,7 @@ The mechanism is unchanged; only the lock targets differ (shards + root instead 
 per-key objects), so there are typically _fewer_ objects to sort and lock, at the
 cost of coarser conflicts.
 
-> **MVP realisation (`glassdb-trans::v2`):** the current engine keeps the two-mode
+> **MVP realisation:** the current engine keeps the two-mode
 > structure above but realises "wait" as **release-and-retry** rather than
 > hold-and-wait, so no transaction ever holds locks while blocked. This is a
 > deliberate **MVP simplification** — see [the migration note](#mvp-vs-the-v1-hold-and-wait-model)
@@ -210,8 +210,8 @@ cost of coarser conflicts.
 > budget / release-and-retry" of the design above is realised directly by the
 > retry loop, and there is **no prefix tiebreak** in wound-wait: a tiebreak would
 > flip under `renew` and reintroduce the equal-priority livelock the serial path
-> exists to prevent (see `should_wound` in `v2.rs`). Write-back remains synchronous
-> (GC/async batching → ADR-022/perf).
+> exists to prevent. Write-back remains synchronous (GC/async batching →
+> ADR-022/perf).
 
 #### MVP vs. the v1 hold-and-wait model
 

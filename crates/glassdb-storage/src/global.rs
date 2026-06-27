@@ -1,14 +1,16 @@
 //! Read-through / write-through caching over a backend. Ported from the Go
-//! `internal/storage/global.go`.
+//! `internal/storage/global.go`, adapted to the slimmed content-CAS-only trait
+//! (ADR-023): cache revalidation is keyed on the object's backend version
+//! (ETag/generation), not on a writer tag.
 
 use std::sync::Arc;
 
-use glassdb_backend::{self as backend, Backend, Metadata, Tags, WriterId};
+use glassdb_backend::{self as backend, Backend};
 use glassdb_data::TxId;
 
 use crate::error::StorageError;
 use crate::local::{Local, MAX_STALENESS};
-use crate::version::{Version, version_from_meta};
+use crate::version::Version;
 
 /// The result of reading a value from global storage.
 #[derive(Debug, Clone)]
@@ -17,15 +19,8 @@ pub struct GlobalRead {
     pub version: Version,
 }
 
-impl GlobalRead {
-    /// The transaction ID of the last writer (empty if none recorded).
-    pub fn writer(&self) -> TxId {
-        self.version.writer.clone()
-    }
-}
-
 /// Wraps a backend with a local cache, performing read-through and
-/// write-through caching of objects and metadata.
+/// write-through caching of objects.
 #[derive(Clone)]
 pub struct Global {
     backend: Arc<dyn Backend>,
@@ -40,72 +35,31 @@ impl Global {
     }
 
     /// Reads the value at `key`, using the cache when possible.
+    ///
+    /// A cached, not-outdated entry with a known backend version is revalidated
+    /// with a version-conditional read: the backend returns the body only if it
+    /// changed, otherwise [`backend::BackendError::Precondition`] meaning "your
+    /// cached copy is still current". The ETag changes on every content write,
+    /// which is exactly when the cache must be invalidated (ADR-023).
     pub async fn read(&self, key: &str) -> Result<GlobalRead, StorageError> {
-        if let Some(e) = self.local.read(key, MAX_STALENESS) {
-            // For a local override or a value known to be outdated, do a
-            // regular read instead.
-            if !e.outdated && !e.version.b.is_unset() {
-                let writer = WriterId::new(e.version.writer.as_bytes().to_vec());
-                let mut modified = true;
-                let mut reply = backend::ReadReply::default();
-                match self.backend.read_if_modified(key, &writer).await {
-                    Ok(r) => reply = r,
-                    Err(backend::BackendError::Precondition) => modified = false,
-                    Err(err) => return Err(err.into()),
-                }
-                if modified {
-                    let meta = Arc::new(Metadata {
-                        tags: Arc::new(reply.tags),
-                        version: reply.version,
-                    });
-                    let contents: Arc<[u8]> = Arc::from(reply.contents);
-                    self.local
-                        .write_with_meta(key, contents.clone(), meta.clone());
+        if let Some(e) = self.local.read(key, MAX_STALENESS)
+            && !e.outdated
+            && !e.version.b.is_unset()
+        {
+            match self.backend.read_if_modified(key, &e.version.b).await {
+                Ok(r) => return Ok(self.cache_read(key, r)),
+                Err(backend::BackendError::Precondition) => {
                     return Ok(GlobalRead {
-                        value: contents,
-                        version: version_from_meta(&meta),
+                        value: e.value,
+                        version: e.version,
                     });
                 }
-                return Ok(GlobalRead {
-                    value: e.value,
-                    version: e.version,
-                });
+                Err(err) => return Err(err.into()),
             }
         }
 
         let r = self.backend.read(key).await?;
-        let meta = Arc::new(Metadata {
-            tags: Arc::new(r.tags),
-            version: r.version,
-        });
-        let contents: Arc<[u8]> = Arc::from(r.contents);
-        self.local
-            .write_with_meta(key, contents.clone(), meta.clone());
-        Ok(GlobalRead {
-            value: contents,
-            version: version_from_meta(&meta),
-        })
-    }
-
-    /// Fetches metadata from the backend and updates the cache. The returned
-    /// metadata is shared (`Arc`) with the cache entry, so neither the cache
-    /// update nor the caller deep-copies the tag map.
-    pub async fn get_metadata(&self, key: &str) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.get_metadata(key).await?);
-        self.local.set_meta(key, meta.clone());
-        Ok(meta)
-    }
-
-    /// Conditionally sets tags and updates the metadata cache.
-    pub async fn set_tags_if(
-        &self,
-        key: &str,
-        expected: &backend::Version,
-        t: Tags,
-    ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.set_tags_if(key, expected, t).await?);
-        self.local.set_meta(key, meta.clone());
-        Ok(meta)
+        Ok(self.cache_read(key, r))
     }
 
     /// Unconditionally writes and updates the cache.
@@ -113,11 +67,10 @@ impl Global {
         &self,
         key: &str,
         value: Arc<[u8]>,
-        t: Tags,
-    ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(self.backend.write(key, value.to_vec(), t).await?);
-        self.local.write_with_meta(key, value, meta.clone());
-        Ok(meta)
+    ) -> Result<backend::Version, StorageError> {
+        let v = self.backend.write(key, value.to_vec()).await?;
+        self.cache_write(key, value, v.clone());
+        Ok(v)
     }
 
     /// Conditionally writes and updates the cache.
@@ -126,15 +79,10 @@ impl Global {
         key: &str,
         value: Arc<[u8]>,
         expected: &backend::Version,
-        t: Tags,
-    ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(
-            self.backend
-                .write_if(key, value.to_vec(), expected, t)
-                .await?,
-        );
-        self.local.write_with_meta(key, value, meta.clone());
-        Ok(meta)
+    ) -> Result<backend::Version, StorageError> {
+        let v = self.backend.write_if(key, value.to_vec(), expected).await?;
+        self.cache_write(key, value, v.clone());
+        Ok(v)
     }
 
     /// Creates the object if absent and updates the cache.
@@ -142,15 +90,13 @@ impl Global {
         &self,
         key: &str,
         value: Arc<[u8]>,
-        t: Tags,
-    ) -> Result<Arc<Metadata>, StorageError> {
-        let meta = Arc::new(
-            self.backend
-                .write_if_not_exists(key, value.to_vec(), t)
-                .await?,
-        );
-        self.local.write_with_meta(key, value, meta.clone());
-        Ok(meta)
+    ) -> Result<backend::Version, StorageError> {
+        let v = self
+            .backend
+            .write_if_not_exists(key, value.to_vec())
+            .await?;
+        self.cache_write(key, value, v.clone());
+        Ok(v)
     }
 
     /// Deletes the object and removes it from the cache.
@@ -160,19 +106,34 @@ impl Global {
         Ok(())
     }
 
-    /// Conditionally deletes the object and removes it from the cache.
-    pub async fn delete_if(
-        &self,
-        key: &str,
-        expected: &backend::Version,
-    ) -> Result<(), StorageError> {
-        self.backend.delete_if(key, expected).await?;
-        self.local.delete(key);
-        Ok(())
-    }
-
     /// Lists object paths under `dir_path`.
     pub async fn list(&self, dir_path: &str) -> Result<Vec<String>, StorageError> {
         Ok(self.backend.list(dir_path).await?)
+    }
+
+    /// Caches a freshly-read object body and returns it as a [`GlobalRead`].
+    fn cache_read(&self, key: &str, r: backend::ReadReply) -> GlobalRead {
+        let version = Version {
+            b: r.version,
+            writer: TxId::default(),
+        };
+        let contents: Arc<[u8]> = Arc::from(r.contents);
+        self.local.write(key, contents.clone(), version.clone());
+        GlobalRead {
+            value: contents,
+            version,
+        }
+    }
+
+    /// Caches a freshly-written object body keyed on its new backend version.
+    fn cache_write(&self, key: &str, value: Arc<[u8]>, v: backend::Version) {
+        self.local.write(
+            key,
+            value,
+            Version {
+                b: v,
+                writer: TxId::default(),
+            },
+        );
     }
 }

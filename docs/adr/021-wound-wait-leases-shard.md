@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted — implemented in `glassdb-trans::v2` (wound-wait + lease expiry /
-crash recovery). One **MVP-only** deviation from the design below: **no background
+Accepted — implemented (wound-wait + lease expiry / crash recovery). One
+**MVP-only** deviation from the design below: **no background
 lease refresher** is implemented, because the MVP engine realises "wait" as
 release-and-retry ([ADR-020](020-commit-write-back-protocol.md)) and so never
 holds locks while blocked — a *pending* object therefore never lingers long
@@ -80,8 +80,8 @@ refresh is cheap. If a refresh CAS finds the object already `aborted`, the
 transaction was wounded: the refresher stops and the owner's commit will fail.
 This is `refresh_pending`, relocated to the transaction object.
 
-> **MVP deviation (implementation):** the current `glassdb-trans::v2` engine does
-> **not** run a refresher. v1 needs one because a transaction can _wait_ (block)
+> **MVP deviation (implementation):** the current engine does **not** run a
+> refresher. v1 needs one because a transaction can _wait_ (block)
 > while holding locks for an unbounded time. The MVP instead realises "wait" as
 > release-and-retry (see [ADR-020](020-commit-write-back-protocol.md)): a
 > transaction either acquires every lock without blocking and commits, or it

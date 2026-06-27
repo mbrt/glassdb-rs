@@ -47,7 +47,7 @@ mod tests {
     use glassdb_data::{TxId, paths};
 
     use super::*;
-    use crate::locker::LockType;
+    use crate::lock::LockType;
     use crate::tlogger::{PathLock, TxCommitStatus, TxWrite};
 
     fn committed_object() -> TxLog {

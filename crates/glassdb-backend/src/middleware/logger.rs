@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId, encode_writer_tag,
-};
+use crate::{Backend, BackendError, ReadReply, Version};
 
 /// A [`Backend`] decorator that emits a `tracing` debug event for every
 /// operation, tagged with the configured backend id.
@@ -33,73 +31,45 @@ fn read_reply_summary(r: &Result<ReadReply, BackendError>) -> String {
     }
 }
 
-fn meta_summary(r: &Result<Metadata, BackendError>) -> String {
+fn version_summary(r: &Result<Version, BackendError>) -> String {
     match r {
-        Ok(m) => format!("{m:?}"),
+        Ok(v) => format!("{v:?}"),
         Err(e) => format!("err={e}"),
     }
 }
 
 #[async_trait]
 impl Backend for BackendLogger {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        let r = self.inner.read_if_modified(path, expected_writer).await;
-        tracing::debug!(
-            backend_id = %self.id,
-            path,
-            writer = %encode_writer_tag(expected_writer),
-            res = %read_reply_summary(&r),
-            "ReadIfModified"
-        );
-        r
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         let r = self.inner.read(path).await;
         tracing::debug!(backend_id = %self.id, path, res = %read_reply_summary(&r), "Read");
         r
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        let r = self.inner.get_metadata(path).await;
-        tracing::debug!(backend_id = %self.id, path, res = %meta_summary(&r), "GetMetadata");
-        r
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        let r = self.inner.set_tags_if(path, expected, tags.clone()).await;
+    ) -> Result<ReadReply, BackendError> {
+        let r = self.inner.read_if_modified(path, expected).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
-            args = %format!("expv:{expected:?};t:{tags:?}"),
-            res = %meta_summary(&r),
-            "SetTagsIf"
+            expv = %format!("{expected:?}"),
+            res = %read_reply_summary(&r),
+            "ReadIfModified"
         );
         r
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         let size = value.len();
-        let r = self.inner.write(path, value, tags.clone()).await;
+        let r = self.inner.write(path, value).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
-            args = %format!("val[size]:{size};t:{tags:?}"),
-            res = %meta_summary(&r),
+            args = %format!("val[size]:{size}"),
+            res = %version_summary(&r),
             "Write"
         );
         r
@@ -110,18 +80,14 @@ impl Backend for BackendLogger {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         let size = value.len();
-        let r = self
-            .inner
-            .write_if(path, value, expected, tags.clone())
-            .await;
+        let r = self.inner.write_if(path, value, expected).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
-            args = %format!("val[size]:{size};expv:{expected:?};t:{tags:?}"),
-            res = %meta_summary(&r),
+            args = %format!("val[size]:{size};expv:{expected:?}"),
+            res = %version_summary(&r),
             "WriteIf"
         );
         r
@@ -131,18 +97,14 @@ impl Backend for BackendLogger {
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         let size = value.len();
-        let r = self
-            .inner
-            .write_if_not_exists(path, value, tags.clone())
-            .await;
+        let r = self.inner.write_if_not_exists(path, value).await;
         tracing::debug!(
             backend_id = %self.id,
             path,
-            args = %format!("val[size]:{size};t:{tags:?}"),
-            res = %meta_summary(&r),
+            args = %format!("val[size]:{size}"),
+            res = %version_summary(&r),
             "WriteIfNotExists"
         );
         r
@@ -151,18 +113,6 @@ impl Backend for BackendLogger {
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         let r = self.inner.delete(path).await;
         tracing::debug!(backend_id = %self.id, path, err = ?r.as_ref().err(), "Delete");
-        r
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        let r = self.inner.delete_if(path, expected).await;
-        tracing::debug!(
-            backend_id = %self.id,
-            path,
-            args = %format!("expv:{expected:?}"),
-            err = ?r.as_ref().err(),
-            "DeleteIf"
-        );
         r
     }
 

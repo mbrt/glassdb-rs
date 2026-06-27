@@ -1,20 +1,14 @@
-//! Google Cloud Storage backend for GlassDB. Ported from the Go `backend/gcs`
-//! package.
+//! Google Cloud Storage backend for GlassDB (ADR-016, ADR-023).
 //!
-//! Each logical key maps to a single GCS object. The user value is stored as
-//! the object body and the lock/last-writer tags are stored as object custom
-//! metadata. GCS provides native compare-and-swap through object generation and
-//! metageneration preconditions, so the opaque [`Version`] token encodes both
-//! as `"{generation}/{metageneration}"`.
+//! Each logical key maps to a single GCS object whose body holds the value.
+//! GCS provides native content compare-and-swap through the object `generation`
+//! precondition, so the opaque [`Version`] token is the object generation.
+//! Conditional reads use `ifGenerationNotMatch`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use glassdb_backend::{
-    Backend, BackendError, Cause, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
-    encode_writer_tag,
-};
+use glassdb_backend::{Backend, BackendError, Cause, ReadReply, Version};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -152,8 +146,8 @@ impl GcsBackend {
 
     /// Sends `rb`. Cancellation is by dropping the surrounding future.
     ///
-    /// Only idempotent operations go through `send` (reads, `get_metadata`,
-    /// unconditional write/delete, and list); conditional writes use
+    /// Only idempotent operations go through `send` (reads, unconditional
+    /// write/delete, and list); conditional writes use
     /// [`Self::send_conditional`]. A transport failure on an idempotent request
     /// is therefore always safe to retry, so it is reported as `Unavailable`
     /// rather than a generic `Other` (ADR-009), letting the engine recover a
@@ -204,8 +198,8 @@ impl GcsBackend {
             .get(self.object_url(path))
             .query(&[("alt", "json")]);
         let resp = self.send(rb).await?;
-        check_status(resp.status(), "GetMetadata", path)?;
-        parse_json(resp, "GetMetadata", path).await
+        check_status(resp.status(), "Read", path)?;
+        parse_json(resp, "Read", path).await
     }
 
     /// Downloads an object body, pinned to the generation in `attrs`. If the
@@ -237,7 +231,6 @@ impl GcsBackend {
             return Ok(ReadReply {
                 contents,
                 version: attrs.version(),
-                tags: attrs.tags(),
             });
         }
         Err(BackendError::other(format!(
@@ -245,20 +238,20 @@ impl GcsBackend {
         )))
     }
 
-    /// Uploads `value` and `tags` as a multipart insert with the given
-    /// preconditions.
+    /// Uploads `value` as a multipart insert with the given generation
+    /// precondition, returning the new version.
     async fn upload(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-        conds: WriteConds,
-    ) -> Result<Metadata, BackendError> {
-        let conditional =
-            conds.if_generation_match.is_some() || conds.if_metageneration_match.is_some();
-        let body = multipart_body(&object_metadata_json(path, &tags), &value);
+        if_generation_match: Option<String>,
+    ) -> Result<Version, BackendError> {
+        let conditional = if_generation_match.is_some();
+        let body = multipart_body(&object_metadata_json(path), &value);
         let mut query: Vec<(&str, String)> = vec![("uploadType", "multipart".to_string())];
-        conds.apply(&mut query);
+        if let Some(g) = &if_generation_match {
+            query.push(("ifGenerationMatch", g.clone()));
+        }
         let rb = self
             .http
             .post(self.upload_url())
@@ -276,95 +269,49 @@ impl GcsBackend {
             resp
         };
         let obj: ObjectResource = parse_json(resp, "Write", path).await?;
-        Ok(Metadata {
-            tags: Arc::new(tags),
-            version: obj.version(),
-        })
-    }
-}
-
-/// Conditional-write preconditions translated into query parameters.
-#[derive(Default)]
-struct WriteConds {
-    if_generation_match: Option<String>,
-    if_metageneration_match: Option<String>,
-}
-
-impl WriteConds {
-    fn apply(&self, query: &mut Vec<(&'static str, String)>) {
-        if let Some(g) = &self.if_generation_match {
-            query.push(("ifGenerationMatch", g.clone()));
-        }
-        if let Some(m) = &self.if_metageneration_match {
-            query.push(("ifMetagenerationMatch", m.clone()));
-        }
+        Ok(obj.version())
     }
 }
 
 #[async_trait]
 impl Backend for GcsBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        let attrs = self.attrs(path).await?;
-        let current = attrs
-            .tags()
-            .get(LAST_WRITER_TAG)
-            .cloned()
-            .unwrap_or_default();
-        if current == encode_writer_tag(expected_writer) {
-            return Err(BackendError::Precondition);
-        }
-        self.read_from_attrs(path, attrs).await
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         let attrs = self.attrs(path).await?;
         self.read_from_attrs(path, attrs).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        Ok(self.attrs(path).await?.metadata())
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        let (generation, metageneration) = parse_token(expected)?;
-        // GCS replaces the entire metadata map on update, so the new tags are
-        // merged onto the current set to preserve the last-writer tag (the
-        // locker only sends the lock tags here).
-        let attrs = self.attrs(path).await?;
-        let mut merged = attrs.tags();
-        for (k, v) in tags {
-            merged.insert(k, v);
+    ) -> Result<ReadReply, BackendError> {
+        if expected.is_unset() {
+            return self.read(path).await;
         }
-        let rb = self
-            .http
-            .patch(self.object_url(path))
-            .query(&[
-                ("ifGenerationMatch", generation.as_str()),
-                ("ifMetagenerationMatch", metageneration.as_str()),
-            ])
-            .header(CONTENT_TYPE, "application/json")
-            .body(metadata_patch_json(&merged));
-        let resp = self.send_conditional(rb, "SetTagsIf", path).await?;
-        let obj: ObjectResource = parse_json(resp, "SetTagsIf", path).await?;
-        Ok(obj.metadata())
+        // A single conditional media GET: the body transfers only when the
+        // generation differs; an unchanged object answers `304 Not Modified`.
+        let rb = self.http.get(self.object_url(path)).query(&[
+            ("alt", "media"),
+            ("ifGenerationNotMatch", expected.token.as_ref()),
+        ]);
+        let resp = self.send(rb).await?;
+        let status = resp.status();
+        if status == StatusCode::NOT_MODIFIED {
+            return Err(BackendError::Precondition);
+        }
+        check_status(status, "ReadIfModified", path)?;
+        let version = generation_from_headers(&resp);
+        let contents = resp.bytes().await.map_err(|e| {
+            BackendError::with_source(format!("ReadIfModified({path}): reading body"), e)
+        })?;
+        Ok(ReadReply {
+            contents: contents.to_vec(),
+            version,
+        })
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.upload(path, value, tags, WriteConds::default()).await
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
+        self.upload(path, value, None).await
     }
 
     async fn write_if(
@@ -372,53 +319,23 @@ impl Backend for GcsBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        let (generation, metageneration) = parse_token(expected)?;
-        self.upload(
-            path,
-            value,
-            tags,
-            WriteConds {
-                if_generation_match: Some(generation),
-                if_metageneration_match: Some(metageneration),
-            },
-        )
-        .await
+    ) -> Result<Version, BackendError> {
+        let generation = parse_token(expected)?;
+        self.upload(path, value, Some(generation)).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.upload(
-            path,
-            value,
-            tags,
-            WriteConds {
-                if_generation_match: Some("0".to_string()),
-                if_metageneration_match: None,
-            },
-        )
-        .await
+    ) -> Result<Version, BackendError> {
+        self.upload(path, value, Some("0".to_string())).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         let rb = self.http.delete(self.object_url(path));
         let resp = self.send(rb).await?;
         check_status(resp.status(), "Delete", path)?;
-        Ok(())
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        let (generation, metageneration) = parse_token(expected)?;
-        let rb = self.http.delete(self.object_url(path)).query(&[
-            ("ifGenerationMatch", generation.as_str()),
-            ("ifMetagenerationMatch", metageneration.as_str()),
-        ]);
-        self.send_conditional(rb, "DeleteIf", path).await?;
         Ok(())
     }
 
@@ -455,32 +372,26 @@ struct ObjectResource {
     name: Option<String>,
     #[serde(default)]
     generation: Option<String>,
-    #[serde(default)]
-    metageneration: Option<String>,
-    #[serde(default)]
-    metadata: Option<HashMap<String, String>>,
 }
 
 impl ObjectResource {
     fn version(&self) -> Version {
-        let g = self.generation.as_deref().unwrap_or("");
-        let m = self.metageneration.as_deref().unwrap_or("");
-        Version::new(format!("{g}/{m}"))
-    }
-
-    fn tags(&self) -> Tags {
-        match &self.metadata {
-            Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            None => Tags::new(),
+        match &self.generation {
+            Some(g) => Version::new(g.as_str()),
+            None => Version::default(),
         }
     }
+}
 
-    fn metadata(&self) -> Metadata {
-        Metadata {
-            tags: Arc::new(self.tags()),
-            version: self.version(),
-        }
-    }
+/// Builds a [`Version`] from the `x-goog-generation` header of a media
+/// download. GCS always sets it on a successful object GET; absent it, an unset
+/// version is returned (the cache will simply re-read fully next time).
+fn generation_from_headers(resp: &reqwest::Response) -> Version {
+    resp.headers()
+        .get("x-goog-generation")
+        .and_then(|v| v.to_str().ok())
+        .map(Version::new)
+        .unwrap_or_default()
 }
 
 /// A subset of the GCS object-listing JSON.
@@ -494,14 +405,14 @@ struct ListResponse {
     next_page_token: Option<String>,
 }
 
-/// Splits an opaque [`Version`] token back into its `generation` and
-/// `metageneration` components. A malformed or null token cannot match any
-/// stored object, so it is reported as a failed precondition.
-fn parse_token(v: &Version) -> Result<(String, String), BackendError> {
-    match v.token.split_once('/') {
-        Some((g, m)) if !g.is_empty() && !m.is_empty() => Ok((g.to_string(), m.to_string())),
-        _ => Err(BackendError::Precondition),
+/// Returns the `generation` carried by an opaque [`Version`] token. A null
+/// token cannot match any stored object, so it is reported as a failed
+/// precondition.
+fn parse_token(v: &Version) -> Result<String, BackendError> {
+    if v.token.is_empty() {
+        return Err(BackendError::Precondition);
     }
+    Ok(v.token.to_string())
 }
 
 /// A structured diagnostic for a GCS request that returned an unsuccessful HTTP
@@ -539,8 +450,8 @@ impl GcsStatusError {
 
 /// Maps a GCS HTTP status onto a [`BackendError`].
 ///
-/// Used only for idempotent requests (reads, `get_metadata`, unconditional
-/// write/delete, list); conditional writes use [`check_conditional_status`].
+/// Used only for idempotent requests (reads, unconditional write/delete, list);
+/// conditional writes use [`check_conditional_status`].
 /// A `5xx` on an idempotent request is a transient outage that is always safe
 /// to retry (ADR-009), so it surfaces as `Unavailable` rather than a generic
 /// `Other`.
@@ -586,32 +497,14 @@ async fn parse_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| BackendError::with_source(format!("{op}({path}): decoding response"), e))
 }
 
-/// Builds the JSON metadata part of a multipart upload.
-fn object_metadata_json(name: &str, tags: &Tags) -> String {
+/// Builds the JSON metadata part of a multipart upload (just the object name).
+fn object_metadata_json(name: &str) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert(
         "name".to_string(),
         serde_json::Value::String(name.to_string()),
     );
-    if !tags.is_empty() {
-        obj.insert("metadata".to_string(), tags_to_json(tags));
-    }
     serde_json::Value::Object(obj).to_string()
-}
-
-/// Builds the JSON body of a metadata-only patch.
-fn metadata_patch_json(tags: &Tags) -> String {
-    let mut obj = serde_json::Map::new();
-    obj.insert("metadata".to_string(), tags_to_json(tags));
-    serde_json::Value::Object(obj).to_string()
-}
-
-fn tags_to_json(tags: &Tags) -> serde_json::Value {
-    serde_json::Value::Object(
-        tags.iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect(),
-    )
 }
 
 /// Assembles a `multipart/related` upload body from a JSON metadata part and a

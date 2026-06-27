@@ -9,17 +9,16 @@
 //! proves the schedule itself replayed deterministically.
 //!
 //! Each record captures the method tag and a canonical encoding of every
-//! argument that crosses the boundary (path, value, tags, expected version, and
-//! writer id). The recording order is the call-issue order; under a
-//! deterministic schedule that order is itself deterministic, which is exactly
-//! the property under test.
+//! argument that crosses the boundary (path, value, and expected version). The
+//! recording order is the call-issue order; under a deterministic schedule that
+//! order is itself deterministic, which is exactly the property under test.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use crate::{Backend, BackendError, ReadReply, Version};
 
 /// A single recorded backend operation: the method tag, the primary path, and a
 /// canonical encoding of the remaining arguments.
@@ -30,8 +29,8 @@ pub struct OpRecord {
     /// The object (or directory) path the call targeted.
     pub path: String,
     /// Canonical little-endian, length-prefixed encoding of the remaining
-    /// arguments (value, tags, expected version, writer id), in the order they
-    /// appear in the method signature.
+    /// arguments (value, expected version), in the order they appear in the
+    /// method signature.
     pub args: Vec<u8>,
 }
 
@@ -54,15 +53,6 @@ pub type OpLog = Arc<Mutex<Vec<OpRecord>>>;
 fn enc_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
     buf.extend_from_slice(b);
-}
-
-fn enc_tags(buf: &mut Vec<u8>, tags: &Tags) {
-    // `Tags` is a `BTreeMap`, so iteration is already in sorted key order.
-    buf.extend_from_slice(&(tags.len() as u64).to_le_bytes());
-    for (k, v) in tags {
-        enc_bytes(buf, k.as_bytes());
-        enc_bytes(buf, v.as_bytes());
-    }
 }
 
 fn enc_version(buf: &mut Vec<u8>, v: &Version) {
@@ -106,51 +96,27 @@ impl RecordingBackend {
 
 #[async_trait]
 impl Backend for RecordingBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        let mut args = Vec::new();
-        enc_bytes(&mut args, expected_writer.as_bytes());
-        self.record("read_if_modified", path, args);
-        self.inner.read_if_modified(path, expected_writer).await
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.record("read", path, Vec::new());
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        self.record("get_metadata", path, Vec::new());
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<ReadReply, BackendError> {
         let mut args = Vec::new();
         enc_version(&mut args, expected);
-        enc_tags(&mut args, &tags);
-        self.record("set_tags_if", path, args);
-        self.inner.set_tags_if(path, expected, tags).await
+        self.record("read_if_modified", path, args);
+        self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         let mut args = Vec::new();
         enc_bytes(&mut args, &value);
-        enc_tags(&mut args, &tags);
         self.record("write", path, args);
-        self.inner.write(path, value, tags).await
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -158,39 +124,28 @@ impl Backend for RecordingBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         let mut args = Vec::new();
         enc_bytes(&mut args, &value);
         enc_version(&mut args, expected);
-        enc_tags(&mut args, &tags);
         self.record("write_if", path, args);
-        self.inner.write_if(path, value, expected, tags).await
+        self.inner.write_if(path, value, expected).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         let mut args = Vec::new();
         enc_bytes(&mut args, &value);
-        enc_tags(&mut args, &tags);
         self.record("write_if_not_exists", path, args);
-        self.inner.write_if_not_exists(path, value, tags).await
+        self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.record("delete", path, Vec::new());
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        let mut args = Vec::new();
-        enc_version(&mut args, expected);
-        self.record("delete_if", path, args);
-        self.inner.delete_if(path, expected).await
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
@@ -228,17 +183,19 @@ mod tests {
         let rec = RecordingBackend::new(inner);
         let log = rec.log();
 
-        rec.write("a/b", b"v".to_vec(), Tags::new()).await.unwrap();
+        let v = rec.write("a/b", b"v".to_vec()).await.unwrap();
         let _ = rec.read("a/b").await;
-        let _ = rec.get_metadata("a/b").await;
+        let _ = rec.read_if_modified("a/b", &v).await;
 
         let recorded = log.lock().unwrap();
         let ops: Vec<&str> = recorded.iter().map(|r| r.op).collect();
-        assert_eq!(ops, vec!["write", "read", "get_metadata"]);
+        assert_eq!(ops, vec!["write", "read", "read_if_modified"]);
         assert_eq!(recorded[0].path, "a/b");
-        // The write encoded its value and (empty) tags into args.
+        // The write encoded its value into args; a plain read carries none.
         assert!(!recorded[0].args.is_empty());
         assert!(recorded[1].args.is_empty());
+        // read_if_modified encoded the expected version.
+        assert!(!recorded[2].args.is_empty());
     }
 
     #[test]
@@ -249,11 +206,11 @@ mod tests {
             args: Vec::new(),
         };
         let a = vec![mk("read"), mk("write"), mk("delete")];
-        let b = vec![mk("read"), mk("get_metadata"), mk("delete")];
+        let b = vec![mk("read"), mk("read_if_modified"), mk("delete")];
         let (i, ar, br) = first_divergence(&a, &b).unwrap();
         assert_eq!(i, 1);
         assert_eq!(ar.unwrap().op, "write");
-        assert_eq!(br.unwrap().op, "get_metadata");
+        assert_eq!(br.unwrap().op, "read_if_modified");
 
         assert!(first_divergence(&a, &a).is_none());
     }
