@@ -80,6 +80,20 @@ pub fn to_key(suffix: &str) -> Result<Vec<u8>, PathError> {
     decode(Type::Key, suffix)
 }
 
+/// Splits a full key path (`{prefix}/_k/<b64>`) into its collection prefix and
+/// decoded raw key bytes, the inverse of [`from_key`]. Unlike [`to_key`] (which
+/// decodes a type-marked suffix), this takes a whole path.
+pub fn split_key(path: &str) -> Result<(String, Vec<u8>), PathError> {
+    let pr = parse(path)?;
+    if pr.typ != Type::Key {
+        return Err(PathError::WrongPrefix {
+            suffix: path.to_string(),
+            expected: Type::Key.as_str().to_string(),
+        });
+    }
+    Ok((pr.prefix, base64::decode(&pr.suffix)?))
+}
+
 /// Returns the listing prefix for all keys under `prefix`.
 pub fn keys_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Key)
@@ -154,6 +168,22 @@ pub fn to_shard(suffix: &str) -> Result<u32, PathError> {
 /// Returns the listing prefix for all shards under `prefix`.
 pub fn shards_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Shard)
+}
+
+/// Decodes the shard index from a full shard object path (`{prefix}/_s/<idx>`),
+/// the inverse of [`from_shard`]. Unlike [`to_shard`] (which decodes a
+/// type-marked suffix), this takes a whole path as returned by a shard listing.
+pub fn shard_index_of(path: &str) -> Result<u32, PathError> {
+    let pr = parse(path)?;
+    if pr.typ != Type::Shard {
+        return Err(PathError::WrongPrefix {
+            suffix: path.to_string(),
+            expected: Type::Shard.as_str().to_string(),
+        });
+    }
+    pr.suffix
+        .parse()
+        .map_err(|_| PathError::Parse(path.to_string()))
 }
 
 /// Splits a storage path into its prefix, type, and suffix components.
@@ -235,6 +265,20 @@ mod tests {
     }
 
     #[test]
+    fn split_key_round_trip_and_errors() {
+        let (prefix, key) = split_key(&from_key("foo/bar", b"Hello")).unwrap();
+        assert_eq!(prefix, "foo/bar");
+        assert_eq!(key, b"Hello");
+        // A non-key path is rejected.
+        assert!(matches!(
+            split_key(&from_shard("db/coll", 1)),
+            Err(PathError::WrongPrefix { .. })
+        ));
+        // A malformed path (no type segment) is a parse error.
+        assert!(matches!(split_key("db"), Err(PathError::Parse(_))));
+    }
+
+    #[test]
     fn collection_info_paths() {
         assert_eq!(collection_info("foo/bar"), "foo/bar/_i");
         assert!(is_collection_info("foo/bar/_i"));
@@ -280,6 +324,18 @@ mod tests {
             to_shard("_s/notanumber"),
             Err(PathError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn shard_index_of_round_trip_and_errors() {
+        assert_eq!(shard_index_of(&from_shard("db/coll", 42)).unwrap(), 42);
+        // A non-shard path is rejected.
+        assert!(matches!(
+            shard_index_of(&from_key("db/coll", b"k")),
+            Err(PathError::WrongPrefix { .. })
+        ));
+        // A malformed path (no type segment) is a parse error.
+        assert!(matches!(shard_index_of("db"), Err(PathError::Parse(_))));
     }
 
     // Golden vectors produced by the Go implementation, to guarantee

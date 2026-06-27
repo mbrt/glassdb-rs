@@ -7,18 +7,17 @@ use glassdb_data::paths;
 use crate::error::Error;
 
 /// Iterates over the keys in a collection.
+///
+/// In v2 keys are resolved from the collection's shard objects and decoded by
+/// the caller, so this iterator simply yields the pre-decoded, sorted raw keys.
 pub struct KeysIter {
-    items: std::vec::IntoIter<String>,
-    prefix: String,
-    done: bool,
+    items: std::vec::IntoIter<Vec<u8>>,
 }
 
 impl KeysIter {
-    pub(crate) fn new(items: Vec<String>) -> Self {
+    pub(crate) fn new(items: Vec<Vec<u8>>) -> Self {
         KeysIter {
             items: items.into_iter(),
-            prefix: String::new(),
-            done: false,
         }
     }
 }
@@ -27,42 +26,7 @@ impl Iterator for KeysIter {
     type Item = Result<Vec<u8>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let backend_path = self.items.next()?;
-        if self.prefix.is_empty() {
-            match paths::parse(&backend_path) {
-                Ok(r) if r.typ == paths::Type::Key => self.prefix = format!("{}/", r.prefix),
-                Ok(r) => {
-                    self.done = true;
-                    return Some(Err(Error::internal(format!(
-                        "got path type {:?}, expected Key",
-                        r.typ
-                    ))));
-                }
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(Error::with_source(
-                        format!("parsing path {backend_path:?}"),
-                        e,
-                    )));
-                }
-            }
-        }
-        let trimmed = backend_path
-            .strip_prefix(&self.prefix)
-            .unwrap_or(&backend_path);
-        match paths::to_key(trimmed) {
-            Ok(k) => Some(Ok(k)),
-            Err(e) => {
-                self.done = true;
-                Some(Err(Error::with_source(
-                    format!("decoding key from path {trimmed:?}"),
-                    e,
-                )))
-            }
-        }
+        self.items.next().map(Ok)
     }
 }
 

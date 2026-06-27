@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Global, Local, TLogger};
+use glassdb_storage::{Global, Local, ShardStore, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Reader, TransError};
 use tokio::sync::Notify;
 
@@ -110,6 +110,8 @@ impl DatabaseBuilder {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let local = Local::new(cache_size);
         let global = Global::new(dyn_backend, local.clone());
+        // One shared, uncached shard/root coordination store over the backend.
+        let shards = ShardStore::new(backend.clone());
         let tl = TLogger::new(global.clone(), local.clone(), &name);
         let bg = Arc::new(Background::new());
         let clock = if deterministic_time {
@@ -123,8 +125,8 @@ impl DatabaseBuilder {
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
         let tmon = Monitor::with_config(local.clone(), tl.clone(), bg_weak.clone(), clock, retry);
-        let reader = Reader::new(local.clone(), global.clone(), tmon.clone(), retry);
-        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
+        let reader = Reader::new(local.clone(), shards.clone(), tmon.clone(), retry);
+        let locker = Locker::new(shards.clone(), tmon.clone(), retry);
         let gc = Gc::new(bg_weak.clone(), tl);
         gc.start();
         let algo = Algo::new(
@@ -140,6 +142,7 @@ impl DatabaseBuilder {
         let inner = Arc::new(DbInner {
             name,
             backend,
+            shards,
             local,
             global,
             tmon,
@@ -158,6 +161,7 @@ impl DatabaseBuilder {
 pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) backend: Arc<StatsBackend>,
+    pub(crate) shards: ShardStore,
     pub(crate) local: Local,
     pub(crate) global: Global,
     pub(crate) tmon: Monitor,
@@ -364,7 +368,7 @@ impl DbInner {
         T: Send,
     {
         let tx = Transaction::new(
-            self.global.clone(),
+            self.shards.clone(),
             self.local.clone(),
             self.tmon.clone(),
             self.retry,

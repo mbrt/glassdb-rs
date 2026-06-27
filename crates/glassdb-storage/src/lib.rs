@@ -11,6 +11,7 @@ mod local;
 mod locker;
 mod root;
 mod shard;
+mod shardstore;
 mod tlogger;
 pub mod txobject;
 mod version;
@@ -25,5 +26,6 @@ pub use locker::{
 };
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
+pub use shardstore::ShardStore;
 pub use tlogger::{PathLock, TLogger, TxCommitStatus, TxLog, TxStatus, TxWrite};
 pub use version::{Version, version_from_meta};
