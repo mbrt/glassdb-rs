@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — implemented (`glassdb-storage::txobject` codec + the `glassdb-trans::v2`
+Accepted — implemented (`glassdb-storage::txobject` codec + the transaction
 engine)
 
 ## Context

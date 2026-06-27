@@ -1420,7 +1420,6 @@ name = "glassdb-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
  "glassdb-concurr",
  "rand 0.10.1",
  "rand_distr",

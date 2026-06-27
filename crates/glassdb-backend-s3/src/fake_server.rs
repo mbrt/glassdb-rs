@@ -94,7 +94,6 @@ struct LostAck {
 
 struct FakeState {
     objects: Mutex<HashMap<String, StoredObject>>,
-    etag_ctr: Mutex<u64>,
     slow: Mutex<SlowDown>,
     lost_ack: Mutex<LostAck>,
     latency: Option<LatencyModel>,
@@ -127,7 +126,6 @@ impl FakeS3 {
     pub async fn start_with(opts: FakeS3Options) -> FakeS3 {
         let state = Arc::new(FakeState {
             objects: Mutex::new(HashMap::new()),
-            etag_ctr: Mutex::new(1),
             slow: Mutex::new(SlowDown::default()),
             lost_ack: Mutex::new(LostAck::default()),
             latency: opts.latency.map(LatencyModel::from_opts),
@@ -296,7 +294,7 @@ async fn handle(
         }
     } else {
         match method {
-            Method::GET => get_object(&state, &key),
+            Method::GET => get_object(&state, &key, &parts.headers),
             Method::HEAD => head_object(&state, &key),
             Method::PUT => put_object(&state, &key, &parts.headers, body.to_vec()),
             Method::DELETE => delete_object(&state, &key),
@@ -306,10 +304,23 @@ async fn handle(
     Ok(resp)
 }
 
-fn get_object(state: &FakeState, key: &str) -> Response<Full<Bytes>> {
+fn get_object(state: &FakeState, key: &str, headers: &hyper::HeaderMap) -> Response<Full<Bytes>> {
     let objs = state.objects.lock().unwrap();
     match objs.get(key) {
-        Some(o) => object_response(o, true),
+        Some(o) => {
+            // Conditional GET (`read_if_modified`): when the caller's cached
+            // ETag still matches, answer `304 Not Modified` with no body.
+            if let Some(inm) = header_str(headers, "if-none-match")
+                && inm == o.etag
+            {
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header("ETag", &o.etag)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+            }
+            object_response(o, true)
+        }
         None => xml_error(StatusCode::NOT_FOUND, "NoSuchKey", "key not found"),
     }
 }
@@ -368,12 +379,11 @@ fn put_object(
         }
     }
 
-    let etag = {
-        let mut ctr = state.etag_ctr.lock().unwrap();
-        let e = format!("\"{ctr}\"");
-        *ctr += 1;
-        e
-    };
+    // Like real S3, the ETag of a (non-multipart) object is derived from its
+    // content: identical bytes yield an identical ETag, and any content change
+    // yields a new one. This is what makes ADR-023's nonce removal safe — the
+    // body itself drives the CAS token.
+    let etag = content_etag(&body);
     objs.insert(
         key.to_string(),
         StoredObject {
@@ -503,6 +513,16 @@ fn ok_empty() -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// A content-derived ETag, mirroring real S3 where a non-multipart object's
+/// ETag is a hash of its bytes. A fixed-seed hasher keeps it deterministic
+/// within the process (the exact value is opaque to the backend).
+fn content_etag(body: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    format!("\"{:016x}\"", h.finish())
+}
+
 fn header_str(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -551,9 +571,7 @@ fn xml_escape(s: &str) -> String {
 
 /// Per-operation lognormal latency, derived from a [`DelayOptions`] profile.
 /// HTTP methods are mapped to the backend operation they implement so the
-/// served latencies match the simulated `DelayBackend`: a `set_tags_if` (a GET
-/// then a PUT) naturally costs `obj_read + obj_write`, matching S3's lack of a
-/// metadata-only update.
+/// served latencies match the simulated `DelayBackend`.
 struct LatencyModel {
     get: Lognormal,
     head: Lognormal,

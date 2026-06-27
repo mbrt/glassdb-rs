@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use glassdb_concurr::rt::{self, Instant};
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use crate::{Backend, BackendError, ReadReply, Version};
 
 /// Typical latency values observed with Google Cloud Storage.
 pub fn gcs_delays() -> DelayOptions {
@@ -32,10 +32,6 @@ pub fn gcs_delays() -> DelayOptions {
 /// Typical latency values for Amazon S3 Standard accessed in-region, derived
 /// from AWS guidance and public benchmarks (p50 GET ~30 ms, p50 PUT ~70 ms,
 /// with a long right tail captured by the lognormal model).
-///
-/// `meta_write` is higher than the other backends because S3 has no
-/// metadata-only update: `set_tags_if` re-uploads the object (a GET followed by
-/// a PUT), so its latency is roughly the sum of the two.
 ///
 /// Unlike GCS, S3 has no per-object write limit; throughput scales per prefix.
 /// `same_obj_write_ps` is therefore set high so the per-object limiter never
@@ -111,8 +107,6 @@ pub struct DelayOptions {
 pub struct DelayBackend {
     inner: Arc<dyn Backend>,
     scale: f64,
-    meta_read: Lognormal,
-    meta_write: Lognormal,
     obj_read: Lognormal,
     obj_write: Lognormal,
     list: Lognormal,
@@ -124,13 +118,15 @@ pub struct DelayBackend {
 
 impl DelayBackend {
     /// Wraps `inner`, simulating the latencies described by `opts`.
+    ///
+    /// The content-CAS-only trait (ADR-023) has no metadata-only operations, so
+    /// `opts.meta_read` / `opts.meta_write` are unused; they remain in
+    /// [`DelayOptions`] only for config-shape stability.
     pub fn new(inner: Arc<dyn Backend>, opts: DelayOptions) -> Self {
         let scale = if opts.scale == 0.0 { 1.0 } else { opts.scale };
         DelayBackend {
             inner,
             scale,
-            meta_read: Lognormal::from_latency(opts.meta_read),
-            meta_write: Lognormal::from_latency(opts.meta_write),
             obj_read: Lognormal::from_latency(opts.obj_read),
             obj_write: Lognormal::from_latency(opts.obj_write),
             list: Lognormal::from_latency(opts.list),
@@ -178,50 +174,27 @@ impl DelayBackend {
 
 #[async_trait]
 impl Backend for DelayBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        self.prefix_read_wait(path).await;
-        self.delay(&self.obj_read).await;
-        self.inner.read_if_modified(path, expected_writer).await
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.prefix_read_wait(path).await;
         self.delay(&self.obj_read).await;
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        self.prefix_read_wait(path).await;
-        self.delay(&self.meta_read).await;
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.prefix_write_wait(path).await;
-        self.backoff(path).await;
-        self.delay(&self.meta_write).await;
-        self.inner.set_tags_if(path, expected, tags).await
+    ) -> Result<ReadReply, BackendError> {
+        self.prefix_read_wait(path).await;
+        self.delay(&self.obj_read).await;
+        self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         self.prefix_write_wait(path).await;
         self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.write(path, value, tags).await
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -229,24 +202,22 @@ impl Backend for DelayBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.prefix_write_wait(path).await;
         self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.write_if(path, value, expected, tags).await
+        self.inner.write_if(path, value, expected).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.prefix_write_wait(path).await;
         self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.write_if_not_exists(path, value, tags).await
+        self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
@@ -254,13 +225,6 @@ impl Backend for DelayBackend {
         self.backoff(path).await;
         self.delay(&self.obj_write).await;
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        self.prefix_write_wait(path).await;
-        self.backoff(path).await;
-        self.delay(&self.obj_write).await;
-        self.inner.delete_if(path, expected).await
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {

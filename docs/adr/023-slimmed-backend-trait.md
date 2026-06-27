@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed — design only. The trait change is the **cutover** step of the v2
-effort: it can only land once the DST oracles are re-pointed at the v2 layout and
-the v1 tag-based commit path is retired (it is the last consumer of tags). The
+Accepted — implemented. The trait change is the **cutover** step of the v2
+effort: it landed once the DST oracles were re-pointed at the v2 layout and the
+v1 tag-based commit path was retired (it was the last consumer of tags). The
 storage caching layer (`Global`, `Local`, `Locker`) is **retained and adapted**,
 not deleted (see [Cutover](#cutover--keep-and-re-point-the-caching-layer)).
 

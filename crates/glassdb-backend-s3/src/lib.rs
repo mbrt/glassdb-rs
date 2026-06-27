@@ -1,14 +1,11 @@
-//! Amazon S3 backend for GlassDB. Ported from the Go `backend/s3` package.
+//! Amazon S3 backend for GlassDB (ADR-016, ADR-023).
 //!
-//! Each logical key maps to a single S3 object. The user value is stored in the
-//! object body with an 8-byte random nonce prepended, and the lock/last-writer
-//! tags are stored as S3 user metadata (`x-amz-meta-*`). The nonce guarantees a
-//! fresh ETag on every PutObject, which restores compare-and-swap semantics for
-//! metadata-only updates (S3 ETags are otherwise the MD5 of the content).
+//! Each logical key maps to a single S3 object whose body holds the value.
+//! Coordination is content CAS only: conditional writes use `If-Match` /
+//! `If-None-Match` on the object ETag, and the opaque [`Version`] token is that
+//! ETag (kept verbatim, quotes included). Conditional reads use `If-None-Match`.
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,10 +14,7 @@ use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use glassdb_backend::{
-    Backend, BackendError, Cause, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
-    encode_writer_tag,
-};
+use glassdb_backend::{Backend, BackendError, Cause, ReadReply, Version};
 
 // The in-process fake S3 server is compiled for this crate's own tests and,
 // when the `fake-server` feature is on, exposed as a reusable component (used by
@@ -36,10 +30,6 @@ mod tests;
 mod tuned_http;
 
 pub use tuned_http::tuned_http_client;
-
-/// Number of random bytes prepended to every object body to force a unique
-/// ETag on each write.
-const NONCE_SIZE: usize = 8;
 
 /// Bounds how many extra times a conditional PutObject is retried after S3
 /// reports a 409 `ConditionalRequestConflict`.
@@ -125,12 +115,12 @@ impl S3Backend {
         aws_sdk_s3::config::Builder::default().retry_config(self.retry.clone())
     }
 
-    /// Awaits an idempotent S3 operation and maps SDK errors. Used for reads,
-    /// HEADs, and the GET behind `set_tags_if` — never for the conditional-write
-    /// loop, which classifies its own outcomes (see [`S3Backend::put`]). Because
-    /// the request is idempotent, transient failures are surfaced as
-    /// `Unavailable` (retryable) via [`annotate_read`]. Cancellation is by
-    /// dropping the surrounding future.
+    /// Awaits an idempotent S3 operation and maps SDK errors. Used for reads
+    /// and the conditional GET behind `read_if_modified` — never for the
+    /// conditional-write loop, which classifies its own outcomes (see
+    /// [`S3Backend::put`]). Because the request is idempotent, transient
+    /// failures are surfaced as `Unavailable` (retryable) via [`annotate_read`].
+    /// Cancellation is by dropping the surrounding future.
     async fn run<F, T, E>(op: &'static str, path: &str, fut: F) -> Result<T, BackendError>
     where
         F: Future<Output = Result<T, SdkError<E>>>,
@@ -145,7 +135,6 @@ impl S3Backend {
         &self,
         path: &str,
         payload: &[u8],
-        metadata: &Option<HashMap<String, String>>,
         conds: &PutConds,
         retry: RetryConfig,
     ) -> PutAttempt {
@@ -154,8 +143,7 @@ impl S3Backend {
             .put_object()
             .bucket(&self.bucket)
             .key(path)
-            .body(ByteStream::from(payload.to_vec()))
-            .set_metadata(metadata.clone());
+            .body(ByteStream::from(payload.to_vec()));
         if let Some(m) = &conds.if_match {
             op = op.if_match(m);
         }
@@ -173,9 +161,8 @@ impl S3Backend {
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
         conds: PutConds,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         if let Some(m) = &conds.if_match
             && m.is_empty()
         {
@@ -184,27 +171,17 @@ impl S3Backend {
             // than risk an unconditional overwrite.
             return Err(BackendError::Precondition);
         }
-        let payload = add_nonce(&value);
-        let metadata: Option<HashMap<String, String>> = if tags.is_empty() {
-            None
-        } else {
-            Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        };
         let conditional = conds.if_match.is_some() || conds.if_none_match;
 
         if !conditional {
-            // An unconditional overwrite is idempotent (the nonce only changes
-            // the ETag), so the SDK's adaptive retryer may ride out
-            // throttling/transient failures transparently: re-applying is
-            // harmless.
+            // An unconditional overwrite is idempotent (re-applying the same
+            // body is harmless), so the SDK's adaptive retryer may ride out
+            // throttling/transient failures transparently.
             return match self
-                .send_put(path, &payload, &metadata, &conds, self.retry.clone())
+                .send_put(path, &value, &conds, self.retry.clone())
                 .await
             {
-                PutAttempt::Ok(version) => Ok(Metadata {
-                    tags: Arc::new(tags),
-                    version,
-                }),
+                PutAttempt::Ok(version) => Ok(version),
                 PutAttempt::Err(e) => Err(annotate("Write", path, *e)),
             };
         }
@@ -220,14 +197,11 @@ impl S3Backend {
         let mut attempt: u32 = 0;
         loop {
             let e = match self
-                .send_put(path, &payload, &metadata, &conds, RetryConfig::disabled())
+                .send_put(path, &value, &conds, RetryConfig::disabled())
                 .await
             {
                 PutAttempt::Ok(version) => {
-                    return Ok(Metadata {
-                        tags: Arc::new(tags),
-                        version,
-                    });
+                    return Ok(version);
                 }
                 PutAttempt::Err(e) => *e,
             };
@@ -284,37 +258,6 @@ struct PutConds {
 
 #[async_trait]
 impl Backend for S3Backend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        // With nonce-in-content the ETag changes on every write, so the
-        // last-writer tag is the source of truth: compare it via HEAD before
-        // downloading.
-        let head = Self::run(
-            "ReadIfModified",
-            path,
-            self.client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .customize()
-                .config_override(self.overrides())
-                .send(),
-        )
-        .await?;
-        let current = head
-            .metadata()
-            .and_then(|m| m.get(LAST_WRITER_TAG))
-            .map(String::as_str)
-            .unwrap_or("");
-        if current == encode_writer_tag(expected_writer) {
-            return Err(BackendError::Precondition);
-        }
-        self.read(path).await
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         let out = Self::run(
             "Read",
@@ -329,7 +272,6 @@ impl Backend for S3Backend {
         )
         .await?;
         let version = version_from_etag(out.e_tag());
-        let tags = tags_from_meta(out.metadata());
         let stored = out
             .body
             .collect()
@@ -339,80 +281,53 @@ impl Backend for S3Backend {
             })?
             .to_vec();
         Ok(ReadReply {
-            contents: read_body(path, stored)?,
+            contents: stored,
             version,
-            tags,
         })
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        let out = Self::run(
-            "GetMetadata",
-            path,
-            self.client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .customize()
-                .config_override(self.overrides())
-                .send(),
-        )
-        .await?;
-        Ok(Metadata {
-            tags: Arc::new(tags_from_meta(out.metadata())),
-            version: version_from_etag(out.e_tag()),
-        })
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        // S3 has no metadata-only update, so the object must be re-uploaded.
-        // The existing tags are preserved and the new tags overlaid on top. A
-        // fresh nonce ensures the ETag changes so the conditional write is real
-        // CAS.
+    ) -> Result<ReadReply, BackendError> {
+        if expected.is_unset() {
+            return self.read(path).await;
+        }
+        // The ETag changes on every content write, so a conditional GET with
+        // `If-None-Match` revalidates without transferring the body: an
+        // unchanged object answers `304 Not Modified`, mapped to `Precondition`
+        // by `annotate` (see the 304 arm).
         let out = Self::run(
-            "SetTagsIf",
+            "ReadIfModified",
             path,
             self.client
                 .get_object()
                 .bucket(&self.bucket)
                 .key(path)
+                .if_none_match(expected.token.as_ref())
                 .customize()
                 .config_override(self.overrides())
                 .send(),
         )
         .await?;
-        let mut merged = tags_from_meta(out.metadata());
-        let stored = out.body.collect().await.map_err(|e| {
-            BackendError::with_source(format!("SetTagsIf({path}): reading object body"), e)
-        })?;
-        let value = read_body(path, stored.to_vec())?;
-        for (k, v) in tags {
-            merged.insert(k, v);
-        }
-        self.put(
-            path,
-            value,
-            merged,
-            PutConds {
-                if_match: Some(expected.token.to_string()),
-                if_none_match: false,
-            },
-        )
-        .await
+        let version = version_from_etag(out.e_tag());
+        let stored = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                BackendError::with_source(format!("ReadIfModified({path}): reading object body"), e)
+            })?
+            .to_vec();
+        Ok(ReadReply {
+            contents: stored,
+            version,
+        })
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.put(path, value, tags, PutConds::default()).await
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
+        self.put(path, value, PutConds::default()).await
     }
 
     async fn write_if(
@@ -420,12 +335,10 @@ impl Backend for S3Backend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.put(
             path,
             value,
-            tags,
             PutConds {
                 if_match: Some(expected.token.to_string()),
                 if_none_match: false,
@@ -438,12 +351,10 @@ impl Backend for S3Backend {
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.put(
             path,
             value,
-            tags,
             PutConds {
                 if_match: None,
                 if_none_match: true,
@@ -455,39 +366,6 @@ impl Backend for S3Backend {
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         Self::run(
             "Delete",
-            path,
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .customize()
-                .config_override(self.overrides())
-                .send(),
-        )
-        .await
-        .map(|_| ())
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        // S3 has no conditional delete, so this is a HEAD-then-DELETE with a
-        // documented TOCTOU window covered by the transaction algorithm.
-        let head = Self::run(
-            "DeleteIf",
-            path,
-            self.client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .customize()
-                .config_override(self.overrides())
-                .send(),
-        )
-        .await?;
-        if &version_from_etag(head.e_tag()) != expected {
-            return Err(BackendError::Precondition);
-        }
-        Self::run(
-            "DeleteIf",
             path,
             self.client
                 .delete_object()
@@ -545,40 +423,12 @@ impl Backend for S3Backend {
     }
 }
 
-/// Prepends [`NONCE_SIZE`] random bytes to `value`.
-fn add_nonce(value: &[u8]) -> Vec<u8> {
-    let nonce: [u8; NONCE_SIZE] = rand::random();
-    let mut buf = Vec::with_capacity(NONCE_SIZE + value.len());
-    buf.extend_from_slice(&nonce);
-    buf.extend_from_slice(value);
-    buf
-}
-
-/// Strips the leading nonce from a stored object body.
-fn read_body(path: &str, stored: Vec<u8>) -> Result<Vec<u8>, BackendError> {
-    if stored.len() < NONCE_SIZE {
-        return Err(BackendError::other(format!(
-            "Read({path}): object body too short ({} bytes) to contain nonce",
-            stored.len()
-        )));
-    }
-    Ok(stored[NONCE_SIZE..].to_vec())
-}
-
 /// Builds an opaque [`Version`] from an S3 ETag, kept verbatim (quotes
 /// included).
 fn version_from_etag(etag: Option<&str>) -> Version {
     match etag {
         Some(e) => Version::new(e),
         None => Version::default(),
-    }
-}
-
-/// Converts S3 user metadata into [`Tags`].
-fn tags_from_meta(meta: Option<&HashMap<String, String>>) -> Tags {
-    match meta {
-        Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        None => Tags::new(),
     }
 }
 
@@ -616,8 +466,8 @@ impl S3RequestError {
     }
 }
 
-/// Maps an S3 SDK error from an *idempotent* request (reads, HEAD, the GET
-/// behind `set_tags_if`) onto a [`BackendError`].
+/// Maps an S3 SDK error from an *idempotent* request (`read` and the
+/// conditional GET behind `read_if_modified`) onto a [`BackendError`].
 ///
 /// A transient failure — throttle (`503`/`429`), timeout, dispatch failure, or
 /// `5xx` — is always safe to retry on an idempotent request (ADR-009), so it is
@@ -656,6 +506,9 @@ where
     }
     match status {
         Some(404) => BackendError::NotFound,
+        // 304 Not Modified answers a conditional GET (`read_if_modified`):
+        // the caller's cached copy is still current.
+        Some(304) => BackendError::Precondition,
         Some(412) | Some(409) => BackendError::Precondition,
         _ => S3RequestError {
             op,

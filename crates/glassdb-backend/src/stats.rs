@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use crate::{Backend, BackendError, ReadReply, Version};
 
 /// Snapshot of backend operation counters.
+///
+/// The content-CAS-only trait (ADR-023) has no metadata-only operations, so the
+/// counters track object reads, writes, and lists only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackendStats {
-    pub meta_reads: u64,
-    pub meta_writes: u64,
     pub obj_reads: u64,
     pub obj_writes: u64,
     pub obj_lists: u64,
@@ -21,8 +22,6 @@ pub struct BackendStats {
 /// Wraps a backend and counts the operations performed on it.
 pub struct StatsBackend {
     inner: Arc<dyn Backend>,
-    meta_reads: AtomicU64,
-    meta_writes: AtomicU64,
     obj_reads: AtomicU64,
     obj_writes: AtomicU64,
     obj_lists: AtomicU64,
@@ -33,8 +32,6 @@ impl StatsBackend {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
         StatsBackend {
             inner,
-            meta_reads: AtomicU64::new(0),
-            meta_writes: AtomicU64::new(0),
             obj_reads: AtomicU64::new(0),
             obj_writes: AtomicU64::new(0),
             obj_lists: AtomicU64::new(0),
@@ -44,8 +41,6 @@ impl StatsBackend {
     /// Returns the current counters and resets them to zero.
     pub fn stats_and_reset(&self) -> BackendStats {
         BackendStats {
-            meta_reads: self.meta_reads.swap(0, Ordering::Relaxed),
-            meta_writes: self.meta_writes.swap(0, Ordering::Relaxed),
             obj_reads: self.obj_reads.swap(0, Ordering::Relaxed),
             obj_writes: self.obj_writes.swap(0, Ordering::Relaxed),
             obj_lists: self.obj_lists.swap(0, Ordering::Relaxed),
@@ -55,43 +50,23 @@ impl StatsBackend {
 
 #[async_trait]
 impl Backend for StatsBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        self.obj_reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.read_if_modified(path, expected_writer).await
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.obj_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        self.meta_reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.meta_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.set_tags_if(path, expected, tags).await
+    ) -> Result<ReadReply, BackendError> {
+        self.obj_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.write(path, value, tags).await
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -99,30 +74,23 @@ impl Backend for StatsBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.write_if(path, value, expected, tags).await
+        self.inner.write_if(path, value, expected).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.write_if_not_exists(path, value, tags).await
+        self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        self.obj_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.delete_if(path, expected).await
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {

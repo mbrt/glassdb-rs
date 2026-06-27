@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::rt;
 
-use crate::{Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use crate::{Backend, BackendError, ReadReply, Version};
 
 /// Produces deterministic delays from a byte sequence. Each call to the
 /// scheduler consumes one byte and yields `byte * tick`; once the sequence is
@@ -71,43 +71,23 @@ impl ScheduledBackend {
 
 #[async_trait]
 impl Backend for ScheduledBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        self.wait().await;
-        self.inner.read_if_modified(path, expected_writer).await
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.wait().await;
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        self.wait().await;
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<ReadReply, BackendError> {
         self.wait().await;
-        self.inner.set_tags_if(path, expected, tags).await
+        self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         self.wait().await;
-        self.inner.write(path, value, tags).await
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -115,30 +95,23 @@ impl Backend for ScheduledBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.wait().await;
-        self.inner.write_if(path, value, expected, tags).await
+        self.inner.write_if(path, value, expected).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         self.wait().await;
-        self.inner.write_if_not_exists(path, value, tags).await
+        self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.wait().await;
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        self.wait().await;
-        self.inner.delete_if(path, expected).await
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {

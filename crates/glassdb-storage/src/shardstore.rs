@@ -1,26 +1,20 @@
 //! Fresh, compare-and-swap I/O for the v2 coordination objects (ADR-017/018).
 //!
 //! Shards (`{prefix}/_s/<i>`) and collection roots (`{prefix}/_i`) are the v2
-//! coordination units. Unlike per-key value objects they carry no `last-writer`
-//! tag, so the writer-tagged read-through cache in [`Global`] cannot tell when
-//! their *content* changed (a lock acquired by a peer leaves the tag empty).
-//! Reading them through that cache would therefore serve stale lock tables. This
-//! store talks to the backend directly so every shard/root read is fresh, and
-//! every store is an unconditional create-if-absent or a version-conditional
-//! compare-and-swap — the only coordination primitive v2 needs.
+//! coordination units. Each store is an unconditional create-if-absent or a
+//! version-conditional compare-and-swap — the only coordination primitive v2
+//! needs (ADR-023).
 //!
-//! TODO(perf): cache shards/roots and revalidate with a version/ETag-conditional
-//! read (`If-None-Match` → `304 Not Modified`) instead of always full-fetching
-//! the body. The writer-tag `read_if_modified` is unusable here (these objects
-//! are tagless), but the ETag *does* change on every content write — exactly when
-//! a cached copy must be invalidated — so a conditional GET would save the body
-//! transfer on the common unchanged-hot-shard case. Needs a version-conditional
-//! read on `Backend` (none today) plus an ETag-keyed cache here. Aligns with the
-//! slimmed content-CAS-only trait (ADR-023).
+//! TODO(perf): route shard/root reads back through the [`Global`] cache and let
+//! it revalidate with the version-conditional `read_if_modified`
+//! (`If-None-Match` → `304 Not Modified`), so a hot unchanged shard revalidates
+//! without re-transferring its body. The ETag changes on every content write —
+//! exactly when a cached copy must be invalidated — so this is safe; today this
+//! store full-fetches every read for simplicity.
 
 use std::sync::Arc;
 
-use glassdb_backend::{self as backend, Backend, BackendError, Tags};
+use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_data::paths;
 
 use crate::error::StorageError;
@@ -68,12 +62,8 @@ impl ShardStore {
         let path = paths::from_shard(prefix, idx);
         let body = shard.encode();
         let res = match expected {
-            Some(v) => self.backend.write_if(&path, body, v, Tags::new()).await,
-            None => {
-                self.backend
-                    .write_if_not_exists(&path, body, Tags::new())
-                    .await
-            }
+            Some(v) => self.backend.write_if(&path, body, v).await,
+            None => self.backend.write_if_not_exists(&path, body).await,
         };
         match res {
             Ok(_) => Ok(true),
@@ -105,12 +95,7 @@ impl ShardStore {
     ) -> Result<bool, StorageError> {
         match self
             .backend
-            .write_if(
-                &paths::collection_info(prefix),
-                root.encode(),
-                expected,
-                Tags::new(),
-            )
+            .write_if(&paths::collection_info(prefix), root.encode(), expected)
             .await
         {
             Ok(_) => Ok(true),
@@ -128,7 +113,7 @@ impl ShardStore {
     ) -> Result<(), StorageError> {
         match self
             .backend
-            .write_if_not_exists(&paths::collection_info(prefix), root.encode(), Tags::new())
+            .write_if_not_exists(&paths::collection_info(prefix), root.encode())
             .await
         {
             Ok(_) | Err(BackendError::Precondition) => Ok(()),
@@ -147,7 +132,7 @@ impl ShardStore {
     ) -> Result<bool, StorageError> {
         match self
             .backend
-            .write_if_not_exists(&paths::collection_info(prefix), root.encode(), Tags::new())
+            .write_if_not_exists(&paths::collection_info(prefix), root.encode())
             .await
         {
             Ok(_) => Ok(true),

@@ -1,5 +1,6 @@
-//! The local, staleness-aware cache of values and metadata. Ported from the Go
-//! `internal/storage/local.go`.
+//! The local, staleness-aware cache of values. Ported from the Go
+//! `internal/storage/local.go`, slimmed to the v2 tagless layout (ADR-023): the
+//! cache no longer tracks object metadata/tags, only values and their version.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,11 +10,7 @@ use std::time::Duration;
 // `--cfg sim`; outside either it behaves like a real monotonic clock.
 use glassdb_concurr::rt::Instant;
 
-use glassdb_backend::Metadata;
-use glassdb_data::TxId;
-
 use crate::cache::{Cache, Weighable};
-use crate::locker::last_writer_from_tags;
 use crate::version::Version;
 
 /// The maximum staleness; effectively "any cached value is acceptable".
@@ -29,20 +26,9 @@ struct CacheValue {
     updated: Instant,
 }
 
-#[derive(Clone)]
-struct CacheMeta {
-    /// Shared so cache reads and write-throughs hand out the metadata without
-    /// deep-copying the tag map on every backend operation.
-    meta: Arc<Metadata>,
-    /// Last-writer decoded from `meta.tags`, cached to avoid re-parsing.
-    writer: TxId,
-    updated: Instant,
-}
-
 #[derive(Clone, Default)]
 struct CacheEntry {
     v: Option<CacheValue>,
-    m: Option<CacheMeta>,
 }
 
 impl Weighable for CacheEntry {
@@ -51,51 +37,7 @@ impl Weighable for CacheEntry {
         if let Some(v) = &self.v {
             res += v.value.len() + v.version.writer.as_bytes().len();
         }
-        if let Some(m) = &self.m {
-            res += m.meta.tags.len() * 16;
-        }
         res
-    }
-}
-
-impl CacheEntry {
-    fn is_meta_outdated(&self) -> bool {
-        let Some(v) = &self.v else {
-            return false;
-        };
-        let Some(m) = &self.m else {
-            return false;
-        };
-        if v.version.b.is_unset() {
-            return false;
-        }
-        if v.version.writer == m.writer {
-            return false;
-        }
-        // Writers differ: if the value was updated last, the metadata is
-        // definitely outdated.
-        v.updated > m.updated
-    }
-
-    fn is_value_outdated(&self) -> bool {
-        let Some(v) = &self.v else {
-            return false;
-        };
-        if v.outdated {
-            return true;
-        }
-        let Some(m) = &self.m else {
-            return false;
-        };
-        if v.version.b.is_unset() {
-            return false;
-        }
-        if v.version.writer == m.writer {
-            return false;
-        }
-        // Writers differ: if the metadata was updated last, the value is
-        // definitely outdated.
-        m.updated > v.updated
     }
 }
 
@@ -109,16 +51,7 @@ pub struct LocalRead {
     pub outdated: bool,
 }
 
-/// Cached metadata along with its freshness status.
-#[derive(Debug, Clone)]
-pub struct LocalMetadata {
-    pub m: Arc<Metadata>,
-    /// True if the metadata is certainly outdated.
-    pub outdated: bool,
-}
-
-/// A local in-memory cache for storage values and metadata with staleness
-/// tracking.
+/// A local in-memory cache for storage values with staleness tracking.
 #[derive(Clone)]
 pub struct Local {
     cache: Arc<Cache<CacheEntry>>,
@@ -137,7 +70,6 @@ impl Local {
         // `cache.get` already hands back an owned (cloned) entry, so move the
         // value and version out of it instead of cloning them a second time.
         let e = self.cache.get(key)?;
-        let outdated = e.is_value_outdated();
         let v = e.v?;
         if is_stale(v.updated, max_stale) {
             return None;
@@ -146,49 +78,11 @@ impl Local {
             value: v.value,
             version: v.version,
             deleted: v.deleted,
-            outdated,
+            outdated: v.outdated,
         })
     }
 
-    /// Reads the cached metadata, if present and not staler than `max_stale`.
-    pub fn get_meta(&self, key: &str, max_stale: Duration) -> Option<LocalMetadata> {
-        let e = self.cache.get(key)?;
-        let outdated = e.is_meta_outdated();
-        let m = e.m?;
-        if is_stale(m.updated, max_stale) {
-            return None;
-        }
-        Some(LocalMetadata {
-            m: m.meta,
-            outdated,
-        })
-    }
-
-    /// Stores both the value and its metadata atomically.
-    pub fn write_with_meta(&self, key: &str, value: Arc<[u8]>, meta: Arc<Metadata>) {
-        let updated = Instant::now();
-        let writer = last_writer_from_tags(&meta.tags);
-        let entry = CacheEntry {
-            v: Some(CacheValue {
-                value,
-                deleted: false,
-                outdated: false,
-                version: Version {
-                    b: meta.version.clone(),
-                    writer: writer.clone(),
-                },
-                updated,
-            }),
-            m: Some(CacheMeta {
-                meta,
-                writer,
-                updated,
-            }),
-        };
-        self.cache.set(key, entry);
-    }
-
-    /// Updates only the value for `key`.
+    /// Updates the value for `key`.
     pub fn write(&self, key: &str, value: Arc<[u8]>, v: Version) {
         let new_value = CacheValue {
             value,
@@ -198,32 +92,9 @@ impl Local {
             updated: Instant::now(),
         };
         self.cache.update(key, move |old| match old {
-            None => Some(CacheEntry {
-                v: Some(new_value),
-                m: None,
-            }),
+            None => Some(CacheEntry { v: Some(new_value) }),
             Some(mut entry) => {
                 entry.v = Some(new_value);
-                Some(entry)
-            }
-        });
-    }
-
-    /// Updates only the metadata for `key`.
-    pub fn set_meta(&self, key: &str, meta: Arc<Metadata>) {
-        let writer = last_writer_from_tags(&meta.tags);
-        let new_meta = CacheMeta {
-            meta,
-            writer,
-            updated: Instant::now(),
-        };
-        self.cache.update(key, move |old| match old {
-            None => Some(CacheEntry {
-                v: None,
-                m: Some(new_meta),
-            }),
-            Some(mut entry) => {
-                entry.m = Some(new_meta);
                 Some(entry)
             }
         });
@@ -254,10 +125,7 @@ impl Local {
             updated: Instant::now(),
         };
         self.cache.update(key, move |old| match old {
-            None => Some(CacheEntry {
-                v: Some(new_value),
-                m: None,
-            }),
+            None => Some(CacheEntry { v: Some(new_value) }),
             Some(mut entry) => {
                 entry.v = Some(new_value);
                 Some(entry)

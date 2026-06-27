@@ -1,30 +1,26 @@
-//! In-memory backend for testing and development. Ported from the Go
-//! `backend/memory` package. Version tokens use the `gen/metagen` format
-//! matching the GCS backend.
+//! In-memory backend for testing and development (ADR-016, ADR-023).
+//!
+//! Content-CAS only: the opaque version token is the object generation, bumped
+//! on every content write. This matches the (now generation-only) GCS token,
+//! so the in-memory backend keeps modelling production conditional-write
+//! semantics.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::{
-    Backend, BackendError, LAST_WRITER_TAG, Metadata, ReadReply, Tags, Version, WriterId,
-    encode_writer_tag,
-};
+use crate::{Backend, BackendError, ReadReply, Version};
 
 #[derive(Clone, Default)]
 struct Object {
     data: Vec<u8>,
-    // Shared so `get_metadata` and `Metadata` clones are refcount bumps; mutated
-    // copy-on-write via `Arc::make_mut` in `update_tags`.
-    tags: Arc<Tags>,
     generation: i64,
-    metagen: i64,
 }
 
 impl Object {
     fn version(&self) -> Version {
-        Version::new(format!("{}/{}", self.generation, self.metagen))
+        Version::new(self.generation.to_string())
     }
 }
 
@@ -63,107 +59,46 @@ impl State {
         res
     }
 
-    fn update_tags(obj: &mut Object, t: &Tags) {
-        if t.is_empty() {
-            return;
-        }
-        let tags = Arc::make_mut(&mut obj.tags);
-        for (k, v) in t {
-            tags.insert(k.clone(), v.clone());
-        }
-        obj.metagen += 1;
-    }
-
     fn update_data(&mut self, obj: &mut Object, d: Vec<u8>) {
         obj.data = d;
         obj.generation = self.next_generation();
-        obj.metagen = 1;
     }
 }
 
 #[async_trait]
 impl Backend for MemoryBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected_writer: &WriterId,
-    ) -> Result<ReadReply, BackendError> {
-        let state = self.state.lock().unwrap();
-        let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
-        let current = obj
-            .tags
-            .get(LAST_WRITER_TAG)
-            .map(String::as_str)
-            .unwrap_or("");
-        if current == encode_writer_tag(expected_writer) {
-            return Err(BackendError::Precondition);
-        }
-        Ok(ReadReply {
-            contents: obj.data.clone(),
-            version: obj.version(),
-            tags: (*obj.tags).clone(),
-        })
-    }
-
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         let state = self.state.lock().unwrap();
         let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
         Ok(ReadReply {
             contents: obj.data.clone(),
             version: obj.version(),
-            tags: (*obj.tags).clone(),
         })
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        let state = self.state.lock().unwrap();
-        let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
-        Ok(Metadata {
-            tags: obj.tags.clone(),
-            version: obj.version(),
-        })
-    }
-
-    async fn set_tags_if(
+    async fn read_if_modified(
         &self,
         path: &str,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        let mut state = self.state.lock().unwrap();
-        let mut obj = state
-            .objects
-            .get(path)
-            .ok_or(BackendError::NotFound)?
-            .clone();
-        if &obj.version() != expected {
+    ) -> Result<ReadReply, BackendError> {
+        let state = self.state.lock().unwrap();
+        let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
+        if &obj.version() == expected {
             return Err(BackendError::Precondition);
         }
-        State::update_tags(&mut obj, &tags);
-        let meta = Metadata {
-            tags: obj.tags.clone(),
+        Ok(ReadReply {
+            contents: obj.data.clone(),
             version: obj.version(),
-        };
-        state.objects.insert(path.to_string(), obj);
-        Ok(meta)
+        })
     }
 
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
         let mut state = self.state.lock().unwrap();
         let mut obj = state.objects.get(path).cloned().unwrap_or_default();
-        State::update_tags(&mut obj, &tags);
         state.update_data(&mut obj, value);
-        let meta = Metadata {
-            tags: obj.tags.clone(),
-            version: obj.version(),
-        };
+        let version = obj.version();
         state.objects.insert(path.to_string(), obj);
-        Ok(meta)
+        Ok(version)
     }
 
     async fn write_if(
@@ -171,8 +106,7 @@ impl Backend for MemoryBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         let mut state = self.state.lock().unwrap();
         let mut obj = state
             .objects
@@ -182,35 +116,26 @@ impl Backend for MemoryBackend {
         if &obj.version() != expected {
             return Err(BackendError::Precondition);
         }
-        State::update_tags(&mut obj, &tags);
         state.update_data(&mut obj, value);
-        let meta = Metadata {
-            tags: obj.tags.clone(),
-            version: obj.version(),
-        };
+        let version = obj.version();
         state.objects.insert(path.to_string(), obj);
-        Ok(meta)
+        Ok(version)
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
+    ) -> Result<Version, BackendError> {
         let mut state = self.state.lock().unwrap();
         if state.objects.contains_key(path) {
             return Err(BackendError::Precondition);
         }
         let mut obj = Object::default();
-        State::update_tags(&mut obj, &tags);
         state.update_data(&mut obj, value);
-        let meta = Metadata {
-            tags: obj.tags.clone(),
-            version: obj.version(),
-        };
+        let version = obj.version();
         state.objects.insert(path.to_string(), obj);
-        Ok(meta)
+        Ok(version)
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
@@ -218,16 +143,6 @@ impl Backend for MemoryBackend {
         if state.objects.remove(path).is_none() {
             return Err(BackendError::NotFound);
         }
-        Ok(())
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        let mut state = self.state.lock().unwrap();
-        let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
-        if &obj.version() != expected {
-            return Err(BackendError::Precondition);
-        }
-        state.objects.remove(path);
         Ok(())
     }
 
@@ -265,8 +180,8 @@ mod tests {
     async fn write_read_delete() {
         let b = MemoryBackend::new();
         assert!(matches!(b.read("a").await, Err(BackendError::NotFound)));
-        let m = b.write("a", b"hello".to_vec(), Tags::new()).await.unwrap();
-        assert_eq!(&*m.version.token, "1/1");
+        let v = b.write("a", b"hello".to_vec()).await.unwrap();
+        assert_eq!(&*v.token, "1");
         let r = b.read("a").await.unwrap();
         assert_eq!(r.contents, b"hello");
         b.delete("a").await.unwrap();
@@ -276,58 +191,48 @@ mod tests {
     #[tokio::test]
     async fn write_if_not_exists_and_conditions() {
         let b = MemoryBackend::new();
-        let m = b
-            .write_if_not_exists("a", b"v".to_vec(), Tags::new())
-            .await
-            .unwrap();
+        let v = b.write_if_not_exists("a", b"v".to_vec()).await.unwrap();
         assert!(matches!(
-            b.write_if_not_exists("a", b"v2".to_vec(), Tags::new())
-                .await,
+            b.write_if_not_exists("a", b"v2".to_vec()).await,
             Err(BackendError::Precondition)
         ));
         // WriteIf with wrong version fails.
         assert!(matches!(
-            b.write_if("a", b"v2".to_vec(), &Version::new("9/9"), Tags::new())
-                .await,
+            b.write_if("a", b"v2".to_vec(), &Version::new("9")).await,
             Err(BackendError::Precondition)
         ));
-        let m2 = b
-            .write_if("a", b"v2".to_vec(), &m.version, Tags::new())
-            .await
-            .unwrap();
-        assert_ne!(m.version, m2.version);
+        let v2 = b.write_if("a", b"v2".to_vec(), &v).await.unwrap();
+        assert_ne!(v, v2);
     }
 
     #[tokio::test]
-    async fn set_tags_bumps_metagen_and_read_if_modified() {
+    async fn read_if_modified_tracks_version() {
         let b = MemoryBackend::new();
-        let mut tags = Tags::new();
-        let writer = WriterId::new(vec![1, 2, 3]);
-        tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
-        let m = b.write("a", b"v".to_vec(), tags).await.unwrap();
-        assert_eq!(&*m.version.token, "1/1");
+        let v = b.write("a", b"v".to_vec()).await.unwrap();
 
-        // ReadIfModified with the same writer => precondition (unchanged).
+        // Same version => precondition (not modified).
         assert!(matches!(
-            b.read_if_modified("a", &writer).await,
+            b.read_if_modified("a", &v).await,
             Err(BackendError::Precondition)
         ));
-        // ReadIfModified with a different writer => returns content.
-        let other = WriterId::new(vec![9]);
-        assert!(b.read_if_modified("a", &other).await.is_ok());
+        // A stale version => returns the current content.
+        let r = b.read_if_modified("a", &Version::new("0")).await.unwrap();
+        assert_eq!(r.contents, b"v");
 
-        // SetTagsIf bumps metagen only.
-        let mut t2 = Tags::new();
-        t2.insert("k".to_string(), "v".to_string());
-        let m2 = b.set_tags_if("a", &m.version, t2).await.unwrap();
-        assert_eq!(&*m2.version.token, "1/2");
+        // After a content write the version changes, so the old token no longer
+        // matches and the body is returned.
+        let v2 = b.write("a", b"v2".to_vec()).await.unwrap();
+        assert_ne!(v, v2);
+        let r = b.read_if_modified("a", &v).await.unwrap();
+        assert_eq!(r.contents, b"v2");
+        assert_eq!(r.version, v2);
     }
 
     #[tokio::test]
     async fn list_lexicographic_with_subdirs() {
         let b = MemoryBackend::new();
         for p in ["d/b", "d/a", "d/sub/x", "d/sub/y", "other/z"] {
-            b.write(p, b"v".to_vec(), Tags::new()).await.unwrap();
+            b.write(p, b"v".to_vec()).await.unwrap();
         }
         let got = b.list("d").await.unwrap();
         assert_eq!(

@@ -1,13 +1,19 @@
 //! Storage object versions, combining a backend version with a local writer.
 //! Ported from the Go `internal/storage/version.go`.
 
-use glassdb_backend::{self as backend, Metadata};
+use glassdb_backend as backend;
 use glassdb_data::TxId;
 
-use crate::locker::last_writer_from_tags;
-
-/// A storage object's version: a backend version plus the transaction that last
-/// wrote it (empty if never written by GlassDB).
+/// A storage object's version. It carries two independent identities, only one
+/// of which is set at a time in the v2 layout:
+///
+/// - `b` — the backend content version (ETag/generation) of a coordination
+///   object (shard, root, transaction log). Used to revalidate a cached copy
+///   with a version-conditional read (ADR-023).
+/// - `writer` — the transaction that last committed a key's value. A key's value
+///   no longer lives in its own object (it lives in the writer's transaction
+///   object), so a cached value is identified by its writer, not a backend
+///   version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Version {
     pub b: backend::Version,
@@ -29,18 +35,5 @@ impl Version {
     /// Reports whether `self` and `other` refer to the same value (same writer).
     pub fn equal_contents(&self, other: &Version) -> bool {
         self.writer == other.writer
-    }
-
-    /// Reports whether `self` matches the version described by backend metadata.
-    pub fn equal_meta_contents(&self, m: &Metadata) -> bool {
-        self.writer == last_writer_from_tags(&m.tags)
-    }
-}
-
-/// Constructs a [`Version`] from backend metadata.
-pub fn version_from_meta(m: &Metadata) -> Version {
-    Version {
-        b: m.version.clone(),
-        writer: last_writer_from_tags(&m.tags),
     }
 }

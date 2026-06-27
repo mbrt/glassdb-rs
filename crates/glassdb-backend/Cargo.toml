@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
-base64 = "0.22.1"
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
 rand = "0.10.1"
 rand_distr = "0.6.0"
