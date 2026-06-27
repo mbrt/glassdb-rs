@@ -1,49 +1,42 @@
-//! Distributed locking over global storage, built on the dedup state machine.
-//! Ported from the Go `internal/trans/tlocker.go`.
+//! Distributed locking over the v2 shard/root coordination objects (ADR-017,
+//! ADR-020). Ported in spirit from the Go `internal/trans/tlocker.go`, but
+//! re-keyed from per-key objects onto shards.
 //!
-//! `Locker` exposes lock/unlock operations per key. Concurrent requests for the
-//! same key are merged or queued through [`glassdb_concurr::Dedup`]; a per-key
-//! worker drives the conditional writes, waits for blocking transactions to
-//! finish, and retries on stale metadata.
+//! The only coordination primitive is a content compare-and-swap on a shard
+//! (`{prefix}/_s/<i>`) or a collection root (`{prefix}/_i`). A transaction
+//! groups its accessed keys by shard and locks each shard with a single
+//! read-modify-write CAS: load the shard, resolve every touched key's holders
+//! (help-forward committed holders, drop aborted ones, wound-wait the live
+//! pending ones via the [`Monitor`]), install this transaction's locks, then CAS
+//! the shard back. A membership change (create/delete) additionally takes the
+//! collection root's write lock. Write-back republishes `current_writer`
+//! pointers and releases the locks.
+//!
+//! Lock acquisition has two modes (ADR-020): the default **parallel** path locks
+//! every touched shard concurrently; the **serial** fallback locks them one at a
+//! time in ascending shard path order so equal-priority contenders queue on the
+//! lowest contended shard and exactly one wins it (first-CAS-wins), guaranteeing
+//! progress where the parallel path could livelock.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use async_trait::async_trait;
-use glassdb_backend::{self as backend};
-use glassdb_concurr::{
-    BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt, shard::Sharded,
-};
-use glassdb_data::{TxId, TxIdSet, set_union};
+use futures::future::join_all;
+use glassdb_concurr::{DedupKeySnapshot, RetryConfig, rt, shard::Sharded};
+use glassdb_data::shard::shard_index;
+use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Global, LockInfo, LockRequest, LockType, LockUpdate, Locker as StorageLocker, PathLock,
-    StorageError, TValue, TxPathState, compute_lock_update, tags_lock_info,
+    CollectionRoot, LockType, PathLock, ShardEntry, ShardStore, StorageError, TxCommitStatus,
 };
 
+use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::reader::Reader;
 
-/// Refresh metadata now and then, to avoid getting stuck retrying for something
-/// that no longer makes sense.
-const META_MAX_STALENESS: Duration = Duration::from_secs(10);
-/// Periodically poll while waiting for transactions to finish.
-const WAIT_POLL_DURATION: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TxState {
-    Unknown,
-    Existing,
-}
-
-#[derive(Default)]
-struct Stats {
-    n_calls: AtomicU64,
-    n_hits: AtomicU64,
-    n_retries: AtomicU64,
-}
+/// Maximum inner CAS retries on a single shard/root before treating the
+/// operation as conflicted and restarting the transaction.
+const CAS_RETRIES: usize = 50;
 
 /// Counters for lock operations performed by a [`Locker`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -53,456 +46,172 @@ pub struct LockStats {
     pub retries: usize,
 }
 
+#[derive(Default)]
+struct Stats {
+    n_calls: AtomicU64,
+    n_hits: AtomicU64,
+    n_retries: AtomicU64,
+}
+
 /// Diagnostic snapshot of one transaction's locally-tracked held locks.
 ///
-/// Returned by [`Locker::tx_locks_snapshot`] for operators investigating hangs
-/// or partial-lock deadlocks. The locks list is sorted by path for stable
-/// display.
+/// Returned by [`Locker::tx_locks_snapshot`] for operators investigating hangs.
+/// The locks list is sorted by path for stable display. In v2 the tracked paths
+/// are the shard and root objects the transaction holds (not per-key objects).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxLockSnapshot {
     pub tx_id: TxId,
     pub locks: Vec<PathLock>,
 }
 
-/// A lock/unlock request that can merge with another for the same key.
+/// The lock a transaction wants on a key's shard entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Desired {
+    Read,
+    Put,
+    Delete,
+}
+
+/// One key's lock intention within a shard.
 #[derive(Clone)]
-struct LockReq(LockRequest);
-
-impl MergeRequest for LockReq {
-    fn merge(&self, other: &Self) -> Option<Self> {
-        merge_requests(self.clone(), other.clone())
-    }
-    fn can_reorder(&self) -> bool {
-        self.0.typ == LockType::None
-    }
+struct KeyIntent {
+    /// Raw user key bytes (the shard-entry key).
+    pub raw_key: Vec<u8>,
+    /// Full storage path of the key (`{prefix}/_k/<b64>`), used to fetch a
+    /// help-forwarded writer's value.
+    pub key_path: String,
+    /// The lock to install.
+    pub desired: Desired,
+    /// The optimistic-validation token observed at read time, if the key was
+    /// read: `Some(token)` validates against the resolved state (`token` is the
+    /// effective writer iff the key existed, else `None`); the outer `None`
+    /// means a blind write with nothing to validate.
+    pub observed: Option<Option<TxId>>,
 }
 
-fn merge_requests(mut r1: LockReq, mut r2: LockReq) -> Option<LockReq> {
-    if r1.0.typ == LockType::None {
-        // Keep r1 as the one dictating the lock type; unlocks stay in r2.
-        std::mem::swap(&mut r1, &mut r2);
+/// The keys a transaction touches in one shard, plus the shard's location.
+struct ShardGroup {
+    /// Collection prefix owning the shard.
+    prefix: String,
+    /// Shard index within the collection.
+    idx: u32,
+    /// Per-key intentions, in ascending raw-key order.
+    intents: Vec<KeyIntent>,
+}
+
+/// The locks a transaction acquired, returned by [`Locker::lock`] and consumed
+/// by [`Locker::write_back`]. Opaque to the caller: it carries the per-shard key
+/// groups and the collection prefixes whose root membership lock was taken.
+pub struct LockedTx {
+    groups: BTreeMap<String, ShardGroup>,
+    membership: BTreeSet<String>,
+}
+
+/// Groups a transaction's accessed keys by shard. Each key gets one intent
+/// carrying its desired lock and, if it was read, the optimistic-validation
+/// token observed at read time.
+fn build_groups(data: &Data) -> Result<BTreeMap<String, ShardGroup>, TransError> {
+    struct Access {
+        desired: Desired,
+        observed: Option<Option<TxId>>,
     }
-    match (r1.0.typ, r2.0.typ) {
-        (LockType::Create, _) | (_, LockType::Create) => return None,
-        (_, LockType::None) => {}
-        (LockType::Read, LockType::Read) => {}
-        _ => return None,
-    }
-    let lockers = set_union(
-        &TxIdSet::from_ids(r1.0.lockers.clone()),
-        &TxIdSet::from_ids(r2.0.lockers.clone()),
-    )
-    .into_iter()
-    .collect();
-    let unlockers = set_union(
-        &TxIdSet::from_ids(r1.0.unlockers.clone()),
-        &TxIdSet::from_ids(r2.0.unlockers.clone()),
-    )
-    .into_iter()
-    .collect();
-    Some(LockReq(LockRequest {
-        typ: r1.0.typ,
-        lockers,
-        unlockers,
-    }))
-}
-
-#[derive(Default)]
-struct LockOpResult {
-    locked_for: Vec<TxId>,
-    unlocked_for: Vec<TxId>,
-    wait_for_tx: Vec<TxId>,
-    wound_tx: Vec<TxId>,
-}
-
-struct LockData {
-    info: LockInfo,
-    version: backend::Version,
-}
-
-/// The shared, lock-independent pieces used by the dedup worker.
-#[derive(Clone)]
-struct LockerCore {
-    global: Global,
-    tmon: Monitor,
-    reader: Reader,
-}
-
-impl LockerCore {
-    async fn do_lock_op(&self, key: &str, req: &LockRequest) -> Result<LockOpResult, StorageError> {
-        // A pure create request is self-checking: `write_if_not_exists` fails
-        // with a precondition error if the object already exists, so the
-        // preliminary metadata read (and lockers-state fetch) that the general
-        // path performs is redundant. `compute_lock_update` ignores the current
-        // lock state for a create anyway (it never waits or wounds), so go
-        // straight to the conditional create and save a metadata round-trip per
-        // created key. On a precondition error the caller falls back to a write
-        // lock, exactly as it would have with the metadata read.
-        if req.typ == LockType::Create && req.unlockers.is_empty() {
-            let locker = StorageLocker::new(self.global.clone());
-            let update = LockUpdate {
-                typ: LockType::Create,
-                lockers: req.lockers.clone(),
-                ..Default::default()
-            };
-            locker
-                .update_lock(key, &backend::Version::default(), &update)
-                .await?;
-            return Ok(LockOpResult {
-                locked_for: req.lockers.clone(),
-                ..Default::default()
-            });
-        }
-
-        let ldata = self.fetch_lock_info(key).await?;
-        let txs = self.fetch_lockers_state(key, &ldata.info).await?;
-        let ops = compute_lock_update(ldata.info, req, &txs)?;
-        if !ops.wound.is_empty() {
-            // Lower-priority holders are in the way. Abort them and retry.
-            return Ok(LockOpResult {
-                wound_tx: ops.wound,
-                ..Default::default()
-            });
-        }
-        if !ops.wait_for.is_empty() {
-            return Ok(LockOpResult {
-                wait_for_tx: ops.wait_for,
-                ..Default::default()
-            });
-        }
-        if let Some(update) = ops.update {
-            let locker = StorageLocker::new(self.global.clone());
-            locker.update_lock(key, &ldata.version, &update).await?;
-        }
-        Ok(LockOpResult {
-            locked_for: ops.locked_for,
-            unlocked_for: ops.unlocked_for,
-            ..Default::default()
-        })
-    }
-
-    async fn fetch_lock_info(&self, key: &str) -> Result<LockData, StorageError> {
-        let meta = match self.reader.get_metadata(key, META_MAX_STALENESS).await {
-            Ok(m) => m,
-            Err(StorageError::NotFound) => {
-                return Ok(LockData {
-                    info: LockInfo {
-                        typ: LockType::None,
-                        ..Default::default()
-                    },
-                    version: backend::Version::default(),
-                });
-            }
-            Err(e) => return Err(e),
+    let mut by_path: BTreeMap<String, Access> = BTreeMap::new();
+    for w in &data.writes {
+        let desired = match w.op {
+            WriteOp::Delete => Desired::Delete,
+            WriteOp::Put(_) => Desired::Put,
         };
-        let info = tags_lock_info(&meta.tags)?;
-        info.valid()?;
-        Ok(LockData {
-            info,
-            version: meta.version.clone(),
-        })
-    }
-
-    async fn fetch_lockers_state(
-        &self,
-        key: &str,
-        info: &LockInfo,
-    ) -> Result<Vec<TxPathState>, StorageError> {
-        if info.typ == LockType::Create || info.typ == LockType::Write {
-            let tx = info.locked_by[0].clone();
-            let tv = self.tmon.committed_value(key, &tx).await.map_err(|e| {
-                trans_to_storage(e).context(format!("getting committed value from tx {tx}"))
-            })?;
-            return Ok(vec![TxPathState {
-                tx,
-                status: tv.status,
-                value: tv.value,
-            }]);
-        }
-
-        // For read locks, the tx status is enough; avoid fetching values.
-        let mut txs = Vec::new();
-        for tx in &info.locked_by {
-            let status =
-                self.tmon.tx_status(tx).await.map_err(|e| {
-                    trans_to_storage(e).context(format!("getting tx status for {tx}"))
-                })?;
-            txs.push(TxPathState {
-                tx: tx.clone(),
-                status,
-                value: TValue::default(),
+        by_path
+            .entry(w.path.to_string())
+            .and_modify(|a| a.desired = desired)
+            .or_insert(Access {
+                desired,
+                observed: None,
             });
-        }
-        Ok(txs)
     }
-}
-
-struct LockerWorker {
-    core: LockerCore,
-    stats: Arc<Stats>,
-}
-
-#[async_trait]
-impl Worker<LockReq, StorageError> for LockerWorker {
-    async fn run(
-        &self,
-        key: &str,
-        batch: &BatchHandle<LockReq, StorageError>,
-    ) -> Result<(), StorageError> {
-        let mut counter: u64 = 0;
-
-        let result = loop {
-            counter += 1;
-            let req = batch.merged().0;
-
-            let lock_res = match self.core.do_lock_op(key, &req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Two recoverable cases reload metadata and try again:
-                    //   - a precondition on a non-create means our cached lock
-                    //     info was stale (someone else changed it);
-                    //   - an in-doubt outcome means the conditional lock write
-                    //     may or may not have landed. Acquiring a lock is
-                    //     pre-commit and idempotent: a fresh read reveals
-                    //     whether it took, and re-applying is harmless. So we
-                    //     retry the lock operation itself rather than
-                    //     surfacing the uncertainty — only the commit point
-                    //     must surface in-doubt (ADR-009), where a blind retry
-                    //     could double-apply a durable write.
-                    let stale =
-                        matches!(e, StorageError::Precondition) && req.typ != LockType::Create;
-                    if stale || matches!(e, StorageError::Unavailable(_)) {
-                        let _ = self.core.global.get_metadata(key).await;
-                        continue;
-                    }
-                    // For create, there's nothing more we can do.
-                    break Err(e);
-                }
-            };
-            if !lock_res.wound_tx.is_empty() {
-                if let Err(e) = self.wound_txs(&lock_res.wound_tx).await {
-                    break Err(e);
-                }
-                // Retry now that the lower-priority holders are aborted.
-                continue;
-            }
-            if !lock_res.wait_for_tx.is_empty() {
-                if let Err(e) = self.wait_for_tx(&lock_res.wait_for_tx, batch).await {
-                    break Err(e);
-                }
-                continue;
-            }
-            if !is_complete(&req, &lock_res) {
-                continue;
-            }
-            break Ok(());
-        };
-
-        if counter > 1 {
-            self.stats
-                .n_retries
-                .fetch_add(counter - 1, Ordering::Relaxed);
-        }
-        result
-    }
-}
-
-impl LockerWorker {
-    /// Aborts the given lower-priority holders so the requester can take over
-    /// their locks under the wound-wait rule.
-    async fn wound_txs(&self, txs: &[TxId]) -> Result<(), StorageError> {
-        for tx in txs {
-            self.core
-                .tmon
-                .wound_tx(tx)
-                .await
-                .map_err(trans_to_storage)?;
-        }
-        Ok(())
+    for r in &data.reads {
+        let token = r.version.as_ref().map(|v| v.last_writer.clone());
+        by_path
+            .entry(r.path.to_string())
+            .and_modify(|a| a.observed = Some(token.clone()))
+            .or_insert(Access {
+                desired: Desired::Read,
+                observed: Some(token),
+            });
     }
 
-    async fn wait_for_tx(
-        &self,
-        txs: &[TxId],
-        batch: &BatchHandle<LockReq, StorageError>,
-    ) -> Result<(), StorageError> {
-        for tx in txs {
-            let status = self
-                .core
-                .tmon
-                .tx_status(tx)
-                .await
-                .map_err(trans_to_storage)?;
-            if status.is_final() {
-                continue;
-            }
-            let wait_fut = self.core.tmon.wait_for_tx(tx);
-
-            tokio::select! {
-                biased;
-                _ = wait_fut => {}
-                _ = batch.changed() => {}
-                _ = rt::sleep(WAIT_POLL_DURATION) => {}
-            }
-            break;
-        }
-        Ok(())
+    let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
+    for (path, access) in by_path {
+        let (prefix, raw_key) = paths::split_key(&path)
+            .map_err(|e| TransError::with_source(format!("parsing key path {path:?}"), e))?;
+        let idx = shard_index(&raw_key);
+        let shard_path = paths::from_shard(&prefix, idx);
+        groups
+            .entry(shard_path)
+            .or_insert_with(|| ShardGroup {
+                prefix,
+                idx,
+                intents: Vec::new(),
+            })
+            .intents
+            .push(KeyIntent {
+                raw_key,
+                key_path: path,
+                desired: access.desired,
+                observed: access.observed,
+            });
     }
-}
-
-/// RAII guard that marks a lock as `Unknown` in the locker's per-tx state if
-/// the `push_request` future is dropped before `dedup.run` returns. The driver
-/// hand-off in `Dedup` may still complete the storage update in a spawned
-/// owner; recording the lock as unknown forces a subsequent serial validate to
-/// `unlock_all` before re-acquiring, keeping `tlocks` and storage consistent
-/// without threading a cancellation token through every locker call.
-struct PushGuard {
-    locker: Arc<LockerState>,
-    key: String,
-    tid: TxId,
-    armed: bool,
-}
-
-impl Drop for PushGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut tlocks = self
-            .locker
-            .tlocks
-            .for_key(self.tid.as_bytes())
-            .lock()
-            .unwrap();
-        tlocks
-            .entry(self.tid.clone())
-            .or_default()
-            .insert(self.key.clone(), LockType::Unknown);
+    for group in groups.values_mut() {
+        group.intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
     }
+    Ok(groups)
 }
 
-fn trans_to_storage(e: TransError) -> StorageError {
-    match e {
-        TransError::Storage(s) => s,
-        other => StorageError::other(other.to_string()),
-    }
+/// Outcome of acquiring locks on a single shard.
+enum ShardOutcome {
+    /// Locked; `membership` is true if the shard saw a create/delete.
+    Locked { membership: bool },
+    /// The transaction must restart (conflict / lost wound-wait).
+    Conflict,
 }
 
-fn is_complete(req: &LockRequest, res: &LockOpResult) -> bool {
-    // Complete when every requested locker ended up locked and every requested
-    // unlocker ended up unlocked. Checked by direct containment over these
-    // (typically single-element) slices: deduplicating into `TxIdSet`s first
-    // would only add allocations without changing the result, and this runs on
-    // every lock/unlock worker iteration.
-    req.lockers.iter().all(|t| res.locked_for.contains(t))
-        && req.unlockers.iter().all(|t| res.unlocked_for.contains(t))
-}
-
-/// Acquires and releases distributed locks on storage objects, hiding waits and
-/// retries from callers.
+/// Acquires and releases distributed locks on the shard/root coordination
+/// objects, hiding waits, wound-wait, and CAS retries from callers.
 #[derive(Clone)]
 pub struct Locker {
     inner: Arc<LockerState>,
 }
 
-/// One independent partition of the per-transaction locks.
+/// One independent partition of the per-transaction held-lock bookkeeping.
 type LockerShard = Mutex<HashMap<TxId, HashMap<String, LockType>>>;
 
 struct LockerState {
     tmon: Monitor,
+    shards: ShardStore,
+    retry: RetryConfig,
     tlocks: Sharded<LockerShard>,
     stats: Arc<Stats>,
-    dedup: Dedup<LockReq, StorageError, LockerWorker>,
 }
 
 impl Locker {
-    /// Creates a locker over global storage, the transaction monitor, and a
-    /// reader.
-    pub fn new(global: Global, tmon: Monitor, reader: Reader) -> Self {
-        let core = LockerCore {
-            global,
-            tmon: tmon.clone(),
-            reader,
-        };
-        let stats = Arc::new(Stats::default());
-        let worker = LockerWorker {
-            core,
-            stats: stats.clone(),
-        };
-        let dedup = Dedup::new(worker);
+    /// Creates a locker over the shared shard store and the transaction monitor.
+    /// `retry` configures the exponential backoff applied between CAS retries on a
+    /// contended shard or root, so contention is never busy-retried.
+    pub fn new(shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
         Locker {
             inner: Arc::new(LockerState {
+                shards,
                 tmon,
+                retry,
                 tlocks: Sharded::new(|_| Mutex::new(HashMap::new())),
-                stats,
-                dedup,
+                stats: Arc::new(Stats::default()),
             }),
         }
     }
 
-    /// Acquires a read lock on `key` for the transaction.
-    pub async fn lock_read(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
-        self.push_request(key, LockType::Read, tid).await
-    }
-
-    /// Acquires a write lock on `key` for the transaction.
-    pub async fn lock_write(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
-        self.push_request(key, LockType::Write, tid).await
-    }
-
-    /// Acquires a create lock on `key` (first-time creation) for the transaction.
-    pub async fn lock_create(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
-        self.push_request(key, LockType::Create, tid).await
-    }
-
-    /// Releases the lock held by the transaction on `key`.
-    pub async fn unlock(&self, key: &str, tid: &TxId) -> Result<(), TransError> {
-        self.push_request(key, LockType::None, tid).await
-    }
-
-    /// Returns the lock type currently held by `tid` on `key`.
-    pub fn lock_type(&self, key: &str, tid: &TxId) -> LockType {
-        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        tlocks
-            .get(tid)
-            .and_then(|m| m.get(key))
-            .copied()
-            .unwrap_or(LockType::None)
-    }
-
-    /// Reports whether `tid` currently holds any lock.
-    pub fn has_locks(&self, tid: &TxId) -> bool {
-        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        tlocks.get(tid).is_some_and(|m| !m.is_empty())
-    }
-
-    /// Returns all paths currently locked by `tid`.
-    pub fn locked_paths(&self, tid: &TxId) -> Vec<PathLock> {
-        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        match tlocks.get(tid) {
-            None => Vec::new(),
-            Some(m) => {
-                let mut out: Vec<PathLock> = m
-                    .iter()
-                    .map(|(p, t)| PathLock {
-                        path: p.clone(),
-                        typ: *t,
-                    })
-                    .collect();
-                // Stable order so the transaction log's lock list is
-                // independent of `HashMap` iteration (needed for byte-for-byte
-                // deterministic replays; harmless in production).
-                out.sort_by(|a, b| a.path.cmp(&b.path));
-                out
-            }
-        }
-    }
-
-    /// Cancels in-flight lock work and awaits any spawned dedup owner tasks, so
-    /// none leak when the database shuts down.
-    pub async fn close(&self) {
-        self.inner.dedup.close().await;
-    }
+    /// No-op kept for API compatibility: v2 spawns no per-key dedup owner tasks,
+    /// so there is nothing to drain on shutdown.
+    pub async fn close(&self) {}
 
     /// Returns and resets the accumulated lock statistics.
     pub fn stats_and_reset(&self) -> LockStats {
@@ -513,15 +222,15 @@ impl Locker {
         }
     }
 
-    /// Returns a snapshot of the per-key dedup state used to coordinate lock
-    /// requests. Pull-only and zero cost unless called.
+    /// Per-key dedup state no longer exists in v2 (locks coordinate per shard via
+    /// direct CAS), so this diagnostic is always empty. Kept for API stability.
     pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
-        self.inner.dedup.snapshot()
+        Vec::new()
     }
 
-    /// Returns one entry per transaction that currently holds any local-cache
-    /// lock, with the held paths sorted by path. Pull-only and zero cost unless
-    /// called. Output is sorted by transaction id for stable display.
+    /// Returns one entry per transaction that currently holds any shard/root
+    /// lock, with the held paths sorted by path. Output is sorted by transaction
+    /// id for stable display.
     pub fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
         let mut out = Vec::new();
         self.inner.tlocks.each(|shard| {
@@ -548,138 +257,488 @@ impl Locker {
         out
     }
 
-    async fn push_request(&self, key: &str, lt: LockType, tid: &TxId) -> Result<(), TransError> {
-        self.inner.stats.n_calls.fetch_add(1, Ordering::Relaxed);
-        let (txs, nproc) = self.needs_processing(key, tid, lt);
-        if !nproc {
-            self.inner.stats.n_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+    // --- Crate-facing lock protocol ----------------------------------------
+
+    /// Groups the transaction's accessed keys by shard, validates its reads, and
+    /// acquires every lock it needs: the touched shards plus the collection roots
+    /// for any membership change (create/delete). Returns a [`LockedTx`] handle to
+    /// drive write-back on commit, or `None` if the transaction must restart.
+    ///
+    /// `serial` selects the sorted sequential fallback over the default parallel
+    /// path (ADR-020).
+    pub async fn lock(
+        &self,
+        id: &TxId,
+        data: &Data,
+        serial: bool,
+    ) -> Result<Option<LockedTx>, TransError> {
+        let groups = build_groups(data)?;
+        let Some(membership) = self.lock_shards(id, &groups, serial).await? else {
+            return Ok(None);
+        };
+        for prefix in &membership {
+            if !self.lock_root(prefix, id).await? {
+                return Ok(None);
+            }
         }
-        if txs == TxState::Unknown {
-            // We'll need refresh logs to keep the locks alive from now on.
-            self.inner.tmon.start_refresh_tx(tid);
+        Ok(Some(LockedTx { groups, membership }))
+    }
+
+    /// Acquires this transaction's locks across every touched shard. Returns
+    /// `Some(prefixes)` listing the collections whose root membership lock must
+    /// still be taken (the shards that saw a create/delete), or `None` if the
+    /// transaction must restart.
+    async fn lock_shards(
+        &self,
+        id: &TxId,
+        groups: &BTreeMap<String, ShardGroup>,
+        serial: bool,
+    ) -> Result<Option<BTreeSet<String>>, TransError> {
+        self.inner.stats.n_calls.fetch_add(1, Ordering::Relaxed);
+        // The first lock for this transaction starts the background refresh so a
+        // long-lived holder's pending object is written lazily, keeping its
+        // lease alive (the tx object is otherwise written only at commit).
+        if !groups.is_empty() {
+            self.inner.tmon.start_refresh_tx(id);
         }
 
-        let (lockers, unlockers) = if lt == LockType::None {
-            (Vec::new(), vec![tid.clone()])
+        let mut membership = BTreeSet::new();
+        if serial {
+            // Ascending shard-path order is the global lock order: the BTreeMap
+            // already iterates sorted by `{prefix}/_s/<idx>`.
+            for group in groups.values() {
+                match self.lock_shard(id, group).await? {
+                    ShardOutcome::Locked { membership: m } => {
+                        if m {
+                            membership.insert(group.prefix.clone());
+                        }
+                    }
+                    ShardOutcome::Conflict => return Ok(None),
+                }
+            }
         } else {
-            (vec![tid.clone()], Vec::new())
-        };
-        let req = LockReq(LockRequest {
-            typ: lt,
-            lockers,
-            unlockers,
+            let outcomes = join_all(groups.values().map(|group| self.lock_shard(id, group))).await;
+            for (group, outcome) in groups.values().zip(outcomes) {
+                match outcome? {
+                    ShardOutcome::Locked { membership: m } => {
+                        if m {
+                            membership.insert(group.prefix.clone());
+                        }
+                    }
+                    ShardOutcome::Conflict => return Ok(None),
+                }
+            }
+        }
+        Ok(Some(membership))
+    }
+
+    /// Validates reads and installs this transaction's locks in one shard with a
+    /// single read-modify-write CAS, retried on contention.
+    async fn lock_shard(&self, id: &TxId, group: &ShardGroup) -> Result<ShardOutcome, TransError> {
+        let mut backoff = self.inner.retry.backoff();
+        for attempt in 0..CAS_RETRIES {
+            if attempt > 0 {
+                rt::sleep(backoff.next_delay()).await;
+                self.inner.stats.n_retries.fetch_add(1, Ordering::Relaxed);
+            }
+            let (shard, ver) = self
+                .inner
+                .shards
+                .load_shard(&group.prefix, group.idx)
+                .await?;
+            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+                .entries()
+                .cloned()
+                .map(|e| (e.key.clone(), e))
+                .collect();
+            let mut membership = false;
+            let mut conflict = false;
+
+            for intent in &group.intents {
+                match self
+                    .resolve_and_lock(id, intent, entries.get(&intent.raw_key).cloned())
+                    .await?
+                {
+                    Some((entry, m)) => {
+                        membership |= m;
+                        entries.insert(intent.raw_key.clone(), entry);
+                    }
+                    None => {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+            if conflict {
+                return Ok(ShardOutcome::Conflict);
+            }
+
+            let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
+            match self
+                .inner
+                .shards
+                .store_shard(&group.prefix, group.idx, &new_shard, ver.as_ref())
+                .await
+            {
+                Ok(true) => {
+                    self.record_shard_lock(id, group);
+                    return Ok(ShardOutcome::Locked { membership });
+                }
+                // Precondition: the shard changed under us; reload and retry.
+                Ok(false) => {}
+                // In-doubt lock CAS: the write may or may not have landed. Lock
+                // acquisition is a pre-commit operation with no durable user
+                // value yet, and re-installing our own lock over a freshly-read
+                // shard is idempotent (we skip ourselves when resolving
+                // holders), so recover in place by reloading and retrying rather
+                // than surfacing the in-doubt error (ADR-009).
+                Err(StorageError::Unavailable(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(ShardOutcome::Conflict)
+    }
+
+    /// Resolves the holders of an entry (help-forward committed, drop aborted,
+    /// wound-wait the live pending ones), validates the read token, and installs
+    /// this transaction's lock. Returns the new entry plus whether the change is
+    /// a membership change, or `None` if the transaction must restart.
+    async fn resolve_and_lock(
+        &self,
+        id: &TxId,
+        intent: &KeyIntent,
+        entry: Option<ShardEntry>,
+    ) -> Result<Option<(ShardEntry, bool)>, TransError> {
+        let mut e = entry.unwrap_or_else(|| ShardEntry {
+            key: intent.raw_key.clone(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: None,
+            deleted: false,
         });
 
-        // If our future is dropped mid-`dedup.run` (e.g. the caller hit a
-        // deadlock watchdog and dropped the validate work), we don't know
-        // whether storage was actually mutated. Be conservative and mark the
-        // lock `Unknown` in our per-tx state so a subsequent serial validate
-        // observes the discrepancy and unlocks before reacquiring. On normal
-        // completion the guard is disarmed and the real outcome is recorded
-        // below.
-        let mut guard = PushGuard {
-            locker: Arc::clone(&self.inner),
-            key: key.to_string(),
-            tid: tid.clone(),
-            armed: true,
-        };
-
-        let res = self.inner.dedup.run(key, req).await;
-        guard.armed = false;
-
-        let (err, lock_updated, final_lt): (Result<(), TransError>, bool, LockType) = match res {
-            Ok(()) => (Ok(()), true, lt),
-            Err(DedupError::Work(e)) => {
-                if matches!(*e, StorageError::Precondition) {
-                    (Err((*e).clone().into()), false, lt)
-                } else {
-                    // On any other error (incl. timeout) we don't know the
-                    // outcome. Be conservative and mark the lock unknown.
-                    (Err((*e).clone().into()), true, LockType::Unknown)
-                }
+        // Resolve existing holders other than us. A committed exclusive holder is
+        // help-forwarded (its value becomes the effective one); aborted/missing
+        // holders are dropped; pending holders remain as live conflicts. The
+        // monitor folds lease expiry and the unknown-tx grace period into
+        // `tx_status`, so a holder still seen as `Pending` here is genuinely
+        // live (ADR-021).
+        let exclusive = matches!(e.lock_type, LockType::Write | LockType::Create);
+        let mut pending: Vec<TxId> = Vec::new();
+        for holder in e.locked_by.clone() {
+            if &holder == id {
+                continue;
             }
-            Err(DedupError::Cancelled) => (
-                Err(TransError::other("dedup shutdown")),
-                true,
-                LockType::Unknown,
-            ),
-        };
-
-        if lock_updated {
-            self.update_tx_locks(key, tid, final_lt);
+            match self.inner.tmon.tx_status(&holder).await? {
+                TxCommitStatus::Ok => {
+                    if exclusive {
+                        let cv = self
+                            .inner
+                            .tmon
+                            .committed_value(&intent.key_path, &holder)
+                            .await?;
+                        if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
+                            e.current_writer = Some(holder.clone());
+                            e.deleted = cv.value.deleted;
+                        }
+                    }
+                }
+                TxCommitStatus::Pending => pending.push(holder),
+                // Aborted / Unknown: the lock is dead; drop it.
+                _ => {}
+            }
         }
-        err
-    }
 
-    fn needs_processing(&self, key: &str, tid: &TxId, lt: LockType) -> (TxState, bool) {
-        let tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        let txl = tlocks.get(tid);
-        let st = if txl.is_some() {
-            TxState::Existing
+        // Validate the read against the resolved state. A reader observes the
+        // existence-aware token (the effective writer iff the key exists), so the
+        // value the transaction read must still be effective. Doing this after
+        // help-forward closes the validate-then-commit race.
+        let token = if e.current_writer.is_some() && !e.deleted {
+            e.current_writer.clone()
         } else {
-            TxState::Unknown
+            None
         };
-        if txl.is_none() && lt == LockType::None {
-            // We don't know the transaction, so there's nothing to unlock.
-            return (st, false);
+        if let Some(observed) = &intent.observed
+            && observed != &token
+        {
+            return Ok(None);
         }
-        let glt = txl.and_then(|m| m.get(key)).copied();
-        if glt.is_none() && lt == LockType::None {
-            return (st, false);
-        }
-        (st, glt != Some(lt))
-    }
 
-    fn update_tx_locks(&self, key: &str, tid: &TxId, lt: LockType) {
-        let mut tlocks = self.inner.tlocks.for_key(tid.as_bytes()).lock().unwrap();
-        if lt == LockType::None {
-            if let Some(m) = tlocks.get_mut(tid) {
-                m.remove(key);
-                if m.is_empty() {
-                    tlocks.remove(tid);
+        let exists_before = e.current_writer.is_some() && !e.deleted;
+
+        // Read locks share with other read holders; everything else is exclusive
+        // and must clear the live pending holders via wound-wait.
+        let compatible = matches!(intent.desired, Desired::Read)
+            && !matches!(e.lock_type, LockType::Write | LockType::Create);
+        if !compatible {
+            for holder in &pending {
+                if !self.try_reclaim(id, holder).await? {
+                    return Ok(None);
                 }
             }
-            tracing::trace!(
-                target: "glassdb::locker",
-                tx = %tid,
-                key,
-                lock_type = %LockType::None,
-                "lock_released",
-            );
-            return;
+            pending.clear();
         }
-        tlocks
-            .entry(tid.clone())
-            .or_default()
-            .insert(key.to_string(), lt);
-        tracing::trace!(
-            target: "glassdb::locker",
-            tx = %tid,
-            key,
-            lock_type = %lt,
-            "lock_acquired",
-        );
+
+        let membership = match intent.desired {
+            Desired::Put => !exists_before,
+            Desired::Delete => exists_before,
+            Desired::Read => false,
+        };
+
+        match intent.desired {
+            Desired::Read => {
+                let mut holders = pending;
+                if !holders.contains(id) {
+                    holders.push(id.clone());
+                }
+                e.locked_by = holders;
+                e.lock_type = LockType::Read;
+            }
+            Desired::Put | Desired::Delete => {
+                e.locked_by = vec![id.clone()];
+                e.lock_type = if exists_before {
+                    LockType::Write
+                } else if matches!(intent.desired, Desired::Put) {
+                    LockType::Create
+                } else {
+                    LockType::Write
+                };
+            }
+        }
+        Ok(Some((e, membership)))
     }
+
+    /// Reclaim decision against a live pending `holder`: `id` may take the lock
+    /// if it **outranks** the holder by wound-wait priority. Lease expiry and the
+    /// unknown-tx grace are folded into the monitor, so a holder seen as pending
+    /// here is live and only an outranking transaction may wound it. When it may,
+    /// it wounds the holder (CAS pending → aborted) and confirms the abort.
+    /// `false` means `id` must restart.
+    async fn try_reclaim(&self, id: &TxId, holder: &TxId) -> Result<bool, TransError> {
+        if !should_wound(id, holder) {
+            return Ok(false);
+        }
+        self.inner.tmon.wound_tx(holder).await?;
+        Ok(self.inner.tmon.tx_status(holder).await? == TxCommitStatus::Aborted)
+    }
+
+    /// Acquires the collection root's membership write lock for `prefix`
+    /// (ADR-018), with the same resolve/wound-wait rules as a shard. Auto-creates
+    /// the root if absent so a write that creates the collection's first key
+    /// works without a prior explicit `create` (matching v1's on-demand
+    /// collection-info lock object). Returns `false` if the transaction must
+    /// restart.
+    async fn lock_root(&self, prefix: &str, id: &TxId) -> Result<bool, TransError> {
+        let mut backoff = self.inner.retry.backoff();
+        for attempt in 0..CAS_RETRIES {
+            if attempt > 0 {
+                rt::sleep(backoff.next_delay()).await;
+            }
+            let (mut root, ver) = match self.inner.shards.load_root(prefix).await {
+                Ok(rv) => rv,
+                Err(StorageError::NotFound) => {
+                    // The collection does not exist yet: create its root holding
+                    // our membership lock. If we lose the create race, reload.
+                    let mut root = CollectionRoot::new(glassdb_data::shard::SHARD_COUNT);
+                    root.set_membership_lock(LockType::Write, [id.clone()]);
+                    match self.inner.shards.create_root(prefix, &root).await {
+                        Ok(true) => {
+                            self.record_root_lock(id, prefix);
+                            return Ok(true);
+                        }
+                        // Lost the create race, or an in-doubt create whose
+                        // landing we can't confirm: reload and retry (idempotent).
+                        Ok(false) => continue,
+                        Err(StorageError::Unavailable(_)) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let mut pending: Vec<TxId> = Vec::new();
+            for holder in root.membership_locked_by().to_vec() {
+                if &holder == id {
+                    continue;
+                }
+                if self.inner.tmon.tx_status(&holder).await? == TxCommitStatus::Pending {
+                    pending.push(holder);
+                }
+            }
+            let mut lost = false;
+            for holder in &pending {
+                if !self.try_reclaim(id, holder).await? {
+                    lost = true;
+                    break;
+                }
+            }
+            if lost {
+                return Ok(false);
+            }
+
+            root.set_membership_lock(LockType::Write, [id.clone()]);
+            match self.inner.shards.store_root(prefix, &root, &ver).await {
+                Ok(true) => {
+                    self.record_root_lock(id, prefix);
+                    return Ok(true);
+                }
+                // Precondition or in-doubt: reload and retry; re-installing our
+                // own membership lock is idempotent (ADR-009).
+                Ok(false) => {}
+                Err(StorageError::Unavailable(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Publishes `current_writer` pointers / tombstones and releases this
+    /// transaction's locks across the shards it touched, then releases the root
+    /// membership locks. Every CAS is idempotent; errors are best-effort
+    /// (a failure leaves the locks to be reclaimed lazily by the next contender
+    /// or lease expiry), so this never fails an already-committed transaction.
+    pub async fn write_back(&self, id: &TxId, locked: &LockedTx) {
+        for group in locked.groups.values() {
+            let _ = self.write_back_shard(id, group).await;
+        }
+        for prefix in &locked.membership {
+            let _ = self.release_root(prefix, id).await;
+        }
+        self.clear_tx_locks(id);
+    }
+
+    async fn write_back_shard(&self, id: &TxId, group: &ShardGroup) -> Result<(), TransError> {
+        let mut backoff = self.inner.retry.backoff();
+        for attempt in 0..CAS_RETRIES {
+            if attempt > 0 {
+                rt::sleep(backoff.next_delay()).await;
+            }
+            let (shard, ver) = self
+                .inner
+                .shards
+                .load_shard(&group.prefix, group.idx)
+                .await?;
+            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+                .entries()
+                .cloned()
+                .map(|e| (e.key.clone(), e))
+                .collect();
+            for intent in &group.intents {
+                let Some(e) = entries.get_mut(&intent.raw_key) else {
+                    continue;
+                };
+                if !e.locked_by.contains(id) {
+                    continue;
+                }
+                match intent.desired {
+                    Desired::Put => {
+                        e.current_writer = Some(id.clone());
+                        e.deleted = false;
+                    }
+                    Desired::Delete => {
+                        e.current_writer = Some(id.clone());
+                        e.deleted = true;
+                    }
+                    Desired::Read => {}
+                }
+                e.locked_by.retain(|h| h != id);
+                if e.locked_by.is_empty() {
+                    e.lock_type = LockType::None;
+                }
+            }
+            let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
+            if self
+                .inner
+                .shards
+                .store_shard(&group.prefix, group.idx, &new_shard, ver.as_ref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn release_root(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
+        let mut backoff = self.inner.retry.backoff();
+        for attempt in 0..CAS_RETRIES {
+            if attempt > 0 {
+                rt::sleep(backoff.next_delay()).await;
+            }
+            let (mut root, ver) = match self.inner.shards.load_root(prefix).await {
+                Ok(rv) => rv,
+                Err(StorageError::NotFound) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            if !root.membership_locked_by().contains(id) {
+                return Ok(());
+            }
+            root.clear_membership_lock();
+            if self.inner.shards.store_root(prefix, &root, &ver).await? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    // --- Per-tx held-lock bookkeeping (diagnostics) -------------------------
+
+    fn record_shard_lock(&self, id: &TxId, group: &ShardGroup) {
+        // Represent the shard hold with its strongest intention so the
+        // diagnostic snapshot distinguishes read-only from write holders.
+        let typ = if group
+            .intents
+            .iter()
+            .any(|i| !matches!(i.desired, Desired::Read))
+        {
+            LockType::Write
+        } else {
+            LockType::Read
+        };
+        let path = paths::from_shard(&group.prefix, group.idx);
+        let mut tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
+        tlocks.entry(id.clone()).or_default().insert(path, typ);
+    }
+
+    fn record_root_lock(&self, id: &TxId, prefix: &str) {
+        let path = paths::collection_info(prefix);
+        let mut tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
+        tlocks
+            .entry(id.clone())
+            .or_default()
+            .insert(path, LockType::Write);
+    }
+
+    fn clear_tx_locks(&self, id: &TxId) {
+        let mut tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
+        tlocks.remove(id);
+    }
+}
+
+/// Wound-wait priority decision: a strictly-older transaction wounds a younger
+/// holder (ADR-002). Equal-priority transactions are deliberately **not**
+/// ordered — neither wounds the other — exactly like [`TxId::older`]. A
+/// prefix-based tiebreak must not be used: a retry mints a fresh prefix
+/// ([`TxId::renew`]), so a prefix tiebreak would flip the winner on every retry
+/// and let two equal-priority transactions wound each other forever (livelock).
+/// The equal-priority case is resolved by the serial sorted-locking fallback.
+fn should_wound(me: &TxId, holder: &TxId) -> bool {
+    me.older(holder)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{
-        Backend, BackendError, Metadata, ReadReply, Tags, Version, WriterId, memory::MemoryBackend,
-    };
+    use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
-    use glassdb_storage::{Local, TLogger, TxCommitStatus, TxLog, TxWrite};
+    use glassdb_data::shard::shard_index;
+    use glassdb_storage::{Global, Local, Shard, TLogger, TxCommitStatus};
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     struct TlCtx {
-        global: Global,
-        backend: Arc<dyn Backend>,
+        shards: ShardStore,
         monitor: Monitor,
-        // Strong owner so spawning still works during the test.
         _bg: Arc<Background>,
     }
 
@@ -689,13 +748,12 @@ mod tests {
         let tl = TLogger::new(global.clone(), local.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(local.clone(), tl, Arc::downgrade(&bg));
-        let reader = Reader::new(local, global.clone(), mon.clone(), RetryConfig::default());
-        let locker = Locker::new(global.clone(), mon.clone(), reader);
+        let shards = ShardStore::new(b.clone());
+        let locker = Locker::new(shards.clone(), mon.clone(), RetryConfig::default());
         (
             locker,
             TlCtx {
-                global,
-                backend: b,
+                shards,
                 monitor: mon,
                 _bg: bg,
             },
@@ -707,686 +765,268 @@ mod tests {
     }
 
     // Builds a deterministic, valid transaction ID. A smaller `order` yields an
-    // older (higher-priority) transaction under the wound-wait rule; the name
-    // only affects the prefix, never the priority.
+    // older (higher-priority) transaction under the wound-wait rule.
     fn mk_tid(order: u64, name: &str) -> TxId {
         TxId::with_priority(order * 1_000_000_000, name.as_bytes())
     }
 
-    async fn assert_lock_info(g: &Global, key: &str, typ: LockType, mut locked_by: Vec<TxId>) {
-        let meta = g.get_metadata(key).await.unwrap();
-        let mut info = tags_lock_info(&meta.tags).unwrap();
-        info.locked_by.sort_by_key(|t| t.to_string());
-        locked_by.sort_by_key(|t| t.to_string());
-        assert_eq!(info.typ, typ, "lock type mismatch for {key}");
-        assert_eq!(info.locked_by, locked_by, "lockers mismatch for {key}");
+    const COLL: &str = "example";
+
+    fn read_intent(key: &[u8], observed: Option<Option<TxId>>) -> KeyIntent {
+        KeyIntent {
+            raw_key: key.to_vec(),
+            key_path: paths::from_key(COLL, key),
+            desired: Desired::Read,
+            observed,
+        }
+    }
+
+    fn put_intent(key: &[u8], observed: Option<Option<TxId>>) -> KeyIntent {
+        KeyIntent {
+            raw_key: key.to_vec(),
+            key_path: paths::from_key(COLL, key),
+            desired: Desired::Put,
+            observed,
+        }
+    }
+
+    fn group_of(key: &[u8], intent: KeyIntent) -> BTreeMap<String, ShardGroup> {
+        let idx = shard_index(key);
+        let mut g = BTreeMap::new();
+        g.insert(
+            paths::from_shard(COLL, idx),
+            ShardGroup {
+                prefix: COLL.to_string(),
+                idx,
+                intents: vec![intent],
+            },
+        );
+        g
+    }
+
+    async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<ShardEntry> {
+        let (shard, _) = ctx.shards.load_shard(COLL, shard_index(key)).await.unwrap();
+        shard.lookup(key).cloned()
     }
 
     #[tokio::test]
-    async fn lock_create() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-        let tx = TxId::new_random();
-        tctx.monitor.begin_tx(&tx);
+    async fn lock_write_creates_entry() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
 
-        // Lock + unlock without commit, repeated.
-        for _ in 0..3 {
-            locker.lock_create(&key, &tx).await.unwrap();
-            assert_lock_info(&tctx.global, &key, LockType::Create, vec![tx.clone()]).await;
+        let groups = group_of(key, put_intent(key, None));
+        let membership = locker.lock_shards(&tx, &groups, false).await.unwrap();
+        assert_eq!(membership, Some(BTreeSet::from([COLL.to_string()])));
 
-            locker.unlock(&key, &tx).await.unwrap();
-            let err = tctx.global.get_metadata(&key).await.unwrap_err();
-            assert!(matches!(err, StorageError::NotFound));
-        }
+        let e = entry_of(&ctx, key).await.expect("entry installed");
+        assert_eq!(e.lock_type, LockType::Create);
+        assert_eq!(e.locked_by, vec![tx.clone()]);
+    }
 
-        // Lock, commit, unlock writes the value.
-        locker.lock_create(&key, &tx).await.unwrap();
-        let value: Arc<[u8]> = Arc::from(&b"val"[..]);
-        let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
+    #[tokio::test]
+    async fn shared_read_locks() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        let tx1 = mk_tid(1, "tx1");
+        let tx2 = mk_tid(2, "tx2");
+        ctx.monitor.begin_tx(&tx1);
+        ctx.monitor.begin_tx(&tx2);
+
+        locker
+            .lock_shards(&tx1, &group_of(key, read_intent(key, None)), false)
+            .await
+            .unwrap();
+        locker
+            .lock_shards(&tx2, &group_of(key, read_intent(key, None)), false)
+            .await
+            .unwrap();
+
+        let e = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(e.lock_type, LockType::Read);
+        let mut holders = e.locked_by.clone();
+        holders.sort_by_key(|t| t.to_string());
+        let mut expected = vec![tx1.clone(), tx2.clone()];
+        expected.sort_by_key(|t| t.to_string());
+        assert_eq!(holders, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn older_wounds_younger_write_holder() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+
+        // Seed a committed value so the key exists (write lock, not create).
+        seed_committed(&ctx, key, b"v0").await;
+
+        let young = mk_tid(2, "young");
+        ctx.monitor.begin_tx(&young);
+        locker
+            .lock_shards(&young, &group_of(key, put_intent(key, None)), false)
+            .await
+            .unwrap();
+
+        let old = mk_tid(1, "old");
+        ctx.monitor.begin_tx(&old);
+        let res = locker
+            .lock_shards(&old, &group_of(key, put_intent(key, None)), false)
+            .await
+            .unwrap();
+        assert!(res.is_some(), "older tx should win the lock");
+
+        let e = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(e.locked_by, vec![old.clone()]);
+        assert_eq!(
+            ctx.monitor.tx_status(&young).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn younger_conflicts_on_write_holder() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        seed_committed(&ctx, key, b"v0").await;
+
+        let old = mk_tid(1, "old");
+        ctx.monitor.begin_tx(&old);
+        locker
+            .lock_shards(&old, &group_of(key, put_intent(key, None)), false)
+            .await
+            .unwrap();
+
+        let young = mk_tid(2, "young");
+        ctx.monitor.begin_tx(&young);
+        let res = locker
+            .lock_shards(&young, &group_of(key, put_intent(key, None)), false)
+            .await
+            .unwrap();
+        assert!(res.is_none(), "younger tx must not wound an older holder");
+        assert_eq!(
+            ctx.monitor.tx_status(&old).await.unwrap(),
+            TxCommitStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_read_token_conflicts() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        seed_committed(&ctx, key, b"v0").await;
+        let writer = entry_of(&ctx, key).await.unwrap().current_writer.unwrap();
+
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
+        // Observed a different (stale) writer than what the shard records.
+        let stale = mk_tid(9, "stale");
+        let intent = read_intent(key, Some(Some(stale)));
+        let res = locker
+            .lock_shards(&tx, &group_of(key, intent), false)
+            .await
+            .unwrap();
+        assert!(res.is_none(), "stale read token must conflict");
+
+        // The authoritative writer is unchanged.
+        assert_eq!(
+            entry_of(&ctx, key).await.unwrap().current_writer,
+            Some(writer)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_publishes_and_releases() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
+
+        let groups = group_of(key, put_intent(key, None));
+        let membership = locker
+            .lock_shards(&tx, &groups, false)
+            .await
+            .unwrap()
+            .unwrap();
+        locker
+            .write_back(&tx, &LockedTx { groups, membership })
+            .await;
+
+        let e = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(e.lock_type, LockType::None);
+        assert!(e.locked_by.is_empty());
+        assert_eq!(e.current_writer, Some(tx.clone()));
+        assert!(locker.tx_locks_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tx_locks_snapshot_lists_held_shards() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
+
+        locker
+            .lock_shards(&tx, &group_of(key, put_intent(key, None)), false)
+            .await
+            .unwrap();
+
+        let snap = locker.tx_locks_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tx_id, tx);
+        // A write intention records the shard as a write lock, plus the root for
+        // the membership change.
+        let shard_path = paths::from_shard(COLL, shard_index(key));
+        let root_path = paths::collection_info(COLL);
+        // lock_root is taken by the Algo, so only the shard appears here; assert
+        // the shard hold is present and write-typed.
+        let _ = root_path;
+        assert!(
+            snap[0]
+                .locks
+                .iter()
+                .any(|l| l.path == shard_path && l.typ == LockType::Write)
+        );
+    }
+
+    // Helper: commit a value for `key` so the shard records a `current_writer`,
+    // making the key exist (so subsequent writes take a Write, not Create, lock).
+    async fn seed_committed(ctx: &TlCtx, key: &[u8], value: &[u8]) {
+        use glassdb_storage::{TxLog, TxWrite};
+        let writer = mk_tid(0, "seed");
+        ctx.monitor.begin_tx(&writer);
+        let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
-            path: key.clone(),
-            value: value.clone(),
+            path: paths::from_key(COLL, key),
+            value: Arc::from(value),
             deleted: false,
             prev_writer: TxId::default(),
         }];
-        tctx.monitor.commit_tx(tl).await.unwrap();
-        locker.unlock(&key, &tx).await.unwrap();
+        ctx.monitor.commit_tx(tl).await.unwrap();
 
-        let gr = tctx.global.read(&key).await.unwrap();
-        assert_eq!(gr.value, value);
-    }
-
-    #[tokio::test]
-    async fn lock_create_fail() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-        let tx = TxId::new_random();
-        tctx.monitor.begin_tx(&tx);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        let err = locker.lock_create(&key, &tx).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Storage(StorageError::Precondition)),
-            "expected precondition, got {err:?}"
+        // Install the committed pointer directly in the shard.
+        let idx = shard_index(key);
+        let (shard, ver) = ctx.shards.load_shard(COLL, idx).await.unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+            .entries()
+            .cloned()
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        entries.insert(
+            key.to_vec(),
+            ShardEntry {
+                key: key.to_vec(),
+                lock_type: LockType::None,
+                locked_by: Vec::new(),
+                current_writer: Some(writer),
+                deleted: false,
+            },
         );
-    }
-
-    #[tokio::test]
-    async fn lock_read_write() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-        let tx = TxId::new_random();
-        tctx.monitor.begin_tx(&tx);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        locker.lock_read(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Read, vec![tx.clone()]).await;
-
-        locker.unlock(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::None, vec![]).await;
-
-        locker.lock_write(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx.clone()]).await;
-
-        locker.unlock(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::None, vec![]).await;
-    }
-
-    #[tokio::test]
-    async fn lock_multiple_r() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-        let tx1 = TxId::new_random();
-        let tx2 = TxId::new_random();
-        tctx.monitor.begin_tx(&tx1);
-        tctx.monitor.begin_tx(&tx2);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        locker.lock_read(&key, &tx1).await.unwrap();
-        locker.lock_read(&key, &tx2).await.unwrap();
-        assert_lock_info(
-            &tctx.global,
-            &key,
-            LockType::Read,
-            vec![tx1.clone(), tx2.clone()],
-        )
-        .await;
-
-        // Lock again with the same tx is a no-op.
-        locker.lock_read(&key, &tx1).await.unwrap();
-        assert_lock_info(
-            &tctx.global,
-            &key,
-            LockType::Read,
-            vec![tx1.clone(), tx2.clone()],
-        )
-        .await;
-
-        locker.unlock(&key, &tx1).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Read, vec![tx2.clone()]).await;
-
-        locker.unlock(&key, &tx2).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::None, vec![]).await;
-    }
-
-    #[tokio::test]
-    async fn lock_read_after_delete() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        let txw = TxId::from_bytes(b"txw".to_vec());
-        tctx.monitor.begin_tx(&txw);
-        locker.lock_write(&key, &txw).await.unwrap();
-        let mut tl = TxLog::new(txw.clone(), TxCommitStatus::Ok);
-        tl.writes = vec![TxWrite {
-            path: key.clone(),
-            value: Arc::from(&[] as &[u8]),
-            deleted: true,
-            prev_writer: TxId::default(),
-        }];
-        tctx.monitor.commit_tx(tl).await.unwrap();
-
-        let txr = TxId::from_bytes(b"txr".to_vec());
-        tctx.monitor.begin_tx(&txr);
-        let err = locker.lock_read(&key, &txr).await.unwrap_err();
+        let new_shard = Shard::from_entries(entries.into_values());
         assert!(
-            matches!(err, TransError::Storage(StorageError::NotFound)),
-            "expected not-found, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn lock_upgrade() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-        let tx = TxId::new_random();
-        tctx.monitor.begin_tx(&tx);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        locker.lock_read(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Read, vec![tx.clone()]).await;
-
-        locker.lock_write(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx.clone()]).await;
-    }
-
-    #[tokio::test]
-    async fn wait_for_tx() {
-        let (locker, tctx) = init_tl_test();
-        let locker = Arc::new(locker);
-        let key = paths::from_key("example", b"key");
-        let txr = TxId::from_bytes(b"txr".to_vec());
-        let txw = TxId::from_bytes(b"txw".to_vec());
-        tctx.monitor.begin_tx(&txr);
-        tctx.monitor.begin_tx(&txw);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        locker.lock_read(&key, &txr).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Read, vec![txr.clone()]).await;
-
-        // Unlock the read just after the write starts waiting.
-        let unlock_task = {
-            let l = locker.clone();
-            let k = key.clone();
-            let t = txr.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                l.unlock(&k, &t).await.unwrap();
-            })
-        };
-        locker.lock_write(&key, &txw).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![txw.clone()]).await;
-
-        // Abort the write tx after a new read starts waiting.
-        let abort_task = {
-            let mon = tctx.monitor.clone();
-            let t = txw.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                mon.abort_tx(&t).await.unwrap();
-            })
-        };
-        // Make sure the unlock and abort have finished before relocking with the
-        // same tx id (concurrent lock/unlock of the same key+tx is unsafe).
-        unlock_task.await.unwrap();
-        abort_task.await.unwrap();
-
-        locker.lock_read(&key, &txr).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Read, vec![txr.clone()]).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn queue_up() {
-        let (locker, tctx) = init_tl_test();
-        let locker = Arc::new(locker);
-        let key = paths::from_key("example", b"key");
-        let txw = TxId::from_bytes(b"txw".to_vec());
-        tctx.monitor.begin_tx(&txw);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        locker.lock_write(&key, &txw).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![txw.clone()]).await;
-
-        // Three transactions try to read-lock in parallel.
-        let mut handles = Vec::new();
-        let mut txrs = Vec::new();
-        for i in 0..3 {
-            let tx = TxId::from_bytes(format!("txr{i}").into_bytes());
-            txrs.push(tx.clone());
-            let l = locker.clone();
-            let k = key.clone();
-            let mon = tctx.monitor.clone();
-            handles.push(tokio::spawn(async move {
-                mon.begin_tx(&tx);
-                l.lock_read(&k, &tx).await
-            }));
-        }
-
-        // A write lock joins the queue a little later.
-        let txw0 = TxId::from_bytes(b"txw0".to_vec());
-        let writer = {
-            let l = locker.clone();
-            let k = key.clone();
-            let mon = tctx.monitor.clone();
-            let t = txw0.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                mon.begin_tx(&t);
-                l.lock_write(&k, &t).await
-            })
-        };
-
-        // Unlock the original write once the reads are waiting.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        locker.unlock(&key, &txw).await.unwrap();
-
-        for h in handles {
-            h.await.unwrap().unwrap();
-        }
-        assert_lock_info(&tctx.global, &key, LockType::Read, txrs.clone()).await;
-
-        // Abort all readers; the queued writer should then acquire the lock.
-        for tx in &txrs {
-            tctx.monitor.abort_tx(tx).await.unwrap();
-        }
-        writer.await.unwrap().unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![txw0.clone()]).await;
-    }
-
-    #[tokio::test]
-    async fn lock_upgrade_wait() {
-        let (locker, tctx) = init_tl_test();
-        let locker = Arc::new(locker);
-        let key = paths::from_key("example", b"key");
-        // Equal priority so the write upgrade waits for the other reader to
-        // release instead of wounding it.
-        let tx = mk_tid(1, "tx");
-        let txr = mk_tid(1, "txr");
-        tctx.monitor.begin_tx(&tx);
-        tctx.monitor.begin_tx(&txr);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        locker.lock_read(&key, &tx).await.unwrap();
-        locker.lock_read(&key, &txr).await.unwrap();
-        assert_lock_info(
-            &tctx.global,
-            &key,
-            LockType::Read,
-            vec![tx.clone(), txr.clone()],
-        )
-        .await;
-
-        {
-            let l = locker.clone();
-            let k = key.clone();
-            let t = txr.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                l.unlock(&k, &t).await.unwrap();
-            });
-        }
-        locker.lock_write(&key, &tx).await.unwrap();
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx.clone()]).await;
-    }
-
-    #[tokio::test]
-    async fn lock_read_remote() {
-        let (locker1, tctx1) = init_tl_test();
-        let (locker2, tctx2) = new_test_locker(tctx1.backend.clone());
-
-        let key = paths::from_key("example", b"key");
-        tctx1
-            .global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        // Make locker1 see stale metadata by caching it first.
-        tctx1.global.get_metadata(&key).await.unwrap();
-
-        let tx2 = TxId::new_random();
-        tctx2.monitor.begin_tx(&tx2);
-        locker2.lock_read(&key, &tx2).await.unwrap();
-        assert_lock_info(&tctx2.global, &key, LockType::Read, vec![tx2.clone()]).await;
-
-        let tx1 = TxId::new_random();
-        tctx1.monitor.begin_tx(&tx1);
-        locker1.lock_read(&key, &tx1).await.unwrap();
-        assert_lock_info(
-            &tctx1.global,
-            &key,
-            LockType::Read,
-            vec![tx1.clone(), tx2.clone()],
-        )
-        .await;
-
-        // There must have been a retry due to stale metadata.
-        let stats = locker1.stats_and_reset();
-        assert_eq!(stats.retries, 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_remote() {
-        let (locker1, tctx1) = init_tl_test();
-        let (locker2, tctx2) = new_test_locker(tctx1.backend.clone());
-        let locker2 = Arc::new(locker2);
-
-        let key = paths::from_key("example", b"key");
-        tctx1
-            .global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        // Equal priority so the second writer waits for the holder to release
-        // instead of wounding it.
-        let tx2 = mk_tid(1, "tx2");
-        tctx2.monitor.begin_tx(&tx2);
-        locker2.lock_write(&key, &tx2).await.unwrap();
-        assert_lock_info(&tctx2.global, &key, LockType::Write, vec![tx2.clone()]).await;
-
-        {
-            let l = locker2.clone();
-            let k = key.clone();
-            let t = tx2.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                l.unlock(&k, &t).await.unwrap();
-            });
-        }
-
-        let tx1 = mk_tid(1, "tx1");
-        tctx1.monitor.begin_tx(&tx1);
-        locker1.lock_write(&key, &tx1).await.unwrap();
-        assert_lock_info(&tctx1.global, &key, LockType::Write, vec![tx1.clone()]).await;
-
-        // Commit tx2 after locker1 holds the write lock.
-        {
-            let mon = tctx2.monitor.clone();
-            let k = key.clone();
-            let t = tx2.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let mut tl = TxLog::new(t.clone(), TxCommitStatus::Ok);
-                tl.writes = vec![TxWrite {
-                    path: k,
-                    value: Arc::from(&b"foo"[..]),
-                    deleted: false,
-                    prev_writer: TxId::default(),
-                }];
-                let _ = mon.commit_tx(tl).await;
-            });
-        }
-
-        locker1.lock_write(&key, &tx1).await.unwrap();
-        assert_lock_info(&tctx1.global, &key, LockType::Write, vec![tx1.clone()]).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wound_younger_holder() {
-        let (locker, tctx) = init_tl_test();
-        let key = paths::from_key("example", b"key");
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        // A younger transaction holds the write lock.
-        let tx_young = mk_tid(2, "young");
-        tctx.monitor.begin_tx(&tx_young);
-        locker.lock_write(&key, &tx_young).await.unwrap();
-
-        // An older (higher-priority) transaction wants the same lock. Under the
-        // wound-wait rule it aborts the younger holder and takes the lock
-        // without waiting.
-        let tx_old = mk_tid(1, "old");
-        tctx.monitor.begin_tx(&tx_old);
-        locker.lock_write(&key, &tx_old).await.unwrap();
-
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx_old.clone()]).await;
-
-        // The younger transaction was wounded (aborted).
-        let status = tctx.monitor.tx_status(&tx_young).await.unwrap();
-        assert_eq!(status, TxCommitStatus::Aborted);
-    }
-
-    /// A [`Backend`] decorator that injects a single in-doubt (lost-ack) fault
-    /// on the first conditional write to `target`: the write is forwarded so it
-    /// really lands, but its acknowledgement is reported as
-    /// [`BackendError::Unavailable`]. This models the ADR-009 in-doubt outcome
-    /// (the op may or may not have applied) on a transaction-log write.
-    struct LostAckOnce {
-        inner: Arc<dyn Backend>,
-        target: String,
-        armed: AtomicBool,
-    }
-
-    impl LostAckOnce {
-        fn new(inner: Arc<dyn Backend>, target: String) -> Arc<Self> {
-            Arc::new(LostAckOnce {
-                inner,
-                target,
-                armed: AtomicBool::new(true),
-            })
-        }
-
-        /// Consumes the one-shot trap if `path` is the target. Returns whether
-        /// the lost-ack fault should fire for this write.
-        fn should_fire(&self, path: &str) -> bool {
-            path == self.target && self.armed.swap(false, Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl Backend for LostAckOnce {
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            w: &WriterId,
-        ) -> Result<ReadReply, BackendError> {
-            self.inner.read_if_modified(path, w).await
-        }
-
-        async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
-            self.inner.read(path).await
-        }
-
-        async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-            self.inner.get_metadata(path).await
-        }
-
-        async fn set_tags_if(
-            &self,
-            path: &str,
-            expected: &Version,
-            tags: Tags,
-        ) -> Result<Metadata, BackendError> {
-            self.inner.set_tags_if(path, expected, tags).await
-        }
-
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            tags: Tags,
-        ) -> Result<Metadata, BackendError> {
-            self.inner.write(path, value, tags).await
-        }
-
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &Version,
-            tags: Tags,
-        ) -> Result<Metadata, BackendError> {
-            let fire = self.should_fire(path);
-            let m = self.inner.write_if(path, value, expected, tags).await?;
-            if fire {
-                return Err(BackendError::Unavailable(format!(
-                    "injected lost ack on write_if {path}"
-                )));
-            }
-            Ok(m)
-        }
-
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            tags: Tags,
-        ) -> Result<Metadata, BackendError> {
-            let fire = self.should_fire(path);
-            let m = self.inner.write_if_not_exists(path, value, tags).await?;
-            if fire {
-                return Err(BackendError::Unavailable(format!(
-                    "injected lost ack on write_if_not_exists {path}"
-                )));
-            }
-            Ok(m)
-        }
-
-        async fn delete(&self, path: &str) -> Result<(), BackendError> {
-            self.inner.delete(path).await
-        }
-
-        async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-            self.inner.delete_if(path, expected).await
-        }
-
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-            self.inner.list(dir_path).await
-        }
-    }
-
-    /// Regression test: an in-doubt **wound** write must be recovered in place.
-    ///
-    /// When an older transaction wounds a younger holder, it forces the
-    /// younger tx's log to `aborted` with a conditional write. If that write
-    /// lands but its acknowledgement is lost (an in-doubt outcome on a real
-    /// object store, e.g. S3/GCS), the wound is a *pre-commit* operation and
-    /// must be recovered transparently: forcing a not-yet-final log to
-    /// `aborted` is idempotent (ADR-009), so re-reading the status resolves it.
-    ///
-    /// Before the fix, `try_abort_remote_tx` did not retry an in-doubt outcome,
-    /// so the wound escaped the locker as a stringified storage error. It
-    /// surfaced from `lock_validate` as
-    /// `Error::Internal("failed validation: failed locking: storage outcome
-    /// unknown (in doubt): Write(<prefix>/_t/<txid>): ...")` and failed lock
-    /// acquisition — exactly the benchmark failure this guards against.
-    #[tokio::test(start_paused = true)]
-    async fn wound_younger_holder_lost_ack_recovers() {
-        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let key = paths::from_key("example", b"key");
-
-        // The wound writes `aborted` to the younger tx's log object; arm a
-        // one-shot lost ack on exactly that path. The log doesn't exist yet
-        // (the holder only locked, never committed), so this is the first — and
-        // the targeted — write to it.
-        let tx_young = mk_tid(2, "young");
-        let tx_old = mk_tid(1, "old");
-        let wound_log = paths::from_transaction("test", &tx_young);
-        let backend = LostAckOnce::new(mem, wound_log);
-        let (locker, tctx) = new_test_locker(backend);
-
-        tctx.global
-            .write(&key, Arc::from(&b"x"[..]), Tags::new())
-            .await
-            .unwrap();
-
-        // A younger transaction holds the write lock.
-        tctx.monitor.begin_tx(&tx_young);
-        locker.lock_write(&key, &tx_young).await.unwrap();
-
-        // The older (higher-priority) transaction wounds the younger holder.
-        // The wound's abort-log write lands but loses its ack; the locker must
-        // recover in place and still acquire the lock without surfacing the
-        // in-doubt outcome.
-        tctx.monitor.begin_tx(&tx_old);
-        locker
-            .lock_write(&key, &tx_old)
-            .await
-            .expect("an in-doubt wound write must be recovered in place, not surfaced");
-
-        assert_lock_info(&tctx.global, &key, LockType::Write, vec![tx_old.clone()]).await;
-
-        // The younger transaction was still wounded (the abort landed despite
-        // the lost ack), so the outcome is correct, not merely unsurfaced.
-        let status = tctx.monitor.tx_status(&tx_young).await.unwrap();
-        assert_eq!(status, TxCommitStatus::Aborted);
-    }
-
-    // Diagnostic snapshot reflects each tx's held locks (sorted by path) and is
-    // empty after every lock is released.
-    #[tokio::test]
-    async fn tx_locks_snapshot_lists_held_locks_per_tx() {
-        let (locker, tctx) = init_tl_test();
-        let key_a = paths::from_key("coll", b"a");
-        let key_b = paths::from_key("coll", b"b");
-        let key_c = paths::from_key("coll", b"c");
-
-        // Pre-create the keys so reads can take a non-Create lock.
-        for k in [&key_a, &key_b, &key_c] {
-            tctx.global
-                .write(k, Arc::from(&b"x"[..]), Tags::new())
+            ctx.shards
+                .store_shard(COLL, idx, &new_shard, ver.as_ref())
                 .await
-                .unwrap();
-        }
-
-        let tx1 = mk_tid(1, "tx1");
-        let tx2 = mk_tid(2, "tx2");
-        tctx.monitor.begin_tx(&tx1);
-        tctx.monitor.begin_tx(&tx2);
-
-        // tx1 holds a write on b and a read on a; tx2 holds a read on c.
-        locker.lock_write(&key_b, &tx1).await.unwrap();
-        locker.lock_read(&key_a, &tx1).await.unwrap();
-        locker.lock_read(&key_c, &tx2).await.unwrap();
-
-        let snap = locker.tx_locks_snapshot();
-        assert_eq!(snap.len(), 2, "expected two txs: {snap:?}");
-        let s1 = snap.iter().find(|s| s.tx_id == tx1).expect("tx1 missing");
-        let s2 = snap.iter().find(|s| s.tx_id == tx2).expect("tx2 missing");
-        // Locks are sorted by path within each tx.
-        assert_eq!(
-            s1.locks,
-            vec![
-                PathLock {
-                    path: key_a.clone(),
-                    typ: LockType::Read,
-                },
-                PathLock {
-                    path: key_b.clone(),
-                    typ: LockType::Write,
-                },
-            ],
+                .unwrap()
         );
-        assert_eq!(
-            s2.locks,
-            vec![PathLock {
-                path: key_c.clone(),
-                typ: LockType::Read,
-            }],
-        );
-
-        // Releasing every lock empties the snapshot.
-        locker.unlock(&key_a, &tx1).await.unwrap();
-        locker.unlock(&key_b, &tx1).await.unwrap();
-        locker.unlock(&key_c, &tx2).await.unwrap();
-        assert!(locker.tx_locks_snapshot().is_empty());
     }
 }

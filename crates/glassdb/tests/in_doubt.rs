@@ -243,6 +243,14 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
 /// never re-applied. This is the bug the in-doubt contract fixes: previously the
 /// lost-ack write was reported as a `Precondition`, the engine treated it as a
 /// conflict, fell back to the locked path, and incremented a second time.
+// Disabled in v2: the logless single-RW fast path (a `write_if` directly on the
+// per-key value object `/_k/`) was removed — values now live in the transaction
+// object and every commit goes through the logged commit point. There is no
+// longer a logless value write to lose an ack on, so this scenario cannot
+// happen. Commit-point in-doubt parity is covered by
+// `logged_commit_lost_ack_retries_transparently` (the `_t/` commit write) and
+// `lock_acquisition_lost_ack_retries_in_place` (the `_s/` lock CAS).
+#[ignore = "logless single-RW value-object path removed in v2"]
 #[tokio::test(start_paused = true)]
 async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -286,6 +294,11 @@ async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
 /// its own precondition, so the engine re-issues the *same* write unchanged: the
 /// object is still untouched, so the retry lands and commits exactly once — no
 /// `Error::InDoubt` is surfaced, and no double-apply happens.
+// Disabled in v2: see `single_rw_lost_ack_surfaces_in_doubt_without_double_apply`.
+// The logless single-RW value write no longer exists; the "in-doubt write that
+// did not land is retried transparently" property is exercised on the v2 commit
+// point by `logged_commit_lost_ack_retries_transparently`.
+#[ignore = "logless single-RW value-object path removed in v2"]
 #[tokio::test(start_paused = true)]
 async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -398,11 +411,11 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     seed(&coll, b"a", 0).await;
     seed(&coll, b"b", 0).await;
 
-    // Trap the first `set_tags_if` on a key path — that's how a non-create
-    // write lock is taken on an existing object. Let it land, then lose the
-    // ack: the lock is actually applied but the locker observes `Unavailable`.
+    // Trap the first shard lock CAS (a `write_if` on a shard path `/_s/` — how a
+    // lock is installed in v2). Let it land, then lose the ack: the lock is
+    // actually applied but the locker observes `Unavailable`.
     backend.arm(Box::new(|kind, path, _tags| {
-        if kind == "set_tags_if" && path.contains("/_k/") {
+        if kind == "write_if" && path.contains("/_s/") {
             Some(Action::LostAck)
         } else {
             None
@@ -432,6 +445,11 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
 /// successfully, applying the increment exactly once. This guards against
 /// over-eagerly treating every precondition as in-doubt, which would break
 /// liveness (and the fault-free exact invariant) under normal contention.
+// Disabled in v2: the logless single-RW fast path it targets (a `write_if` on
+// `/_k/`) was removed. A clean conflict being retried transparently is still
+// covered for the v2 paths by the locker's shard-CAS precondition retry and by
+// the engine-level concurrency suites (e.g. `concurrent_rmw`).
+#[ignore = "logless single-RW value-object path removed in v2"]
 #[tokio::test(start_paused = true)]
 async fn clean_conflict_on_single_rw_still_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());

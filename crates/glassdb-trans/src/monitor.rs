@@ -178,14 +178,21 @@ impl Monitor {
         });
     }
 
-    /// Marks the transaction committed, writing the final log (if it held
-    /// locks), updating local storage, and notifying waiters.
+    /// Marks the transaction committed, writing the final transaction object
+    /// (if it produced any writes or held any locks), updating local storage,
+    /// and notifying waiters.
     pub async fn commit_tx(&self, mut tl: TxLog) -> Result<(), TransError> {
         self.stop_tx_refresh(&tl.id);
 
-        // Optimization: if nothing was locked (RO or single-W tx), avoid writing
-        // the transaction log.
-        if !tl.locks.is_empty() {
+        // In v2 the transaction object is the value store: it must be persisted
+        // whenever the transaction has writes (the committed values readers
+        // help-forward) or recorded lock intentions. A read-only transaction
+        // carries neither, so it skips the write entirely — its in-memory
+        // bookkeeping is simply cleared below. This is the create-or-flip commit
+        // point: `set_final_log` creates the committed object when no pending
+        // one was written (the short-transaction case where the lazy refresh
+        // never fired), or CASes pending -> committed otherwise.
+        if !tl.locks.is_empty() || !tl.writes.is_empty() {
             tl.status = TxCommitStatus::Ok;
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
             // path can recognize a wound (the log was already aborted out from
@@ -195,11 +202,6 @@ impl Monitor {
             self.set_final_log(&tl)
                 .await
                 .map_err(|e| e.context("writing tx log"))?;
-        } else if tl.writes.len() > 1 {
-            return Err(TransError::other(format!(
-                "got {} writes with no locks; this is a bug",
-                tl.writes.len()
-            )));
         }
 
         let version = Version {

@@ -1,17 +1,26 @@
-//! The transactional read path. Ported from the Go `internal/trans/reader.go`.
+//! The transactional read path for the v2 object-native engine (ADR-017/020).
 //!
-//! Reads from local then global storage, and resolves keys that may be locked
-//! in "create" (i.e. uncommitted) by consulting the transaction monitor.
+//! A key's value no longer lives in a per-key object; it lives in the
+//! transaction object of whichever transaction last committed it. Reading a key
+//! therefore resolves its shard entry to an *effective writer* (help-forwarding
+//! a committed-but-not-written-back exclusive holder, dropping aborted/expired
+//! holders) and then materializes the value from that writer's transaction
+//! object through the [`Monitor`]. Resolved values are cached in [`Local`],
+//! keyed by writer, so a hot key does not re-resolve its shard on every read;
+//! the cache is invalidated by the commit path when validation detects a stale
+//! read.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb_backend::{BackendError, Metadata};
 use glassdb_concurr::{RetryConfig, rt};
+use glassdb_data::shard::shard_index;
+use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Global, Local, LockType, StorageError, TxCommitStatus, Version, tags_lock_info,
+    Local, LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus, Version,
 };
 
+use crate::error::TransError;
 use crate::monitor::Monitor;
 
 /// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
@@ -23,28 +32,56 @@ use crate::monitor::Monitor;
 /// the future.
 const READ_UNAVAILABLE_RETRIES: usize = 5;
 
-/// The result of reading a key: the raw value and its storage version.
+/// The result of reading a key: the raw value and its storage version. The
+/// version's writer is the *effective writer* the read resolved through, which
+/// is the optimistic-validation token the commit path checks.
 #[derive(Debug, Clone, Default)]
 pub struct ReadValue {
     pub value: Arc<[u8]>,
     pub version: Version,
 }
 
-/// Reads values from local and global storage, resolving create-locked keys.
+/// The resolved view of a shard entry, after help-forwarding committed holders.
+#[derive(Debug, Clone, Default)]
+struct Resolved {
+    /// The effective committed writer holding the key's value (the MVCC
+    /// pointer), or `None` if the key has no committed value.
+    writer: Option<TxId>,
+    /// Whether that writer's value for the key is a tombstone.
+    deleted: bool,
+}
+
+impl Resolved {
+    /// The existence-aware validation token: the effective writer iff the key
+    /// currently exists (committed and not tombstoned), else `None`. This is the
+    /// value a read observes, so it is what optimistic validation compares.
+    fn token(self) -> Option<TxId> {
+        match self.writer {
+            Some(w) if !self.deleted => Some(w),
+            _ => None,
+        }
+    }
+}
+
+/// Reads values by resolving a key's shard entry to its effective committed
+/// writer and materializing the value from that writer's transaction object.
 #[derive(Clone)]
 pub struct Reader {
     local: Local,
-    global: Global,
+    shards: ShardStore,
     tmon: Monitor,
     retry: RetryConfig,
 }
 
 impl Reader {
-    /// Creates a reader over local/global storage and a monitor.
-    pub fn new(local: Local, global: Global, tmon: Monitor, retry: RetryConfig) -> Self {
+    /// Creates a reader over local storage, the shard coordination store, and a
+    /// monitor. The `shards` store is shared (it is a thin, uncached handle over
+    /// the backend); shard objects must be read fresh because they carry no
+    /// writer-tag the read-through cache could key on.
+    pub fn new(local: Local, shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
         Reader {
             local,
-            global,
+            shards,
             tmon,
             retry,
         }
@@ -70,115 +107,109 @@ impl Reader {
         self.read_once(key, max_stale).await
     }
 
-    /// A single read attempt: local cache then global storage, resolving
-    /// create-locked keys. Wrapped by [`Reader::read`] for in-place retries.
+    /// A single read attempt: local cache then shard resolution. Wrapped by
+    /// [`Reader::read`] for in-place retries.
     async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
         if let Some(lr) = self.local.read(key, max_stale)
             && !lr.outdated
         {
             if lr.deleted {
-                return Err(BackendError::NotFound.into());
+                return Err(StorageError::NotFound);
             }
-            let lres = ReadValue {
+            return Ok(ReadValue {
                 value: lr.value,
                 version: lr.version,
-            };
-            return self.handle_lock_create(key, lres).await;
+            });
         }
-        let gr = self.global.read(key).await?;
-        let gres = ReadValue {
-            value: gr.value,
-            version: gr.version,
-        };
-        self.handle_lock_create(key, gres).await
+        self.resolve_value(key).await
     }
 
-    /// Returns the object metadata, using the local cache when fresh enough.
-    pub async fn get_metadata(
-        &self,
-        key: &str,
-        max_stale: Duration,
-    ) -> Result<Arc<Metadata>, StorageError> {
-        if let Some(lm) = self.local.get_meta(key, max_stale)
-            && !lm.outdated
-        {
-            return Ok(lm.m);
-        }
-        self.global.get_metadata(key).await
+    /// Returns the effective committed writer of `key` (the validation token):
+    /// `Some(writer)` if the key currently exists, `None` if it is absent or
+    /// tombstoned. Always reads the shard fresh (no value cache), so the commit
+    /// path observes the authoritative coordination state.
+    pub async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
+        let (prefix, raw_key) = paths::split_key(key)
+            .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
+        let (shard, _) = self
+            .shards
+            .load_shard(&prefix, shard_index(&raw_key))
+            .await?;
+        let resolved = self
+            .resolve_entry(key, shard.lookup(&raw_key))
+            .await
+            .map_err(trans_to_storage)?;
+        Ok(resolved.token())
     }
 
-    /// Resolves a possibly-empty read. An empty value can be a lock placeholder
-    /// rather than a genuinely-empty committed value: acquiring a create lock
-    /// writes an empty object, and a write/read lock can leave the object empty
-    /// while the locker holds it. In every locked case the authoritative value
-    /// lives in the transaction log, so we resolve it through the monitor,
-    /// mirroring the commit-time logic in `algo::validate_locked_read`. When the
-    /// value cannot be authoritatively resolved we report `NotFound` rather than
-    /// the misleading empty bytes, which makes the surrounding transaction retry
-    /// and re-read the committed value.
-    async fn handle_lock_create(
-        &self,
-        key: &str,
-        rv: ReadValue,
-    ) -> Result<ReadValue, StorageError> {
-        if !rv.value.is_empty() {
-            // A non-empty value is never a lock placeholder.
-            return Ok(rv);
+    /// Resolves `key` through its shard to the effective writer, then
+    /// materializes the value from that writer's transaction object.
+    async fn resolve_value(&self, key: &str) -> Result<ReadValue, StorageError> {
+        let (prefix, raw_key) = paths::split_key(key)
+            .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
+        let (shard, _) = self
+            .shards
+            .load_shard(&prefix, shard_index(&raw_key))
+            .await?;
+        let resolved = self
+            .resolve_entry(key, shard.lookup(&raw_key))
+            .await
+            .map_err(trans_to_storage)?;
+        let Some(writer) = resolved.token() else {
+            // Absent or tombstoned: not found. (A tombstone could be cached, but
+            // the next validation re-resolves the shard anyway, so we keep the
+            // read path simple and only cache materialized live values.)
+            return Err(StorageError::NotFound);
+        };
+        let cv = self
+            .tmon
+            .committed_value(key, &writer)
+            .await
+            .map_err(trans_to_storage)?;
+        if cv.status != TxCommitStatus::Ok || cv.value.not_written {
+            // The writer's value is not authoritatively resolvable yet (e.g. its
+            // object is in-doubt). Report not-found so the caller retries rather
+            // than trusting an empty placeholder.
+            return Err(StorageError::NotFound);
         }
-        let meta = self.global.get_metadata(key).await?;
-        let info = tags_lock_info(&meta.tags)?;
+        self.materialize(key, writer, cv.value)
+    }
 
-        // Determine whose committed value is authoritative for this empty object.
-        let writer = if info.typ == LockType::None {
-            // Unlocked but empty: a committed writer can release its lock before
-            // its value reaches the object (the value still lives in its log).
-            // Resolve through the recorded last writer; with none recorded the
-            // empty value is genuinely committed.
-            if info.last_writer.is_unset() {
-                return Ok(rv);
-            }
-            info.last_writer.clone()
-        } else if info.locked_by.len() == 1 {
-            let locker = info.locked_by[0].clone();
-            // The locker if it has committed and wrote this key, otherwise the
-            // previous last writer.
-            match self.tmon.tx_status(&locker).await {
-                Ok(TxCommitStatus::Ok) => {
-                    match self.tmon.committed_value(key, &locker).await {
-                        Ok(cv) if cv.status == TxCommitStatus::Ok && !cv.value.not_written => {
-                            // The locker's own committed write is authoritative.
-                            return self.materialize(key, locker, cv.value);
-                        }
-                        // Committed but did not write this key: fall back to the
-                        // previous writer.
-                        Ok(_) => info.last_writer.clone(),
-                        Err(_) => return Err(BackendError::NotFound.into()),
-                    }
-                }
-                Ok(TxCommitStatus::Aborted) | Ok(TxCommitStatus::Pending) => {
-                    info.last_writer.clone()
-                }
-                Ok(TxCommitStatus::Unknown) => {
-                    return Err(StorageError::other("unknown tx commit status"));
-                }
-                Err(_) => return Err(BackendError::NotFound.into()),
-            }
-        } else {
-            return Err(BackendError::NotFound.into());
+    /// Resolves `entry` against the transaction monitor: help-forward a committed
+    /// exclusive holder (one that committed but has not yet published its
+    /// `current_writer` pointer) and drop aborted/absent holders. `key_path` is
+    /// the full storage path of the key, used to fetch the help-forwarded
+    /// writer's value. A `None` entry resolves to "no value".
+    async fn resolve_entry(
+        &self,
+        key_path: &str,
+        entry: Option<&ShardEntry>,
+    ) -> Result<Resolved, TransError> {
+        let Some(e) = entry else {
+            return Ok(Resolved::default());
         };
 
-        if writer.is_unset() {
-            // No prior committed value (e.g. a pending create): not found.
-            return Err(BackendError::NotFound.into());
-        }
-        match self.tmon.committed_value(key, &writer).await {
-            Ok(cv) if cv.status == TxCommitStatus::Ok && !cv.value.not_written => {
-                self.materialize(key, writer, cv.value)
+        let mut writer = e.current_writer.clone();
+        let mut deleted = e.deleted;
+
+        // Only an exclusive (write/create) holder can change the committed value
+        // by help-forwarding. Read-lock holders never change the value, and
+        // pending/aborted holders are ignored (a pending holder has published no
+        // value; an aborted holder's lock is dead).
+        if matches!(e.lock_type, LockType::Write | LockType::Create) {
+            for holder in &e.locked_by {
+                if self.tmon.tx_status(holder).await? != TxCommitStatus::Ok {
+                    continue;
+                }
+                let cv = self.tmon.committed_value(key_path, holder).await?;
+                if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
+                    writer = Some(holder.clone());
+                    deleted = cv.value.deleted;
+                }
             }
-            // Unresolvable (e.g. the writer committed via the single-RW fast
-            // path, which writes no log): retry rather than trust empty bytes.
-            _ => Err(BackendError::NotFound.into()),
         }
+
+        Ok(Resolved { writer, deleted })
     }
 
     /// Caches and returns a resolved committed value, or reports `NotFound` for a
@@ -195,12 +226,20 @@ impl Reader {
         };
         if value.deleted {
             self.local.mark_deleted(key, version);
-            return Err(BackendError::NotFound.into());
+            return Err(StorageError::NotFound);
         }
         self.local.write(key, value.value.clone(), version.clone());
         Ok(ReadValue {
             value: value.value,
             version,
         })
+    }
+}
+
+/// Converts a transaction-engine error into a storage error for the read path.
+pub(crate) fn trans_to_storage(e: TransError) -> StorageError {
+    match e {
+        TransError::Storage(s) => s,
+        other => StorageError::other(other.to_string()),
     }
 }

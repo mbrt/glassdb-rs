@@ -165,7 +165,8 @@ Each design decision becomes its own ADR (next free number is 022).
   validate-and-lock as one RMW CAS per shard → commit flip CAS → idempotent
   per-shard write-back). Shard-CAS contention vs lock conflict; effective-current-
   writer / help-forward resolution; cross-shard non-atomicity gated on the commit
-  object; in-doubt parity at every CAS site; read-only and single-RW fast paths.
+  object; in-doubt parity at every CAS site; read-only fast path (the single-RW
+  fast path is **deferred to a follow-up** — see Group B below).
   Lock acquisition is **parallel by default** with a **serial sorted-by-index
   fallback** after `SERIAL_FALLBACK_AFTER` failed attempts; both abort-and-retry
   rather than block (the serial path's single global lock order is what gives
@@ -230,9 +231,13 @@ Group B — protocol details:
       blocks while holding locks). Creation point (pending object at prepare) is
       ADR-020.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
-      create, shard lock CAS, commit CAS, write-back CAS, single-RW) — ADR-009
-      carries over (ADR-020).
-- [x] Single-RW and read-only fast-path shapes in the new layout (ADR-020).
+      create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
+      (ADR-020). The single-RW fast path's shard-CAS commit point is a further
+      in-doubt site that lands with its deferred follow-up (see below).
+- [x] Read-only fast-path shape in the new layout (ADR-020).
+- [ ] Single-RW fast path. The integrated engine routes every read-write
+      transaction (including a single-key write touching one shard) through the
+      full locked + logged commit path
 
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):
@@ -260,6 +265,16 @@ Group D — GC & lifecycle:
 Group E — backends:
 
 - [ ] Final `Backend` trait signature and error semantics on the reduced surface.
+- [ ] Cache tagless coordination objects via version/ETag-conditional reads.
+      Today `ShardStore` full-fetches every shard/root read (the writer-tag
+      `read_if_modified` is unusable on these tagless objects).
+      Add a version-conditional read to `Backend` (`If-None-Match` → `304`/
+      `Precondition`) plus an ETag-keyed cache in `ShardStore`, so a hot unchanged
+      shard revalidates without transferring its body; the ETag changes on every
+      content write, which is exactly when to invalidate. This is what makes the
+      "shard (conditional GET)" in *Direction at a glance* real. Folds into the
+      slimmed content-CAS trait (ADR-023). See the `TODO(perf)` in
+      `glassdb-storage::shardstore`.
 - [ ] S3 mapping (drop nonce/tags; conditional writes; remove `delete_if`).
 - [ ] GCS mapping (content CAS via generation `If-Match`; drop metadata patch).
 - [ ] In-memory backend semantics for the new trait (and DST fault injection).
