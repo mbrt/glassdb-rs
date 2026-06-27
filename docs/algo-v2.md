@@ -188,8 +188,14 @@ Each design decision becomes its own ADR (next free number is 022).
 - **ADR-022 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
   locked-by`; the commit→write-back gap; deferral of the explicit counter and
   compaction.
-- **ADR-023 — Slimmed `Backend` trait.** The reduced surface; removal of tags /
-  nonce / `delete_if`; content CAS as the only coordination primitive. Relates to
+- **[ADR-023](adr/023-slimmed-backend-trait.md) — Slimmed `Backend` trait.** ✅
+  Written (design). The reduced seven-method surface (`read`, `read_if_modified`,
+  `write`, `write_if`, `write_if_not_exists`, `delete`, `list`); removal of tags /
+  nonce / `set_tags_if` / `get_metadata` / `delete_if`; content CAS as the only
+  coordination primitive. `read_if_modified` is **re-keyed from the writer tag to
+  the object version/ETag** so the retained `Global` cache can revalidate the
+  tagless coordination objects with a conditional GET (Group E point 2). `Global`
+  and `Locker` are retained and adapted, not deleted. Relates to
   [ADR-009](adr/009-in-doubt-conditional-writes.md) for in-doubt parity at the
   new CAS sites.
 
@@ -264,16 +270,18 @@ Group D — GC & lifecycle:
 
 Group E — backends:
 
-- [ ] Final `Backend` trait signature and error semantics on the reduced surface.
+- [ ] Final `Backend` trait signature and error semantics on the reduced surface
+      — specified by [ADR-023](adr/023-slimmed-backend-trait.md) (seven methods;
+      content CAS only; ADR-009 in-doubt parity).
 - [ ] Cache tagless coordination objects via version/ETag-conditional reads.
       Today `ShardStore` full-fetches every shard/root read (the writer-tag
-      `read_if_modified` is unusable on these tagless objects).
-      Add a version-conditional read to `Backend` (`If-None-Match` → `304`/
-      `Precondition`) plus an ETag-keyed cache in `ShardStore`, so a hot unchanged
-      shard revalidates without transferring its body; the ETag changes on every
-      content write, which is exactly when to invalidate. This is what makes the
-      "shard (conditional GET)" in *Direction at a glance* real. Folds into the
-      slimmed content-CAS trait (ADR-023). See the `TODO(perf)` in
+      `read_if_modified` is unusable on these tagless objects). **Designed in
+      [ADR-023](adr/023-slimmed-backend-trait.md):** `read_if_modified` is
+      re-keyed to the object version (`If-None-Match` → `304`/`Precondition`), and
+      the retained `Global` cache is re-pointed at it so a hot unchanged shard
+      revalidates without transferring its body; the ETag changes on every content
+      write, which is exactly when to invalidate. This is what makes the "shard
+      (conditional GET)" in *Direction at a glance* real. See the `TODO(perf)` in
       `glassdb-storage::shardstore`.
 - [ ] S3 mapping (drop nonce/tags; conditional writes; remove `delete_if`).
 - [ ] GCS mapping (content CAS via generation `If-Match`; drop metadata patch).
