@@ -95,9 +95,10 @@ preserved across retries (`TxId::renew`).
 
 Lock acquisition keeps ADR-020's two modes, with "wait" realised — **for the MVP
 only** — as release-and-retry (a transaction never blocks while holding locks).
-When the engine is ported onto v1's logic and data structures this reverts to
-**hold-and-wait** (locks preserved across retries, deadlock-timeout → serial,
-lease refresh); see [ADR-020 § MVP vs. v1](adr/020-commit-write-back-protocol.md#mvp-vs-the-v1-hold-and-wait-model).
+The reversion to **hold-and-wait** (locks preserved across retries,
+deadlock-timeout → serial, lease refresh) is now decided in
+[ADR-024](adr/024-hold-and-wait-conflict-resolution.md) (past MVP), pending
+implementation; see also [ADR-020 § MVP vs. v1](adr/020-commit-write-back-protocol.md#mvp-vs-the-v1-hold-and-wait-model).
 - **Parallel by default** — all touched shards are locked concurrently (then the
   root last). On an unwinnable conflict the transaction aborts and retries with
   its priority preserved. Deadlock-/livelock-free for distinct priorities.
@@ -109,18 +110,23 @@ lease refresh); see [ADR-020 § MVP vs. v1](adr/020-commit-write-back-protocol.m
   Wound-wait uses **no prefix tiebreak** (it would flip under `renew` and
   reintroduce the livelock); equal priorities are resolved only by this fallback.
 
-One designed mechanism is intentionally **not ported for the MVP**, because in
-release-and-retry a transaction aborts rather than blocks while holding locks:
-- **No background lease refresher (ADR-021)** — a *pending* object never lingers
-  long enough to expire while live (its lock window is a few synchronous CAS
-  round-trips), and a *committed* object never expires. The refresher **returns**
-  with the v1 hold-and-wait port.
+One designed mechanism is intentionally **not load-bearing in the MVP**, because
+in release-and-retry a transaction aborts rather than blocks while holding locks:
+- **No load-bearing lease refresher (ADR-021)** — a *pending* object never
+  lingers long enough to expire while live (its lock window is a few synchronous
+  CAS round-trips), and a *committed* object never expires. The refresher becomes
+  load-bearing with the v1 hold-and-wait port
+  ([ADR-024](adr/024-hold-and-wait-conflict-resolution.md)), where a transaction
+  can block while holding locks.
 
 The engine deliberately defers:
-- **GC (ADR-022)** — synchronous write-back; aborted/unreferenced transaction
-  objects and empty shard entries are never swept. A `locked_by` entry pointing
-  at a *missing* object is dropped rather than given the `handle_unknown_tx`
-  grace period (safe only until GC can delete a still-referenced object).
+- **GC ([ADR-022](adr/022-garbage-collection-mark-sweep.md))** — synchronous
+  write-back; aborted/unreferenced transaction objects and empty shard entries
+  are never swept. A `locked_by` entry pointing at a *missing* object is given the
+  `handle_unknown_tx` grace (load-bearing under hold-and-wait,
+  [ADR-024](adr/024-hold-and-wait-conflict-resolution.md), since a live tx
+  materializes its pending object lazily); GC respects that grace and never
+  deletes a still-referenced or within-horizon object.
 - **Performance** — no cache, no batched/async write-back, no proactive lock
   release on abort, a fresh pending object per attempt.
 
@@ -129,7 +135,7 @@ the `Backend` trait is slimmed (ADR-023).
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 022).
+Each design decision becomes its own ADR (next free number is 025).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -180,13 +186,43 @@ Each design decision becomes its own ADR (next free number is 022).
   if older *or* expired), uniformly for shard entries and the root membership lock.
   Discovery is lazy via `locked-by` (no pending registry); reads never consult the
   lease; abort CAS keeps ADR-009 in-doubt parity. Re-frames
-  [ADR-002](adr/002-wound-wait-locking.md) for the new layout. Two parts are
-  superseded/deferred: **no background refresher** (the engine never blocks while
-  holding locks, so a live pending object cannot expire), and the **`handle_unknown_tx`
-  grace period** for a missing object is deferred to GC (ADR-022).
-- **ADR-022 — Garbage collection by mark-sweep.** Live set = `current-writer ∪
-  locked-by`; the commit→write-back gap; deferral of the explicit counter and
-  compaction.
+  [ADR-002](adr/002-wound-wait-locking.md) for the new layout. Two MVP-era
+  simplifications are both made load-bearing again by **hold-and-wait
+  ([ADR-024](adr/024-hold-and-wait-conflict-resolution.md))**: the **background
+  refresher** returns (a transaction can now block while holding locks), and the
+  **`handle_unknown_tx` grace period** for a missing object becomes load-bearing in
+  the engine (a live tx materializes its pending object lazily); GC merely respects
+  that grace (ADR-022).
+- **[ADR-022](adr/022-garbage-collection-mark-sweep.md) — Garbage collection by
+  mark-sweep.** ✅ Written (design); implementation still deferred (the `Gc` is
+  inert). Liveness = reachability: live set = `current-writer ∪ locked-by` across
+  shards plus `membership-locked-by` on roots, with the ADR-021 lease as the
+  safety horizon (a recent pending object found unreferenced is kept — its lock may
+  post-date the check, and under ADR-024 the object is materialized lazily after its
+  locks are taken). Rather than a database-wide forward mark (infeasible at scale),
+  GC is **candidate-driven and reverse**: each transaction object records its own
+  back-references (`locks ∪ writes`, plus the `prev_writer` an overwrite
+  supersedes), so GC checks a *batch* of `_t/` candidates against only the
+  shards/root they name, deletes those past the horizon with no remaining reference,
+  and prunes their own stale locks. A paged `_t/` list makes the candidate set
+  complete (no forward scan); a committed object is freed only once proven
+  unreferenced, while a finalized valueless object is reclaimed past the horizon
+  regardless (a residual stale lock degrades to a missing-object reference the
+  `handle_unknown_tx` grace absorbs). Pruning/deletion touch **only finalized**
+  transactions: a dead *pending* one is first **force-aborted**
+  (`pending → aborted` CAS, the ADR-021 reclaim) — which loses the race to a
+  slow-but-live owner's commit — then has its known locks released, then is deleted,
+  so an observing client never sees a lock vanish from under a live owner. An
+  **aborted object is a tombstone**, deleted only a full safety lease *after the
+  abort* (the abort stamps a fresh `timestamp`), so a stuck owner cannot be
+  resurrected by its own create-if-absent refresher (ADR-024) and a late lock it
+  installs resolves against a present aborted object rather than a missing one.
+  Proactive stale-lock / empty-entry pruning
+  (the
+  uncontended-dead-lock case ADR-021 left to GC); subcollection teardown
+  (ADR-018). The commit→write-back gap is covered because a committed object stays
+  referenced via `locked-by` until write-back. Explicit liveness counter and
+  compaction deferred.
 - **[ADR-023](adr/023-slimmed-backend-trait.md) — Slimmed `Backend` trait.** ✅
   Written & implemented. The reduced seven-method surface (`read`, `read_if_modified`,
   `write`, `write_if`, `write_if_not_exists`, `delete`, `list`); removal of tags /
@@ -197,6 +233,22 @@ Each design decision becomes its own ADR (next free number is 022).
   and `Locker` are retained and adapted, not deleted. Relates to
   [ADR-009](adr/009-in-doubt-conditional-writes.md) for in-doubt parity at the
   new CAS sites.
+- **[ADR-024](adr/024-hold-and-wait-conflict-resolution.md) — Hold-and-wait
+  conflict resolution.** ✅ Written (design); implementation pending. Past the
+  MVP, reinstate v1's **hold-and-wait**: a younger-or-equal transaction **waits**
+  (polling via `wait_for_tx`) for a conflicting holder while **keeping its locks
+  and transaction object** instead of aborting-and-retrying, with the lease
+  refresher (ADR-021) made load-bearing. The pending object **stays lazily
+  created** (no upfront prepare); a held lock is bridged by the
+  `handle_unknown_tx` grace period until the refresher materializes it. A
+  **deadlock timeout** bounds the wait and escalates to the
+  serial sorted-by-path acquisition; older-wounds-younger and ADR-009 in-doubt
+  parity are unchanged. Supersedes the MVP-only release-and-retry / no-refresher
+  deviations of ADR-020/021 and **refines ADR-021's expiry predicate**: the
+  observer-relative grace (timestamp-advance / object-appearance within
+  `PENDING_TX_TIMEOUT`) owes no `MAX_CLOCK_SKEW`; only the absolute
+  `timestamp`-vs-`now` check does. Activates the dormant `wait_for_tx` /
+  `refresh_pending` / `LockTimeout` / `ValidateRetry` machinery.
 
 ## Open points checklist
 
@@ -261,11 +313,21 @@ point; see ADR-018):
 
 Group D — GC & lifecycle:
 
-- [ ] Mark-sweep trigger cadence, batching, and bounds (LIST/read cost).
-- [ ] Safety horizon to avoid sweeping in-flight transactions (ADR-021 settles the
-      lease side: a non-expired pending object is live/reachable and must not be
-      swept; remaining cadence/horizon spec is ADR-022).
-- [ ] Defer/spec compaction (v2) and the explicit liveness-counter object.
+- [x] GC trigger cadence, batching, and bounds (LIST/read cost) — a background
+      loop on the `Clock` / `Background` seam whose steady-state cost is
+      proportional to *garbage*, not database size: a **candidate-driven reverse**
+      check of a `_t/` batch against only the shards/root each candidate records
+      (cache-amortized), batched deletes, and **no** database-wide scan — a paged
+      `_t/` list makes the candidate set complete. The write-back
+      `schedule_tx_cleanup` hook becomes the primary **candidate feed** (the
+      `prev_writer` an overwrite just superseded), not a delete queue (ADR-022).
+- [x] Safety horizon to avoid sweeping in-flight transactions: reuse ADR-021's
+      lease expiry (`now > timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW`) as
+      the sweep horizon, so a recent pending object (or in-doubt create) is never
+      swept even when the non-atomic mark has not yet observed its lock — which,
+      under ADR-024's lazy materialization, post-dates the lock (ADR-022).
+- [x] Defer/spec compaction (v2) and the explicit liveness-counter object — both
+      specified as deferred; the MVP is full mark-sweep of whole objects (ADR-022).
 
 Group E — backends:
 

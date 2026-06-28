@@ -10,7 +10,11 @@ holds locks while blocked — a *pending* object therefore never lingers long
 enough to expire while its owner is live, and a *committed* object never expires.
 When the engine is ported onto v1's logic and data structures it becomes
 hold-and-wait again, at which point the **refresher returns** (a transaction that
-waits while holding locks must refresh its lease, exactly as v1 does). See
+waits while holding locks must refresh its lease, exactly as v1 does); this is
+specified by [ADR-024](024-hold-and-wait-conflict-resolution.md), which also
+**refines the expiry predicate below**: the observer-relative grace (a missing
+object appearing, or the `timestamp` advancing, within `PENDING_TX_TIMEOUT`) owes
+no `MAX_CLOCK_SKEW` — only the absolute `timestamp`-vs-`now` check does. See
 [Consequences](#consequences). The `handle_unknown_tx` grace period for a lock
 that references a *missing* object is likewise deferred to GC (ADR-022), the only
 thing that can delete a still-referenced object.
