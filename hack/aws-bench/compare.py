@@ -6,29 +6,43 @@
 #     "pandas>=2.0",
 #     "matplotlib>=3.8",
 #     "seaborn>=0.13",
+#     "numpy>=1.26",
 # ]
 # ///
-"""Compare two rtbench result sets and report how closely they match.
+"""Compare two rtbench/autoresearch result sets and report how they differ.
 
-This is used to check that the "fake" backend (in-memory + simulated S3
-latencies, ``rtbench --backend=memory --delays=s3``) reproduces a real Amazon S3
-run (``rtbench --backend=s3``). It reads the CSVs produced by both runs from two
-directories -- ``--real`` (the reference, default ``hack/aws-bench/out``) and
-``--fake`` (default ``hack/aws-bench/out-fake``) -- and prints, for each of the
-comparable metrics, a side-by-side table with the ratio ``fake / real``:
+Generic two-directory comparator. Each side is a directory of result files
+produced by `rtbench` and (optionally) the `autoresearch` scoring harness:
 
-* transaction throughput per type (total tx/s = ``num_db * median(per-db rate)``);
-* retries per committed transaction;
-* deadlock latency p50/p90 at 100% overlap, per contended-key count.
+* `throughput.csv`  -> transaction throughput per tx-type (total tx/s);
+* `samples.csv`     -> per-transaction latency percentiles (p50/p90/p95);
+* `stats.csv`       -> retries/tx and backend-ops/tx (object-storage round-trips);
+* `deadlock.csv`    -> latency under contention (p50/p90 at 100% overlap);
+* `score.json`      -> autoresearch primary score + per-workload cost/ops per tx.
 
-A ratio near 1.0 means the fake backend matches. It also writes overlay PNGs
-(``cmp-tx-throughput.png``, ``cmp-retries.png``, ``cmp-deadlock-latency.png``)
-into ``--out`` so the curves can be eyeballed together.
+Whatever files are present on both sides are compared; the rest are skipped.
+Every metric is reported as the ratio ``b / a`` (the second set over the first),
+so for an engine comparison with ``--label-a v1 --label-b v2`` a ratio above 1.0
+means v2 has more of that quantity than v1:
+
+* throughput ratio > 1  -> v2 is faster (good);
+* latency / retries / backend-ops / cost ratio < 1 -> v2 is cheaper (good).
+
+Two original use cases are both covered by this generic shape:
+
+* engine versions: ``--a out/v1 --label-a v1 --b out/v2 --label-b v2`` (see
+  ``compare-refs.sh``);
+* fake vs real S3: ``--a out --label-a real --b out-fake --label-b fake``.
+
+It also writes overlay PNGs (``cmp-tx-throughput.png``, ``cmp-tx-latency.png``,
+``cmp-retries.png``, ``cmp-deadlock-latency.png``) into ``--out`` so the curves
+can be eyeballed together.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -37,11 +51,19 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 
-REAL = "real"
-FAKE = "fake"
+# Backend-op columns that sum into total round-trips, in case a `stats.csv` from
+# an older run predates the explicit `backend-ops` total column. Engine versions
+# categorize ops differently (e.g. v1's tag/metadata ops vs v2 folding all
+# coordination into object reads/writes), so summing every class is what makes
+# the efficiency number comparable across versions.
+OP_COLS = ["obj-write", "obj-read", "obj-list", "meta-write", "meta-read"]
+
+# autoresearch JSON op-count fields (camelCase) that sum into ops/tx.
+SCORE_OP_FIELDS = ["objReads", "objWrites", "objLists", "metaReads", "metaWrites"]
 
 
 def read_csv(input_dir: Path, name: str) -> pd.DataFrame | None:
@@ -49,15 +71,43 @@ def read_csv(input_dir: Path, name: str) -> pd.DataFrame | None:
     for path in (input_dir / name, input_dir / f"{name}.xz"):
         if path.exists():
             return pd.read_csv(path)
-    print(f"warning: {input_dir / name}[.xz] not found, skipping", file=sys.stderr)
     return None
 
 
-def _ratio(fake: float, real: float) -> float:
-    return float("nan") if real == 0 else fake / real
+def read_json(input_dir: Path, name: str) -> dict | None:
+    path = input_dir / name
+    if path.exists():
+        return json.loads(path.read_text())
+    return None
 
 
-def throughput_table(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
+def _ratio(b: float, a: float) -> float:
+    return float("nan") if a == 0 else b / a
+
+
+def _geomean(s: pd.Series) -> float:
+    s = pd.Series(s).dropna()
+    s = s[s > 0]
+    if s.empty:
+        return float("nan")
+    return float(np.exp(np.log(s).mean()))
+
+
+def backend_ops_series(df: pd.DataFrame) -> pd.Series:
+    """Total backend round-trips per row: the `backend-ops` column if present,
+    else the sum of whatever per-class op columns exist (back-compat)."""
+    if "backend-ops" in df.columns:
+        return df["backend-ops"]
+    present = [c for c in OP_COLS if c in df.columns]
+    return df[present].sum(axis=1) if present else pd.Series(0, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# Tables (each returns a merged frame with a `ratio` / `*-ratio` column)
+# ---------------------------------------------------------------------------
+
+
+def throughput_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     """Total tx/s per (concurrency, tx-type): num_db * median(per-db rate)."""
 
     def agg(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,20 +116,41 @@ def throughput_table(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
-    r = agg(real)
-    f = agg(fake)
-    merged = r.merge(
-        f,
-        on=["num-db", "tx-type", "concurrent"],
-        suffixes=(f"_{REAL}", f"_{FAKE}"),
+    merged = agg(a).merge(
+        agg(b), on=["num-db", "tx-type", "concurrent"], suffixes=("_a", "_b")
     )
     merged["ratio"] = merged.apply(
-        lambda row: _ratio(row[f"total-tps_{FAKE}"], row[f"total-tps_{REAL}"]), axis=1
+        lambda r: _ratio(r["total-tps_b"], r["total-tps_a"]), axis=1
     )
     return merged
 
 
-def retries_table(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
+def latency_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
+    """p50/p90/p95 transaction latency (ms) per (concurrency, tx-type)."""
+    pctiles = {"p50": 0.5, "p90": 0.9, "p95": 0.95}
+
+    def agg(df: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for (numdb, tp), grp in df.groupby(["num-db", "tx-type"]):
+            row = {"num-db": numdb, "tx-type": tp}
+            for name, q in pctiles.items():
+                row[name] = grp["latency"].quantile(q)
+            rows.append(row)
+        out = pd.DataFrame(rows)
+        out["concurrent"] = out["num-db"] * conc_per_db
+        return out
+
+    merged = agg(a).merge(
+        agg(b), on=["num-db", "tx-type", "concurrent"], suffixes=("_a", "_b")
+    )
+    for p in pctiles:
+        merged[f"{p}-ratio"] = merged.apply(
+            lambda r, p=p: _ratio(r[f"{p}_b"], r[f"{p}_a"]), axis=1
+        )
+    return merged
+
+
+def retries_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
         d = df.copy()
         d["retries-per-tx"] = d["num-retries"] / d["num-tx"].where(d["num-tx"] > 0)
@@ -87,19 +158,32 @@ def retries_table(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
-    r = agg(real)
-    f = agg(fake)
-    merged = r.merge(f, on=["num-db", "concurrent"], suffixes=(f"_{REAL}", f"_{FAKE}"))
+    merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
     merged["ratio"] = merged.apply(
-        lambda row: _ratio(
-            row[f"retries-per-tx_{FAKE}"], row[f"retries-per-tx_{REAL}"]
-        ),
-        axis=1,
+        lambda r: _ratio(r["retries-per-tx_b"], r["retries-per-tx_a"]), axis=1
     )
     return merged
 
 
-def deadlock_table(real: pd.DataFrame, fake: pd.DataFrame):
+def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
+    """Backend round-trips per committed transaction per concurrency step."""
+
+    def agg(df: pd.DataFrame) -> pd.DataFrame:
+        d = df.copy()
+        d["backend-ops"] = backend_ops_series(d)
+        g = d.groupby("num-db").agg({"backend-ops": "sum", "num-tx": "sum"}).reset_index()
+        g["ops-per-tx"] = g["backend-ops"] / g["num-tx"].where(g["num-tx"] > 0)
+        g["concurrent"] = g["num-db"] * conc_per_db
+        return g
+
+    merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
+    merged["ratio"] = merged.apply(
+        lambda r: _ratio(r["ops-per-tx_b"], r["ops-per-tx_a"]), axis=1
+    )
+    return merged
+
+
+def deadlock_table(a: pd.DataFrame, b: pd.DataFrame):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
         d = df[df["overlap-pct"] == 100]
         if d.empty:
@@ -113,55 +197,79 @@ def deadlock_table(real: pd.DataFrame, fake: pd.DataFrame):
         g.columns = ["num-keys", "p50", "p90"]
         return g
 
-    r = agg(real)
-    f = agg(fake)
-    merged = r.merge(f, on="num-keys", suffixes=(f"_{REAL}", f"_{FAKE}"))
+    merged = agg(a).merge(agg(b), on="num-keys", suffixes=("_a", "_b"))
     for pct in ("p50", "p90"):
         merged[f"{pct}-ratio"] = merged.apply(
-            lambda row, p=pct: _ratio(row[f"{p}_{FAKE}"], row[f"{p}_{REAL}"]), axis=1
+            lambda r, p=pct: _ratio(r[f"{p}_b"], r[f"{p}_a"]), axis=1
         )
     return merged
 
 
+def efficiency_table(a: dict, b: dict):
+    """Per-workload autoresearch cost/tx and ops/tx, plus the primary score."""
+
+    def by_name(d: dict) -> dict:
+        return {w["name"]: w for w in d.get("workloads", [])}
+
+    wa, wb = by_name(a), by_name(b)
+    rows = []
+    for name in sorted(set(wa) & set(wb)):
+        x, y = wa[name], wb[name]
+
+        def ops_per_tx(w: dict) -> float:
+            txn = w.get("txn", 0) or 0
+            if txn == 0:
+                return float("nan")
+            return sum(w.get(f, 0) for f in SCORE_OP_FIELDS) / txn
+
+        rows.append(
+            {
+                "workload": name,
+                "costPerTx_a": x.get("costPerTx", float("nan")),
+                "costPerTx_b": y.get("costPerTx", float("nan")),
+                "cost-ratio": _ratio(y.get("costPerTx", 0), x.get("costPerTx", 0)),
+                "opsPerTx_a": ops_per_tx(x),
+                "opsPerTx_b": ops_per_tx(y),
+                "ops-ratio": _ratio(ops_per_tx(y), ops_per_tx(x)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
 def print_table(title: str, df: pd.DataFrame) -> None:
     print(f"\n## {title}\n")
-    if df.empty:
+    if df is None or df.empty:
         print("(no overlapping data)")
         return
     with pd.option_context(
         "display.max_rows",
         None,
         "display.width",
-        200,
+        220,
         "display.float_format",
         "{:.3f}".format,
     ):
         print(df.to_string(index=False))
 
 
-def summarize_ratios(name: str, ratios: pd.Series) -> str:
-    r = ratios.dropna()
+def summarize(name: str, ratios: pd.Series) -> str:
+    r = pd.Series(ratios).dropna()
     if r.empty:
         return f"{name}: no data"
     return (
-        f"{name}: ratio fake/real "
-        f"min={r.min():.2f} median={r.median():.2f} max={r.max():.2f} "
-        f"(geomean={_geomean(r):.2f})"
+        f"{name}: ratio b/a min={r.min():.2f} median={r.median():.2f} "
+        f"max={r.max():.2f} (geomean={_geomean(r):.2f})"
     )
 
 
-def _geomean(s: pd.Series) -> float:
-    import numpy as np
-
-    s = s[s > 0]
-    if s.empty:
-        return float("nan")
-    return float(np.exp(np.log(s).mean()))
-
-
-def _tidy_throughput(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
+def _tidy_throughput(a, b, la, lb, conc_per_db):
     frames = []
-    for src, df in ((REAL, real), (FAKE, fake)):
+    for src, df in ((la, a), (lb, b)):
         d = df.copy()
         d["concurrent"] = d["num-db"] * conc_per_db
         d["total-tps"] = d["tx-per-sec"] * d["num-db"]
@@ -170,9 +278,19 @@ def _tidy_throughput(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
     return pd.concat(frames, ignore_index=True)
 
 
-def _tidy_retries(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
+def _tidy_latency(a, b, la, lb, conc_per_db):
     frames = []
-    for src, df in ((REAL, real), (FAKE, fake)):
+    for src, df in ((la, a), (lb, b)):
+        d = df.copy()
+        d["concurrent"] = d["num-db"] * conc_per_db
+        d["source"] = src
+        frames.append(d)
+    return pd.concat(frames, ignore_index=True)
+
+
+def _tidy_retries(a, b, la, lb, conc_per_db):
+    frames = []
+    for src, df in ((la, a), (lb, b)):
         d = df.copy()
         d["concurrent"] = d["num-db"] * conc_per_db
         d["retries-per-tx"] = d["num-retries"] / d["num-tx"].where(d["num-tx"] > 0)
@@ -181,9 +299,9 @@ def _tidy_retries(real: pd.DataFrame, fake: pd.DataFrame, conc_per_db: int):
     return pd.concat(frames, ignore_index=True)
 
 
-def _tidy_deadlock(real: pd.DataFrame, fake: pd.DataFrame):
+def _tidy_deadlock(a, b, la, lb):
     frames = []
-    for src, df in ((REAL, real), (FAKE, fake)):
+    for src, df in ((la, a), (lb, b)):
         d = df[df["overlap-pct"] == 100].copy()
         if d.empty:
             d = df.copy()
@@ -204,10 +322,29 @@ def plot_overlay_throughput(data, out_dir: Path) -> None:
         errorbar=None,
         ax=ax,
     )
-    ax.set_title("Transaction throughput: real vs fake")
+    ax.set_title("Transaction throughput")
     ax.set_xlabel("Concurrent transactions")
     ax.set_ylabel("Transactions / sec")
     _save(fig, out_dir, "cmp-tx-throughput.png")
+
+
+def plot_overlay_latency(data, out_dir: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.lineplot(
+        data=data,
+        x="concurrent",
+        y="latency",
+        hue="tx-type",
+        style="source",
+        estimator="median",
+        errorbar=None,
+        ax=ax,
+    )
+    ax.set_yscale("log")
+    ax.set_title("Transaction latency (p50)")
+    ax.set_xlabel("Concurrent transactions")
+    ax.set_ylabel("Latency (ms, log scale)")
+    _save(fig, out_dir, "cmp-tx-latency.png")
 
 
 def plot_overlay_retries(data, out_dir: Path) -> None:
@@ -222,7 +359,7 @@ def plot_overlay_retries(data, out_dir: Path) -> None:
         marker="o",
         ax=ax,
     )
-    ax.set_title("Transaction retries: real vs fake")
+    ax.set_title("Transaction retries")
     ax.set_xlabel("Concurrent transactions")
     ax.set_ylabel("Retries per transaction")
     _save(fig, out_dir, "cmp-retries.png")
@@ -241,7 +378,7 @@ def plot_overlay_deadlock(data, out_dir: Path) -> None:
         ax=ax,
     )
     ax.set_yscale("log")
-    ax.set_title("Latency under contention: real vs fake")
+    ax.set_title("Latency under contention")
     ax.set_xlabel("Contended keys (5 workers, 100% overlap)")
     ax.set_ylabel("Transaction latency (ms, log scale)")
     _save(fig, out_dir, "cmp-deadlock-latency.png")
@@ -258,72 +395,111 @@ def _save(fig: plt.Figure, out_dir: Path, name: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     base = Path(__file__).resolve().parent
-    parser.add_argument("--real", type=Path, default=base / "out")
-    parser.add_argument("--fake", type=Path, default=base / "out-fake")
-    parser.add_argument("--out", type=Path, default=base / "out-fake")
+    parser.add_argument("--a", type=Path, default=base / "out")
+    parser.add_argument("--b", type=Path, default=base / "out-fake")
+    parser.add_argument("--label-a", default="a")
+    parser.add_argument("--label-b", default="b")
+    parser.add_argument("--out", type=Path, default=None, help="dir for PNGs (default: --b)")
+    parser.add_argument("--title", default="", help="prefix for the report header")
     parser.add_argument("--concurrency-per-db", type=int, default=10)
-    parser.add_argument(
-        "--no-plots", action="store_true", help="skip writing overlay PNGs"
-    )
+    parser.add_argument("--no-plots", action="store_true", help="skip overlay PNGs")
     args = parser.parse_args()
 
-    sns.set_theme(style="whitegrid", context="talk")
+    la, lb = args.label_a, args.label_b
+    out_dir = args.out if args.out is not None else args.b
+    cpd = args.concurrency_per_db
 
-    print(f"# rtbench comparison: fake={args.fake} vs real={args.real}")
+    sns.set_theme(style="whitegrid", context="talk")
+    prefix = f"{args.title}: " if args.title else ""
+    print(f"# {prefix}comparison: a={la} ({args.a})  b={lb} ({args.b})")
+    print(f"# ratio = {lb} / {la}")
 
     summaries: list[str] = []
 
-    real_tp = read_csv(args.real, "throughput.csv")
-    fake_tp = read_csv(args.fake, "throughput.csv")
-    if real_tp is not None and fake_tp is not None:
-        tbl = throughput_table(real_tp, fake_tp, args.concurrency_per_db)
-        cols = [
-            "concurrent",
-            "tx-type",
-            f"total-tps_{REAL}",
-            f"total-tps_{FAKE}",
-            "ratio",
-        ]
-        print_table("Throughput (total tx/s, fake/real ratio)", tbl[cols])
+    a_tp, b_tp = read_csv(args.a, "throughput.csv"), read_csv(args.b, "throughput.csv")
+    if a_tp is not None and b_tp is not None:
+        tbl = throughput_table(a_tp, b_tp, cpd)
+        cols = ["concurrent", "tx-type", "total-tps_a", "total-tps_b", "ratio"]
+        print_table(f"Throughput (total tx/s, {lb}/{la})", tbl[cols])
         for tx_type, grp in tbl.groupby("tx-type"):
-            summaries.append(summarize_ratios(f"throughput[{tx_type}]", grp["ratio"]))
+            summaries.append(summarize(f"throughput[{tx_type}]", grp["ratio"]))
 
-    real_st = read_csv(args.real, "stats.csv")
-    fake_st = read_csv(args.fake, "stats.csv")
-    if real_st is not None and fake_st is not None:
-        tbl = retries_table(real_st, fake_st, args.concurrency_per_db)
+    a_la, b_la = read_csv(args.a, "samples.csv"), read_csv(args.b, "samples.csv")
+    if a_la is not None and b_la is not None:
+        tbl = latency_table(a_la, b_la, cpd)
+        cols = ["concurrent", "tx-type", "p50_a", "p50_b", "p50-ratio", "p90-ratio", "p95-ratio"]
+        print_table(f"Latency (ms; p50 values + percentile {lb}/{la} ratios)", tbl[cols])
+        for tx_type, grp in tbl.groupby("tx-type"):
+            summaries.append(summarize(f"latency-p50[{tx_type}]", grp["p50-ratio"]))
+
+    a_st, b_st = read_csv(args.a, "stats.csv"), read_csv(args.b, "stats.csv")
+    if a_st is not None and b_st is not None:
+        tbl = retries_table(a_st, b_st, cpd)
+        cols = ["concurrent", "retries-per-tx_a", "retries-per-tx_b", "ratio"]
+        print_table(f"Retries per transaction ({lb}/{la})", tbl[cols])
+        summaries.append(summarize("retries", tbl["ratio"]))
+
+        tbl = backend_ops_table(a_st, b_st, cpd)
+        cols = ["concurrent", "ops-per-tx_a", "ops-per-tx_b", "ratio"]
+        print_table(f"Backend round-trips per transaction ({lb}/{la})", tbl[cols])
+        summaries.append(summarize("backend-ops/tx", tbl["ratio"]))
+
+    a_dl, b_dl = read_csv(args.a, "deadlock.csv"), read_csv(args.b, "deadlock.csv")
+    if a_dl is not None and b_dl is not None:
+        tbl = deadlock_table(a_dl, b_dl)
+        print_table(f"Deadlock latency at 100% overlap (ms, {lb}/{la})", tbl)
+        summaries.append(summarize("deadlock-p50", tbl["p50-ratio"]))
+        summaries.append(summarize("deadlock-p90", tbl["p90-ratio"]))
+
+    a_sc, b_sc = read_json(args.a, "score.json"), read_json(args.b, "score.json")
+    if a_sc is not None and b_sc is not None:
+        sa, sb = a_sc.get("score"), b_sc.get("score")
+        if sa is not None and sb is not None:
+            print(f"\n## Autoresearch primary score (cost/tx geomean, lower = better)\n")
+            print(f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={_ratio(sb, sa):.3f}")
+        tbl = efficiency_table(a_sc, b_sc)
         cols = [
-            "concurrent",
-            f"retries-per-tx_{REAL}",
-            f"retries-per-tx_{FAKE}",
-            "ratio",
+            "workload",
+            "costPerTx_a",
+            "costPerTx_b",
+            "cost-ratio",
+            "opsPerTx_a",
+            "opsPerTx_b",
+            "ops-ratio",
         ]
-        print_table("Retries per transaction (fake/real ratio)", tbl[cols])
-        summaries.append(summarize_ratios("retries", tbl["ratio"]))
+        print_table(f"Autoresearch per-workload cost/ops per tx ({lb}/{la})", tbl[cols])
+        if not tbl.empty:
+            summaries.append(summarize("autoresearch-cost/tx", tbl["cost-ratio"]))
+            summaries.append(summarize("autoresearch-ops/tx", tbl["ops-ratio"]))
 
-    real_dl = read_csv(args.real, "deadlock.csv")
-    fake_dl = read_csv(args.fake, "deadlock.csv")
-    if real_dl is not None and fake_dl is not None:
-        tbl = deadlock_table(real_dl, fake_dl)
-        print_table("Deadlock latency at 100% overlap (ms, fake/real ratio)", tbl)
-        summaries.append(summarize_ratios("deadlock-p50", tbl["p50-ratio"]))
-        summaries.append(summarize_ratios("deadlock-p90", tbl["p90-ratio"]))
-
-    print("\n## Summary (closer to 1.0 = better match)\n")
+    print("\n## Summary (ratio = b/a; throughput >1 good, latency/ops/cost <1 good)\n")
     for s in summaries:
         print(f"- {s}")
+    if not summaries:
+        print("(no overlapping result files found on both sides)")
 
     if not args.no_plots:
-        if real_tp is not None and fake_tp is not None:
-            plot_overlay_throughput(
-                _tidy_throughput(real_tp, fake_tp, args.concurrency_per_db), args.out
+        if a_tp is not None and b_tp is not None:
+            plot_overlay_throughput(_tidy_throughput(a_tp, b_tp, la, lb, cpd), out_dir)
+        if a_la is not None and b_la is not None:
+            # p50 latency per (concurrent, tx-type) for the overlay.
+            lat = latency_table(a_la, b_la, cpd)
+            tidy = pd.concat(
+                [
+                    lat[["concurrent", "tx-type", "p50_a"]]
+                    .rename(columns={"p50_a": "latency"})
+                    .assign(source=la),
+                    lat[["concurrent", "tx-type", "p50_b"]]
+                    .rename(columns={"p50_b": "latency"})
+                    .assign(source=lb),
+                ],
+                ignore_index=True,
             )
-        if real_st is not None and fake_st is not None:
-            plot_overlay_retries(
-                _tidy_retries(real_st, fake_st, args.concurrency_per_db), args.out
-            )
-        if real_dl is not None and fake_dl is not None:
-            plot_overlay_deadlock(_tidy_deadlock(real_dl, fake_dl), args.out)
+            plot_overlay_latency(tidy, out_dir)
+        if a_st is not None and b_st is not None:
+            plot_overlay_retries(_tidy_retries(a_st, b_st, la, lb, cpd), out_dir)
+        if a_dl is not None and b_dl is not None:
+            plot_overlay_deadlock(_tidy_deadlock(a_dl, b_dl, la, lb), out_dir)
 
     return 0
 

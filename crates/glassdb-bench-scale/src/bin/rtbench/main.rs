@@ -82,6 +82,13 @@ struct Args {
     /// Which test to run.
     #[arg(long, default_value = "simple", value_parser = ["simple", "rw9010", "deadlock"])]
     test_name: String,
+    /// Transaction mix for the `rw9010` test: a named preset (`balanced` =
+    /// 1,6,3, the default 10%-write mix; `readheavy` = 1,14,5; `writeheavy` =
+    /// 6,3,1) or explicit `W,SR,WR` counts (writers, strong-readers,
+    /// weak-readers). At least one writer is required (each worker's loop
+    /// terminates on the write bench reaching its sample floor).
+    #[arg(long, default_value = "balanced")]
+    rw_mix: String,
     /// Output file with raw samples data.
     #[arg(long, default_value = "samples.csv")]
     samples_out: String,
@@ -719,6 +726,43 @@ fn make_tx_series(num_w: usize, num_strong_r: usize, num_weak_r: usize) -> Vec<T
     v
 }
 
+/// The per-worker (writers, strong-readers, weak-readers) counts for the
+/// `rw9010` test, as set by `--rw-mix`.
+type RwMix = (usize, usize, usize);
+
+/// Parses the `--rw-mix` value: either a named preset or explicit
+/// `W,SR,WR` counts. At least one writer is required because each worker's loop
+/// runs until the *write* bench reaches its sample floor; a zero-writer mix
+/// would never terminate.
+fn parse_rw_mix(s: &str) -> Result<RwMix, String> {
+    let mix = match s.trim() {
+        "balanced" | "rw9010" => (1, 6, 3),
+        "readheavy" => (1, 14, 5),
+        "writeheavy" => (6, 3, 1),
+        other => {
+            let parts: Vec<&str> = other.split(',').collect();
+            if parts.len() != 3 {
+                return Err(format!(
+                    "invalid --rw-mix {s:?}: expected a preset \
+                     (balanced|readheavy|writeheavy) or W,SR,WR"
+                ));
+            }
+            let n = |p: &str| {
+                p.trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --rw-mix count {p:?}"))
+            };
+            (n(parts[0])?, n(parts[1])?, n(parts[2])?)
+        }
+    };
+    if mix.0 == 0 {
+        return Err(format!(
+            "invalid --rw-mix {s:?}: at least one writer is required"
+        ));
+    }
+    Ok(mix)
+}
+
 /// The three per-DB benches (one per transaction type).
 struct DbBench {
     write: Bench,
@@ -778,6 +822,14 @@ fn run_read_write_9010(
     metrics: Option<Arc<HttpMetrics>>,
     server_conns: Option<Arc<AtomicU64>>,
 ) -> Result<(), Box<dyn Error>> {
+    // Parse the transaction mix up front so a bad --rw-mix fails before the
+    // expensive key initialization.
+    let mix = parse_rw_mix(&args.rw_mix)?;
+    eprintln!(
+        "Transaction mix (writers,strong-readers,weak-readers): {},{},{}",
+        mix.0, mix.1, mix.2
+    );
+
     eprintln!("Initialize keys");
     let keys = init_keys(handle, backend.clone(), args.num_keys)?;
     eprintln!("End of keys initialization");
@@ -785,7 +837,7 @@ fn run_read_write_9010(
     let mut samples = create_csv(&args.samples_out, "num-db,db,tx-type,ops,latency\n")?;
     let mut stats = create_csv(
         &args.stats_out,
-        "num-db,db,num-tx,num-retries,obj-write,obj-read\n",
+        "num-db,db,num-tx,num-retries,obj-write,obj-read,obj-list,backend-ops\n",
     )?;
     let mut throughput = create_csv(
         &args.throughput_out,
@@ -822,6 +874,7 @@ fn run_read_write_9010(
                 server_conns.as_ref(),
                 &keys,
                 numdb,
+                mix,
                 &mut rnd,
                 &mut samples,
                 &mut stats,
@@ -843,6 +896,7 @@ fn run_read_write_9010_step(
     server_conns: Option<&Arc<AtomicU64>>,
     keys: &[Vec<u8>],
     numdb: usize,
+    mix: RwMix,
     rnd: &mut StdRng,
     samples: &mut impl Write,
     stats: &mut impl Write,
@@ -855,19 +909,19 @@ fn run_read_write_9010_step(
     let sampler = ThreadSampler::start();
     let wall_start = std::time::Instant::now();
 
-    let (results, failures) = match read_write_9010_all_dbs(handle, args, backend, keys, numdb, rnd)
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // Individual failed transactions are counted and dropped, not
-            // propagated. Reaching here means an unexpected fatal error (e.g. a
-            // worker panic): warn and skip just this concurrency point rather
-            // than discarding the whole sweep.
-            let _ = sampler.stop_and_peak();
-            eprintln!("WARNING: step num-db={numdb} failed, skipping: {e}");
-            return Ok(());
-        }
-    };
+    let (results, failures) =
+        match read_write_9010_all_dbs(handle, args, backend, keys, numdb, mix, rnd) {
+            Ok(r) => r,
+            Err(e) => {
+                // Individual failed transactions are counted and dropped, not
+                // propagated. Reaching here means an unexpected fatal error (e.g. a
+                // worker panic): warn and skip just this concurrency point rather
+                // than discarding the whole sweep.
+                let _ = sampler.stop_and_peak();
+                eprintln!("WARNING: step num-db={numdb} failed, skipping: {e}");
+                return Ok(());
+            }
+        };
 
     let wall = wall_start.elapsed();
     let (user_after, sys_after) = cpu::process_cpu_time();
@@ -903,6 +957,7 @@ fn read_write_9010_all_dbs(
     backend: &Arc<dyn Backend>,
     keys: &[Vec<u8>],
     numdb: usize,
+    mix: RwMix,
     rnd: &mut StdRng,
 ) -> Result<(Vec<DbResults>, u64), Box<dyn Error>> {
     // One seed per Database, derived up front from the shared source.
@@ -941,6 +996,7 @@ fn read_write_9010_all_dbs(
                 db_bench,
                 keys,
                 failures.clone(),
+                mix,
                 wseed,
             )));
         }
@@ -972,12 +1028,15 @@ async fn read_write_9010_worker(
     db_bench: Arc<DbBench>,
     keys: Arc<[Vec<u8>]>,
     failures: Arc<AtomicU64>,
+    mix: RwMix,
     seed: u64,
 ) -> Result<(), GError> {
     let mut rng = StdRng::seed_from_u64(seed);
     let coll = db.collection(READ_WRITE_9010_CNAME.as_bytes());
-    // 1 writer, 6 strong readers, 3 weak readers.
-    let mut series = make_tx_series(1, 6, 3);
+    // Per-worker transaction mix (writers, strong-readers, weak-readers),
+    // selected by `--rw-mix` (default 1,6,3 = the 10%-write rw9010 mix).
+    let (num_w, num_strong_r, num_weak_r) = mix;
+    let mut series = make_tx_series(num_w, num_strong_r, num_weak_r);
 
     while !db_bench.write.is_finished() {
         shuffle(&mut rng, &mut series);
@@ -1195,10 +1254,16 @@ fn dump_stats(
     numdb: usize,
 ) -> Result<(), Box<dyn Error>> {
     for (i, res) in results.iter().enumerate() {
+        let s = &res.stats;
+        // Total backend round-trips: the single comparable efficiency number.
+        // Summing every backend-op class keeps it meaningful across engine
+        // versions that categorize ops differently (e.g. v1's tag/metadata ops
+        // vs v2 folding all coordination into object reads/writes).
+        let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists;
         writeln!(
             out,
-            "{numdb},{i},{},{},{},{}",
-            res.stats.tx_n, res.stats.tx_retries, res.stats.obj_writes, res.stats.obj_reads,
+            "{numdb},{i},{},{},{},{},{},{}",
+            s.tx_n, s.tx_retries, s.obj_writes, s.obj_reads, s.obj_lists, backend_ops,
         )?;
     }
     Ok(())
