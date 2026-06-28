@@ -376,8 +376,13 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
     deterministic); see [`hack/autoresearch/`](hack/autoresearch).
 - **`hack/aws-bench/`** — the real-S3 harness: `cloudformation.yaml` (private
   VPC + SSM + S3 gateway endpoint), `deploy.sh` (now cross-compiles a static
-  `x86_64-unknown-linux-musl` `rtbench` instead of a Go binary), and the
-  unchanged `plot.py` / `compare.py` (the CSV schema is preserved).
+  `x86_64-unknown-linux-musl` `rtbench` instead of a Go binary), `plot.py`, and
+  `compare.py` — now a generic two-result-set comparator (throughput, latency
+  percentiles, retries, backend round-trips per tx, deadlock, and the
+  autoresearch score) used both for fake-vs-real and for the engine-version
+  comparison `compare-refs.sh` drives. `rtbench`'s
+  `stats.csv` gained a `backend-ops` total column; `compare.py` falls back to
+  summing the per-class op columns for result sets that predate it.
 
 Two parts deviate from the Go original by necessity:
 

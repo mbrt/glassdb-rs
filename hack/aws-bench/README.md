@@ -211,9 +211,12 @@ cargo run --release -p glassdb-bench-scale --bin rtbench -- \
   --backend=fakes3 --test-name=deadlock \
   --duration=20s --deadlock-out=hack/aws-bench/out-fake/deadlock.csv
 
-# Compare fake vs real: prints per-concurrency fake/real ratios for throughput,
-# retries and deadlock p50/p90, and writes overlay PNGs into out-fake/.
-uv run hack/aws-bench/compare.py
+# Compare fake vs real: per-concurrency ratios for throughput, latency,
+# retries, backend round-trips and deadlock p50/p90, and overlay PNGs into the
+# `b` dir. `compare.py` is a generic two-result-set comparator (ratio = b/a):
+uv run hack/aws-bench/compare.py \
+  --a hack/aws-bench/out --label-a real \
+  --b hack/aws-bench/out-fake --label-b fake
 ```
 
 Hammer a particular concurrency band:
@@ -250,6 +253,54 @@ wait. `out-fake/` CSVs and plots are generated locally and not committed.
 To explore how prefix partitioning affects throughput, add `--prefix-depth=N`
 (default 2: the transaction-log and data subtrees are throttled separately;
 higher N models S3 splitting hot prefixes into more partitions).
+
+## Comparing two engine versions (`compare-refs.sh`)
+
+`compare-refs.sh` measures how the current engine performs against a baseline
+git ref, under the in-memory backend with simulated S3 latency **and
+throttling** (`--backend=memory --delays=s3`). This is the routine way to track
+that a redesign stays on par with — or beats — the previous version, and to prove
+the next optimization. Throughput and latency are the primary axes; transaction
+retries and **backend round-trips per transaction** (object-storage efficiency)
+are secondary.
+
+```bash
+# main (baseline) vs the current worktree:
+hack/aws-bench/compare-refs.sh
+
+# quick smoke run (smaller/faster):
+DELAY_SCALE=0.02 DB_LIST=1,5 NUM_KEYS=500 DURATION=5s NUM_RUNS=1 \
+  DEADLOCK_DURATION=3s COUNT=2 RW_MIX=balanced hack/aws-bench/compare-refs.sh
+
+# pick the two refs explicitly, and drop the build worktrees when done:
+BASE=main TARGET=s3-redesign hack/aws-bench/compare-refs.sh
+hack/aws-bench/compare-refs.sh --clean
+```
+
+How it works: each ref compiles its own engine (the `Backend` trait differs
+across versions), so the script builds `rtbench` + `autoresearch` from the
+baseline ref in a **reused detached git worktree** and from the target tree,
+runs `rw9010` (the `--rw-mix` presets `balanced`/`readheavy`/`writeheavy`),
+`deadlock`, and the `autoresearch` score on both into `out-refs/`, then diffs
+them with `compare.py` (`ratio = target / base`: throughput > 1 is a win;
+latency / retries / backend-ops / cost < 1 is a win).
+
+Both refs must carry the enhanced `rtbench` for a full comparison (the
+`--rw-mix` flag and the `backend-ops` column in `stats.csv`). When the target is
+an older tree that lacks them, the driver falls back to the `balanced` mix only
+and `compare.py` reconstructs backend round-trips by summing the per-class op
+columns, so the run still works (it just can't vary the mix).
+
+Tunables (env): `BASE`, `TARGET`, `LABEL_A`/`LABEL_B`, `DELAY_SCALE`, `DB_LIST`,
+`NUM_KEYS`, `DURATION`, `NUM_RUNS`, `DEADLOCK_DURATION`, `COUNT`, `RW_MIX`,
+`OUT`, `BASE_WT`/`TARGET_WT`.
+
+> **Criterion is secondary here.** `cargo bench -p glassdb` (`make bench`)
+> measures one transaction at a time at compressed delays; it is good for
+> within-branch micro-latency A/B (`--save-baseline`/`--baseline`) and the
+> per-op printout, but not for sustained throughput under concurrency and
+> throttling. `compare-refs.sh`/`rtbench` is the authority for those; the
+> deterministic `autoresearch` score is the authority for backend-op efficiency.
 
 ## Cost & cleanup
 
