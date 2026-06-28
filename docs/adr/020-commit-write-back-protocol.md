@@ -9,9 +9,10 @@ failed attempts (see [Deadlock prevention](#deadlock-prevention-and-the-serial-f
 Two deliberate simplifications remain, both **MVP-only**:
 
 - The conflict-resolution model is **release-and-retry**, not hold-and-wait. This
-  keeps the MVP simple and refresher-free; when the engine is ported onto v1's
-  logic and data structures it becomes **hold-and-wait again** (locks preserved
-  across retries, deadlock-timeout → serial fallback, lease refresh). See
+  keeps the MVP simple and refresher-free; past the MVP it becomes
+  **hold-and-wait again** (locks preserved across retries, deadlock-timeout →
+  serial fallback, lease refresh), now specified by
+  [ADR-024](024-hold-and-wait-conflict-resolution.md). See
   [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback).
 - Write-back is **synchronous** (not yet async/batched; GC and caching are
   ADR-022/perf follow-ups).
@@ -238,7 +239,11 @@ This restores v1's behaviour; the only reason it is not in the MVP is that, on a
 backend with no wait/notify primitive, "wait" degrades to polling, so the
 simplicity of release-and-retry is the better starting point. The serial fallback,
 wound-wait, and lease-expiry semantics are identical across both models — only the
-conflict action (release vs. wait) changes.
+conflict action (release vs. wait) changes. This reversion is specified by
+[ADR-024](024-hold-and-wait-conflict-resolution.md), with one departure from the
+design body above: the pending object is **not** prepared up front (phase 2) but
+kept lazily created as in the MVP — materialized by the now load-bearing refresher
+and bridged by the `handle_unknown_tx` grace until it exists.
 
 ### In-doubt outcomes at the new CAS sites
 
