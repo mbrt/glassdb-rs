@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import matplotlib
@@ -171,7 +170,11 @@ def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
         d = df.copy()
         d["backend-ops"] = backend_ops_series(d)
-        g = d.groupby("num-db").agg({"backend-ops": "sum", "num-tx": "sum"}).reset_index()
+        g = (
+            d.groupby("num-db")
+            .agg({"backend-ops": "sum", "num-tx": "sum"})
+            .reset_index()
+        )
         g["ops-per-tx"] = g["backend-ops"] / g["num-tx"].where(g["num-tx"] > 0)
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
@@ -265,6 +268,23 @@ def summarize(name: str, ratios: pd.Series) -> str:
         f"{name}: ratio b/a min={r.min():.2f} median={r.median():.2f} "
         f"max={r.max():.2f} (geomean={_geomean(r):.2f})"
     )
+
+
+def append_summary(path: Path, title: str, summaries: list[str]) -> None:
+    """Append a small markdown section for this comparison to ``path``.
+
+    The shell driver points every comparison at the same file so the result is
+    one compact, trackable digest per run (deterministic for the autoresearch
+    score, noisy but indicative for the rtbench ratios)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"## {title or 'comparison'}", ""]
+    if summaries:
+        lines += [f"- {s}" for s in summaries]
+    else:
+        lines.append("- (no overlapping result files)")
+    lines.append("")
+    with path.open("a") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def _tidy_throughput(a, b, la, lb, conc_per_db):
@@ -399,10 +419,18 @@ def main() -> int:
     parser.add_argument("--b", type=Path, default=base / "out-fake")
     parser.add_argument("--label-a", default="a")
     parser.add_argument("--label-b", default="b")
-    parser.add_argument("--out", type=Path, default=None, help="dir for PNGs (default: --b)")
+    parser.add_argument(
+        "--out", type=Path, default=None, help="dir for PNGs (default: --b)"
+    )
     parser.add_argument("--title", default="", help="prefix for the report header")
     parser.add_argument("--concurrency-per-db", type=int, default=10)
     parser.add_argument("--no-plots", action="store_true", help="skip overlay PNGs")
+    parser.add_argument(
+        "--summary-out",
+        type=Path,
+        default=None,
+        help="append the compact ratio summary as a markdown section to this file",
+    )
     args = parser.parse_args()
 
     la, lb = args.label_a, args.label_b
@@ -427,8 +455,18 @@ def main() -> int:
     a_la, b_la = read_csv(args.a, "samples.csv"), read_csv(args.b, "samples.csv")
     if a_la is not None and b_la is not None:
         tbl = latency_table(a_la, b_la, cpd)
-        cols = ["concurrent", "tx-type", "p50_a", "p50_b", "p50-ratio", "p90-ratio", "p95-ratio"]
-        print_table(f"Latency (ms; p50 values + percentile {lb}/{la} ratios)", tbl[cols])
+        cols = [
+            "concurrent",
+            "tx-type",
+            "p50_a",
+            "p50_b",
+            "p50-ratio",
+            "p90-ratio",
+            "p95-ratio",
+        ]
+        print_table(
+            f"Latency (ms; p50 values + percentile {lb}/{la} ratios)", tbl[cols]
+        )
         for tx_type, grp in tbl.groupby("tx-type"):
             summaries.append(summarize(f"latency-p50[{tx_type}]", grp["p50-ratio"]))
 
@@ -455,8 +493,14 @@ def main() -> int:
     if a_sc is not None and b_sc is not None:
         sa, sb = a_sc.get("score"), b_sc.get("score")
         if sa is not None and sb is not None:
-            print(f"\n## Autoresearch primary score (cost/tx geomean, lower = better)\n")
-            print(f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={_ratio(sb, sa):.3f}")
+            print("\n## Autoresearch primary score (cost/tx geomean, lower = better)\n")
+            print(
+                f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={_ratio(sb, sa):.3f}"
+            )
+            summaries.append(
+                f"autoresearch-score: {la}={sa:.2f} {lb}={sb:.2f} "
+                f"ratio={_ratio(sb, sa):.3f}"
+            )
         tbl = efficiency_table(a_sc, b_sc)
         cols = [
             "workload",
@@ -477,6 +521,9 @@ def main() -> int:
         print(f"- {s}")
     if not summaries:
         print("(no overlapping result files found on both sides)")
+
+    if args.summary_out is not None:
+        append_summary(args.summary_out, args.title, summaries)
 
     if not args.no_plots:
         if a_tp is not None and b_tp is not None:

@@ -272,10 +272,21 @@ hack/aws-bench/compare-refs.sh
 DELAY_SCALE=0.02 DB_LIST=1,5 NUM_KEYS=500 DURATION=5s NUM_RUNS=1 \
   DEADLOCK_DURATION=3s COUNT=2 RW_MIX=balanced hack/aws-bench/compare-refs.sh
 
-# pick the two refs explicitly, and drop the build worktrees when done:
+# only the deterministic autoresearch efficiency score (no rtbench sweeps):
+hack/aws-bench/compare-refs.sh --autoresearch-only
+
+# pick the two refs explicitly:
 BASE=main TARGET=s3-redesign hack/aws-bench/compare-refs.sh
+
+# the build worktrees are removed at the end of every run; `--clean` does it
+# on demand (e.g. after an interrupted run):
 hack/aws-bench/compare-refs.sh --clean
 ```
+
+Each run writes a small digest to `out-refs/summary.md`: the per-section ratio
+summaries plus the autoresearch primary score. That file is the only `out-refs/`
+artifact that is **not** gitignored, so it can be committed to track the numbers
+(the autoresearch score is deterministic) across changes.
 
 How it works: each ref compiles its own engine (the `Backend` trait differs
 across versions), so the script builds `rtbench` + `autoresearch` from the

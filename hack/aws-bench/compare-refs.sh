@@ -16,12 +16,19 @@
 # is merged into the v2 branch); against an older target the driver falls back
 # to the `balanced` mix only and `compare.py` degrades gracefully.
 #
+# Each run leaves a small, trackable digest at $OUT/summary.md (the per-section
+# ratio summaries plus the deterministic autoresearch score). It is the only
+# out-refs artifact that is not gitignored, so it can be committed to follow the
+# numbers over time. The worktrees built for the base/target refs are removed at
+# the end of every run (same as `--clean`).
+#
 # Usage:
 #   hack/aws-bench/compare-refs.sh            # main (v1) vs current worktree
 #   BASE=main TARGET=s3-redesign hack/aws-bench/compare-refs.sh
 #   DELAY_SCALE=0.02 DB_LIST=1,5 DURATION=5s NUM_RUNS=1 \
 #     DEADLOCK_DURATION=3s COUNT=2 RW_MIX=balanced \
 #     hack/aws-bench/compare-refs.sh        # quick smoke run
+#   hack/aws-bench/compare-refs.sh --autoresearch-only  # only the efficiency score
 #   hack/aws-bench/compare-refs.sh --clean   # drop the base/target worktrees
 #
 # Tunables (env, with defaults):
@@ -49,10 +56,10 @@ TARGET="${TARGET:-}"
 LABEL_A="${LABEL_A:-v1}"
 LABEL_B="${LABEL_B:-v2}"
 DELAY_SCALE="${DELAY_SCALE:-0.05}"
-DB_LIST="${DB_LIST:-1,5,10,20,40}"
+DB_LIST="${DB_LIST:-1,10,20,40}"
 NUM_KEYS="${NUM_KEYS:-5000}"
 DURATION="${DURATION:-15s}"
-NUM_RUNS="${NUM_RUNS:-2}"
+NUM_RUNS="${NUM_RUNS:-1}"
 DEADLOCK_DURATION="${DEADLOCK_DURATION:-8s}"
 COUNT="${COUNT:-5}"
 RW_MIX="${RW_MIX:-balanced readheavy writeheavy}"
@@ -82,18 +89,40 @@ remove_worktree() {
   git -C "$REPO_ROOT" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
 }
 
-if [ "${1:-}" = "--clean" ]; then
+clean_worktrees() {
   remove_worktree "$BASE_WT"
   remove_worktree "$TARGET_WT"
   git -C "$REPO_ROOT" worktree prune
   log "removed perf worktrees"
-  exit 0
-fi
+}
+
+# When set, run (and compare) only the deterministic autoresearch efficiency
+# score, skipping the rw9010 + deadlock rtbench sweeps. Handy for a quick,
+# trackable check of backend-op efficiency.
+AUTORESEARCH_ONLY="${AUTORESEARCH_ONLY:-0}"
+
+case "${1:-}" in
+  --clean)
+    clean_worktrees
+    exit 0
+    ;;
+  --autoresearch-only)
+    AUTORESEARCH_ONLY=1
+    ;;
+  "")
+    ;;
+  *)
+    log "unknown argument: $1 (expected --clean or --autoresearch-only)"
+    exit 2
+    ;;
+esac
 
 build_bins() {
   local dir="$1"
-  log "building rtbench + autoresearch in $dir (release)"
-  (cd "$dir" && cargo build --release --bin rtbench --bin autoresearch >&2)
+  local bins=(--bin rtbench --bin autoresearch)
+  [ "$AUTORESEARCH_ONLY" = "1" ] && bins=(--bin autoresearch)
+  log "building ${bins[*]} in $dir (release)"
+  (cd "$dir" && cargo build --release "${bins[@]}" >&2)
 }
 
 # Whether the rtbench binary at $1 understands --rw-mix (post-enhancement).
@@ -109,28 +138,30 @@ run_side() {
   local label="$1" bindir="$2" has_mix="$3"
   local common=(--backend=memory --delays=s3 --delay-scale="$DELAY_SCALE")
 
-  for mix in $MIXES; do
-    local d="$OUT/$mix/$label"
-    mkdir -p "$d"
-    local mix_args=()
-    if [ "$has_mix" = "1" ]; then
-      mix_args=(--rw-mix="$mix")
-    fi
-    log "$label rw9010 mix=$mix"
-    "$bindir/rtbench" "${common[@]}" \
-      --test-name=rw9010 "${mix_args[@]}" \
-      --db-list="$DB_LIST" --num-keys="$NUM_KEYS" \
-      --duration="$DURATION" --num-runs="$NUM_RUNS" \
-      --samples-out="$d/samples.csv" --stats-out="$d/stats.csv" \
-      --throughput-out="$d/throughput.csv" --client-stats-out="$d/client-stats.csv" >&2
-  done
+  if [ "$AUTORESEARCH_ONLY" != "1" ]; then
+    for mix in $MIXES; do
+      local d="$OUT/$mix/$label"
+      mkdir -p "$d"
+      local mix_args=()
+      if [ "$has_mix" = "1" ]; then
+        mix_args=(--rw-mix="$mix")
+      fi
+      log "$label rw9010 mix=$mix"
+      "$bindir/rtbench" "${common[@]}" \
+        --test-name=rw9010 "${mix_args[@]}" \
+        --db-list="$DB_LIST" --num-keys="$NUM_KEYS" \
+        --duration="$DURATION" --num-runs="$NUM_RUNS" \
+        --samples-out="$d/samples.csv" --stats-out="$d/stats.csv" \
+        --throughput-out="$d/throughput.csv" --client-stats-out="$d/client-stats.csv" >&2
+    done
 
-  local dd="$OUT/contention/$label"
-  mkdir -p "$dd"
-  log "$label deadlock"
-  "$bindir/rtbench" "${common[@]}" \
-    --test-name=deadlock --duration="$DEADLOCK_DURATION" --num-runs="$NUM_RUNS" \
-    --deadlock-out="$dd/deadlock.csv" >&2
+    local dd="$OUT/contention/$label"
+    mkdir -p "$dd"
+    log "$label deadlock"
+    "$bindir/rtbench" "${common[@]}" \
+      --test-name=deadlock --duration="$DEADLOCK_DURATION" --num-runs="$NUM_RUNS" \
+      --deadlock-out="$dd/deadlock.csv" >&2
+  fi
 
   local de="$OUT/efficiency/$label"
   mkdir -p "$de"
@@ -156,18 +187,25 @@ else
 fi
 
 # Determine the mix set: every requested mix only when both binaries support
-# --rw-mix, else fall back to the default balanced mix (run flagless).
+# --rw-mix, else fall back to the default balanced mix (run flagless). Skipped
+# entirely when only the autoresearch score is requested (no rtbench built).
 A_MIX=0; B_MIX=0
-supports_rw_mix "$BASE_BIN" && A_MIX=1
-supports_rw_mix "$TARGET_BIN" && B_MIX=1
-if [ "$A_MIX" = "1" ] && [ "$B_MIX" = "1" ]; then
-  MIXES="$RW_MIX"
-else
-  log "WARNING: a side lacks --rw-mix (base=$A_MIX target=$B_MIX); running balanced only"
-  MIXES="balanced"
+if [ "$AUTORESEARCH_ONLY" != "1" ]; then
+  supports_rw_mix "$BASE_BIN" && A_MIX=1
+  supports_rw_mix "$TARGET_BIN" && B_MIX=1
+  if [ "$A_MIX" = "1" ] && [ "$B_MIX" = "1" ]; then
+    MIXES="$RW_MIX"
+  else
+    log "WARNING: a side lacks --rw-mix (base=$A_MIX target=$B_MIX); running balanced only"
+    MIXES="balanced"
+  fi
 fi
 
-log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); mixes: $MIXES"
+if [ "$AUTORESEARCH_ONLY" = "1" ]; then
+  log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); autoresearch only"
+else
+  log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); mixes: $MIXES"
+fi
 rm -rf "$OUT"
 
 # --- Run both sides back-to-back -------------------------------------------
@@ -176,19 +214,41 @@ run_side "$LABEL_A" "$BASE_BIN" "$A_MIX"
 run_side "$LABEL_B" "$TARGET_BIN" "$B_MIX"
 
 # --- Compare ---------------------------------------------------------------
+# Every comparison appends a section to $SUMMARY, leaving one small, trackable
+# digest of the run in the output dir.
 
-for mix in $MIXES; do
+SUMMARY="$OUT/summary.md"
+mkdir -p "$OUT"
+{
+  echo "# compare-refs summary"
+  echo
+  echo "- base: $BASE ($LABEL_A)"
+  echo "- target: $TARGET_DESC ($LABEL_B)"
+  echo "- ratio = $LABEL_B / $LABEL_A (throughput >1 good; latency/ops/cost <1 good)"
+  echo
+} >"$SUMMARY"
+
+if [ "$AUTORESEARCH_ONLY" != "1" ]; then
+  for mix in $MIXES; do
+    uv run "$SCRIPT_DIR/compare.py" \
+      --a "$OUT/$mix/$LABEL_A" --b "$OUT/$mix/$LABEL_B" \
+      --label-a "$LABEL_A" --label-b "$LABEL_B" --title "rw9010/$mix" \
+      --summary-out "$SUMMARY"
+  done
+
   uv run "$SCRIPT_DIR/compare.py" \
-    --a "$OUT/$mix/$LABEL_A" --b "$OUT/$mix/$LABEL_B" \
-    --label-a "$LABEL_A" --label-b "$LABEL_B" --title "rw9010/$mix"
-done
-
-uv run "$SCRIPT_DIR/compare.py" \
-  --a "$OUT/contention/$LABEL_A" --b "$OUT/contention/$LABEL_B" \
-  --label-a "$LABEL_A" --label-b "$LABEL_B" --title "deadlock"
+    --a "$OUT/contention/$LABEL_A" --b "$OUT/contention/$LABEL_B" \
+    --label-a "$LABEL_A" --label-b "$LABEL_B" --title "deadlock" \
+    --summary-out "$SUMMARY"
+fi
 
 uv run "$SCRIPT_DIR/compare.py" \
   --a "$OUT/efficiency/$LABEL_A" --b "$OUT/efficiency/$LABEL_B" \
-  --label-a "$LABEL_A" --label-b "$LABEL_B" --title "efficiency" --no-plots
+  --label-a "$LABEL_A" --label-b "$LABEL_B" --title "efficiency" --no-plots \
+  --summary-out "$SUMMARY"
 
-log "done. CSVs + overlay PNGs under $OUT/"
+# --- Clean up worktrees ----------------------------------------------------
+
+clean_worktrees
+
+log "done. summary in $SUMMARY; CSVs + overlay PNGs under $OUT/"
