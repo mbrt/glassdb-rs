@@ -44,5 +44,5 @@ impl Gc {
     /// Enqueues a finalized transaction object for later deletion. No-op while
     /// GC is inert: a committed transaction object is referenced by its shard
     /// entries' `current_writer` pointers and must not be deleted.
-    pub fn schedule_tx_cleanup(&self, _tid: TxId) {}
+    pub(crate) fn schedule_tx_cleanup(&self, _tid: TxId) {}
 }

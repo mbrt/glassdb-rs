@@ -67,6 +67,37 @@ async fn rw() {
     assert_eq!(stats.tx_retries, 0);
 }
 
+// The distributed locker's counters are surfaced through `Database::stats()`
+// (the same reset-on-read accumulation pattern as the backend object counters),
+// not only through the internal diagnostics snapshot. A committed write
+// transaction takes the locked commit path (a read-only commit does not), so it
+// must bump `lock_calls` while a pure read leaves the counter unchanged.
+#[tokio::test(start_paused = true)]
+async fn stats_report_locker_activity() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+
+    let before = db.stats();
+    coll.write(b"key1", b"value1").await.unwrap();
+    let after_write = db.stats();
+    assert!(
+        after_write.lock_calls > before.lock_calls,
+        "a committed write must report locker calls: {} -> {}",
+        before.lock_calls,
+        after_write.lock_calls
+    );
+
+    // A read-only transaction commits via the lock-free fast path, so the
+    // counter is unchanged across it.
+    let _ = coll.read(b"key1").await.unwrap();
+    let after_read = db.stats();
+    assert_eq!(
+        after_read.lock_calls, after_write.lock_calls,
+        "a read-only commit takes no locks"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn delete() {
     let db = init_db(mem()).await;

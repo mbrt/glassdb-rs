@@ -21,9 +21,9 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
+use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::TxId;
-use glassdb_storage::{Global, Local, TxCommitStatus, TxLog, TxWrite, Version};
+use glassdb_storage::{Local, TxCommitStatus, TxLog, TxWrite, Version};
 
 use crate::error::TransError;
 use crate::gc::Gc;
@@ -73,7 +73,7 @@ pub struct ReadVersion {
 impl ReadVersion {
     /// Converts to a storage version (writer-only; the backend version is unused
     /// in v2 since shards carry no per-key backend version).
-    pub fn to_storage_version(&self) -> Version {
+    pub(crate) fn to_storage_version(&self) -> Version {
         Version {
             b: glassdb_backend::Version::default(),
             writer: self.last_writer.clone(),
@@ -85,12 +85,12 @@ impl ReadVersion {
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
     pub path: Arc<str>,
-    pub op: WriteOp,
+    pub(crate) op: WriteOp,
 }
 
 /// The write operation staged for a key.
 #[derive(Debug, Clone)]
-pub enum WriteOp {
+pub(crate) enum WriteOp {
     Put(Arc<[u8]>),
     Delete,
 }
@@ -165,20 +165,21 @@ pub struct Algo {
     locker: Locker,
     mon: Monitor,
     gc: Gc,
+    clock: Clock,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
 }
 
 impl Algo {
-    /// Creates an algorithm coordinator. `global` is unused directly (the reader
-    /// and locker own their own storage handles) but kept in the signature for
-    /// call-site stability.
+    /// Creates an algorithm coordinator. `clock` is the wall-clock source for
+    /// transaction-id timestamps; pass the same clock the monitor uses so
+    /// priorities and lease timing share one time base.
     pub fn new(
-        _global: Global,
         local: Local,
         locker: Locker,
         mon: Monitor,
+        clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
         reader: Reader,
@@ -189,6 +190,7 @@ impl Algo {
             locker,
             mon,
             gc,
+            clock,
             background,
         }
     }
@@ -207,7 +209,7 @@ impl Algo {
     /// Starts a new transaction with the given data. The id's random prefix and
     /// timestamp are deterministic under `--cfg sim`.
     pub fn begin(&self, d: Data) -> Handle {
-        let id = TxId::new_at(self.mon.clock_now());
+        let id = TxId::new_at(self.clock.now());
         Handle {
             data: d,
             status: Status::New,
@@ -530,8 +532,8 @@ mod tests {
     use glassdb_data::paths;
     use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        CollectionRoot, Local, MAX_STALENESS, ShardEntry, ShardStore, StorageError, TLogger,
-        TxCommitStatus,
+        CollectionRoot, Global, Local, MAX_STALENESS, ShardEntry, ShardStore, StorageError,
+        TLogger, TxCommitStatus,
     };
 
     const TEST_COLL: &str = "testp";
@@ -578,10 +580,10 @@ mod tests {
             .unwrap();
 
         let algo = Algo::new(
-            global.clone(),
             local.clone(),
             locker,
             tmon.clone(),
+            Clock::real(),
             gc,
             None,
             reader,

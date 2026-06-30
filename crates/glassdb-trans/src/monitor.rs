@@ -62,7 +62,7 @@ struct TxStatusEntry {
 }
 
 struct WaitRequest {
-    tx: oneshot::Sender<WaitTxResult>,
+    tx: oneshot::Sender<TxCommitStatus>,
 }
 
 /// Observer-relative liveness tracker for a watched remote pending transaction
@@ -109,16 +109,9 @@ pub struct Monitor {
 
 /// A transaction's commit status for a specific key, plus the value written.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyCommitStatus {
+pub(crate) struct KeyCommitStatus {
     pub status: TxCommitStatus,
     pub value: TValue,
-}
-
-/// The outcome of waiting for a transaction to complete.
-#[derive(Debug, Clone, Default)]
-pub struct WaitTxResult {
-    pub status: TxCommitStatus,
-    pub err: Option<TransError>,
 }
 
 impl Monitor {
@@ -155,14 +148,8 @@ impl Monitor {
         self.inner.shards.for_key(tid.as_bytes())
     }
 
-    /// Returns the current wall-clock time according to the monitor's clock.
-    /// Used by the transaction engine to derive a transaction's priority.
-    pub(crate) fn clock_now(&self) -> SystemTime {
-        self.inner.clock.now()
-    }
-
     /// Registers a new pending local transaction.
-    pub fn begin_tx(&self, tid: &TxId) {
+    pub(crate) fn begin_tx(&self, tid: &TxId) {
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.insert(
             tid.clone(),
@@ -177,7 +164,7 @@ impl Monitor {
     /// Starts a background task that periodically refreshes the pending log so
     /// the transaction is not considered expired. The task is aborted when its
     /// [`Background`] is dropped.
-    pub fn start_refresh_tx(&self, tid: &TxId) {
+    pub(crate) fn start_refresh_tx(&self, tid: &TxId) {
         let need_start = {
             let mut st = self.shard_for(tid).lock().unwrap();
             match st.local_tx.get_mut(tid) {
@@ -207,7 +194,7 @@ impl Monitor {
     /// Marks the transaction committed, writing the final transaction object
     /// (if it produced any writes or held any locks), updating local storage,
     /// and notifying waiters.
-    pub async fn commit_tx(&self, mut tl: TxLog) -> Result<(), TransError> {
+    pub(crate) async fn commit_tx(&self, mut tl: TxLog) -> Result<(), TransError> {
         self.stop_tx_refresh(&tl.id);
 
         // In v2 the transaction object is the value store: it must be persisted
@@ -246,20 +233,13 @@ impl Monitor {
 
         let mut st = self.shard_for(&tl.id).lock().unwrap();
         st.local_tx.remove(&tl.id);
-        notify_waiters(
-            &mut st,
-            &tl.id,
-            WaitTxResult {
-                status: TxCommitStatus::Ok,
-                err: None,
-            },
-        );
+        notify_waiters(&mut st, &tl.id, TxCommitStatus::Ok);
         Ok(())
     }
 
     /// Marks the transaction aborted, writing the final log and notifying
     /// waiters. The local state is cleared even if writing the log fails.
-    pub async fn abort_tx(&self, tid: &TxId) -> Result<(), TransError> {
+    pub(crate) async fn abort_tx(&self, tid: &TxId) -> Result<(), TransError> {
         self.stop_tx_refresh(tid);
 
         let res = self
@@ -268,14 +248,7 @@ impl Monitor {
 
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid);
-        notify_waiters(
-            &mut st,
-            tid,
-            WaitTxResult {
-                status: TxCommitStatus::Aborted,
-                err: None,
-            },
-        );
+        notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
         res
     }
 
@@ -288,7 +261,7 @@ impl Monitor {
     /// The abort is made durable via a conditional write on the transaction log,
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
-    pub async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
+    pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
         let cs = self.inner.tl.commit_status(tid).await.map_err(|e| {
             TransError::Storage(e.context(format!("reading status of wound target {tid}")))
         })?;
@@ -315,18 +288,11 @@ impl Monitor {
 
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid);
-        notify_waiters(
-            &mut st,
-            tid,
-            WaitTxResult {
-                status: TxCommitStatus::Aborted,
-                err: None,
-            },
-        );
+        notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
     }
 
     /// Returns the commit status, checking locally first then remote storage.
-    pub async fn tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
+    pub(crate) async fn tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
         {
             let st = self.shard_for(tid).lock().unwrap();
             if let Some(e) = st.local_tx.get(tid) {
@@ -336,17 +302,19 @@ impl Monitor {
         self.fetch_remote_tx_status(tid).await
     }
 
-    /// Waits asynchronously for the transaction to finalize. The returned
-    /// future yields exactly one result; dropping it cancels the wait.
-    pub fn wait_for_tx(
+    /// Waits asynchronously for the transaction to finalize, yielding its final
+    /// commit status. The returned future yields exactly one value; dropping it
+    /// cancels the wait. If the sender is dropped without finalizing, it yields
+    /// [`TxCommitStatus::Unknown`] (the default) so the caller re-resolves.
+    pub(crate) fn wait_for_tx(
         &self,
         tid: &TxId,
-    ) -> impl std::future::Future<Output = WaitTxResult> + Send + use<> {
+    ) -> impl std::future::Future<Output = TxCommitStatus> + Send + use<> {
         let rx = self.wait_for_tx_rx(tid);
         async move { rx.await.unwrap_or_default() }
     }
 
-    fn wait_for_tx_rx(&self, tid: &TxId) -> oneshot::Receiver<WaitTxResult> {
+    fn wait_for_tx_rx(&self, tid: &TxId) -> oneshot::Receiver<TxCommitStatus> {
         let (tx, rx) = oneshot::channel();
 
         let mut st = self.shard_for(tid).lock().unwrap();
@@ -356,7 +324,7 @@ impl Monitor {
 
         // Matches Go precedence: (isLocal && OK) || Aborted.
         if (is_local && status == TxCommitStatus::Ok) || status == TxCommitStatus::Aborted {
-            let _ = tx.send(WaitTxResult { status, err: None });
+            let _ = tx.send(status);
             return rx;
         }
 
@@ -384,10 +352,9 @@ impl Monitor {
         // status or a fetch error) or when every caller has dropped its
         // `wait_for_tx` future.
         rt::spawn(async move {
-            let (status, err) = m.poll_tx_status_with_liveness(&tid).await;
-            let res = WaitTxResult { status, err };
+            let status = m.poll_tx_status_with_liveness(&tid).await;
             let mut st = m.shard_for(&tid).lock().unwrap();
-            notify_waiters(&mut st, &tid, res);
+            notify_waiters(&mut st, &tid, status);
         });
 
         rx
@@ -395,7 +362,7 @@ impl Monitor {
 
     /// Returns the committed value a transaction wrote for `key`, reading from
     /// local storage or the transaction log.
-    pub async fn committed_value(
+    pub(crate) async fn committed_value(
         &self,
         key: &str,
         tid: &TxId,
@@ -594,18 +561,21 @@ impl Monitor {
     /// caller has dropped its `wait_for_tx` future (signalled by closed
     /// `oneshot::Sender`s in the waiters list). The latter is the future-drop
     /// equivalent of the per-call cancellation contexts the Go original used.
-    async fn poll_tx_status_with_liveness(
-        &self,
-        tid: &TxId,
-    ) -> (TxCommitStatus, Option<TransError>) {
+    ///
+    /// Returns the last status seen: the final status on success, or
+    /// [`TxCommitStatus::Unknown`] / the last pending status on a fetch error or
+    /// abandoned poll. A waiter woken with a non-final status re-resolves the
+    /// holder (re-issuing `tx_status`), so a transient fetch error is retried and
+    /// a persistent one resurfaces there — the poll itself reports no error.
+    async fn poll_tx_status_with_liveness(&self, tid: &TxId) -> TxCommitStatus {
         let mut backoff = self.inner.retry.backoff();
         loop {
             let s = match self.fetch_remote_tx_status(tid).await {
-                Err(e) => return (TxCommitStatus::Unknown, Some(e)),
+                Err(_) => return TxCommitStatus::Unknown,
                 Ok(s) => s,
             };
             if s.is_final() {
-                return (s, None);
+                return s;
             }
             let alive = {
                 let mut st = self.shard_for(tid).lock().unwrap();
@@ -623,10 +593,7 @@ impl Monitor {
                 }
             };
             if !alive {
-                return (
-                    s,
-                    Some(TransError::other("no live waiters; abandoning poll")),
-                );
+                return s;
             }
             rt::sleep(backoff.next_delay()).await;
         }
@@ -785,12 +752,12 @@ impl Monitor {
     }
 }
 
-fn notify_waiters(st: &mut State, tid: &TxId, res: WaitTxResult) {
+fn notify_waiters(st: &mut State, tid: &TxId, status: TxCommitStatus) {
     if let Some(ws) = st.waiters.remove(tid) {
         for w in ws {
             // `send` silently fails if the receiver has been dropped,
             // which is the new "waiter cancelled" signal.
-            let _ = w.tx.send(res.clone());
+            let _ = w.tx.send(status);
         }
     }
 }
@@ -805,6 +772,9 @@ mod tests {
     struct TestCtx {
         tl: TLogger,
         global: Global,
+        // The clock the monitor was built with, so tests can stamp tx logs with
+        // the monitor's own notion of "now".
+        clock: Clock,
         // The strong `Arc<Background>` lives here so refresh tasks can be
         // spawned for the duration of the test; the `Monitor` only stores a
         // `Weak`.
@@ -824,7 +794,7 @@ mod tests {
             local,
             tl.clone(),
             Arc::downgrade(&bg),
-            clock,
+            clock.clone(),
             RetryConfig::default(),
         );
         (
@@ -832,6 +802,7 @@ mod tests {
             TestCtx {
                 tl,
                 global,
+                clock,
                 _bg: bg,
             },
         )
@@ -910,8 +881,8 @@ mod tests {
         let ch2 = mon1.wait_for_tx(&tx);
 
         mon1.abort_tx(&tx).await.unwrap();
-        assert_eq!(ch1.await.status, TxCommitStatus::Aborted);
-        assert_eq!(ch2.await.status, TxCommitStatus::Aborted);
+        assert_eq!(ch1.await, TxCommitStatus::Aborted);
+        assert_eq!(ch2.await, TxCommitStatus::Aborted);
     }
 
     #[tokio::test]
@@ -928,8 +899,8 @@ mod tests {
 
         mon1.abort_tx(&tx).await.unwrap();
 
-        assert_eq!(ch2.await.status, TxCommitStatus::Aborted);
-        assert_eq!(ch3.await.status, TxCommitStatus::Aborted);
+        assert_eq!(ch2.await, TxCommitStatus::Aborted);
+        assert_eq!(ch3.await, TxCommitStatus::Aborted);
     }
 
     #[tokio::test(start_paused = true)]
@@ -997,7 +968,7 @@ mod tests {
         // holder). Its absolute lease stays valid for `PENDING_TX_TIMEOUT +
         // MAX_CLOCK_SKEW`, so only the relative check can reclaim it sooner.
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Pending);
-        tl.timestamp = Some(mon.clock_now());
+        tl.timestamp = Some(t.clock.now());
         t.tl.set(&tl).await.unwrap();
 
         // First sight records the progress baseline; still pending.

@@ -49,12 +49,11 @@ The cause is a small newtype `Cause(Arc<dyn std::error::Error + Send + Sync>)`
 that implements `Error`, `Display`, `Debug` and `Clone`. The `Arc` is
 deliberate:
 
-- Errors are **fanned out** in the engine — the dedup batch shares one error via
-  `Arc`, and `WaitTxResult` is broadcast to every waiter via `Clone`. A plain
-  `Box<dyn Error>` would force dropping `Clone`, which in turn would force
-  _lossy_ reconstruction on those fan-out paths — discarding the very cause we
-  set out to keep. `Arc` keeps the error types cheaply `Clone` while preserving
-  the chain.
+- Errors are **fanned out** in the engine — e.g. the dedup batch shares one
+  error with every joined caller via `Arc`/`Clone`. A plain `Box<dyn Error>`
+  would force dropping `Clone`, which in turn would force _lossy_ reconstruction
+  on those fan-out paths — discarding the very cause we set out to keep. `Arc`
+  keeps the error types cheaply `Clone` while preserving the chain.
 - `thiserror`'s `#[source]` requires the field to implement `Error`; a bare
   `Arc<dyn Error>` does not, so the newtype bridges it.
 

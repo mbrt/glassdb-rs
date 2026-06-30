@@ -98,7 +98,7 @@ struct ShardGroup {
 /// The locks a transaction acquired, returned by [`Locker::lock`] and consumed
 /// by [`Locker::write_back`]. Opaque to the caller: it carries the per-shard key
 /// groups and the collection prefixes whose root membership lock was taken.
-pub struct LockedTx {
+pub(crate) struct LockedTx {
     groups: BTreeMap<String, ShardGroup>,
     membership: BTreeSet<String>,
 }
@@ -307,6 +307,21 @@ impl Locker {
         out
     }
 
+    /// Publishes `current_writer` pointers / tombstones and releases this
+    /// transaction's locks across the shards it touched, then releases the root
+    /// membership locks. Every CAS is idempotent; errors are best-effort
+    /// (a failure leaves the locks to be reclaimed lazily by the next contender
+    /// or lease expiry), so this never fails an already-committed transaction.
+    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) {
+        for group in locked.groups.values() {
+            let _ = self.write_back_shard(id, group).await;
+        }
+        for prefix in &locked.membership {
+            let _ = self.release_root(prefix, id).await;
+        }
+        self.clear_tx_locks(id);
+    }
+
     // --- Crate-facing lock protocol ----------------------------------------
 
     /// Groups the transaction's accessed keys by shard and acquires every lock it
@@ -338,6 +353,54 @@ impl Locker {
             }
         }
         Ok(LockOutcome::Locked(LockedTx { groups, membership }))
+    }
+
+    /// Releases every lock `id` holds across the shards and collection roots it
+    /// has acquired, **without publishing any value** and **leaving the
+    /// transaction object pending**. Unlike [`Locker::write_back`] (the
+    /// post-commit release that republishes `current_writer` pointers), this
+    /// just clears `id` from the lock holders so the transaction can re-acquire
+    /// its locks from scratch under the same id.
+    ///
+    /// This is the deadlock-timeout serial fallback's release step (ADR-024):
+    /// when a parallel acquisition blocks past the deadlock budget, the
+    /// transaction drops the locks it grabbed out of order and re-acquires them
+    /// in the global sorted order, where one contender always makes progress.
+    /// Holding the out-of-order locks across the re-acquire would recreate the
+    /// very cycle serial locking exists to break, so they must be released
+    /// first. The held set is read from the per-tx bookkeeping the same way v1's
+    /// `unlock_all` consulted `locked_paths`. Idempotent and best-effort.
+    pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
+        let held: Vec<String> = {
+            let tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
+            let mut paths: Vec<String> = tlocks
+                .get(id)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            // The bookkeeping is a `HashMap`, so sort to release in a
+            // deterministic (ascending path) order: the simulation op-stream
+            // oracle requires the backend CAS sequence to be reproducible.
+            paths.sort();
+            paths
+        };
+        for path in held {
+            let pr = paths::parse(&path).map_err(|e| {
+                TransError::with_source(format!("parsing held lock path {path:?}"), e)
+            })?;
+            match pr.typ {
+                paths::Type::CollectionInfo => self.release_root(&pr.prefix, id).await?,
+                paths::Type::Shard => {
+                    let idx = pr.suffix.parse::<u32>().map_err(|_| {
+                        TransError::other(format!("malformed shard lock path {path:?}"))
+                    })?;
+                    self.release_shard_locks(&pr.prefix, idx, id).await?;
+                }
+                // Only shards and roots carry transaction locks in v2.
+                _ => {}
+            }
+        }
+        self.clear_tx_locks(id);
+        Ok(())
     }
 
     /// Acquires this transaction's locks across every touched shard. Returns the
@@ -719,21 +782,6 @@ impl Locker {
         Ok(RootAttempt::Conflict)
     }
 
-    /// Publishes `current_writer` pointers / tombstones and releases this
-    /// transaction's locks across the shards it touched, then releases the root
-    /// membership locks. Every CAS is idempotent; errors are best-effort
-    /// (a failure leaves the locks to be reclaimed lazily by the next contender
-    /// or lease expiry), so this never fails an already-committed transaction.
-    pub async fn write_back(&self, id: &TxId, locked: &LockedTx) {
-        for group in locked.groups.values() {
-            let _ = self.write_back_shard(id, group).await;
-        }
-        for prefix in &locked.membership {
-            let _ = self.release_root(prefix, id).await;
-        }
-        self.clear_tx_locks(id);
-    }
-
     async fn write_back_shard(&self, id: &TxId, group: &ShardGroup) -> Result<(), TransError> {
         let mut backoff = self.inner.retry.backoff();
         for attempt in 0..CAS_RETRIES {
@@ -805,54 +853,6 @@ impl Locker {
                 return Ok(());
             }
         }
-        Ok(())
-    }
-
-    /// Releases every lock `id` holds across the shards and collection roots it
-    /// has acquired, **without publishing any value** and **leaving the
-    /// transaction object pending**. Unlike [`Locker::write_back`] (the
-    /// post-commit release that republishes `current_writer` pointers), this
-    /// just clears `id` from the lock holders so the transaction can re-acquire
-    /// its locks from scratch under the same id.
-    ///
-    /// This is the deadlock-timeout serial fallback's release step (ADR-024):
-    /// when a parallel acquisition blocks past the deadlock budget, the
-    /// transaction drops the locks it grabbed out of order and re-acquires them
-    /// in the global sorted order, where one contender always makes progress.
-    /// Holding the out-of-order locks across the re-acquire would recreate the
-    /// very cycle serial locking exists to break, so they must be released
-    /// first. The held set is read from the per-tx bookkeeping the same way v1's
-    /// `unlock_all` consulted `locked_paths`. Idempotent and best-effort.
-    pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
-        let held: Vec<String> = {
-            let tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
-            let mut paths: Vec<String> = tlocks
-                .get(id)
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
-            // The bookkeeping is a `HashMap`, so sort to release in a
-            // deterministic (ascending path) order: the simulation op-stream
-            // oracle requires the backend CAS sequence to be reproducible.
-            paths.sort();
-            paths
-        };
-        for path in held {
-            let pr = paths::parse(&path).map_err(|e| {
-                TransError::with_source(format!("parsing held lock path {path:?}"), e)
-            })?;
-            match pr.typ {
-                paths::Type::CollectionInfo => self.release_root(&pr.prefix, id).await?,
-                paths::Type::Shard => {
-                    let idx = pr.suffix.parse::<u32>().map_err(|_| {
-                        TransError::other(format!("malformed shard lock path {path:?}"))
-                    })?;
-                    self.release_shard_locks(&pr.prefix, idx, id).await?;
-                }
-                // Only shards and roots carry transaction locks in v2.
-                _ => {}
-            }
-        }
-        self.clear_tx_locks(id);
         Ok(())
     }
 
