@@ -2,13 +2,17 @@ name: Fuzz
 
 on:
   schedule:
-    - cron: '0 4 * * *'   # daily
+    - cron: '33 2 * * *'   # daily
   workflow_dispatch:        # allow manual runs
     inputs:
       force:
         description: 'Fuzz even if no Rust files changed since the last run'
         type: boolean
         default: false
+      duration:
+        description: 'Total fuzzing duration in minutes'
+        type: number
+        default: 30
 
 permissions:
   contents: write           # push corpus commit to main
@@ -77,12 +81,15 @@ jobs:
       if: steps.changes.outputs.run == 'true'
       run: cargo install --locked cargo-fuzz
 
-    - name: Fuzz 30 minutes total, then minimize
+    - name: Fuzz, then minimize
       if: steps.changes.outputs.run == 'true'
+      env:
+        DURATION_MINUTES: ${{ inputs.duration || 30 }}
       run: |
+        total=$((DURATION_MINUTES * 60))
         n=$(cd fuzz && cargo +nightly fuzz list | wc -l)
-        per=$((1800 / n))
-        echo "Fuzzing $n target(s) for ${per}s each (~30 min total)"
+        per=$((total / n))
+        echo "Fuzzing $n target(s) for ${per}s each (~${DURATION_MINUTES} min total)"
         if ! make fuzz FUZZ_TIME="$per"; then
           echo "::error::fuzzing failed (build error or crash); if a crash, see the uploaded fuzz-crashes artifact"
           echo "To reproduce a downloaded crash file:"
