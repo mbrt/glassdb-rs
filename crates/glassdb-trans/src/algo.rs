@@ -19,6 +19,7 @@
 //! the equal-priority livelock (one contender always wins the lowest shard).
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::TxId;
@@ -28,7 +29,7 @@ use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
 use crate::reader::Reader;
-use crate::tlocker::Locker;
+use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
 /// the serial sorted-locking fallback (ADR-020). The parallel path is fast but
@@ -37,6 +38,17 @@ use crate::tlocker::Locker;
 /// acquisition, where first-CAS-wins on the lowest contended shard guarantees
 /// one of them makes progress.
 const SERIAL_FALLBACK_AFTER: usize = 3;
+
+/// Upper bound on how long a transaction blocks acquiring its locks in the
+/// default parallel mode before suspecting a deadlock and escalating to the
+/// serial sorted-locking fallback (ADR-024). Under hold-and-wait a
+/// younger-or-equal transaction *waits* for a conflicting holder while keeping
+/// its locks; distinct priorities cannot cycle (wound-wait), but two
+/// equal-priority transactions can each wait on the other forever. This timeout
+/// bounds that wait: on elapse the transaction releases its locks and
+/// re-acquires them in the global sorted order, where one contender always
+/// completes. Reuses v1's 5s budget (ADR-002 / architecture.md).
+const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -117,9 +129,11 @@ pub struct Handle {
     /// so [`Algo::end`] knows it must abort (a pure read-only fast path never
     /// engages, so it has nothing to release).
     engaged: bool,
-    /// Per-transaction backoff, advanced before each conflict restart so a
-    /// transaction waiting on a (possibly dead) holder yields virtual time for
-    /// the holder's lease to expire instead of busy-looping.
+    /// Per-transaction backoff for the internal CAS-contention retry in
+    /// [`Algo::acquire_locks`] (a lost shard/root CAS race): advanced before each
+    /// same-id re-lock so churning contenders spread out instead of busy-looping.
+    /// The lock-holding restart paths (`restart`, `revalidate`) and the read-only
+    /// validation paths deliberately do not back off.
     backoff: Backoff,
 }
 
@@ -128,6 +142,19 @@ impl Handle {
     pub fn id(&self) -> &TxId {
         &self.id
     }
+}
+
+/// Terminal outcome of [`Algo::acquire_locks`]. CAS contention and suspected
+/// deadlocks are resolved *inside* `acquire_locks` (release + same-id re-lock),
+/// so they are not represented here — only the two outcomes the commit path must
+/// act on remain. Read-version validation happens *after* this returns
+/// [`Acquired::Locked`], so a stale read is not an acquisition outcome.
+enum Acquired {
+    /// Every lock is held; proceed to validate reads, then the commit point.
+    Locked(LockedTx),
+    /// A higher-priority peer aborted this transaction: renew the id and re-run
+    /// ([`TransError::Wounded`]).
+    Wounded,
 }
 
 /// Coordinates transactions: read validation, locking, commit, and write-back.
@@ -207,8 +234,12 @@ impl Algo {
     }
 
     /// Validates all reads and applies all writes. Returns [`TransError::Wounded`]
-    /// when a read-write transaction must abort and retry with a fresh id, or
-    /// [`TransError::Retry`] when a read-only transaction must re-run.
+    /// only when a higher-priority peer aborted this transaction, so it must
+    /// retry with a fresh id (priority preserved), or [`TransError::Retry`] when
+    /// the body must re-run in place — a read-only transaction whose reads
+    /// changed, or a read-write transaction whose read moved before it locked
+    /// the key (re-run holding its locks, ADR-024). CAS contention and suspected
+    /// deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.data.writes.is_empty() {
             return self.commit_readonly(tx).await;
@@ -219,18 +250,25 @@ impl Algo {
     /// Read-only fast path: re-resolve each read's effective writer against the
     /// shards and commit if none changed. Takes no locks and writes nothing, so
     /// it never registers with the monitor.
+    ///
+    /// A failed validation does not back off before signalling [`Retry`]: the
+    /// re-run re-reads the authoritative values (the cache was just invalidated)
+    /// rather than busy-spinning on the stale ones, and an idle delay would only
+    /// add commit latency.
+    ///
+    /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
         if self.validate_reads_inner(&tx.data).await? {
             tx.status = Status::Committed;
             return Ok(());
         }
         self.invalidate_reads(&tx.data);
-        rt::sleep(tx.backoff.next_delay()).await;
         Err(TransError::Retry)
     }
 
     /// Read-write path: lock the touched shards (and roots for membership
-    /// changes), flip the transaction object to committed, then write back.
+    /// changes), validate the reads now that their values are frozen, flip the
+    /// transaction object to committed, then write back.
     async fn commit_read_write(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
@@ -238,16 +276,21 @@ impl Algo {
             tx.engaged = true;
         }
 
-        // Stop early if a higher-priority transaction wounded us already.
-        if self.was_wounded(tx).await {
-            return self.restart(tx).await;
-        }
-
-        let serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
-        let locked = match self.locker.lock(&tx.id, &tx.data, serial).await? {
-            Some(l) => l,
-            None => return self.restart(tx).await,
+        let locked = match self.acquire_locks(tx).await? {
+            Acquired::Locked(l) => l,
+            // A higher-priority peer aborted us: renew the id and re-run.
+            Acquired::Wounded => return self.restart(tx).await,
         };
+
+        // Optimistic read validation (ADR-024): now that every touched key is
+        // locked, its value is frozen, so re-resolve each read's effective
+        // writer and check it still matches what the body observed. A read that
+        // moved before we locked means that our snapshot is stale: re-run the
+        // body to observe the new value, holding our locks and keeping our id.
+        // This is the only conflict that re-runs the body.
+        if !self.validate_reads_inner(&tx.data).await? {
+            return self.revalidate(tx).await;
+        }
 
         // Commit point: create-or-flip the transaction object to committed.
         if let Err(e) = self.commit_writes(&tx.data.writes, &tx.id).await {
@@ -271,14 +314,103 @@ impl Algo {
         Ok(())
     }
 
-    /// Backs off and signals the read-write restart: invalidate stale cached
-    /// reads (so the retry re-reads the authoritative value rather than the
-    /// stale one it would otherwise re-validate and re-conflict on) and return
-    /// [`TransError::Wounded`] so the caller renews the id and re-runs.
+    /// Signals the read-write restart after a genuine wound: invalidate stale
+    /// cached reads (so the retry re-reads the authoritative value rather than
+    /// the stale one it would otherwise re-validate and re-conflict on) and
+    /// return [`TransError::Wounded`] so the caller renews the id and re-runs.
+    /// Does not back off: the wound already aborted us (its locks are
+    /// immediately reclaimable), the locker's CAS loop backs off real lock
+    /// contention, and a delay here would only slow the renewed retry.
     async fn restart(&self, tx: &mut Handle) -> Result<(), TransError> {
         self.invalidate_reads(&tx.data);
-        rt::sleep(tx.backoff.next_delay()).await;
         Err(TransError::Wounded)
+    }
+
+    /// Acquires every lock the transaction needs, resolving both **CAS
+    /// contention** and **suspected deadlocks** internally — without renewing
+    /// the id or re-running the body (ADR-020/024). Only one non-success outcome
+    /// leaves this loop: [`Acquired::Wounded`], a higher-priority peer having
+    /// aborted us (the one conflict that must renew the id and re-run).
+    ///
+    /// - **CAS contention** (a shard/root lost its bounded CAS race): drop the
+    ///   partial locks ([`Locker::release_locks`]) and retry under the **same
+    ///   id** after backing off, so a transaction that merely lost a race never
+    ///   discards its executed body. Persistent contention escalates to the
+    ///   serial order, which removes the equal-priority livelock.
+    /// - **Suspected deadlock** (the parallel wait exceeded
+    ///   [`MAX_DEADLOCK_TIMEOUT`]): drop the out-of-order locks and re-acquire in
+    ///   the global serial sorted order, where first-CAS-wins on the lowest
+    ///   contended shard guarantees one contender always completes. Serial mode
+    ///   cannot deadlock, so it arms no timeout.
+    ///
+    /// `tx.attempts` (genuine-wound restarts) starts a heavily-restarted
+    /// transaction directly in the serial order as a backstop.
+    async fn acquire_locks(&self, tx: &mut Handle) -> Result<Acquired, TransError> {
+        let mut serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
+        let mut conflicts: usize = 0;
+        loop {
+            // A higher-priority peer may have aborted us; re-checked each
+            // iteration so a wound landing during a long wait surfaces promptly
+            // rather than driving a pointless re-lock.
+            if self.was_wounded(tx).await {
+                return Ok(Acquired::Wounded);
+            }
+            let outcome = if serial {
+                self.locker.lock(&tx.id, &tx.data, true).await
+            } else {
+                tokio::select! {
+                    res = self.locker.lock(&tx.id, &tx.data, false) => res,
+                    _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
+                }
+            };
+            match outcome {
+                Ok(LockOutcome::Locked(l)) => return Ok(Acquired::Locked(l)),
+                // CAS contention: drop the partial locks and retry under the same
+                // id after backing off — no renew, no body re-run. Escalate to
+                // the serial order if contention persists.
+                Ok(LockOutcome::Conflict) => {
+                    self.release_for_retry(tx).await?;
+                    conflicts += 1;
+                    serial = serial || conflicts >= SERIAL_FALLBACK_AFTER;
+                    rt::sleep(tx.backoff.next_delay()).await;
+                }
+                // Suspected deadlock: drop the out-of-order locks and re-acquire
+                // in the cannot-deadlock serial order, keeping our id.
+                Err(TransError::LockTimeout) => {
+                    self.release_for_retry(tx).await?;
+                    serial = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Releases every lock the transaction currently holds before an in-place,
+    /// same-id re-lock (the CAS-contention and deadlock-timeout retries). The
+    /// transaction object stays pending; only the shard/root lock entries clear.
+    async fn release_for_retry(&self, tx: &Handle) -> Result<(), TransError> {
+        self.locker
+            .release_locks(&tx.id)
+            .await
+            .map_err(|e| e.context(format!("releasing locks before re-lock for tx {}", tx.id)))
+    }
+
+    /// Signals a stale-read re-validation restart (ADR-024): a read's value moved
+    /// before it was locked, so the body must re-run to observe the new value —
+    /// but, unlike [`Algo::restart`], **holding the locks already acquired** and
+    /// **without renewing the id**. Invalidates the stale cached reads so the
+    /// re-run re-reads the authoritative values, then returns
+    /// [`TransError::Retry`], which the db retry loop re-runs in place (the
+    /// transaction object stays pending and its locks stay installed). Any lock
+    /// left on a key the re-run no longer touches is reclaimed lazily by the next
+    /// contender (ADR-021).
+    ///
+    /// Unlike [`Algo::restart`] this does **not** back off: the transaction holds
+    /// *live* locks here (its object is still pending), so sleeping would block
+    /// every peer waiting on those keys and only delay our own release.
+    async fn revalidate(&self, tx: &mut Handle) -> Result<(), TransError> {
+        self.invalidate_reads(&tx.data);
+        Err(TransError::Retry)
     }
 
     /// Reports whether the transaction was already aborted by a higher-priority
@@ -292,7 +424,8 @@ impl Algo {
 
     /// Validates the reads of a read-only transaction (the error-recovery path
     /// in the db retry loop), returning [`TransError::Retry`] if any read was
-    /// invalidated.
+    /// invalidated. It holds no locks and does not back off before signalling
+    /// the retry.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
         if !tx.data.writes.is_empty() {
             return Err(TransError::other(
@@ -303,7 +436,6 @@ impl Algo {
             return Ok(());
         }
         self.invalidate_reads(&tx.data);
-        rt::sleep(tx.backoff.next_delay()).await;
         Err(TransError::Retry)
     }
 
@@ -576,8 +708,13 @@ mod tests {
         assert_eq!(r.version.as_ref().unwrap().last_writer, *h.id());
     }
 
+    // A read whose value moved before it was locked does not abort-and-renew; it
+    // re-runs the body in place (`Retry`) while holding its locks (ADR-024). The
+    // engine validates *after* locking, so unlike a pre-lock check the moved key
+    // is itself locked during the re-run window — the v1 guarantee that the retry
+    // holds all its locks.
     #[tokio::test]
-    async fn stale_read_write_is_wounded() {
+    async fn stale_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         let keyp = paths::from_key(TEST_COLL, b"k");
@@ -593,8 +730,218 @@ mod tests {
             writes: vec![wa(&keyp, b"v3")],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(matches!(err, TransError::Wounded), "got {err:?}");
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+
+        // The moved key is locked by us when the stale read is signalled: the
+        // re-run owns the lock and cannot lose it again to the same race.
+        let e = entry(&tctx, b"k").await.expect("entry exists");
+        assert_eq!(e.locked_by, vec![h.id().clone()]);
+
         tm.end(&mut h).await.unwrap();
+    }
+
+    // ADR-024: a suspected deadlock is broken *inside* `Algo`, never surfaced. A
+    // transaction that cannot wound the holder of a lock it needs waits; the
+    // wait is bounded by `MAX_DEADLOCK_TIMEOUT`, after which the transaction
+    // releases its locks and re-acquires them in the cannot-deadlock serial
+    // order — under the *same id*, re-running no body. It never returns
+    // `LockTimeout`, and once the holder finalizes it commits.
+    #[tokio::test(start_paused = true)]
+    async fn deadlock_timeout_relocks_serially_keeping_id() {
+        use crate::tlocker::LockOutcome;
+        use std::time::Duration;
+        let (tm, tctx) = new_algo().await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        // An older holder takes the key's write lock and does not finalize.
+        let holder = TxId::with_priority(0, b"holder");
+        tctx.tmon.begin_tx(&holder);
+        let held = tm
+            .locker()
+            .lock(
+                &holder,
+                &Data {
+                    reads: Vec::new(),
+                    writes: vec![wa(&keyp, b"h")],
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(held, LockOutcome::Locked(_)),
+            "older holder should acquire its lock"
+        );
+
+        // A younger transaction wants the same key; it cannot wound the holder.
+        // Drive its commit concurrently so we can observe it parked waiting.
+        let mut h = tm.begin(Data {
+            reads: Vec::new(),
+            writes: vec![wa(&keyp, b"a")],
+        });
+        let id_before = h.id().clone();
+        let tm2 = tm.clone();
+        let committing = tokio::spawn(async move {
+            let res = tm2.commit(&mut h).await;
+            (h, res)
+        });
+
+        // Let the parallel wait time out and escalate to serial. Serial cannot
+        // wound the older peer either, so the transaction keeps waiting — it has
+        // not aborted and has surfaced no error.
+        rt::sleep(MAX_DEADLOCK_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            !committing.is_finished(),
+            "younger keeps waiting on the older holder after escalating to serial"
+        );
+
+        // Finalizing the holder releases the younger, which commits under its
+        // original id without ever surfacing `LockTimeout`.
+        tctx.tmon.abort_tx(&holder).await.unwrap();
+        let (mut h, res) = committing.await.unwrap();
+        res.expect("younger commits once the holder releases");
+        assert_eq!(
+            *h.id(),
+            id_before,
+            "the id is preserved across the serial fallback (no renew)"
+        );
+        tm.end(&mut h).await.unwrap();
+    }
+
+    /// A [`Backend`] that, once armed, makes the first `budget` shard-lock CAS
+    /// writes (`write_if` on a `/_s/` shard object) miss their precondition,
+    /// then passes through. Sustained misses force the lock acquisition past the
+    /// parallel deadlock timeout into the serial order and then exhaust the
+    /// serial CAS budget, which is the only way a `Conflict` reaches
+    /// `acquire_locks`.
+    struct FlakyShardCas {
+        inner: Arc<dyn Backend>,
+        armed: std::sync::atomic::AtomicBool,
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyShardCas {
+        fn new(inner: Arc<dyn Backend>, budget: usize) -> Arc<Self> {
+            Arc::new(FlakyShardCas {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                remaining: std::sync::atomic::AtomicUsize::new(budget),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn remaining(&self) -> usize {
+            self.remaining.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FlakyShardCas {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read(path).await
+        }
+
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read_if_modified(path, expected).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            use std::sync::atomic::Ordering;
+            if self.armed.load(Ordering::SeqCst)
+                && path.contains("/_s/")
+                && self
+                    .remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(glassdb_backend::BackendError::Precondition);
+            }
+            self.inner.write_if(path, value, expected).await
+        }
+
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    // ADR-020/024: CAS contention is resolved *inside* `Algo`. A transaction that
+    // loses the shard-lock CAS repeatedly releases its (partial) locks and
+    // re-acquires them under the *same id* — no renew, no body re-run — escalating
+    // to the serial order. It never surfaces `Wounded` for a mere lost race, and
+    // commits unchanged once the contention clears. A budget far larger than the
+    // ~handful of parallel attempts that fit before the deadlock timeout forces
+    // the serial CAS budget to be exhausted, i.e. the `Conflict` path.
+    #[tokio::test(start_paused = true)]
+    async fn cas_contention_relocks_keeping_id() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let flaky = FlakyShardCas::new(mem, 70);
+        let backend: Arc<dyn Backend> = flaky.clone();
+        let (tm, tctx) = new_algo_from_backend(backend).await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        // Seed the key over a clean connection so the shard exists (its lock CAS
+        // is then a `write_if`, the thing we fault).
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+
+        flaky.arm();
+        let mut h = tm.begin(Data {
+            reads: Vec::new(),
+            writes: vec![wa(&keyp, b"v2")],
+        });
+        let id_before = h.id().clone();
+        tm.commit(&mut h)
+            .await
+            .expect("commits despite sustained CAS contention");
+        assert_eq!(
+            *h.id(),
+            id_before,
+            "CAS contention retries under the same id (no renew)"
+        );
+        tm.end(&mut h).await.unwrap();
+
+        // The whole budget was consumed, so the transaction did exhaust the
+        // serial CAS budget (the `Conflict` path), not merely time out in
+        // parallel mode.
+        assert_eq!(flaky.remaining(), 0, "expected sustained CAS contention");
+        // It still committed: the shard points at our writer with no live lock.
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current_writer, Some(id_before));
+        assert!(e.locked_by.is_empty());
     }
 
     #[tokio::test]

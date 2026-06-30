@@ -2,13 +2,27 @@
 
 ## Status
 
-Accepted (design). **Implementation pending.** Most of the supporting machinery
-is already ported from v1 but currently **dormant**: `Monitor::wait_for_tx`
-(poll a holder to a final status; used only in tests), the `refresh_pending` /
-`start_refresh_tx` lease refresher (wired but, under release-and-retry, it almost
-never fires), and the `TransError::LockTimeout` / `ValidateRetry` control-flow
-sentinels (defined and mapped to a user error, never emitted by the v2 engine).
-This ADR wires them into the conflict path.
+Accepted and **implemented**. The supporting machinery that was dormant in the
+MVP is now wired into the conflict path: `Monitor::wait_for_tx` backs the wait,
+the `refresh_pending` / `start_refresh_tx` lease refresher is load-bearing (and
+made wound-safe), the expiry predicate is split into an absolute (skew-padded)
+lease check and an observer-relative (no-skew) progress check, and the
+deadlock-timeout → serial fallback is handled **autonomously inside `Algo`**: on
+timeout the transaction releases its locks (`Locker::release_locks`) and
+re-acquires them in the serial sorted order under the **same id**, looping
+internally — it never renews, never re-runs the body, and never surfaces the
+timeout to the `db.rs` retry loop (`TransError::LockTimeout` is only an internal
+control signal). **CAS contention** is resolved the same way: a lost shard/root
+CAS race releases the partial locks and re-acquires under the **same id** after a
+backoff (escalating to the serial order if it persists), so a transaction that
+merely lost a race never discards its executed body. Read-version validation runs
+**in `Algo`, after locking** (not in the shard CAS): once every touched key is
+locked and frozen, `Algo` re-resolves the read set's effective writers — reusing
+the read-only validation routine — and a read whose value moved re-runs the body
+holding its locks (`TransError::Retry`) instead of releasing and renewing. Body
+re-runs are therefore limited to the two cases that prove they are needed: a
+**stale read**, and a **genuine wound** (a higher-priority peer aborted us, so our
+id is dead and must be renewed).
 
 It **supersedes the MVP-only deviations** of
 [ADR-020](020-commit-write-back-protocol.md) (§ "MVP realisation" and § "MVP vs.
@@ -56,15 +70,17 @@ already exists and is deterministic under the DST executor, so the only missing
 piece is wiring the conflict path to wait rather than abort.
 
 This ADR changes **only the conflict action and its supporting lifecycle**. The
-five-phase protocol, the shard-CAS validate-and-lock, wound-wait priority, the
+five-phase protocol, the shard-CAS lock step, wound-wait priority, the
 serial-sorted lock order, the commit flip, write-back, and the on-disk formats
-are all unchanged from ADR-017–021.
+are all unchanged from ADR-017–021. (Read-version validation was later lifted out
+of the shard CAS into `Algo` — see "Read-version validation lives in `Algo`,
+after locking" — but the lock CAS itself is otherwise as in ADR-020.)
 
 ## Decision
 
 ### A younger-or-equal transaction waits, holding its locks
 
-When validate-and-lock meets an entry locked by a live **pending** holder `L`
+When the shard lock step meets an entry locked by a live **pending** holder `L`
 (in a shard or the collection root) and this transaction does **not** outrank `L`
 by wound-wait priority, it no longer returns a conflict that aborts the attempt.
 Instead it **waits** for `L` to finalize — `Monitor::wait_for_tx(L)` — while
@@ -85,18 +101,56 @@ renew its id and does not release its locks**. Its acquired locks stay installed
 in their shards/root and its transaction object stays `pending` (materialized
 lazily, below) throughout the wait, so the work already done (executed body,
 acquired locks) is preserved. A fresh id (`TxId::renew`) and a body re-run are
-reserved for the two cases that genuinely require them:
+reserved for the one case that genuinely requires them:
 
-- **Wounded** — `L` was *this* transaction and an older peer aborted it: it must
-  restart with a renewed id (preserving priority), exactly as today.
-- **Serial fallback** — a deadlock timeout (below) releases all locks before
-  re-acquiring in sorted order.
+- **Wounded** — `L` was *this* transaction and a higher-priority peer aborted it:
+  its id is dead, so it must restart with a renewed id (preserving priority),
+  exactly as today.
 
-A stale read discovered during locking re-validates against the refreshed state
-holding the locks already taken (the dormant `ValidateRetry` path); only a read
-whose value actually moved forces a body re-run, and even then under the same
-held locks rather than a released-and-renewed attempt. This is the hold-and-retry
-that the MVP replaced with release-and-retry.
+The **serial fallback** (a deadlock timeout, below) does release its locks, but
+it neither renews the id nor re-runs the body: `Algo` releases and re-acquires in
+sorted order internally, keeping the same transaction identity (v1's model).
+**Losing a CAS-contention race** is handled identically — release the partial
+locks and re-acquire under the same id after a backoff, escalating to the serial
+order if contention persists — so a lost race is no longer a renew-and-re-run
+`Wounded`; it never discards the executed body.
+
+A **stale read** re-validates against the refreshed state holding the locks
+already taken (the dormant `ValidateRetry` path); only a read whose value actually
+moved forces a body re-run, and even then under the same held locks rather than a
+released-and-renewed attempt. This validation now lives in `Algo`, **after** every
+read is locked (so its value is frozen), reusing the same effective-writer check
+as the read-only fast path (see the next section). This is the hold-and-retry that
+the MVP replaced with release-and-retry.
+
+### Read-version validation lives in `Algo`, after locking
+
+A v2 shard entry co-locates a key's **lock state** (`locked_by` / `lock_type`)
+and its **version pointer** (`current_writer`) in one object, so the first cut
+folded optimistic read validation into the shard CAS: the lock attempt compared
+the read's observed token against the resolved entry and bailed out with a
+`StaleRead` restart. That coupled the locker to optimistic-concurrency *policy*
+and left the read's shard **unlocked** on a stale bail-out, so the body re-run had
+to re-acquire it.
+
+Validation is now `Algo`'s responsibility and runs **after** all locks are held.
+Once `Locker::lock` returns `Locked`, every touched key is locked and its value
+frozen — only the write-lock holder (this transaction) can move it — so `Algo`
+re-resolves each read's effective writer through the path-based `Reader` and
+compares it to the observed token, reusing the exact routine the read-only fast
+path uses. A mismatch re-runs the body holding the locks (`Retry`). Because the
+moved key is itself locked during the re-run, this restores v1's guarantee that
+the retry holds **all** its locks (the shard-CAS variant left the stale key
+unlocked). The locker no longer carries read tokens or returns a stale-read
+outcome — `LockOutcome` is just `Locked | Conflict` — so it is a pure locking
+mechanism and read validation exists in exactly one place.
+
+Validating after locking is correct and is *not* a new TOCTOU window: a peer can
+only change a read key's effective writer by committing a write to it, which
+requires the write lock this transaction holds; a peer that committed *before* we
+locked is caught by the post-lock re-resolve, exactly as the folded check was. The
+cost is one effective-writer resolve per read after locking instead of folding it
+into the lock CAS — the same shape v1 used (`GetMetadata` after lock).
 
 ### The pending object stays lazily created (no upfront prepare)
 
@@ -206,17 +260,29 @@ as in v1:
 - Distinct priorities cannot cycle: wound-wait makes the strictly-older
   transaction wound its way forward, so it never waits on a younger holder.
 - Equal priorities can cycle (each waits on the other). A per-transaction
-  **deadlock timeout** bounds every wait; on timeout (`TransError::LockTimeout`)
-  the transaction **releases all its locks** and re-acquires them in the global
-  **serial sorted-by-object-path** order (the existing `serial` mode, ADR-020).
+  **deadlock timeout** bounds every wait. On timeout `Algo` **releases all its
+  locks** (`Locker::release_locks`, which clears the holder from each shard/root
+  it touched without publishing a value) and **re-acquires them in the global
+  serial sorted-by-object-path** order (the existing `serial` mode, ADR-020).
   Under one global order the holder of the highest lock always finds everything
   above it free, so one contender always completes — no livelock, no deadlock.
+
+This release-and-re-lock happens **entirely inside `Algo::commit`** (an internal
+loop over the locking step): the transaction keeps its **same id**, re-runs **no
+user code**, and surfaces **no error** to the `db.rs` retry loop — exactly v1's
+`serial_validate`. `TransError::LockTimeout` exists only as the internal signal
+the parallel select arm raises to trigger the release-and-serial step; it never
+escapes the engine. Releasing the out-of-order locks before re-acquiring is
+essential: re-locking serially while still holding a lock grabbed out of order
+would recreate the very cycle the sorted order exists to break.
 
 This replaces the MVP trigger for the serial fallback ("after
 `SERIAL_FALLBACK_AFTER` failed *abort-and-retry* attempts") with the v1 trigger
 ("a wait exceeded the deadlock budget"); the sorted-acquisition mechanism itself
-is unchanged. Wound-wait still uses **no prefix tiebreak** (a tiebreak would flip
-under `renew`), so equal priorities are resolved only by this serial path, as in
+is unchanged. (`SERIAL_FALLBACK_AFTER` is retained only as a secondary backstop
+that starts a heavily-restarted transaction directly in the serial order.)
+Wound-wait still uses **no prefix tiebreak** (a tiebreak would flip under
+`renew`), so equal priorities are resolved only by this serial path, as in
 ADR-020.
 
 ### Waiting is poll-based
@@ -262,9 +328,15 @@ in-doubt case.
   `Clock` / `Background` seam, so the existing serializability and cycle oracles
   exercise it unchanged.
 - The change is **localised to the conflict path and the transaction lifecycle**;
-  no on-disk format, no proto, and no change to validate-and-lock, the commit
-  flip, or write-back. The dormant `wait_for_tx` / `refresh_pending` /
-  `LockTimeout` / `ValidateRetry` machinery is activated rather than newly built.
+  no on-disk format, no proto, and no change to the shard lock CAS, the commit
+  flip, or write-back. (Read-version validation was additionally lifted out of the
+  shard CAS into `Algo`, post-lock — see "Read-version validation lives in `Algo`,
+  after locking" — leaving the locker a pure locking mechanism.) The dormant
+  `wait_for_tx` / `refresh_pending` machinery is
+  activated rather than newly built, and both the deadlock-timeout serial
+  fallback and CAS-contention retry are handled inside `Algo` (release + re-lock
+  under the same id) exactly as v1's `serial_validate` did, rather than surfaced
+  to the db retry loop.
 - After this ADR the v2 engine matches **v1's concurrency behaviour**; the only
   remaining difference from v1 is the lock **granularity** (per-shard entries vs.
   per-key objects), which is unchanged here.

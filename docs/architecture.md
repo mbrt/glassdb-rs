@@ -95,6 +95,110 @@ in-memory backend and middleware. The deterministic-simulation runtime (the
 `rt`/`exec` seam in `glassdb-concurr`) is compiled only under `--cfg sim`; see
 [PORTING.md](../PORTING.md) and [dst-approach.md](dst-approach.md).
 
+## Component Responsibilities
+
+Inside the transaction engine (`glassdb-trans`) the division of labour follows a
+deliberate **policy vs. mechanism** split, with one structural invariant: the
+**shard concept never leaks above the locker**. `Algo` decides *what* must happen
+to commit a transaction — purely in terms of logical keys (paths), the version
+tokens observed at read time, and staged writes — while the `Locker` decides
+*how* to acquire those locks efficiently, owning the mapping from keys to shard
+objects and the parallel/serial CAS. (`Reader` is likewise shard-aware
+internally but exposes a path-based API.)
+
+> The v2 shard / content-CAS model shown here supersedes the tag-based
+> description in the older *Distributed Locks* and *Single read-modify-write*
+> sections further below, which are pending a refresh.
+
+```
+                         glassdb  (public API)
+        Database · Transaction · Collection · tx_impl retry loop
+               runs the user body, collects accesses by path
+                                │  Data = reads(path, token) + writes(path, op)
+                                ▼
+═══════════════════════════ glassdb-trans ═══════════════════════════
+
+  Algo — commit POLICY  (shard-agnostic)
+    · lifecycle:        begin / rebegin / end
+    · orchestrates:     lock → validate reads → commit point → write-back
+    · conflict policy:  wound · deadlock-timeout · serial · backoff
+    · read validation:  effective-writer token vs. observed (post-lock)
+    · speaks:           Data · TxId · LockOutcome{Locked|Conflict}
+
+      │ validate           │ lock(Data, serial)  │ status        │ schedule
+      │                    │  ▲ LockedTx (opaque) │               │
+      ▼                    ▼  │                    ▼               ▼
+ ┌─────────┐   ┌───────────────────────┐   ┌──────────┐   ┌─────────┐
+ │ Reader  │   │ Locker — MECHANISM    │   │ Monitor  │   │   Gc    │
+ │ effctv. │   │ owns the SHARD model: │   │ tx-log   │   │ tx-log  │
+ │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ cleanup │
+ │ snapshot│   │ · parallel/serial CAS │   │ wound /  │   │         │
+ │ reads + │   │ · wound-wait holders  │   │ wait /   │   │         │
+ │ validate│   │ · write-back, release │   │ refresh  │   │         │
+ └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
+      │                    │                    │              │
+      ▼                    ▼                    ▼              ▼
+══════════════════════════ glassdb-storage ══════════════════════════
+  ShardStore (_s shards · _i roots) · TLogger (_t logs)
+  Global (read/write-through cache) · Local (staleness LRU)
+                                │
+                                ▼
+            glassdb-backend  (content-CAS object store: GCS / S3)
+```
+
+`Algo` is shard-agnostic by construction: in non-test code it never imports
+`ShardStore`, calls `shard_index`, or sees a `ShardEntry`. It hands the `Locker`
+a `Data` value plus a `serial: bool`, and receives a logical `LockOutcome` plus
+an opaque `LockedTx` it only passes back to `write_back`. Everything
+shard-shaped — `{prefix}/_s/<i>` objects, `ShardEntry`, `CollectionRoot`, the
+per-shard read-modify-write CAS — lives below the locker boundary.
+
+| Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
+| --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `glassdb` (`tx_impl`) | API / retry      | closures, `Error`            | user body, retry loop, cancel-safety                                                                                  | locks, shards, tx logs              |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry) | **shards**, CAS details, caching    |
+| `Locker`              | lock **mechanism** | `Data`, `TxId`, shard objects | key→shard grouping, parallel & serial acquisition, wound-wait, write-back, release             | retry *policy*, **read validation** (reports `Conflict` only) |
+| `Reader`              | read mechanism   | paths                        | effective-writer resolution, snapshot reads                                                                           | commit / lock policy                |
+| `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
+| `Gc`                  | maintenance      | `TxId`                       | scheduled tx-log cleanup                                                                                              | shards, commit policy               |
+
+### The lock boundary
+
+The single call across the policy/mechanism seam carries no shard vocabulary:
+
+```rust
+// Algo → Locker: acquire every lock the access set needs.
+async fn lock(&self, id: &TxId, data: &Data, serial: bool)
+    -> Result<LockOutcome, TransError>;
+```
+
+- **Down**: `Data` (the transaction's reads and its staged writes), plus
+  `serial` — the *only* policy signal the locker needs. The locker reads each
+  access's *path* to decide which lock to install (a read lock for a read-only
+  key, write/create/delete for a written one); it does **not** look at the
+  version token — that is validation, which is `Algo`'s job. It groups keys by
+  shard and locks them in parallel by default, or one shard at a time in sorted
+  path order when `Algo` decides contention warrants the serial fallback.
+- **Up**: `LockOutcome::Locked(LockedTx)` on success, or `LockOutcome::Conflict`
+  when a CAS race was lost — both logical, never shards. `Algo` maps `Conflict`
+  onto its policy: release and re-acquire under the same id, escalating to serial
+  and backing off.
+
+Read-version validation is **not** at this seam. Once `Locked` comes back, every
+touched key is locked and its value frozen, so `Algo` re-resolves each read's
+effective writer (via `Reader`, path-based) and compares it to the token the body
+observed. A mismatch means the value moved before the lock landed: `Algo` re-runs
+the body **holding its locks** (`Retry`). This is optimistic-concurrency policy
+over the shard-agnostic read set, and it reuses the same routine as the read-only
+fast path — so validation lives in exactly one place, never in the locker.
+
+Because the deadlock timeout, serial-escalation decision, and backoff are
+*policy*, they live in `Algo`; the locker is bounded only by an internal
+CAS-retry budget and reports sustained contention back as `Conflict` rather than
+looping forever. This keeps efficient batch acquisition — which is inherently
+shard-shaped (many keys collapse into one shard CAS) — in the one component that
+understands shards, without ever surfacing shards to the commit algorithm.
+
 ## Backend Abstraction
 
 The `Backend` trait (`glassdb-backend`) defines the contract with object

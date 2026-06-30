@@ -6,16 +6,17 @@ Accepted — implemented. Shard locking runs **in parallel by default** and fall
 back to **serial sorted-by-path acquisition** after a few
 failed attempts (see [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback)).
 
-Two deliberate simplifications remain, both **MVP-only**:
+One deliberate simplification remains, **MVP-only**:
 
-- The conflict-resolution model is **release-and-retry**, not hold-and-wait. This
-  keeps the MVP simple and refresher-free; past the MVP it becomes
-  **hold-and-wait again** (locks preserved across retries, deadlock-timeout →
-  serial fallback, lease refresh), now specified by
-  [ADR-024](024-hold-and-wait-conflict-resolution.md). See
-  [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback).
 - Write-back is **synchronous** (not yet async/batched; GC and caching are
   ADR-022/perf follow-ups).
+
+The conflict-resolution model was **release-and-retry** in the MVP; it is now
+back to **hold-and-wait** (locks preserved across waits, deadlock-timeout →
+serial fallback, load-bearing lease refresh), implemented per
+[ADR-024](024-hold-and-wait-conflict-resolution.md). The MVP-only realisation
+notes below are retained for history but are **superseded by ADR-024**; see
+[Deadlock prevention](#deadlock-prevention-and-the-serial-fallback).
 
 ## Context
 
@@ -183,11 +184,17 @@ The mechanism is unchanged; only the lock targets differ (shards + root instead 
 per-key objects), so there are typically _fewer_ objects to sort and lock, at the
 cost of coarser conflicts.
 
-> **MVP realisation:** the current engine keeps the two-mode
-> structure above but realises "wait" as **release-and-retry** rather than
-> hold-and-wait, so no transaction ever holds locks while blocked. This is a
+> **Superseded by [ADR-024](024-hold-and-wait-conflict-resolution.md):** the MVP
+> realised "wait" as release-and-retry; the engine is now back to hold-and-wait
+> (a transaction keeps its locks and waits for a conflicting holder, bounded by a
+> deadlock timeout that escalates to the serial order, with a load-bearing lease
+> refresher). The MVP description below is retained for history only.
+>
+> **MVP realisation (historical):** the MVP engine kept the two-mode
+> structure above but realised "wait" as **release-and-retry** rather than
+> hold-and-wait, so no transaction ever held locks while blocked. This was a
 > deliberate **MVP simplification** — see [the migration note](#mvp-vs-the-v1-hold-and-wait-model)
-> below for why and what replaces it.
+> below for why and what replaced it.
 >
 > - **Default (parallel) path.** All touched shards are locked concurrently (one
 >   RTT for the whole set), then the root last (it is the highest object in the
@@ -216,9 +223,13 @@ cost of coarser conflicts.
 
 #### MVP vs. the v1 hold-and-wait model
 
-The release-and-retry realisation above is an **MVP-only** choice. It trades the
+> **Resolved by [ADR-024](024-hold-and-wait-conflict-resolution.md):** the
+> reversion to hold-and-wait described in this section is now implemented. The
+> text is kept for the rationale.
+
+The release-and-retry realisation above was an **MVP-only** choice. It traded the
 efficiency of holding locks across retries for a much smaller, refresher-free,
-DST-friendly engine while the new shard/transaction-object layout is validated end
+DST-friendly engine while the new shard/transaction-object layout was validated end
 to end. Its costs are real: on a conflict the whole transaction body is re-run and
 every shard is re-CAS'd, and each `TxId::renew` orphans an aborted transaction
 object (GC debt) until ADR-022 lands.

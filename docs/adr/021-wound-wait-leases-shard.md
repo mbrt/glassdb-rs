@@ -2,22 +2,22 @@
 
 ## Status
 
-Accepted — implemented (wound-wait + lease expiry / crash recovery). One
-**MVP-only** deviation from the design below: **no background
-lease refresher** is implemented, because the MVP engine realises "wait" as
-release-and-retry ([ADR-020](020-commit-write-back-protocol.md)) and so never
-holds locks while blocked — a *pending* object therefore never lingers long
-enough to expire while its owner is live, and a *committed* object never expires.
-When the engine is ported onto v1's logic and data structures it becomes
-hold-and-wait again, at which point the **refresher returns** (a transaction that
-waits while holding locks must refresh its lease, exactly as v1 does); this is
-specified by [ADR-024](024-hold-and-wait-conflict-resolution.md), which also
-**refines the expiry predicate below**: the observer-relative grace (a missing
-object appearing, or the `timestamp` advancing, within `PENDING_TX_TIMEOUT`) owes
-no `MAX_CLOCK_SKEW` — only the absolute `timestamp`-vs-`now` check does. See
+Accepted — implemented (wound-wait + lease expiry / crash recovery). The
+MVP-only deviation noted here — **no background lease refresher** — is now
+**resolved by [ADR-024](024-hold-and-wait-conflict-resolution.md)**: the engine
+is back to hold-and-wait, so the refresher is live and load-bearing (a
+transaction that waits while holding locks refreshes its lease, exactly as v1
+does), and its first write *creates* the pending object with create-if-absent
+semantics so a wound can never be resurrected. ADR-024 also **refined the expiry
+predicate below**: the observer-relative grace (a missing object appearing, or
+the `timestamp` advancing, within `PENDING_TX_TIMEOUT`) owes no `MAX_CLOCK_SKEW`
+— only the absolute `timestamp`-vs-`now` check does. See
 [Consequences](#consequences). The `handle_unknown_tx` grace period for a lock
-that references a *missing* object is likewise deferred to GC (ADR-022), the only
+that references a *missing* object continues to lean on GC (ADR-022), the only
 thing that can delete a still-referenced object.
+
+The MVP-deviation notes inlined below are retained for history but are
+superseded by ADR-024.
 
 ## Context
 
@@ -80,22 +80,28 @@ wound/expiry stay deterministic for DST (ADR-008/013).
 A transaction that holds any lock runs a background refresher that CAS-rewrites
 its pending object's `timestamp` every `PENDING_TX_TIMEOUT / 2`, over the object's
 version, until it commits or aborts. The pending object is small (no values), so a
-refresh is cheap. If a refresh CAS finds the object already `aborted`, the
-transaction was wounded: the refresher stops and the owner's commit will fail.
-This is `refresh_pending`, relocated to the transaction object.
+refresh is cheap. Its **first** write *creates* the object with create-if-absent
+semantics, so an older peer that already wounded this transaction (wrote an
+`aborted` object before it materialized its own pending one) wins; if a refresh
+CAS finds the object already `aborted`, the transaction was wounded: the
+refresher stops and the owner's commit will fail. This is `refresh_pending`,
+relocated to the transaction object.
 
-> **MVP deviation (implementation):** the current engine does **not** run a
+> **Implemented per [ADR-024](024-hold-and-wait-conflict-resolution.md):** the
+> engine now runs this refresher and it is load-bearing — under hold-and-wait a
+> transaction can block while holding locks for far longer than
+> `PENDING_TX_TIMEOUT`, so the lease must be kept alive. The MVP-only note below
+> (no refresher) is retained for history.
+>
+> **MVP deviation (historical):** the MVP engine did **not** run a
 > refresher. v1 needs one because a transaction can _wait_ (block)
-> while holding locks for an unbounded time. The MVP instead realises "wait" as
+> while holding locks for an unbounded time. The MVP instead realised "wait" as
 > release-and-retry (see [ADR-020](020-commit-write-back-protocol.md)): a
-> transaction either acquires every lock without blocking and commits, or it
-> aborts and releases. So the window in which a *pending* object holds locks is
+> transaction either acquired every lock without blocking and committed, or it
+> aborted and released. So the window in which a *pending* object held locks was
 > bounded by a handful of synchronous CAS round-trips — far below
-> `PENDING_TX_TIMEOUT` — and a live owner is never falsely reclaimed. Once
+> `PENDING_TX_TIMEOUT` — and a live owner was never falsely reclaimed. Once
 > committed (the point after which write-back runs), the object never expires.
-> The refresher is therefore unnecessary **for the MVP only**: porting onto v1's
-> logic and data structures reintroduces hold-and-wait (a transaction blocks while
-> holding locks), at which point this refresher returns exactly as described above.
 
 ### Reclaiming a conflicting lock — the interplay with `locked_by`
 

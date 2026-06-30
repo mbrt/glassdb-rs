@@ -27,9 +27,10 @@ tags. No object tags anywhere.
     existing key touches only its shard.
   - *Transaction* (`_t/<txid>`): unified; pending (small: lease + lock
     intentions) → committed (fat: value map) → aborted.
-- **Protocol** — execute → validate+lock (one shard GET + one CAS per shard) →
-  commit (CAS the transaction object to committed, attaching values) → async
-  per-shard write-back (publish current-writer pointers + release locks).
+- **Protocol** — execute → lock (one shard GET + one CAS per shard) → validate
+  reads (re-resolve effective writers in `Algo`, post-lock) → commit (CAS the
+  transaction object to committed, attaching values) → async per-shard write-back
+  (publish current-writer pointers + release locks).
 - **Membership** — key create/delete write-lock the collection root (phantom
   prevention) and CAS the key's shard; listing OCC-validates the root version and
   enumerates, falling back to a root read lock under contention. Subcollections
@@ -88,36 +89,50 @@ Data layer landed in `glassdb-storage`: `Shard` (ADR-017), `CollectionRoot`
 (ADR-018), and the `txobject` codec over `TransactionLog` (ADR-019), each
 golden-anchored.
 
-ADR-016…021 are now behavior-complete: validate-and-lock, wound-wait with
+ADR-016…021 are now behavior-complete: locking (with read validation lifted into
+`Algo`, post-lock, ADR-024), wound-wait with
 **lease expiry** (crash recovery), the commit flip, and synchronous write-back,
 all over content CAS on shards / root / transaction objects, with priority
 preserved across retries (`TxId::renew`).
 
-Lock acquisition keeps ADR-020's two modes, with "wait" realised — **for the MVP
-only** — as release-and-retry (a transaction never blocks while holding locks).
-The reversion to **hold-and-wait** (locks preserved across retries,
-deadlock-timeout → serial, lease refresh) is now decided in
-[ADR-024](adr/024-hold-and-wait-conflict-resolution.md) (past MVP), pending
-implementation; see also [ADR-020 § MVP vs. v1](adr/020-commit-write-back-protocol.md#mvp-vs-the-v1-hold-and-wait-model).
+Lock acquisition keeps ADR-020's two modes, now with "wait" realised as
+**hold-and-wait** ([ADR-024](adr/024-hold-and-wait-conflict-resolution.md),
+implemented): a transaction keeps the locks it holds and waits for a conflicting
+holder it cannot wound, bounded by a deadlock timeout that escalates to the
+serial order, with a load-bearing lease refresher keeping its held locks alive.
 - **Parallel by default** — all touched shards are locked concurrently (then the
-  root last). On an unwinnable conflict the transaction aborts and retries with
-  its priority preserved. Deadlock-/livelock-free for distinct priorities.
-- **Serial sorted fallback (ADR-020)** — after `SERIAL_FALLBACK_AFTER` failed
-  attempts a transaction locks shards one at a time in ascending index order.
-  Two *equal-priority* transactions can livelock the parallel path (each grabs a
-  different shard first); under the single global lock order they instead queue
-  on the lowest shard, where first-CAS-wins picks a winner that always finishes.
-  Wound-wait uses **no prefix tiebreak** (it would flip under `renew` and
-  reintroduce the livelock); equal priorities are resolved only by this fallback.
+  root last). An older transaction wounds a younger holder and proceeds; a
+  younger-or-equal one **waits** for the holder to finalize, then re-resolves and
+  proceeds (committed → help-forward, aborted → drop). Reads are validated in
+  `Algo` **after** locking; a read whose value moved before it was locked re-runs
+  the body **holding its locks** (`Retry`), not via a released-and-renewed
+  restart. Deadlock-/livelock-free for distinct priorities.
+- **Deadlock timeout → serial sorted fallback (ADR-020/024)** — a parallel wait
+  that exceeds `MAX_DEADLOCK_TIMEOUT` (5s) makes `Algo` release the locks
+  (`Locker::release_locks`) and re-acquire them one shard at a time in ascending
+  index order (`SERIAL_FALLBACK_AFTER` failed attempts is a backstop trigger).
+  This happens **inside `Algo::commit`** — an internal loop over the locking step
+  that keeps the **same id** and re-runs no user body (v1's `serial_validate`);
+  the `LockTimeout` signal never reaches the `db.rs` retry loop. Two
+  *equal-priority* transactions can wait-cycle on the parallel path (each holds a
+  different shard); under the single global lock order they instead queue on the
+  lowest shard, where first-CAS-wins picks a winner that always finishes.
+  Wound-wait uses **no prefix tiebreak** (it would flip under `renew`); equal
+  priorities are resolved only by this fallback.
+- **CAS contention → same-id retry (ADR-020/024)** — losing a shard/root CAS race
+  (the bounded retry budget exhausted under churn) is resolved by the same
+  internal loop: release the partial locks and re-acquire under the **same id**
+  after a backoff, escalating to the serial order if it persists. A lost race no
+  longer aborts-renews-and-re-runs (`Wounded`); the executed body is preserved.
+  Body re-runs are limited to a **stale read** (`Retry`, holding locks) and a
+  **genuine wound** (renew + re-run, the only case whose id is dead).
 
-One designed mechanism is intentionally **not load-bearing in the MVP**, because
-in release-and-retry a transaction aborts rather than blocks while holding locks:
-- **No load-bearing lease refresher (ADR-021)** — a *pending* object never
-  lingers long enough to expire while live (its lock window is a few synchronous
-  CAS round-trips), and a *committed* object never expires. The refresher becomes
-  load-bearing with the v1 hold-and-wait port
-  ([ADR-024](adr/024-hold-and-wait-conflict-resolution.md)), where a transaction
-  can block while holding locks.
+The lease refresher is now **load-bearing (ADR-021/024)**: under hold-and-wait a
+live transaction can hold locks far longer than `PENDING_TX_TIMEOUT`, so the
+background refresher keeps its lease alive. Its first write *creates* the pending
+object (create-if-absent), so it can never resurrect itself over a wound; expiry
+combines an absolute (skew-padded) lease check with an observer-relative
+(no-skew) no-progress check.
 
 The engine deliberately defers:
 - **GC ([ADR-022](adr/022-garbage-collection-mark-sweep.md))** — synchronous
@@ -234,21 +249,30 @@ Each design decision becomes its own ADR (next free number is 025).
   [ADR-009](adr/009-in-doubt-conditional-writes.md) for in-doubt parity at the
   new CAS sites.
 - **[ADR-024](adr/024-hold-and-wait-conflict-resolution.md) — Hold-and-wait
-  conflict resolution.** ✅ Written (design); implementation pending. Past the
-  MVP, reinstate v1's **hold-and-wait**: a younger-or-equal transaction **waits**
-  (polling via `wait_for_tx`) for a conflicting holder while **keeping its locks
-  and transaction object** instead of aborting-and-retrying, with the lease
-  refresher (ADR-021) made load-bearing. The pending object **stays lazily
-  created** (no upfront prepare); a held lock is bridged by the
-  `handle_unknown_tx` grace period until the refresher materializes it. A
-  **deadlock timeout** bounds the wait and escalates to the
-  serial sorted-by-path acquisition; older-wounds-younger and ADR-009 in-doubt
-  parity are unchanged. Supersedes the MVP-only release-and-retry / no-refresher
-  deviations of ADR-020/021 and **refines ADR-021's expiry predicate**: the
-  observer-relative grace (timestamp-advance / object-appearance within
-  `PENDING_TX_TIMEOUT`) owes no `MAX_CLOCK_SKEW`; only the absolute
-  `timestamp`-vs-`now` check does. Activates the dormant `wait_for_tx` /
-  `refresh_pending` / `LockTimeout` / `ValidateRetry` machinery.
+  conflict resolution.** ✅ Implemented. Reinstates v1's **hold-and-wait**: a
+  younger-or-equal transaction **waits** (polling via `wait_for_tx`) for a
+  conflicting holder while **keeping its locks and transaction object** instead
+  of aborting-and-retrying, with the lease refresher (ADR-021) made load-bearing.
+  The pending object **stays lazily created** (no upfront prepare); a held lock is
+  bridged by the `handle_unknown_tx` grace period until the refresher
+  materializes it (create-if-absent, so a wound is never resurrected). A
+  **deadlock timeout** (`MAX_DEADLOCK_TIMEOUT` = 5s) bounds the wait and is broken
+  **inside `Algo`** (v1's `serial_validate`): on timeout it releases its locks
+  (`Locker::release_locks`) and re-acquires them in the serial sorted-by-path
+  order under the **same id**, re-running no body and never surfacing
+  `LockTimeout` to the db retry loop; older-wounds-younger and ADR-009 in-doubt
+  parity are unchanged. **CAS contention** is handled by the same internal loop —
+  release the partial locks and re-acquire under the same id after a backoff — so
+  a lost race no longer renews-and-re-runs (`Wounded`); body re-runs are limited
+  to a stale read found when `Algo` validates after locking (re-run **holding its
+  locks**, `Retry`) and a genuine wound (renew + re-run). Supersedes the MVP-only
+  release-and-retry /
+  no-refresher deviations of ADR-020/021 and **refines ADR-021's expiry
+  predicate**: the observer-relative grace (timestamp-advance / object-appearance
+  within `PENDING_TX_TIMEOUT`) owes no `MAX_CLOCK_SKEW`; only the absolute
+  `timestamp`-vs-`now` check does. Activated the dormant `wait_for_tx` /
+  `refresh_pending` machinery and added `Locker::release_locks` for the serial
+  fallback's release step.
 
 ## Open points checklist
 
@@ -273,20 +297,25 @@ Group B — protocol details:
 - [x] Resolution of the "effective current writer" when a committed-but-not-
       written-back write-lock holder exists (relocated `validate_locked_read` +
       help-forward) (ADR-020).
-- [x] Deadlock/livelock fallback: parallel locking by default; after
-      `SERIAL_FALLBACK_AFTER` failed attempts, serial sorted-by-shard-index
-      acquisition (ADR-020). Both abort-and-retry rather than block; the serial
-      path's single global lock order (first-CAS-wins on the lowest shard) is what
-      gives equal-priority transactions progress. Wound-wait uses **no prefix
-      tiebreak** (it would flip under `TxId::renew` and livelock); priority is
-      preserved on retry. Regression-tested for the wound decision and
-      cross-shard liveness.
+- [x] Deadlock/livelock fallback: parallel locking by default; a wait that
+      exceeds `MAX_DEADLOCK_TIMEOUT` (or `SERIAL_FALLBACK_AFTER` failed attempts)
+      escalates to serial sorted-by-shard-index acquisition (ADR-020/024),
+      **inside `Algo`**: it releases its locks and re-acquires them under the same
+      id (no renew, no body re-run, no error surfaced — v1's `serial_validate`).
+      Under hold-and-wait a younger-or-equal transaction **waits** holding its
+      locks rather than aborting; the serial path's single global lock order
+      (first-CAS-wins on the lowest shard) is what gives equal-priority
+      transactions progress. Wound-wait uses **no prefix tiebreak** (it would flip
+      under `TxId::renew` and livelock); priority is preserved on retry.
+      Regression-tested for the wound decision, the wait-then-proceed paths, the
+      deadlock-timeout escalation, and cross-shard liveness.
 - [x] Lease refresh cadence and the expiry/wound CAS sequence; reuse of existing
       timeout constants — lease is the object `timestamp`, reclaim if older-or-
-      expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW` (ADR-021). Implemented in
-      the transaction engine; the background refresher is unnecessary there (the
-      engine never blocks while holding locks). Creation point (pending object at prepare) is
-      ADR-020.
+      expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW` (ADR-021). The background
+      refresher is **load-bearing** under hold-and-wait (ADR-024): it lazily
+      *creates* the pending object (create-if-absent, wound-safe) and CAS-bumps the
+      `timestamp` every `PENDING_TX_TIMEOUT / 2`. Expiry combines the absolute
+      (skew-padded) check with an observer-relative (no-skew) no-progress check.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
       (ADR-020). The single-RW fast path's shard-CAS commit point is a further
