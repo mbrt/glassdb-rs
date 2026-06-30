@@ -26,9 +26,23 @@ fn refresh_timeout() -> Duration {
     PENDING_TX_TIMEOUT / 2
 }
 
+/// Absolute lease check (ADR-021): compares the holder's own wall-clock lease
+/// `timestamp` against the observer's `now`. The comparison crosses machines, so
+/// it is padded by `MAX_CLOCK_SKEW`. Lets a waiter immediately reclaim a holder
+/// whose last refresh is already ancient the first time it is seen.
 fn is_expired(last_refresh: SystemTime, now: SystemTime) -> bool {
     // Go: now.Sub(lastRefresh.Add(maxClockSkew)) > pendingTxTimeout
     match now.duration_since(last_refresh + MAX_CLOCK_SKEW) {
+        Ok(d) => d > PENDING_TX_TIMEOUT,
+        Err(_) => false,
+    }
+}
+
+/// Observer-relative check (ADR-024): both endpoints are the observer's *own*
+/// clock — the time it first saw a fact (a missing object, or a lease
+/// `timestamp` value) and `now` — so **no** `MAX_CLOCK_SKEW` is added.
+fn is_expired_no_skew(first_seen: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(first_seen) {
         Ok(d) => d > PENDING_TX_TIMEOUT,
         Err(_) => false,
     }
@@ -51,11 +65,23 @@ struct WaitRequest {
     tx: oneshot::Sender<WaitTxResult>,
 }
 
+/// Observer-relative liveness tracker for a watched remote pending transaction
+/// (ADR-024). Remembers the last lease `timestamp` seen on the holder's object
+/// and the observer-clock time it was first seen at that value; if the value
+/// does not advance within `PENDING_TX_TIMEOUT` of `observed_at` (no skew, since
+/// both endpoints are the observer's own clock) the holder has stopped making
+/// progress and is treated as dead.
+struct PendingProgress {
+    last_seen: SystemTime,
+    observed_at: SystemTime,
+}
+
 #[derive(Default)]
 struct State {
     local_tx: HashMap<TxId, TxStatusEntry>,
     waiters: HashMap<TxId, Vec<WaitRequest>>,
     unknown_tx: HashMap<TxId, SystemTime>,
+    pending_progress: HashMap<TxId, PendingProgress>,
 }
 
 struct Inner {
@@ -427,14 +453,66 @@ impl Monitor {
         match status.status {
             TxCommitStatus::Unknown => self.handle_unknown_tx(tid).await,
             TxCommitStatus::Pending => {
-                if is_expired(status.last_update, self.inner.clock.now()) {
+                let now = self.inner.clock.now();
+                // Absolute lease check (foreign clock — skew applies): a holder
+                // whose last refresh is already ancient is reclaimed at once.
+                // Observer-relative progress check (one clock — no skew): a
+                // holder that stops bumping its lease `timestamp` while a waiter
+                // watches it is dead within `PENDING_TX_TIMEOUT` (ADR-024).
+                if is_expired(status.last_update, now)
+                    || self.pending_no_progress(tid, status.last_update, now)
+                {
+                    self.clear_pending_progress(tid);
                     self.try_abort_remote_tx(tid, &status.version).await
                 } else {
                     Ok(TxCommitStatus::Pending)
                 }
             }
-            s => Ok(s),
+            s => {
+                // Finalized: drop the observer-relative progress tracking.
+                self.clear_pending_progress(tid);
+                Ok(s)
+            }
         }
+    }
+
+    /// Observer-relative no-progress check (ADR-024). Records the lease
+    /// `timestamp` seen on the holder's pending object and when (observer clock)
+    /// it was first seen at that value. Returns `true` only if the value has not
+    /// advanced within `PENDING_TX_TIMEOUT` of that first sight — comparing two
+    /// values from the *same* observer clock, so no `MAX_CLOCK_SKEW` is owed.
+    fn pending_no_progress(&self, tid: &TxId, last_update: SystemTime, now: SystemTime) -> bool {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        match st.pending_progress.get_mut(tid) {
+            None => {
+                st.pending_progress.insert(
+                    tid.clone(),
+                    PendingProgress {
+                        last_seen: last_update,
+                        observed_at: now,
+                    },
+                );
+                false
+            }
+            Some(p) => {
+                if p.last_seen != last_update {
+                    // The lease advanced: progress. Reset the window.
+                    p.last_seen = last_update;
+                    p.observed_at = now;
+                    false
+                } else {
+                    is_expired_no_skew(p.observed_at, now)
+                }
+            }
+        }
+    }
+
+    fn clear_pending_progress(&self, tid: &TxId) {
+        self.shard_for(tid)
+            .lock()
+            .unwrap()
+            .pending_progress
+            .remove(tid);
     }
 
     async fn handle_unknown_tx(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
@@ -450,7 +528,11 @@ impl Monitor {
             }
         };
 
-        if is_expired(first_check, now) {
+        // Observer-relative grace: the object must *appear* within
+        // `PENDING_TX_TIMEOUT` of first sight. Both endpoints are the observer's
+        // own clock, so this owes no `MAX_CLOCK_SKEW` (ADR-024 refines ADR-021,
+        // which over-granted this window by reusing the skew-padded check).
+        if is_expired_no_skew(first_check, now) {
             let res = self
                 .try_abort_remote_tx(tid, &backend::Version::default())
                 .await;
@@ -630,6 +712,24 @@ impl Monitor {
         }
     }
 
+    /// Background lease refresher (ADR-021/ADR-024). Under hold-and-wait a live
+    /// transaction can block while holding locks for far longer than
+    /// `PENDING_TX_TIMEOUT`, so this loop keeps its lease fresh until the
+    /// transaction commits or aborts (`should_refresh` flips). It is
+    /// load-bearing: its **first** write *creates* the pending transaction
+    /// object with create-if-absent semantics, materializing the lazily-created
+    /// object (ADR-024); thereafter it CAS-bumps the `timestamp` over the
+    /// object's version every `PENDING_TX_TIMEOUT / 2`.
+    ///
+    /// Create-if-absent is what keeps lazy materialization wound-safe: if an
+    /// older peer already wounded this transaction (wrote an `aborted` object)
+    /// before it materialized its own pending one, the create loses, the
+    /// refresher observes the final status, stops, and the owner's commit fails
+    /// — it can never resurrect itself over a wound. A later refresh CAS that
+    /// finds the object `aborted` is the same wound signal once materialized.
+    /// Transient backend failures (in-doubt, unavailable) are retried rather
+    /// than abandoning the lease, since re-applying a pending refresh is
+    /// idempotent and convergent (ADR-009).
     async fn refresh_pending(&self, tid: TxId) {
         if !self.should_refresh(&tid) {
             return;
@@ -647,6 +747,8 @@ impl Monitor {
             tl.timestamp = Some(start);
 
             let r = if last_version.is_unset() {
+                // First materialization: create-if-absent so a pre-existing
+                // `aborted` object (an older peer's wound) wins.
                 self.inner.tl.set(&tl).await
             } else {
                 self.inner.tl.set_if(&tl, &last_version).await
@@ -659,7 +761,25 @@ impl Monitor {
                         e.last_version = last_version.clone();
                     }
                 }
-                Err(_) => return,
+                // The create lost (object already exists) or the CAS version
+                // moved under us. Re-read: a final status is a wound (or a race
+                // we lost) — stop and let the owner observe it; a still-pending
+                // status means we adopt its version and keep refreshing.
+                Err(StorageError::Precondition) => {
+                    match self.inner.tl.commit_status(&tid).await {
+                        Ok(st) if st.status.is_final() => {
+                            self.mark_local_aborted(&tid, st.status);
+                            return;
+                        }
+                        Ok(st) => last_version = st.version,
+                        // Couldn't read it back; retry on the next cycle.
+                        Err(_) => {}
+                    }
+                }
+                // In-doubt or other transient failures: keep the lease alive by
+                // retrying on the next cycle rather than abandoning a live
+                // holder's locks to false reclamation.
+                Err(_) => {}
             }
         }
     }
@@ -831,6 +951,64 @@ mod tests {
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
         mon.abort_tx(&tx).await.unwrap();
+    }
+
+    // ADR-024: a peer that repeatedly polls a *live* holder over a span far
+    // beyond `PENDING_TX_TIMEOUT` never reclaims it, because the refresher bumps
+    // the lease timestamp every `PENDING_TX_TIMEOUT/2`, so the observer always
+    // sees progress (neither the absolute lease nor the relative no-progress
+    // check fires).
+    #[tokio::test(start_paused = true)]
+    async fn live_holder_not_reclaimed_across_long_wait() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, _t) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let (observer, _o) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let tx = TxId::from_bytes(b"live".to_vec());
+        mon.begin_tx(&tx);
+        mon.start_refresh_tx(&tx);
+
+        // 50s total, far past the 15s timeout, polled every 5s.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert_eq!(
+                observer.tx_status(&tx).await.unwrap(),
+                TxCommitStatus::Pending
+            );
+        }
+
+        mon.abort_tx(&tx).await.unwrap();
+        assert_eq!(
+            observer.tx_status(&tx).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
+    }
+
+    // ADR-024: a crashed holder whose pending object exists but stops being
+    // refreshed is reclaimed within `PENDING_TX_TIMEOUT` by the observer-relative
+    // no-progress check — even though its absolute (skew-padded) lease is nowhere
+    // near expiry — once a watcher has seen it make no progress for that long.
+    #[tokio::test(start_paused = true)]
+    async fn dead_holder_reclaimed_by_relative_progress() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let tx = TxId::from_bytes(b"dead".to_vec());
+
+        // A pending object stamped "now" that never refreshes (a crashed
+        // holder). Its absolute lease stays valid for `PENDING_TX_TIMEOUT +
+        // MAX_CLOCK_SKEW`, so only the relative check can reclaim it sooner.
+        let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        tl.timestamp = Some(mon.clock_now());
+        t.tl.set(&tl).await.unwrap();
+
+        // First sight records the progress baseline; still pending.
+        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
+
+        // No progress for longer than the timeout on the observer's own clock.
+        tokio::time::sleep(PENDING_TX_TIMEOUT + Duration::from_secs(1)).await;
+
+        // The stalled holder is reclaimed (aborted), well before its absolute
+        // lease would have expired.
+        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
     }
 
     // Tiny helper to build a TxWrite in tests.

@@ -2,6 +2,8 @@
 
 ## Development
 
+- No need to update PORTING.md anymore. This project is now independent of the original Go project.
+
 ### Tests
 
 Always use `make test-all` to run tests. This runs format checks, linting

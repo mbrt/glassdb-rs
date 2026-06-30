@@ -443,8 +443,8 @@ impl DbInner {
                 Ok(()) => break Ok(value),
                 Err(TransError::Wounded) => {
                     // A higher-priority transaction aborted us. Release whatever
-                    // we were holding and restart with a fresh ID that preserves
-                    // our priority, so we are not starved on the retry.
+                    // we held and restart with a fresh id that preserves our
+                    // priority, so we are not starved on the retry.
                     if let Some(h) = handle.as_mut() {
                         let _ = self.algo.end(h).await;
                     }

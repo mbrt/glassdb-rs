@@ -169,10 +169,17 @@ layer, matched directly (`matches!(e, BackendError::NotFound)` rather than Go's
   normalizes the backend variants here so callers match `StorageError::NotFound`
   directly instead of unwrapping a nested backend error.
 - `TransError`: the engine's control-flow errors — `Retry` (Go `ErrRetry`),
-  `AlreadyFinalized`, `Wounded` (Go `ErrWounded`; a wound-wait abort, consumed by
-  the database retry loop which restarts the victim with a renewed ID), and the
-  **internal** `ValidateRetry` (Go `errValidateRetry`) and
-  `LockTimeout` / `NoSingleWrite`. Storage/backend failures stay wrapped in
+  `AlreadyFinalized`, `Wounded` (Go `ErrWounded`; a wound-wait abort by a
+  higher-priority peer, consumed by the database retry loop which restarts the
+  victim with a renewed ID), and the **internal** `LockTimeout`, `ValidateRetry`
+  (Go `errValidateRetry`), and `NoSingleWrite`. `LockTimeout` is a suspected
+  deadlock (the parallel wait exceeded `MAX_DEADLOCK_TIMEOUT`); like v1 it is
+  handled **inside `Algo`** — the engine releases its locks and re-acquires them
+  in the serial sorted order under the same id — so it never escapes to the
+  database retry loop (ADR-024). A lost CAS-contention race is handled the same
+  way (release + same-id re-lock after a backoff, escalating to the serial
+  order), so it is no longer surfaced as `Wounded` either. Storage/backend
+  failures stay wrapped in
   `Storage(StorageError)`; the few call sites that need a specific storage
   outcome match through it (e.g. `TransError::Storage(StorageError::NotFound)`).
   There is no `Cancelled` variant.
@@ -180,10 +187,15 @@ layer, matched directly (`matches!(e, BackendError::NotFound)` rather than Go's
   `AlreadyFinalized`, `InDoubt`, `ShuttingDown`, `InvalidInput`, `Internal`.
 
 Each layer converts into the next with `From`, mapping sentinels losslessly.
-Care was taken that **internal** control-flow errors never leak: e.g.
-`ValidateRetry` is consumed by `Algo::commit`'s validation loop, and the public
-retry loop only treats `TransError::Retry` (not `ValidateRetry`) as a retry —
-matching the original transaction loop, which only reacts to `ErrRetry`.
+Care was taken that **internal** control-flow errors never leak: the v2
+stale-read path surfaces `TransError::Retry` directly (`Algo` validates the read
+set **after** locking, and a read whose value moved before it was locked re-runs
+the body **holding its locks**, ADR-024), so the database retry loop reacts only
+to `Retry` and `Wounded`. It never sees `LockTimeout` or a CAS-contention conflict
+(both consumed inside `Algo`, which releases and re-acquires its locks under the
+same id — serial order for a suspected deadlock) nor the internal `ValidateRetry`
+sentinel (kept for parity with the Go engine but unused on the v2 stale-read
+path).
 
 ## Encoding fidelity
 
