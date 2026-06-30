@@ -124,16 +124,22 @@ impl DatabaseBuilder {
         // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::with_config(local.clone(), tl.clone(), bg_weak.clone(), clock, retry);
+        let tmon = Monitor::with_config(
+            local.clone(),
+            tl.clone(),
+            bg_weak.clone(),
+            clock.clone(),
+            retry,
+        );
         let reader = Reader::new(local.clone(), shards.clone(), tmon.clone(), retry);
         let locker = Locker::new(shards.clone(), tmon.clone(), retry);
         let gc = Gc::new(bg_weak.clone(), tl);
         gc.start();
         let algo = Algo::new(
-            global.clone(),
             local.clone(),
             locker,
             tmon.clone(),
+            clock,
             gc,
             Some(bg_weak),
             reader,
@@ -277,8 +283,10 @@ impl Database {
     /// close. Counters only increase; subtract snapshots for intervals.
     pub fn stats(&self) -> Stats {
         let bstats = self.inner.backend.stats_and_reset();
+        let lstats = self.inner.algo.locker().stats_and_reset();
         let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
+        s.add_lock(&lstats);
         *s
     }
 

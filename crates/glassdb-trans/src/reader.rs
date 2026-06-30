@@ -128,7 +128,7 @@ impl Reader {
     /// `Some(writer)` if the key currently exists, `None` if it is absent or
     /// tombstoned. Always reads the shard fresh (no value cache), so the commit
     /// path observes the authoritative coordination state.
-    pub async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
+    pub(crate) async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
         let (prefix, raw_key) = paths::split_key(key)
             .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
         let (shard, _) = self
