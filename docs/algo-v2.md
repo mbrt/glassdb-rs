@@ -153,7 +153,7 @@ the `Backend` trait is slimmed (ADR-023).
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 026).
+Each design decision becomes its own ADR (next free number is 027).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -292,6 +292,16 @@ Each design decision becomes its own ADR (next free number is 026).
   per-object lock step, so the ADR-020/021/024 protocol, priorities, serial
   fallback, and ADR-009 in-doubt recovery are all unchanged; re-activates the
   dormant `Dedup`, `Locker::close`, and `Locker::dedup_snapshot`.
+- **[ADR-026](adr/026-dedup-shard-release-write-back.md) — Deduplicated shard
+  release and write-back.** ✅ Implemented (follow-up to ADR-025). Extends the
+  ADR-025 `Dedup` to also batch **write-back** and
+  **release** on the same object path, so N committing/aborting transactions on
+  one shard collapse from N GET+CAS to one — closing the release-side half of the
+  within-shard false sharing that ADR-025 removed from acquisition. Releases are
+  the most mergeable operations (they never lock-conflict; write-back sets only
+  the committing tx's own monotonic pointer), so a release-only request is
+  reorderable — the v2 analog of v1 marking unlocks reorderable. Stays beneath
+  the per-object step, leaving the ADR-020/021/024/009 semantics unchanged.
 
 ## Open points checklist
 
@@ -384,16 +394,9 @@ Group E — backends:
       (`read`, `read_if_modified`, `write`, `write_if`, `write_if_not_exists`,
       `delete`, `list`); content CAS only; ADR-009 in-doubt parity
       (`glassdb-backend`).
-- [ ] Cache tagless coordination objects via version/ETag-conditional reads.
+- [x] Cache tagless coordination objects via version/ETag-conditional reads.
       Today `ShardStore` full-fetches every shard/root read (the writer-tag
-      `read_if_modified` is unusable on these tagless objects). **Designed in
-      [ADR-023](adr/023-slimmed-backend-trait.md):** `read_if_modified` is
-      re-keyed to the object version (`If-None-Match` → `304`/`Precondition`), and
-      the retained `Global` cache is re-pointed at it so a hot unchanged shard
-      revalidates without transferring its body; the ETag changes on every content
-      write, which is exactly when to invalidate. This is what makes the "shard
-      (conditional GET)" in *Direction at a glance* real. See the `TODO(perf)` in
-      `glassdb-storage::shardstore`.
+      `read_if_modified` is unusable on these tagless objects).
 - [x] S3 mapping — `S3Backend` on the slimmed trait: `If-Match` /
       `If-None-Match` conditional writes, ETag versions, no nonce/tags and
       `delete_if` removed (`glassdb-backend-s3`).

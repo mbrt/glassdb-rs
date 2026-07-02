@@ -141,7 +141,8 @@ Because the change is confined beneath the per-object step:
   `release_shard_locks`, `release_root`): they are idempotent, version-
   conditional, and best-effort, so a concurrent acquire CAS merely retries.
   Deduplicating write-back is a possible future extension, deliberately out of
-  scope here to keep the change confined to acquisition.
+  scope here to keep the change confined to acquisition (proposed in
+  [ADR-026](026-dedup-shard-release-write-back.md)).
 - **Cancellation** stays safe: on the `MAX_DEADLOCK_TIMEOUT` drop, `Algo` drops
   the `lock` future, and `Dedup`'s `DriverGuard` / `WaiterDropGuard` hand off or
   prune the in-flight round. A handed-off owner may still install the dropped
