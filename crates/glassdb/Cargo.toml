@@ -14,6 +14,7 @@ workspace = true
 
 [dependencies]
 glassdb-data = { workspace = true }
+glassdb-proto = { workspace = true }
 glassdb-backend = { workspace = true }
 glassdb-backend-s3 = { workspace = true, optional = true }
 glassdb-backend-gcs = { workspace = true, optional = true }
@@ -21,6 +22,7 @@ glassdb-storage = { workspace = true }
 glassdb-trans = { workspace = true }
 glassdb-concurr = { workspace = true }
 futures = "0.3.32"
+prost = "0.14.3"
 thiserror = "2.0.18"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tokio-util = "0.7.18"
