@@ -13,9 +13,8 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::global::Global;
-use crate::local::{Local, MAX_STALENESS};
 use crate::lock::LockType;
+use crate::object_cache::ObjectCache;
 
 /// The commit state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,17 +96,15 @@ pub struct PathLock {
 #[derive(Clone)]
 pub struct TLogger {
     prefix: String,
-    global: Global,
-    local: Local,
+    objects: ObjectCache,
 }
 
 impl TLogger {
     /// Creates a logger storing logs under `prefix`.
-    pub fn new(global: Global, local: Local, prefix: impl Into<String>) -> Self {
+    pub fn new(objects: ObjectCache, prefix: impl Into<String>) -> Self {
         TLogger {
             prefix: prefix.into(),
-            global,
-            local,
+            objects,
         }
     }
 
@@ -116,17 +113,16 @@ impl TLogger {
     /// body (ADR-019); an absent object means the transaction is unknown.
     pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
-        // A finalized (committed/aborted) log is immutable, so a fresh cached
-        // copy can answer without a backend revalidation round-trip.
-        if let Some(lr) = self.local.read(&p, MAX_STALENESS)
-            && !lr.outdated
-            && let Ok(ts) = decode_status(&lr.value, lr.version.b.clone())
+        // A finalized (committed/aborted) log is immutable, so a cached copy can
+        // answer without a backend revalidation round-trip.
+        if let Some(o) = self.objects.peek(&p)
+            && let Ok(ts) = decode_status(&o.value, o.version)
             && ts.status.is_final()
         {
             return Ok(ts);
         }
-        match self.global.read(&p).await {
-            Ok(gr) => decode_status(&gr.value, gr.version.b),
+        match self.objects.read(&p).await {
+            Ok(gr) => decode_status(&gr.value, gr.version),
             Err(StorageError::NotFound) => Ok(TxStatus {
                 status: TxCommitStatus::Unknown,
                 last_update: UNIX_EPOCH,
@@ -146,7 +142,7 @@ impl TLogger {
     pub async fn set(&self, l: &TxLog) -> Result<backend::Version, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let buf = marshal_log(l, ts)?;
-        self.global
+        self.objects
             .write_if_not_exists(
                 &paths::from_transaction(&self.prefix, &l.id),
                 Arc::from(buf),
@@ -162,7 +158,7 @@ impl TLogger {
     ) -> Result<backend::Version, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let buf = marshal_log(l, ts)?;
-        self.global
+        self.objects
             .write_if(
                 &paths::from_transaction(&self.prefix, &l.id),
                 Arc::from(buf),
@@ -174,7 +170,7 @@ impl TLogger {
     /// Removes the log for `id`, ignoring not-found errors.
     pub async fn delete(&self, id: &TxId) -> Result<(), StorageError> {
         match self
-            .global
+            .objects
             .delete(&paths::from_transaction(&self.prefix, id))
             .await
         {
@@ -186,19 +182,17 @@ impl TLogger {
 
     async fn read_log(&self, id: &TxId) -> Result<pb::TransactionLog, StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
-        // A finalized log is immutable, so a fresh cached copy is authoritative.
-        // A pending log can still change, so fall through to a read-through that
-        // revalidates via the version-conditional GET (the ETag changes on every
-        // content write — refresh or finalization — ADR-023).
-        if let Some(lr) = self.local.read(&p, MAX_STALENESS)
-            && !lr.outdated
-        {
-            let log = parse_log(&lr.value)?;
+        // A finalized log is immutable, so a cached copy is authoritative. A
+        // pending log can still change, so fall through to a read-through that
+        // revalidates via the version-conditional GET (the backend version
+        // changes on every content write — refresh or finalization — ADR-023).
+        if let Some(o) = self.objects.peek(&p) {
+            let log = parse_log(&o.value)?;
             if log.status() != pb::transaction_log::Status::Pending {
                 return Ok(log);
             }
         }
-        let gr = self.global.read(&p).await?;
+        let gr = self.objects.read(&p).await?;
         parse_log(&gr.value)
     }
 }
@@ -436,13 +430,14 @@ fn proto_ts_to_system(ts: prost_types::Timestamp) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::SharedCache;
     use glassdb_backend::memory::MemoryBackend;
 
     fn new_tlogger() -> TLogger {
-        let local = Local::new(1 << 20);
+        let cache = SharedCache::new(1 << 20);
         let backend = Arc::new(MemoryBackend::new());
-        let global = Global::new(backend, local.clone());
-        TLogger::new(global, local, "db")
+        let objects = ObjectCache::new(backend, &cache);
+        TLogger::new(objects, "db")
     }
 
     #[tokio::test]

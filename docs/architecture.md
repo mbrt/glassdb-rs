@@ -83,7 +83,7 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
 | `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `monitor.rs`, `reader.rs`, `gc.rs`                  | Transaction engine: commit algorithm, distributed locker, lifecycle monitor, read path, log GC                                                |
-| `glassdb-storage`     | `global.rs`, `local.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs`   | Backend read/write-through cache, local cache with staleness, lock-state value type, transaction-log persistence, version tracking, generic LRU |
+| `glassdb-storage`     | `object_cache.rs`, `value_cache.rs`, `shardstore.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Object cache (read/write-through, version-keyed), value cache (writer-keyed, staleness), shard/root CAS store, lock-state value type, transaction-log persistence, version tracking, generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`, `gopath.rs`                              | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
@@ -140,7 +140,7 @@ internally but exposes a path-based API.)
       ▼                    ▼                    ▼              ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
   ShardStore (_s shards · _i roots) · TLogger (_t logs)
-  Global (read/write-through cache) · Local (staleness LRU)
+  ObjectCache (read/write-through) · ValueCache (staleness LRU)
                                 │
                                 ▼
             glassdb-backend  (content-CAS object store: GCS / S3)
@@ -597,14 +597,14 @@ GlassDB uses a three-layer caching architecture to minimize backend calls:
                   │ tx.read / tx.write
                   ▼
 ┌───────────────────────────────────────┐
-│         Local Cache (per-DB)          │
+│           ValueCache (per-DB)         │
 │  Staleness tracking, outdated flags   │
-│  Caches values keyed by their version │
+│  Caches values keyed by their writer  │
 └─────────────────┬─────────────────────┘
                   │ cache miss or stale
                   ▼
 ┌───────────────────────────────────────┐
-│     Global Cache (read-through)       │
+│      ObjectCache (read-through)       │
 │  Uses read_if_modified to avoid full  │
 │  downloads if the version is unchanged│
 └─────────────────┬─────────────────────┘
@@ -615,25 +615,36 @@ GlassDB uses a three-layer caching architecture to minimize backend calls:
 └───────────────────────────────────────┘
 ```
 
+Two facades share **one** byte-weighted LRU (a single `cache_size` budget),
+keyed by two disjoint identities (ADR-023): user values by their **writer**, and
+coordination objects by their **backend version**. Both are built from a
+`SharedCache` handle rather than one depending on the other.
+
 **LRU Cache** (`glassdb-storage/src/cache.rs`). A thread-safe, byte-weighted LRU
 cache (default 512 MiB, configurable via `DatabaseBuilder::cache_size`). Entries
-are evicted least-recently-used first when the total size exceeds the limit.
+are evicted least-recently-used first when the total size exceeds the limit. A
+`SharedCache` wraps one instance and hands it to both facades below.
 
-**Local Cache** (`glassdb-storage/src/local.rs`). Wraps the LRU cache with
-staleness awareness. Each entry stores a value with its backend `Version` and
-tracks when it was last updated and whether it has been marked outdated (e.g.,
-because a concurrent transaction invalidated it). Relative staleness uses
-`tokio::time::Instant` so it stays deterministic under paused time (see
-[PORTING.md](../PORTING.md), "Time and determinism").
+**ValueCache** (`glassdb-storage/src/value_cache.rs`). The writer-keyed facade
+for user values, with staleness awareness. A value lives in the transaction
+object of whichever transaction last committed it, so it is identified by that
+**writer**, not a backend object version. Each entry tracks when it was last
+updated and whether it has been marked outdated (e.g., because a concurrent
+transaction invalidated it). Relative staleness uses `tokio::time::Instant` so it
+stays deterministic under paused time (see [PORTING.md](../PORTING.md), "Time and
+determinism").
 
-**Global Cache** (`glassdb-storage/src/global.rs`). A read-through and
-write-through layer over the backend. On reads, it uses the version-conditional
-`read_if_modified` to avoid re-downloading objects whose version hasn't changed.
-On writes, it updates the local cache with the new value and version immediately.
+**ObjectCache** (`glassdb-storage/src/object_cache.rs`). The backend-version-keyed,
+read-through / write-through facade for coordination objects (shards, roots,
+transaction logs). On reads it uses the version-conditional `read_if_modified` to
+avoid re-downloading objects whose backend version hasn't changed; on writes it
+updates the cache with the new bytes and version immediately. `ShardStore` and
+`TLogger` read and compare-and-swap through it, so a hot unchanged shard/root/log
+revalidates without re-transferring its body.
 
-After a transaction commits, its written values are cached locally. Subsequent
-transactions on the same client can read them without hitting the backend,
-unless another client modifies the same keys.
+After a transaction commits, its written values are cached in the `ValueCache`.
+Subsequent transactions on the same client can read them without hitting the
+backend, unless another client modifies the same keys.
 
 ## Data Model
 
@@ -679,18 +690,21 @@ The `Collection` helpers (`read`, `read_stale`, `write`, `delete`, `update`,
 
 ### Versioning
 
-The `Version` type in `glassdb-storage/src/version.rs` combines two sources of
-truth:
+Two version identities are kept separate (ADR-023):
 
+- **Writer** — the storage-layer `Version` in `glassdb-storage/src/version.rs` is
+  writer-only (`data::TxId`): the transaction that last committed the value. A
+  value lives in that transaction object's body (ADR-019), so the writer *is* the
+  value's identity. This is what the `ValueCache` keys on.
 - **Backend version** (`backend::Version`): the opaque CAS token assigned by
-  object storage, used for conditional operations and for cache revalidation via
-  the version-conditional `read_if_modified`.
-- **Writer** (`data::TxId`): the transaction that last wrote the value. In v2 it
-  is read from the committed transaction object's body (ADR-019), not from a tag.
+  object storage, used for conditional writes and for cache revalidation via the
+  version-conditional `read_if_modified`. It identifies a coordination object's
+  content, so it is tracked in the `ObjectCache` entries (not in the storage
+  `Version`).
 
 During validation, the algorithm detects concurrent modifications by comparing
-the observed writer/version against the current state. The backend version is
-the CAS token for the conditional write that takes the lock.
+the observed writer against the current state; the backend version is the CAS
+token for the conditional write that takes the lock.
 
 ## Garbage Collection
 

@@ -49,7 +49,7 @@ impl Collection {
     pub async fn read_stale(&self, key: &[u8], max_staleness: Duration) -> Result<Vec<u8>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
-            self.db.local.clone(),
+            self.db.values.clone(),
             self.db.shards.clone(),
             self.db.tmon.clone(),
             self.db.retry,

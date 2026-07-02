@@ -962,7 +962,7 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_data::shard::shard_index;
-    use glassdb_storage::{Global, Local, Shard, TLogger, TxCommitStatus};
+    use glassdb_storage::{ObjectCache, Shard, SharedCache, TLogger, TxCommitStatus, ValueCache};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -973,12 +973,13 @@ mod tests {
     }
 
     fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
-        let local = Local::new(1024);
-        let global = Global::new(b.clone(), local.clone());
-        let tl = TLogger::new(global.clone(), local.clone(), "test");
+        let cache = SharedCache::new(1024);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(b.clone(), &cache);
+        let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(local.clone(), tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(b.clone());
+        let mon = Monitor::new(values.clone(), tl, Arc::downgrade(&bg));
+        let shards = ShardStore::new(objects.clone());
         let locker = Locker::new(shards.clone(), mon.clone(), RetryConfig::default());
         (
             locker,
