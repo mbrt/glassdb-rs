@@ -150,6 +150,16 @@ pub struct ShardEntry {
     #[prost(bool, tag = "5")]
     pub deleted: bool,
 }
+/// Database-level metadata, written once at `{name}/glassdb` when a database is
+/// first opened. Its presence marks the database as initialized; `version` gates
+/// on-disk format compatibility. A message (not a bare string) so new metadata
+/// fields can be added without breaking existing databases.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatabaseMetadata {
+    /// On-disk format version identifier (e.g. "v2").
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+}
 /// The collection root object: collection existence, the (constant) shard count,
 /// the subcollection directory, and the membership lock that serializes
 /// create/delete against listing. See ADR-018.

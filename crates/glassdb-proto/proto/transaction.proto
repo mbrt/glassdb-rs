@@ -72,6 +72,15 @@ message ShardEntry {
     bool deleted = 5;
 }
 
+// Database-level metadata, written once at `{name}/glassdb` when a database is
+// first opened. Its presence marks the database as initialized; `version` gates
+// on-disk format compatibility. A message (not a bare string) so new metadata
+// fields can be added without breaking existing databases.
+message DatabaseMetadata {
+    // On-disk format version identifier (e.g. "v2").
+    string version = 1;
+}
+
 // The collection root object: collection existence, the (constant) shard count,
 // the subcollection directory, and the membership lock that serializes
 // create/delete against listing. See ADR-018.
