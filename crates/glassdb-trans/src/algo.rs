@@ -268,7 +268,8 @@ impl Algo {
 
     /// Read-write path: lock the touched shards (and roots for membership
     /// changes), validate the reads now that their values are frozen, flip the
-    /// transaction object to committed, then write back.
+    /// transaction object to committed, then spawn the write-back in the
+    /// background so commit returns without waiting for it.
     async fn commit_read_write(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
@@ -303,15 +304,32 @@ impl Algo {
         }
         tx.status = Status::Committed;
 
-        // Write-back publishes pointers and releases locks. Idempotent and
-        // best-effort: the transaction is already durably committed, so a
-        // write-back failure only delays lazy lock cleanup, never the result.
-        // TODO: Do it in the background to not delay commit return
-        self.locker.write_back(&tx.id, &locked).await;
+        self.write_back(&tx.id, locked).await;
         // GC is inert in v2 (ADR-022 deferred); this records nothing but keeps
         // the write-back hook wired for the future mark-sweep collector.
         self.gc.schedule_tx_cleanup(tx.id.clone());
         Ok(())
+    }
+
+    /// Publishes the committed transaction's pointers and releases its locks.
+    /// Idempotent and best-effort: the transaction is already durably committed,
+    /// so a write-back failure only delays lazy lock cleanup, never the result.
+    /// It is spawned in the background so commit returns immediately rather than
+    /// waiting for the pointer publishes and lock releases; a shutdown drains
+    /// the spawned task (`Background::spawn_waited`). Without a background
+    /// executor (unit tests, or after shutdown dropped it) it releases inline so
+    /// locks are not left to lazy reclaim.
+    async fn write_back(&self, id: &TxId, locked: LockedTx) {
+        match self.background.as_ref().and_then(|w| w.upgrade()) {
+            Some(bg) => {
+                let locker = self.locker.clone();
+                let id = id.clone();
+                bg.spawn_waited(async move {
+                    locker.write_back(&id, &locked).await;
+                });
+            }
+            None => self.locker.write_back(id, &locked).await,
+        }
     }
 
     /// Signals the read-write restart after a genuine wound: invalidate stale

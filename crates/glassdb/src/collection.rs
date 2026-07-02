@@ -7,7 +7,7 @@ use glassdb_backend::Backend;
 use glassdb_data::paths;
 use glassdb_data::shard::SHARD_COUNT;
 use glassdb_storage::CollectionRoot;
-use glassdb_trans::Reader;
+use glassdb_trans::{Reader, Resolver};
 
 use crate::db::DbInner;
 use crate::error::Error;
@@ -122,8 +122,9 @@ impl Collection {
     /// Keys live in the collection's shard objects (the v2 key directory,
     /// ADR-017), not in per-key objects. A single `list` of the shard prefix
     /// enumerates the populated shards; each is read and its live (committed,
-    /// non-tombstoned) entries are unioned. The result is sorted for a stable
-    /// listing.
+    /// non-tombstoned) entries are unioned, help-forwarding committed holders so
+    /// a just-committed key lists before its (asynchronous) write-back publishes
+    /// the `current_writer` pointer. The result is sorted for a stable listing.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
         let shard_paths = self
             .db
@@ -131,22 +132,18 @@ impl Collection {
             .list(&paths::shards_prefix(&self.prefix))
             .await
             .map_err(|e| Error::from_read(e.into()))?;
-        let store = &self.db.shards;
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut indices = Vec::with_capacity(shard_paths.len());
         for sp in shard_paths {
-            let idx = paths::shard_index_of(&sp)
-                .map_err(|e| Error::with_source(format!("parsing shard path {sp:?}"), e))?;
-            let (shard, _) = store
-                .load_shard(&self.prefix, idx)
-                .await
-                .map_err(Error::from_read)?;
-            keys.extend(
-                shard
-                    .entries()
-                    .filter(|e| e.exists())
-                    .map(|e| e.key.clone()),
+            indices.push(
+                paths::shard_index_of(&sp)
+                    .map_err(|e| Error::with_source(format!("parsing shard path {sp:?}"), e))?,
             );
         }
+        let resolver = Resolver::new(self.db.shards.clone(), self.db.tmon.clone());
+        let mut keys = resolver
+            .live_keys(&self.prefix, &indices)
+            .await
+            .map_err(Error::from_read)?;
         keys.sort();
         Ok(KeysIter::new(keys))
     }
