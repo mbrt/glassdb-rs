@@ -5,10 +5,10 @@
 //! therefore resolves its shard entry to an *effective writer* (help-forwarding
 //! a committed-but-not-written-back exclusive holder, dropping aborted/expired
 //! holders) and then materializes the value from that writer's transaction
-//! object through the [`Monitor`]. Resolved values are cached in [`Local`],
-//! keyed by writer, so a hot key does not re-resolve its shard on every read;
-//! the cache is invalidated by the commit path when validation detects a stale
-//! read.
+//! object through the [`Monitor`]. Resolved values are cached in the
+//! [`ValueCache`], keyed by writer, so a hot key does not re-resolve its shard
+//! on every read; the cache is invalidated by the commit path when validation
+//! detects a stale read.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Local, LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus, Version,
+    LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus, ValueCache, Version,
 };
 
 use crate::error::TransError;
@@ -67,20 +67,20 @@ impl Resolved {
 /// writer and materializing the value from that writer's transaction object.
 #[derive(Clone)]
 pub struct Reader {
-    local: Local,
+    values: ValueCache,
     shards: ShardStore,
     tmon: Monitor,
     retry: RetryConfig,
 }
 
 impl Reader {
-    /// Creates a reader over local storage, the shard coordination store, and a
-    /// monitor. The `shards` store is shared (it is a thin, uncached handle over
-    /// the backend); shard objects must be read fresh because they carry no
-    /// writer-tag the read-through cache could key on.
-    pub fn new(local: Local, shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
+    /// Creates a reader over the value cache, the shard coordination store, and
+    /// a monitor. The `shards` store revalidates shard objects by their backend
+    /// version (ADR-023), so a read always observes the current coordination
+    /// state without re-transferring an unchanged shard's body.
+    pub fn new(values: ValueCache, shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
         Reader {
-            local,
+            values,
             shards,
             tmon,
             retry,
@@ -110,7 +110,7 @@ impl Reader {
     /// A single read attempt: local cache then shard resolution. Wrapped by
     /// [`Reader::read`] for in-place retries.
     async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
-        if let Some(lr) = self.local.read(key, max_stale)
+        if let Some(lr) = self.values.read(key, max_stale)
             && !lr.outdated
         {
             if lr.deleted {
@@ -220,15 +220,12 @@ impl Reader {
         writer: glassdb_data::TxId,
         value: glassdb_storage::TValue,
     ) -> Result<ReadValue, StorageError> {
-        let version = Version {
-            b: glassdb_backend::Version::default(),
-            writer,
-        };
+        let version = Version { writer };
         if value.deleted {
-            self.local.mark_deleted(key, version);
+            self.values.mark_deleted(key, version);
             return Err(StorageError::NotFound);
         }
-        self.local.write(key, value.value.clone(), version.clone());
+        self.values.write(key, value.value.clone(), version.clone());
         Ok(ReadValue {
             value: value.value,
             version,

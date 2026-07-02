@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Global, Local, ShardStore, TLogger};
+use glassdb_storage::{ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Reader, TransError};
 use tokio::sync::Notify;
 
@@ -108,11 +108,15 @@ impl DatabaseBuilder {
 
         let backend = Arc::new(StatsBackend::new(b));
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let local = Local::new(cache_size);
-        let global = Global::new(dyn_backend, local.clone());
-        // One shared, uncached shard/root coordination store over the backend.
-        let shards = ShardStore::new(backend.clone());
-        let tl = TLogger::new(global.clone(), local.clone(), &name);
+        // One shared LRU sized by `cache_size` backs both cache facades: the
+        // writer-keyed value cache and the backend-version-keyed object cache.
+        let cache = SharedCache::new(cache_size);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(dyn_backend, &cache);
+        // The shard/root coordination store reads/writes through the object
+        // cache, so a hot shard revalidates without re-transferring its body.
+        let shards = ShardStore::new(objects.clone());
+        let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
         let clock = if deterministic_time {
             Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
@@ -125,18 +129,18 @@ impl DatabaseBuilder {
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
         let tmon = Monitor::with_config(
-            local.clone(),
+            values.clone(),
             tl.clone(),
             bg_weak.clone(),
             clock.clone(),
             retry,
         );
-        let reader = Reader::new(local.clone(), shards.clone(), tmon.clone(), retry);
+        let reader = Reader::new(values.clone(), shards.clone(), tmon.clone(), retry);
         let locker = Locker::new(shards.clone(), tmon.clone(), retry);
         let gc = Gc::new(bg_weak.clone(), tl);
         gc.start();
         let algo = Algo::new(
-            local.clone(),
+            values.clone(),
             locker,
             tmon.clone(),
             clock,
@@ -149,7 +153,7 @@ impl DatabaseBuilder {
             name,
             backend,
             shards,
-            local,
+            values,
             tmon,
             algo,
             retry,
@@ -167,7 +171,7 @@ pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) backend: Arc<StatsBackend>,
     pub(crate) shards: ShardStore,
-    pub(crate) local: Local,
+    pub(crate) values: ValueCache,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
     pub(crate) retry: RetryConfig,
@@ -375,7 +379,7 @@ impl DbInner {
     {
         let tx = Transaction::new(
             self.shards.clone(),
-            self.local.clone(),
+            self.values.clone(),
             self.tmon.clone(),
             self.retry,
         );

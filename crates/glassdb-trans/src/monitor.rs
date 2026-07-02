@@ -12,7 +12,7 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    Local, MAX_STALENESS, StorageError, TLogger, TValue, TxCommitStatus, TxLog, Version,
+    MAX_STALENESS, StorageError, TLogger, TValue, TxCommitStatus, TxLog, ValueCache, Version,
 };
 use tokio::sync::oneshot;
 
@@ -85,7 +85,7 @@ struct State {
 }
 
 struct Inner {
-    local: Local,
+    values: ValueCache,
     tl: TLogger,
     // Weak so a `Monitor` clone captured inside a spawned task does not keep
     // the [`Background`] alive across DB shutdown. The single strong owner
@@ -116,8 +116,14 @@ pub(crate) struct KeyCommitStatus {
 
 impl Monitor {
     /// Creates a monitor using the real wall-clock and default retry timing.
-    pub fn new(local: Local, tl: TLogger, background: Weak<Background>) -> Self {
-        Self::with_config(local, tl, background, Clock::real(), RetryConfig::default())
+    pub fn new(values: ValueCache, tl: TLogger, background: Weak<Background>) -> Self {
+        Self::with_config(
+            values,
+            tl,
+            background,
+            Clock::real(),
+            RetryConfig::default(),
+        )
     }
 
     /// Creates a monitor with a custom clock (used in tests for deterministic
@@ -125,7 +131,7 @@ impl Monitor {
     /// tunes the backoff used when polling a peer transaction's commit status
     /// and when writing a transaction's final log.
     pub fn with_config(
-        local: Local,
+        values: ValueCache,
         tl: TLogger,
         background: Weak<Background>,
         clock: Clock,
@@ -133,7 +139,7 @@ impl Monitor {
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
-                local,
+                values,
                 tl,
                 background,
                 clock,
@@ -218,15 +224,14 @@ impl Monitor {
         }
 
         let version = Version {
-            b: backend::Version::default(),
             writer: tl.id.clone(),
         };
         for entry in &tl.writes {
             if entry.deleted {
-                self.inner.local.mark_deleted(&entry.path, version.clone());
+                self.inner.values.mark_deleted(&entry.path, version.clone());
             } else {
                 self.inner
-                    .local
+                    .values
                     .write(&entry.path, entry.value.clone(), version.clone());
             }
         }
@@ -367,7 +372,7 @@ impl Monitor {
         key: &str,
         tid: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
-        if let Some(lr) = self.inner.local.read(key, MAX_STALENESS)
+        if let Some(lr) = self.inner.values.read(key, MAX_STALENESS)
             && lr.version.writer == *tid
         {
             return Ok(KeyCommitStatus {
@@ -767,11 +772,11 @@ mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
-    use glassdb_storage::{Global, LockType, PathLock, TxWrite};
+    use glassdb_storage::{LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache};
 
     struct TestCtx {
         tl: TLogger,
-        global: Global,
+        objects: ObjectCache,
         // The clock the monitor was built with, so tests can stamp tx logs with
         // the monitor's own notion of "now".
         clock: Clock,
@@ -786,12 +791,13 @@ mod tests {
     }
 
     fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
-        let local = Local::new(1024);
-        let global = Global::new(b, local.clone());
-        let tl = TLogger::new(global.clone(), local.clone(), "test");
+        let cache = SharedCache::new(1024);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(b, &cache);
+        let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
-            local,
+            values,
             tl.clone(),
             Arc::downgrade(&bg),
             clock.clone(),
@@ -801,7 +807,7 @@ mod tests {
             mon,
             TestCtx {
                 tl,
-                global,
+                objects,
                 clock,
                 _bg: bg,
             },
@@ -843,7 +849,7 @@ mod tests {
         let (mon2, _t2) = new_test_monitor(b.clone());
         let key = paths::from_key("example", b"key");
 
-        t1.global.write(&key, Arc::from(&b"x"[..])).await.unwrap();
+        t1.objects.write(&key, Arc::from(&b"x"[..])).await.unwrap();
 
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);

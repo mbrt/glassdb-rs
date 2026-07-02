@@ -5,8 +5,14 @@
 Accepted — implemented. The trait change is the **cutover** step of the v2
 effort: it landed once the DST oracles were re-pointed at the v2 layout and the
 v1 tag-based commit path was retired (it was the last consumer of tags). The
-storage caching layer (`Global`, `Local`, `Locker`) is **retained and adapted**,
-not deleted (see [Cutover](#cutover--keep-and-re-point-the-caching-layer)).
+storage caching layer (`ObjectCache`, `ValueCache`, `Locker`) is **retained and
+adapted**, not deleted (see
+[Cutover](#cutover--keep-and-re-point-the-caching-layer)).
+
+> Naming note: the caches were later renamed for clarity — `Global` →
+> `ObjectCache` (backend-version-keyed) and `Local` → `ValueCache`
+> (writer-keyed), both now built from a shared LRU. The names below use the
+> current ones; the decision is unchanged.
 
 ## Context
 
@@ -18,8 +24,8 @@ has ten methods, shaped by the tag-based layout it was built for
   (`lock-type`, `locked-by`, `last-writer`) and is flipped by a conditional
   metadata update.
 - `read_if_modified(path, &WriterId)` + the `last-writer` tag — cache
-  revalidation: the read-through cache (`Global`) skips the body download when the
-  object's *last-writer tag* is unchanged.
+  revalidation: the read-through cache (`ObjectCache`) skips the body download when
+  the object's *last-writer tag* is unchanged.
 - `get_metadata` — a tag/version read with no body.
 - `delete_if` — a conditional delete used on the GC / unlock-create path.
 
@@ -77,7 +83,7 @@ read_if_modified(path, expected: &Version) -> Result<ReadReply, BackendError>
 
 It returns the full object when the stored version differs from `expected`, and
 `BackendError::Precondition` to mean *"not modified — your cached copy is still
-current."* This is a deliberate reuse of the existing convention: `Global::read`
+current."* This is a deliberate reuse of the existing convention: `ObjectCache::read`
 already treats a `Precondition` from `read_if_modified` as "unchanged, serve the
 cached entry", so the cache contract carries over verbatim — only the condition
 (version instead of writer tag) changes.
@@ -143,13 +149,13 @@ sequencing is:
 
 1. Re-point the DST oracles (serializability, cycle ring) at the v2 layout.
 2. Retire the v1 tag-based commit path.
-3. **Keep `Global` / `Local` / `Locker`** and adapt them to the slimmed
-   interface. In particular, re-point `Global`'s read-through revalidation from
-   the writer-tag `read_if_modified` to the **version-conditional** one, and route
-   shard/root reads back through the cache, so a hot unchanged shard revalidates
-   without a body transfer. These modules are the substrate for re-introducing
-   proper caching over the new interface; deleting them is **not** part of the
-   cutover.
+3. **Keep `ObjectCache` / `ValueCache` / `Locker`** and adapt them to the slimmed
+   interface. In particular, re-point `ObjectCache`'s read-through revalidation
+   from the writer-tag `read_if_modified` to the **version-conditional** one, and
+   route shard/root reads back through the cache, so a hot unchanged shard
+   revalidates without a body transfer. These modules are the substrate for
+   re-introducing proper caching over the new interface; deleting them is **not**
+   part of the cutover.
 4. Slim the `Backend` trait to the seven methods above.
 5. Simplify the three backends and the middleware.
 6. Regenerate the golden vectors and the `RecordingBackend` byte-stream
@@ -162,9 +168,9 @@ sequencing is:
 - The cached conditional-GET read of *Direction at a glance* becomes real: the
   version-conditional `read_if_modified` lets the cache revalidate the tagless
   coordination objects (Group E in [`docs/algo-v2.md`](../algo-v2.md)).
-- The `Global` / `Locker` caching layer is **preserved and re-pointed**, not
+- The `ObjectCache` / `Locker` caching layer is **preserved and re-pointed**, not
   rewritten: the cache logic is reused, with only its revalidation condition
-  swapped from the writer tag to the ETag.
+  swapped from the writer tag to the object version.
 - S3 sheds the nonce and the `delete_if` TOCTOU window; GCS's version token
   simplifies to a single generation.
 - It is a **breaking change** for any external `Backend` implementation, and the

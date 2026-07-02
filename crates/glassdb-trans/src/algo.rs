@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::TxId;
-use glassdb_storage::{Local, TxCommitStatus, TxLog, TxWrite, Version};
+use glassdb_storage::{TxCommitStatus, TxLog, TxWrite, ValueCache, Version};
 
 use crate::error::TransError;
 use crate::gc::Gc;
@@ -71,11 +71,9 @@ pub struct ReadVersion {
 }
 
 impl ReadVersion {
-    /// Converts to a storage version (writer-only; the backend version is unused
-    /// in v2 since shards carry no per-key backend version).
+    /// Converts to a storage version (the writer that last committed the value).
     pub(crate) fn to_storage_version(&self) -> Version {
         Version {
-            b: glassdb_backend::Version::default(),
             writer: self.last_writer.clone(),
         }
     }
@@ -160,7 +158,7 @@ enum Acquired {
 /// Coordinates transactions: read validation, locking, commit, and write-back.
 #[derive(Clone)]
 pub struct Algo {
-    local: Local,
+    values: ValueCache,
     reader: Reader,
     locker: Locker,
     mon: Monitor,
@@ -176,7 +174,7 @@ impl Algo {
     /// transaction-id timestamps; pass the same clock the monitor uses so
     /// priorities and lease timing share one time base.
     pub fn new(
-        local: Local,
+        values: ValueCache,
         locker: Locker,
         mon: Monitor,
         clock: Clock,
@@ -185,7 +183,7 @@ impl Algo {
         reader: Reader,
     ) -> Self {
         Algo {
-            local,
+            values,
             reader,
             locker,
             mon,
@@ -494,7 +492,7 @@ impl Algo {
     fn invalidate_reads(&self, data: &Data) {
         for r in &data.reads {
             if let Some(v) = &r.version {
-                self.local
+                self.values
                     .mark_value_outdated(&r.path, v.to_storage_version());
             }
         }
@@ -532,15 +530,15 @@ mod tests {
     use glassdb_data::paths;
     use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        CollectionRoot, Global, Local, MAX_STALENESS, ShardEntry, ShardStore, StorageError,
-        TLogger, TxCommitStatus,
+        CollectionRoot, MAX_STALENESS, ObjectCache, ShardEntry, ShardStore, SharedCache,
+        StorageError, TLogger, TxCommitStatus, ValueCache,
     };
 
     const TEST_COLL: &str = "testp";
 
     struct Tctx {
         backend: Arc<dyn Backend>,
-        local: Local,
+        values: ValueCache,
         tlogger: TLogger,
         tmon: Monitor,
         shards: ShardStore,
@@ -551,18 +549,19 @@ mod tests {
     }
 
     async fn new_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
-        let local = Local::new(1024);
-        let global = Global::new(b.clone(), local.clone());
-        let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
+        let cache = SharedCache::new(1024);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(b.clone(), &cache);
+        let tlogger = TLogger::new(objects.clone(), TEST_COLL);
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         // Leak the background so spawned async aborts can run for the test's
         // lifetime without us threading the owner through every helper.
         std::mem::forget(bg);
-        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
-        let shards = ShardStore::new(b.clone());
+        let tmon = Monitor::new(values.clone(), tlogger.clone(), bg_weak.clone());
+        let shards = ShardStore::new(objects.clone());
         let reader = Reader::new(
-            local.clone(),
+            values.clone(),
             shards.clone(),
             tmon.clone(),
             RetryConfig::default(),
@@ -580,7 +579,7 @@ mod tests {
             .unwrap();
 
         let algo = Algo::new(
-            local.clone(),
+            values.clone(),
             locker,
             tmon.clone(),
             Clock::real(),
@@ -592,7 +591,7 @@ mod tests {
             algo,
             Tctx {
                 backend: b,
-                local,
+                values,
                 tlogger,
                 tmon,
                 shards,
@@ -624,7 +623,7 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(
-            tctx.local.clone(),
+            tctx.values.clone(),
             tctx.shards.clone(),
             tctx.tmon.clone(),
             RetryConfig::default(),
