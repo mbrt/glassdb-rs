@@ -2,27 +2,22 @@
 //!
 //! A key's value no longer lives in a per-key object; it lives in the
 //! transaction object of whichever transaction last committed it. Reading a key
-//! therefore resolves its shard entry to an *effective writer* (help-forwarding
-//! a committed-but-not-written-back exclusive holder, dropping aborted/expired
-//! holders) and then materializes the value from that writer's transaction
-//! object through the [`Monitor`]. Resolved values are cached in the
-//! [`ValueCache`], keyed by writer, so a hot key does not re-resolve its shard
-//! on every read; the cache is invalidated by the commit path when validation
-//! detects a stale read.
+//! therefore resolves its shard entry to an *effective writer* — delegated to
+//! the [`Resolver`], the shared home for that coordination step — and then
+//! materializes the value from that writer's transaction object through the
+//! [`Monitor`]. Resolved values are cached in the [`ValueCache`], keyed by
+//! writer, so a hot key does not re-resolve its shard on every read; the cache
+//! is invalidated by the commit path when validation detects a stale read.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::shard::shard_index;
-use glassdb_data::{TxId, paths};
-use glassdb_storage::{
-    LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus, ValueCache, Version,
-};
+use glassdb_storage::{ShardStore, StorageError, TxCommitStatus, ValueCache, Version};
 
-use crate::error::TransError;
+use crate::error::trans_to_storage;
 use crate::monitor::Monitor;
+use crate::resolver::Resolver;
 
 /// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
 /// outcome before the error is surfaced. Reads are idempotent (ADR-009), so
@@ -42,52 +37,28 @@ pub struct ReadValue {
     pub version: Version,
 }
 
-/// A read key grouped for batched resolution: its full storage path (the map
-/// key of the returned effective-writer set) paired with its decoded raw key
-/// (the shard-entry lookup key).
-type KeyRef = (Arc<str>, Vec<u8>);
-
-/// The resolved view of a shard entry, after help-forwarding committed holders.
-#[derive(Debug, Clone, Default)]
-struct Resolved {
-    /// The effective committed writer holding the key's value (the MVCC
-    /// pointer), or `None` if the key has no committed value.
-    writer: Option<TxId>,
-    /// Whether that writer's value for the key is a tombstone.
-    deleted: bool,
-}
-
-impl Resolved {
-    /// The existence-aware validation token: the effective writer iff the key
-    /// currently exists (committed and not tombstoned), else `None`. This is the
-    /// value a read observes, so it is what optimistic validation compares.
-    fn token(self) -> Option<TxId> {
-        match self.writer {
-            Some(w) if !self.deleted => Some(w),
-            _ => None,
-        }
-    }
-}
-
 /// Reads values by resolving a key's shard entry to its effective committed
-/// writer and materializing the value from that writer's transaction object.
+/// writer (via the [`Resolver`]) and materializing the value from that writer's
+/// transaction object.
 #[derive(Clone)]
 pub struct Reader {
+    resolver: Resolver,
     values: ValueCache,
-    shards: ShardStore,
     tmon: Monitor,
     retry: RetryConfig,
 }
 
 impl Reader {
     /// Creates a reader over the value cache, the shard coordination store, and
-    /// a monitor. The `shards` store revalidates shard objects by their backend
-    /// version (ADR-023), so a read always observes the current coordination
-    /// state without re-transferring an unchanged shard's body.
+    /// a monitor. Effective-writer resolution is delegated to a [`Resolver`]
+    /// built over the same `shards`/`tmon`; the shard store revalidates shard
+    /// objects by their backend version (ADR-023), so a read always observes the
+    /// current coordination state without re-transferring an unchanged shard's
+    /// body.
     pub fn new(values: ValueCache, shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
         Reader {
+            resolver: Resolver::new(shards, tmon.clone()),
             values,
-            shards,
             tmon,
             retry,
         }
@@ -130,61 +101,10 @@ impl Reader {
         self.resolve_value(key).await
     }
 
-    /// Returns the effective committed writer of every `key` (the validation
-    /// tokens): `Some(writer)` if the key currently exists, `None` if it is
-    /// absent or tombstoned. Keys are grouped by shard so each touched shard is
-    /// loaded once (concurrently), then every key in it is resolved against the
-    /// one loaded copy — this is the batched replacement for a per-key resolve.
-    /// Always reads the shards fresh (no value cache), so the commit path
-    /// observes the authoritative coordination state.
-    pub(crate) async fn effective_writers(
-        &self,
-        keys: &[Arc<str>],
-    ) -> Result<HashMap<Arc<str>, Option<TxId>>, StorageError> {
-        // Group distinct keys by (prefix, shard index). The BTreeMap fixes a
-        // deterministic (sorted) load/resolve order so the simulation op-stream
-        // oracle stays reproducible.
-        let mut groups: BTreeMap<(String, u32), Vec<KeyRef>> = BTreeMap::new();
-        for key in keys {
-            let (prefix, raw_key) = paths::split_key(key)
-                .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
-            let idx = shard_index(&raw_key);
-            groups
-                .entry((prefix, idx))
-                .or_default()
-                .push((key.clone(), raw_key));
-        }
-
-        let targets: Vec<(String, u32)> = groups.keys().cloned().collect();
-        let shards = self.shards.load_shards(&targets).await?;
-
-        let mut out = HashMap::with_capacity(keys.len());
-        for ((_, refs), (shard, _)) in groups.iter().zip(shards) {
-            for (key, raw_key) in refs {
-                let resolved = self
-                    .resolve_entry(key, shard.lookup(raw_key))
-                    .await
-                    .map_err(trans_to_storage)?;
-                out.insert(key.clone(), resolved.token());
-            }
-        }
-        Ok(out)
-    }
-
-    /// Resolves `key` through its shard to the effective writer, then
+    /// Resolves `key` to its effective writer (via the [`Resolver`]), then
     /// materializes the value from that writer's transaction object.
     async fn resolve_value(&self, key: &str) -> Result<ReadValue, StorageError> {
-        let (prefix, raw_key) = paths::split_key(key)
-            .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
-        let (shard, _) = self
-            .shards
-            .load_shard(&prefix, shard_index(&raw_key))
-            .await?;
-        let resolved = self
-            .resolve_entry(key, shard.lookup(&raw_key))
-            .await
-            .map_err(trans_to_storage)?;
-        let Some(writer) = resolved.token() else {
+        let Some(writer) = self.resolver.effective_writer(key).await? else {
             // Absent or tombstoned: not found. (A tombstone could be cached, but
             // the next validation re-resolves the shard anyway, so we keep the
             // read path simple and only cache materialized live values.)
@@ -202,43 +122,6 @@ impl Reader {
             return Err(StorageError::NotFound);
         }
         self.materialize(key, writer, cv.value)
-    }
-
-    /// Resolves `entry` against the transaction monitor: help-forward a committed
-    /// exclusive holder (one that committed but has not yet published its
-    /// `current_writer` pointer) and drop aborted/absent holders. `key_path` is
-    /// the full storage path of the key, used to fetch the help-forwarded
-    /// writer's value. A `None` entry resolves to "no value".
-    async fn resolve_entry(
-        &self,
-        key_path: &str,
-        entry: Option<&ShardEntry>,
-    ) -> Result<Resolved, TransError> {
-        let Some(e) = entry else {
-            return Ok(Resolved::default());
-        };
-
-        let mut writer = e.current_writer.clone();
-        let mut deleted = e.deleted;
-
-        // Only an exclusive (write/create) holder can change the committed value
-        // by help-forwarding. Read-lock holders never change the value, and
-        // pending/aborted holders are ignored (a pending holder has published no
-        // value; an aborted holder's lock is dead).
-        if matches!(e.lock_type, LockType::Write | LockType::Create) {
-            for holder in &e.locked_by {
-                if self.tmon.tx_status(holder).await? != TxCommitStatus::Ok {
-                    continue;
-                }
-                let cv = self.tmon.committed_value(key_path, holder).await?;
-                if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
-                    writer = Some(holder.clone());
-                    deleted = cv.value.deleted;
-                }
-            }
-        }
-
-        Ok(Resolved { writer, deleted })
     }
 
     /// Caches and returns a resolved committed value, or reports `NotFound` for a
@@ -259,154 +142,5 @@ impl Reader {
             value: value.value,
             version,
         })
-    }
-}
-
-/// Converts a transaction-engine error into a storage error for the read path.
-pub(crate) fn trans_to_storage(e: TransError) -> StorageError {
-    match e {
-        TransError::Storage(s) => s,
-        other => StorageError::other(other.to_string()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::collections::BTreeSet;
-
-    use glassdb_backend::Backend;
-    use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_concurr::Background;
-    use glassdb_storage::{ObjectCache, Shard, SharedCache, TLogger};
-
-    const COLL: &str = "coll";
-
-    // A reader over `backend` with its own fresh cache, so it starts cold. The
-    // returned `Background` must be kept alive for the monitor's lifetime.
-    fn reader_over(backend: Arc<dyn Backend>) -> (Reader, Arc<Background>) {
-        let cache = SharedCache::new(1 << 20);
-        let values = ValueCache::new(&cache);
-        let objects = ObjectCache::new(backend, &cache);
-        let tl = TLogger::new(objects.clone(), COLL);
-        let bg = Arc::new(Background::new());
-        let mon = Monitor::new(values.clone(), tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(objects);
-        let reader = Reader::new(values, shards, mon, RetryConfig::default());
-        (reader, bg)
-    }
-
-    // Installs a committed pointer for `key` directly in its shard (no lock
-    // holders), so the entry resolves to `writer` — or to no writer when it is a
-    // tombstone.
-    async fn seed_writer(store: &ShardStore, key: &[u8], writer: &TxId, deleted: bool) {
-        let idx = shard_index(key);
-        let (shard, ver) = store.load_shard(COLL, idx).await.unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
-            .entries()
-            .cloned()
-            .map(|e| (e.key.clone(), e))
-            .collect();
-        entries.insert(
-            key.to_vec(),
-            ShardEntry {
-                key: key.to_vec(),
-                lock_type: LockType::None,
-                locked_by: Vec::new(),
-                current_writer: Some(writer.clone()),
-                deleted,
-            },
-        );
-        let new_shard = Shard::from_entries(entries.into_values());
-        assert!(
-            store
-                .store_shard(COLL, idx, &new_shard, ver.as_ref())
-                .await
-                .unwrap()
-        );
-    }
-
-    // Two distinct keys that hash to the same shard, found by a small scan (a
-    // collision is overwhelmingly likely within a few dozen keys for
-    // SHARD_COUNT=1024). Proves the batch collapses same-shard keys to one load.
-    fn colliding_keys() -> (Vec<u8>, Vec<u8>) {
-        let mut seen: HashMap<u32, Vec<u8>> = HashMap::new();
-        for i in 0..100_000u32 {
-            let k = format!("key-{i}").into_bytes();
-            let idx = shard_index(&k);
-            if let Some(prev) = seen.get(&idx) {
-                return (prev.clone(), k);
-            }
-            seen.insert(idx, k);
-        }
-        panic!("no colliding key pair found");
-    }
-
-    fn count_shard_reads(log: &OpLog) -> usize {
-        log.lock()
-            .unwrap()
-            .iter()
-            .filter(|r| (r.op == "read" || r.op == "read_if_modified") && r.path.contains("/_s/"))
-            .count()
-    }
-
-    // Keys are grouped by shard: a live pointer, a tombstone, and an absent key
-    // all resolve to the right token, and the batch issues exactly one shard
-    // read per distinct shard — not one per key (the colliding pair loads its
-    // shard once).
-    #[tokio::test]
-    async fn effective_writers_batches_by_shard() {
-        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let log = recorder.log();
-        let backend: Arc<dyn Backend> = Arc::new(recorder);
-
-        // Seed through a separate cache so the reader-under-test starts cold.
-        let seed_store = ShardStore::new(ObjectCache::new(
-            backend.clone(),
-            &SharedCache::new(1 << 20),
-        ));
-        let (a, b) = colliding_keys();
-        let c = b"lonely".to_vec();
-        let live = TxId::with_priority(1, b"live");
-        let tomb = TxId::with_priority(2, b"tomb");
-
-        seed_writer(&seed_store, &a, &live, false).await;
-        seed_writer(&seed_store, &b, &tomb, true).await;
-        // `c` is deliberately left absent.
-
-        let (reader, _bg) = reader_over(backend.clone());
-        log.lock().unwrap().clear();
-
-        let pa: Arc<str> = paths::from_key(COLL, &a).into();
-        let pb: Arc<str> = paths::from_key(COLL, &b).into();
-        let pc: Arc<str> = paths::from_key(COLL, &c).into();
-        let out = reader
-            .effective_writers(&[pa.clone(), pb.clone(), pc.clone()])
-            .await
-            .unwrap();
-
-        assert_eq!(out.get(&pa).cloned(), Some(Some(live)));
-        assert_eq!(
-            out.get(&pb).cloned(),
-            Some(None),
-            "a tombstone resolves to no writer"
-        );
-        assert_eq!(
-            out.get(&pc).cloned(),
-            Some(None),
-            "an absent key resolves to no writer"
-        );
-
-        let distinct: BTreeSet<u32> = [&a, &b, &c].iter().map(|k| shard_index(k)).collect();
-        assert_eq!(
-            count_shard_reads(&log),
-            distinct.len(),
-            "each distinct shard is loaded once, regardless of keys per shard"
-        );
-        // The colliding pair means 3 keys span at most 2 shards: a per-key
-        // resolve would have read 3 times.
-        assert!(distinct.len() < 3, "the colliding pair shares a shard");
     }
 }

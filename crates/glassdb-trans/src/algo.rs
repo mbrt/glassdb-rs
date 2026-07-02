@@ -28,7 +28,7 @@ use glassdb_storage::{TxCommitStatus, TxLog, TxWrite, ValueCache, Version};
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
-use crate::reader::Reader;
+use crate::resolver::Resolver;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -159,7 +159,7 @@ enum Acquired {
 #[derive(Clone)]
 pub struct Algo {
     values: ValueCache,
-    reader: Reader,
+    resolver: Resolver,
     locker: Locker,
     mon: Monitor,
     gc: Gc,
@@ -180,11 +180,11 @@ impl Algo {
         clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
-        reader: Reader,
+        resolver: Resolver,
     ) -> Self {
         Algo {
             values,
-            reader,
+            resolver,
             locker,
             mon,
             gc,
@@ -448,7 +448,7 @@ impl Algo {
             return Ok(true);
         }
         let keys: Vec<Arc<str>> = data.reads.iter().map(|r| r.path.clone()).collect();
-        let current = self.reader.effective_writers(&keys).await?;
+        let current = self.resolver.effective_writers(&keys).await?;
         for r in &data.reads {
             let observed = r.version.as_ref().map(|v| v.last_writer.clone());
             if current.get(&r.path).cloned().flatten() != observed {
@@ -531,6 +531,7 @@ impl Algo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reader::Reader;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
@@ -566,12 +567,7 @@ mod tests {
         std::mem::forget(bg);
         let tmon = Monitor::new(values.clone(), tlogger.clone(), bg_weak.clone());
         let shards = ShardStore::new(objects.clone());
-        let reader = Reader::new(
-            values.clone(),
-            shards.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-        );
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
         let locker = Locker::new(shards.clone(), tmon.clone(), RetryConfig::default());
         let gc = Gc::new(bg_weak.clone(), tlogger.clone());
 
@@ -591,7 +587,7 @@ mod tests {
             Clock::real(),
             gc,
             None,
-            reader,
+            resolver,
         );
         (
             algo,

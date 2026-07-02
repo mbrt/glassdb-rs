@@ -10,7 +10,7 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
-use glassdb_trans::{Algo, Gc, Locker, Monitor, Reader, TransError};
+use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -135,7 +135,7 @@ impl DatabaseBuilder {
             clock.clone(),
             retry,
         );
-        let reader = Reader::new(values.clone(), shards.clone(), tmon.clone(), retry);
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
         let locker = Locker::new(shards.clone(), tmon.clone(), retry);
         let gc = Gc::new(bg_weak.clone(), tl);
         gc.start();
@@ -146,7 +146,7 @@ impl DatabaseBuilder {
             clock,
             gc,
             Some(bg_weak),
-            reader,
+            resolver,
         );
 
         let inner = Arc::new(DbInner {

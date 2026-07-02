@@ -6,6 +6,7 @@ mod error;
 mod gc;
 mod monitor;
 mod reader;
+mod resolver;
 mod tlocker;
 
 pub use algo::{Algo, Data, Handle, ReadAccess, ReadVersion, WriteAccess};
@@ -13,6 +14,7 @@ pub use error::TransError;
 pub use gc::Gc;
 pub use monitor::Monitor;
 pub use reader::{ReadValue, Reader};
+pub use resolver::Resolver;
 pub use tlocker::{LockStats, Locker, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface (returned by
