@@ -7,6 +7,60 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-025 - ADR-026
+
+Caching improvements and lock-dedup work.
+
+### compare-refs summary
+
+- base: 870c07e3ef9c0d8a29b9a29704e055da425e1550 (v1)
+- target: cf04218bed0f97d50090726e2230e90af519974c (v2) 
+- ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
+
+### rw9010/balanced
+
+- throughput[strong-read]: ratio b/a min=1.08 median=1.26 max=1.99 (geomean=1.36)
+- throughput[weak-read]: ratio b/a min=1.08 median=1.26 max=1.99 (geomean=1.36)
+- throughput[write]: ratio b/a min=1.08 median=1.26 max=1.99 (geomean=1.36)
+- latency-p50[strong-read]: ratio b/a min=0.53 median=0.82 max=0.84 (geomean=0.74)
+- latency-p50[weak-read]: no data
+- latency-p50[write]: ratio b/a min=0.48 median=0.66 max=0.67 (geomean=0.61)
+- retries: ratio b/a min=1.03 median=1.05 max=1.10 (geomean=1.06)
+- backend-ops/tx: ratio b/a min=0.95 median=1.07 max=1.07 (geomean=1.04)
+
+### rw9010/readheavy
+
+- throughput[strong-read]: ratio b/a min=0.94 median=1.33 max=1.87 (geomean=1.33)
+- throughput[weak-read]: ratio b/a min=0.94 median=1.33 max=1.87 (geomean=1.33)
+- throughput[write]: ratio b/a min=0.94 median=1.33 max=1.87 (geomean=1.33)
+- latency-p50[strong-read]: ratio b/a min=0.53 median=0.82 max=1.26 (geomean=0.82)
+- latency-p50[weak-read]: no data
+- latency-p50[write]: ratio b/a min=0.48 median=0.65 max=0.89 (geomean=0.65)
+- retries: ratio b/a min=0.85 median=1.02 max=1.09 (geomean=0.99)
+- backend-ops/tx: ratio b/a min=0.96 median=1.07 max=1.08 (geomean=1.04)
+
+### rw9010/writeheavy
+
+- throughput[strong-read]: ratio b/a min=0.93 median=1.19 max=2.25 (geomean=1.31)
+- throughput[weak-read]: ratio b/a min=0.93 median=1.19 max=2.25 (geomean=1.31)
+- throughput[write]: ratio b/a min=0.93 median=1.19 max=2.25 (geomean=1.31)
+- latency-p50[strong-read]: ratio b/a min=0.44 median=0.84 max=0.88 (geomean=0.72)
+- latency-p50[weak-read]: ratio b/a min=0.69 median=0.97 max=1.03 (geomean=0.89)
+- latency-p50[write]: ratio b/a min=0.48 median=0.65 max=0.69 (geomean=0.61)
+- retries: ratio b/a min=0.98 median=1.12 max=1.57 (geomean=1.18)
+- backend-ops/tx: ratio b/a min=0.95 median=1.04 max=1.05 (geomean=1.02)
+
+### deadlock
+
+- deadlock-p50: ratio b/a min=0.94 median=4.83 max=11.40 (geomean=3.09)
+- deadlock-p90: ratio b/a min=0.32 median=0.42 max=14.06 (geomean=0.73)
+
+### efficiency
+
+- autoresearch-score: v1=1003.84 v2=937.56 ratio=0.934
+- autoresearch-cost/tx: ratio b/a min=0.72 median=0.99 max=1.02 (geomean=0.93)
+- autoresearch-ops/tx: ratio b/a min=0.72 median=0.99 max=1.02 (geomean=0.93)
+
 ## ADR-024
 
 Designed in [ADR-024](adr/024-hold-and-wait-conflict-resolution.md).
