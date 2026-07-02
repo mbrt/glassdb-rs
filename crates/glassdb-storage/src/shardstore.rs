@@ -48,6 +48,23 @@ impl ShardStore {
         }
     }
 
+    /// Loads several shards concurrently, one `(Shard, version)` per target in
+    /// the given order (a missing shard yields the empty shard with no version,
+    /// as [`load_shard`] does). Callers pass distinct `(prefix, idx)` targets so
+    /// each shard is fetched once; the batched effective-writer resolution
+    /// groups a transaction's read set by shard before calling this.
+    ///
+    /// [`load_shard`]: Self::load_shard
+    pub async fn load_shards(
+        &self,
+        targets: &[(String, u32)],
+    ) -> Result<Vec<(Shard, Option<backend::Version>)>, StorageError> {
+        let loads = targets
+            .iter()
+            .map(|(prefix, idx)| self.load_shard(prefix, *idx));
+        futures::future::join_all(loads).await.into_iter().collect()
+    }
+
     /// Compare-and-swaps shard `idx`. `expected = None` means create-if-absent.
     /// Returns `false` on a precondition miss (the caller reloads and retries),
     /// `true` on success.
@@ -194,6 +211,43 @@ mod tests {
             "hot load revalidates conditionally"
         );
         assert_eq!(v1, v2, "unchanged shard keeps its version");
+    }
+
+    // A batch load returns one result per target, in order: an existing shard
+    // with its version and a missing shard as the empty shard with no version.
+    // Each distinct target is fetched exactly once (one backend read apiece).
+    #[tokio::test]
+    async fn load_shards_returns_aligned_results() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let present = shard_index(b"present");
+        let absent = shard_index(b"absent");
+        assert_ne!(present, absent, "test keys must map to distinct shards");
+
+        // Seed only the `present` shard through a separate cache so the reader
+        // below starts cold and full-reads it.
+        assert!(
+            store_over(backend.clone())
+                .store_shard(COLL, present, &Shard::new(), None)
+                .await
+                .unwrap()
+        );
+
+        let reader = store_over(backend.clone());
+        let out = reader
+            .load_shards(&[(COLL.to_string(), present), (COLL.to_string(), absent)])
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 2, "one result per target, in order");
+        assert!(out[0].1.is_some(), "the seeded shard carries a version");
+        assert!(
+            out[1].1.is_none() && out[1].0.is_empty(),
+            "a missing shard is the empty shard with no version"
+        );
+        // Each distinct shard was fetched exactly once.
+        assert_eq!(count(&log, "read"), 2);
     }
 
     // A write-through store updates the cache, so a load after a CAS observes the

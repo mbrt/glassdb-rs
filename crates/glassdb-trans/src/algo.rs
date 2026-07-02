@@ -441,11 +441,17 @@ impl Algo {
 
     /// Re-resolves every read's effective writer and reports whether they all
     /// still match what the transaction observed (a consistent snapshot exists).
+    /// The read set is resolved in one shard-batched pass (each touched shard is
+    /// loaded once) rather than one shard load per key.
     async fn validate_reads_inner(&self, data: &Data) -> Result<bool, TransError> {
+        if data.reads.is_empty() {
+            return Ok(true);
+        }
+        let keys: Vec<Arc<str>> = data.reads.iter().map(|r| r.path.clone()).collect();
+        let current = self.reader.effective_writers(&keys).await?;
         for r in &data.reads {
             let observed = r.version.as_ref().map(|v| v.last_writer.clone());
-            let current = self.reader.effective_writer(&r.path).await?;
-            if current != observed {
+            if current.get(&r.path).cloned().flatten() != observed {
                 return Ok(false);
             }
         }
