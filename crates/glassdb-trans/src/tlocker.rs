@@ -1,5 +1,6 @@
 //! Distributed locking over the v2 shard/root coordination objects (ADR-017,
-//! ADR-020). Ported in spirit from the Go `internal/trans/tlocker.go`, but
+//! ADR-020, ADR-024), with cross-transaction request **deduplication**
+//! (ADR-025). Ported in spirit from the Go `internal/trans/tlocker.go`, but
 //! re-keyed from per-key objects onto shards.
 //!
 //! The only coordination primitive is a content compare-and-swap on a shard
@@ -12,6 +13,16 @@
 //! collection root's write lock. Write-back republishes `current_writer`
 //! pointers and releases the locks.
 //!
+//! **Deduplication (ADR-025):** the per-object lock step is not run directly but
+//! submitted to a [`Dedup`] keyed on the object path, so several transactions
+//! contending the same shard **merge** into one owner-driven load + CAS whenever
+//! they do not exclusively conflict on the same key (disjoint keys or shared
+//! reads). N GET+CAS round-trips collapse to one; same-key writers (and root
+//! membership requests) queue and resolve by the unchanged wound-wait. The
+//! [`Dedup`] fans out one shared result, so each transaction's own outcome
+//! (`CasOutcome`) travels back through a per-submission slot the caller reads
+//! once its submission resolves.
+//!
 //! Lock acquisition has two modes (ADR-020): the default **parallel** path locks
 //! every touched shard concurrently; the **serial** fallback locks them one at a
 //! time in ascending shard path order so equal-priority contenders queue on the
@@ -23,8 +34,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::future::join_all;
-use glassdb_concurr::{DedupKeySnapshot, RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{
+    BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
+    shard::Sharded,
+};
 use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
@@ -175,16 +190,139 @@ enum ShardOutcome {
     Conflict,
 }
 
-/// Outcome of one bounded CAS attempt at locking a shard, *before* any wait.
-enum ShardAttempt {
+/// One transaction's outcome for a single deduplicated CAS round (ADR-025),
+/// deposited by the worker into that transaction's [`OutcomeSlot`] and read by
+/// its caller once the [`Dedup`] submission resolves.
+enum CasOutcome {
     /// Locked; `membership` is true if the shard saw a create/delete.
+    Locked { membership: bool },
+    /// A touched key is held by a live holder this transaction does not
+    /// outrank: wait for `holder` to finalize, then re-submit (hold-and-wait,
+    /// ADR-024). Nothing was staged for this transaction in the round's CAS.
+    Wait(TxId),
+    /// The bounded CAS budget was exhausted under churn; release and re-lock.
+    Conflict,
+}
+
+/// Per-submission mailbox carrying one transaction's [`CasOutcome`] back from
+/// the dedup worker. Owned by the caller and cloned into the merged request, so
+/// it lives exactly as long as either side needs it and never leaks when a
+/// caller's future is dropped mid-round.
+type OutcomeSlot = Arc<Mutex<Option<CasOutcome>>>;
+
+/// One transaction's participation in a shard CAS batch: the keys it wants and
+/// where to deliver its outcome.
+#[derive(Clone)]
+struct ShardMember {
+    intents: Arc<Vec<KeyIntent>>,
+    slot: OutcomeSlot,
+}
+
+/// A deduplication request for one CAS coordination object (ADR-025): the unit
+/// merged by [`Dedup`], keyed on the object path. A single submission carries
+/// one transaction; a merged request accumulates several compatible ones.
+#[derive(Clone)]
+enum CasReq {
+    /// Lock keys in a shard. `members` maps each contending transaction to its
+    /// intents and outcome slot.
+    Shard {
+        prefix: String,
+        idx: u32,
+        members: BTreeMap<TxId, ShardMember>,
+    },
+    /// Take the collection root's exclusive membership lock. Roots never merge,
+    /// so a request always carries exactly one transaction.
+    Root {
+        prefix: String,
+        tx: TxId,
+        slot: OutcomeSlot,
+    },
+}
+
+impl MergeRequest for CasReq {
+    fn merge(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            (
+                CasReq::Shard {
+                    prefix,
+                    idx,
+                    members: a,
+                },
+                CasReq::Shard { members: b, .. },
+            ) => {
+                // Merge only when the two sides do not exclusively conflict: for
+                // every key touched by both, both must hold a read-only intent
+                // (disjoint keys or shared reads). A write/create/delete overlap
+                // is a genuine lock conflict and must be ordered by wound-wait,
+                // so the loser stays queued.
+                if shard_reqs_conflict(a, b) {
+                    return None;
+                }
+                let mut members = a.clone();
+                for (tx, m) in b {
+                    members.insert(tx.clone(), m.clone());
+                }
+                Some(CasReq::Shard {
+                    prefix: prefix.clone(),
+                    idx: *idx,
+                    members,
+                })
+            }
+            // A root takes the single exclusive membership lock, so two root
+            // requests never merge; a shard and a root never share a dedup key.
+            _ => None,
+        }
+    }
+
+    fn can_reorder(&self) -> bool {
+        match self {
+            // A pure read-only shard request can join a later read batch instead
+            // of FIFO-blocking behind an unrelated writer.
+            CasReq::Shard { members, .. } => members
+                .values()
+                .all(|m| m.intents.iter().all(|i| matches!(i.desired, Desired::Read))),
+            CasReq::Root { .. } => false,
+        }
+    }
+}
+
+/// Reports whether two shard requests exclusively conflict: some key touched by
+/// both carries a write/create/delete intent on either side. Disjoint key sets
+/// and shared read-only keys do not conflict and may merge into one CAS.
+fn shard_reqs_conflict(a: &BTreeMap<TxId, ShardMember>, b: &BTreeMap<TxId, ShardMember>) -> bool {
+    let ca = shard_key_exclusive(a);
+    let cb = shard_key_exclusive(b);
+    ca.iter().any(|(k, ea)| match cb.get(k) {
+        Some(eb) => *ea || *eb,
+        None => false,
+    })
+}
+
+/// Maps each key touched by `members` to whether any member holds an exclusive
+/// (write/create/delete) intent on it.
+fn shard_key_exclusive(members: &BTreeMap<TxId, ShardMember>) -> HashMap<Vec<u8>, bool> {
+    let mut out: HashMap<Vec<u8>, bool> = HashMap::new();
+    for m in members.values() {
+        for it in m.intents.iter() {
+            let excl = !matches!(it.desired, Desired::Read);
+            out.entry(it.raw_key.clone())
+                .and_modify(|e| *e |= excl)
+                .or_insert(excl);
+        }
+    }
+    out
+}
+
+/// One member's resolution against a loaded shard within a batch round.
+enum MemberResolution {
+    /// The member's locks are ready in `changes` (one entry per touched key);
+    /// `membership` is true if it saw a create/delete.
     Locked {
+        changes: Vec<(Vec<u8>, ShardEntry)>,
         membership: bool,
     },
-    Conflict,
-    /// A touched key is held by a live holder this transaction does not
-    /// outrank: wait for `holder` to finalize, then reload and retry
-    /// (hold-and-wait, ADR-024). No CAS was performed.
+    /// A touched key is held by a live holder this member cannot wound: it must
+    /// wait for `holder` and re-submit; nothing is staged for it.
     Wait(TxId),
 }
 
@@ -233,344 +371,74 @@ pub struct Locker {
 /// One independent partition of the per-transaction held-lock bookkeeping.
 type LockerShard = Mutex<HashMap<TxId, HashMap<String, LockType>>>;
 
-struct LockerState {
+/// State shared by the [`Locker`] and its dedup [`CasWorker`]: the storage
+/// handles, retry config, per-transaction held-lock bookkeeping, and stats.
+struct LockerCore {
     tmon: Monitor,
     shards: ShardStore,
     retry: RetryConfig,
     tlocks: Sharded<LockerShard>,
-    stats: Arc<Stats>,
+    stats: Stats,
 }
 
-impl Locker {
-    /// Creates a locker over the shared shard store and the transaction monitor.
-    /// `retry` configures the exponential backoff applied both between CAS
-    /// retries on a contended shard or root and between hold-and-wait re-polls of
-    /// a conflicting holder, so neither contention nor a wait is ever
-    /// busy-retried (its `max_interval` caps the wait re-poll cadence).
-    pub fn new(shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
-        Locker {
-            inner: Arc::new(LockerState {
-                shards,
-                tmon,
-                retry,
-                tlocks: Sharded::new(|_| Mutex::new(HashMap::new())),
-                stats: Arc::new(Stats::default()),
-            }),
-        }
-    }
-
-    /// No-op kept for API compatibility: v2 spawns no per-key dedup owner tasks,
-    /// so there is nothing to drain on shutdown.
-    pub async fn close(&self) {}
-
-    /// Returns and resets the accumulated lock statistics.
-    pub fn stats_and_reset(&self) -> LockStats {
-        LockStats {
-            calls: self.inner.stats.n_calls.swap(0, Ordering::Relaxed) as usize,
-            hits: self.inner.stats.n_hits.swap(0, Ordering::Relaxed) as usize,
-            retries: self.inner.stats.n_retries.swap(0, Ordering::Relaxed) as usize,
-        }
-    }
-
-    /// Per-key dedup state no longer exists in v2 (locks coordinate per shard via
-    /// direct CAS), so this diagnostic is always empty. Kept for API stability.
-    pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
-        Vec::new()
-    }
-
-    /// Returns one entry per transaction that currently holds any shard/root
-    /// lock, with the held paths sorted by path. Output is sorted by transaction
-    /// id for stable display.
-    pub fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
-        let mut out = Vec::new();
-        self.inner.tlocks.each(|shard| {
-            let m = shard.lock().unwrap();
-            for (tx_id, locks) in m.iter() {
-                if locks.is_empty() {
-                    continue;
-                }
-                let mut paths: Vec<PathLock> = locks
-                    .iter()
-                    .map(|(p, t)| PathLock {
-                        path: p.clone(),
-                        typ: *t,
-                    })
-                    .collect();
-                paths.sort_by(|a, b| a.path.cmp(&b.path));
-                out.push(TxLockSnapshot {
-                    tx_id: tx_id.clone(),
-                    locks: paths,
-                });
-            }
-        });
-        out.sort_by(|a, b| a.tx_id.cmp(&b.tx_id));
-        out
-    }
-
-    /// Publishes `current_writer` pointers / tombstones and releases this
-    /// transaction's locks across the shards it touched, then releases the root
-    /// membership locks. Every CAS is idempotent; errors are best-effort
-    /// (a failure leaves the locks to be reclaimed lazily by the next contender
-    /// or lease expiry), so this never fails an already-committed transaction.
-    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) {
-        for group in locked.groups.values() {
-            let _ = self.write_back_shard(id, group).await;
-        }
-        for prefix in &locked.membership {
-            let _ = self.release_root(prefix, id).await;
-        }
-        self.clear_tx_locks(id);
-    }
-
-    // --- Crate-facing lock protocol ----------------------------------------
-
-    /// Groups the transaction's accessed keys by shard and acquires every lock it
-    /// needs: the touched shards plus the collection roots for any membership
-    /// change (create/delete). Returns a [`LockedTx`] handle to drive write-back
-    /// on commit, or [`LockOutcome::Conflict`] when a CAS race was lost and the
-    /// caller must release and re-lock under the same id.
-    ///
-    /// Read validation is **not** done here. The engine ([`super::algo::Algo`])
-    /// validates reads *after* every touched key is locked and its value frozen
-    /// (ADR-024); the locker is a pure locking mechanism.
-    ///
-    /// `serial` selects the sorted sequential fallback over the default parallel
-    /// path (ADR-020).
-    pub(crate) async fn lock(
-        &self,
-        id: &TxId,
-        data: &Data,
-        serial: bool,
-    ) -> Result<LockOutcome, TransError> {
-        let groups = build_groups(data)?;
-        let membership = match self.lock_shards(id, &groups, serial).await? {
-            ShardsOutcome::Locked(m) => m,
-            ShardsOutcome::Conflict => return Ok(LockOutcome::Conflict),
-        };
-        for prefix in &membership {
-            if !self.lock_root(prefix, id).await? {
-                return Ok(LockOutcome::Conflict);
-            }
-        }
-        Ok(LockOutcome::Locked(LockedTx { groups, membership }))
-    }
-
-    /// Releases every lock `id` holds across the shards and collection roots it
-    /// has acquired, **without publishing any value** and **leaving the
-    /// transaction object pending**. Unlike [`Locker::write_back`] (the
-    /// post-commit release that republishes `current_writer` pointers), this
-    /// just clears `id` from the lock holders so the transaction can re-acquire
-    /// its locks from scratch under the same id.
-    ///
-    /// This is the deadlock-timeout serial fallback's release step (ADR-024):
-    /// when a parallel acquisition blocks past the deadlock budget, the
-    /// transaction drops the locks it grabbed out of order and re-acquires them
-    /// in the global sorted order, where one contender always makes progress.
-    /// Holding the out-of-order locks across the re-acquire would recreate the
-    /// very cycle serial locking exists to break, so they must be released
-    /// first. The held set is read from the per-tx bookkeeping the same way v1's
-    /// `unlock_all` consulted `locked_paths`. Idempotent and best-effort.
-    pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
-        let held: Vec<String> = {
-            let tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
-            let mut paths: Vec<String> = tlocks
-                .get(id)
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
-            // The bookkeeping is a `HashMap`, so sort to release in a
-            // deterministic (ascending path) order: the simulation op-stream
-            // oracle requires the backend CAS sequence to be reproducible.
-            paths.sort();
-            paths
-        };
-        for path in held {
-            let pr = paths::parse(&path).map_err(|e| {
-                TransError::with_source(format!("parsing held lock path {path:?}"), e)
-            })?;
-            match pr.typ {
-                paths::Type::CollectionInfo => self.release_root(&pr.prefix, id).await?,
-                paths::Type::Shard => {
-                    let idx = pr.suffix.parse::<u32>().map_err(|_| {
-                        TransError::other(format!("malformed shard lock path {path:?}"))
-                    })?;
-                    self.release_shard_locks(&pr.prefix, idx, id).await?;
-                }
-                // Only shards and roots carry transaction locks in v2.
-                _ => {}
-            }
-        }
-        self.clear_tx_locks(id);
-        Ok(())
-    }
-
-    /// Acquires this transaction's locks across every touched shard. Returns the
-    /// collections whose root membership lock must still be taken (the shards
-    /// that saw a create/delete), or [`ShardsOutcome::Conflict`] if a shard lost
-    /// its bounded CAS race and the transaction must release and re-lock under
-    /// the same id (the first conflicting shard wins, in deterministic shard-path
-    /// order).
-    async fn lock_shards(
-        &self,
-        id: &TxId,
-        groups: &BTreeMap<String, ShardGroup>,
-        serial: bool,
-    ) -> Result<ShardsOutcome, TransError> {
-        self.inner.stats.n_calls.fetch_add(1, Ordering::Relaxed);
-        // The first lock for this transaction starts the background refresh so a
-        // long-lived holder's pending object is written lazily, keeping its
-        // lease alive (the tx object is otherwise written only at commit).
-        if !groups.is_empty() {
-            self.inner.tmon.start_refresh_tx(id);
-        }
-
-        let mut membership = BTreeSet::new();
-        if serial {
-            // Ascending shard-path order is the global lock order: the BTreeMap
-            // already iterates sorted by `{prefix}/_s/<idx>`.
-            for group in groups.values() {
-                match self.lock_shard(id, group).await? {
-                    ShardOutcome::Locked { membership: m } => {
-                        if m {
-                            membership.insert(group.prefix.clone());
-                        }
-                    }
-                    ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
-                }
-            }
+impl LockerCore {
+    fn record_shard_lock(&self, id: &TxId, prefix: &str, idx: u32, intents: &[KeyIntent]) {
+        // Represent the shard hold with its strongest intention so the
+        // diagnostic snapshot distinguishes read-only from write holders.
+        let typ = if intents.iter().any(|i| !matches!(i.desired, Desired::Read)) {
+            LockType::Write
         } else {
-            let outcomes = join_all(groups.values().map(|group| self.lock_shard(id, group))).await;
-            for (group, outcome) in groups.values().zip(outcomes) {
-                match outcome? {
-                    ShardOutcome::Locked { membership: m } => {
-                        if m {
-                            membership.insert(group.prefix.clone());
-                        }
-                    }
-                    ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
-                }
-            }
-        }
-        Ok(ShardsOutcome::Locked(membership))
+            LockType::Read
+        };
+        let path = paths::from_shard(prefix, idx);
+        let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
+        tlocks.entry(id.clone()).or_default().insert(path, typ);
     }
 
-    /// Installs this transaction's locks on every key it touches in one shard.
-    ///
-    /// Hold-and-wait (ADR-024): an attempt that meets a key held by a live
-    /// holder this transaction cannot wound **waits** for that holder to
-    /// finalize — keeping every lock already acquired on other shards — then
-    /// reloads and retries. The wait is *not* charged to the bounded
-    /// CAS-contention budget; the algo-level deadlock timeout bounds the total
-    /// wait and escalates to the cannot-deadlock serial order.
-    async fn lock_shard(&self, id: &TxId, group: &ShardGroup) -> Result<ShardOutcome, TransError> {
-        // Paces the hold-and-wait re-poll (below). It advances across successive
-        // blind polls of a holder that will not budge, and resets whenever a
-        // holder finalizes — real progress — so a fresh conflict is re-checked
-        // fine-grained again instead of at the inflated interval.
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            match self.lock_shard_attempt(id, group).await? {
-                ShardAttempt::Locked { membership } => {
-                    return Ok(ShardOutcome::Locked { membership });
-                }
-                ShardAttempt::Conflict => return Ok(ShardOutcome::Conflict),
-                ShardAttempt::Wait(holder) => {
-                    let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
-                        backoff = self.inner.retry.backoff();
-                    }
-                }
-            }
-        }
+    fn record_root_lock(&self, id: &TxId, prefix: &str) {
+        let path = paths::collection_info(prefix);
+        let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
+        tlocks
+            .entry(id.clone())
+            .or_default()
+            .insert(path, LockType::Write);
     }
 
-    /// Parks until the conflicting `holder` finalizes **or** `timeout` elapses,
-    /// whichever comes first, then lets the caller re-resolve, reporting which
-    /// woke it.
-    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Woke {
-        let wait = self.inner.tmon.wait_for_tx(holder);
-        tokio::select! {
-            _ = wait => Woke::Finalized,
-            _ = rt::sleep(timeout) => Woke::PollTimeout,
-        }
+    fn clear_tx_locks(&self, id: &TxId) {
+        let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
+        tlocks.remove(id);
     }
+}
 
-    /// One bounded read-modify-write CAS attempt at locking a shard. Loads the
-    /// shard, resolves every touched key, and CASes the result back, retrying
-    /// only on CAS contention. Returns [`ShardAttempt::Wait`] *without* writing
-    /// when a key is held by a live holder this transaction cannot wound, so the
-    /// caller can wait and retry while holding its other locks.
-    async fn lock_shard_attempt(
-        &self,
-        id: &TxId,
-        group: &ShardGroup,
-    ) -> Result<ShardAttempt, TransError> {
-        let mut backoff = self.inner.retry.backoff();
-        for attempt in 0..CAS_RETRIES {
-            if attempt > 0 {
-                rt::sleep(backoff.next_delay()).await;
-                self.inner.stats.n_retries.fetch_add(1, Ordering::Relaxed);
-            }
-            let (shard, ver) = self
-                .inner
-                .shards
-                .load_shard(&group.prefix, group.idx)
-                .await?;
-            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
-                .entries()
-                .cloned()
-                .map(|e| (e.key.clone(), e))
-                .collect();
-            let mut membership = false;
+struct LockerState {
+    core: Arc<LockerCore>,
+    dedup: Dedup<CasReq, TransError, CasWorker>,
+}
 
-            for intent in &group.intents {
-                match self
-                    .resolve_and_lock(id, intent, entries.get(&intent.raw_key).cloned())
-                    .await?
-                {
-                    EntryResolution::Locked {
-                        entry,
-                        membership: m,
-                    } => {
-                        membership |= m;
-                        entries.insert(intent.raw_key.clone(), entry);
-                    }
-                    // Hold-and-wait: bubble up the holder to wait on, without
-                    // CASing, so no partial lock is installed on this shard.
-                    EntryResolution::Wait(holder) => return Ok(ShardAttempt::Wait(holder)),
-                }
-            }
+/// The [`Dedup`] worker driving one merged lock-acquisition round per CAS object
+/// (ADR-025): it loads the shard/root once, resolves every merged member, does a
+/// single CAS, and deposits each member's [`CasOutcome`] into its slot.
+struct CasWorker {
+    core: Arc<LockerCore>,
+}
 
-            let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
-            match self
-                .inner
-                .shards
-                .store_shard(&group.prefix, group.idx, &new_shard, ver.as_ref())
-                .await
-            {
-                Ok(true) => {
-                    self.record_shard_lock(id, group);
-                    return Ok(ShardAttempt::Locked { membership });
-                }
-                // Precondition: the shard changed under us; reload and retry.
-                Ok(false) => {}
-                // In-doubt lock CAS: the write may or may not have landed. Lock
-                // acquisition is a pre-commit operation with no durable user
-                // value yet, and re-installing our own lock over a freshly-read
-                // shard is idempotent (we skip ourselves when resolving
-                // holders), so recover in place by reloading and retrying rather
-                // than surfacing the in-doubt error (ADR-009).
-                Err(StorageError::Unavailable(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(ShardAttempt::Conflict)
+/// Returns the merged shard request's members, erroring if the dedup key somehow
+/// produced a root request (shard and root paths never collide).
+fn shard_members(
+    batch: &BatchHandle<CasReq, TransError>,
+) -> Result<BTreeMap<TxId, ShardMember>, TransError> {
+    match batch.merged() {
+        CasReq::Shard { members, .. } => Ok(members),
+        CasReq::Root { .. } => Err(TransError::other("shard dedup key produced a root request")),
     }
+}
 
+impl CasWorker {
     /// Resolves the holders of an entry (help-forward committed, drop aborted,
-    /// wound-wait the live pending ones) and installs this transaction's lock.
-    /// Returns [`EntryResolution::Locked`] with the new entry and whether the
-    /// change is a membership change; or [`Wait`] if a live holder this
-    /// transaction cannot wound must be waited on (hold-and-wait, ADR-024).
+    /// wound-wait the live pending ones) and installs `id`'s lock. Returns
+    /// [`EntryResolution::Locked`] with the new entry and whether the change is a
+    /// membership change; or [`Wait`] if a live holder this transaction cannot
+    /// wound must be waited on (hold-and-wait, ADR-024).
     ///
     /// Read-version validation is not done here — the engine validates reads
     /// after every lock is held (ADR-024).
@@ -602,11 +470,11 @@ impl Locker {
             if &holder == id {
                 continue;
             }
-            match self.inner.tmon.tx_status(&holder).await? {
+            match self.core.tmon.tx_status(&holder).await? {
                 TxCommitStatus::Ok => {
                     if exclusive {
                         let cv = self
-                            .inner
+                            .core
                             .tmon
                             .committed_value(&intent.key_path, &holder)
                             .await?;
@@ -687,57 +555,170 @@ impl Locker {
         if !should_wound(id, holder) {
             return Ok(Reclaim::Wait);
         }
-        self.inner.tmon.wound_tx(holder).await?;
-        if self.inner.tmon.tx_status(holder).await? == TxCommitStatus::Aborted {
+        self.core.tmon.wound_tx(holder).await?;
+        if self.core.tmon.tx_status(holder).await? == TxCommitStatus::Aborted {
             Ok(Reclaim::Wounded)
         } else {
             Ok(Reclaim::Wait)
         }
     }
 
-    /// Acquires the collection root's membership write lock for `prefix`
-    /// (ADR-018), with the same resolve/wound-wait/hold-and-wait rules as a
-    /// shard. Auto-creates the root if absent so a write that creates the
-    /// collection's first key works without a prior explicit `create` (matching
-    /// v1's on-demand collection-info lock object). Returns `false` if the
-    /// transaction must restart.
-    async fn lock_root(&self, prefix: &str, id: &TxId) -> Result<bool, TransError> {
-        // Same backed-off hold-and-wait re-poll as `lock_shard`.
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            match self.lock_root_attempt(prefix, id).await? {
-                RootAttempt::Locked => return Ok(true),
-                RootAttempt::Conflict => return Ok(false),
-                RootAttempt::Wait(holder) => {
-                    let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
-                        backoff = self.inner.retry.backoff();
+    /// Resolves all of one member's key intents against the currently-staged
+    /// shard `entries`. Returns [`MemberResolution::Locked`] with one resolved
+    /// entry per key, or [`MemberResolution::Wait`] the moment any key is held by
+    /// a live holder the member cannot wound — staging nothing for it, so the
+    /// batch's other members still proceed.
+    async fn resolve_member(
+        &self,
+        tx: &TxId,
+        intents: &[KeyIntent],
+        entries: &BTreeMap<Vec<u8>, ShardEntry>,
+    ) -> Result<MemberResolution, TransError> {
+        let mut changes = Vec::with_capacity(intents.len());
+        let mut membership = false;
+        for intent in intents {
+            let cur = entries.get(&intent.raw_key).cloned();
+            match self.resolve_and_lock(tx, intent, cur).await? {
+                EntryResolution::Locked {
+                    entry,
+                    membership: m,
+                } => {
+                    membership |= m;
+                    changes.push((intent.raw_key.clone(), entry));
+                }
+                EntryResolution::Wait(holder) => return Ok(MemberResolution::Wait(holder)),
+            }
+        }
+        Ok(MemberResolution::Locked {
+            changes,
+            membership,
+        })
+    }
+
+    /// Drives one merged shard round: load once, resolve every member, CAS once,
+    /// and deposit each member's outcome. A member that must wait stages nothing
+    /// and is delivered [`CasOutcome::Wait`], so the owner never blocks — its
+    /// caller waits and re-submits while the other members make progress.
+    async fn run_shard(
+        &self,
+        prefix: &str,
+        idx: u32,
+        batch: &BatchHandle<CasReq, TransError>,
+    ) -> Result<(), TransError> {
+        let mut backoff = self.core.retry.backoff();
+        for attempt in 0..CAS_RETRIES {
+            if attempt > 0 {
+                rt::sleep(backoff.next_delay()).await;
+                self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
+            }
+            let (shard, ver) = self.core.shards.load_shard(prefix, idx).await?;
+            // Read the merged set *after* the load so this round absorbs every
+            // member that queued while the load I/O was in flight (ADR-025) — the
+            // window that turns N contenders' loads+CASes into one.
+            let members = shard_members(batch)?;
+            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+                .entries()
+                .cloned()
+                .map(|e| (e.key.clone(), e))
+                .collect();
+
+            // Resolve every member against the shared entry set. The merge rule
+            // guarantees members overlap only on shared-read keys, so applying a
+            // locked member's staged changes cannot clobber another's.
+            let mut results: Vec<(TxId, CasOutcome)> = Vec::with_capacity(members.len());
+            let mut staged = false;
+            for (tx, m) in &members {
+                match self.resolve_member(tx, &m.intents, &entries).await? {
+                    MemberResolution::Locked {
+                        changes,
+                        membership,
+                    } => {
+                        for (k, e) in changes {
+                            entries.insert(k, e);
+                        }
+                        staged = true;
+                        results.push((tx.clone(), CasOutcome::Locked { membership }));
+                    }
+                    MemberResolution::Wait(holder) => {
+                        results.push((tx.clone(), CasOutcome::Wait(holder)));
                     }
                 }
             }
+
+            if staged {
+                let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
+                match self
+                    .core
+                    .shards
+                    .store_shard(prefix, idx, &new_shard, ver.as_ref())
+                    .await
+                {
+                    Ok(true) => {}
+                    // Precondition: the shard changed under us; reload and retry.
+                    Ok(false) => continue,
+                    // In-doubt lock CAS (ADR-009): re-installing our own locks
+                    // over a freshly-read shard is idempotent, so recover in
+                    // place by reloading and retrying.
+                    Err(StorageError::Unavailable(_)) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // The CAS landed (or nothing needed staging): record held locks and
+            // publish each member's outcome into its slot before returning, so
+            // the deposit happens-before the dedup delivers to the caller.
+            for (tx, outcome) in results {
+                if let (CasOutcome::Locked { .. }, Some(m)) = (&outcome, members.get(&tx)) {
+                    self.core.record_shard_lock(&tx, prefix, idx, &m.intents);
+                }
+                if let Some(m) = members.get(&tx) {
+                    *m.slot.lock().unwrap() = Some(outcome);
+                }
+            }
+            return Ok(());
         }
+        // Bounded CAS budget exhausted under churn: report a conflict to every
+        // current member so each caller releases and re-locks (ADR-024).
+        for m in shard_members(batch)?.values() {
+            *m.slot.lock().unwrap() = Some(CasOutcome::Conflict);
+        }
+        Ok(())
+    }
+
+    /// Drives one root membership-lock round. Roots never merge, so the batch
+    /// carries exactly one transaction; its outcome goes to `slot`.
+    async fn run_root(&self, prefix: &str, id: TxId, slot: OutcomeSlot) -> Result<(), TransError> {
+        let outcome = match self.lock_root_attempt(prefix, &id).await? {
+            RootAttempt::Locked => CasOutcome::Locked { membership: false },
+            RootAttempt::Conflict => CasOutcome::Conflict,
+            RootAttempt::Wait(holder) => CasOutcome::Wait(holder),
+        };
+        *slot.lock().unwrap() = Some(outcome);
+        Ok(())
     }
 
     /// One bounded CAS attempt at the root membership lock. Returns
     /// [`RootAttempt::Wait`] *without* writing when the membership lock is held
     /// by a live holder this transaction cannot wound, so the caller can wait
-    /// and retry (hold-and-wait, ADR-024).
+    /// and re-submit (hold-and-wait, ADR-024). Auto-creates the root if absent so
+    /// a write that creates the collection's first key works without a prior
+    /// explicit `create` (ADR-018).
     async fn lock_root_attempt(&self, prefix: &str, id: &TxId) -> Result<RootAttempt, TransError> {
-        let mut backoff = self.inner.retry.backoff();
+        let mut backoff = self.core.retry.backoff();
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
             }
-            let (mut root, ver) = match self.inner.shards.load_root(prefix).await {
+            let (mut root, ver) = match self.core.shards.load_root(prefix).await {
                 Ok(rv) => rv,
                 Err(StorageError::NotFound) => {
                     // The collection does not exist yet: create its root holding
                     // our membership lock. If we lose the create race, reload.
                     let mut root = CollectionRoot::new(glassdb_data::shard::SHARD_COUNT);
                     root.set_membership_lock(LockType::Write, [id.clone()]);
-                    match self.inner.shards.create_root(prefix, &root).await {
+                    match self.core.shards.create_root(prefix, &root).await {
                         Ok(true) => {
-                            self.record_root_lock(id, prefix);
+                            self.core.record_root_lock(id, prefix);
                             return Ok(RootAttempt::Locked);
                         }
                         // Lost the create race, or an in-doubt create whose
@@ -755,7 +736,7 @@ impl Locker {
                 if &holder == id {
                     continue;
                 }
-                if self.inner.tmon.tx_status(&holder).await? == TxCommitStatus::Pending {
+                if self.core.tmon.tx_status(&holder).await? == TxCommitStatus::Pending {
                     pending.push(holder);
                 }
             }
@@ -767,9 +748,9 @@ impl Locker {
             }
 
             root.set_membership_lock(LockType::Write, [id.clone()]);
-            match self.inner.shards.store_root(prefix, &root, &ver).await {
+            match self.core.shards.store_root(prefix, &root, &ver).await {
                 Ok(true) => {
-                    self.record_root_lock(id, prefix);
+                    self.core.record_root_lock(id, prefix);
                     return Ok(RootAttempt::Locked);
                 }
                 // Precondition or in-doubt: reload and retry; re-installing our
@@ -781,15 +762,368 @@ impl Locker {
         }
         Ok(RootAttempt::Conflict)
     }
+}
+
+#[async_trait]
+impl Worker<CasReq, TransError> for CasWorker {
+    async fn run(
+        &self,
+        _key: &str,
+        batch: &BatchHandle<CasReq, TransError>,
+    ) -> Result<(), TransError> {
+        // The dedup key fixes the object kind (shard vs root paths never
+        // collide), so the first merged snapshot selects the resolver.
+        match batch.merged() {
+            CasReq::Shard { prefix, idx, .. } => self.run_shard(&prefix, idx, batch).await,
+            CasReq::Root { prefix, tx, slot } => self.run_root(&prefix, tx, slot).await,
+        }
+    }
+}
+
+impl Locker {
+    /// Creates a locker over the shared shard store and the transaction monitor.
+    /// `retry` configures the exponential backoff applied both between CAS
+    /// retries on a contended shard or root and between hold-and-wait re-polls of
+    /// a conflicting holder, so neither contention nor a wait is ever
+    /// busy-retried (its `max_interval` caps the wait re-poll cadence).
+    pub fn new(shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
+        let core = Arc::new(LockerCore {
+            tmon,
+            shards,
+            retry,
+            tlocks: Sharded::new(|_| Mutex::new(HashMap::new())),
+            stats: Stats::default(),
+        });
+        let dedup = Dedup::new(CasWorker { core: core.clone() });
+        Locker {
+            inner: Arc::new(LockerState { core, dedup }),
+        }
+    }
+
+    /// Cancels in-flight lock work and awaits any spawned dedup owner tasks, so
+    /// none leak when the database shuts down (ADR-025).
+    pub async fn close(&self) {
+        self.inner.dedup.close().await;
+    }
+
+    /// Returns and resets the accumulated lock statistics.
+    pub fn stats_and_reset(&self) -> LockStats {
+        LockStats {
+            calls: self.inner.core.stats.n_calls.swap(0, Ordering::Relaxed) as usize,
+            hits: self.inner.core.stats.n_hits.swap(0, Ordering::Relaxed) as usize,
+            retries: self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed) as usize,
+        }
+    }
+
+    /// Returns a per-object dedup coordination snapshot (ADR-025): one entry per
+    /// shard/root with an in-flight or queued lock batch, for operators
+    /// investigating hangs.
+    pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
+        self.inner.dedup.snapshot()
+    }
+
+    /// Returns one entry per transaction that currently holds any shard/root
+    /// lock, with the held paths sorted by path. Output is sorted by transaction
+    /// id for stable display.
+    pub fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
+        let mut out = Vec::new();
+        self.inner.core.tlocks.each(|shard| {
+            let m = shard.lock().unwrap();
+            for (tx_id, locks) in m.iter() {
+                if locks.is_empty() {
+                    continue;
+                }
+                let mut paths: Vec<PathLock> = locks
+                    .iter()
+                    .map(|(p, t)| PathLock {
+                        path: p.clone(),
+                        typ: *t,
+                    })
+                    .collect();
+                paths.sort_by(|a, b| a.path.cmp(&b.path));
+                out.push(TxLockSnapshot {
+                    tx_id: tx_id.clone(),
+                    locks: paths,
+                });
+            }
+        });
+        out.sort_by(|a, b| a.tx_id.cmp(&b.tx_id));
+        out
+    }
+
+    /// Groups the transaction's accessed keys by shard and acquires every lock it
+    /// needs: the touched shards plus the collection roots for any membership
+    /// change (create/delete). Returns a [`LockedTx`] handle to drive write-back
+    /// on commit, or [`LockOutcome::Conflict`] when a CAS race was lost and the
+    /// caller must release and re-lock under the same id.
+    ///
+    /// Read validation is **not** done here. The engine ([`super::algo::Algo`])
+    /// validates reads *after* every touched key is locked and its value frozen
+    /// (ADR-024); the locker is a pure locking mechanism.
+    ///
+    /// `serial` selects the sorted sequential fallback over the default parallel
+    /// path (ADR-020).
+    pub(crate) async fn lock(
+        &self,
+        id: &TxId,
+        data: &Data,
+        serial: bool,
+    ) -> Result<LockOutcome, TransError> {
+        let groups = build_groups(data)?;
+        let membership = match self.lock_shards(id, &groups, serial).await? {
+            ShardsOutcome::Locked(m) => m,
+            ShardsOutcome::Conflict => return Ok(LockOutcome::Conflict),
+        };
+        for prefix in &membership {
+            if !self.lock_root(prefix, id).await? {
+                return Ok(LockOutcome::Conflict);
+            }
+        }
+        Ok(LockOutcome::Locked(LockedTx { groups, membership }))
+    }
+
+    /// Releases every lock `id` holds across the shards and collection roots it
+    /// has acquired, **without publishing any value** and **leaving the
+    /// transaction object pending**. Unlike [`Locker::write_back`] (the
+    /// post-commit release that republishes `current_writer` pointers), this
+    /// just clears `id` from the lock holders so the transaction can re-acquire
+    /// its locks from scratch under the same id.
+    ///
+    /// This is the deadlock-timeout serial fallback's release step (ADR-024):
+    /// when a parallel acquisition blocks past the deadlock budget, the
+    /// transaction drops the locks it grabbed out of order and re-acquires them
+    /// in the global sorted order, where one contender always makes progress.
+    /// Holding the out-of-order locks across the re-acquire would recreate the
+    /// very cycle serial locking exists to break, so they must be released
+    /// first. The held set is read from the per-tx bookkeeping the same way v1's
+    /// `unlock_all` consulted `locked_paths`. Idempotent and best-effort.
+    pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
+        let held: Vec<String> = {
+            let tlocks = self
+                .inner
+                .core
+                .tlocks
+                .for_key(id.as_bytes())
+                .lock()
+                .unwrap();
+            let mut paths: Vec<String> = tlocks
+                .get(id)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            // The bookkeeping is a `HashMap`, so sort to release in a
+            // deterministic (ascending path) order: the simulation op-stream
+            // oracle requires the backend CAS sequence to be reproducible.
+            paths.sort();
+            paths
+        };
+        for path in held {
+            let pr = paths::parse(&path).map_err(|e| {
+                TransError::with_source(format!("parsing held lock path {path:?}"), e)
+            })?;
+            match pr.typ {
+                paths::Type::CollectionInfo => self.release_root(&pr.prefix, id).await?,
+                paths::Type::Shard => {
+                    let idx = pr.suffix.parse::<u32>().map_err(|_| {
+                        TransError::other(format!("malformed shard lock path {path:?}"))
+                    })?;
+                    self.release_shard_locks(&pr.prefix, idx, id).await?;
+                }
+                // Only shards and roots carry transaction locks in v2.
+                _ => {}
+            }
+        }
+        self.inner.core.clear_tx_locks(id);
+        Ok(())
+    }
+
+    /// Publishes `current_writer` pointers / tombstones and releases this
+    /// transaction's locks across the shards it touched, then releases the root
+    /// membership locks. Every CAS is idempotent; errors are best-effort
+    /// (a failure leaves the locks to be reclaimed lazily by the next contender
+    /// or lease expiry), so this never fails an already-committed transaction.
+    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) {
+        for group in locked.groups.values() {
+            let _ = self.write_back_shard(id, group).await;
+        }
+        for prefix in &locked.membership {
+            let _ = self.release_root(prefix, id).await;
+        }
+        self.inner.core.clear_tx_locks(id);
+    }
+
+    /// Acquires this transaction's locks across every touched shard. Returns the
+    /// collections whose root membership lock must still be taken (the shards
+    /// that saw a create/delete), or [`ShardsOutcome::Conflict`] if a shard lost
+    /// its bounded CAS race and the transaction must release and re-lock under
+    /// the same id (the first conflicting shard wins, in deterministic shard-path
+    /// order).
+    async fn lock_shards(
+        &self,
+        id: &TxId,
+        groups: &BTreeMap<String, ShardGroup>,
+        serial: bool,
+    ) -> Result<ShardsOutcome, TransError> {
+        self.inner
+            .core
+            .stats
+            .n_calls
+            .fetch_add(1, Ordering::Relaxed);
+        // The first lock for this transaction starts the background refresh so a
+        // long-lived holder's pending object is written lazily, keeping its
+        // lease alive (the tx object is otherwise written only at commit).
+        if !groups.is_empty() {
+            self.inner.core.tmon.start_refresh_tx(id);
+        }
+
+        let mut membership = BTreeSet::new();
+        if serial {
+            // Ascending shard-path order is the global lock order: the BTreeMap
+            // already iterates sorted by `{prefix}/_s/<idx>`.
+            for group in groups.values() {
+                match self.lock_shard(id, group).await? {
+                    ShardOutcome::Locked { membership: m } => {
+                        if m {
+                            membership.insert(group.prefix.clone());
+                        }
+                    }
+                    ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
+                }
+            }
+        } else {
+            let outcomes = join_all(groups.values().map(|group| self.lock_shard(id, group))).await;
+            for (group, outcome) in groups.values().zip(outcomes) {
+                match outcome? {
+                    ShardOutcome::Locked { membership: m } => {
+                        if m {
+                            membership.insert(group.prefix.clone());
+                        }
+                    }
+                    ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
+                }
+            }
+        }
+        Ok(ShardsOutcome::Locked(membership))
+    }
+
+    /// Installs this transaction's locks on every key it touches in one shard,
+    /// through the shared [`Dedup`] (ADR-025): the submission merges with other
+    /// transactions contending the same shard whenever they do not exclusively
+    /// conflict, so one owner-driven load + CAS serves the whole batch.
+    ///
+    /// Hold-and-wait (ADR-024): if the worker reports [`CasOutcome::Wait`] — a
+    /// key is held by a live holder this transaction cannot wound — it **waits**
+    /// for that holder to finalize (keeping every lock already acquired on other
+    /// shards) then re-submits. The wait is *not* charged to the bounded
+    /// CAS-contention budget; the algo-level deadlock timeout bounds the total
+    /// wait and escalates to the cannot-deadlock serial order.
+    async fn lock_shard(&self, id: &TxId, group: &ShardGroup) -> Result<ShardOutcome, TransError> {
+        let shard_path = paths::from_shard(&group.prefix, group.idx);
+        let intents = Arc::new(group.intents.clone());
+        // Paces the hold-and-wait re-poll. It advances across successive blind
+        // polls of a holder that will not budge, and resets whenever a holder
+        // finalizes — real progress.
+        let mut backoff = self.inner.core.retry.backoff();
+        loop {
+            let slot: OutcomeSlot = Arc::new(Mutex::new(None));
+            let mut members = BTreeMap::new();
+            members.insert(
+                id.clone(),
+                ShardMember {
+                    intents: intents.clone(),
+                    slot: slot.clone(),
+                },
+            );
+            let req = CasReq::Shard {
+                prefix: group.prefix.clone(),
+                idx: group.idx,
+                members,
+            };
+            match self.inner.dedup.run(&shard_path, req).await {
+                Ok(()) => {}
+                Err(DedupError::Work(e)) => return Err((*e).clone()),
+                Err(DedupError::Cancelled) => {
+                    return Err(TransError::other("locker shut down while locking shard"));
+                }
+            }
+            let outcome = slot.lock().unwrap().take();
+            match outcome {
+                Some(CasOutcome::Locked { membership }) => {
+                    return Ok(ShardOutcome::Locked { membership });
+                }
+                Some(CasOutcome::Conflict) => return Ok(ShardOutcome::Conflict),
+                Some(CasOutcome::Wait(holder)) => {
+                    let delay = backoff.next_delay();
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                        backoff = self.inner.core.retry.backoff();
+                    }
+                }
+                // The worker always deposits an outcome for a delivered member,
+                // so a missing one means the round was abandoned or shut down;
+                // treat it as a conflict for a safe release-and-relock.
+                None => return Ok(ShardOutcome::Conflict),
+            }
+        }
+    }
+
+    /// Parks until the conflicting `holder` finalizes **or** `timeout` elapses,
+    /// whichever comes first, then lets the caller re-resolve, reporting which
+    /// woke it.
+    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Woke {
+        let wait = self.inner.core.tmon.wait_for_tx(holder);
+        tokio::select! {
+            _ = wait => Woke::Finalized,
+            _ = rt::sleep(timeout) => Woke::PollTimeout,
+        }
+    }
+
+    /// Acquires the collection root's membership write lock for `prefix`
+    /// (ADR-018) through the shared [`Dedup`] (ADR-025). Roots take the single
+    /// exclusive membership lock, so requests never merge — the dedup only
+    /// serializes contenders through one owner, removing the CAS race. Auto-
+    /// creates the root if absent so a write that creates the collection's first
+    /// key works without a prior explicit `create`. Returns `false` if the
+    /// transaction must restart.
+    async fn lock_root(&self, prefix: &str, id: &TxId) -> Result<bool, TransError> {
+        let root_path = paths::collection_info(prefix);
+        // Same backed-off hold-and-wait re-poll as `lock_shard`.
+        let mut backoff = self.inner.core.retry.backoff();
+        loop {
+            let slot: OutcomeSlot = Arc::new(Mutex::new(None));
+            let req = CasReq::Root {
+                prefix: prefix.to_string(),
+                tx: id.clone(),
+                slot: slot.clone(),
+            };
+            match self.inner.dedup.run(&root_path, req).await {
+                Ok(()) => {}
+                Err(DedupError::Work(e)) => return Err((*e).clone()),
+                Err(DedupError::Cancelled) => {
+                    return Err(TransError::other("locker shut down while locking root"));
+                }
+            }
+            let outcome = slot.lock().unwrap().take();
+            match outcome {
+                Some(CasOutcome::Locked { .. }) => return Ok(true),
+                Some(CasOutcome::Conflict) | None => return Ok(false),
+                Some(CasOutcome::Wait(holder)) => {
+                    let delay = backoff.next_delay();
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                        backoff = self.inner.core.retry.backoff();
+                    }
+                }
+            }
+        }
+    }
 
     async fn write_back_shard(&self, id: &TxId, group: &ShardGroup) -> Result<(), TransError> {
-        let mut backoff = self.inner.retry.backoff();
+        let mut backoff = self.inner.core.retry.backoff();
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
             }
             let (shard, ver) = self
                 .inner
+                .core
                 .shards
                 .load_shard(&group.prefix, group.idx)
                 .await?;
@@ -824,6 +1158,7 @@ impl Locker {
             let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
             if self
                 .inner
+                .core
                 .shards
                 .store_shard(&group.prefix, group.idx, &new_shard, ver.as_ref())
                 .await?
@@ -835,12 +1170,12 @@ impl Locker {
     }
 
     async fn release_root(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
-        let mut backoff = self.inner.retry.backoff();
+        let mut backoff = self.inner.core.retry.backoff();
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
             }
-            let (mut root, ver) = match self.inner.shards.load_root(prefix).await {
+            let (mut root, ver) = match self.inner.core.shards.load_root(prefix).await {
                 Ok(rv) => rv,
                 Err(StorageError::NotFound) => return Ok(()),
                 Err(e) => return Err(e.into()),
@@ -849,7 +1184,13 @@ impl Locker {
                 return Ok(());
             }
             root.clear_membership_lock();
-            if self.inner.shards.store_root(prefix, &root, &ver).await? {
+            if self
+                .inner
+                .core
+                .shards
+                .store_root(prefix, &root, &ver)
+                .await?
+            {
                 return Ok(());
             }
         }
@@ -867,12 +1208,12 @@ impl Locker {
         idx: u32,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut backoff = self.inner.retry.backoff();
+        let mut backoff = self.inner.core.retry.backoff();
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
             }
-            let (shard, ver) = self.inner.shards.load_shard(prefix, idx).await?;
+            let (shard, ver) = self.inner.core.shards.load_shard(prefix, idx).await?;
             let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
                 .entries()
                 .cloned()
@@ -895,6 +1236,7 @@ impl Locker {
             let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
             match self
                 .inner
+                .core
                 .shards
                 .store_shard(prefix, idx, &new_shard, ver.as_ref())
                 .await
@@ -908,39 +1250,6 @@ impl Locker {
             }
         }
         Ok(())
-    }
-
-    // --- Per-tx held-lock bookkeeping (diagnostics) -------------------------
-
-    fn record_shard_lock(&self, id: &TxId, group: &ShardGroup) {
-        // Represent the shard hold with its strongest intention so the
-        // diagnostic snapshot distinguishes read-only from write holders.
-        let typ = if group
-            .intents
-            .iter()
-            .any(|i| !matches!(i.desired, Desired::Read))
-        {
-            LockType::Write
-        } else {
-            LockType::Read
-        };
-        let path = paths::from_shard(&group.prefix, group.idx);
-        let mut tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        tlocks.entry(id.clone()).or_default().insert(path, typ);
-    }
-
-    fn record_root_lock(&self, id: &TxId, prefix: &str) {
-        let path = paths::collection_info(prefix);
-        let mut tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        tlocks
-            .entry(id.clone())
-            .or_default()
-            .insert(path, LockType::Write);
-    }
-
-    fn clear_tx_locks(&self, id: &TxId) {
-        let mut tlocks = self.inner.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        tlocks.remove(id);
     }
 }
 
@@ -958,13 +1267,16 @@ fn should_wound(me: &TxId, holder: &TxId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_backend::{Backend, BackendError, ReadReply, Version, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_data::shard::shard_index;
     use glassdb_storage::{ObjectCache, Shard, SharedCache, TLogger, TxCommitStatus, ValueCache};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     struct TlCtx {
         shards: ShardStore,
@@ -1340,5 +1652,278 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    // --- ADR-025: cross-transaction lock-acquisition deduplication ----------
+
+    /// Test backend that blocks the *first* `read` on a gate until released, so a
+    /// test can park the dedup driver mid-load while other contenders queue —
+    /// forcing them into one merged CAS round. Every other call passes through.
+    struct GateBackend {
+        inner: Arc<dyn Backend>,
+        gate: Arc<Notify>,
+        armed: AtomicBool,
+    }
+
+    impl GateBackend {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<dyn Backend>, Arc<Notify>) {
+            let gate = Arc::new(Notify::new());
+            let b = Arc::new(GateBackend {
+                inner,
+                gate: gate.clone(),
+                armed: AtomicBool::new(true),
+            });
+            (b, gate)
+        }
+    }
+
+    #[async_trait]
+    impl Backend for GateBackend {
+        async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.read(path).await
+        }
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &Version,
+        ) -> Result<ReadReply, BackendError> {
+            self.inner.read_if_modified(path, expected).await
+        }
+        async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
+            self.inner.write(path, value).await
+        }
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &Version,
+        ) -> Result<Version, BackendError> {
+            self.inner.write_if(path, value, expected).await
+        }
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<Version, BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), BackendError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    /// A locker whose backend records ops and gates the first read.
+    fn gated_locker() -> (Locker, TlCtx, OpLog, Arc<Notify>) {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (gated, gate) = GateBackend::wrap(mem);
+        let recorder = Arc::new(RecordingBackend::new(gated));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder);
+        (locker, ctx, log, gate)
+    }
+
+    /// A locker whose backend records ops (no gating).
+    fn recording_locker() -> (Locker, TlCtx, OpLog) {
+        let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder);
+        (locker, ctx, log)
+    }
+
+    /// Counts the CAS stores (create or conditional write) issued against `path`.
+    fn count_stores(log: &OpLog, path: &str) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == path && (r.op == "write_if" || r.op == "write_if_not_exists"))
+            .count()
+    }
+
+    /// A distinct key that hashes to the same shard as `base`, for exercising
+    /// disjoint-key contention within a single shard object.
+    fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
+        let idx = shard_index(base);
+        for i in 0u32.. {
+            let k = format!("sib-{i}").into_bytes();
+            if k != base && shard_index(&k) == idx {
+                return k;
+            }
+        }
+        unreachable!("a same-shard sibling must exist")
+    }
+
+    // Two concurrent read-lockers on one key merge into a single CAS round: one
+    // load + one store serves both, and both end up holding the shared read lock.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_readers_share_one_cas() {
+        let (locker, ctx, log, gate) = gated_locker();
+        let key = b"key";
+        let tx1 = mk_tid(1, "r1");
+        let tx2 = mk_tid(2, "r2");
+        ctx.monitor.begin_tx(&tx1);
+        ctx.monitor.begin_tx(&tx2);
+
+        let (l1, l2) = (locker.clone(), locker.clone());
+        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let g1 = group_of(key, read_intent(key));
+        let g2 = group_of(key, read_intent(key));
+        let h1 = tokio::spawn(async move { l1.lock_shards(&t1, &g1, false).await });
+        let h2 = tokio::spawn(async move { l2.lock_shards(&t2, &g2, false).await });
+
+        // Under paused time this sleep only fires once both tasks are parked (the
+        // driver in the gated load, the second queued); then release the load.
+        rt::sleep(Duration::from_millis(50)).await;
+        gate.notify_one();
+
+        assert!(matches!(
+            h1.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+        assert!(matches!(
+            h2.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+
+        let shard_path = paths::from_shard(COLL, shard_index(key));
+        assert_eq!(
+            count_stores(&log, &shard_path),
+            1,
+            "two readers must share a single CAS"
+        );
+        let e = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(e.lock_type, LockType::Read);
+        assert_eq!(e.locked_by.len(), 2, "both readers hold the shared lock");
+    }
+
+    // Two concurrent writers on *disjoint* keys of the same shard do not conflict,
+    // so they batch into one CAS round rather than each doing its own load+store.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_disjoint_writers_share_one_cas() {
+        let (locker, ctx, log, gate) = gated_locker();
+        let ka = b"key-a".to_vec();
+        let kb = same_shard_sibling(&ka);
+        let tx1 = mk_tid(1, "w1");
+        let tx2 = mk_tid(2, "w2");
+        ctx.monitor.begin_tx(&tx1);
+        ctx.monitor.begin_tx(&tx2);
+
+        let (l1, l2) = (locker.clone(), locker.clone());
+        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let g1 = group_of(&ka, put_intent(&ka));
+        let g2 = group_of(&kb, put_intent(&kb));
+        let h1 = tokio::spawn(async move { l1.lock_shards(&t1, &g1, false).await });
+        let h2 = tokio::spawn(async move { l2.lock_shards(&t2, &g2, false).await });
+
+        rt::sleep(Duration::from_millis(50)).await;
+        gate.notify_one();
+
+        assert!(matches!(
+            h1.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+        assert!(matches!(
+            h2.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+
+        let shard_path = paths::from_shard(COLL, shard_index(&ka));
+        assert_eq!(
+            count_stores(&log, &shard_path),
+            1,
+            "disjoint writers batch into one CAS"
+        );
+        assert_eq!(entry_of(&ctx, &ka).await.unwrap().locked_by, vec![tx1]);
+        assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![tx2]);
+    }
+
+    // Two writers on the *same* key exclusively conflict, so they cannot share a
+    // CAS: each takes its own round (two stores) and wound-wait orders them.
+    #[tokio::test]
+    async fn same_key_writers_do_not_merge() {
+        let (locker, ctx, log) = recording_locker();
+        let key = b"key";
+        let young = mk_tid(2, "young");
+        let old = mk_tid(1, "old");
+        ctx.monitor.begin_tx(&young);
+        ctx.monitor.begin_tx(&old);
+
+        lock_ok(&locker, &young, &group_of(key, put_intent(key))).await;
+        // The older tx wounds the younger holder in its own round.
+        lock_ok(&locker, &old, &group_of(key, put_intent(key))).await;
+
+        let shard_path = paths::from_shard(COLL, shard_index(key));
+        assert_eq!(
+            count_stores(&log, &shard_path),
+            2,
+            "same-key writers each take their own CAS"
+        );
+        let e = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(e.locked_by, vec![old.clone()]);
+        assert_eq!(
+            ctx.monitor.tx_status(&young).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
+    }
+
+    // `close` cancels new submissions; the dedup snapshot tracks only live
+    // coordination, so it is empty while idle and after an uncontended lock.
+    #[tokio::test]
+    async fn close_cancels_new_locks_and_snapshot_tracks_idle() {
+        let (locker, ctx) = init_tl_test();
+        assert!(
+            locker.dedup_snapshot().is_empty(),
+            "no coordination while idle"
+        );
+
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
+        lock_ok(&locker, &tx, &group_of(b"key", put_intent(b"key"))).await;
+        assert!(
+            locker.dedup_snapshot().is_empty(),
+            "an uncontended lock leaves no dedup key behind"
+        );
+
+        locker.close().await;
+        let err = locker
+            .lock_shards(&tx, &group_of(b"key2", put_intent(b"key2")), false)
+            .await;
+        assert!(err.is_err(), "locking after close is cancelled");
+    }
+
+    // Dropping a waiting lock future mid-wait (the deadlock-timeout analog) must
+    // not wedge the locker: the holder can still release and a fresh transaction
+    // acquires the key without hanging.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_waiter_leaves_locker_usable() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        seed_committed(&ctx, key, b"v0").await;
+
+        let old = mk_tid(1, "old");
+        ctx.monitor.begin_tx(&old);
+        lock_ok(&locker, &old, &group_of(key, put_intent(key))).await;
+
+        let young = mk_tid(2, "young");
+        ctx.monitor.begin_tx(&young);
+        let l = locker.clone();
+        let y = young.clone();
+        let g = group_of(key, put_intent(key));
+        let waiting = tokio::spawn(async move { l.lock_shards(&y, &g, false).await });
+        rt::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "younger blocks on the older holder");
+        waiting.abort();
+        let _ = waiting.await;
+
+        locker.release_locks(&old).await.unwrap();
+        let other = mk_tid(3, "other");
+        ctx.monitor.begin_tx(&other);
+        lock_ok(&locker, &other, &group_of(key, put_intent(key))).await;
+        assert_eq!(entry_of(&ctx, key).await.unwrap().locked_by, vec![other]);
     }
 }
