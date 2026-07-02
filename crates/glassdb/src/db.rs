@@ -243,10 +243,11 @@ impl Database {
             }
             notified.await;
         }
-        // Drain spawned dedup owner tasks so callers observing `shutdown` to
-        // return synchronize with their full release.
-        self.inner.algo.close().await;
+        // Drain background write-backs and async aborts first: a backgrounded
+        // write-back submits through the locker's dedup, so it must complete
+        // before the dedup is closed.
         self.inner.background.shutdown().await;
+        self.inner.algo.close().await;
     }
 
     /// Returns a top-level collection with the given name.

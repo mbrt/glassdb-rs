@@ -85,6 +85,39 @@ impl Resolver {
         Resolver { shards, tmon }
     }
 
+    /// Returns the raw keys that currently exist (committed and not tombstoned)
+    /// in the given shards of `prefix`, help-forwarding committed holders so a
+    /// key whose writer committed but has not yet published its `current_writer`
+    /// pointer (write-back is asynchronous) still lists. The listing path uses
+    /// this instead of reading `current_writer` directly, so a collection's keys
+    /// are visible immediately on commit rather than only after write-back.
+    pub async fn live_keys(
+        &self,
+        prefix: &str,
+        shard_indices: &[u32],
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let targets: Vec<(String, u32)> = shard_indices
+            .iter()
+            .map(|&idx| (prefix.to_string(), idx))
+            .collect();
+        let shards = self.shards.load_shards(&targets).await?;
+
+        let mut keys = Vec::new();
+        for (shard, _) in shards {
+            for e in shard.entries() {
+                let key_path = paths::from_key(prefix, &e.key);
+                let resolved = self
+                    .resolve_entry(&key_path, Some(e))
+                    .await
+                    .map_err(trans_to_storage)?;
+                if resolved.token().is_some() {
+                    keys.push(e.key.clone());
+                }
+            }
+        }
+        Ok(keys)
+    }
+
     /// Returns the effective committed writer of every `key` (the validation
     /// tokens): `Some(writer)` if the key currently exists, `None` if it is
     /// absent or tombstoned. Keys are grouped by shard so each touched shard is
