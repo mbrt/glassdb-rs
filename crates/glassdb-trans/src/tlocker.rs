@@ -49,6 +49,7 @@ use glassdb_storage::{
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
+use crate::resolver::Resolver;
 
 /// Maximum inner CAS retries on a single shard/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -489,6 +490,7 @@ type LockerShard = Mutex<HashMap<TxId, HashMap<String, LockType>>>;
 struct LockerCore {
     tmon: Monitor,
     shards: ShardStore,
+    resolver: Resolver,
     retry: RetryConfig,
     tlocks: Sharded<LockerShard>,
     stats: Stats,
@@ -571,37 +573,20 @@ impl CasWorker {
             deleted: false,
         });
 
-        // Resolve existing holders other than us. A committed exclusive holder is
-        // help-forwarded (its value becomes the effective one); aborted/missing
-        // holders are dropped; pending holders remain as live conflicts. The
-        // monitor folds lease expiry and the unknown-tx grace period into
-        // `tx_status`, so a holder still seen as `Pending` here is genuinely
-        // live (ADR-021).
-        let exclusive = matches!(e.lock_type, LockType::Write | LockType::Create);
-        let mut pending: Vec<TxId> = Vec::new();
-        for holder in e.locked_by.clone() {
-            if &holder == id {
-                continue;
-            }
-            match self.core.tmon.tx_status(&holder).await? {
-                TxCommitStatus::Ok => {
-                    if exclusive {
-                        let cv = self
-                            .core
-                            .tmon
-                            .committed_value(&intent.key_path, &holder)
-                            .await?;
-                        if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
-                            e.current_writer = Some(holder.clone());
-                            e.deleted = cv.value.deleted;
-                        }
-                    }
-                }
-                TxCommitStatus::Pending => pending.push(holder),
-                // Aborted / Unknown: the lock is dead; drop it.
-                _ => {}
-            }
-        }
+        // Resolve existing holders other than us via the shared resolver: a
+        // committed exclusive holder is help-forwarded (its value becomes the
+        // effective one), aborted/missing holders are dropped, and the live
+        // pending ones come back as conflicts to wound-wait. The monitor folds
+        // lease expiry and the unknown-tx grace period into `tx_status`, so a
+        // holder still seen as `Pending` here is genuinely live (ADR-021).
+        let resolved = self
+            .core
+            .resolver
+            .resolve_holders(&intent.key_path, &e, Some(id))
+            .await?;
+        e.current_writer = resolved.writer;
+        e.deleted = resolved.deleted;
+        let mut pending = resolved.pending;
 
         let exists_before = e.current_writer.is_some() && !e.deleted;
 
@@ -973,9 +958,11 @@ impl Locker {
     /// a conflicting holder, so neither contention nor a wait is ever
     /// busy-retried (its `max_interval` caps the wait re-poll cadence).
     pub fn new(shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
         let core = Arc::new(LockerCore {
             tmon,
             shards,
+            resolver,
             retry,
             tlocks: Sharded::new(|_| Mutex::new(HashMap::new())),
             stats: Stats::default(),

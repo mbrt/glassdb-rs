@@ -5,15 +5,18 @@
 //! committed it, so a shard entry only points at the *effective writer*: the
 //! `current_writer` pointer, plus any committed-but-not-yet-written-back
 //! exclusive holder that must be help-forwarded (aborted/expired holders are
-//! dropped). Resolving that pointer is a coordination concern shared by two
+//! dropped). Resolving that pointer is a coordination concern shared by three
 //! consumers with different needs:
 //!
-//! - the [`Reader`](crate::Reader) materializes the value the writer holds, and
+//! - the [`Reader`](crate::Reader) materializes the value the writer holds,
 //! - the commit algorithm ([`Algo`](crate::Algo)) validates reads by comparing
-//!   the observed writer against the current one (ADR-024).
+//!   the observed writer against the current one (ADR-024), and
+//! - the locker acquires a shard's locks, which first resolves the same holders
+//!   (and additionally wound-waits the live pending ones) via
+//!   [`resolve_holders`](Resolver::resolve_holders).
 //!
-//! This module owns that single resolution routine so both go through one place
-//! and neither re-implements help-forwarding. It reads shards fresh (no value
+//! This module owns that single resolution routine so all three go through one
+//! place and none re-implement help-forwarding. It reads shards fresh (no value
 //! cache), so every resolve observes the authoritative coordination state.
 
 use std::collections::{BTreeMap, HashMap};
@@ -51,6 +54,17 @@ impl Resolved {
             _ => None,
         }
     }
+}
+
+/// The outcome of interpreting a shard entry's holder set against transaction
+/// status: the effective committed writer (after help-forwarding), whether that
+/// writer's value is a tombstone, and the foreign holders still live-pending.
+/// The read path uses `writer`/`deleted`; the lock path also wound-waits the
+/// `pending` holders.
+pub(crate) struct HolderResolution {
+    pub writer: Option<TxId>,
+    pub deleted: bool,
+    pub pending: Vec<TxId>,
 }
 
 /// Resolves a key's shard entry to its effective committed writer, help-
@@ -142,27 +156,67 @@ impl Resolver {
             return Ok(Resolved::default());
         };
 
-        let mut writer = e.current_writer.clone();
-        let mut deleted = e.deleted;
-
-        // Only an exclusive (write/create) holder can change the committed value
-        // by help-forwarding. Read-lock holders never change the value, and
-        // pending/aborted holders are ignored (a pending holder has published no
-        // value; an aborted holder's lock is dead).
-        if matches!(e.lock_type, LockType::Write | LockType::Create) {
-            for holder in &e.locked_by {
-                if self.tmon.tx_status(holder).await? != TxCommitStatus::Ok {
-                    continue;
-                }
-                let cv = self.tmon.committed_value(key_path, holder).await?;
-                if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
-                    writer = Some(holder.clone());
-                    deleted = cv.value.deleted;
-                }
-            }
+        // A read-locked (non-exclusive) entry's holders never change the value,
+        // so skip the holder scan entirely — no monitor lookups for a key that
+        // only has shared readers.
+        if !matches!(e.lock_type, LockType::Write | LockType::Create) {
+            return Ok(Resolved {
+                writer: e.current_writer.clone(),
+                deleted: e.deleted,
+            });
         }
 
-        Ok(Resolved { writer, deleted })
+        let r = self.resolve_holders(key_path, e, None).await?;
+        Ok(Resolved {
+            writer: r.writer,
+            deleted: r.deleted,
+        })
+    }
+
+    /// Interprets `entry`'s holders against transaction status — the step shared
+    /// by read resolution and lock acquisition (the locker): help-forward a
+    /// committed exclusive holder's value (one that committed but has not yet
+    /// published its `current_writer` pointer), drop aborted/unknown holders,
+    /// and collect the live pending ones. `skip` is the caller's own id, never
+    /// treated as a foreign holder. Only an exclusive (write/create) entry
+    /// help-forwards; a read-locked entry's holders never change the value but
+    /// are still classified so a writer can wound-wait them. `key_path` is the
+    /// full storage path of the key, used to fetch a help-forwarded writer's
+    /// value.
+    pub(crate) async fn resolve_holders(
+        &self,
+        key_path: &str,
+        entry: &ShardEntry,
+        skip: Option<&TxId>,
+    ) -> Result<HolderResolution, TransError> {
+        let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
+        let mut writer = entry.current_writer.clone();
+        let mut deleted = entry.deleted;
+        let mut pending = Vec::new();
+        for holder in &entry.locked_by {
+            if Some(holder) == skip {
+                continue;
+            }
+            match self.tmon.tx_status(holder).await? {
+                TxCommitStatus::Ok => {
+                    if exclusive {
+                        let cv = self.tmon.committed_value(key_path, holder).await?;
+                        if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
+                            writer = Some(holder.clone());
+                            deleted = cv.value.deleted;
+                        }
+                    }
+                }
+                TxCommitStatus::Pending => pending.push(holder.clone()),
+                // Aborted / Unknown: the lock is dead; drop it.
+                _ => {}
+            }
+        }
+        Ok(HolderResolution {
+            writer,
+            deleted,
+            pending,
+        })
     }
 }
 
@@ -180,9 +234,11 @@ mod tests {
 
     const COLL: &str = "coll";
 
-    // A resolver over `backend` with its own fresh cache, so it starts cold. The
-    // returned `Background` must be kept alive for the monitor's lifetime.
-    fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Arc<Background>) {
+    // A resolver over `backend` with its own fresh cache, so it starts cold,
+    // paired with the monitor backing it (a clone, sharing its caches) so a test
+    // can commit holder values the resolver then help-forwards. The returned
+    // `Background` must be kept alive for the monitor's lifetime.
+    fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Monitor, Arc<Background>) {
         let cache = SharedCache::new(1 << 20);
         let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(backend, &cache);
@@ -190,7 +246,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(values, tl, Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
-        (Resolver::new(shards, mon), bg)
+        (Resolver::new(shards, mon.clone()), mon, bg)
     }
 
     // Installs a committed pointer for `key` directly in its shard (no lock
@@ -212,6 +268,52 @@ mod tests {
                 locked_by: Vec::new(),
                 current_writer: Some(writer.clone()),
                 deleted,
+            },
+        );
+        let new_shard = Shard::from_entries(entries.into_values());
+        assert!(
+            store
+                .store_shard(COLL, idx, &new_shard, ver.as_ref())
+                .await
+                .unwrap()
+        );
+    }
+
+    // Commits `writer`'s value for `key` through the monitor (a tombstone when
+    // `deleted`), so a later help-forward of that holder observes it.
+    async fn commit_value(mon: &Monitor, key: &[u8], writer: &TxId, deleted: bool) {
+        use glassdb_storage::{TxLog, TxWrite};
+        mon.begin_tx(writer);
+        let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
+        tl.writes = vec![TxWrite {
+            path: paths::from_key(COLL, key),
+            value: Arc::from(b"v".as_slice()),
+            deleted,
+            prev_writer: TxId::default(),
+        }];
+        mon.commit_tx(tl).await.unwrap();
+    }
+
+    // Installs a write-locked entry for `key` whose only holder is `holder` and
+    // whose `current_writer` pointer is not yet published — the help-forward
+    // case: the effective writer must be discovered from the committed holder,
+    // not the (stale, empty) pointer.
+    async fn seed_locked(store: &ShardStore, key: &[u8], holder: &TxId) {
+        let idx = shard_index(key);
+        let (shard, ver) = store.load_shard(COLL, idx).await.unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+            .entries()
+            .cloned()
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        entries.insert(
+            key.to_vec(),
+            ShardEntry {
+                key: key.to_vec(),
+                lock_type: LockType::Write,
+                locked_by: vec![holder.clone()],
+                current_writer: None,
+                deleted: false,
             },
         );
         let new_shard = Shard::from_entries(entries.into_values());
@@ -271,7 +373,7 @@ mod tests {
         seed_writer(&seed_store, &b, &tomb, true).await;
         // `c` is deliberately left absent.
 
-        let (resolver, _bg) = resolver_over(backend.clone());
+        let (resolver, _mon, _bg) = resolver_over(backend.clone());
         log.lock().unwrap().clear();
 
         let pa: Arc<str> = paths::from_key(COLL, &a).into();
@@ -324,7 +426,7 @@ mod tests {
         )
         .await;
 
-        let (resolver, _bg) = resolver_over(backend);
+        let (resolver, _mon, _bg) = resolver_over(backend);
         assert_eq!(
             resolver
                 .effective_writer(&paths::from_key(COLL, b"live-key"))
@@ -345,6 +447,46 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    // A committed exclusive holder that has not yet published its `current_writer`
+    // pointer is help-forwarded: the read path discovers the effective writer
+    // (and its tombstone flag) from the holder's committed value, not the stale
+    // pointer. This is the branch now shared with the locker via
+    // `resolve_holders`.
+    #[tokio::test]
+    async fn effective_writer_help_forwards_committed_holder() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed_store = ShardStore::new(ObjectCache::new(
+            backend.clone(),
+            &SharedCache::new(1 << 20),
+        ));
+        let (resolver, mon, _bg) = resolver_over(backend);
+
+        let live = TxId::with_priority(1, b"live");
+        commit_value(&mon, b"live-key", &live, false).await;
+        seed_locked(&seed_store, b"live-key", &live).await;
+
+        let tomb = TxId::with_priority(2, b"tomb");
+        commit_value(&mon, b"dead-key", &tomb, true).await;
+        seed_locked(&seed_store, b"dead-key", &tomb).await;
+
+        assert_eq!(
+            resolver
+                .effective_writer(&paths::from_key(COLL, b"live-key"))
+                .await
+                .unwrap(),
+            Some(live),
+            "a committed exclusive holder is help-forwarded as the writer"
+        );
+        assert_eq!(
+            resolver
+                .effective_writer(&paths::from_key(COLL, b"dead-key"))
+                .await
+                .unwrap(),
+            None,
+            "a help-forwarded tombstone resolves to no writer"
         );
     }
 }
