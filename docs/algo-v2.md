@@ -60,7 +60,10 @@ per-decision ADRs.
 - Collections larger than `C × keys-per-shard` (needs v2 split-resharding).
 - **Within-shard false sharing**: transactions sharing a shard serialize on its
   CAS (~`1 / RTT` per shard). The deliberate trade for removing S3 value-rewrite
-  amplification; `C` is the write-parallelism knob.
+  amplification; `C` is the write-parallelism knob. Mitigated by
+  **[ADR-025](adr/025-dedup-shard-lock-acquisition.md)** deduplication: compatible
+  contenders (disjoint keys or shared reads) merge into one owner-driven GET+CAS
+  instead of racing separate ones.
 - No compaction (a cold key can pin a fat transaction blob of otherwise-dead
   values); no explicit GC counter (full mark-sweep only).
 
@@ -150,7 +153,7 @@ the `Backend` trait is slimmed (ADR-023).
 
 ## Planned ADRs
 
-Each design decision becomes its own ADR (next free number is 025).
+Each design decision becomes its own ADR (next free number is 026).
 
 - **[ADR-016](adr/016-object-storage-native-layout.md) — Object-storage-native
   layout.** ✅ Written. The umbrella decision: move coordination state from tags
@@ -273,6 +276,22 @@ Each design decision becomes its own ADR (next free number is 025).
   `timestamp`-vs-`now` check does. Activated the dormant `wait_for_tx` /
   `refresh_pending` machinery and added `Locker::release_locks` for the serial
   fallback's release step.
+- **[ADR-025](adr/025-dedup-shard-lock-acquisition.md) — Deduplicated
+  shard-batched lock acquisition.** ✅ Implemented. Re-introduces v1's request
+  **deduplication** in the `Locker`, re-keyed from per-key objects onto the v2
+  CAS objects (shards + collection roots) via the dormant
+  `glassdb_concurr::Dedup`. `Locker::lock_shard` / `lock_root` route through one
+  `Dedup` keyed on the object path: several transactions contending the same
+  shard **merge** (disjoint keys or shared reads) so one owner loads it once,
+  installs every compatible contender's lock, and CASes **once** — N GET+CAS
+  round-trips collapse to one. Same-key exclusive contenders (and root membership
+  requests) queue and resolve by the unchanged wound-wait / hold-and-wait. A
+  per-transaction outcome side channel carries the heterogeneous
+  `Locked{membership}` / `Wait` / `Conflict` results (`Dedup` fans out one shared
+  result). Write-back / release stay direct CAS. Confined **beneath** the
+  per-object lock step, so the ADR-020/021/024 protocol, priorities, serial
+  fallback, and ADR-009 in-doubt recovery are all unchanged; re-activates the
+  dormant `Dedup`, `Locker::close`, and `Locker::dedup_snapshot`.
 
 ## Open points checklist
 
