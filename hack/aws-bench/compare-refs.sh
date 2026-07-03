@@ -3,18 +3,24 @@
 # Compare GlassDB transaction performance between two engine versions (git
 # refs) under the in-memory backend with simulated S3 latency and throttling.
 #
-# It builds `rtbench` + `autoresearch` from a base ref (default `main`, built in
-# a reused detached git worktree) and from the target tree (the current worktree
-# by default), runs the same workloads on both into `out-refs/`, and diffs them
-# with `compare.py`. Throughput and latency are the primary axes; retries and
-# backend round-trips per transaction (object-storage efficiency) are secondary.
+# It builds `rtbench` + `autoresearch` (+ `mixbench`, best-effort) from a base
+# ref (default `main`, built in a reused detached git worktree) and from the
+# target tree (the current worktree by default), runs the same workloads on both
+# into `out-refs/`, and diffs them with `compare.py`. Throughput and latency are
+# the primary axes; retries and backend round-trips per transaction
+# (object-storage efficiency) are secondary. `mixbench` adds a mixed-workload
+# contention grid (per-shape throughput and ops/tx across contention mode x
+# Database topology) that surfaces the in-process request-dedup efficiency the
+# low-contention rw9010 sweep does not.
 #
 # Because each ref compiles its own engine (the Backend trait differs across v1
 # and v2), the two sides are built from separate source trees and reconciled
 # through the CSV/JSON outputs. The cross-version run is only fully
 # apples-to-apples once both refs carry the enhanced `rtbench` (e.g. after `main`
 # is merged into the v2 branch); against an older target the driver falls back
-# to the `balanced` mix only and `compare.py` degrades gracefully.
+# to the `balanced` mix only and `compare.py` degrades gracefully. Likewise
+# `mixbench` runs only on refs that carry it; a ref that predates it just skips
+# that section.
 #
 # Each run leaves a small, trackable digest at $OUT/summary.md (the per-section
 # ratio summaries plus the deterministic autoresearch score). It is the only
@@ -44,6 +50,14 @@
 #   DEADLOCK_DURATION=8s    deadlock duration per contention configuration
 #   COUNT=5                 autoresearch suite repeats (reports the median)
 #   RW_MIX="balanced readheavy writeheavy"   rw9010 mixes to run
+#   MIX_DURATION=2s         mixbench measured window per shape
+#   MIX_MODES=lo,hi         mixbench contention modes to sweep
+#   MIX_TOPOLOGIES=shared,per-shape          mixbench Database topologies
+#   MIX_WORKERS=8           mixbench workers per shape
+#   MIX_CLIENTS=4           mixbench client Databases per shape (per-shape topo)
+#   MIX_NUM_KEYS=<NUM_KEYS> mixbench lo-mode key pool
+#   MIX_HOT_KEYS=8          mixbench hi-mode hot-key pool
+#   MIX_MULTI_KEYS=10       mixbench keys per multi-key shape
 #   OUT=<script dir>/out-refs                output root
 #   BASE_WT, TARGET_WT      worktree paths (defaults are repo-parent siblings)
 set -euo pipefail
@@ -63,6 +77,16 @@ NUM_RUNS="${NUM_RUNS:-1}"
 DEADLOCK_DURATION="${DEADLOCK_DURATION:-8s}"
 COUNT="${COUNT:-5}"
 RW_MIX="${RW_MIX:-balanced readheavy writeheavy}"
+# mixbench (mixed-workload contention grid) tunables. Skipped automatically for
+# any ref that predates the binary (e.g. an old BASE), and in --autoresearch-only.
+MIX_DURATION="${MIX_DURATION:-2s}"
+MIX_MODES="${MIX_MODES:-lo,hi}"
+MIX_TOPOLOGIES="${MIX_TOPOLOGIES:-shared,per-shape}"
+MIX_WORKERS="${MIX_WORKERS:-8}"
+MIX_CLIENTS="${MIX_CLIENTS:-4}"
+MIX_NUM_KEYS="${MIX_NUM_KEYS:-$NUM_KEYS}"
+MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
+MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
 OUT="${OUT:-$SCRIPT_DIR/out-refs}"
 BASE_WT="${BASE_WT:-$(dirname "$REPO_ROOT")/.glassdb-perf-base}"
 TARGET_WT_DEFAULT="$(dirname "$REPO_ROOT")/.glassdb-perf-target"
@@ -123,6 +147,16 @@ build_bins() {
   [ "$AUTORESEARCH_ONLY" = "1" ] && bins=(--bin autoresearch)
   log "building ${bins[*]} in $dir (release)"
   (cd "$dir" && cargo build --release "${bins[@]}" >&2)
+  # mixbench is newer than some base refs, so build it best-effort: a ref that
+  # predates the binary just skips the mixbench section (like the --rw-mix
+  # negotiation). Not needed when only the efficiency score is requested.
+  if [ "$AUTORESEARCH_ONLY" != "1" ]; then
+    if (cd "$dir" && cargo build --release --bin mixbench) >/dev/null 2>&1; then
+      log "built mixbench in $dir"
+    else
+      log "NOTE: no mixbench binary in $dir (older ref); its mixbench section is skipped"
+    fi
+  fi
 }
 
 # Whether the rtbench binary at $1 understands --rw-mix (post-enhancement).
@@ -161,6 +195,22 @@ run_side() {
     "$bindir/rtbench" "${common[@]}" \
       --test-name=deadlock --duration="$DEADLOCK_DURATION" --num-runs="$NUM_RUNS" \
       --deadlock-out="$dd/deadlock.csv" >&2
+
+    # mixbench: all shapes together over the contention x topology grid. Only
+    # when this side actually built the binary (older refs skip it); progress
+    # goes to stderr, the JSON grid to the compared artifact.
+    if [ -x "$bindir/mixbench" ]; then
+      local dm="$OUT/mixbench/$label"
+      mkdir -p "$dm"
+      log "$label mixbench"
+      "$bindir/mixbench" --delays=s3 --delay-scale="$DELAY_SCALE" \
+        --duration="$MIX_DURATION" --modes="$MIX_MODES" --topologies="$MIX_TOPOLOGIES" \
+        --workers-per-shape="$MIX_WORKERS" --clients-per-shape="$MIX_CLIENTS" \
+        --num-keys="$MIX_NUM_KEYS" --hot-keys="$MIX_HOT_KEYS" --multi-keys="$MIX_MULTI_KEYS" \
+        --json >"$dm/mixbench.json"
+    else
+      log "$label has no mixbench binary; skipping mixbench"
+    fi
   fi
 
   local de="$OUT/efficiency/$label"
@@ -240,6 +290,17 @@ if [ "$AUTORESEARCH_ONLY" != "1" ]; then
     --a "$OUT/contention/$LABEL_A" --b "$OUT/contention/$LABEL_B" \
     --label-a "$LABEL_A" --label-b "$LABEL_B" --title "deadlock" \
     --summary-out "$SUMMARY"
+
+  # Only when both sides produced a grid (both refs carry mixbench).
+  if [ -f "$OUT/mixbench/$LABEL_A/mixbench.json" ] \
+     && [ -f "$OUT/mixbench/$LABEL_B/mixbench.json" ]; then
+    uv run "$SCRIPT_DIR/compare.py" \
+      --a "$OUT/mixbench/$LABEL_A" --b "$OUT/mixbench/$LABEL_B" \
+      --label-a "$LABEL_A" --label-b "$LABEL_B" --title "mixbench" --no-plots \
+      --summary-out "$SUMMARY"
+  else
+    log "skipping mixbench comparison (missing on a side)"
+  fi
 fi
 
 uv run "$SCRIPT_DIR/compare.py" \

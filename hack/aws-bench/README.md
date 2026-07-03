@@ -289,22 +289,44 @@ artifact that is **not** gitignored, so it can be committed to track the numbers
 (the autoresearch score is deterministic) across changes.
 
 How it works: each ref compiles its own engine (the `Backend` trait differs
-across versions), so the script builds `rtbench` + `autoresearch` from the
-baseline ref in a **reused detached git worktree** and from the target tree,
-runs `rw9010` (the `--rw-mix` presets `balanced`/`readheavy`/`writeheavy`),
-`deadlock`, and the `autoresearch` score on both into `out-refs/`, then diffs
-them with `compare.py` (`ratio = target / base`: throughput > 1 is a win;
-latency / retries / backend-ops / cost < 1 is a win).
+across versions), so the script builds `rtbench` + `autoresearch` (+ `mixbench`,
+best-effort) from the baseline ref in a **reused detached git worktree** and from
+the target tree, runs `rw9010` (the `--rw-mix` presets
+`balanced`/`readheavy`/`writeheavy`), `deadlock`, the `autoresearch` score, and
+the `mixbench` grid on both into `out-refs/`, then diffs them with `compare.py`
+(`ratio = target / base`: throughput > 1 is a win; latency / retries /
+backend-ops / cost < 1 is a win).
+
+`mixbench` runs all four transaction shapes (`rwSingle`, `rwMany`, `roSingle`,
+`roMulti`) together over a contention **mode** (`lo`/`hi`) x Database
+**topology** (`shared`/`per-shape`) grid, reporting per-shape throughput and
+ops/tx. It is the section that exposes the in-process request-dedup efficiency
+the low-contention `rw9010` sweep cannot — the `hi`/`shared` cell is where
+concurrent requests actually merge. `compare.py` reads its `mixbench.json` and
+adds per-shape `mix-tps`/`mix-ops/tx`/`mix-retries/tx` (and, in the `shared`
+topology, whole-DB `mix-agg-ops/tx`) ratio lines to the digest.
+
+Reported transaction **latency and throughput are in simulated
+(real-time-equivalent) time**: `rtbench`/`mixbench` divide `--delay-scale` back
+out of every measured latency and duration, so the numbers are comparable across
+scales and to a real-S3 run rather than reflecting the compressed wall-clock the
+run actually took. Per-transaction counts (retries, backend-ops/tx) are
+scale-free already, and the `client-stats.csv` CPU/HTTP diagnostics stay in real
+wall-clock (they measure the client process). The compensation is exact only
+while the simulated delays dominate; at very small `--delay-scale` real
+scheduling overhead is amplified, so prefer a scale near `1.0` when absolute
+latencies matter.
 
 Both refs must carry the enhanced `rtbench` for a full comparison (the
-`--rw-mix` flag and the `backend-ops` column in `stats.csv`). When the target is
-an older tree that lacks them, the driver falls back to the `balanced` mix only
-and `compare.py` reconstructs backend round-trips by summing the per-class op
-columns, so the run still works (it just can't vary the mix).
+`--rw-mix` flag and the `backend-ops` column in `stats.csv`, and `mixbench`).
+When the target is an older tree that lacks them, the driver falls back to the
+`balanced` mix only and `compare.py` reconstructs backend round-trips by summing
+the per-class op columns, so the run still works.
 
 Tunables (env): `BASE`, `TARGET`, `LABEL_A`/`LABEL_B`, `DELAY_SCALE`, `DB_LIST`,
 `NUM_KEYS`, `DURATION`, `NUM_RUNS`, `DEADLOCK_DURATION`, `COUNT`, `RW_MIX`,
-`OUT`, `BASE_WT`/`TARGET_WT`.
+`MIX_DURATION`, `MIX_MODES`, `MIX_TOPOLOGIES`, `MIX_WORKERS`, `MIX_CLIENTS`,
+`MIX_NUM_KEYS`, `MIX_HOT_KEYS`, `MIX_MULTI_KEYS`, `OUT`, `BASE_WT`/`TARGET_WT`.
 
 > **Criterion is secondary here.** `cargo bench -p glassdb` (`make bench`)
 > measures one transaction at a time at compressed delays; it is good for

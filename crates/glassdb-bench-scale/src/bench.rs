@@ -4,6 +4,14 @@
 //! [`Bench`] accumulates per-operation latency samples over a configurable
 //! duration; [`Results`] computes the mean and percentiles (using the same R8
 //! interpolation method as the Go code, so the numbers line up).
+//!
+//! A [`Bench`] can carry a `time_scale` multiplier ([`Bench::with_time_scale`])
+//! applied to every recorded latency and to the total duration. It compensates
+//! for a backend that compresses wall-clock time — `DelayBackend`'s
+//! `--delay-scale` sleeps and rate-limits at `s * real`, so passing
+//! `1.0 / s` reports latency and throughput in the *simulated*
+//! (real-time-equivalent) domain instead of the compressed wall-clock one.
+//! Count-based metrics (ops/tx, retries) are unaffected either way.
 
 use std::future::Future;
 use std::sync::Mutex;
@@ -16,6 +24,10 @@ const MIN_SAMPLES: usize = 10;
 /// across concurrent workers, so all methods take `&self`.
 pub struct Bench {
     expected_duration: Duration,
+    /// Multiplier applied to every recorded latency and to the total duration,
+    /// to report simulated (real-time-equivalent) values when the backend
+    /// compresses wall-clock time. `1.0` records raw wall-clock.
+    time_scale: f64,
     inner: Mutex<Inner>,
 }
 
@@ -27,15 +39,33 @@ struct Inner {
 
 impl Bench {
     /// Creates a benchmark that runs for `duration` (or the 10s default when
-    /// `duration` is zero).
+    /// `duration` is zero), recording raw wall-clock latencies.
     pub fn new(duration: Duration) -> Self {
+        Self::with_time_scale(duration, 1.0)
+    }
+
+    /// Like [`Bench::new`], but multiplies every recorded latency and the total
+    /// duration by `time_scale`. Pass `1.0 / delay_scale` to undo a
+    /// `DelayBackend`'s wall-clock compression so the reported latency and
+    /// throughput are in the simulated (real-time-equivalent) domain. Values
+    /// that are not finite and positive fall back to `1.0`.
+    ///
+    /// `duration` is the wall-clock run length and is never scaled, so the
+    /// benchmark still stops after that much real time.
+    pub fn with_time_scale(duration: Duration, time_scale: f64) -> Self {
         let expected = if duration.is_zero() {
             DEFAULT_DURATION
         } else {
             duration
         };
+        let time_scale = if time_scale.is_finite() && time_scale > 0.0 {
+            time_scale
+        } else {
+            1.0
+        };
         Bench {
             expected_duration: expected,
+            time_scale,
             inner: Mutex::new(Inner {
                 start_time: None,
                 tot_duration: Duration::ZERO,
@@ -49,11 +79,11 @@ impl Bench {
         self.inner.lock().unwrap().start_time = Some(Instant::now());
     }
 
-    /// Records the total elapsed time since [`Bench::start`].
+    /// Records the total elapsed time since [`Bench::start`] (time-scaled).
     pub fn end(&self) {
         let mut g = self.inner.lock().unwrap();
         if let Some(start) = g.start_time {
-            g.tot_duration = start.elapsed();
+            g.tot_duration = start.elapsed().mul_f64(self.time_scale);
         }
     }
 
@@ -78,9 +108,18 @@ impl Bench {
     {
         let start = Instant::now();
         f().await?;
-        let d = start.elapsed();
-        self.inner.lock().unwrap().samples.push(d);
+        self.record_raw(start.elapsed());
         Ok(())
+    }
+
+    /// Records one raw wall-clock latency sample, applying the time-scale
+    /// compensation so the stored value is in the reported (simulated) domain.
+    fn record_raw(&self, raw: Duration) {
+        self.inner
+            .lock()
+            .unwrap()
+            .samples
+            .push(raw.mul_f64(self.time_scale));
     }
 
     /// Returns a snapshot of the collected results.
@@ -151,6 +190,41 @@ mod tests {
         // The median lands inside the sample range.
         let p50 = r.percentile(0.5);
         assert!(p50 >= Duration::from_millis(40) && p50 <= Duration::from_millis(70));
+    }
+
+    #[test]
+    fn time_scale_multiplies_recorded_latencies() {
+        // A 0.02 delay-scale compresses wall-clock 50x, so reporting in the
+        // simulated domain multiplies each measured latency by 1/0.02 = 50.
+        let b = Bench::with_time_scale(Duration::from_secs(1), 50.0);
+        b.record_raw(Duration::from_millis(10));
+        b.record_raw(Duration::from_millis(20));
+        let r = b.results();
+        assert_eq!(
+            r.samples,
+            vec![Duration::from_millis(500), Duration::from_secs(1)]
+        );
+    }
+
+    #[test]
+    fn new_records_raw_wall_clock() {
+        // The default (real-time) bench applies no scaling.
+        let b = Bench::new(Duration::from_secs(1));
+        b.record_raw(Duration::from_millis(10));
+        assert_eq!(b.results().samples, vec![Duration::from_millis(10)]);
+    }
+
+    #[test]
+    fn non_positive_time_scale_falls_back_to_one() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let b = Bench::with_time_scale(Duration::from_secs(1), bad);
+            b.record_raw(Duration::from_millis(10));
+            assert_eq!(
+                b.results().samples,
+                vec![Duration::from_millis(10)],
+                "time_scale {bad} should fall back to 1.0"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score flamegraph profile
+.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score bench-mix flamegraph profile
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -30,12 +30,17 @@ format:
 bench:
 	cargo bench -p glassdb
 
-# Print the autoresearch performance metric for the current tree: a single-client,
-# deterministic op-cost score (lower is better) plus memory/CPU secondary axes.
-# Runs the suite a few times and reports the median; this is the basis for the
-# CI perf-regression check. Append `-- --json` args for machine-readable output.
+# Print the autoresearch performance metric: deterministic op-cost score (lower
+# is better) plus memory/CPU secondary axes. Append `-- --json` args for
+# machine-readable output.
 bench-score:
 	@cargo run --release -p glassdb-bench-score --bin autoresearch -- --count 3
+
+# Run the mixed-workload contention gridA fast dev tool for seeing where an
+# algorithm change lands. Pass extra flags after `--`, e.g. `make bench-mix
+# ARGS="--modes hi --json"`.
+bench-mix:
+	@cargo run --release -p glassdb-bench-scale --bin mixbench -- $(ARGS)
 
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
 # excluded from `test`, `bench-score`, and the autoresearch gate; it changes no

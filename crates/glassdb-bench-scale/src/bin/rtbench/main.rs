@@ -17,6 +17,17 @@
 //! threads (rather than one OS thread per worker), so a single shared S3 client
 //! and reactor serve everyone — matching the Go design where all goroutines
 //! share one client.
+//!
+//! ## Reported units
+//!
+//! For the simulated backends (`memory`, `fakes3`) `--delay-scale` compresses
+//! wall-clock time. Reported transaction latency and throughput are rescaled
+//! back to the simulated (real-time-equivalent) domain (see
+//! [`report_time_scale`]), so they are comparable across `--delay-scale` values
+//! and to the real `s3`/`gcs` backends. Per-transaction *counts* (retries,
+//! backend ops) are scale-free already. The `client-stats.csv` diagnostics
+//! (wall time, CPU, HTTP) stay in real wall-clock: they measure the actual
+//! client process, not the simulated storage timeline.
 
 mod clientmetrics;
 mod cpu;
@@ -148,20 +159,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let handle = rt.handle().clone();
 
     let setup = rt.block_on(init_backend(&args))?;
+    let time_scale = report_time_scale(&args);
 
     match args.test_name.as_str() {
-        "simple" => run_simple(&handle, setup.backend)?,
+        "simple" => run_simple(&handle, setup.backend, time_scale)?,
         "rw9010" => run_read_write_9010(
             &handle,
             &args,
             setup.backend,
             setup.http,
             setup.server_conns,
+            time_scale,
         )?,
-        "deadlock" => run_deadlock(&handle, &args, setup.backend)?,
+        "deadlock" => run_deadlock(&handle, &args, setup.backend, time_scale)?,
         other => return Err(format!("unknown test name {other:?}").into()),
     }
     Ok(())
+}
+
+/// Multiplier applied to measured latencies and throughput so the reported
+/// numbers are in the simulated (real-time-equivalent) domain rather than the
+/// compressed wall-clock one. The simulated backends (`memory` via
+/// `DelayBackend`, `fakes3` via the injected `FakeS3` latency) sleep at
+/// `delay_scale * real`, so we divide it back out; the real cloud backends
+/// (`s3`, `gcs`) run in real time and need no compensation.
+fn report_time_scale(args: &Args) -> f64 {
+    match args.backend.as_str() {
+        "memory" | "fakes3" if args.delay_scale > 0.0 && args.delay_scale.is_finite() => {
+            1.0 / args.delay_scale
+        }
+        _ => 1.0,
+    }
 }
 
 /// What [`init_backend`] returns: the backend plus the optional client-side HTTP
@@ -363,9 +391,9 @@ struct Benchmarker {
 }
 
 impl Benchmarker {
-    fn new(duration: Duration) -> Self {
+    fn new(duration: Duration, time_scale: f64) -> Self {
         Benchmarker {
-            bench: Arc::new(Bench::new(duration)),
+            bench: Arc::new(Bench::with_time_scale(duration, time_scale)),
             num_keys: 0,
             num_workers: 0,
             num_keys_per_worker: 0,
@@ -422,7 +450,11 @@ impl Benchmarker {
 // `simple` scenario
 // ---------------------------------------------------------------------------
 
-fn run_simple(handle: &Handle, backend: Arc<dyn Backend>) -> Result<(), Box<dyn Error>> {
+fn run_simple(
+    handle: &Handle,
+    backend: Arc<dyn Backend>,
+    time_scale: f64,
+) -> Result<(), Box<dyn Error>> {
     println!(
         "{}",
         [
@@ -452,6 +484,7 @@ fn run_simple(handle: &Handle, backend: Arc<dyn Backend>) -> Result<(), Box<dyn 
             &name,
             backend.clone(),
             Duration::ZERO,
+            time_scale,
             |b, db, h| independent_single_rmw(b, db, h, numw),
         )?;
         i += 5;
@@ -469,6 +502,7 @@ fn run_simple(handle: &Handle, backend: Arc<dyn Backend>) -> Result<(), Box<dyn 
                 &name,
                 backend.clone(),
                 Duration::ZERO,
+                time_scale,
                 |b, db, h| independent_multi_rmw(b, db, h, numw, numk),
             )?;
             j += 5;
@@ -489,6 +523,7 @@ fn run_simple(handle: &Handle, backend: Arc<dyn Backend>) -> Result<(), Box<dyn 
                     &name,
                     backend.clone(),
                     Duration::ZERO,
+                    time_scale,
                     |b, db, h| overlapping_multi_rmw(b, db, h, numw, numkpw, nover),
                 )?;
                 j += 2;
@@ -505,13 +540,14 @@ fn run_test<F>(
     name: &str,
     backend: Arc<dyn Backend>,
     duration: Duration,
+    time_scale: f64,
     f: F,
 ) -> Result<(), Box<dyn Error>>
 where
     F: FnOnce(&mut Benchmarker, &Database, &Handle) -> Result<(), GError>,
 {
     let db = open_db(handle, backend);
-    let mut ben = Benchmarker::new(duration);
+    let mut ben = Benchmarker::new(duration, time_scale);
     let res = f(&mut ben, &db, handle);
     handle.block_on(db.shutdown());
     res?;
@@ -771,11 +807,11 @@ struct DbBench {
 }
 
 impl DbBench {
-    fn new(duration: Duration) -> Self {
+    fn new(duration: Duration, time_scale: f64) -> Self {
         DbBench {
-            write: Bench::new(duration),
-            strong: Bench::new(duration),
-            weak: Bench::new(duration),
+            write: Bench::with_time_scale(duration, time_scale),
+            strong: Bench::with_time_scale(duration, time_scale),
+            weak: Bench::with_time_scale(duration, time_scale),
         }
     }
 
@@ -821,6 +857,7 @@ fn run_read_write_9010(
     backend: Arc<dyn Backend>,
     metrics: Option<Arc<HttpMetrics>>,
     server_conns: Option<Arc<AtomicU64>>,
+    time_scale: f64,
 ) -> Result<(), Box<dyn Error>> {
     // Parse the transaction mix up front so a bad --rw-mix fails before the
     // expensive key initialization.
@@ -875,6 +912,7 @@ fn run_read_write_9010(
                 &keys,
                 numdb,
                 mix,
+                time_scale,
                 &mut rnd,
                 &mut samples,
                 &mut stats,
@@ -897,6 +935,7 @@ fn run_read_write_9010_step(
     keys: &[Vec<u8>],
     numdb: usize,
     mix: RwMix,
+    time_scale: f64,
     rnd: &mut StdRng,
     samples: &mut impl Write,
     stats: &mut impl Write,
@@ -910,7 +949,7 @@ fn run_read_write_9010_step(
     let wall_start = std::time::Instant::now();
 
     let (results, failures) =
-        match read_write_9010_all_dbs(handle, args, backend, keys, numdb, mix, rnd) {
+        match read_write_9010_all_dbs(handle, args, backend, keys, numdb, mix, time_scale, rnd) {
             Ok(r) => r,
             Err(e) => {
                 // Individual failed transactions are counted and dropped, not
@@ -951,6 +990,7 @@ fn run_read_write_9010_step(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_write_9010_all_dbs(
     handle: &Handle,
     args: &Args,
@@ -958,6 +998,7 @@ fn read_write_9010_all_dbs(
     keys: &[Vec<u8>],
     numdb: usize,
     mix: RwMix,
+    time_scale: f64,
     rnd: &mut StdRng,
 ) -> Result<(Vec<DbResults>, u64), Box<dyn Error>> {
     // One seed per Database, derived up front from the shared source.
@@ -968,7 +1009,7 @@ fn read_write_9010_all_dbs(
         .map(|_| open_db(handle, backend.clone()))
         .collect();
     let benches: Vec<Arc<DbBench>> = (0..numdb)
-        .map(|_| Arc::new(DbBench::new(args.duration)))
+        .map(|_| Arc::new(DbBench::new(args.duration, time_scale)))
         .collect();
     for db_bench in &benches {
         db_bench.start();
@@ -1158,6 +1199,7 @@ fn run_deadlock(
     handle: &Handle,
     args: &Args,
     backend: Arc<dyn Backend>,
+    time_scale: f64,
 ) -> Result<(), Box<dyn Error>> {
     let mut out = create_csv(
         &args.deadlock_out,
@@ -1178,7 +1220,7 @@ fn run_deadlock(
         for k in 1..=6usize {
             for overlap in 1..=k {
                 let db = open_db(handle, backend.clone());
-                let mut ben = Benchmarker::new(args.duration);
+                let mut ben = Benchmarker::new(args.duration, time_scale);
                 let res =
                     overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
                 handle.block_on(db.shutdown());

@@ -18,6 +18,9 @@ workspace = true
 #                 (ported from Go `hack/rtbench`).
 #   backendbench  raw backend storage-op latencies (ported from Go
 #                 `hack/backendbench`).
+#   mixbench      mixed-workload contention grid: all transaction shapes run
+#                 together, swept over contention mode x Database topology, with
+#                 per-shape throughput and (per-shape or aggregate) ops/tx.
 [dependencies]
 glassdb = { path = "../glassdb", features = ["s3", "gcs", "s3-fake-server"] }
 glassdb-backend = { workspace = true }
@@ -27,6 +30,9 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "ti
 clap = { version = "4", features = ["derive"] }
 futures = "0.3.32"
 rand = "0.10.1"
+# mixbench emits/diffs its result grid as JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 aws-config = "1.8.17"
 aws-sdk-s3 = "1.134.0"
 # Plaintext HTTP client for the fakes3 backend's connection-pool A/B knob

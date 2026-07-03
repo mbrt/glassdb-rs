@@ -18,7 +18,10 @@ produced by `rtbench` and (optionally) the `autoresearch` scoring harness:
 * `samples.csv`     -> per-transaction latency percentiles (p50/p90/p95);
 * `stats.csv`       -> retries/tx and backend-ops/tx (object-storage round-trips);
 * `deadlock.csv`    -> latency under contention (p50/p90 at 100% overlap);
-* `score.json`      -> autoresearch primary score + per-workload cost/ops per tx.
+* `score.json`      -> autoresearch primary score + per-workload cost/ops per tx;
+* `mixbench.json`   -> mixed-workload grid: per-shape throughput and ops/tx across
+                       contention mode x Database topology (the contention /
+                       in-process-dedup efficiency signal).
 
 Whatever files are present on both sides are compared; the rest are skipped.
 Every metric is reported as the ratio ``b / a`` (the second set over the first),
@@ -44,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -73,7 +77,9 @@ def read_csv(input_dir: Path, name: str) -> pd.DataFrame | None:
     return None
 
 
-def read_json(input_dir: Path, name: str) -> dict | None:
+def read_json(input_dir: Path, name: str) -> Any | None:
+    """Load a result JSON. The top-level shape depends on the file: `score.json`
+    is an object (dict), `mixbench.json` is an array (list) of grid cells."""
     path = input_dir / name
     if path.exists():
         return json.loads(path.read_text())
@@ -234,6 +240,77 @@ def efficiency_table(a: dict, b: dict):
                 "opsPerTx_a": ops_per_tx(x),
                 "opsPerTx_b": ops_per_tx(y),
                 "ops-ratio": _ratio(ops_per_tx(y), ops_per_tx(x)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _mixbench_cells(cells: list) -> dict:
+    """Index a mixbench result grid by (mode, topology)."""
+    return {(c["mode"], c["topology"]): c for c in cells}
+
+
+def mixbench_shape_table(a: list, b: list) -> pd.DataFrame:
+    """Per (mode, topology, shape) throughput, latency, and — where the topology
+    attributes ops per shape (`per-shape`) — ops/tx and retries/tx ratios."""
+    ca, cb = _mixbench_cells(a), _mixbench_cells(b)
+    rows = []
+    for key in sorted(set(ca) & set(cb)):
+        mode, topo = key
+        sa = {s["shape"]: s for s in ca[key].get("shapes", [])}
+        sb = {s["shape"]: s for s in cb[key].get("shapes", [])}
+        for shape in sorted(set(sa) & set(sb)):
+            x, y = sa[shape], sb[shape]
+            ox, oy = x.get("ops"), y.get("ops")
+            rows.append(
+                {
+                    "mode": mode,
+                    "topology": topo,
+                    "shape": shape,
+                    "tps_a": x.get("txPerSec", float("nan")),
+                    "tps_b": y.get("txPerSec", float("nan")),
+                    "tps-ratio": _ratio(y.get("txPerSec", 0), x.get("txPerSec", 0)),
+                    "p50-ratio": _ratio(y.get("p50Ms", 0), x.get("p50Ms", 0)),
+                    "p90-ratio": _ratio(y.get("p90Ms", 0), x.get("p90Ms", 0)),
+                    "opsPerTx_a": ox.get("totalOpsPerTx") if ox else float("nan"),
+                    "opsPerTx_b": oy.get("totalOpsPerTx") if oy else float("nan"),
+                    "ops-ratio": (
+                        _ratio(oy["totalOpsPerTx"], ox["totalOpsPerTx"])
+                        if ox and oy
+                        else float("nan")
+                    ),
+                    "retries-ratio": (
+                        _ratio(oy["retriesPerTx"], ox["retriesPerTx"])
+                        if ox and oy
+                        else float("nan")
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def mixbench_aggregate_table(a: list, b: list) -> pd.DataFrame:
+    """Whole-DB aggregate ops/tx and retries/tx per (mode, topology), for cells
+    (the `shared` topology) that cannot attribute ops per shape."""
+    ca, cb = _mixbench_cells(a), _mixbench_cells(b)
+    rows = []
+    for key in sorted(set(ca) & set(cb)):
+        mode, topo = key
+        oa, ob = ca[key].get("aggregateOps"), cb[key].get("aggregateOps")
+        if not (oa and ob):
+            continue
+        rows.append(
+            {
+                "mode": mode,
+                "topology": topo,
+                "opsPerTx_a": oa.get("totalOpsPerTx", float("nan")),
+                "opsPerTx_b": ob.get("totalOpsPerTx", float("nan")),
+                "ops-ratio": _ratio(
+                    ob.get("totalOpsPerTx", 0), oa.get("totalOpsPerTx", 0)
+                ),
+                "retries-ratio": _ratio(
+                    ob.get("retriesPerTx", 0), oa.get("retriesPerTx", 0)
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -515,6 +592,45 @@ def main() -> int:
         if not tbl.empty:
             summaries.append(summarize("autoresearch-cost/tx", tbl["cost-ratio"]))
             summaries.append(summarize("autoresearch-ops/tx", tbl["ops-ratio"]))
+
+    a_mx, b_mx = read_json(args.a, "mixbench.json"), read_json(args.b, "mixbench.json")
+    if a_mx is not None and b_mx is not None:
+        tbl = mixbench_shape_table(a_mx, b_mx)
+        if not tbl.empty:
+            cols = [
+                "mode",
+                "topology",
+                "shape",
+                "tps_a",
+                "tps_b",
+                "tps-ratio",
+                "p50-ratio",
+                "opsPerTx_a",
+                "opsPerTx_b",
+                "ops-ratio",
+                "retries-ratio",
+            ]
+            print_table(f"mixbench per-shape ({lb}/{la})", tbl[cols])
+            # Throughput ratio per shape (geomean folds the mode/topology cells).
+            for shape, grp in tbl.groupby("shape"):
+                summaries.append(summarize(f"mix-tps[{shape}]", grp["tps-ratio"]))
+            # ops/tx + retries/tx are per-shape only where a shape owns its DBs
+            # (the `per-shape` topology); keep the mode split so the hi-contention
+            # dedup signal is not washed out.
+            ops = tbl.dropna(subset=["ops-ratio"])
+            for (mode, shape), grp in ops.groupby(["mode", "shape"]):
+                summaries.append(
+                    summarize(f"mix-ops/tx[{mode}/{shape}]", grp["ops-ratio"])
+                )
+            for mode, grp in ops.groupby("mode"):
+                summaries.append(
+                    summarize(f"mix-retries/tx[{mode}]", grp["retries-ratio"])
+                )
+        agg = mixbench_aggregate_table(a_mx, b_mx)
+        if not agg.empty:
+            print_table(f"mixbench shared-DB aggregate ops/tx ({lb}/{la})", agg)
+            for mode, grp in agg.groupby("mode"):
+                summaries.append(summarize(f"mix-agg-ops/tx[{mode}]", grp["ops-ratio"]))
 
     print("\n## Summary (ratio = b/a; throughput >1 good, latency/ops/cost <1 good)\n")
     for s in summaries:
