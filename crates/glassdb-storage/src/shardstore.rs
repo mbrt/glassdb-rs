@@ -15,17 +15,27 @@ use std::sync::Arc;
 
 use glassdb_backend as backend;
 use glassdb_data::paths;
+use glassdb_data::shard::{ShardKeys, group_by_owning_shard, shard_index};
 
 use crate::error::StorageError;
 use crate::object_cache::ObjectCache;
 use crate::root::CollectionRoot;
-use crate::shard::Shard;
+use crate::shard::{Shard, ShardEntry};
 
 /// Reads and compare-and-swaps shard and collection-root objects through the
 /// [`ObjectCache`], the v2 coordination substrate.
 #[derive(Clone)]
 pub struct ShardStore {
     objects: ObjectCache,
+}
+
+/// One shard returned by [`ShardStore::load_by_keys`]: the loaded `shard` and
+/// its `version`, together with the raw `keys` (and their payloads) routed to
+/// it. Callers look each key up in the single loaded `shard`.
+pub struct LoadedShard<T> {
+    pub shard: Shard,
+    pub version: Option<backend::Version>,
+    pub keys: ShardKeys<T>,
 }
 
 impl ShardStore {
@@ -63,6 +73,43 @@ impl ShardStore {
             .iter()
             .map(|(prefix, idx)| self.load_shard(prefix, *idx));
         futures::future::join_all(loads).await.into_iter().collect()
+    }
+
+    /// Routes `(key_path, payload)` items to their owning shards and loads those
+    /// shards once each (concurrently), returning one entry per touched shard —
+    /// its loaded `(Shard, version)` together with the raw keys and payloads that
+    /// landed in it, in deterministic shard order. The batched form the read and
+    /// GC paths use: they attach whatever per-key data they need to check, then
+    /// look each key up in its shard's single loaded copy. Key→shard routing
+    /// lives entirely in [`group_by_owning_shard`].
+    pub async fn load_by_keys<P: AsRef<str>, T>(
+        &self,
+        items: impl IntoIterator<Item = (P, T)>,
+    ) -> Result<Vec<LoadedShard<T>>, StorageError> {
+        let groups = group_by_owning_shard(items)
+            .map_err(|e| StorageError::with_source("grouping keys by shard", e))?;
+        let targets: Vec<(String, u32)> = groups.keys().cloned().collect();
+        let shards = self.load_shards(&targets).await?;
+        Ok(shards
+            .into_iter()
+            .zip(groups.into_values())
+            .map(|((shard, version), keys)| LoadedShard {
+                shard,
+                version,
+                keys,
+            })
+            .collect())
+    }
+
+    /// Loads the coordination entry for `key_path`, or `None` if the key has no
+    /// entry yet. The singular counterpart to [`load_by_keys`]: it routes the one
+    /// key to its owning shard and looks it up, so the caller never computes a
+    /// shard index. The read path uses this before resolving a single key.
+    pub async fn load_entry(&self, key_path: &str) -> Result<Option<ShardEntry>, StorageError> {
+        let (prefix, raw_key) = paths::split_key(key_path)
+            .map_err(|e| StorageError::with_source("parsing key path", e))?;
+        let (shard, _) = self.load_shard(&prefix, shard_index(&raw_key)).await?;
+        Ok(shard.lookup(&raw_key).cloned())
     }
 
     /// Compare-and-swaps shard `idx`. `expected = None` means create-if-absent.
@@ -166,9 +213,12 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_data::TxId;
     use glassdb_data::shard::shard_index;
 
     use crate::entry::SharedCache;
+    use crate::lock::LockType;
+    use crate::shard::ShardEntry;
 
     const COLL: &str = "coll";
 
@@ -248,6 +298,66 @@ mod tests {
         );
         // Each distinct shard was fetched exactly once.
         assert_eq!(count(&log, "read"), 2);
+    }
+
+    // load_by_keys routes each key to its owning shard, loads it once, and
+    // returns the raw keys and payloads that landed there alongside the loaded
+    // copy — so a caller looks each key up in the single fetched shard.
+    #[tokio::test]
+    async fn load_by_keys_routes_and_aligns_payloads() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let present = b"present".to_vec();
+        let absent = b"absent".to_vec();
+        assert_ne!(
+            shard_index(&present),
+            shard_index(&absent),
+            "test keys must map to distinct shards"
+        );
+
+        let tid = TxId::from_bytes(vec![1, 2, 3]);
+        let entry = ShardEntry {
+            key: present.clone(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: Some(tid),
+            deleted: false,
+        };
+        store
+            .store_shard(
+                COLL,
+                shard_index(&present),
+                &Shard::from_entries([entry]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let out = store
+            .load_by_keys([
+                (paths::from_key(COLL, &present), "P"),
+                (paths::from_key(COLL, &absent), "A"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 2, "one entry per distinct owning shard");
+
+        let present_group = out.iter().find(|g| g.keys[0].1 == "P").unwrap();
+        assert_eq!(present_group.keys, vec![(present.clone(), "P")]);
+        assert!(
+            present_group.shard.lookup(&present).is_some(),
+            "the seeded entry is visible in its loaded shard"
+        );
+        assert!(
+            present_group.version.is_some(),
+            "seeded shard carries a version"
+        );
+
+        let absent_group = out.iter().find(|g| g.keys[0].1 == "A").unwrap();
+        assert!(
+            absent_group.shard.is_empty() && absent_group.version.is_none(),
+            "a missing shard is the empty shard with no version"
+        );
     }
 
     // A write-through store updates the cache, so a load after a CAS observes the

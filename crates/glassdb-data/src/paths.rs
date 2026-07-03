@@ -134,6 +134,26 @@ pub fn to_transaction(suffix: &str) -> Result<TxId, PathError> {
     Ok(TxId::from_bytes(decode(Type::Transaction, suffix)?))
 }
 
+/// Returns the listing prefix for all transaction objects under `prefix`.
+pub fn transactions_prefix(prefix: &str) -> String {
+    typed_prefix(prefix, Type::Transaction)
+}
+
+/// Decodes the transaction ID from a full transaction object path
+/// (`{prefix}/_t/<b64>`), the inverse of [`from_transaction`]. Unlike
+/// [`to_transaction`] (which decodes a type-marked suffix), this takes a whole
+/// path as returned by a transaction listing.
+pub fn transaction_id_of(path: &str) -> Result<TxId, PathError> {
+    let pr = parse(path)?;
+    if pr.typ != Type::Transaction {
+        return Err(PathError::WrongPrefix {
+            suffix: path.to_string(),
+            expected: Type::Transaction.as_str().to_string(),
+        });
+    }
+    Ok(TxId::from_bytes(base64::decode(&pr.suffix)?))
+}
+
 /// Returns the storage path for shard `index` under `prefix`.
 ///
 /// The index is a fixed-width zero-padded decimal so shard paths are a stable,
@@ -301,6 +321,20 @@ mod tests {
         assert_eq!(keys_prefix("db/coll"), "db/coll/_k/");
         assert_eq!(collections_prefix("db/coll"), "db/coll/_c/");
         assert_eq!(shards_prefix("db/coll"), "db/coll/_s/");
+        assert_eq!(transactions_prefix("db"), "db/_t/");
+    }
+
+    #[test]
+    fn transaction_id_of_round_trip_and_errors() {
+        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        assert_eq!(transaction_id_of(&from_transaction("db", &id)).unwrap(), id);
+        // A non-transaction path is rejected.
+        assert!(matches!(
+            transaction_id_of(&from_key("db/coll", b"k")),
+            Err(PathError::WrongPrefix { .. })
+        ));
+        // A malformed path (no type segment) is a parse error.
+        assert!(matches!(transaction_id_of("db"), Err(PathError::Parse(_))));
     }
 
     #[test]

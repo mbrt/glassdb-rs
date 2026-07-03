@@ -19,10 +19,9 @@
 //! place and none re-implement help-forwarding. It reads shards fresh (no value
 //! cache), so every resolve observes the authoritative coordination state.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus};
 
@@ -32,8 +31,6 @@ use crate::monitor::Monitor;
 /// A read key grouped for batched resolution: its full storage path (the map
 /// key of the returned effective-writer set) paired with its decoded raw key
 /// (the shard-entry lookup key).
-type KeyRef = (Arc<str>, Vec<u8>);
-
 /// The resolved view of a shard entry, after help-forwarding committed holders.
 #[derive(Debug, Clone, Default)]
 struct Resolved {
@@ -128,28 +125,19 @@ impl Resolver {
         &self,
         keys: &[Arc<str>],
     ) -> Result<HashMap<Arc<str>, Option<TxId>>, StorageError> {
-        // Group distinct keys by (prefix, shard index). The BTreeMap fixes a
-        // deterministic (sorted) load/resolve order so the simulation op-stream
-        // oracle stays reproducible.
-        let mut groups: BTreeMap<(String, u32), Vec<KeyRef>> = BTreeMap::new();
-        for key in keys {
-            let (prefix, raw_key) = paths::split_key(key)
-                .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
-            let idx = shard_index(&raw_key);
-            groups
-                .entry((prefix, idx))
-                .or_default()
-                .push((key.clone(), raw_key));
-        }
-
-        let targets: Vec<(String, u32)> = groups.keys().cloned().collect();
-        let shards = self.shards.load_shards(&targets).await?;
+        // Route the keys to their shards and load each once; the key→shard
+        // grouping (and its deterministic order) lives in `load_by_keys`. Each
+        // key rides along as its own payload so it can key the output map.
+        let groups = self
+            .shards
+            .load_by_keys(keys.iter().map(|k| (k.clone(), k.clone())))
+            .await?;
 
         let mut out = HashMap::with_capacity(keys.len());
-        for ((_, refs), (shard, _)) in groups.iter().zip(shards) {
-            for (key, raw_key) in refs {
+        for loaded in &groups {
+            for (raw_key, key) in &loaded.keys {
                 let resolved = self
-                    .resolve_entry(key, shard.lookup(raw_key))
+                    .resolve_entry(key, loaded.shard.lookup(raw_key))
                     .await
                     .map_err(trans_to_storage)?;
                 out.insert(key.clone(), resolved.token());
@@ -162,14 +150,9 @@ impl Resolver {
     /// if the key currently exists, `None` if it is absent or tombstoned. The
     /// singular form the read path uses before materializing the value.
     pub(crate) async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
-        let (prefix, raw_key) = paths::split_key(key)
-            .map_err(|e| StorageError::with_source(format!("parsing key path {key:?}"), e))?;
-        let (shard, _) = self
-            .shards
-            .load_shard(&prefix, shard_index(&raw_key))
-            .await?;
+        let entry = self.shards.load_entry(key).await?;
         let resolved = self
-            .resolve_entry(key, shard.lookup(&raw_key))
+            .resolve_entry(key, entry.as_ref())
             .await
             .map_err(trans_to_storage)?;
         Ok(resolved.token())
@@ -257,7 +240,9 @@ impl Resolver {
 mod tests {
     use super::*;
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use glassdb_data::shard::shard_index;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;

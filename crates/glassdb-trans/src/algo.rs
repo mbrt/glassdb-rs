@@ -305,9 +305,6 @@ impl Algo {
         tx.status = Status::Committed;
 
         self.write_back(&tx.id, locked).await;
-        // GC is inert in v2 (ADR-022 deferred); this records nothing but keeps
-        // the write-back hook wired for the future mark-sweep collector.
-        self.gc.schedule_tx_cleanup(tx.id.clone());
         Ok(())
     }
 
@@ -323,12 +320,17 @@ impl Algo {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
                 let locker = self.locker.clone();
+                let gc = self.gc.clone();
                 let id = id.clone();
                 bg.spawn_waited(async move {
-                    locker.write_back(&id, &locked).await;
+                    let superseded = locker.write_back(&id, &locked).await;
+                    feed_gc_hints(&gc, superseded);
                 });
             }
-            None => self.locker.write_back(id, &locked).await,
+            None => {
+                let superseded = self.locker.write_back(id, &locked).await;
+                feed_gc_hints(&self.gc, superseded);
+            }
         }
     }
 
@@ -546,6 +548,15 @@ impl Algo {
     }
 }
 
+/// Feeds the transaction ids a write-back superseded to GC as reverse-check
+/// candidates (ADR-022): each is a former `current_writer` a fresh commit's
+/// pointer overwrote, so it just lost a reference and may now be collectable.
+fn feed_gc_hints(gc: &Gc, superseded: Vec<TxId>) {
+    for prev in superseded {
+        gc.schedule_tx_cleanup(prev);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +598,13 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let locker = Locker::new(shards.clone(), tmon.clone(), RetryConfig::default());
-        let gc = Gc::new(bg_weak.clone(), tlogger.clone());
+        let gc = Gc::new(
+            bg_weak.clone(),
+            tlogger.clone(),
+            shards.clone(),
+            tmon.clone(),
+            Clock::real(),
+        );
 
         // Create the collection root so membership locks have a home.
         shards
@@ -698,7 +715,7 @@ mod tests {
 
         let status = tctx.tlogger.commit_status(&tid).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
-        let txlog = tctx.tlogger.get(&tid).await.unwrap();
+        let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
         assert_eq!(txlog.writes.len(), 1);
         assert_eq!(txlog.writes[0].path, keyp);
         assert_eq!(&*txlog.writes[0].value, val);

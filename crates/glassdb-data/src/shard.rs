@@ -5,7 +5,9 @@
 //! FNV-1a mapping are part of the on-disk format: changing either remaps every
 //! key, so they are format-version constants, never runtime options.
 
-use crate::paths;
+use std::collections::BTreeMap;
+
+use crate::paths::{self, PathError};
 
 const FNV_OFFSET_32: u32 = 2166136261;
 const FNV_PRIME_32: u32 = 16777619;
@@ -47,6 +49,38 @@ pub fn shard_index(key: &[u8]) -> u32 {
 /// Returns the storage path of the shard that owns `key` under `prefix`.
 pub fn shard_path(prefix: &str, key: &[u8]) -> String {
     paths::from_shard(prefix, shard_index(key))
+}
+
+/// The raw keys (with their payloads) that landed in one shard.
+pub type ShardKeys<T> = Vec<(Vec<u8>, T)>;
+
+/// Keys grouped by their owning shard, keyed by `(prefix, shard index)` in
+/// deterministic order. The output of [`group_by_owning_shard`].
+pub type ShardGroups<T> = BTreeMap<(String, u32), ShardKeys<T>>;
+
+/// Groups `(key_path, payload)` items by the shard that owns each key, keyed by
+/// `(prefix, shard index)` and carrying each key's raw bytes with its payload.
+///
+/// The single home for routing a batch of keys to their shards: callers hand it
+/// key paths and never compute a shard index themselves, so evolving the mapping
+/// (a different `SHARD_COUNT`, resharding, or a key spanning several shards)
+/// stays local to this module. The `BTreeMap` fixes a deterministic (sorted)
+/// iteration order, keeping simulation op-stream replays reproducible; ordering
+/// *within* a shard follows input order. A non-key path surfaces its
+/// [`PathError`].
+pub fn group_by_owning_shard<P: AsRef<str>, T>(
+    items: impl IntoIterator<Item = (P, T)>,
+) -> Result<ShardGroups<T>, PathError> {
+    let mut groups: ShardGroups<T> = BTreeMap::new();
+    for (path, payload) in items {
+        let (prefix, raw_key) = paths::split_key(path.as_ref())?;
+        let idx = shard_index(&raw_key);
+        groups
+            .entry((prefix, idx))
+            .or_default()
+            .push((raw_key, payload));
+    }
+    Ok(groups)
 }
 
 /// Inline FNV-1a 32-bit hash that avoids allocating a hasher. Mirrors the
@@ -109,5 +143,55 @@ mod tests {
     #[test]
     fn shard_path_format() {
         assert_eq!(shard_path("db/coll", b"Hello"), "db/coll/_s/0331");
+    }
+
+    #[test]
+    fn group_by_owning_shard_collapses_and_orders() {
+        // Two keys of the same collection that hash to the same shard collapse
+        // into one group; a key in another collection is a separate target.
+        let a = paths::from_key("db/coll", b"Hello"); // shard 331
+        let b = paths::from_key("db/coll", b"hello"); // shard 171
+        let other = paths::from_key("db/other", b"Hello"); // shard 331, other prefix
+
+        let groups = group_by_owning_shard([(&a, 1u32), (&b, 2u32), (&other, 3u32)]).unwrap();
+
+        let keys: Vec<_> = groups.keys().cloned().collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("db/coll".to_string(), 171),
+                ("db/coll".to_string(), 331),
+                ("db/other".to_string(), 331),
+            ],
+            "targets are distinct (prefix, idx) pairs in sorted order"
+        );
+        assert_eq!(
+            groups[&("db/coll".to_string(), 331)],
+            vec![(b"Hello".to_vec(), 1u32)]
+        );
+    }
+
+    #[test]
+    fn group_by_owning_shard_merges_same_shard_keys() {
+        // A key and a sibling that map to the same shard share one group,
+        // preserving input order and their payloads.
+        let a = paths::from_key("db/coll", b"Hello"); // shard 331
+        let a2 = paths::from_key("db/coll", b"Hello"); // same key, second intent
+
+        let groups = group_by_owning_shard([(a, 'w'), (a2, 'r')]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[&("db/coll".to_string(), 331)],
+            vec![(b"Hello".to_vec(), 'w'), (b"Hello".to_vec(), 'r')]
+        );
+    }
+
+    #[test]
+    fn group_by_owning_shard_rejects_non_key_path() {
+        let bad = paths::from_shard("db/coll", 0);
+        assert!(matches!(
+            group_by_owning_shard([(bad, ())]),
+            Err(PathError::WrongPrefix { .. })
+        ));
     }
 }

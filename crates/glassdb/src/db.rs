@@ -137,7 +137,13 @@ impl DatabaseBuilder {
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let locker = Locker::new(shards.clone(), tmon.clone(), retry);
-        let gc = Gc::new(bg_weak.clone(), tl);
+        let gc = Gc::new(
+            bg_weak.clone(),
+            tl,
+            shards.clone(),
+            tmon.clone(),
+            clock.clone(),
+        );
         gc.start();
         let algo = Algo::new(
             values.clone(),

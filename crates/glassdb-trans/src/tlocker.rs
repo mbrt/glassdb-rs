@@ -40,7 +40,7 @@ use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
     shard::Sharded,
 };
-use glassdb_data::shard::shard_index;
+use glassdb_data::shard::group_by_owning_shard;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
     CollectionRoot, LockType, PathLock, ShardEntry, ShardStore, StorageError, TxCommitStatus,
@@ -138,28 +138,28 @@ fn build_groups(data: &Data) -> Result<BTreeMap<String, ShardGroup>, TransError>
         by_path.entry(r.path.to_string()).or_insert(Desired::Read);
     }
 
+    let grouped = group_by_owning_shard(by_path)
+        .map_err(|e| TransError::with_source("grouping keys by shard", e))?;
+
     let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
-    for (path, desired) in by_path {
-        let (prefix, raw_key) = paths::split_key(&path)
-            .map_err(|e| TransError::with_source(format!("parsing key path {path:?}"), e))?;
-        let idx = shard_index(&raw_key);
-        let shard_path = paths::from_shard(&prefix, idx);
-        groups
-            .entry(shard_path)
-            .or_insert_with(|| ShardGroup {
+    for ((prefix, idx), keys) in grouped {
+        let mut intents: Vec<KeyIntent> = keys
+            .into_iter()
+            .map(|(raw_key, desired)| KeyIntent {
+                key_path: paths::from_key(&prefix, &raw_key),
+                raw_key,
+                desired,
+            })
+            .collect();
+        intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
+        groups.insert(
+            paths::from_shard(&prefix, idx),
+            ShardGroup {
                 prefix,
                 idx,
-                intents: Vec::new(),
-            })
-            .intents
-            .push(KeyIntent {
-                raw_key,
-                key_path: path,
-                desired,
-            });
-    }
-    for group in groups.values_mut() {
-        group.intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
+                intents,
+            },
+        );
     }
     Ok(groups)
 }
@@ -205,7 +205,9 @@ enum CasOutcome {
     Conflict,
     /// A release or write-back completed (ADR-026). Idempotent and best-effort:
     /// there is nothing to wait on and nothing for the caller to retry.
-    Released,
+    /// `superseded` carries the `current_writer` transaction ids a write-back
+    /// overwrote — GC reverse-check candidates (ADR-022); empty for a release.
+    Released { superseded: Vec<TxId> },
 }
 
 /// Per-submission mailbox carrying one transaction's [`CasOutcome`] back from
@@ -371,8 +373,9 @@ fn writeback_changes(
     id: &TxId,
     intents: &[KeyIntent],
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
-) -> Vec<(Vec<u8>, ShardEntry)> {
+) -> WritebackStaged {
     let mut changes = Vec::new();
+    let mut superseded = Vec::new();
     for intent in intents {
         let Some(e) = entries.get(&intent.raw_key) else {
             continue;
@@ -382,13 +385,14 @@ fn writeback_changes(
         }
         let mut e = e.clone();
         match intent.desired {
-            Desired::Put => {
+            Desired::Put | Desired::Delete => {
+                if let Some(prev) = &e.current_writer
+                    && prev != id
+                {
+                    superseded.push(prev.clone());
+                }
                 e.current_writer = Some(id.clone());
-                e.deleted = false;
-            }
-            Desired::Delete => {
-                e.current_writer = Some(id.clone());
-                e.deleted = true;
+                e.deleted = matches!(intent.desired, Desired::Delete);
             }
             Desired::Read => {}
         }
@@ -398,7 +402,17 @@ fn writeback_changes(
         }
         changes.push((intent.raw_key.clone(), e));
     }
-    changes
+    WritebackStaged {
+        changes,
+        superseded,
+    }
+}
+
+/// The staged result of a write-back: the entry changes to apply and the
+/// `current_writer`s they superseded (GC candidates, ADR-022).
+struct WritebackStaged {
+    changes: Vec<(Vec<u8>, ShardEntry)>,
+    superseded: Vec<TxId>,
 }
 
 /// Stages `id`'s release: drop its hold from **every** entry in the shard,
@@ -437,7 +451,12 @@ enum MemberResolution {
     Wait(TxId),
     /// A release / write-back applied its changes (ADR-026); `changes` may be
     /// empty when the member held nothing. It never waits or conflicts.
-    Released { changes: Vec<(Vec<u8>, ShardEntry)> },
+    /// `superseded` carries the `current_writer`s a write-back overwrote (GC
+    /// candidates, ADR-022); empty for a release.
+    Released {
+        changes: Vec<(Vec<u8>, ShardEntry)>,
+        superseded: Vec<TxId>,
+    },
 }
 
 /// How a hold-and-wait wake happened, so the re-poll cadence can be tuned: a
@@ -730,11 +749,19 @@ impl CasWorker {
             for (tx, m) in &members {
                 let resolution = match m.action {
                     ShardAction::Acquire => self.resolve_member(tx, &m.intents, &entries).await?,
-                    ShardAction::WriteBack => MemberResolution::Released {
-                        changes: writeback_changes(tx, &m.intents, &entries),
-                    },
+                    ShardAction::WriteBack => {
+                        let WritebackStaged {
+                            changes,
+                            superseded,
+                        } = writeback_changes(tx, &m.intents, &entries);
+                        MemberResolution::Released {
+                            changes,
+                            superseded,
+                        }
+                    }
                     ShardAction::Release => MemberResolution::Released {
                         changes: release_changes(tx, &entries),
+                        superseded: Vec::new(),
                     },
                 };
                 match resolution {
@@ -751,12 +778,15 @@ impl CasWorker {
                     MemberResolution::Wait(holder) => {
                         results.push((tx.clone(), CasOutcome::Wait(holder)));
                     }
-                    MemberResolution::Released { changes } => {
+                    MemberResolution::Released {
+                        changes,
+                        superseded,
+                    } => {
                         staged |= !changes.is_empty();
                         for (k, e) in changes {
                             entries.insert(k, e);
                         }
-                        results.push((tx.clone(), CasOutcome::Released));
+                        results.push((tx.clone(), CasOutcome::Released { superseded }));
                     }
                 }
             }
@@ -800,7 +830,9 @@ impl CasWorker {
         for m in shard_members(batch)?.values() {
             let outcome = match m.action {
                 ShardAction::Acquire => CasOutcome::Conflict,
-                ShardAction::WriteBack | ShardAction::Release => CasOutcome::Released,
+                ShardAction::WriteBack | ShardAction::Release => CasOutcome::Released {
+                    superseded: Vec::new(),
+                },
             };
             *m.slot.lock().unwrap() = Some(outcome);
         }
@@ -825,7 +857,9 @@ impl CasWorker {
             },
             RootAction::Release => {
                 self.release_root_attempt(prefix, &id).await?;
-                CasOutcome::Released
+                CasOutcome::Released {
+                    superseded: Vec::new(),
+                }
             }
         };
         *slot.lock().unwrap() = Some(outcome);
@@ -1114,14 +1148,22 @@ impl Locker {
     /// membership locks. Every CAS is idempotent; errors are best-effort
     /// (a failure leaves the locks to be reclaimed lazily by the next contender
     /// or lease expiry), so this never fails an already-committed transaction.
-    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) {
+    ///
+    /// Returns the transaction ids each published pointer *superseded* (the
+    /// former `current_writer` an overwrite replaced): these just lost a
+    /// reference and are GC write-back hint candidates (ADR-022).
+    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
+        let mut superseded = Vec::new();
         for group in locked.groups.values() {
-            let _ = self.write_back_shard(id, group).await;
+            if let Ok(mut s) = self.write_back_shard(id, group).await {
+                superseded.append(&mut s);
+            }
         }
         for prefix in &locked.membership {
             let _ = self.release_root(prefix, id).await;
         }
         self.inner.core.clear_tx_locks(id);
+        superseded
     }
 
     /// Acquires this transaction's locks across every touched shard. Returns the
@@ -1233,7 +1275,7 @@ impl Locker {
                 // `Released` cannot reach an acquire; a missing outcome means the
                 // round was abandoned or shut down. Either way, report a conflict
                 // for a safe release-and-relock.
-                Some(CasOutcome::Conflict | CasOutcome::Released) | None => {
+                Some(CasOutcome::Conflict | CasOutcome::Released { .. }) | None => {
                     return Ok(ShardOutcome::Conflict);
                 }
             }
@@ -1280,7 +1322,9 @@ impl Locker {
             let outcome = slot.lock().unwrap().take();
             match outcome {
                 Some(CasOutcome::Locked { .. }) => return Ok(true),
-                Some(CasOutcome::Conflict | CasOutcome::Released) | None => return Ok(false),
+                Some(CasOutcome::Conflict | CasOutcome::Released { .. }) | None => {
+                    return Ok(false);
+                }
                 Some(CasOutcome::Wait(holder)) => {
                     let delay = backoff.next_delay();
                     if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
@@ -1295,8 +1339,13 @@ impl Locker {
     /// through the shared [`Dedup`] (ADR-026): the write-back merges into any
     /// in-flight round for the shard (it never lock-conflicts), so N committers
     /// on one shard collapse to one CAS. Best-effort — a lost race leaves the
-    /// holds to lazy reclaim / lease expiry.
-    async fn write_back_shard(&self, id: &TxId, group: &ShardGroup) -> Result<(), TransError> {
+    /// holds to lazy reclaim / lease expiry. Returns the `current_writer`s it
+    /// superseded, GC candidates (ADR-022).
+    async fn write_back_shard(
+        &self,
+        id: &TxId,
+        group: &ShardGroup,
+    ) -> Result<Vec<TxId>, TransError> {
         self.submit_shard_unlock(
             &group.prefix,
             group.idx,
@@ -1320,13 +1369,15 @@ impl Locker {
     ) -> Result<(), TransError> {
         self.submit_shard_unlock(prefix, idx, id, ShardAction::Release, Arc::new(Vec::new()))
             .await
+            .map(|_| ())
     }
 
     /// Submits one release / write-back member for a shard through the [`Dedup`]
     /// and awaits it. The worker retries CAS contention / in-doubt internally and
     /// then reports done, so this is best-effort (ADR-026): a shutdown mid-flight
     /// simply leaves the holds to lease expiry, and only a genuine storage error
-    /// surfaces.
+    /// surfaces. Returns the `current_writer`s a write-back overwrote — GC
+    /// candidates (ADR-022), always empty for a release.
     async fn submit_shard_unlock(
         &self,
         prefix: &str,
@@ -1334,7 +1385,7 @@ impl Locker {
         id: &TxId,
         action: ShardAction,
         intents: Arc<Vec<KeyIntent>>,
-    ) -> Result<(), TransError> {
+    ) -> Result<Vec<TxId>, TransError> {
         let shard_path = paths::from_shard(prefix, idx);
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
@@ -1343,7 +1394,7 @@ impl Locker {
             ShardMember {
                 action,
                 intents,
-                slot,
+                slot: slot.clone(),
             },
         );
         let req = CasReq::Shard {
@@ -1352,9 +1403,12 @@ impl Locker {
             members,
         };
         match self.inner.dedup.run(&shard_path, req).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(match slot.lock().unwrap().take() {
+                Some(CasOutcome::Released { superseded }) => superseded,
+                _ => Vec::new(),
+            }),
             Err(DedupError::Work(e)) => Err((*e).clone()),
-            Err(DedupError::Cancelled) => Ok(()),
+            Err(DedupError::Cancelled) => Ok(Vec::new()),
         }
     }
 
@@ -1662,15 +1716,41 @@ mod tests {
 
         let groups = group_of(key, put_intent(key));
         let membership = lock_ok(&locker, &tx, &groups).await;
-        locker
+        // First writer of a fresh key overwrites no pointer: no GC hint.
+        let superseded = locker
             .write_back(&tx, &LockedTx { groups, membership })
             .await;
+        assert!(superseded.is_empty());
 
         let e = entry_of(&ctx, key).await.unwrap();
         assert_eq!(e.lock_type, LockType::None);
         assert!(e.locked_by.is_empty());
         assert_eq!(e.current_writer, Some(tx.clone()));
         assert!(locker.tx_locks_snapshot().is_empty());
+    }
+
+    // Write-back over an existing key returns the `current_writer` it overwrote:
+    // that txid just lost its reference and is the GC candidate hint (ADR-022).
+    #[tokio::test]
+    async fn write_back_returns_superseded_writer() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+
+        // First committer publishes the pointer for `key`; it supersedes nothing.
+        let old = mk_tid(1, "old");
+        let lt_old = lock_commit(&locker, &ctx, &old, key).await;
+        assert!(locker.write_back(&old, &lt_old).await.is_empty());
+        assert_eq!(
+            entry_of(&ctx, key).await.unwrap().current_writer,
+            Some(old.clone())
+        );
+
+        // A second committer overwrites the same key; its write-back reports the
+        // pointer it replaced.
+        let new = mk_tid(2, "new");
+        let lt_new = lock_commit(&locker, &ctx, &new, key).await;
+        assert_eq!(locker.write_back(&new, &lt_new).await, vec![old]);
+        assert_eq!(entry_of(&ctx, key).await.unwrap().current_writer, Some(new));
     }
 
     // The deadlock-timeout serial fallback releases held locks *without*

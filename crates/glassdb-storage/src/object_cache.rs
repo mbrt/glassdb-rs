@@ -126,6 +126,13 @@ impl ObjectCache {
         Ok(())
     }
 
+    /// Lists object paths under `dir_path`. Goes straight to the backend: a
+    /// listing enumerates keys rather than fetching bodies, so there is nothing
+    /// to serve from (or store in) the object cache.
+    pub async fn list(&self, dir_path: &str) -> Result<Vec<String>, StorageError> {
+        Ok(self.backend.list(dir_path).await?)
+    }
+
     /// Caches a freshly-read object body and returns it as an [`ObjectRead`].
     fn cache_read(&self, key: &str, r: backend::ReadReply) -> ObjectRead {
         let bytes: Arc<[u8]> = Arc::from(r.contents);

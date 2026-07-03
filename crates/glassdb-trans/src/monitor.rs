@@ -18,8 +18,8 @@ use tokio::sync::oneshot;
 
 use crate::error::TransError;
 
-const PENDING_TX_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
+pub(crate) const PENDING_TX_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
 
 fn refresh_timeout() -> Duration {
     // refreshMultiplier = 0.5
@@ -30,7 +30,12 @@ fn refresh_timeout() -> Duration {
 /// `timestamp` against the observer's `now`. The comparison crosses machines, so
 /// it is padded by `MAX_CLOCK_SKEW`. Lets a waiter immediately reclaim a holder
 /// whose last refresh is already ancient the first time it is seen.
-fn is_expired(last_refresh: SystemTime, now: SystemTime) -> bool {
+///
+/// This is also GC's safety horizon (ADR-022): a transaction object is
+/// collectable-by-age exactly when its lease `timestamp` is expired by this
+/// predicate, and for an aborted object (whose `timestamp` is the abort instant)
+/// it doubles as the tombstone-retention gate.
+pub(crate) fn is_expired(last_refresh: SystemTime, now: SystemTime) -> bool {
     // Go: now.Sub(lastRefresh.Add(maxClockSkew)) > pendingTxTimeout
     match now.duration_since(last_refresh + MAX_CLOCK_SKEW) {
         Ok(d) => d > PENDING_TX_TIMEOUT,
@@ -393,7 +398,7 @@ impl Monitor {
             });
         }
 
-        let tl = self
+        let (tl, _) = self
             .inner
             .tl
             .get(tid)
@@ -514,6 +519,20 @@ impl Monitor {
             return res;
         }
         Ok(TxCommitStatus::Pending)
+    }
+
+    /// Force-aborts a specific pending version of a transaction, the ADR-022 GC
+    /// reclaim of a dead pending object. It is the *same* official sequence a
+    /// contended lease expiry uses ([`Monitor::try_abort_remote_tx`]): CAS
+    /// `pending → aborted` over `expected`. If a live owner committed or
+    /// refreshed first the CAS loses and the now-durable status is reported
+    /// instead, so GC never drops a lock out from under a still-live owner.
+    pub(crate) async fn force_abort(
+        &self,
+        tid: &TxId,
+        expected: &backend::Version,
+    ) -> Result<TxCommitStatus, TransError> {
+        self.try_abort_remote_tx(tid, expected).await
     }
 
     async fn try_abort_remote_tx(

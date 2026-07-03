@@ -132,10 +132,26 @@ impl TLogger {
         }
     }
 
-    /// Reads and parses the full transaction log for `id`.
-    pub async fn get(&self, id: &TxId) -> Result<TxLog, StorageError> {
-        let tr = self.read_log(id).await?;
-        decode_tx_log_from_proto(id, &tr)
+    /// Reads and parses the full transaction log for `id`, together with its
+    /// backend version. The version is the CAS token GC needs to force-abort a
+    /// dead pending object and to prune its locks (ADR-022); callers that only
+    /// need the log body ignore it.
+    ///
+    /// A finalized (committed/aborted) log is immutable, so a cached copy — and
+    /// its version — is authoritative and answers without a backend round-trip.
+    /// A pending log can still change, so it is read through, revalidating via
+    /// the version-conditional GET (the backend version changes on every content
+    /// write — refresh or finalization — ADR-023).
+    pub async fn get(&self, id: &TxId) -> Result<(TxLog, backend::Version), StorageError> {
+        let p = paths::from_transaction(&self.prefix, id);
+        if let Some(o) = self.objects.peek(&p) {
+            let log = decode_tx_log(id, &o.value)?;
+            if log.status.is_final() {
+                return Ok((log, o.version));
+            }
+        }
+        let gr = self.objects.read(&p).await?;
+        Ok((decode_tx_log(id, &gr.value)?, gr.version))
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
@@ -167,6 +183,20 @@ impl TLogger {
             .await
     }
 
+    /// Lists every transaction id with a persisted object under this logger's
+    /// prefix. This is the flat `{prefix}/_t/` directory GC pages through to
+    /// make its candidate set complete without any database-wide shard scan
+    /// (ADR-022). Entries that are not transaction paths (e.g. sub-directory
+    /// prefixes a listing may return) are skipped.
+    pub async fn list_transaction_ids(&self) -> Result<Vec<TxId>, StorageError> {
+        let dir = paths::transactions_prefix(&self.prefix);
+        let paths = self.objects.list(&dir).await?;
+        Ok(paths
+            .iter()
+            .filter_map(|p| paths::transaction_id_of(p).ok())
+            .collect())
+    }
+
     /// Removes the log for `id`, ignoring not-found errors.
     pub async fn delete(&self, id: &TxId) -> Result<(), StorageError> {
         match self
@@ -178,22 +208,6 @@ impl TLogger {
             Err(StorageError::NotFound) => Ok(()),
             Err(e) => Err(e),
         }
-    }
-
-    async fn read_log(&self, id: &TxId) -> Result<pb::TransactionLog, StorageError> {
-        let p = paths::from_transaction(&self.prefix, id);
-        // A finalized log is immutable, so a cached copy is authoritative. A
-        // pending log can still change, so fall through to a read-through that
-        // revalidates via the version-conditional GET (the backend version
-        // changes on every content write — refresh or finalization — ADR-023).
-        if let Some(o) = self.objects.peek(&p) {
-            let log = parse_log(&o.value)?;
-            if log.status() != pb::transaction_log::Status::Pending {
-                return Ok(log);
-            }
-        }
-        let gr = self.objects.read(&p).await?;
-        parse_log(&gr.value)
     }
 }
 
@@ -468,7 +482,7 @@ mod tests {
         };
         t.set(&log).await.unwrap();
 
-        let got = t.get(&id).await.unwrap();
+        let (got, _) = t.get(&id).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         // Locks include the collection lock and the key lock.
@@ -490,5 +504,48 @@ mod tests {
         let t = new_tlogger();
         let status = t.commit_status(&TxId::from_bytes(vec![7])).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn get_returns_log_and_version() {
+        let t = new_tlogger();
+        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let key_path = paths::from_key("db/root", b"hello");
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        log.writes = vec![TxWrite {
+            path: key_path.clone(),
+            value: Arc::from(&b"world"[..]),
+            deleted: false,
+            prev_writer: TxId::default(),
+        }];
+        let stored_v = t.set(&log).await.unwrap();
+
+        let (got, version) = t.get(&id).await.unwrap();
+        assert_eq!(got.status, TxCommitStatus::Ok);
+        assert_eq!(got.writes, log.writes);
+        assert_eq!(got.timestamp, log.timestamp);
+        assert_eq!(version, stored_v);
+    }
+
+    #[tokio::test]
+    async fn list_transaction_ids_enumerates_the_flat_directory() {
+        let t = new_tlogger();
+        let ids = [
+            TxId::from_bytes(vec![1, 2]),
+            TxId::from_bytes(vec![3, 4]),
+            TxId::from_bytes(vec![5, 6]),
+        ];
+        for id in &ids {
+            t.set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
+                .await
+                .unwrap();
+        }
+        // A non-transaction object under a different prefix must not appear.
+        let mut listed = t.list_transaction_ids().await.unwrap();
+        listed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut expected: Vec<TxId> = ids.to_vec();
+        expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(listed, expected);
     }
 }

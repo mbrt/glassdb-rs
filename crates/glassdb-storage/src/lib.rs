@@ -23,7 +23,7 @@ pub use lock::LockType;
 pub use object_cache::{ObjectCache, ObjectRead};
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
-pub use shardstore::ShardStore;
+pub use shardstore::{LoadedShard, ShardStore};
 pub use tlogger::{PathLock, TLogger, TValue, TxCommitStatus, TxLog, TxStatus, TxWrite};
 pub use value_cache::{MAX_STALENESS, ValueCache, ValueRead};
 pub use version::Version;

@@ -2,12 +2,10 @@
 
 ## Status
 
-Accepted (design). **Implementation deferred**: the collector in
-[`crates/glassdb-trans/src/gc.rs`](../../crates/glassdb-trans/src/gc.rs) is
-currently inert (`Gc::start` / `Gc::schedule_tx_cleanup` are no-ops), so nothing
-is swept yet and no referenced object can be lost. This ADR fixes *what* the
-collector reclaims and *why it is safe*; the background loop, cadence constants,
-and DST coverage land when the inert `Gc` is replaced by the design below.
+Accepted — implemented.
+
+Deferred to a follow-up: subcollection teardown (reclaiming orphaned child roots
+and shards), and persisting a wound victim's locks into the aborted object.
 
 ## Context
 
