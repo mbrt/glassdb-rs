@@ -51,3 +51,49 @@ message Lock {
     string suffix = 1;
     LockType lock_type = 2;
 }
+
+// A shard object: the coordination directory (lock table, MVCC current-writer
+// index, and key directory) for the keys that map to it. See ADR-017.
+message Shard {
+    repeated ShardEntry entries = 1;
+}
+
+message ShardEntry {
+    // Raw user key bytes; also the entry's sort key.
+    bytes key = 1;
+    // Lock currently held on the key.
+    Lock.LockType lock_type = 2;
+    // Transactions holding the lock (more than one only for read locks).
+    repeated bytes locked_by = 3;
+    // Transaction object holding the committed value (the MVCC pointer); empty
+    // if the key has no committed value yet.
+    bytes current_writer = 4;
+    // Tombstone flag.
+    bool deleted = 5;
+}
+
+// Database-level metadata, written once at `{name}/glassdb` when a database is
+// first opened. Its presence marks the database as initialized; `version` gates
+// on-disk format compatibility. A message (not a bare string) so new metadata
+// fields can be added without breaking existing databases.
+message DatabaseMetadata {
+    // On-disk format version identifier (e.g. "v2").
+    string version = 1;
+}
+
+// The collection root object: collection existence, the (constant) shard count,
+// the subcollection directory, and the membership lock that serializes
+// create/delete against listing. See ADR-018.
+message CollectionRoot {
+    // The shard count C this collection was created with. Part of the on-disk
+    // format; validated against the compile-time SHARD_COUNT on open.
+    uint32 shard_count = 1;
+    // Child collection names (raw bytes), the subcollection directory; sorted so
+    // the encoding is canonical.
+    repeated bytes subcollections = 2;
+    // Membership lock serializing create/delete (write) against listing (read).
+    Lock.LockType membership_lock = 3;
+    // Transactions holding the membership lock (more than one only for read
+    // locks); sorted so the encoding is canonical.
+    repeated bytes membership_locked_by = 4;
+}

@@ -15,7 +15,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::cell::RefCell;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +24,7 @@ use rand::Rng;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, gcs_delays};
-use glassdb_backend::{
-    Backend, BackendError, LAST_WRITER_TAG, Metadata, Tags, Version, WriterId, encode_writer_tag,
-};
+use glassdb_backend::{Backend, BackendError, Version};
 use glassdb_bench_scale::bench::Bench;
 const TEST_ROOT: &str = "backend-bench";
 
@@ -52,8 +49,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ("WriteFailPre", run_write_fail_pre),
         ("Read", run_read),
         ("ReadUnchanged", run_read_unchanged),
-        ("SetMetaSame", run_set_meta_same),
-        ("GetMeta", run_get_meta),
     ];
 
     for (name, f) in tests {
@@ -129,12 +124,6 @@ fn random_data(size: usize) -> Vec<u8> {
     b
 }
 
-fn one_tag(key: &str, val: String) -> Tags {
-    let mut t = Tags::new();
-    t.insert(key.to_string(), val);
-    t
-}
-
 fn fmt_ms(d: Duration) -> String {
     let ms = d.as_secs_f64() * 1000.0;
     if ms > 1000.0 {
@@ -146,20 +135,21 @@ fn fmt_ms(d: Duration) -> String {
 
 fn run_write_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
-        let data = random_data(1024);
         let p = format!("{TEST_ROOT}/write-same");
         let mut count = 0u64;
         while !bench.is_finished() {
-            let c = count;
+            // Vary the content so each overwrite is a genuinely new object
+            // (content-derived CAS version in v2), matching real write traffic.
+            let data = random_data(1024);
             bench
                 .measure(|| async {
-                    b.write(&p, data.clone(), one_tag("key", format!("val{c}")))
-                        .await?;
+                    b.write(&p, data.clone()).await?;
                     Ok(())
                 })
                 .await?;
             count += 1;
         }
+        let _ = count;
         Ok(())
     })
 }
@@ -168,28 +158,17 @@ fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/write-same");
-        b.write(&p, data.clone(), one_tag("key", "val".into()))
-            .await?;
+        b.write(&p, data.clone()).await?;
         // A clearly-bogus version so the conditional write always fails its
         // precondition; the error is ignored, the latency is what we measure.
         let expected = Version::new("0/0");
-        let mut count = 0u64;
         while !bench.is_finished() {
-            let c = count;
             bench
                 .measure(|| async {
-                    let _ = b
-                        .write_if(
-                            &p,
-                            data.clone(),
-                            &expected,
-                            one_tag("key", format!("val{c}")),
-                        )
-                        .await;
+                    let _ = b.write_if(&p, data.clone(), &expected).await;
                     Ok(())
                 })
                 .await?;
-            count += 1;
         }
         Ok(())
     })
@@ -199,7 +178,7 @@ fn run_read(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/read");
-        b.write(&p, data, one_tag("key", "val".into())).await?;
+        b.write(&p, data).await?;
         while !bench.is_finished() {
             bench
                 .measure(|| async {
@@ -216,62 +195,19 @@ fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/read");
-        let writer = WriterId::new(b"benchmark-writer".to_vec());
-        let mut tags = one_tag("key", "val".into());
-        tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
-        b.write(&p, data, tags).await?;
+        // The version returned by the write is the object's current CAS token;
+        // a conditional read against it short-circuits (304 / Precondition).
+        let version = b.write(&p, data).await?;
         while !bench.is_finished() {
             bench
                 .measure(|| async {
-                    // The object is unchanged for `writer`, so the backend
-                    // returns a precondition error; that is the fast path we
-                    // are timing, not a failure.
-                    match b.read_if_modified(&p, &writer).await {
+                    // The object is unchanged, so the backend returns a
+                    // precondition error; that is the fast path we are timing,
+                    // not a failure.
+                    match b.read_if_modified(&p, &version).await {
                         Ok(_) | Err(BackendError::Precondition) => Ok(()),
                         Err(e) => Err(e),
                     }
-                })
-                .await?;
-        }
-        Ok(())
-    })
-}
-
-fn run_set_meta_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
-    Box::pin(async move {
-        let data = random_data(1024);
-        let p = format!("{TEST_ROOT}/set-meta");
-        let meta0 = b.write(&p, data, one_tag("key", "val".into())).await?;
-        let meta: RefCell<Metadata> = RefCell::new(meta0);
-        let mut count = 0u64;
-        while !bench.is_finished() {
-            let c = count;
-            bench
-                .measure(|| async {
-                    let version = meta.borrow().version.clone();
-                    let m = b
-                        .set_tags_if(&p, &version, one_tag("key", format!("val{c}")))
-                        .await?;
-                    *meta.borrow_mut() = m;
-                    Ok(())
-                })
-                .await?;
-            count += 1;
-        }
-        Ok(())
-    })
-}
-
-fn run_get_meta(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
-    Box::pin(async move {
-        let data = random_data(1024);
-        let p = format!("{TEST_ROOT}/get-meta");
-        b.write(&p, data, one_tag("key", "val".into())).await?;
-        while !bench.is_finished() {
-            bench
-                .measure(|| async {
-                    b.get_metadata(&p).await?;
-                    Ok(())
                 })
                 .await?;
         }

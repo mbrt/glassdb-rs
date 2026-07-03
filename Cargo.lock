@@ -1406,9 +1406,11 @@ dependencies = [
  "glassdb-backend-s3",
  "glassdb-concurr",
  "glassdb-data",
+ "glassdb-proto",
  "glassdb-storage",
  "glassdb-trans",
  "proptest",
+ "prost",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1420,7 +1422,6 @@ name = "glassdb-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
  "glassdb-concurr",
  "rand 0.10.1",
  "rand_distr",
@@ -1543,6 +1544,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "criterion",
+ "futures",
  "glassdb-backend",
  "glassdb-concurr",
  "glassdb-data",

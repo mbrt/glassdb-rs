@@ -7,9 +7,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use glassdb_backend::{
-    Backend, BackendError, LAST_WRITER_TAG, Tags, Version, WriterId, encode_writer_tag,
-};
+use glassdb_backend::{Backend, BackendError, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -245,9 +243,21 @@ fn get_media(
     {
         return error_json(StatusCode::PRECONDITION_FAILED, "conditionNotMet");
     }
+    // Conditional read: an unchanged generation answers 304 with no body.
+    if let Some(g) = query
+        .get("ifGenerationNotMatch")
+        .and_then(|v| v.parse::<i64>().ok())
+        && g == o.generation
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
+        .header("x-goog-generation", o.generation.to_string())
         .body(Full::new(Bytes::from(o.bytes.clone())))
         .unwrap()
 }
@@ -526,15 +536,12 @@ async fn read_write_roundtrip() {
         ("empty", Vec::new()),
         ("binary", vec![0x00, 0x01, 0x02, 0xff]),
     ] {
-        let mut tags = Tags::new();
-        tags.insert("key".to_string(), "val".to_string());
-        let meta = b.write(name, value.clone(), tags).await.unwrap();
-        assert!(!meta.version.is_unset());
+        let version = b.write(name, value.clone()).await.unwrap();
+        assert!(!version.is_unset());
 
         let r = b.read(name).await.unwrap();
         assert_eq!(r.contents, value, "case {name}");
-        assert_eq!(r.tags.get("key").map(String::as_str), Some("val"));
-        assert_eq!(r.version, meta.version);
+        assert_eq!(r.version, version);
     }
 }
 
@@ -542,70 +549,17 @@ async fn read_write_roundtrip() {
 async fn write_produces_fresh_version_each_time() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m1 = b.write("k", b"same".to_vec(), Tags::new()).await.unwrap();
-    let m2 = b.write("k", b"same".to_vec(), Tags::new()).await.unwrap();
-    assert_ne!(m1.version, m2.version);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn set_tags_if_merges_and_cas() {
-    let fake = FakeGcs::start().await;
-    let b = backend(&fake);
-
-    let writer = WriterId::new(b"tx-1".to_vec());
-    let mut tags = Tags::new();
-    tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
-    tags.insert("lock-type".to_string(), "-".to_string());
-    let m0 = b.write("k", b"value".to_vec(), tags).await.unwrap();
-
-    let mut new_tags = Tags::new();
-    new_tags.insert("lock-type".to_string(), "w".to_string());
-    new_tags.insert("locked-by".to_string(), "tx2".to_string());
-    let m1 = b.set_tags_if("k", &m0.version, new_tags).await.unwrap();
-    assert_ne!(m0.version, m1.version);
-    // The last-writer tag is preserved across a lock-only update.
-    assert_eq!(
-        m1.tags.get(LAST_WRITER_TAG).map(String::as_str),
-        Some(encode_writer_tag(&writer).as_str())
-    );
-    assert_eq!(m1.tags.get("lock-type").map(String::as_str), Some("w"));
-    assert_eq!(m1.tags.get("locked-by").map(String::as_str), Some("tx2"));
-
-    // The object body is untouched by a tag update.
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"value");
-
-    // The now-stale version fails the precondition.
-    let mut t = Tags::new();
-    t.insert("lock-type".to_string(), "r".to_string());
-    let err = b.set_tags_if("k", &m0.version, t).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn set_tags_if_not_found() {
-    let fake = FakeGcs::start().await;
-    let b = backend(&fake);
-    let mut t = Tags::new();
-    t.insert("lock-type".to_string(), "r".to_string());
-    let err = b
-        .set_tags_if("missing", &Version::new("1/1"), t)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
+    let v1 = b.write("k", b"same".to_vec()).await.unwrap();
+    let v2 = b.write("k", b"same".to_vec()).await.unwrap();
+    assert_ne!(v1, v2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_if_not_exists() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write_if_not_exists("k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
-    let err = b
-        .write_if_not_exists("k", b"b".to_vec(), Tags::new())
-        .await
-        .unwrap_err();
+    b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
+    let err = b.write_if_not_exists("k", b"b".to_vec()).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"a");
@@ -615,19 +569,16 @@ async fn write_if_not_exists() {
 async fn write_if_cas() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
+    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
 
     let err = b
-        .write_if("k", b"b".to_vec(), &Version::new("999/999"), Tags::new())
+        .write_if("k", b"b".to_vec(), &Version::new("999"))
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
-    let m1 = b
-        .write_if("k", b"b".to_vec(), &m0.version, Tags::new())
-        .await
-        .unwrap();
-    assert_ne!(m0.version, m1.version);
+    let v1 = b.write_if("k", b"b".to_vec(), &v0).await.unwrap();
+    assert_ne!(v0, v1);
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
 }
@@ -636,73 +587,58 @@ async fn write_if_cas() {
 async fn write_if_null_version_fails_precondition() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
+    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
 
     let err = b
-        .write_if("k", b"b".to_vec(), &Version::default(), Tags::new())
+        .write_if("k", b"b".to_vec(), &Version::default())
         .await
         .unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"a");
-    assert_eq!(r.version, m0.version);
+    assert_eq!(r.version, v0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_if_modified() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let writer = WriterId::new(b"w1".to_vec());
-    let mut tags = Tags::new();
-    tags.insert(LAST_WRITER_TAG.to_string(), encode_writer_tag(&writer));
-    b.write("k", b"x".to_vec(), tags).await.unwrap();
+    let v0 = b.write("k", b"x".to_vec()).await.unwrap();
 
-    let err = b.read_if_modified("k", &writer).await.unwrap_err();
+    // Unchanged generation => precondition (not modified).
+    let err = b.read_if_modified("k", &v0).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition));
 
-    let r = b
-        .read_if_modified("k", &WriterId::new(b"other".to_vec()))
-        .await
-        .unwrap();
+    // A stale version returns the current content and the fresh version.
+    let r = b.read_if_modified("k", &Version::new("1")).await.unwrap();
     assert_eq!(r.contents, b"x");
-}
+    assert_eq!(r.version, v0);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_if() {
-    let fake = FakeGcs::start().await;
-    let b = backend(&fake);
-    let m0 = b.write("k", b"x".to_vec(), Tags::new()).await.unwrap();
-
-    let err = b
-        .delete_if("k", &Version::new("999/999"))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-    b.read("k").await.unwrap();
-
-    b.delete_if("k", &m0.version).await.unwrap();
-    let err = b.read("k").await.unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
+    // After a content write the generation changes, so the old token no longer
+    // matches and the body is returned.
+    let v1 = b.write("k", b"y".to_vec()).await.unwrap();
+    assert_ne!(v0, v1);
+    let r = b.read_if_modified("k", &v0).await.unwrap();
+    assert_eq!(r.contents, b"y");
+    assert_eq!(r.version, v1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_unconditional() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write("k", b"x".to_vec(), Tags::new()).await.unwrap();
+    b.write("k", b"x".to_vec()).await.unwrap();
     b.delete("k").await.unwrap();
     let err = b.read("k").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_and_metadata_not_found() {
+async fn read_not_found() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
     let err = b.read("missing").await.unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
-    let err = b.get_metadata("missing").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
 }
 
@@ -711,9 +647,7 @@ async fn list_with_subdirs() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write(name, name.as_bytes().to_vec(), Tags::new())
-            .await
-            .unwrap();
+        b.write(name, name.as_bytes().to_vec()).await.unwrap();
     }
     let got = b.list("d").await.unwrap();
     assert_eq!(got, vec!["d/a/", "d/c/", "d/root"]);
@@ -737,10 +671,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
 
     // The create lands, but the server answers 500, hiding that it landed.
     fake.set_lost_ack(1);
-    let err = b
-        .write_if_not_exists("k", b"v".to_vec(), Tags::new())
-        .await
-        .unwrap_err();
+    let err = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap_err();
     assert!(
         matches!(err, BackendError::Unavailable(_)),
         "expected Unavailable (in-doubt), got {err:?}"
@@ -755,13 +686,10 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
 async fn write_if_lost_ack_is_in_doubt() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let m0 = b.write("k", b"a".to_vec(), Tags::new()).await.unwrap();
+    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
 
     fake.set_lost_ack(1);
-    let err = b
-        .write_if("k", b"b".to_vec(), &m0.version, Tags::new())
-        .await
-        .unwrap_err();
+    let err = b.write_if("k", b"b".to_vec(), &v0).await.unwrap_err();
     assert!(
         matches!(err, BackendError::Unavailable(_)),
         "expected Unavailable (in-doubt), got {err:?}"
@@ -776,13 +704,8 @@ async fn clean_conflict_still_precondition() {
     // A genuine conflict with no lost ack must stay a retryable `Precondition`.
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write_if_not_exists("k", b"a".to_vec(), Tags::new())
-        .await
-        .unwrap();
-    let err = b
-        .write_if_not_exists("k", b"b".to_vec(), Tags::new())
-        .await
-        .unwrap_err();
+    b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
+    let err = b.write_if_not_exists("k", b"b".to_vec()).await.unwrap_err();
     assert!(matches!(err, BackendError::Precondition), "got {err:?}");
 }
 
@@ -795,7 +718,7 @@ async fn clean_conflict_still_precondition() {
 async fn read_server_error_surfaces_unavailable() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write("k", b"v".to_vec(), Tags::new()).await.unwrap();
+    b.write("k", b"v".to_vec()).await.unwrap();
 
     // The object stays durable, but the next metadata GET answers 500.
     fake.set_read_fault(1);

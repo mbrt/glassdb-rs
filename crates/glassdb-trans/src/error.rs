@@ -82,6 +82,16 @@ impl From<BackendError> for TransError {
     }
 }
 
+/// Converts a transaction-engine error into a storage error, for the read /
+/// resolution paths whose public surface is `StorageError`. Shared by the
+/// [`Reader`](crate::Reader) and the [`Resolver`](crate::Resolver).
+pub(crate) fn trans_to_storage(e: TransError) -> StorageError {
+    match e {
+        TransError::Storage(s) => s,
+        other => StorageError::other(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

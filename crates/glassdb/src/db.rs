@@ -9,8 +9,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Global, Local, TLogger};
-use glassdb_trans::{Algo, Gc, Locker, Monitor, Reader, TransError};
+use glassdb_storage::{ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
+use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -108,9 +108,15 @@ impl DatabaseBuilder {
 
         let backend = Arc::new(StatsBackend::new(b));
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let local = Local::new(cache_size);
-        let global = Global::new(dyn_backend, local.clone());
-        let tl = TLogger::new(global.clone(), local.clone(), &name);
+        // One shared LRU sized by `cache_size` backs both cache facades: the
+        // writer-keyed value cache and the backend-version-keyed object cache.
+        let cache = SharedCache::new(cache_size);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(dyn_backend, &cache);
+        // The shard/root coordination store reads/writes through the object
+        // cache, so a hot shard revalidates without re-transferring its body.
+        let shards = ShardStore::new(objects.clone());
+        let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
         let clock = if deterministic_time {
             Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
@@ -122,26 +128,38 @@ impl DatabaseBuilder {
         // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::with_config(local.clone(), tl.clone(), bg_weak.clone(), clock, retry);
-        let reader = Reader::new(local.clone(), global.clone(), tmon.clone(), retry);
-        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
-        let gc = Gc::new(bg_weak.clone(), tl);
+        let tmon = Monitor::with_config(
+            values.clone(),
+            tl.clone(),
+            bg_weak.clone(),
+            clock.clone(),
+            retry,
+        );
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
+        let locker = Locker::new(shards.clone(), tmon.clone(), retry);
+        let gc = Gc::new(
+            bg_weak.clone(),
+            tl,
+            shards.clone(),
+            tmon.clone(),
+            clock.clone(),
+        );
         gc.start();
         let algo = Algo::new(
-            global.clone(),
-            local.clone(),
+            values.clone(),
             locker,
             tmon.clone(),
+            clock,
             gc,
             Some(bg_weak),
-            reader,
+            resolver,
         );
 
         let inner = Arc::new(DbInner {
             name,
             backend,
-            local,
-            global,
+            shards,
+            values,
             tmon,
             algo,
             retry,
@@ -158,8 +176,8 @@ impl DatabaseBuilder {
 pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) backend: Arc<StatsBackend>,
-    pub(crate) local: Local,
-    pub(crate) global: Global,
+    pub(crate) shards: ShardStore,
+    pub(crate) values: ValueCache,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
     pub(crate) retry: RetryConfig,
@@ -231,10 +249,11 @@ impl Database {
             }
             notified.await;
         }
-        // Drain spawned dedup owner tasks so callers observing `shutdown` to
-        // return synchronize with their full release.
-        self.inner.algo.close().await;
+        // Drain background write-backs and async aborts first: a backgrounded
+        // write-back submits through the locker's dedup, so it must complete
+        // before the dedup is closed.
         self.inner.background.shutdown().await;
+        self.inner.algo.close().await;
     }
 
     /// Returns a top-level collection with the given name.
@@ -275,8 +294,10 @@ impl Database {
     /// close. Counters only increase; subtract snapshots for intervals.
     pub fn stats(&self) -> Stats {
         let bstats = self.inner.backend.stats_and_reset();
+        let lstats = self.inner.algo.locker().stats_and_reset();
         let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
+        s.add_lock(&lstats);
         *s
     }
 
@@ -364,8 +385,8 @@ impl DbInner {
         T: Send,
     {
         let tx = Transaction::new(
-            self.global.clone(),
-            self.local.clone(),
+            self.shards.clone(),
+            self.values.clone(),
             self.tmon.clone(),
             self.retry,
         );
@@ -441,8 +462,8 @@ impl DbInner {
                 Ok(()) => break Ok(value),
                 Err(TransError::Wounded) => {
                     // A higher-priority transaction aborted us. Release whatever
-                    // we were holding and restart with a fresh ID that preserves
-                    // our priority, so we are not starved on the retry.
+                    // we held and restart with a fresh id that preserves our
+                    // priority, so we are not starved on the retry.
                     if let Some(h) = handle.as_mut() {
                         let _ = self.algo.end(h).await;
                     }

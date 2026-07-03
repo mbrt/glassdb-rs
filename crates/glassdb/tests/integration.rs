@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::{BackendError, Metadata, ReadReply, Tags, Version, WriterId};
+use glassdb::backend::{BackendError, ReadReply, Version};
 use glassdb::{Backend, Collection, Database, Error, Transaction};
+use glassdb_storage::TxCommitStatus;
 use tokio::sync::oneshot;
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
@@ -64,6 +65,37 @@ async fn rw() {
     assert_eq!(stats.tx_n, 2);
     assert_eq!(stats.tx_writes, 1);
     assert_eq!(stats.tx_retries, 0);
+}
+
+// The distributed locker's counters are surfaced through `Database::stats()`
+// (the same reset-on-read accumulation pattern as the backend object counters),
+// not only through the internal diagnostics snapshot. A committed write
+// transaction takes the locked commit path (a read-only commit does not), so it
+// must bump `lock_calls` while a pure read leaves the counter unchanged.
+#[tokio::test(start_paused = true)]
+async fn stats_report_locker_activity() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+
+    let before = db.stats();
+    coll.write(b"key1", b"value1").await.unwrap();
+    let after_write = db.stats();
+    assert!(
+        after_write.lock_calls > before.lock_calls,
+        "a committed write must report locker calls: {} -> {}",
+        before.lock_calls,
+        after_write.lock_calls
+    );
+
+    // A read-only transaction commits via the lock-free fast path, so the
+    // counter is unchanged across it.
+    let _ = coll.read(b"key1").await.unwrap();
+    let after_read = db.stats();
+    assert_eq!(
+        after_read.lock_calls, after_write.lock_calls,
+        "a read-only commit takes no locks"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -413,6 +445,33 @@ async fn diagnostics_returns_typed_snapshot() {
     );
 }
 
+// A committed read-write transaction returns before its write-back runs (it is
+// spawned in the background), but a graceful shutdown drains that spawned task,
+// so afterwards no transaction still holds locks — the write-back published its
+// pointers and released them.
+#[tokio::test(start_paused = true)]
+async fn shutdown_drains_background_write_back() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+
+    let coll_ref = &coll;
+    db.tx(|tx| async move {
+        tx.write(coll_ref, b"k1", b"v1")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    db.shutdown().await;
+
+    let diag = db.diagnostics();
+    assert!(
+        diag.transactions.is_empty(),
+        "shutdown should drain the background write-back and release locks: {diag:?}",
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn list_keys() {
     let db = init_db(mem()).await;
@@ -602,16 +661,21 @@ impl PausingBackend {
         None
     }
 
-    fn take_abort_write_gate(&self, path: &str, tags: &Tags) -> Option<AbortWriteGate> {
-        if !path.contains("/_t/")
-            || tags
-                .get("commit-status")
-                .is_none_or(|status| status != "aborted")
-        {
+    fn take_abort_write_gate(&self, path: &str, value: &[u8]) -> Option<AbortWriteGate> {
+        // With the tagless backend (ADR-023) the commit status is in the object
+        // body, so decode it to recognize an aborted transaction object.
+        if !path.contains("/_t/") || !is_aborted_tx_log(value) {
             return None;
         }
         self.abort_write_gate.lock().unwrap().take()
     }
+}
+
+/// Reports whether `body` is a transaction object marked aborted.
+fn is_aborted_tx_log(body: &[u8]) -> bool {
+    glassdb_storage::txobject::decode(&glassdb_data::TxId::default(), body)
+        .map(|l| l.status == TxCommitStatus::Aborted)
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -619,35 +683,17 @@ impl Backend for PausingBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected_writer: &WriterId,
+        expected: &Version,
     ) -> Result<ReadReply, BackendError> {
-        self.inner.read_if_modified(path, expected_writer).await
+        self.inner.read_if_modified(path, expected).await
     }
 
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.inner.read(path).await
     }
 
-    async fn get_metadata(&self, path: &str) -> Result<Metadata, BackendError> {
-        self.inner.get_metadata(path).await
-    }
-
-    async fn set_tags_if(
-        &self,
-        path: &str,
-        expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.set_tags_if(path, expected, tags).await
-    }
-
-    async fn write(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.write(path, value, tags).await
+    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
+        self.inner.write(path, value).await
     }
 
     async fn write_if(
@@ -655,18 +701,16 @@ impl Backend for PausingBackend {
         path: &str,
         value: Vec<u8>,
         expected: &Version,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        self.inner.write_if(path, value, expected, tags).await
+    ) -> Result<Version, BackendError> {
+        self.inner.write_if(path, value, expected).await
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-        tags: Tags,
-    ) -> Result<Metadata, BackendError> {
-        if let Some(gate) = self.take_abort_write_gate(path, &tags) {
+    ) -> Result<Version, BackendError> {
+        if let Some(gate) = self.take_abort_write_gate(path, &value) {
             let _ = gate.arrived.send(());
             let _ = gate.release.await;
         }
@@ -675,15 +719,11 @@ impl Backend for PausingBackend {
             std::future::pending::<()>().await;
             unreachable!("PausingBackend pause should outlive any future that hits it");
         }
-        self.inner.write_if_not_exists(path, value, tags).await
+        self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
         self.inner.delete(path).await
-    }
-
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
-        self.inner.delete_if(path, expected).await
     }
 
     async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {

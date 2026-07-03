@@ -10,7 +10,7 @@ graded against the five stated intents:
 4. Fuzz-guided exploration of edge cases
 5. Efficient
 
-Sources: ADR-008/010/011/012/013, `PORTING.md`, the `rt`/`exec`/`fault`
+Sources: ADR-008/010/011/012/013, `porting-go.md`, the `rt`/`exec`/`fault`
 modules, and upstream docs for the alternatives.
 
 ## TL;DR

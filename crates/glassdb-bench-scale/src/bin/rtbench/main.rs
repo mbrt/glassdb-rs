@@ -874,7 +874,7 @@ fn run_read_write_9010(
     let mut samples = create_csv(&args.samples_out, "num-db,db,tx-type,ops,latency\n")?;
     let mut stats = create_csv(
         &args.stats_out,
-        "num-db,db,num-tx,num-retries,obj-write,obj-read,obj-list,meta-write,meta-read,backend-ops\n",
+        "num-db,db,num-tx,num-retries,obj-write,obj-read\n",
     )?;
     let mut throughput = create_csv(
         &args.throughput_out,
@@ -1301,18 +1301,16 @@ fn dump_stats(
         // Summing every backend-op class keeps it meaningful across engine
         // versions that categorize ops differently (e.g. v1's tag/metadata ops
         // vs v2 folding all coordination into object reads/writes).
-        let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists + s.meta_writes + s.meta_reads;
+        let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists;
         writeln!(
             out,
-            "{numdb},{i},{},{},{},{},{},{},{},{}",
-            s.tx_n,
-            s.tx_retries,
-            s.obj_writes,
-            s.obj_reads,
-            s.obj_lists,
-            s.meta_writes,
-            s.meta_reads,
-            backend_ops,
+            "{numdb},{i},{},{},{},{},{},{}",
+            res.stats.tx_n,
+            res.stats.tx_retries,
+            res.stats.obj_writes,
+            res.stats.obj_reads,
+            res.stats.obj_lists,
+            backend_ops
         )?;
     }
     Ok(())

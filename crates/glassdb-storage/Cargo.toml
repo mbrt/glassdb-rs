@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 base64 = "0.22.1"
+futures = "0.3.32"
 glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
 glassdb-data = { version = "0.1.0", path = "../glassdb-data" }

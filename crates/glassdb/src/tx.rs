@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::RetryConfig;
 use glassdb_data::paths;
-use glassdb_storage::{Global, Local, MAX_STALENESS, StorageError};
+use glassdb_storage::{MAX_STALENESS, ShardStore, StorageError, ValueCache};
 use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
 
 use crate::collection::Collection;
@@ -119,13 +119,13 @@ impl Transaction {
     }
 
     pub(crate) fn new(
-        global: Global,
-        local: Local,
+        shards: ShardStore,
+        values: ValueCache,
         tmon: glassdb_trans::Monitor,
         retry: RetryConfig,
     ) -> Self {
         Transaction {
-            reader: Reader::new(local, global, tmon, retry),
+            reader: Reader::new(values, shards, tmon, retry),
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }
     }

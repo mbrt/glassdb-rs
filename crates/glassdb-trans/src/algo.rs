@@ -1,65 +1,65 @@
-//! The transaction commit protocol with serializable isolation. Ported from the
-//! Go `internal/trans/algo.go`.
+//! The transaction commit protocol with serializable isolation for the v2
+//! object-native engine (ADR-016 … ADR-021).
 //!
-//! Highlights: a read-only fast path, a single read-write CAS fast path, and a
-//! general validate-and-lock path that locks in parallel and, on a suspected
-//! deadlock (lock timeout), falls back to serialized, sorted locking.
+//! A read-write transaction validates its reads and installs its locks with one
+//! read-modify-write CAS per touched shard (plus the collection root for
+//! membership changes), flips its transaction object to committed (the commit
+//! point), then publishes `current_writer` pointers and releases its locks
+//! (write-back). A read-only transaction takes a pure optimistic fast path: it
+//! re-resolves each read's effective writer against the shards and commits if
+//! none changed, taking no locks.
+//!
+//! Concurrency control (ADR-002 / ADR-020 / ADR-021 / ADR-024): strict two-phase
+//! locking with wound-wait and leases for crash recovery. On a conflict it cannot
+//! win, a younger-or-equal transaction **waits while holding its locks**
+//! (hold-and-wait, ADR-024) instead of aborting; an older one wounds the holder
+//! and proceeds. Distinct priorities cannot deadlock (wound-wait keeps the
+//! wait-for graph acyclic); two equal-priority transactions that would cycle are
+//! broken by escalating to the serial order. Lock acquisition has two modes: the
+//! default **parallel** path locks every shard concurrently; after a
+//! [`MAX_DEADLOCK_TIMEOUT`] wait or [`SERIAL_FALLBACK_AFTER`] failed attempts a
+//! transaction releases its locks and re-acquires them under the **serial**
+//! sorted order (same id, no body re-run), where first-CAS-wins on the lowest
+//! contended shard guarantees one contender makes progress. Only a genuine wound
+//! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use futures::StreamExt;
-use glassdb_backend::{self as backend, Metadata};
-use glassdb_concurr::{Background, rt};
-use glassdb_data::{TxId, paths};
-use glassdb_storage::{
-    Global, Local, LockType, PathLock, StorageError, TValue, TxLog, TxWrite, Version,
-    tags_lock_info,
-};
+use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
+use glassdb_data::TxId;
+use glassdb_storage::{PathLock, TxCommitStatus, TxLog, TxWrite, ValueCache, Version};
 
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
-use crate::reader::Reader;
-use crate::tlocker::Locker;
+use crate::resolver::Resolver;
+use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
-const ALGO_CONCURRENCY: usize = 10;
-const BACKGROUND_CONCURRENCY: usize = 3;
-const LOCK_LATENCY: Duration = Duration::from_millis(90);
+/// Number of failed parallel-locking attempts before a transaction escalates to
+/// the serial sorted-locking fallback (ADR-020). The parallel path is fast but
+/// can *livelock* two equal-priority transactions that each grab a different
+/// shard first; after this many failures the transaction switches to sorted
+/// acquisition, where first-CAS-wins on the lowest contended shard guarantees
+/// one of them makes progress.
+const SERIAL_FALLBACK_AFTER: usize = 3;
+
+/// Upper bound on how long a transaction blocks acquiring its locks in the
+/// default parallel mode before suspecting a deadlock and escalating to the
+/// serial sorted-locking fallback (ADR-024). Under hold-and-wait a
+/// younger-or-equal transaction *waits* for a conflicting holder while keeping
+/// its locks; distinct priorities cannot cycle (wound-wait), but two
+/// equal-priority transactions can each wait on the other forever. This timeout
+/// bounds that wait: on elapse the transaction releases its locks and
+/// re-acquires them in the global sorted order, where one contender always
+/// completes. Reuses v1's 5s budget (ADR-002 / architecture.md).
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const BG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
-/// How many times the single-RW fast path re-issues the *same* conditional
-/// write after an in-doubt (`Unavailable`) outcome before surfacing the
-/// uncertainty. The write is idempotent under its own precondition, so a retry
-/// either lands (nothing changed) or fails the precondition (a change already
-/// happened), which bounds the loop in practice; this is just the cap for a
-/// persistently-unavailable backend.
-const SINGLE_RW_INDOUBT_RETRIES: usize = 2;
-
-/// Converts a wall-clock instant to UnixNano, used to derive a transaction's
-/// wound-wait priority. The `SystemTime`->`u64` conversion lives here in `trans`
-/// (rather than in the pure `data` crate) so the priority can be sourced from
-/// the monitor's clock, which is anchored to tokio's virtual time in tests.
-fn now_unix_nanos(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
     New,
     Validating,
     Committed,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VResult {
-    Unknown,
-    Ok,
-    Retry,
-    NeedsCLock,
 }
 
 /// A single key read within a transaction.
@@ -76,10 +76,9 @@ pub struct ReadVersion {
 }
 
 impl ReadVersion {
-    /// Converts to a storage version.
-    pub fn to_storage_version(&self) -> Version {
+    /// Converts to a storage version (the writer that last committed the value).
+    pub(crate) fn to_storage_version(&self) -> Version {
         Version {
-            b: backend::Version::default(),
             writer: self.last_writer.clone(),
         }
     }
@@ -89,12 +88,12 @@ impl ReadVersion {
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
     pub path: Arc<str>,
-    pub op: WriteOp,
+    pub(crate) op: WriteOp,
 }
 
 /// The write operation staged for a key.
 #[derive(Debug, Clone)]
-pub enum WriteOp {
+pub(crate) enum WriteOp {
     Put(Arc<[u8]>),
     Delete,
 }
@@ -113,10 +112,6 @@ impl WriteAccess {
             op: WriteOp::Delete,
         }
     }
-
-    fn is_delete(&self) -> bool {
-        matches!(self.op, WriteOp::Delete)
-    }
 }
 
 /// The reads and writes that make up a transaction.
@@ -131,7 +126,18 @@ pub struct Handle {
     data: Data,
     status: Status,
     id: TxId,
-    mode: CommitMode,
+    /// Number of restarts so far; drives the serial-locking escalation.
+    attempts: usize,
+    /// Whether the transaction registered with the monitor and may hold locks,
+    /// so [`Algo::end`] knows it must abort (a pure read-only fast path never
+    /// engages, so it has nothing to release).
+    engaged: bool,
+    /// Per-transaction backoff for the internal CAS-contention retry in
+    /// [`Algo::acquire_locks`] (a lost shard/root CAS race): advanced before each
+    /// same-id re-lock so churning contenders spread out instead of busy-looping.
+    /// The lock-holding restart paths (`restart`, `revalidate`) and the read-only
+    /// validation paths deliberately do not back off.
+    backoff: Backoff,
 }
 
 impl Handle {
@@ -141,416 +147,304 @@ impl Handle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CommitMode {
-    Fast,
-    Locked,
-    Serial,
+/// Terminal outcome of [`Algo::acquire_locks`]. CAS contention and suspected
+/// deadlocks are resolved *inside* `acquire_locks` (release + same-id re-lock),
+/// so they are not represented here — only the two outcomes the commit path must
+/// act on remain. Read-version validation happens *after* this returns
+/// [`Acquired::Locked`], so a stale read is not an acquisition outcome.
+enum Acquired {
+    /// Every lock is held; proceed to validate reads, then the commit point.
+    Locked(LockedTx),
+    /// A higher-priority peer aborted this transaction: renew the id and re-run
+    /// ([`TransError::Wounded`]).
+    Wounded,
 }
 
-#[derive(Clone)]
-struct PathState {
-    path: Arc<str>,
-    read: Option<PathRead>,
-    write: Option<PathWrite>,
-    existence: PathExistence,
-    result: VResult,
-}
-
-#[derive(Clone)]
-enum PathRead {
-    Found(Version),
-    NotFound,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PathWrite {
-    Put,
-    Delete,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PathExistence {
-    Unknown,
-    Found,
-    NotFound,
-}
-
-impl PathState {
-    fn has_read(&self) -> bool {
-        self.read.is_some()
-    }
-
-    fn has_write(&self) -> bool {
-        self.write.is_some()
-    }
-
-    fn read_not_found(&self) -> bool {
-        self.existence == PathExistence::NotFound
-    }
-
-    fn write_deletes(&self) -> bool {
-        matches!(self.write, Some(PathWrite::Delete))
-    }
-
-    fn read_version(&self) -> &Version {
-        match &self.read {
-            Some(PathRead::Found(version)) => version,
-            Some(PathRead::NotFound) => {
-                panic!("not-found read has no concrete version")
-            }
-            None => panic!("path has no read version"),
-        }
-    }
-
-    fn read_version_for_invalidation(&self) -> Version {
-        match &self.read {
-            Some(PathRead::Found(version)) => version.clone(),
-            Some(PathRead::NotFound) | None => Version::default(),
-        }
-    }
-
-    fn mark_not_found(&mut self) {
-        self.existence = PathExistence::NotFound;
-    }
-
-    fn needs_locks(&self) -> Result<Vec<PathLock>, TransError> {
-        let lt = if self.has_read() {
-            LockType::Read
-        } else if self.has_write() {
-            LockType::Write
-        } else {
-            return Ok(Vec::new());
-        };
-        let mut res = vec![PathLock {
-            path: self.path.to_string(),
-            typ: lt,
-        }];
-        if !self.read_not_found() {
-            return Ok(res);
-        }
-        let pr = paths::parse(&self.path)
-            .map_err(|e| TransError::with_source("parsing path while locking", e))?;
-        if pr.typ != paths::Type::Key {
-            return Err(TransError::other(format!(
-                "expected only keys while locking, got path {:?}",
-                self.path
-            )));
-        }
-        let cpath = paths::collection_info(&pr.prefix);
-        res.push(PathLock {
-            path: cpath,
-            typ: lt,
-        });
-        Ok(res)
-    }
-}
-
-struct ValidationState {
-    paths: Vec<PathState>,
-}
-
-impl ValidationState {
-    fn outcome(&self) -> Result<(), TransError> {
-        let mut retry = 0usize;
-        let mut unknown = 0usize;
-        let mut needsclock = 0usize;
-        for p in &self.paths {
-            match p.result {
-                VResult::Retry => retry += 1,
-                VResult::Unknown => unknown += 1,
-                VResult::NeedsCLock => needsclock += 1,
-                VResult::Ok => {}
-            }
-        }
-        // Retry wins over everything else.
-        if retry > 0 {
-            return Err(TransError::Retry);
-        }
-        if unknown > 0 || needsclock > 0 {
-            return Err(TransError::ValidateRetry);
-        }
-        Ok(())
-    }
-}
-
-fn init_validation(h: &Handle) -> ValidationState {
-    // `collect_accesses` emits reads and writes already sorted and unique by
-    // path (see ADR-008), so merge the two sorted runs directly into a
-    // path-sorted `PathState` list. This avoids a per-transaction `HashMap`
-    // allocation (plus its hashing and the separate final sort) while keeping
-    // the same deterministic, deduplicated validation order: a key that is both
-    // read and written yields a single merged entry.
-    let reads = &h.data.reads;
-    let writes = &h.data.writes;
-    let mut paths: Vec<PathState> = Vec::with_capacity(reads.len() + writes.len());
-    let (mut i, mut j) = (0, 0);
-    loop {
-        let (take_read, take_write) = match (reads.get(i), writes.get(j)) {
-            (Some(r), Some(w)) => match r.path.cmp(&w.path) {
-                std::cmp::Ordering::Less => (true, false),
-                std::cmp::Ordering::Greater => (false, true),
-                std::cmp::Ordering::Equal => (true, true),
-            },
-            (Some(_), None) => (true, false),
-            (None, Some(_)) => (false, true),
-            (None, None) => break,
-        };
-        let path = if take_read {
-            reads[i].path.clone()
-        } else {
-            writes[j].path.clone()
-        };
-        let mut ps = PathState {
-            path,
-            read: None,
-            write: None,
-            existence: PathExistence::Unknown,
-            result: VResult::Unknown,
-        };
-        if take_read {
-            let r = &reads[i];
-            ps.read = Some(if let Some(version) = &r.version {
-                ps.existence = PathExistence::Found;
-                PathRead::Found(version.to_storage_version())
-            } else {
-                ps.existence = PathExistence::NotFound;
-                PathRead::NotFound
-            });
-            i += 1;
-        }
-        if take_write {
-            let w = &writes[j];
-            ps.write = Some(if w.is_delete() {
-                PathWrite::Delete
-            } else {
-                PathWrite::Put
-            });
-            j += 1;
-        }
-        paths.push(ps);
-    }
-    ValidationState { paths }
-}
-
-fn is_single_rw(data: &Data) -> bool {
-    if data.reads.len() != 1 || data.writes.len() != 1 {
-        return false;
-    }
-    if data.reads[0].path != data.writes[0].path {
-        return false;
-    }
-    // A delete cannot take the logless fast path: it would issue a conditional
-    // delete while holding no lock, which the storage locker rejects (it only
-    // deletes as the unlock step of a write/create lock). Route deletes through
-    // the locked commit path, which handles them correctly (write-lock the key
-    // plus the collection lock for phantom prevention, then delete on unlock).
-    if data.writes[0].is_delete() {
-        return false;
-    }
-    data.reads[0].version.is_some()
-}
-
-fn same_version_after_lock(v: &Version, meta: &Metadata) -> bool {
-    v.equal_meta_contents(meta)
-}
-
-fn to_log(id: TxId, writes: &[WriteAccess]) -> TxLog {
-    let mut tl = TxLog::new(id, glassdb_storage::TxCommitStatus::Ok);
-    for w in writes {
-        let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
-            WriteOp::Put(value) => (value.clone(), false),
-            WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
-        };
-        tl.writes.push(TxWrite {
-            path: w.path.to_string(),
-            value,
-            deleted,
-            prev_writer: TxId::default(),
-        });
-    }
-    tl
-}
-
-fn write_access_from_value(path: Arc<str>, value: Arc<[u8]>, deleted: bool) -> WriteAccess {
-    if deleted {
-        WriteAccess::delete(path)
-    } else {
-        WriteAccess::put(path, value)
-    }
-}
-
-fn collections_locks(vstate: &ValidationState) -> Result<Vec<PathLock>, TransError> {
-    let mut locks: HashMap<String, LockType> = HashMap::new();
-
-    for info in &vstate.paths {
-        // A blind write (write without a prior read) has unknown existence: it
-        // may need to create the key, which requires the collection lock for
-        // phantom prevention. Acquire it up front so the key can take the
-        // create-or-write path directly, instead of first attempting a write
-        // lock (a wasted metadata read that returns not-found for a new key)
-        // and only then retrying under a collection lock.
-        let blind_write = info.has_write() && !info.has_read();
-        if !info.read_not_found()
-            && !info.write_deletes()
-            && info.result != VResult::NeedsCLock
-            && !blind_write
-        {
-            // Only not-found, deleted, and blind-write items require collection
-            // locks.
-            continue;
-        }
-        let pr = paths::parse(&info.path)
-            .map_err(|e| TransError::with_source("parsing path while locking", e))?;
-        if pr.typ != paths::Type::Key {
-            return Err(TransError::other(format!(
-                "expected only keys while locking, got path {:?}",
-                info.path
-            )));
-        }
-        if info.has_write() {
-            locks.insert(pr.prefix.clone(), LockType::Write);
-            continue;
-        }
-        if !info.has_read() {
-            continue;
-        }
-        if let Some(LockType::Write) = locks.get(&pr.prefix) {
-            continue;
-        }
-        locks.insert(pr.prefix.clone(), LockType::Read);
-    }
-
-    // Sort by collection path for the same determinism reason as
-    // `init_validation`: a stable lock order independent of `HashMap` iteration.
-    let mut out: Vec<PathLock> = locks
-        .into_iter()
-        .map(|(p, t)| PathLock {
-            path: paths::collection_info(&p),
-            typ: t,
-        })
-        .collect();
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
-}
-
-/// Coordinates transactions: read validation, locking, and write application.
+/// Coordinates transactions: read validation, locking, commit, and write-back.
 #[derive(Clone)]
 pub struct Algo {
-    global: Global,
-    local: Local,
-    reader: Reader,
+    values: ValueCache,
+    resolver: Resolver,
     locker: Locker,
     mon: Monitor,
     gc: Gc,
-    // Weak so a captured `Algo` clone inside a spawned async-cleanup task
-    // does not keep [`Background`] alive past DB shutdown.
+    clock: Clock,
+    // Weak so a captured `Algo` clone inside a spawned async-abort task does not
+    // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
 }
 
 impl Algo {
-    /// Creates an algorithm coordinator.
+    /// Creates an algorithm coordinator. `clock` is the wall-clock source for
+    /// transaction-id timestamps; pass the same clock the monitor uses so
+    /// priorities and lease timing share one time base.
     pub fn new(
-        global: Global,
-        local: Local,
+        values: ValueCache,
         locker: Locker,
         mon: Monitor,
+        clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
-        reader: Reader,
+        resolver: Resolver,
     ) -> Self {
         Algo {
-            global,
-            local,
-            reader,
+            values,
+            resolver,
             locker,
             mon,
             gc,
+            clock,
             background,
         }
     }
 
-    /// Releases coordinator resources, awaiting any spawned locker dedup owner
-    /// tasks so none leak on database close.
+    /// Releases coordinator resources. A no-op in v2 (the locker spawns no owner
+    /// tasks), kept for call-site stability.
     pub async fn close(&self) {
         self.locker.close().await;
     }
 
-    /// Returns a reference to the underlying [`Locker`], so higher layers can
-    /// pull lock-coordination diagnostics (dedup state and per-transaction held
-    /// locks) without needing access to the locker directly.
+    /// Returns a reference to the underlying [`Locker`] for diagnostics.
     pub fn locker(&self) -> &Locker {
         &self.locker
     }
 
-    /// Starts a new transaction with the given data. The id's random prefix
-    /// and timestamp are deterministic under `--cfg sim` because they are
-    /// drawn from the seeded executor RNG and the anchored clock
-    /// respectively, so wound-wait priorities replay byte-for-byte.
+    /// Starts a new transaction with the given data. The id's random prefix and
+    /// timestamp are deterministic under `--cfg sim`.
     pub fn begin(&self, d: Data) -> Handle {
-        let id = TxId::new_at(now_unix_nanos(self.mon.clock_now()));
+        let id = TxId::new_at(self.clock.now());
         Handle {
             data: d,
             status: Status::New,
             id,
-            mode: CommitMode::Fast,
+            attempts: 0,
+            engaged: false,
+            backoff: RetryConfig::default().backoff(),
         }
     }
 
-    /// Restarts a wounded or retried transaction, preserving its priority
-    /// (timestamp) while minting a fresh log identity. Reusing the original
-    /// priority prevents a restarted transaction from being starved by an
-    /// endless stream of younger peers.
+    /// Restarts a wounded transaction, preserving its priority (timestamp) while
+    /// minting a fresh log identity ([`TxId::renew`]) so it keeps its wound-wait
+    /// rank and cannot be starved. Carries the backoff forward and bumps the
+    /// attempt counter (which drives the serial-locking escalation).
     pub fn rebegin(&self, old: Handle) -> Handle {
         Handle {
             id: old.id.renew(),
             data: old.data,
             status: Status::New,
-            mode: CommitMode::Fast,
+            attempts: old.attempts + 1,
+            engaged: false,
+            backoff: old.backoff,
         }
     }
 
-    /// Validates all reads and applies all writes, returning [`TransError::Retry`]
-    /// on a detected conflict.
+    /// Validates all reads and applies all writes. Returns [`TransError::Wounded`]
+    /// only when a higher-priority peer aborted this transaction, so it must
+    /// retry with a fresh id (priority preserved), or [`TransError::Retry`] when
+    /// the body must re-run in place — a read-only transaction whose reads
+    /// changed, or a read-write transaction whose read moved before it locked
+    /// the key (re-run holding its locks, ADR-024). CAS contention and suspected
+    /// deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
+        if tx.data.writes.is_empty() {
+            return self.commit_readonly(tx).await;
+        }
+        self.commit_read_write(tx).await
+    }
+
+    /// Read-only fast path: re-resolve each read's effective writer against the
+    /// shards and commit if none changed. Takes no locks and writes nothing, so
+    /// it never registers with the monitor.
+    ///
+    /// A failed validation does not back off before signalling [`Retry`]: the
+    /// re-run re-reads the authoritative values (the cache was just invalidated)
+    /// rather than busy-spinning on the stale ones, and an idle delay would only
+    /// add commit latency.
+    ///
+    /// [`Retry`]: TransError::Retry
+    async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
+        if self.validate_reads_inner(&tx.data).await? {
+            tx.status = Status::Committed;
+            return Ok(());
+        }
+        self.invalidate_reads(&tx.data);
+        Err(TransError::Retry)
+    }
+
+    /// Read-write path: lock the touched shards (and roots for membership
+    /// changes), validate the reads now that their values are frozen, flip the
+    /// transaction object to committed, then spawn the write-back in the
+    /// background so commit returns without waiting for it.
+    async fn commit_read_write(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
             tx.status = Status::Validating;
-        }
-        let mut vstate = init_validation(tx);
-
-        loop {
-            // Stop early if a higher-priority transaction wounded us while we
-            // were validating: there's no point acquiring more locks.
-            if self.was_wounded(tx).await {
-                self.update_local_cache(&vstate);
-                return Err(TransError::Wounded);
-            }
-            match self.validate_round(&mut vstate, tx).await {
-                Ok(()) => break,
-                Err(TransError::ValidateRetry) => continue,
-                Err(e) => {
-                    self.update_local_cache(&vstate);
-                    return Err(e);
-                }
-            }
+            tx.engaged = true;
         }
 
-        if let Err(e) = self.commit_writes(&tx.data.writes, &tx.id).await {
+        let locked = match self.acquire_locks(tx).await? {
+            Acquired::Locked(l) => l,
+            // A higher-priority peer aborted us: renew the id and re-run.
+            Acquired::Wounded => return self.restart(tx).await,
+        };
+
+        // Record the held lock set so both the committed object (below) and the
+        // refresher's pending object describe their own back-references, which
+        // is what lets GC prune this transaction's locks by reverse check
+        // (ADR-022). This tracks the latest acquire; a `revalidate` re-run that
+        // drops keys may under-record, which only defers those stale locks to
+        // lazy reclaim, never a correctness loss.
+        let locks = locked.locked_paths();
+        self.mon.record_tx_locks(&tx.id, locks.clone());
+
+        // Optimistic read validation (ADR-024): now that every touched key is
+        // locked, its value is frozen, so re-resolve each read's effective
+        // writer and check it still matches what the body observed. A read that
+        // moved before we locked means that our snapshot is stale: re-run the
+        // body to observe the new value, holding our locks and keeping our id.
+        // This is the only conflict that re-runs the body.
+        if !self.validate_reads_inner(&tx.data).await? {
+            return self.revalidate(tx).await;
+        }
+
+        // Commit point: create-or-flip the transaction object to committed.
+        if let Err(e) = self.commit_writes(&tx.data.writes, locks, &tx.id).await {
             if matches!(e, TransError::AlreadyFinalized) {
-                // The log was already finalized as `aborted`: we were wounded
-                // (or reclaimed as expired) between validation and commit.
-                // Third parties only write our log to wound (status
-                // `aborted`); a `committed` status can only come from our own
-                // previously-landed attempt, which `set_final_log` resolves to
-                // `Ok` internally.
-                return Err(TransError::Wounded);
+                // The log was finalized as `aborted` out from under us: a wound
+                // landed between locking and commit.
+                return self.restart(tx).await;
             }
             return Err(e.context(format!("committing writes for tx {}", tx.id)));
         }
         tx.status = Status::Committed;
-        self.async_cleanup(tx);
+
+        self.write_back(&tx.id, locked).await;
         Ok(())
+    }
+
+    /// Publishes the committed transaction's pointers and releases its locks.
+    /// Idempotent and best-effort: the transaction is already durably committed,
+    /// so a write-back failure only delays lazy lock cleanup, never the result.
+    /// It is spawned in the background so commit returns immediately rather than
+    /// waiting for the pointer publishes and lock releases; a shutdown drains
+    /// the spawned task (`Background::spawn_waited`). Without a background
+    /// executor (unit tests, or after shutdown dropped it) it releases inline so
+    /// locks are not left to lazy reclaim.
+    async fn write_back(&self, id: &TxId, locked: LockedTx) {
+        match self.background.as_ref().and_then(|w| w.upgrade()) {
+            Some(bg) => {
+                let locker = self.locker.clone();
+                let gc = self.gc.clone();
+                let id = id.clone();
+                bg.spawn_waited(async move {
+                    let superseded = locker.write_back(&id, &locked).await;
+                    feed_gc_hints(&gc, superseded);
+                });
+            }
+            None => {
+                let superseded = self.locker.write_back(id, &locked).await;
+                feed_gc_hints(&self.gc, superseded);
+            }
+        }
+    }
+
+    /// Signals the read-write restart after a genuine wound: invalidate stale
+    /// cached reads (so the retry re-reads the authoritative value rather than
+    /// the stale one it would otherwise re-validate and re-conflict on) and
+    /// return [`TransError::Wounded`] so the caller renews the id and re-runs.
+    /// Does not back off: the wound already aborted us (its locks are
+    /// immediately reclaimable), the locker's CAS loop backs off real lock
+    /// contention, and a delay here would only slow the renewed retry.
+    async fn restart(&self, tx: &mut Handle) -> Result<(), TransError> {
+        self.invalidate_reads(&tx.data);
+        Err(TransError::Wounded)
+    }
+
+    /// Acquires every lock the transaction needs, resolving both **CAS
+    /// contention** and **suspected deadlocks** internally — without renewing
+    /// the id or re-running the body (ADR-020/024). Only one non-success outcome
+    /// leaves this loop: [`Acquired::Wounded`], a higher-priority peer having
+    /// aborted us (the one conflict that must renew the id and re-run).
+    ///
+    /// - **CAS contention** (a shard/root lost its bounded CAS race): drop the
+    ///   partial locks ([`Locker::release_locks`]) and retry under the **same
+    ///   id** after backing off, so a transaction that merely lost a race never
+    ///   discards its executed body. Persistent contention escalates to the
+    ///   serial order, which removes the equal-priority livelock.
+    /// - **Suspected deadlock** (the parallel wait exceeded
+    ///   [`MAX_DEADLOCK_TIMEOUT`]): drop the out-of-order locks and re-acquire in
+    ///   the global serial sorted order, where first-CAS-wins on the lowest
+    ///   contended shard guarantees one contender always completes. Serial mode
+    ///   cannot deadlock, so it arms no timeout.
+    ///
+    /// `tx.attempts` (genuine-wound restarts) starts a heavily-restarted
+    /// transaction directly in the serial order as a backstop.
+    async fn acquire_locks(&self, tx: &mut Handle) -> Result<Acquired, TransError> {
+        let mut serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
+        let mut conflicts: usize = 0;
+        loop {
+            // A higher-priority peer may have aborted us; re-checked each
+            // iteration so a wound landing during a long wait surfaces promptly
+            // rather than driving a pointless re-lock.
+            if self.was_wounded(tx).await {
+                return Ok(Acquired::Wounded);
+            }
+            let outcome = if serial {
+                self.locker.lock(&tx.id, &tx.data, true).await
+            } else {
+                tokio::select! {
+                    res = self.locker.lock(&tx.id, &tx.data, false) => res,
+                    _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
+                }
+            };
+            match outcome {
+                Ok(LockOutcome::Locked(l)) => return Ok(Acquired::Locked(l)),
+                // CAS contention: drop the partial locks and retry under the same
+                // id after backing off — no renew, no body re-run. Escalate to
+                // the serial order if contention persists.
+                Ok(LockOutcome::Conflict) => {
+                    self.release_for_retry(tx).await?;
+                    conflicts += 1;
+                    serial = serial || conflicts >= SERIAL_FALLBACK_AFTER;
+                    rt::sleep(tx.backoff.next_delay()).await;
+                }
+                // Suspected deadlock: drop the out-of-order locks and re-acquire
+                // in the cannot-deadlock serial order, keeping our id.
+                Err(TransError::LockTimeout) => {
+                    self.release_for_retry(tx).await?;
+                    serial = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Releases every lock the transaction currently holds before an in-place,
+    /// same-id re-lock (the CAS-contention and deadlock-timeout retries). The
+    /// transaction object stays pending; only the shard/root lock entries clear.
+    async fn release_for_retry(&self, tx: &Handle) -> Result<(), TransError> {
+        self.locker
+            .release_locks(&tx.id)
+            .await
+            .map_err(|e| e.context(format!("releasing locks before re-lock for tx {}", tx.id)))
+    }
+
+    /// Signals a stale-read re-validation restart (ADR-024): a read's value moved
+    /// before it was locked, so the body must re-run to observe the new value —
+    /// but, unlike [`Algo::restart`], **holding the locks already acquired** and
+    /// **without renewing the id**. Invalidates the stale cached reads so the
+    /// re-run re-reads the authoritative values, then returns
+    /// [`TransError::Retry`], which the db retry loop re-runs in place (the
+    /// transaction object stays pending and its locks stay installed). Any lock
+    /// left on a key the re-run no longer touches is reclaimed lazily by the next
+    /// contender (ADR-021).
+    ///
+    /// Unlike [`Algo::restart`] this does **not** back off: the transaction holds
+    /// *live* locks here (its object is still pending), so sleeping would block
+    /// every peer waiting on those keys and only delay our own release.
+    async fn revalidate(&self, tx: &mut Handle) -> Result<(), TransError> {
+        self.invalidate_reads(&tx.data);
+        Err(TransError::Retry)
     }
 
     /// Reports whether the transaction was already aborted by a higher-priority
@@ -558,31 +452,48 @@ impl Algo {
     async fn was_wounded(&self, tx: &Handle) -> bool {
         matches!(
             self.mon.tx_status(&tx.id).await,
-            Ok(glassdb_storage::TxCommitStatus::Aborted)
+            Ok(TxCommitStatus::Aborted)
         )
     }
 
-    /// Validates the reads of a read-only transaction, returning
-    /// [`TransError::Retry`] if any read was invalidated.
+    /// Validates the reads of a read-only transaction (the error-recovery path
+    /// in the db retry loop), returning [`TransError::Retry`] if any read was
+    /// invalidated. It holds no locks and does not back off before signalling
+    /// the retry.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::New {
-            self.mon.begin_tx(&tx.id);
-            tx.status = Status::Validating;
-        }
         if !tx.data.writes.is_empty() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
             ));
         }
-        let mut vstate = init_validation(tx);
-        if let Err(e) = self.validate_readonly(&mut vstate, tx).await {
-            self.update_local_cache(&vstate);
-            return Err(e);
+        if self.validate_reads_inner(&tx.data).await? {
+            return Ok(());
         }
-        Ok(())
+        self.invalidate_reads(&tx.data);
+        Err(TransError::Retry)
     }
 
-    /// Replaces the transaction's data, preserving acquired locks.
+    /// Re-resolves every read's effective writer and reports whether they all
+    /// still match what the transaction observed (a consistent snapshot exists).
+    /// The read set is resolved in one shard-batched pass (each touched shard is
+    /// loaded once) rather than one shard load per key.
+    async fn validate_reads_inner(&self, data: &Data) -> Result<bool, TransError> {
+        if data.reads.is_empty() {
+            return Ok(true);
+        }
+        let keys: Vec<Arc<str>> = data.reads.iter().map(|r| r.path.clone()).collect();
+        let current = self.resolver.effective_writers(&keys).await?;
+        for r in &data.reads {
+            let observed = r.version.as_ref().map(|v| v.last_writer.clone());
+            if current.get(&r.path).cloned().flatten() != observed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Replaces the transaction's data. Allowed before commit (the db retry loop
+    /// resets accesses between attempts).
     pub fn reset(&self, tx: &mut Handle, data: Data) {
         assert!(
             tx.status != Status::Committed,
@@ -591,27 +502,19 @@ impl Algo {
         tx.data = data;
     }
 
-    /// Aborts a non-committed transaction, releasing its locks.
+    /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
+    /// by marking its transaction object aborted). A pure read-only transaction
+    /// never engaged, so there is nothing to abort.
     pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::Committed {
+        if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
         }
-        if let Err(e) = self.mon.abort_tx(&tx.id).await {
-            // A timeout here is fine; we follow up with an async cleanup.
-            self.async_cleanup(tx);
-            return Err(e);
-        }
-        Ok(())
+        self.mon.abort_tx(&tx.id).await
     }
 
     /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
-    /// future is dropped mid-flight so [`Algo::end`] never ran. Synchronous:
-    /// schedules a spawned task on the background executor and returns
-    /// immediately. `Database::shutdown` waits for the spawned task to write the
-    /// Aborted log entry. If it fails, the transaction's locks linger until
-    /// lease expiry, exactly the behaviour we'd have without this method.
-    /// Idempotent (a transaction that already finalized is a no-op in
-    /// `mon.abort_tx`).
+    /// future is dropped mid-flight so [`Algo::end`] never ran. Schedules a
+    /// spawned task and returns immediately; idempotent.
     pub fn async_abort(&self, tx_id: &TxId) {
         let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
             return;
@@ -623,903 +526,80 @@ impl Algo {
         });
     }
 
-    async fn validate_round(
-        &self,
-        vstate: &mut ValidationState,
-        tx: &mut Handle,
-    ) -> Result<(), TransError> {
-        if tx.mode != CommitMode::Fast {
-            return self.validate_read_write(vstate, tx).await;
-        }
-        if tx.data.writes.is_empty() {
-            return self.validate_readonly(vstate, tx).await;
-        }
-        // The single-RW fast path writes the value straight to the object,
-        // which *is* its commit point; it bypasses the lock/transaction-log
-        // protocol. That is only sound when this transaction holds no locks. A
-        // previous attempt retried with the same id (via `tx.reset`) may still
-        // hold locks it deliberately preserved; taking the fast path then would
-        // make the value durable and *then* have `commit_writes` try to
-        // finalize a log for those leftover locks, fail with `AlreadyFinalized`,
-        // and trigger a retry that applies the write a second time. Commit
-        // through the lock-based path instead.
-        if is_single_rw(&tx.data) && !self.locker.has_locks(&tx.id) {
-            match self.commit_single_rw(tx).await {
-                Err(TransError::NoSingleWrite) | Err(TransError::Retry) => {
-                    // Fall back to regular validation, acquiring locks early.
-                    tx.mode = CommitMode::Locked;
-                    return Err(TransError::ValidateRetry);
-                }
-                other => return other,
+    /// Invalidates the local cache entries for the transaction's found reads, so
+    /// a retry re-reads the authoritative value instead of re-validating the
+    /// stale cached one (which would re-conflict forever).
+    fn invalidate_reads(&self, data: &Data) {
+        for r in &data.reads {
+            if let Some(v) = &r.version {
+                self.values
+                    .mark_value_outdated(&r.path, v.to_storage_version());
             }
-        }
-        self.validate_read_write(vstate, tx).await
-    }
-
-    async fn validate_read_write(
-        &self,
-        vstate: &mut ValidationState,
-        tx: &mut Handle,
-    ) -> Result<(), TransError> {
-        if tx.mode == CommitMode::Serial {
-            return self.serial_validate(vstate, tx).await;
-        }
-        match self.parallel_validate(vstate, tx).await {
-            Ok(()) => Ok(()),
-            Err(TransError::LockTimeout) => {
-                // Most likely deadlocked: restart with serialized locking.
-                tx.mode = CommitMode::Serial;
-                let held = self.locker.locked_paths(&tx.id);
-                tracing::debug!(
-                    target: "glassdb::algo",
-                    tx = %tx.id,
-                    needed_paths = vstate.paths.len(),
-                    held_locks = held.len(),
-                    "parallel_lock_timeout_fallback_to_serial",
-                );
-                Err(TransError::ValidateRetry)
-            }
-            Err(e) => Err(e),
         }
     }
 
-    async fn commit_single_rw(&self, tx: &mut Handle) -> Result<(), TransError> {
-        let read = tx.data.reads[0].clone();
-        let write = tx.data.writes[0].clone();
-        let read_version = read
-            .version
-            .as_ref()
-            .expect("single read-write fast path requires a found read");
-
-        let mut meta = match self.reader.get_metadata(&read.path, MAX_STALE).await {
-            Ok(m) => m,
-            Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
-            Err(e) => {
-                return Err(TransError::Storage(
-                    e.context(format!("getting metadata for {:?}", read.path)),
-                ));
-            }
-        };
-
-        // Try validating twice without retrying the whole transaction.
-        for _ in 0..2 {
-            if let Err(e) = self.check_read_version_unlocked(read_version, &meta) {
-                if matches!(e, TransError::Retry) {
-                    self.local
-                        .mark_value_outdated(&write.path, read_version.to_storage_version());
-                }
-                return Err(e);
-            }
-            match self
-                .write_single_rw(&read.path, &meta.version, &tx.id, &write)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(StorageError::Precondition) => {
-                    // Raced (and not in-doubt): refresh metadata with a strong
-                    // read and retry.
-                    meta = match self.global.get_metadata(&read.path).await {
-                        Ok(m) => m,
-                        Err(StorageError::NotFound) => return Err(TransError::NoSingleWrite),
-                        Err(e) => {
-                            return Err(TransError::Storage(
-                                e.context(format!("getting metadata for {:?}", read.path)),
-                            ));
-                        }
-                    };
-                }
-                // An `Unavailable` here is the genuine in-doubt outcome (a retry
-                // hit a precondition, so our earlier attempt may have committed)
-                // and surfaces to the caller as `Error::InDoubt`.
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        // We keep getting raced against; do regular validations from now on.
-        self.local
-            .mark_value_outdated(&read.path, read_version.to_storage_version());
-        Err(TransError::Retry)
-    }
-
-    /// Issues the single-RW fast-path conditional write, re-issuing the same
-    /// write on an in-doubt (`Unavailable`) outcome.
-    ///
-    /// The conditional write (`write_if`, via the storage locker) is idempotent
-    /// under its own precondition, so re-issuing it unchanged — same expected
-    /// version, same value — cannot double-apply: it either lands (the object
-    /// was still at `expected` because no writer changed it, so it is applied
-    /// exactly once) or fails the precondition because a change already
-    /// happened. Re-reads are not needed and actually harmful; the precondition
-    /// is what enforces "only when nothing changed".
-    ///
-    /// A precondition *after* we re-issued an in-doubt write is itself
-    /// in-doubt: our earlier attempt may have committed, and with no
-    /// transaction log that is indistinguishable from a genuine conflict, so it
-    /// is reported as `Unavailable`. A precondition on the very first attempt
-    /// is a clean conflict and is returned as `Precondition` for the caller to
-    /// retry.
-    async fn write_single_rw(
+    /// Builds and writes the committed transaction object (the commit point).
+    /// Records `locks` (the held lock set) alongside `writes` so the object
+    /// carries its full back-reference set for GC's reverse check (ADR-022).
+    async fn commit_writes(
         &self,
-        key: &str,
-        expected: &backend::Version,
+        writes: &[WriteAccess],
+        locks: Vec<PathLock>,
         id: &TxId,
-        write: &WriteAccess,
-    ) -> Result<(), StorageError> {
-        let slocker = glassdb_storage::Locker::new(self.global.clone());
-        let update = glassdb_storage::LockUpdate {
-            typ: LockType::None,
-            writer: id.clone(),
-            value: match &write.op {
-                WriteOp::Put(value) => TValue {
-                    value: value.clone(),
-                    ..Default::default()
-                },
-                WriteOp::Delete => TValue {
-                    deleted: true,
-                    ..Default::default()
-                },
-            },
-            ..Default::default()
-        };
-
-        let mut in_doubt: Option<String> = None;
-        for _ in 0..=SINGLE_RW_INDOUBT_RETRIES {
-            match slocker.update_lock(key, expected, &update).await {
-                Ok(()) => return Ok(()),
-                Err(StorageError::Precondition) => {
-                    return match in_doubt {
-                        // A precondition after re-issuing an in-doubt write:
-                        // our earlier attempt may have committed.
-                        // Indistinguishable from a genuine conflict, so surface
-                        // the uncertainty.
-                        Some(reason) => Err(StorageError::Unavailable(reason)),
-                        // Clean conflict on a fresh attempt.
-                        None => Err(StorageError::Precondition),
-                    };
-                }
-                Err(StorageError::Unavailable(reason)) => {
-                    // The outcome is unknown. Re-issue the same conditional
-                    // write unchanged; it is idempotent under its precondition.
-                    in_doubt = Some(reason);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(StorageError::Unavailable(in_doubt.unwrap_or_else(|| {
-            "single read-write conditional write retries exhausted".into()
-        })))
-    }
-
-    async fn validate_readonly(
-        &self,
-        vstate: &mut ValidationState,
-        tx: &mut Handle,
     ) -> Result<(), TransError> {
-        let paths = &vstate.paths;
-        let n = paths.len();
-        let (outs, err) = self
-            .run_indexed(n, |i| {
-                let mut item = paths[i].clone();
-                async move {
-                    if item.read_not_found() {
-                        self.validate_read_not_found(&mut item).await?;
-                    } else {
-                        self.validate_read(&mut item).await?;
-                    }
-                    Ok(item)
-                }
-            })
-            .await;
-        for (i, o) in outs.into_iter().enumerate() {
-            if let Some(it) = o {
-                vstate.paths[i] = it;
-            }
-        }
-        err?;
-
-        let res = vstate.outcome();
-        if let Err(TransError::Retry) = &res {
-            // Avoid retrying too often: do regular validation after locking.
-            tx.mode = CommitMode::Locked;
-        }
-        res
-    }
-
-    async fn validate_read(&self, item: &mut PathState) -> Result<(), TransError> {
-        let meta = match self.global.get_metadata(&item.path).await {
-            Ok(m) => m,
-            Err(StorageError::NotFound) => {
-                item.result = VResult::Retry;
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let read_from = item.read_version().writer.clone();
-        let li = tags_lock_info(&meta.tags)?;
-
-        if li.typ == LockType::None || li.typ == LockType::Read {
-            if li.last_writer != read_from {
-                item.result = VResult::Retry;
-            } else {
-                item.result = VResult::Ok;
-            }
-            return Ok(());
-        }
-        self.validate_locked_read(item, &li, &read_from).await
-    }
-
-    async fn validate_locked_read(
-        &self,
-        item: &mut PathState,
-        li: &glassdb_storage::LockInfo,
-        read_from: &TxId,
-    ) -> Result<(), TransError> {
-        if li.locked_by.len() != 1 {
-            return Err(TransError::other(format!(
-                "bad lock: {:?} with {} lockers",
-                li.typ,
-                li.locked_by.len()
-            )));
-        }
-        let locker = li.locked_by[0].clone();
-        let status = self.mon.tx_status(&locker).await?;
-
-        let expected_writer;
-        let mut expected_val = None;
-
-        match status {
-            glassdb_storage::TxCommitStatus::Ok => {
-                let v = self.mon.committed_value(&item.path, &locker).await?;
-                if v.value.not_written {
-                    expected_writer = li.last_writer.clone();
-                } else if v.value.deleted {
-                    item.result = VResult::Retry;
-                    self.update_local(&WriteAccess::delete(item.path.clone()), &locker);
-                    return Ok(());
-                } else {
-                    expected_writer = locker.clone();
-                    expected_val = Some(v);
-                }
-            }
-            glassdb_storage::TxCommitStatus::Aborted | glassdb_storage::TxCommitStatus::Pending => {
-                expected_writer = li.last_writer.clone();
-            }
-            glassdb_storage::TxCommitStatus::Unknown => {
-                return Err(TransError::other("unknown tx commit status"));
-            }
-        }
-
-        if *read_from == expected_writer {
-            item.result = VResult::Ok;
-            return Ok(());
-        }
-
-        // We read from an old value: update our local copy and retry.
-        item.result = VResult::Retry;
-
-        let mut ev = match expected_val {
-            Some(v) => v,
-            None => match self.mon.committed_value(&item.path, &expected_writer).await {
-                Ok(v) => v,
-                Err(_) => {
-                    self.local
-                        .mark_value_outdated(&item.path, item.read_version_for_invalidation());
-                    return Ok(());
-                }
-            },
-        };
-
-        if ev.status != glassdb_storage::TxCommitStatus::Ok {
-            ev = match self.mon.committed_value(&item.path, &expected_writer).await {
-                Ok(v) => v,
-                Err(_) => {
-                    self.local
-                        .mark_value_outdated(&item.path, item.read_version_for_invalidation());
-                    return Ok(());
-                }
+        let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        tl.locks = locks;
+        for w in writes {
+            let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
+                WriteOp::Put(value) => (value.clone(), false),
+                WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
             };
+            tl.writes.push(TxWrite {
+                path: w.path.to_string(),
+                value,
+                deleted,
+                prev_writer: TxId::default(),
+            });
         }
-
-        if ev.status != glassdb_storage::TxCommitStatus::Ok || ev.value.not_written {
-            // We cannot authoritatively resolve expected_writer's value. This
-            // happens when expected_writer committed through the single-RW fast
-            // path, which writes no transaction log, so its log-based status is
-            // unknown/aborted even though it did commit. Caching a guessed value
-            // here would be corrupting: it would pair value bytes with a writer
-            // that did not produce them, and a later read could trust that
-            // (writer matches the live last-writer) and overwrite a newer value,
-            // losing an update. Instead, invalidate the stale cached value so the
-            // retry re-reads the authoritative one straight from storage.
-            self.local
-                .mark_value_outdated(&item.path, item.read_version_for_invalidation());
-            return Ok(());
-        }
-
-        self.update_local(
-            &write_access_from_value(item.path.clone(), ev.value.value, ev.value.deleted),
-            &expected_writer,
-        );
-        Ok(())
-    }
-
-    async fn validate_read_not_found(&self, item: &mut PathState) -> Result<(), TransError> {
-        let meta = match self.global.get_metadata(&item.path).await {
-            Ok(m) => m,
-            Err(StorageError::NotFound) => {
-                item.result = VResult::Ok;
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let li = tags_lock_info(&meta.tags)?;
-
-        if li.typ == LockType::None || li.typ == LockType::Read {
-            item.result = VResult::Retry;
-            return Ok(());
-        }
-        if li.locked_by.len() != 1 {
-            return Err(TransError::other(format!(
-                "bad lock: {:?} with {} lockers",
-                li.typ,
-                li.locked_by.len()
-            )));
-        }
-        let locker = li.locked_by[0].clone();
-        let status = self.mon.tx_status(&locker).await?;
-        let last_writer = match status {
-            glassdb_storage::TxCommitStatus::Ok => locker.clone(),
-            glassdb_storage::TxCommitStatus::Aborted | glassdb_storage::TxCommitStatus::Pending => {
-                li.last_writer.clone()
-            }
-            glassdb_storage::TxCommitStatus::Unknown => {
-                return Err(TransError::other("unknown tx commit status"));
-            }
-        };
-
-        let v = self.mon.committed_value(&item.path, &last_writer).await?;
-        if v.value.deleted {
-            item.result = VResult::Ok;
-            return Ok(());
-        }
-
-        // Was written to: retry. Only refresh the local cache when we could
-        // authoritatively resolve the value. If last_writer committed via the
-        // single-RW fast path it has no transaction log, so the value is
-        // unresolvable here; caching a guessed value would corrupt the entry, so we
-        // just retry and let the next read fetch the authoritative value.
-        if v.status == glassdb_storage::TxCommitStatus::Ok && !v.value.not_written {
-            self.update_local(
-                &write_access_from_value(item.path.clone(), v.value.value, v.value.deleted),
-                &last_writer,
-            );
-        }
-
-        item.result = VResult::Retry;
-        Ok(())
-    }
-
-    fn check_read_version_unlocked(
-        &self,
-        rv: &ReadVersion,
-        meta: &Metadata,
-    ) -> Result<(), TransError> {
-        let linfo = tags_lock_info(&meta.tags)?;
-        let same_last_writer = linfo.last_writer == rv.last_writer && linfo.typ == LockType::None;
-        let locked_by_writer = linfo.locked_by.len() == 1 && linfo.locked_by[0] == rv.last_writer;
-        if !same_last_writer && !locked_by_writer {
-            return Err(TransError::Retry);
-        }
-        Ok(())
-    }
-
-    async fn parallel_validate(
-        &self,
-        vstate: &mut ValidationState,
-        tx: &mut Handle,
-    ) -> Result<(), TransError> {
-        let timeout = deadlock_timeout(vstate);
-        let validate = async {
-            self.lock_collections(vstate, tx)
-                .await
-                .map_err(|e| e.context("locking collections"))?;
-            self.lock_validate(vstate, tx)
-                .await
-                .map_err(|e| e.context("failed validation"))?;
-            Ok::<_, TransError>(())
-        };
-        // Bound the locking work to break deadlocks. Dropping the validate
-        // future on the sleep arm cancels every in-flight `lock_*` future,
-        // which the locker (`PushGuard` in `tlocker`) and dedup
-        // (`DriverGuard`/`WaiterDropGuard`) handle cleanly: ambiguous locks
-        // are marked `Unknown` in the per-tx state so the serial fallback
-        // observes the mismatch and unlocks before re-acquiring.
-        let res = match timeout {
-            Some(t) => tokio::select! {
-                biased;
-                r = validate => r,
-                _ = rt::sleep(t) => Err(TransError::LockTimeout),
-            },
-            None => validate.await,
-        };
-        res?;
-        vstate.outcome()
-    }
-
-    async fn lock_collections(
-        &self,
-        vstate: &ValidationState,
-        tx: &Handle,
-    ) -> Result<(), TransError> {
-        let colocks = collections_locks(vstate)?;
-        if colocks.is_empty() {
-            return Ok(());
-        }
-        let (_, err) = self
-            .run_indexed(colocks.len(), |i| {
-                let cl = colocks[i].clone();
-                async move {
-                    self.lock_path(&cl.path, cl.typ, tx)
-                        .await
-                        .map_err(|e| e.context(format!("locking collection {:?}", cl.path)))
-                }
-            })
-            .await;
-        err
-    }
-
-    async fn serial_validate(
-        &self,
-        vstate: &mut ValidationState,
-        tx: &mut Handle,
-    ) -> Result<(), TransError> {
-        if !self.already_locked(vstate, tx) {
-            // We need to lock in the right order, so first unlock everything.
-            self.unlock_all(tx).await.map_err(|e| {
-                e.context(format!("unlocking before serial validate for tx {}", tx.id))
-            })?;
-            for item in &mut vstate.paths {
-                item.result = VResult::Unknown;
-            }
-        }
-
-        // Lock collections first, sorted.
-        let mut colocks = collections_locks(vstate)?;
-        if !colocks.is_empty() {
-            colocks.sort_by(|a, b| a.path.cmp(&b.path));
-            for cl in &colocks {
-                self.lock_path(&cl.path, cl.typ, tx)
-                    .await
-                    .map_err(|e| e.context(format!("locking collection {:?}", cl.path)))?;
-            }
-        }
-
-        // Then sort keys and validate them in order.
-        vstate.paths.sort_by(|a, b| a.path.cmp(&b.path));
-        let n = vstate.paths.len();
-        for i in 0..n {
-            let mut item = vstate.paths[i].clone();
-            let r = self.lock_validate_key(&mut item, tx).await;
-            vstate.paths[i] = item;
-            r?;
-        }
-        vstate.outcome()
-    }
-
-    fn already_locked(&self, vstate: &ValidationState, tx: &Handle) -> bool {
-        let mut need_locks: HashMap<String, LockType> = HashMap::new();
-        for ps in &vstate.paths {
-            let path_locks = ps.needs_locks().unwrap_or_default();
-            for pl in path_locks {
-                match need_locks.get(&pl.path) {
-                    Some(_) if pl.typ != LockType::Write => {}
-                    _ => {
-                        need_locks.insert(pl.path, pl.typ);
-                    }
-                }
-            }
-        }
-        let held = self.locker.locked_paths(&tx.id);
-        for (p, elt) in &need_locks {
-            // The tx must already hold a compatible lock for *every* needed path.
-            // A path it holds with too weak a type, or does not hold at all,
-            // means the held set is partial: serial validation must release
-            // everything and re-acquire in sorted order. Treating a partial set
-            // as "already locked" keeps out-of-order locks (e.g. those an aborted
-            // parallel attempt left behind) and can re-create the very deadlock
-            // serial locking exists to break.
-            let compatible = held
-                .iter()
-                .find(|lp| &lp.path == p)
-                .is_some_and(|lp| lp.typ == *elt || lp.typ == LockType::Write);
-            if !compatible {
-                tracing::debug!(
-                    target: "glassdb::algo",
-                    tx = %tx.id,
-                    missing_path = %p,
-                    needed_lock = %elt,
-                    held_count = held.len(),
-                    needed_count = need_locks.len(),
-                    "serial_validate_held_set_partial",
-                );
-                return false;
-            }
-        }
-        true
-    }
-
-    async fn lock_validate(
-        &self,
-        vstate: &mut ValidationState,
-        tx: &Handle,
-    ) -> Result<(), TransError> {
-        let paths = &vstate.paths;
-        let n = paths.len();
-        let (outs, err) = self
-            .run_indexed(n, |i| {
-                let mut item = paths[i].clone();
-                async move {
-                    self.lock_validate_key(&mut item, tx).await?;
-                    Ok(item)
-                }
-            })
-            .await;
-        for (i, o) in outs.into_iter().enumerate() {
-            if let Some(it) = o {
-                vstate.paths[i] = it;
-            }
-        }
-        err
-    }
-
-    async fn lock_validate_key(&self, item: &mut PathState, tx: &Handle) -> Result<(), TransError> {
-        if item.result == VResult::Ok {
-            return Ok(());
-        }
-        if item.read_not_found() {
-            return self.lock_validate_not_found_key(item, tx).await;
-        }
-        // A blind write (write with no prior read) has unknown existence. Take
-        // the create-or-write path: try a conditional create first (cheap for a
-        // new key, no metadata read), falling back to a write lock if the key
-        // already exists. The collection lock it relies on was acquired up
-        // front by `collections_locks`. This avoids the wasted write-lock
-        // attempt (and its not-found metadata read) on keys that must be
-        // created.
-        if item.has_write() && !item.has_read() {
-            return self.lock_validate_not_found_key(item, tx).await;
-        }
-        self.lock_validate_found_key(item, tx).await
-    }
-
-    async fn lock_validate_found_key(
-        &self,
-        item: &mut PathState,
-        tx: &Handle,
-    ) -> Result<(), TransError> {
-        let lock_res = if item.has_write() {
-            self.locker.lock_write(&item.path, &tx.id).await
-        } else if item.has_read() {
-            self.locker.lock_read(&item.path, &tx.id).await
-        } else {
-            Ok(())
-        };
-
-        if let Err(e) = lock_res {
-            if matches!(e, TransError::Storage(StorageError::NotFound)) {
-                if item.has_read() {
-                    item.result = VResult::Retry;
-                    return Ok(());
-                }
-                item.mark_not_found();
-                if self.is_key_collection_locked(&item.path, LockType::Write, tx) {
-                    return self.lock_validate_not_found_key(item, tx).await;
-                }
-                item.result = VResult::NeedsCLock;
-                return Ok(());
-            }
-            return Err(e.context("failed locking"));
-        }
-        if !item.has_read() {
-            item.result = VResult::Ok;
-            return Ok(());
-        }
-
-        let meta = self.reader.get_metadata(&item.path, MAX_STALE).await?;
-        if !same_version_after_lock(item.read_version(), &meta) {
-            item.result = VResult::Retry;
-            return Ok(());
-        }
-        item.result = VResult::Ok;
-        Ok(())
-    }
-
-    async fn lock_validate_not_found_key(
-        &self,
-        item: &mut PathState,
-        tx: &Handle,
-    ) -> Result<(), TransError> {
-        if item.has_read() && item.has_write() {
-            match self.locker.lock_create(&item.path, &tx.id).await {
-                Ok(()) => {
-                    item.result = VResult::Ok;
-                    Ok(())
-                }
-                Err(TransError::Storage(StorageError::Precondition)) => {
-                    item.result = VResult::Retry;
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        } else if item.has_read() && !item.has_write() {
-            match self.global.get_metadata(&item.path).await {
-                Err(StorageError::NotFound) => {
-                    item.result = VResult::Ok;
-                    Ok(())
-                }
-                Err(e) => Err(e.into()),
-                Ok(_) => {
-                    // The item exists now; lock read and validate.
-                    match self.locker.lock_read(&item.path, &tx.id).await {
-                        Err(TransError::Storage(StorageError::NotFound)) => {
-                            item.result = VResult::Ok;
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                        Ok(()) => {
-                            item.result = VResult::Retry;
-                            Ok(())
-                        }
-                    }
-                }
-            }
-        } else if item.has_write() {
-            match self.locker.lock_create(&item.path, &tx.id).await {
-                Ok(()) => {
-                    item.result = VResult::Ok;
-                    Ok(())
-                }
-                Err(TransError::Storage(StorageError::Precondition)) => {
-                    // Found now; lock it in write instead.
-                    self.locker.lock_write(&item.path, &tx.id).await?;
-                    item.result = VResult::Ok;
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn lock_path(&self, path: &str, lt: LockType, tx: &Handle) -> Result<(), TransError> {
-        match lt {
-            LockType::Read => self.locker.lock_read(path, &tx.id).await,
-            LockType::Write => self.locker.lock_write(path, &tx.id).await,
-            LockType::Create => self.locker.lock_create(path, &tx.id).await,
-            other => Err(TransError::other(format!(
-                "unsupported lock type {other:?}"
-            ))),
-        }
-        .map_err(|e| e.context(format!("locking path {path:?}")))
-    }
-
-    fn update_local_cache(&self, vstate: &ValidationState) {
-        for ps in &vstate.paths {
-            if ps.result == VResult::Retry {
-                self.local
-                    .mark_value_outdated(&ps.path, ps.read_version_for_invalidation());
-            }
-        }
-    }
-
-    async fn commit_writes(&self, writes: &[WriteAccess], id: &TxId) -> Result<(), TransError> {
-        let mut tl = to_log(id.clone(), writes);
-        tl.locks = self.locker.locked_paths(id);
-        // `context` preserves the `AlreadyFinalized` sentinel (so the commit
-        // path can map it to a wound) and any in-doubt outcome, instead of
-        // collapsing them into a generic error.
+        // `context` preserves the `AlreadyFinalized` sentinel and any in-doubt
+        // outcome instead of collapsing them into a generic error.
         self.mon
             .commit_tx(tl)
             .await
             .map_err(|e| e.context("creating transaction object"))
     }
-
-    fn update_local(&self, w: &WriteAccess, tid: &TxId) {
-        let version = Version {
-            b: backend::Version::default(),
-            writer: tid.clone(),
-        };
-        match &w.op {
-            WriteOp::Put(value) => self.local.write(&w.path, value.clone(), version),
-            WriteOp::Delete => self.local.mark_deleted(&w.path, version),
-        }
-    }
-
-    async fn unlock_all(&self, tx: &Handle) -> Result<(), TransError> {
-        let ps = self.locker.locked_paths(&tx.id);
-        if ps.is_empty() {
-            return Ok(());
-        }
-        let (outs, _) = self
-            .run_indexed(ps.len(), |i| {
-                let pl = ps[i].clone();
-                async move {
-                    match self.locker.unlock(&pl.path, &tx.id).await {
-                        Ok(()) => Ok(None::<TransError>),
-                        Err(e) => Ok(Some(e.context(format!("unlocking {:?}", pl.path)))),
-                    }
-                }
-            })
-            .await;
-        let errs: Vec<TransError> = outs.into_iter().flatten().flatten().collect();
-        if !errs.is_empty() {
-            return Err(TransError::other(format!(
-                "unlocking all for tx {}: {} errors",
-                tx.id,
-                errs.len()
-            )));
-        }
-        Ok(())
-    }
-
-    fn async_cleanup(&self, tx: &Handle) {
-        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
-            return;
-        };
-        let ps = self.locker.locked_paths(&tx.id);
-        if ps.is_empty() {
-            return;
-        }
-        let algo = self.clone();
-        let tid = tx.id.clone();
-        bg.spawn(async move {
-            let handle = Handle {
-                data: Data::default(),
-                status: Status::Committed,
-                id: tid.clone(),
-                mode: CommitMode::Fast,
-            };
-            // Bound the cleanup with a sleep-based watchdog: when it elapses
-            // the `select!` drops the `run_limited` future, which in turn
-            // drops every in-flight unlock attempt. Using `rt::sleep` keeps
-            // the watchdog deterministic under `--cfg sim`.
-            let ps_len = ps.len();
-            let algo_ref = &algo;
-            let handle_ref = &handle;
-            let ps_ref = &ps;
-            let work = algo.run_limited(BACKGROUND_CONCURRENCY, ps_len, move |i| async move {
-                match algo_ref
-                    .locker
-                    .unlock(&ps_ref[i].path, &handle_ref.id)
-                    .await
-                {
-                    Ok(()) => Ok(None::<()>),
-                    Err(_) => Ok(Some(())),
-                }
-            });
-            let outs = tokio::select! {
-                biased;
-                r = work => r.0,
-                _ = rt::sleep(BG_CLEANUP_TIMEOUT) => return,
-            };
-            let failures = outs.into_iter().flatten().flatten().count();
-            if failures == 0 {
-                algo.gc.schedule_tx_cleanup(tid);
-            }
-        });
-    }
-
-    async fn run_indexed<T, F, Fut>(
-        &self,
-        num: usize,
-        f: F,
-    ) -> (Vec<Option<T>>, Result<(), TransError>)
-    where
-        F: Fn(usize) -> Fut,
-        Fut: std::future::Future<Output = Result<T, TransError>>,
-    {
-        self.run_limited(ALGO_CONCURRENCY, num, f).await
-    }
-
-    async fn run_limited<T, F, Fut>(
-        &self,
-        limit: usize,
-        num: usize,
-        f: F,
-    ) -> (Vec<Option<T>>, Result<(), TransError>)
-    where
-        F: Fn(usize) -> Fut,
-        Fut: std::future::Future<Output = Result<T, TransError>>,
-    {
-        let mut outs: Vec<Option<T>> = (0..num).map(|_| None).collect();
-        if num == 0 {
-            return (outs, Ok(()));
-        }
-        let f = &f;
-        let mut stream = futures::stream::iter(0..num)
-            .map(|i| async move { (i, f(i).await) })
-            .buffer_unordered(limit.max(1));
-
-        // On the first error we break out of the loop and drop the stream;
-        // dropping `buffer_unordered` cancels every still-pending sibling
-        // (their futures are dropped). Already-completed `Ok` results stay in
-        // `outs` for the caller to consume.
-        let mut result = Ok(());
-        while let Some((i, r)) = stream.next().await {
-            match r {
-                Ok(v) => outs[i] = Some(v),
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            }
-        }
-        (outs, result)
-    }
-
-    fn is_key_collection_locked(&self, key: &str, expected: LockType, tx: &Handle) -> bool {
-        let pr = match paths::parse(key) {
-            Ok(pr) => pr,
-            Err(_) => return false,
-        };
-        let cpath = paths::collection_info(&pr.prefix);
-        self.locker.lock_type(&cpath, &tx.id) == expected
-    }
 }
 
-/// Per-tx deadlock budget. Returns `None` for trivially serialised work
-/// (`paths.len() <= 1`), in which case no timeout is applied.
-fn deadlock_timeout(vstate: &ValidationState) -> Option<Duration> {
-    if vstate.paths.len() <= 1 {
-        return None;
+/// Feeds the transaction ids a write-back superseded to GC as reverse-check
+/// candidates (ADR-022): each is a former `current_writer` a fresh commit's
+/// pointer overwrote, so it just lost a reference and may now be collectable.
+fn feed_gc_hints(gc: &Gc, superseded: Vec<TxId>) {
+    for prev in superseded {
+        gc.schedule_tx_cleanup(prev);
     }
-    Some(std::cmp::min(
-        LOCK_LATENCY * 4 * vstate.paths.len() as u32,
-        MAX_DEADLOCK_TIMEOUT,
-    ))
 }
-
-const MAX_STALE: Duration = glassdb_storage::MAX_STALENESS;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::{Backend, Tags, memory::MemoryBackend};
-    use glassdb_concurr::RetryConfig;
-    use glassdb_data::TxId;
-    use glassdb_storage::{LockType, MAX_STALENESS, TLogger, TxCommitStatus};
+    use crate::reader::Reader;
+    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_data::paths;
+    use glassdb_data::shard::shard_index;
+    use glassdb_storage::{
+        CollectionRoot, MAX_STALENESS, ObjectCache, ShardEntry, ShardStore, SharedCache,
+        StorageError, TLogger, TxCommitStatus, ValueCache,
+    };
 
     const TEST_COLL: &str = "testp";
-    const COLL_INFO: &[u8] = b"__foo__";
 
     struct Tctx {
         backend: Arc<dyn Backend>,
-        global: Global,
-        local: Local,
+        values: ValueCache,
         tlogger: TLogger,
         tmon: Monitor,
-        locker: Locker,
+        shards: ShardStore,
     }
 
     async fn new_algo() -> (Algo, Tctx) {
@@ -1527,49 +607,53 @@ mod tests {
     }
 
     async fn new_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
-        let local = Local::new(1024);
-        let global = Global::new(b.clone(), local.clone());
-        let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
+        let cache = SharedCache::new(1024);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(b.clone(), &cache);
+        let tlogger = TLogger::new(objects.clone(), TEST_COLL);
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
-        let reader = Reader::new(
-            local.clone(),
-            global.clone(),
+        // Leak the background so spawned async aborts can run for the test's
+        // lifetime without us threading the owner through every helper.
+        std::mem::forget(bg);
+        let tmon = Monitor::new(values.clone(), tlogger.clone(), bg_weak.clone());
+        let shards = ShardStore::new(objects.clone());
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
+        let locker = Locker::new(shards.clone(), tmon.clone(), RetryConfig::default());
+        let gc = Gc::new(
+            bg_weak.clone(),
+            tlogger.clone(),
+            shards.clone(),
             tmon.clone(),
-            RetryConfig::default(),
+            Clock::real(),
         );
-        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
-        let gc = Gc::new(bg_weak.clone(), tlogger.clone());
 
-        global
-            .write(
-                &paths::collection_info(TEST_COLL),
-                Arc::from(COLL_INFO),
-                Tags::new(),
+        // Create the collection root so membership locks have a home.
+        shards
+            .create_root_if_absent(
+                TEST_COLL,
+                &CollectionRoot::new(glassdb_data::shard::SHARD_COUNT),
             )
             .await
             .unwrap();
 
-        // Disable algo background tasks (async cleanup) to keep tests deterministic.
         let algo = Algo::new(
-            global.clone(),
-            local.clone(),
-            locker.clone(),
+            values.clone(),
+            locker,
             tmon.clone(),
+            Clock::real(),
             gc,
             None,
-            reader,
+            resolver,
         );
         (
             algo,
             Tctx {
                 backend: b,
-                global,
-                local,
+                values,
                 tlogger,
                 tmon,
-                locker,
+                shards,
             },
         )
     }
@@ -1598,8 +682,8 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(
-            tctx.local.clone(),
-            tctx.global.clone(),
+            tctx.values.clone(),
+            tctx.shards.clone(),
             tctx.tmon.clone(),
             RetryConfig::default(),
         );
@@ -1608,14 +692,6 @@ mod tests {
             Err(StorageError::NotFound) => ra_not_found(path),
             Err(e) => panic!("reading {path}: {e:?}"),
         }
-    }
-
-    async fn do_reads(tctx: &Tctx, ps: &[&str]) -> Vec<ReadAccess> {
-        let mut res = Vec::new();
-        for p in ps {
-            res.push(do_read(tctx, p).await);
-        }
-        res
     }
 
     async fn commit_access(tm: &Algo, d: Data) -> Handle {
@@ -1636,13 +712,13 @@ mod tests {
         .await
     }
 
-    async fn flush_writes(tm: &Algo, h: &Handle) {
-        tm.unlock_all(h).await.unwrap();
-    }
-
-    async fn lock_info(tctx: &Tctx, key: &str) -> glassdb_storage::LockInfo {
-        let m = tctx.global.get_metadata(key).await.unwrap();
-        tags_lock_info(&m.tags).unwrap()
+    async fn entry(tctx: &Tctx, key: &[u8]) -> Option<ShardEntry> {
+        let (shard, _) = tctx
+            .shards
+            .load_shard(TEST_COLL, shard_index(key))
+            .await
+            .unwrap();
+        shard.lookup(key).cloned()
     }
 
     #[tokio::test]
@@ -1659,173 +735,350 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        tctx.global.read(&keyp).await.unwrap();
         let status = tctx.tlogger.commit_status(&tid).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
-
-        let txlog = tctx.tlogger.get(&tid).await.unwrap();
-        assert!(txlog.timestamp.is_some());
+        let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
         assert_eq!(txlog.writes.len(), 1);
         assert_eq!(txlog.writes[0].path, keyp);
         assert_eq!(&*txlog.writes[0].value, val);
-        let mut locks = txlog.locks.clone();
-        locks.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut expected = vec![
-            PathLock {
-                path: paths::collection_info(TEST_COLL),
-                typ: LockType::Write,
-            },
-            PathLock {
-                path: keyp.clone(),
-                typ: LockType::Create,
-            },
-        ];
-        expected.sort_by(|a, b| a.path.cmp(&b.path));
-        assert_eq!(locks, expected);
+
+        // The shard entry points at the committed writer and the lock is gone.
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current_writer, Some(tid));
+        assert!(e.locked_by.is_empty());
     }
 
+    // Regression (review 1.1 / ADR-022): the committed transaction object must
+    // record its full lock set, not just its writes, so GC's reverse liveness
+    // check and lock pruning operate on real logs. A transaction that reads one
+    // key and creates another records: a read lock on the read key, a write lock
+    // on the created key, and the collection membership (root) lock.
     #[tokio::test]
-    async fn read_not_found_write() {
+    async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-        let val = b"v";
+        let readp = paths::from_key(TEST_COLL, b"r");
+        let writep = paths::from_key(TEST_COLL, b"w");
 
+        // Seed the read key so it resolves to a committed value.
+        commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
+
+        let r = do_read(&tctx, &readp).await;
         let mut h = tm.begin(Data {
-            reads: vec![ra_not_found(&keyp)],
-            writes: vec![wa(&keyp, val)],
+            reads: vec![r],
+            writes: vec![wa(&writep, b"v")],
         });
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        tctx.global.read(&keyp).await.unwrap();
-        let status = tctx.tlogger.commit_status(&tid).await.unwrap();
-        assert_eq!(status.status, TxCommitStatus::Ok);
+        let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
+        let locked: std::collections::BTreeSet<&str> =
+            txlog.locks.iter().map(|l| l.path.as_str()).collect();
+        let root = paths::collection_info(TEST_COLL);
+        assert!(
+            locked.contains(readp.as_str()),
+            "read lock recorded: {locked:?}"
+        );
+        assert!(
+            locked.contains(writep.as_str()),
+            "write lock recorded: {locked:?}"
+        );
+        assert!(
+            locked.contains(root.as_str()),
+            "membership root lock recorded: {locked:?}"
+        );
     }
 
     #[tokio::test]
-    async fn single_read_write() {
+    async fn read_then_write_round_trips() {
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
-        let val = b"v";
 
         let h = commit_writes(&tm, vec![wa(&keyp, b"init")]).await;
-        flush_writes(&tm, &h).await;
-
-        let gr = tctx.global.read(&keyp).await.unwrap();
-
-        let mut h = tm.begin(Data {
-            reads: vec![ra_found(&keyp, gr.version.writer)],
-            writes: vec![wa(&keyp, val)],
-        });
-        tm.commit(&mut h).await.unwrap();
-        tm.end(&mut h).await.unwrap();
-
-        let gr = tctx.global.read(&keyp).await.unwrap();
-        assert_eq!(&*gr.value, val);
-    }
-
-    #[tokio::test]
-    async fn read_write_while_lock_create() {
-        let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-        let val = b"v";
-
-        // Initialize the variable from another algo, without flushing.
-        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        commit_writes(&tm2, vec![wa(&keyp, b"init")]).await;
-
-        let gr = tctx.global.read(&keyp).await.unwrap();
-
-        let mut h = tm.begin(Data {
-            reads: vec![ra_found(&keyp, gr.version.writer)],
-            writes: vec![wa(&keyp, val)],
-        });
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-
-        let gr = tctx.global.read(&keyp).await.unwrap();
-        tm.reset(
-            &mut h,
-            Data {
-                reads: vec![ra_found(&keyp, gr.version.writer)],
-                writes: vec![wa(&keyp, val)],
-            },
-        );
-        tm.commit(&mut h).await.unwrap();
-        tm.end(&mut h).await.unwrap();
-
-        let lr = tctx.local.read(&keyp, MAX_STALENESS).unwrap();
-        assert_eq!(&*lr.value, val);
-        assert_eq!(lr.version.writer, *h.id());
-
-        tm.unlock_all(&h).await.unwrap();
-        let gr = tctx.global.read(&keyp).await.unwrap();
-        assert_eq!(&*gr.value, val);
-    }
-
-    #[tokio::test]
-    async fn readonly() {
-        let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-        let val = b"v";
-
-        let h = commit_writes(&tm, vec![wa(&keyp, val)]).await;
-        flush_writes(&tm, &h).await;
-
-        let gr = tctx.global.read(&keyp).await.unwrap();
-
-        let mut h = tm.begin(Data {
-            reads: vec![ra_found(&keyp, gr.version.writer)],
-            writes: Vec::new(),
-        });
-        tm.commit(&mut h).await.unwrap();
-        tm.end(&mut h).await.unwrap();
-
-        let gr = tctx.global.read(&keyp).await.unwrap();
-        assert_eq!(&*gr.value, val);
-    }
-
-    #[tokio::test]
-    async fn readonly_in_lock_create() {
-        let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-        let val = b"v";
-
-        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        commit_writes(&tm2, vec![wa(&keyp, val)]).await;
+        let _ = h;
 
         let r = do_read(&tctx, &keyp).await;
+        let mut h = tm.begin(Data {
+            reads: vec![r],
+            writes: vec![wa(&keyp, b"v2")],
+        });
+        tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
+
+        let r = do_read(&tctx, &keyp).await;
+        assert_eq!(r.version.as_ref().unwrap().last_writer, *h.id());
+    }
+
+    // A read whose value moved before it was locked does not abort-and-renew; it
+    // re-runs the body in place (`Retry`) while holding its locks (ADR-024). The
+    // engine validates *after* locking, so unlike a pre-lock check the moved key
+    // is itself locked during the re-run window — the v1 guarantee that the retry
+    // holds all its locks.
+    #[tokio::test]
+    async fn stale_read_write_retries_holding_locks() {
+        let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
+        let ra = do_read(&tctx, &keyp).await;
+
+        // Another client overwrites the key, making `ra` stale.
+        commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
+
+        let mut h = tm.begin(Data {
+            reads: vec![ra],
+            writes: vec![wa(&keyp, b"v3")],
+        });
+        let err = tm.commit(&mut h).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+
+        // The moved key is locked by us when the stale read is signalled: the
+        // re-run owns the lock and cannot lose it again to the same race.
+        let e = entry(&tctx, b"k").await.expect("entry exists");
+        assert_eq!(e.locked_by, vec![h.id().clone()]);
+
+        tm.end(&mut h).await.unwrap();
+    }
+
+    // ADR-024: a suspected deadlock is broken *inside* `Algo`, never surfaced. A
+    // transaction that cannot wound the holder of a lock it needs waits; the
+    // wait is bounded by `MAX_DEADLOCK_TIMEOUT`, after which the transaction
+    // releases its locks and re-acquires them in the cannot-deadlock serial
+    // order — under the *same id*, re-running no body. It never returns
+    // `LockTimeout`, and once the holder finalizes it commits.
+    #[tokio::test(start_paused = true)]
+    async fn deadlock_timeout_relocks_serially_keeping_id() {
+        use crate::tlocker::LockOutcome;
+        use std::time::Duration;
+        let (tm, tctx) = new_algo().await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        // An older holder takes the key's write lock and does not finalize.
+        let holder = TxId::with_priority(0, b"holder");
+        tctx.tmon.begin_tx(&holder);
+        let held = tm
+            .locker()
+            .lock(
+                &holder,
+                &Data {
+                    reads: Vec::new(),
+                    writes: vec![wa(&keyp, b"h")],
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(held, LockOutcome::Locked(_)),
+            "older holder should acquire its lock"
+        );
+
+        // A younger transaction wants the same key; it cannot wound the holder.
+        // Drive its commit concurrently so we can observe it parked waiting.
+        let mut h = tm.begin(Data {
+            reads: Vec::new(),
+            writes: vec![wa(&keyp, b"a")],
+        });
+        let id_before = h.id().clone();
+        let tm2 = tm.clone();
+        let committing = tokio::spawn(async move {
+            let res = tm2.commit(&mut h).await;
+            (h, res)
+        });
+
+        // Let the parallel wait time out and escalate to serial. Serial cannot
+        // wound the older peer either, so the transaction keeps waiting — it has
+        // not aborted and has surfaced no error.
+        rt::sleep(MAX_DEADLOCK_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            !committing.is_finished(),
+            "younger keeps waiting on the older holder after escalating to serial"
+        );
+
+        // Finalizing the holder releases the younger, which commits under its
+        // original id without ever surfacing `LockTimeout`.
+        tctx.tmon.abort_tx(&holder).await.unwrap();
+        let (mut h, res) = committing.await.unwrap();
+        res.expect("younger commits once the holder releases");
+        assert_eq!(
+            *h.id(),
+            id_before,
+            "the id is preserved across the serial fallback (no renew)"
+        );
+        tm.end(&mut h).await.unwrap();
+    }
+
+    /// A [`Backend`] that, once armed, makes the first `budget` shard-lock CAS
+    /// writes (`write_if` on a `/_s/` shard object) miss their precondition,
+    /// then passes through. Sustained misses force the lock acquisition past the
+    /// parallel deadlock timeout into the serial order and then exhaust the
+    /// serial CAS budget, which is the only way a `Conflict` reaches
+    /// `acquire_locks`.
+    struct FlakyShardCas {
+        inner: Arc<dyn Backend>,
+        armed: std::sync::atomic::AtomicBool,
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyShardCas {
+        fn new(inner: Arc<dyn Backend>, budget: usize) -> Arc<Self> {
+            Arc::new(FlakyShardCas {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                remaining: std::sync::atomic::AtomicUsize::new(budget),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn remaining(&self) -> usize {
+            self.remaining.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FlakyShardCas {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read(path).await
+        }
+
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read_if_modified(path, expected).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            use std::sync::atomic::Ordering;
+            if self.armed.load(Ordering::SeqCst)
+                && path.contains("/_s/")
+                && self
+                    .remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(glassdb_backend::BackendError::Precondition);
+            }
+            self.inner.write_if(path, value, expected).await
+        }
+
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    // ADR-020/024: CAS contention is resolved *inside* `Algo`. A transaction that
+    // loses the shard-lock CAS repeatedly releases its (partial) locks and
+    // re-acquires them under the *same id* — no renew, no body re-run — escalating
+    // to the serial order. It never surfaces `Wounded` for a mere lost race, and
+    // commits unchanged once the contention clears. A budget far larger than the
+    // ~handful of parallel attempts that fit before the deadlock timeout forces
+    // the serial CAS budget to be exhausted, i.e. the `Conflict` path.
+    #[tokio::test(start_paused = true)]
+    async fn cas_contention_relocks_keeping_id() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let flaky = FlakyShardCas::new(mem, 70);
+        let backend: Arc<dyn Backend> = flaky.clone();
+        let (tm, tctx) = new_algo_from_backend(backend).await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        // Seed the key over a clean connection so the shard exists (its lock CAS
+        // is then a `write_if`, the thing we fault).
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+
+        flaky.arm();
+        let mut h = tm.begin(Data {
+            reads: Vec::new(),
+            writes: vec![wa(&keyp, b"v2")],
+        });
+        let id_before = h.id().clone();
+        tm.commit(&mut h)
+            .await
+            .expect("commits despite sustained CAS contention");
+        assert_eq!(
+            *h.id(),
+            id_before,
+            "CAS contention retries under the same id (no renew)"
+        );
+        tm.end(&mut h).await.unwrap();
+
+        // The whole budget was consumed, so the transaction did exhaust the
+        // serial CAS budget (the `Conflict` path), not merely time out in
+        // parallel mode.
+        assert_eq!(flaky.remaining(), 0, "expected sustained CAS contention");
+        // It still committed: the shard points at our writer with no live lock.
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current_writer, Some(id_before));
+        assert!(e.locked_by.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readonly_validates() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
+        let r = do_read(&tctx, &keyp).await;
+
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
     }
 
     #[tokio::test]
-    async fn readonly_after_delete() {
+    async fn readonly_after_remote_change_retries() {
         let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 
-        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        commit_writes(&tm2, vec![wa(&keyp, b"v")]).await;
-        commit_writes(&tm2, vec![wdel(&keyp)]).await;
-
+        commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
         let r = do_read(&tctx, &keyp).await;
+        commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
+
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
 
+        // After re-reading, validation passes.
         let r = do_read(&tctx, &keyp).await;
         tm.reset(
             &mut h,
@@ -1838,14 +1091,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_local_after_delete() {
+    async fn readonly_after_delete_not_found() {
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         commit_writes(&tm, vec![wdel(&keyp)]).await;
 
+        // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
+        assert!(r.version.is_none());
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
@@ -1854,400 +1109,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_local_after_delete_flushed() {
+    async fn delete_round_trips() {
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
-        let h = commit_writes(&tm, vec![wdel(&keyp)]).await;
-        flush_writes(&tm, &h).await;
-
         let r = do_read(&tctx, &keyp).await;
         let mut h = tm.begin(Data {
             reads: vec![r],
-            writes: Vec::new(),
+            writes: vec![wdel(&keyp)],
         });
         tm.commit(&mut h).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn single_rw_retry() {
-        let (tm, tctx) = new_algo().await;
-        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-
-        commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
-
-        let ra = do_read(&tctx, &keyp).await;
-        assert!(ra.version.is_some());
-
-        // Modify the value from another algo as a single-RW transaction.
-        commit_access(
-            &tm2,
-            Data {
-                reads: vec![ra.clone()],
-                writes: vec![wa(&keyp, b"v")],
-            },
-        )
-        .await;
-
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&keyp, b"v2")],
-        });
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-
-        let ra = do_read(&tctx, &keyp).await;
-        tm.reset(
-            &mut h,
-            Data {
-                reads: vec![ra],
-                writes: vec![wa(&keyp, b"v2")],
-            },
-        );
-        tm.commit(&mut h).await.unwrap();
-        tm.end(&mut h).await.unwrap();
-    }
-
-    /// Regression test for ADR-007: a single-RW writer leaves no transaction log,
-    /// so validation must not cache an unresolvable value tagged with that writer.
-    #[tokio::test]
-    async fn single_rw_lost_update() {
-        let (tm_writer, tctx_w) = new_algo().await;
-        let (tm_victim, tctx_v) = new_algo_from_backend(tctx_w.backend.clone()).await;
-        let (_, tctx_l) = new_algo_from_backend(tctx_w.backend.clone()).await;
-        let key = paths::from_key(TEST_COLL, b"k");
-        let v0 = b"v0";
-        let v1 = b"v1";
-
-        // 1. Create k=v0 through a normal (logged) commit and flush it.
-        let h0 = commit_writes(&tm_writer, vec![wa(&key, v0)]).await;
-        flush_writes(&tm_writer, &h0).await;
-
-        // 2. The victim reads k, caching v0@W0 in its local storage.
-        let ra0 = do_read(&tctx_v, &key).await;
-        assert!(ra0.version.is_some());
-
-        // 3. The writer overwrites k=v1 through the single-RW fast path.
-        let ra_w = do_read(&tctx_w, &key).await;
-        let h_w1 = commit_access(
-            &tm_writer,
-            Data {
-                reads: vec![ra_w],
-                writes: vec![wa(&key, v1)],
-            },
-        )
-        .await;
-        let w1 = h_w1.id.clone();
-        let st = tctx_w.tlogger.commit_status(&w1).await.unwrap();
-        assert_eq!(st.status, TxCommitStatus::Unknown);
-        let gr = tctx_w.global.read(&key).await.unwrap();
-        assert_eq!(&*gr.value, v1);
-        assert_eq!(gr.writer(), w1);
-
-        // 4. A third client write-locks k and stays pending.
-        let w2 = TxId::with_priority(5 * 1_000_000_000, b"w2");
-        tctx_l.tmon.begin_tx(&w2);
-        tctx_l.locker.lock_write(&key, &w2).await.unwrap();
-        let info = lock_info(&tctx_l, &key).await;
-        assert_eq!(info.typ, LockType::Write);
-        assert_eq!(info.locked_by.len(), 1);
-        assert_eq!(info.locked_by[0], w2);
-        assert_eq!(info.last_writer, w1);
-
-        // 5. The victim validates its now-stale read of k.
-        let mut hv = tm_victim.begin(Data {
-            reads: vec![ra0],
-            writes: Vec::new(),
-        });
-        let err = tm_victim.commit(&mut hv).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-        tm_victim.end(&mut hv).await.unwrap();
-
-        // 6. The third client releases its lock; k is unlocked at v1@W1.
-        tctx_l.locker.unlock(&key, &w2).await.unwrap();
-        let info = lock_info(&tctx_l, &key).await;
-        assert_eq!(info.typ, LockType::None);
-        assert_eq!(info.last_writer, w1);
-        tctx_l.tmon.abort_tx(&w2).await.unwrap();
-
-        // 7. Reading k must return the authoritative committed value v1.
-        let reader = Reader::new(
-            tctx_v.local.clone(),
-            tctx_v.global.clone(),
-            tctx_v.tmon.clone(),
-            RetryConfig::default(),
-        );
-        let rv = reader.read(&key, MAX_STALENESS).await.unwrap();
-        assert_eq!(&*rv.value, v1);
-        assert_eq!(rv.version.writer, w1);
-    }
-
-    /// Regression: a timed-out parallel-locking attempt leaves a transaction
-    /// holding a *subset* of the locks it needs, possibly in the wrong order.
-    /// Serial validation breaks the resulting deadlock only if it releases and
-    /// re-acquires everything in sorted order, which it gates on
-    /// `already_locked`. The guard must therefore report a partial set as *not*
-    /// already locked; otherwise two equal-priority transactions (a tie
-    /// wound-wait cannot order) keep their cross-held locks and wait on each
-    /// other forever — the livelock a fuzz run surfaced.
-    #[tokio::test]
-    async fn already_locked_requires_every_needed_lock() {
-        let (tm, tctx) = new_algo().await;
-        let k1 = paths::from_key(TEST_COLL, b"k1");
-        let k2 = paths::from_key(TEST_COLL, b"k2");
-
-        // Create both keys committed and unlocked on a separate client.
-        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let setup = commit_writes(&tm2, vec![wa(&k1, b"0"), wa(&k2, b"0")]).await;
-        flush_writes(&tm2, &setup).await;
-
-        // A transaction that writes both keys needs a write lock on each.
-        let h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&k1, b"1"), wa(&k2, b"1")],
-        });
-        tctx.tmon.begin_tx(h.id());
-        let vstate = init_validation(&h);
-
-        // Holding only one of the two needed locks is a partial set.
-        tctx.locker.lock_write(&k1, h.id()).await.unwrap();
-        assert!(
-            !tm.already_locked(&vstate, &h),
-            "a partial lock set must not count as already locked"
-        );
-
-        // With every needed lock held, the serial re-lock is a no-op.
-        tctx.locker.lock_write(&k2, h.id()).await.unwrap();
-        assert!(
-            tm.already_locked(&vstate, &h),
-            "holding every needed lock should count as already locked"
-        );
-    }
-
-    #[tokio::test]
-    async fn change_writes_clean_abort() {
-        let (tm, tctx) = new_algo().await;
-        let keys = [
-            paths::from_key(TEST_COLL, b"k1"),
-            paths::from_key(TEST_COLL, b"k2"),
-            paths::from_key(TEST_COLL, b"k3"),
-        ];
-
-        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let h = commit_writes(
-            &tm2,
-            vec![wa(&keys[0], b"0"), wa(&keys[1], b"0"), wa(&keys[2], b"0")],
-        )
-        .await;
-        flush_writes(&tm2, &h).await;
-
-        let reads = do_reads(&tctx, &[&keys[0], &keys[1]]).await;
-        commit_writes(&tm2, vec![wa(&keys[0], b"x")]).await;
-
-        let mut h = tm.begin(Data {
-            reads,
-            writes: vec![wa(&keys[0], b"1"), wa(&keys[1], b"1")],
-        });
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-
-        let reads = do_reads(&tctx, &[&keys[1], &keys[2]]).await;
-        commit_writes(&tm2, vec![wa(&keys[2], b"y")]).await;
-
-        tm.reset(
-            &mut h,
-            Data {
-                reads,
-                writes: vec![wa(&keys[0], b"1")],
-            },
-        );
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-
         tm.end(&mut h).await.unwrap();
 
-        // The keys should be lockable now.
-        let txtest = TxId::new_random();
-        tctx.tmon.begin_tx(&txtest);
-        for key in &keys {
-            tctx.locker.lock_write(key, &txtest).await.unwrap();
-            tctx.locker.unlock(key, &txtest).await.unwrap();
-        }
-        tctx.tmon.abort_tx(&txtest).await.unwrap();
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert!(e.deleted);
+        let r = do_read(&tctx, &keyp).await;
+        assert!(r.version.is_none());
     }
 
     #[tokio::test]
-    async fn clean_abort() {
-        for num_writes in 1..=3 {
-            let (tm, tctx) = new_algo().await;
-            let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-
-            let keys: Vec<String> = (0..num_writes)
-                .map(|i| paths::from_key(TEST_COLL, format!("k{i}").as_bytes()))
-                .collect();
-
-            let writes: Vec<WriteAccess> = keys.iter().map(|k| wa(k, b"0")).collect();
-            let h = commit_writes(&tm2, writes).await;
-            flush_writes(&tm2, &h).await;
-
-            let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-            let reads = do_reads(&tctx, &key_refs).await;
-
-            // Change the last value from another algo.
-            commit_writes(&tm2, vec![wa(&keys[num_writes - 1], b"x")]).await;
-
-            let writes: Vec<WriteAccess> = keys.iter().map(|k| wa(k, b"1")).collect();
-            let mut h = tm.begin(Data { reads, writes });
-            let err = tm.commit(&mut h).await.unwrap_err();
-            assert!(
-                matches!(err, TransError::Retry),
-                "[{num_writes}] expected retry, got {err:?}"
-            );
-
-            tm.end(&mut h).await.unwrap();
-
-            // The keys should be lockable now.
-            let txtest = TxId::new_random();
-            tctx.tmon.begin_tx(&txtest);
-            for key in &keys {
-                tctx.locker.lock_write(key, &txtest).await.unwrap();
-                tctx.locker.unlock(key, &txtest).await.unwrap();
-            }
-            tctx.tmon.abort_tx(&txtest).await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn readonly_from_uncommitted() {
+    async fn multi_key_commit() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-        let val = b"v";
-
-        let wh = commit_writes(&tm, vec![wa(&keyp, b"xxx")]).await;
-        flush_writes(&tm, &wh).await;
-
-        let ra1 = do_read(&tctx, &keyp).await;
-
-        let wh = commit_writes(&tm, vec![wa(&keyp, val)]).await;
-        flush_writes(&tm, &wh).await;
-
-        // A transaction tries to update from a stale read; it fails and leaves
-        // the item locked in write.
-        let mut h1 = tm.begin(Data {
-            reads: vec![ra1.clone()],
-            writes: vec![wa(&keyp, b"tmpw")],
-        });
-        let err = tm.commit(&mut h1).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-
-        let info = lock_info(&tctx, &keyp).await;
-        assert_eq!(info.typ, LockType::Write);
-        assert_eq!(info.locked_by[0], *h1.id());
-
-        // The read-only transition arrives with the old read and asks for retry.
-        let mut h2 = tm.begin(Data {
-            reads: vec![ra1],
-            writes: Vec::new(),
-        });
-        let err = tm.commit(&mut h2).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Retry),
-            "expected retry, got {err:?}"
-        );
-
-        let ra2 = do_read(&tctx, &keyp).await;
-        assert_eq!(ra2.version.as_ref().unwrap().last_writer, *wh.id());
-    }
-
-    /// Variant of [`new_algo_from_backend`] that wires a real [`Background`]
-    /// into the [`Algo`] so `async_cleanup` actually runs.
-    async fn new_algo_with_bg() -> (Algo, Tctx, Arc<Background>, Gc) {
-        let b = Arc::new(MemoryBackend::new());
-        let local = Local::new(1024);
-        let global = Global::new(b.clone(), local.clone());
-        let tlogger = TLogger::new(global.clone(), local.clone(), TEST_COLL);
-        let bg = Arc::new(Background::new());
-        let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::new(local.clone(), tlogger.clone(), bg_weak.clone());
-        let reader = Reader::new(
-            local.clone(),
-            global.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-        );
-        let locker = Locker::new(global.clone(), tmon.clone(), reader.clone());
-        let gc = Gc::new(bg_weak.clone(), tlogger.clone());
-
-        global
-            .write(
-                &paths::collection_info(TEST_COLL),
-                Arc::from(COLL_INFO),
-                Tags::new(),
-            )
-            .await
-            .unwrap();
-
-        let algo = Algo::new(
-            global.clone(),
-            local.clone(),
-            locker.clone(),
-            tmon.clone(),
-            gc.clone(),
-            Some(bg_weak),
-            reader,
-        );
-        (
-            algo,
-            Tctx {
-                backend: b,
-                global,
-                local,
-                tlogger,
-                tmon,
-                locker,
-            },
-            bg,
-            gc,
-        )
-    }
-
-    /// Yield-driven polling for background side effects. Yields between checks
-    /// so spawned tasks get a scheduler slice without consuming virtual time
-    /// (so it composes with `start_paused` tests that later advance the clock
-    /// via `tokio::time::sleep`).
-    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..10_000 {
-            if cond() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("timed out waiting for: {label}");
-    }
-
-    /// Happy path: after a normal commit, the spawned cleanup task releases
-    /// every lock the transaction held, both in the local cache and in
-    /// storage. We never call `unlock_all` ourselves.
-    #[tokio::test]
-    async fn async_cleanup_releases_locks() {
-        let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
         let k1 = paths::from_key(TEST_COLL, b"k1");
         let k2 = paths::from_key(TEST_COLL, b"k2");
 
@@ -2256,106 +1139,9 @@ mod tests {
             writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
         });
         tm.commit(&mut h).await.unwrap();
-        let tid = h.id().clone();
+        tm.end(&mut h).await.unwrap();
 
-        wait_for("async cleanup released the local lock set", || {
-            tctx.locker.locked_paths(&tid).is_empty()
-        })
-        .await;
-
-        for k in [&k1, &k2] {
-            let info = lock_info(&tctx, k).await;
-            assert_eq!(info.typ, LockType::None, "{k} still locked in storage");
-            assert_eq!(info.last_writer, tid);
-        }
-
-        drop(bg);
-    }
-
-    /// On success the cleanup schedules the transaction log for delayed GC.
-    /// We exercise the GC loop end-to-end: time auto-advances past the
-    /// cleanup interval and the log must be deleted from storage.
-    #[tokio::test(start_paused = true)]
-    async fn async_cleanup_schedules_tx_log_gc() {
-        let (tm, tctx, bg, gc) = new_algo_with_bg().await;
-        gc.start();
-        let k1 = paths::from_key(TEST_COLL, b"k1");
-
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&k1, b"v")],
-        });
-        tm.commit(&mut h).await.unwrap();
-        let tid = h.id().clone();
-
-        assert!(
-            tctx.tlogger.get(&tid).await.is_ok(),
-            "tx log must exist right after commit"
-        );
-
-        wait_for("async cleanup finished unlocking", || {
-            tctx.locker.locked_paths(&tid).is_empty()
-        })
-        .await;
-
-        // Two GC cleanup intervals plus slack: scheduling adds an item with
-        // `due = now + CLEANUP_INTERVAL`, and the loop drains items every
-        // `CLEANUP_INTERVAL`, so a single tick can miss it depending on
-        // ordering. Two ticks is always enough.
-        tokio::time::sleep(Duration::from_secs(180)).await;
-
-        let err = tctx.tlogger.get(&tid).await.unwrap_err();
-        assert!(
-            matches!(err, StorageError::NotFound),
-            "expected log deleted, got {err:?}"
-        );
-
-        drop(bg);
-    }
-
-    /// Best-effort guarantee: tearing down the `Background` while a cleanup is
-    /// still in flight must not hang. `Drop` aborts the cleanup synchronously;
-    /// the in-flight unlocks are dropped at their next `.await`.
-    #[tokio::test]
-    async fn async_cleanup_does_not_block_background_close() {
-        let (tm, _tctx, bg, _gc) = new_algo_with_bg().await;
-        let k1 = paths::from_key(TEST_COLL, b"k1");
-
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&k1, b"v")],
-        });
-        tm.commit(&mut h).await.unwrap();
-
-        // Dropping `bg` races the freshly-spawned cleanup task. `Drop` is
-        // synchronous and aborts every tracked handle; nothing can hang.
-        drop(bg);
-    }
-
-    /// `async_abort` is scheduled synchronously when a transaction's future is
-    /// dropped between `begin` and `end`: the tx log entry must end up marked
-    /// Aborted without the dropping caller awaiting anything. We `begin` a
-    /// transaction (skipping `commit` to leave it unfinalized) and verify the
-    /// stored status flips to `Aborted` after the background task runs.
-    #[tokio::test]
-    async fn async_abort_marks_tx_aborted() {
-        let (tm, tctx, bg, _gc) = new_algo_with_bg().await;
-        let h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&paths::from_key(TEST_COLL, b"k1"), b"v")],
-        });
-        let tid = h.id().clone();
-
-        tm.async_abort(&tid);
-
-        for _ in 0..10_000 {
-            let cs = tctx.tlogger.commit_status(&tid).await.unwrap();
-            if cs.status == glassdb_storage::TxCommitStatus::Aborted {
-                drop(bg);
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("async_abort never marked tx as Aborted");
+        assert!(entry(&tctx, b"k1").await.unwrap().exists());
+        assert!(entry(&tctx, b"k2").await.unwrap().exists());
     }
 }

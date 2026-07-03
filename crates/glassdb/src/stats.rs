@@ -6,6 +6,7 @@ use std::ops::Sub;
 use std::time::Duration;
 
 use glassdb_backend::BackendStats;
+use glassdb_trans::LockStats;
 
 /// Holds cumulative performance counters for a database.
 ///
@@ -24,16 +25,19 @@ pub struct Stats {
     /// Number of retried transactions.
     pub tx_retries: u64,
 
-    /// Number of metadata reads.
-    pub meta_reads: u64,
-    /// Number of metadata writes.
-    pub meta_writes: u64,
     /// Number of object reads.
     pub obj_reads: u64,
     /// Number of object writes.
     pub obj_writes: u64,
     /// Number of list calls.
     pub obj_lists: u64,
+
+    /// Number of lock-acquisition calls made by the distributed locker.
+    pub lock_calls: u64,
+    /// Number of lock acquisitions served without contention.
+    pub lock_hits: u64,
+    /// Number of inner CAS retries the locker performed under contention.
+    pub lock_retries: u64,
 }
 
 impl Stats {
@@ -43,19 +47,24 @@ impl Stats {
         self.tx_reads += other.tx_reads;
         self.tx_writes += other.tx_writes;
         self.tx_retries += other.tx_retries;
-        self.meta_reads += other.meta_reads;
-        self.meta_writes += other.meta_writes;
         self.obj_reads += other.obj_reads;
         self.obj_writes += other.obj_writes;
         self.obj_lists += other.obj_lists;
+        self.lock_calls += other.lock_calls;
+        self.lock_hits += other.lock_hits;
+        self.lock_retries += other.lock_retries;
     }
 
     pub(crate) fn add_backend(&mut self, b: &BackendStats) {
-        self.meta_reads += b.meta_reads;
-        self.meta_writes += b.meta_writes;
         self.obj_reads += b.obj_reads;
         self.obj_writes += b.obj_writes;
         self.obj_lists += b.obj_lists;
+    }
+
+    pub(crate) fn add_lock(&mut self, l: &LockStats) {
+        self.lock_calls += l.calls as u64;
+        self.lock_hits += l.hits as u64;
+        self.lock_retries += l.retries as u64;
     }
 }
 
@@ -69,11 +78,12 @@ impl Sub for Stats {
             tx_reads: self.tx_reads.saturating_sub(other.tx_reads),
             tx_writes: self.tx_writes.saturating_sub(other.tx_writes),
             tx_retries: self.tx_retries.saturating_sub(other.tx_retries),
-            meta_reads: self.meta_reads.saturating_sub(other.meta_reads),
-            meta_writes: self.meta_writes.saturating_sub(other.meta_writes),
             obj_reads: self.obj_reads.saturating_sub(other.obj_reads),
             obj_writes: self.obj_writes.saturating_sub(other.obj_writes),
             obj_lists: self.obj_lists.saturating_sub(other.obj_lists),
+            lock_calls: self.lock_calls.saturating_sub(other.lock_calls),
+            lock_hits: self.lock_hits.saturating_sub(other.lock_hits),
+            lock_retries: self.lock_retries.saturating_sub(other.lock_retries),
         }
     }
 }

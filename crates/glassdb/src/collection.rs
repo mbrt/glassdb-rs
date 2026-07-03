@@ -3,16 +3,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_backend::Tags;
+use glassdb_backend::Backend;
 use glassdb_data::paths;
-use glassdb_storage::StorageError;
-use glassdb_trans::Reader;
+use glassdb_data::shard::SHARD_COUNT;
+use glassdb_storage::CollectionRoot;
+use glassdb_trans::{Reader, Resolver};
 
 use crate::db::DbInner;
 use crate::error::Error;
 use crate::iter::{CollectionsIter, KeysIter};
-
-const COLL_INFO_CONTENTS: &[u8] = b"__collection__";
 
 /// A named group of key-value pairs within a database.
 #[derive(Clone)]
@@ -50,8 +49,8 @@ impl Collection {
     pub async fn read_stale(&self, key: &[u8], max_staleness: Duration) -> Result<Vec<u8>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
-            self.db.local.clone(),
-            self.db.global.clone(),
+            self.db.values.clone(),
+            self.db.shards.clone(),
             self.db.tmon.clone(),
             self.db.retry,
         );
@@ -104,50 +103,64 @@ impl Collection {
     }
 
     /// Ensures the collection exists in the backend, creating it if necessary.
+    ///
+    /// Existence is the presence of the collection root object `_i`
+    /// ([`CollectionRoot`], ADR-018). The create is an idempotent create-if-absent:
+    /// a concurrent creator (another `create`, or the membership-lock auto-create
+    /// on the first key write) that won the race is treated as success.
     pub async fn create(&self) -> Result<(), Error> {
-        let p = paths::collection_info(&self.prefix);
-        // The existence probe is a pure read, so an outage is retry-safe
-        // `Unavailable`. The conditional create below is a mutation, so it keeps
-        // the conservative `Unavailable -> InDoubt` mapping of `From`.
-        match self.db.global.get_metadata(&p).await {
-            Ok(_) => return Ok(()),
-            Err(StorageError::NotFound) => {}
-            Err(e) => return Err(Error::from_read(e)),
-        }
-        match self
-            .db
-            .global
-            .write_if_not_exists(&p, Arc::from(COLL_INFO_CONTENTS), Tags::new())
+        let root = CollectionRoot::new(SHARD_COUNT);
+        self.db
+            .shards
+            .create_root_if_absent(&self.prefix, &root)
             .await
-        {
-            Ok(_) => Ok(()),
-            // Created concurrently; assume it's there.
-            Err(StorageError::Precondition) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+            .map_err(Error::from)
     }
 
     /// Returns an iterator over the keys in the collection.
+    ///
+    /// Keys live in the collection's shard objects (the v2 key directory,
+    /// ADR-017), not in per-key objects. A single `list` of the shard prefix
+    /// enumerates the populated shards; each is read and its live (committed,
+    /// non-tombstoned) entries are unioned, help-forwarding committed holders so
+    /// a just-committed key lists before its (asynchronous) write-back publishes
+    /// the `current_writer` pointer. The result is sorted for a stable listing.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
-        let keys_prefix = paths::keys_prefix(&self.prefix);
-        let items = self
+        let shard_paths = self
             .db
-            .global
-            .list(&keys_prefix)
+            .backend
+            .list(&paths::shards_prefix(&self.prefix))
+            .await
+            .map_err(|e| Error::from_read(e.into()))?;
+        let mut indices = Vec::with_capacity(shard_paths.len());
+        for sp in shard_paths {
+            indices.push(
+                paths::shard_index_of(&sp)
+                    .map_err(|e| Error::with_source(format!("parsing shard path {sp:?}"), e))?,
+            );
+        }
+        let resolver = Resolver::new(self.db.shards.clone(), self.db.tmon.clone());
+        let mut keys = resolver
+            .live_keys(&self.prefix, &indices)
             .await
             .map_err(Error::from_read)?;
-        Ok(KeysIter::new(items))
+        keys.sort();
+        Ok(KeysIter::new(keys))
     }
 
     /// Returns an iterator over the sub-collections in this collection.
+    ///
+    /// A sub-collection nests its own objects under `{prefix}/_c/<name>/…`, so a
+    /// single delimited `list` of the `_c/` prefix yields exactly the immediate
+    /// sub-collection directory names.
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
         let cprefix = paths::collections_prefix(&self.prefix);
         let items = self
             .db
-            .global
+            .backend
             .list(&cprefix)
             .await
-            .map_err(Error::from_read)?;
+            .map_err(|e| Error::from_read(e.into()))?;
         Ok(CollectionsIter::new(items))
     }
 }

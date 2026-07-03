@@ -1,24 +1,29 @@
-//! Storage and caching layers. Ported from the Go `internal/storage` and
-//! `internal/cache` packages: a byte-weighted LRU cache, version tracking, a
-//! staleness-aware local cache, read/write-through global storage, lock-state
-//! encoding with the pure lock-transition logic, and transaction-log
-//! persistence.
+//! Storage and caching layers: a byte-weighted LRU cache shared by two facades
+//! — a writer-keyed [`ValueCache`] for user values and a backend-version-keyed,
+//! read/write-through [`ObjectCache`] for coordination objects — plus the shard
+//! / root coordination store and transaction-log persistence.
 
 pub mod cache;
+mod entry;
 mod error;
-mod global;
-mod local;
-mod locker;
+mod lock;
+mod object_cache;
+mod root;
+mod shard;
+mod shardstore;
 mod tlogger;
+pub mod txobject;
+mod value_cache;
 mod version;
 
 pub use cache::{Cache, Weighable};
+pub use entry::SharedCache;
 pub use error::StorageError;
-pub use global::{Global, GlobalRead};
-pub use local::{Local, LocalMetadata, LocalRead, MAX_STALENESS};
-pub use locker::{
-    LockInfo, LockOps, LockRequest, LockType, LockUpdate, Locker, TValue, TxPathState,
-    compute_lock_update, last_writer_from_tags, tags_lock_info,
-};
-pub use tlogger::{PathLock, TLogger, TxCommitStatus, TxLog, TxStatus, TxWrite};
-pub use version::{Version, version_from_meta};
+pub use lock::LockType;
+pub use object_cache::{ObjectCache, ObjectRead};
+pub use root::CollectionRoot;
+pub use shard::{Shard, ShardEntry};
+pub use shardstore::{LoadedShard, ShardStore};
+pub use tlogger::{PathLock, TLogger, TValue, TxCommitStatus, TxLog, TxStatus, TxWrite};
+pub use value_cache::{MAX_STALENESS, ValueCache, ValueRead};
+pub use version::Version;

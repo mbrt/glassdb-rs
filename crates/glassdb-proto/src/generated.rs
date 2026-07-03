@@ -124,3 +124,60 @@ pub mod lock {
         }
     }
 }
+/// A shard object: the coordination directory (lock table, MVCC current-writer
+/// index, and key directory) for the keys that map to it. See ADR-017.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Shard {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<ShardEntry>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShardEntry {
+    /// Raw user key bytes; also the entry's sort key.
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    /// Lock currently held on the key.
+    #[prost(enumeration = "lock::LockType", tag = "2")]
+    pub lock_type: i32,
+    /// Transactions holding the lock (more than one only for read locks).
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Transaction object holding the committed value (the MVCC pointer); empty
+    /// if the key has no committed value yet.
+    #[prost(bytes = "vec", tag = "4")]
+    pub current_writer: ::prost::alloc::vec::Vec<u8>,
+    /// Tombstone flag.
+    #[prost(bool, tag = "5")]
+    pub deleted: bool,
+}
+/// Database-level metadata, written once at `{name}/glassdb` when a database is
+/// first opened. Its presence marks the database as initialized; `version` gates
+/// on-disk format compatibility. A message (not a bare string) so new metadata
+/// fields can be added without breaking existing databases.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatabaseMetadata {
+    /// On-disk format version identifier (e.g. "v2").
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+}
+/// The collection root object: collection existence, the (constant) shard count,
+/// the subcollection directory, and the membership lock that serializes
+/// create/delete against listing. See ADR-018.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CollectionRoot {
+    /// The shard count C this collection was created with. Part of the on-disk
+    /// format; validated against the compile-time SHARD_COUNT on open.
+    #[prost(uint32, tag = "1")]
+    pub shard_count: u32,
+    /// Child collection names (raw bytes), the subcollection directory; sorted so
+    /// the encoding is canonical.
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub subcollections: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Membership lock serializing create/delete (write) against listing (read).
+    #[prost(enumeration = "lock::LockType", tag = "3")]
+    pub membership_lock: i32,
+    /// Transactions holding the membership lock (more than one only for read
+    /// locks); sorted so the encoding is canonical.
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub membership_locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
