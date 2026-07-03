@@ -9,14 +9,19 @@
 //! re-resolves each read's effective writer against the shards and commits if
 //! none changed, taking no locks.
 //!
-//! Concurrency control (ADR-002 / ADR-020 / ADR-021): strict two-phase locking
-//! with wound-wait and leases for crash recovery. On a conflict it cannot win a
-//! transaction **aborts and retries with its priority preserved**
-//! ([`TxId::renew`]) rather than blocking while holding locks, so it cannot
-//! deadlock. Lock acquisition has two modes: the default **parallel** path locks
-//! every shard concurrently; after [`SERIAL_FALLBACK_AFTER`] failed attempts a
-//! transaction escalates to the **serial** sorted-locking fallback that breaks
-//! the equal-priority livelock (one contender always wins the lowest shard).
+//! Concurrency control (ADR-002 / ADR-020 / ADR-021 / ADR-024): strict two-phase
+//! locking with wound-wait and leases for crash recovery. On a conflict it cannot
+//! win, a younger-or-equal transaction **waits while holding its locks**
+//! (hold-and-wait, ADR-024) instead of aborting; an older one wounds the holder
+//! and proceeds. Distinct priorities cannot deadlock (wound-wait keeps the
+//! wait-for graph acyclic); two equal-priority transactions that would cycle are
+//! broken by escalating to the serial order. Lock acquisition has two modes: the
+//! default **parallel** path locks every shard concurrently; after a
+//! [`MAX_DEADLOCK_TIMEOUT`] wait or [`SERIAL_FALLBACK_AFTER`] failed attempts a
+//! transaction releases its locks and re-acquires them under the **serial**
+//! sorted order (same id, no body re-run), where first-CAS-wins on the lowest
+//! contended shard guarantees one contender makes progress. Only a genuine wound
+//! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;

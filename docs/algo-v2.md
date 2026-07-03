@@ -39,8 +39,9 @@ tags. No object tags anywhere.
   immutable transaction object (cacheable indefinitely). Read/write of an
   existing key needs no root lock; read-only stays lock-free.
 - **GC** — mark-sweep; live set = `current-writer ∪ locked-by` across shards.
-- **Backend trait** — `read / write / write_if / write_if_not_exists / delete /
-  list` (tags, nonce, `set_tags_if`, `read_if_modified`, `delete_if` all gone).
+- **Backend trait** — `read / read_if_modified / write / write_if /
+  write_if_not_exists / delete / list` (seven methods; tags, nonce, `set_tags_if`,
+  `get_metadata`, `delete_if` all gone).
 
 ## Decided
 
@@ -137,16 +138,18 @@ object (create-if-absent), so it can never resurrect itself over a wound; expiry
 combines an absolute (skew-padded) lease check with an observer-relative
 (no-skew) no-progress check.
 
-The engine deliberately defers:
-- **GC ([ADR-022](adr/022-garbage-collection-mark-sweep.md))** — synchronous
-  write-back; aborted/unreferenced transaction objects and empty shard entries
-  are never swept. A `locked_by` entry pointing at a *missing* object is given the
-  `handle_unknown_tx` grace (load-bearing under hold-and-wait,
-  [ADR-024](adr/024-hold-and-wait-conflict-resolution.md), since a live tx
-  materializes its pending object lazily); GC respects that grace and never
-  deletes a still-referenced or within-horizon object.
-- **Performance** — no cache, no batched/async write-back, no proactive lock
-  release on abort, a fresh pending object per attempt.
+**GC ([ADR-022](adr/022-garbage-collection-mark-sweep.md))** is implemented: a
+candidate-driven reverse mark-sweep whose live set is `current-writer ∪ locked-by`
+across shards plus `membership-locked-by` on roots, with the ADR-021 lease as the
+safety horizon. A `locked_by` entry pointing at a *missing* object is given the
+`handle_unknown_tx` grace (load-bearing under hold-and-wait,
+[ADR-024](adr/024-hold-and-wait-conflict-resolution.md), since a live tx
+materializes its pending object lazily); GC respects that grace and never deletes
+a still-referenced or within-horizon object.
+
+The MVP performance simplifications are also gone: the `ObjectCache` / `ValueCache`
+(ADR-023), asynchronous background write-back, and dedup-batched CAS on
+acquisition, release, and write-back (ADR-025/026) have all landed.
 
 The **cutover** is done: the DST oracles run on this engine, v1 is retired, and
 the `Backend` trait is slimmed (ADR-023).
@@ -212,8 +215,8 @@ Each design decision becomes its own ADR (next free number is 027).
   the engine (a live tx materializes its pending object lazily); GC merely respects
   that grace (ADR-022).
 - **[ADR-022](adr/022-garbage-collection-mark-sweep.md) — Garbage collection by
-  mark-sweep.** ✅ Written (design); implementation still deferred (the `Gc` is
-  inert). Liveness = reachability: live set = `current-writer ∪ locked-by` across
+  mark-sweep.** ✅ Written & implemented. Liveness = reachability: live set =
+  `current-writer ∪ locked-by` across
   shards plus `membership-locked-by` on roots, with the ADR-021 lease as the
   safety horizon (a recent pending object found unreferenced is kept — its lock may
   post-date the check, and under ADR-024 the object is materialized lazily after its

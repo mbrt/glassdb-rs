@@ -106,9 +106,11 @@ tokens observed at read time, and staged writes — while the `Locker` decides
 objects and the parallel/serial CAS. (`Reader` is likewise shard-aware
 internally but exposes a path-based API.)
 
-> The v2 shard / content-CAS model shown here supersedes the tag-based
-> description in the older *Distributed Locks* and *Single read-modify-write*
-> sections further below, which are pending a refresh.
+> The v2 shard / content-CAS model shown here is authoritative. The *Single
+> read-modify-write* optimization described further below is **not yet
+> implemented** in v2 (its fast path is deferred; see
+> [algo-v2.md](algo-v2.md)) — every read-write transaction currently runs the
+> full locked commit path.
 
 ```
                          glassdb  (public API)
@@ -160,7 +162,7 @@ per-shard read-modify-write CAS — lives below the locker boundary.
 | `Locker`              | lock **mechanism** | `Data`, `TxId`, shard objects | key→shard grouping, parallel & serial acquisition, wound-wait, write-back, release             | retry *policy*, **read validation** (reports `Conflict` only) |
 | `Reader`              | read mechanism   | paths                        | effective-writer resolution, snapshot reads                                                                           | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
-| `Gc`                  | maintenance      | `TxId`                       | scheduled tx-log cleanup                                                                                              | shards, commit policy               |
+| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged `_t/` walk, update shards                           | commit policy                       |
 
 ### The lock boundary
 
@@ -396,19 +398,24 @@ When transactions _do_ conflict:
 
 ### Distributed Locks
 
-Lock state is stored in the **object metadata tags** of each key
-(`glassdb-storage/src/locker.rs`):
+Lock state lives in the **content** of the shard objects (`_s/<i>`), not in object
+tags. Each shard holds a directory of per-key entries; a locked key's entry
+records its lock type, the set of holding transactions, and the current writer
+(`glassdb-storage/src/shard.rs`, `lock.rs`):
 
-| Tag           | Values                          | Purpose                                       |
-| ------------- | ------------------------------- | --------------------------------------------- |
-| `lock-type`   | `r`, `w`, `c`, `-`              | Current lock type (read, write, create, none) |
-| `locked-by`   | base64 tx IDs (comma-separated) | Which transactions hold the lock              |
-| `last-writer` | base64 tx ID                    | Transaction that last wrote this key          |
+| Field            | Values             | Purpose                                        |
+| ---------------- | ------------------ | ---------------------------------------------- |
+| `lock-type`      | `r`, `w`, `c`, `-` | Current lock type (read, write, create, none)  |
+| `locked-by`      | tx IDs             | Which transactions hold the lock               |
+| `current-writer` | tx ID              | Transaction that last wrote this key           |
 
-Lock acquisition is a compare-and-swap on the metadata: read the current tags
-and version, compute the new lock state, and conditionally write the updated tags
-using `set_tags_if`. If the version changed (another transaction modified the
-tags), the operation retries.
+Lock acquisition is a compare-and-swap on the shard *object*: read the current
+shard and its version, compute the new lock state for every requested key that
+maps to it, and conditionally rewrite the shard with `write_if` (the
+version/ETag as the precondition). If the version changed (another transaction
+mutated the shard), the operation retries. Keys are grouped by shard so many
+keys collapse into a single GET + CAS (ADR-017/020), and contending transactions
+on the same shard are deduplicated into one owner-driven CAS (ADR-025/026).
 
 **Compatibility rules** (`LockType`: `None`, `Read`, `Write`, `Create`):
 
@@ -445,8 +452,8 @@ from a copy of `transaction.proto`) and contains:
 - **Status**: pending, committed, or aborted.
 - **Timestamp**: when the log was last updated.
 - **Writes**: list of (path, value, deleted, previous writer) entries (the
-  `oneof val_delete` layout is preserved byte-for-byte).
-- **Locks**: list of (path, lock type) entries.
+  `oneof val_delete` layout is preserved byte-for-byte). Committed values live
+  here; lock state lives in the shard objects, not in the log.
 
 The transaction log serves two critical purposes:
 
@@ -707,16 +714,26 @@ token for the conditional write that takes the lock.
 
 ## Garbage Collection
 
-Committed and aborted transaction logs are no longer needed once all their locks
-are released and values written back. The `Gc` component
-(`glassdb-trans/src/gc.rs`) handles cleanup:
+A transaction object is **live** exactly while some shard or root still
+references its txid (`current-writer`, `locked-by`, or the root's
+`membership-locked-by`), so garbage collection is a reachability problem rather
+than a timer. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
+candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 
-- **Scheduled cleanup.** After a transaction completes, its log is queued for
-  deletion with a 1-minute delay (`CLEANUP_INTERVAL`). The delay ensures
-  in-flight readers can still inspect the log.
-- **Bounded queue.** The cleanup queue holds at most 1024 items
-  (`SIZE_LIMIT`). If the queue is full, further items are dropped (they'll be
-  cleaned up eventually by future transactions or restarts).
-- **Background execution.** Cleanup runs asynchronously on the `Background` task
-  manager and does not block transaction processing. Background loops are torn
+- **Reverse liveness check.** A forward mark (list every shard, union the
+  referenced txids) would cost the whole database per cycle. Instead each
+  candidate `_t/` object records its own back-references (its `locks ∪ writes`),
+  so GC reads a batch of candidates and confirms each one dead by GET-ing only
+  the handful of shards/root it names — never a database-wide scan.
+- **Candidate feed.** Candidates come from the write-back hint queue (the
+  `current-writer` a fresh commit just superseded, capped at `HINT_QUEUE_CAP`)
+  and a paged walk of the flat `{db}/_t/` directory (`GC_LIST_PAGE` per cycle),
+  which makes the candidate set complete regardless of lost hints.
+- **Safety horizon.** The ADR-021 lease acts as the sweep horizon: a candidate
+  within the horizon is always kept, because the non-atomic reverse check can
+  race a lock a live transaction has taken but not yet published (ADR-024's lazy
+  object materialization). A dead *pending* object is first force-aborted
+  (`pending → aborted` CAS) so its death is durable before any lock moves.
+- **Background execution.** Sweeps run every `GC_INTERVAL` on the `Background`
+  task manager and do not block transaction processing. Background loops are torn
   down via `Drop` when the last `Database` clone is dropped.
