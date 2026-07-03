@@ -12,7 +12,8 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    MAX_STALENESS, StorageError, TLogger, TValue, TxCommitStatus, TxLog, ValueCache, Version,
+    MAX_STALENESS, PathLock, StorageError, TLogger, TValue, TxCommitStatus, TxLog, ValueCache,
+    Version,
 };
 use tokio::sync::oneshot;
 
@@ -64,6 +65,9 @@ struct TxStatusEntry {
     status: TxCommitStatus,
     last_version: backend::Version,
     refresh_state: RefreshState,
+    // The lock set this transaction holds, recorded by the engine once it has
+    // acquired its locks.
+    locks: Vec<PathLock>,
 }
 
 struct WaitRequest {
@@ -168,8 +172,20 @@ impl Monitor {
                 status: TxCommitStatus::Pending,
                 last_version: backend::Version::default(),
                 refresh_state: RefreshState::NotStarted,
+                locks: Vec::new(),
             },
         );
+    }
+
+    /// Records the lock set a transaction currently holds, so the refresher can
+    /// stamp it onto the pending transaction object (ADR-022). Overwrites any
+    /// previously recorded set with the latest acquire; a no-op if the
+    /// transaction is no longer tracked (already finalized).
+    pub(crate) fn record_tx_locks(&self, tid: &TxId, locks: Vec<PathLock>) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        if let Some(e) = st.local_tx.get_mut(tid) {
+            e.locks = locks;
+        }
     }
 
     /// Starts a background task that periodically refreshes the pending log so
@@ -736,6 +752,17 @@ impl Monitor {
             let start = self.inner.clock.now();
             let mut tl = TxLog::new(tid.clone(), TxCommitStatus::Pending);
             tl.timestamp = Some(start);
+            // Stamp the currently-held lock set (read synchronously before the
+            // write) so the materialized pending object records its own
+            // back-references for GC (ADR-022).
+            tl.locks = self
+                .shard_for(&tid)
+                .lock()
+                .unwrap()
+                .local_tx
+                .get(&tid)
+                .map(|e| e.locks.clone())
+                .unwrap_or_default();
 
             let r = if last_version.is_unset() {
                 // First materialization: create-if-absent so a pre-existing
@@ -945,6 +972,34 @@ mod tests {
         // A separate monitor should still see it as pending (not expired).
         let (mon2, _t2) = new_test_monitor_clock(b, Clock::anchored());
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
+
+        mon.abort_tx(&tx).await.unwrap();
+    }
+
+    // Regression (review 1.1 / ADR-022): the lazily-materialized pending object
+    // the refresher writes must carry the transaction's recorded lock set, so a
+    // dead pending transaction still describes its own back-references for GC to
+    // prune. Recording locks before the refresher fires must land on the object.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_records_locks() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let tx = TxId::from_bytes(b"tx1".to_vec());
+        let locks = vec![PathLock {
+            path: paths::from_key("example", b"k"),
+            typ: LockType::Write,
+        }];
+        mon.begin_tx(&tx);
+        mon.record_tx_locks(&tx, locks.clone());
+        mon.start_refresh_tx(&tx);
+
+        // Advance past the refresh interval so the refresher materializes the
+        // pending object.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+        let (tl, _) = t.tl.get(&tx).await.unwrap();
+        assert_eq!(tl.status, TxCommitStatus::Pending);
+        assert_eq!(tl.locks, locks);
 
         mon.abort_tx(&tx).await.unwrap();
     }

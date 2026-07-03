@@ -119,6 +119,41 @@ pub(crate) struct LockedTx {
     membership: BTreeSet<String>,
 }
 
+impl LockedTx {
+    /// The per-key and membership-root paths this transaction holds, as the
+    /// `PathLock` set GC records on the transaction object for its reverse
+    /// liveness check and lock pruning (ADR-022). Keys map to their `_k/` path,
+    /// membership prefixes to their collection-info path; GC ignores the lock
+    /// type, so it is only kept faithful for diagnostics.
+    pub(crate) fn locked_paths(&self) -> Vec<PathLock> {
+        let mut out = Vec::new();
+        for group in self.groups.values() {
+            for intent in &group.intents {
+                out.push(PathLock {
+                    path: intent.key_path.clone(),
+                    typ: lock_type(intent.desired),
+                });
+            }
+        }
+        for prefix in &self.membership {
+            out.push(PathLock {
+                path: paths::collection_info(prefix),
+                typ: LockType::Write,
+            });
+        }
+        out
+    }
+}
+
+/// The lock type a `Desired` intention installs, for the recorded `PathLock`
+/// set (a read lock for a key only read, a write lock for any mutation).
+fn lock_type(desired: Desired) -> LockType {
+    match desired {
+        Desired::Read => LockType::Read,
+        Desired::Put | Desired::Delete => LockType::Write,
+    }
+}
+
 /// Groups a transaction's accessed keys by shard. Each key gets one intent
 /// carrying the lock to install: a write/create/delete for a written key, a
 /// read lock for a key only read. Optimistic read validation is the engine's

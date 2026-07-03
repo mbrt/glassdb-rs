@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::TxId;
-use glassdb_storage::{TxCommitStatus, TxLog, TxWrite, ValueCache, Version};
+use glassdb_storage::{PathLock, TxCommitStatus, TxLog, TxWrite, ValueCache, Version};
 
 use crate::error::TransError;
 use crate::gc::Gc;
@@ -283,6 +283,15 @@ impl Algo {
             Acquired::Wounded => return self.restart(tx).await,
         };
 
+        // Record the held lock set so both the committed object (below) and the
+        // refresher's pending object describe their own back-references, which
+        // is what lets GC prune this transaction's locks by reverse check
+        // (ADR-022). This tracks the latest acquire; a `revalidate` re-run that
+        // drops keys may under-record, which only defers those stale locks to
+        // lazy reclaim, never a correctness loss.
+        let locks = locked.locked_paths();
+        self.mon.record_tx_locks(&tx.id, locks.clone());
+
         // Optimistic read validation (ADR-024): now that every touched key is
         // locked, its value is frozen, so re-resolve each read's effective
         // writer and check it still matches what the body observed. A read that
@@ -294,7 +303,7 @@ impl Algo {
         }
 
         // Commit point: create-or-flip the transaction object to committed.
-        if let Err(e) = self.commit_writes(&tx.data.writes, &tx.id).await {
+        if let Err(e) = self.commit_writes(&tx.data.writes, locks, &tx.id).await {
             if matches!(e, TransError::AlreadyFinalized) {
                 // The log was finalized as `aborted` out from under us: a wound
                 // landed between locking and commit.
@@ -525,8 +534,16 @@ impl Algo {
     }
 
     /// Builds and writes the committed transaction object (the commit point).
-    async fn commit_writes(&self, writes: &[WriteAccess], id: &TxId) -> Result<(), TransError> {
+    /// Records `locks` (the held lock set) alongside `writes` so the object
+    /// carries its full back-reference set for GC's reverse check (ADR-022).
+    async fn commit_writes(
+        &self,
+        writes: &[WriteAccess],
+        locks: Vec<PathLock>,
+        id: &TxId,
+    ) -> Result<(), TransError> {
         let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        tl.locks = locks;
         for w in writes {
             let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
                 WriteOp::Put(value) => (value.clone(), false),
@@ -724,6 +741,47 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current_writer, Some(tid));
         assert!(e.locked_by.is_empty());
+    }
+
+    // Regression (review 1.1 / ADR-022): the committed transaction object must
+    // record its full lock set, not just its writes, so GC's reverse liveness
+    // check and lock pruning operate on real logs. A transaction that reads one
+    // key and creates another records: a read lock on the read key, a write lock
+    // on the created key, and the collection membership (root) lock.
+    #[tokio::test]
+    async fn commit_records_locks() {
+        let (tm, tctx) = new_algo().await;
+        let readp = paths::from_key(TEST_COLL, b"r");
+        let writep = paths::from_key(TEST_COLL, b"w");
+
+        // Seed the read key so it resolves to a committed value.
+        commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
+
+        let r = do_read(&tctx, &readp).await;
+        let mut h = tm.begin(Data {
+            reads: vec![r],
+            writes: vec![wa(&writep, b"v")],
+        });
+        tm.commit(&mut h).await.unwrap();
+        let tid = h.id().clone();
+        tm.end(&mut h).await.unwrap();
+
+        let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
+        let locked: std::collections::BTreeSet<&str> =
+            txlog.locks.iter().map(|l| l.path.as_str()).collect();
+        let root = paths::collection_info(TEST_COLL);
+        assert!(
+            locked.contains(readp.as_str()),
+            "read lock recorded: {locked:?}"
+        );
+        assert!(
+            locked.contains(writep.as_str()),
+            "write lock recorded: {locked:?}"
+        );
+        assert!(
+            locked.contains(root.as_str()),
+            "membership root lock recorded: {locked:?}"
+        );
     }
 
     #[tokio::test]
