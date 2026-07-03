@@ -289,5 +289,5 @@ details.
 
 See [architecture.md](docs/architecture.md) for the design decisions behind the
 implementation (concurrency model, time/determinism, error handling, and
-encoding fidelity), and [PORTING.md](PORTING.md) for the Go porting related
-tradeoffs.
+encoding fidelity), and [porting-go.md](docs/porting-go.md) for the (historical)
+Go porting related tradeoffs.

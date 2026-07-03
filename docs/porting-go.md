@@ -1,7 +1,13 @@
 # Porting GlassDB from Go to Rust
 
+> [!NOTE]
+> **Historical document — no longer maintained.** This records the original
+> port of GlassDB from Go to Rust and is kept for reference only. The v2 engine
+> is completely independent from the Go version; this document is frozen and
+> will not be updated to reflect subsequent changes.
+
 This document records the design decisions made while porting GlassDB from Go to
-Rust, and why. It complements the [README](README.md), which covers usage and
+Rust, and why. It complements the [README](../README.md), which covers usage and
 layout. The original implementation was written in Go; this repository is the
 standalone Rust port.
 
@@ -115,7 +121,7 @@ caller future:
   `Locker::close` → `Algo::close` → `Database::close`.
 
 This was one of the highest-risk pieces; its behavior tests and drop/cancel
-regression tests live in [`dedup.rs`](crates/glassdb-concurr/src/dedup.rs).
+regression tests live in [`dedup.rs`](../crates/glassdb-concurr/src/dedup.rs).
 
 ### Cancel-safety contract
 
@@ -210,7 +216,7 @@ the Go code:
   `Display`. The random prefix leads so transaction-log keys keep a
   high-entropy prefix (object stores partition by key prefix), while the
   timestamp suffix encodes the wound-wait priority (see
-  [ADR-002](docs/adr/002-wound-wait-locking.md)).
+  [ADR-002](adr/002-wound-wait-locking.md)).
 - **Transaction log protobuf**: `prost`-generated from a copy of
   `transaction.proto`, keeping identical field numbers and the `oneof val_delete`
   layout, so logs written by either implementation are mutually readable.
@@ -305,13 +311,13 @@ The latency, scheduler, and logger decorators wrap any `Backend`:
   `FuzzConcurrentTx` uses a byte-driven backend-delay scheduler. The Rust port
   goes further with a DST in which scheduling, time, and randomness are all
   functions of the input. The runtime started on `madsim`
-  ([ADR-008](docs/adr/008-deterministic-simulation-fuzzer.md)) but now runs on a
+  ([ADR-008](adr/008-deterministic-simulation-fuzzer.md)) but now runs on a
   minimal in-repo deterministic executor that controls task poll order via a
   pluggable scheduler — a **schedule-tape** (the libFuzzer-guidable primary) and
   **PCT** (seed-breadth) — with faults injected at the `Backend` trait
   (`FaultBackend`) rather than a simulated network: see
-  [ADR-011](docs/adr/011-guided-interleaving-executor.md) (and
-  [ADR-010](docs/adr/010-fuzzer-coverage-guidance.md) for why guidance needs a
+  [ADR-011](adr/011-guided-interleaving-executor.md) (and
+  [ADR-010](adr/010-fuzzer-coverage-guidance.md) for why guidance needs a
   tape). A `cargo-fuzz` target (`fuzz/`) turns libFuzzer bytes into
   `(seed, Workload, FaultConfig, schedule_tape, fault_tape)` — a second tape that
   makes the fault schedule coverage-guidable too — runs an N-client RMW mix on a
@@ -385,7 +391,7 @@ a **simulated** backend (in-memory + `DelayBackend`) and **real Amazon S3**.
   cloud SDKs, so it builds fast); backs the autoresearch loop and CI
   perf-regression checks (`make bench-score`):
   - `autoresearch` — the autoresearch scoring harness (single-client,
-    deterministic); see [`hack/autoresearch/`](hack/autoresearch).
+    deterministic); see [`hack/autoresearch/`](../hack/autoresearch).
 - **`hack/aws-bench/`** — the real-S3 harness: `cloudformation.yaml` (private
   VPC + SSM + S3 gateway endpoint), `deploy.sh` (now cross-compiles a static
   `x86_64-unknown-linux-musl` `rtbench` instead of a Go binary), `plot.py`, and
@@ -433,7 +439,7 @@ per-prefix request-rate ceiling (see [Middleware decorators](#middleware-decorat
 ### What was ported (`c1471c3`..`62dab6f`, autoresearch excluded)
 
 - ADR-007 lost-update fix in `validate_locked_read` / `validate_read_not_found`
-  ([docs/adr/007-single-rw-cache-lost-update.md](docs/adr/007-single-rw-cache-lost-update.md))
+  ([docs/adr/007-single-rw-cache-lost-update.md](adr/007-single-rw-cache-lost-update.md))
 - `single_rw_lost_update` regression test in `glassdb-trans`
 
 ### Determinism work (built Rust-native, see ADR-008 and ADR-011)

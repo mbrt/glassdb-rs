@@ -114,7 +114,7 @@ must beat.
 For each experiment:
 
 1. **Study & hypothesize.** Read the relevant code and the design docs
-   ([`PORTING.md`](../../PORTING.md) and the ADRs under
+   ([`architecture.md`](../../docs/architecture.md) and the ADRs under
    [`docs/adr/`](../../docs/adr)). Pick ONE coherent, well-motivated hypothesis.
    The change it implies may be **substantial and span multiple files** (e.g.
    reworking how locks or validation work); that is fine as long as it all
