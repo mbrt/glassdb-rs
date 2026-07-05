@@ -9,7 +9,16 @@ description = "Amazon S3 object-storage backend for GlassDB."
 [dependencies]
 async-trait = "0.1.89"
 aws-config = "1.8.17"
-aws-sdk-s3 = "1.134.0"
+# Drop the default `rustls` feature: it enables aws-smithy's legacy hyper-0.14 +
+# rustls-0.21 client, which drags in the vulnerable rustls-webpki 0.101.x
+# (RUSTSEC-2026-0104, unpatched on that line). The modern
+# `default-https-client` path (rustls-aws-lc) uses the patched rustls-webpki.
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-runtime-api = { version = "1.12.3", default-features = false, features = ["client"] }
 glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
