@@ -78,10 +78,7 @@ impl ShardStore {
     /// Routes `(key_path, payload)` items to their owning shards and loads those
     /// shards once each (concurrently), returning one entry per touched shard —
     /// its loaded `(Shard, version)` together with the raw keys and payloads that
-    /// landed in it, in deterministic shard order. The batched form the read and
-    /// GC paths use: they attach whatever per-key data they need to check, then
-    /// look each key up in its shard's single loaded copy. Key→shard routing
-    /// lives entirely in [`group_by_owning_shard`].
+    /// landed in it, in deterministic shard order.
     pub async fn load_by_keys<P: AsRef<str>, T>(
         &self,
         items: impl IntoIterator<Item = (P, T)>,
@@ -104,7 +101,7 @@ impl ShardStore {
     /// Loads the coordination entry for `key_path`, or `None` if the key has no
     /// entry yet. The singular counterpart to [`load_by_keys`]: it routes the one
     /// key to its owning shard and looks it up, so the caller never computes a
-    /// shard index. The read path uses this before resolving a single key.
+    /// shard index.
     pub async fn load_entry(&self, key_path: &str) -> Result<Option<ShardEntry>, StorageError> {
         let (prefix, raw_key) = paths::split_key(key_path)
             .map_err(|e| StorageError::with_source("parsing key path", e))?;
@@ -169,9 +166,7 @@ impl ShardStore {
     }
 
     /// Creates the collection root if absent, reporting whether this call won the
-    /// create (`true`) or found it already present (`false`). The membership lock
-    /// path uses this to learn whether it holds the lock it just installed, so it
-    /// can fall back to a reload-and-retry when it lost the create race.
+    /// create (`true`) or found it already present (`false`).
     pub async fn create_root(
         &self,
         prefix: &str,
