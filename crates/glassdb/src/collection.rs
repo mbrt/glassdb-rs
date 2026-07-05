@@ -112,8 +112,9 @@ impl Collection {
         let root = CollectionRoot::new(SHARD_COUNT);
         self.db
             .shards
-            .create_root_if_absent(&self.prefix, &root)
+            .create_root(&self.prefix, &root)
             .await
+            .map(|_| ())
             .map_err(Error::from)
     }
 

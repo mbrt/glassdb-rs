@@ -168,23 +168,6 @@ impl ShardStore {
         }
     }
 
-    /// Creates the collection root if absent, treating a lost create race as
-    /// success (ADR-018: existence == the root exists).
-    pub async fn create_root_if_absent(
-        &self,
-        prefix: &str,
-        root: &CollectionRoot,
-    ) -> Result<(), StorageError> {
-        match self
-            .objects
-            .write_if_not_exists(&paths::collection_info(prefix), Arc::from(root.encode()))
-            .await
-        {
-            Ok(_) | Err(StorageError::Precondition) => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Creates the collection root if absent, reporting whether this call won the
     /// create (`true`) or found it already present (`false`). The membership lock
     /// path uses this to learn whether it holds the lock it just installed, so it

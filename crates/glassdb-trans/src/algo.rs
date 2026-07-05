@@ -630,7 +630,7 @@ mod tests {
 
         // Create the collection root so membership locks have a home.
         shards
-            .create_root_if_absent(
+            .create_root(
                 TEST_COLL,
                 &CollectionRoot::new(glassdb_data::shard::SHARD_COUNT),
             )
