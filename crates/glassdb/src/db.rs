@@ -43,16 +43,6 @@ pub struct DatabaseBuilder {
 }
 
 impl DatabaseBuilder {
-    fn new(name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
-        DatabaseBuilder {
-            name: name.into(),
-            backend,
-            cache_size: DEFAULT_CACHE_SIZE,
-            deterministic_time: false,
-            retry: RetryConfig::default(),
-        }
-    }
-
     /// Sets the number of bytes dedicated to caching objects and metadata.
     /// Setting this too small may impact performance, as more backend calls are
     /// necessary.
@@ -170,6 +160,16 @@ impl DatabaseBuilder {
             background: bg,
         });
         Ok(Database { inner })
+    }
+
+    fn new(name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
+        DatabaseBuilder {
+            name: name.into(),
+            backend,
+            cache_size: DEFAULT_CACHE_SIZE,
+            deterministic_time: false,
+            retry: RetryConfig::default(),
+        }
     }
 }
 
@@ -349,11 +349,6 @@ impl DbInner {
         Collection::new(prefix, self.clone())
     }
 
-    fn update_stats(&self, s: &Stats) {
-        let mut stats = self.stats.lock().unwrap();
-        stats.add(s);
-    }
-
     pub(crate) async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
@@ -376,6 +371,11 @@ impl DbInner {
         stats.tx_time = begin.elapsed();
         self.update_stats(&stats);
         res
+    }
+
+    fn update_stats(&self, s: &Stats) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.add(s);
     }
 
     async fn tx_impl<T, F, Fut>(&self, mut f: F, stats: &mut Stats) -> Result<T, Error>

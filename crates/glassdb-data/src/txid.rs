@@ -114,18 +114,6 @@ impl TxId {
         self.priority() < other.priority()
     }
 
-    /// Returns the wound-wait priority (the big-endian UnixNano timestamp
-    /// suffix). Defensive on short IDs, which have no timestamp and thus the
-    /// highest priority (zero).
-    fn priority(&self) -> u64 {
-        if self.0.len() < TX_ID_LEN {
-            return 0;
-        }
-        let mut ts = [0u8; 8];
-        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..TX_ID_LEN]);
-        u64::from_be_bytes(ts)
-    }
-
     /// Wraps raw bytes as a transaction ID.
     pub fn from_bytes(b: impl Into<Vec<u8>>) -> Self {
         let v: Vec<u8> = b.into();
@@ -145,6 +133,18 @@ impl TxId {
     /// Reports whether the ID is unset.
     pub fn is_unset(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Returns the wound-wait priority (the big-endian UnixNano timestamp
+    /// suffix). Defensive on short IDs, which have no timestamp and thus the
+    /// highest priority (zero).
+    fn priority(&self) -> u64 {
+        if self.0.len() < TX_ID_LEN {
+            return 0;
+        }
+        let mut ts = [0u8; 8];
+        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..TX_ID_LEN]);
+        u64::from_be_bytes(ts)
     }
 }
 

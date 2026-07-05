@@ -252,6 +252,57 @@ impl Algo {
         self.commit_read_write(tx).await
     }
 
+    /// Validates the reads of a read-only transaction (the error-recovery path
+    /// in the db retry loop), returning [`TransError::Retry`] if any read was
+    /// invalidated. It holds no locks and does not back off before signalling
+    /// the retry.
+    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
+        if !tx.data.writes.is_empty() {
+            return Err(TransError::other(
+                "cannot validate only reads when writes are present",
+            ));
+        }
+        if self.validate_reads_inner(&tx.data).await? {
+            return Ok(());
+        }
+        self.invalidate_reads(&tx.data);
+        Err(TransError::Retry)
+    }
+
+    /// Replaces the transaction's data. Allowed before commit (the db retry loop
+    /// resets accesses between attempts).
+    pub fn reset(&self, tx: &mut Handle, data: Data) {
+        assert!(
+            tx.status != Status::Committed,
+            "cannot reset a committed transaction"
+        );
+        tx.data = data;
+    }
+
+    /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
+    /// by marking its transaction object aborted). A pure read-only transaction
+    /// never engaged, so there is nothing to abort.
+    pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
+        if tx.status == Status::Committed || !tx.engaged {
+            return Ok(());
+        }
+        self.mon.abort_tx(&tx.id).await
+    }
+
+    /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
+    /// future is dropped mid-flight so [`Algo::end`] never ran. Schedules a
+    /// spawned task and returns immediately; idempotent.
+    pub fn async_abort(&self, tx_id: &TxId) {
+        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let mon = self.mon.clone();
+        let tx_id = tx_id.clone();
+        bg.spawn_waited(async move {
+            let _ = mon.abort_tx(&tx_id).await;
+        });
+    }
+
     /// Read-only fast path: re-resolve each read's effective writer against the
     /// shards and commit if none changed. Takes no locks and writes nothing, so
     /// it never registers with the monitor.
@@ -456,23 +507,6 @@ impl Algo {
         )
     }
 
-    /// Validates the reads of a read-only transaction (the error-recovery path
-    /// in the db retry loop), returning [`TransError::Retry`] if any read was
-    /// invalidated. It holds no locks and does not back off before signalling
-    /// the retry.
-    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if !tx.data.writes.is_empty() {
-            return Err(TransError::other(
-                "cannot validate only reads when writes are present",
-            ));
-        }
-        if self.validate_reads_inner(&tx.data).await? {
-            return Ok(());
-        }
-        self.invalidate_reads(&tx.data);
-        Err(TransError::Retry)
-    }
-
     /// Re-resolves every read's effective writer and reports whether they all
     /// still match what the transaction observed (a consistent snapshot exists).
     /// The read set is resolved in one shard-batched pass (each touched shard is
@@ -490,40 +524,6 @@ impl Algo {
             }
         }
         Ok(true)
-    }
-
-    /// Replaces the transaction's data. Allowed before commit (the db retry loop
-    /// resets accesses between attempts).
-    pub fn reset(&self, tx: &mut Handle, data: Data) {
-        assert!(
-            tx.status != Status::Committed,
-            "cannot reset a committed transaction"
-        );
-        tx.data = data;
-    }
-
-    /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
-    /// by marking its transaction object aborted). A pure read-only transaction
-    /// never engaged, so there is nothing to abort.
-    pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::Committed || !tx.engaged {
-            return Ok(());
-        }
-        self.mon.abort_tx(&tx.id).await
-    }
-
-    /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
-    /// future is dropped mid-flight so [`Algo::end`] never ran. Schedules a
-    /// spawned task and returns immediately; idempotent.
-    pub fn async_abort(&self, tx_id: &TxId) {
-        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
-            return;
-        };
-        let mon = self.mon.clone();
-        let tx_id = tx_id.clone();
-        bg.spawn_waited(async move {
-            let _ = mon.abort_tx(&tx_id).await;
-        });
     }
 
     /// Invalidates the local cache entries for the transaction's found reads, so
@@ -630,7 +630,7 @@ mod tests {
 
         // Create the collection root so membership locks have a home.
         shards
-            .create_root_if_absent(
+            .create_root(
                 TEST_COLL,
                 &CollectionRoot::new(glassdb_data::shard::SHARD_COUNT),
             )

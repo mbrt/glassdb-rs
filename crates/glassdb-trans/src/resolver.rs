@@ -158,37 +158,6 @@ impl Resolver {
         Ok(resolved.token())
     }
 
-    /// Resolves `entry` against the transaction monitor: help-forward a committed
-    /// exclusive holder (one that committed but has not yet published its
-    /// `current_writer` pointer) and drop aborted/absent holders. `key_path` is
-    /// the full storage path of the key, used to fetch the help-forwarded
-    /// writer's value. A `None` entry resolves to "no value".
-    async fn resolve_entry(
-        &self,
-        key_path: &str,
-        entry: Option<&ShardEntry>,
-    ) -> Result<Resolved, TransError> {
-        let Some(e) = entry else {
-            return Ok(Resolved::default());
-        };
-
-        // A read-locked (non-exclusive) entry's holders never change the value,
-        // so skip the holder scan entirely — no monitor lookups for a key that
-        // only has shared readers.
-        if !matches!(e.lock_type, LockType::Write | LockType::Create) {
-            return Ok(Resolved {
-                writer: e.current_writer.clone(),
-                deleted: e.deleted,
-            });
-        }
-
-        let r = self.resolve_holders(key_path, e, None).await?;
-        Ok(Resolved {
-            writer: r.writer,
-            deleted: r.deleted,
-        })
-    }
-
     /// Interprets `entry`'s holders against transaction status — the step shared
     /// by read resolution and lock acquisition (the locker): help-forward a
     /// committed exclusive holder's value (one that committed but has not yet
@@ -232,6 +201,37 @@ impl Resolver {
             writer,
             deleted,
             pending,
+        })
+    }
+
+    /// Resolves `entry` against the transaction monitor: help-forward a committed
+    /// exclusive holder (one that committed but has not yet published its
+    /// `current_writer` pointer) and drop aborted/absent holders. `key_path` is
+    /// the full storage path of the key, used to fetch the help-forwarded
+    /// writer's value. A `None` entry resolves to "no value".
+    async fn resolve_entry(
+        &self,
+        key_path: &str,
+        entry: Option<&ShardEntry>,
+    ) -> Result<Resolved, TransError> {
+        let Some(e) = entry else {
+            return Ok(Resolved::default());
+        };
+
+        // A read-locked (non-exclusive) entry's holders never change the value,
+        // so skip the holder scan entirely — no monitor lookups for a key that
+        // only has shared readers.
+        if !matches!(e.lock_type, LockType::Write | LockType::Create) {
+            return Ok(Resolved {
+                writer: e.current_writer.clone(),
+                deleted: e.deleted,
+            });
+        }
+
+        let r = self.resolve_holders(key_path, e, None).await?;
+        Ok(Resolved {
+            writer: r.writer,
+            deleted: r.deleted,
         })
     }
 }
