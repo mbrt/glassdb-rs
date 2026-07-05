@@ -158,11 +158,6 @@ impl Monitor {
         }
     }
 
-    /// Returns the shard lock responsible for `tid`.
-    fn shard_for(&self, tid: &TxId) -> &Mutex<State> {
-        self.inner.shards.for_key(tid.as_bytes())
-    }
-
     /// Registers a new pending local transaction.
     pub(crate) fn begin_tx(&self, tid: &TxId) {
         let mut st = self.shard_for(tid).lock().unwrap();
@@ -304,19 +299,6 @@ impl Monitor {
         Ok(())
     }
 
-    /// Reflects a durable abort in the in-memory state when the wounded
-    /// transaction is local, so the victim and any waiters unwind promptly.
-    fn mark_local_aborted(&self, tid: &TxId, status: TxCommitStatus) {
-        if status != TxCommitStatus::Aborted {
-            return;
-        }
-        self.stop_tx_refresh(tid);
-
-        let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.remove(tid);
-        notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
-    }
-
     /// Returns the commit status, checking locally first then remote storage.
     pub(crate) async fn tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
         {
@@ -338,52 +320,6 @@ impl Monitor {
     ) -> impl std::future::Future<Output = TxCommitStatus> + Send + use<> {
         let rx = self.wait_for_tx_rx(tid);
         async move { rx.await.unwrap_or_default() }
-    }
-
-    fn wait_for_tx_rx(&self, tid: &TxId) -> oneshot::Receiver<TxCommitStatus> {
-        let (tx, rx) = oneshot::channel();
-
-        let mut st = self.shard_for(tid).lock().unwrap();
-        let entry = st.local_tx.get(tid);
-        let is_local = entry.is_some();
-        let status = entry.map(|e| e.status).unwrap_or(TxCommitStatus::Unknown);
-
-        // Matches Go precedence: (isLocal && OK) || Aborted.
-        if (is_local && status == TxCommitStatus::Ok) || status == TxCommitStatus::Aborted {
-            let _ = tx.send(status);
-            return rx;
-        }
-
-        if let Some(ws) = st.waiters.get_mut(tid) {
-            ws.push(WaitRequest { tx });
-            return rx;
-        }
-
-        if is_local {
-            // Local transition: no worker needed; we'll be notified by
-            // commit_tx/abort_tx.
-            st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
-            return rx;
-        }
-
-        // Remote transaction: spawn a poller. Waiter liveness is checked
-        // between polls so the poller exits promptly once every caller has
-        // dropped its `wait_for_tx` future.
-        st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
-        drop(st);
-
-        let m = self.clone();
-        let tid = tid.clone();
-        // Detached poller: it terminates either when the tx finalizes (final
-        // status or a fetch error) or when every caller has dropped its
-        // `wait_for_tx` future.
-        rt::spawn(async move {
-            let status = m.poll_tx_status_with_liveness(&tid).await;
-            let mut st = m.shard_for(&tid).lock().unwrap();
-            notify_waiters(&mut st, &tid, status);
-        });
-
-        rx
     }
 
     /// Returns the committed value a transaction wrote for `key`, reading from
@@ -439,6 +375,84 @@ impl Monitor {
                 ..Default::default()
             },
         })
+    }
+
+    /// Force-aborts a specific pending version of a transaction, the ADR-022 GC
+    /// reclaim of a dead pending object. It is the *same* official sequence a
+    /// contended lease expiry uses ([`Monitor::try_abort_remote_tx`]): CAS
+    /// `pending → aborted` over `expected`. If a live owner committed or
+    /// refreshed first the CAS loses and the now-durable status is reported
+    /// instead, so GC never drops a lock out from under a still-live owner.
+    pub(crate) async fn force_abort(
+        &self,
+        tid: &TxId,
+        expected: &backend::Version,
+    ) -> Result<TxCommitStatus, TransError> {
+        self.try_abort_remote_tx(tid, expected).await
+    }
+
+    /// Returns the shard lock responsible for `tid`.
+    fn shard_for(&self, tid: &TxId) -> &Mutex<State> {
+        self.inner.shards.for_key(tid.as_bytes())
+    }
+
+    /// Reflects a durable abort in the in-memory state when the wounded
+    /// transaction is local, so the victim and any waiters unwind promptly.
+    fn mark_local_aborted(&self, tid: &TxId, status: TxCommitStatus) {
+        if status != TxCommitStatus::Aborted {
+            return;
+        }
+        self.stop_tx_refresh(tid);
+
+        let mut st = self.shard_for(tid).lock().unwrap();
+        st.local_tx.remove(tid);
+        notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
+    }
+
+    fn wait_for_tx_rx(&self, tid: &TxId) -> oneshot::Receiver<TxCommitStatus> {
+        let (tx, rx) = oneshot::channel();
+
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let entry = st.local_tx.get(tid);
+        let is_local = entry.is_some();
+        let status = entry.map(|e| e.status).unwrap_or(TxCommitStatus::Unknown);
+
+        // Matches Go precedence: (isLocal && OK) || Aborted.
+        if (is_local && status == TxCommitStatus::Ok) || status == TxCommitStatus::Aborted {
+            let _ = tx.send(status);
+            return rx;
+        }
+
+        if let Some(ws) = st.waiters.get_mut(tid) {
+            ws.push(WaitRequest { tx });
+            return rx;
+        }
+
+        if is_local {
+            // Local transition: no worker needed; we'll be notified by
+            // commit_tx/abort_tx.
+            st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
+            return rx;
+        }
+
+        // Remote transaction: spawn a poller. Waiter liveness is checked
+        // between polls so the poller exits promptly once every caller has
+        // dropped its `wait_for_tx` future.
+        st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
+        drop(st);
+
+        let m = self.clone();
+        let tid = tid.clone();
+        // Detached poller: it terminates either when the tx finalizes (final
+        // status or a fetch error) or when every caller has dropped its
+        // `wait_for_tx` future.
+        rt::spawn(async move {
+            let status = m.poll_tx_status_with_liveness(&tid).await;
+            let mut st = m.shard_for(&tid).lock().unwrap();
+            notify_waiters(&mut st, &tid, status);
+        });
+
+        rx
     }
 
     async fn fetch_remote_tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
@@ -535,20 +549,6 @@ impl Monitor {
             return res;
         }
         Ok(TxCommitStatus::Pending)
-    }
-
-    /// Force-aborts a specific pending version of a transaction, the ADR-022 GC
-    /// reclaim of a dead pending object. It is the *same* official sequence a
-    /// contended lease expiry uses ([`Monitor::try_abort_remote_tx`]): CAS
-    /// `pending → aborted` over `expected`. If a live owner committed or
-    /// refreshed first the CAS loses and the now-durable status is reported
-    /// instead, so GC never drops a lock out from under a still-live owner.
-    pub(crate) async fn force_abort(
-        &self,
-        tid: &TxId,
-        expected: &backend::Version,
-    ) -> Result<TxCommitStatus, TransError> {
-        self.try_abort_remote_tx(tid, expected).await
     }
 
     async fn try_abort_remote_tx(

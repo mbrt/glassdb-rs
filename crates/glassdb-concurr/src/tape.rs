@@ -31,17 +31,6 @@ impl Tape {
         }
     }
 
-    /// The next byte: from the tape while it lasts, otherwise from the seeded RNG.
-    fn next_byte(&mut self) -> u8 {
-        match self.bytes.get(self.pos) {
-            Some(&b) => {
-                self.pos += 1;
-                b
-            }
-            None => (self.rng.next_u64() & 0xff) as u8,
-        }
-    }
-
     /// Returns true with probability `prob/256` (one byte per call). A `prob` of
     /// zero never fires.
     pub fn roll(&mut self, prob: u8) -> bool {
@@ -64,6 +53,17 @@ impl Tape {
             limit >>= 8;
         }
         acc % n
+    }
+
+    /// The next byte: from the tape while it lasts, otherwise from the seeded RNG.
+    fn next_byte(&mut self) -> u8 {
+        match self.bytes.get(self.pos) {
+            Some(&b) => {
+                self.pos += 1;
+                b
+            }
+            None => (self.rng.next_u64() & 0xff) as u8,
+        }
     }
 }
 

@@ -112,6 +112,15 @@ impl Bench {
         Ok(())
     }
 
+    /// Returns a snapshot of the collected results.
+    pub fn results(&self) -> Results {
+        let g = self.inner.lock().unwrap();
+        Results {
+            samples: g.samples.clone(),
+            tot_duration: g.tot_duration,
+        }
+    }
+
     /// Records one raw wall-clock latency sample, applying the time-scale
     /// compensation so the stored value is in the reported (simulated) domain.
     fn record_raw(&self, raw: Duration) {
@@ -120,15 +129,6 @@ impl Bench {
             .unwrap()
             .samples
             .push(raw.mul_f64(self.time_scale));
-    }
-
-    /// Returns a snapshot of the collected results.
-    pub fn results(&self) -> Results {
-        let g = self.inner.lock().unwrap();
-        Results {
-            samples: g.samples.clone(),
-            tot_duration: g.tot_duration,
-        }
     }
 }
 

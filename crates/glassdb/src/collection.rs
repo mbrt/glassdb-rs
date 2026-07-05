@@ -21,14 +21,6 @@ pub struct Collection {
 }
 
 impl Collection {
-    pub(crate) fn new(prefix: String, db: Arc<DbInner>) -> Self {
-        Collection { prefix, db }
-    }
-
-    pub(crate) fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
     /// Reads the value for `key` with strong (serializable) consistency.
     pub async fn read(&self, key: &[u8]) -> Result<Vec<u8>, Error> {
         let res: Option<Vec<u8>> = self
@@ -163,5 +155,13 @@ impl Collection {
             .await
             .map_err(|e| Error::from_read(e.into()))?;
         Ok(CollectionsIter::new(items))
+    }
+
+    pub(crate) fn new(prefix: String, db: Arc<DbInner>) -> Self {
+        Collection { prefix, db }
+    }
+
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
     }
 }

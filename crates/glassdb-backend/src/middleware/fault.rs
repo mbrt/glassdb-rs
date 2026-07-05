@@ -129,10 +129,6 @@ impl FaultBackend {
         self.active.store(on, Ordering::SeqCst);
     }
 
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
-    }
-
     /// Opens a sustained outage on this client's transport: every operation
     /// faults (on either side) until [`heal`](Self::heal).
     pub fn down(&self) {
@@ -142,6 +138,10 @@ impl FaultBackend {
     /// Heals a previously [downed](Self::down) transport.
     pub fn heal(&self) {
         self.down.store(false, Ordering::SeqCst);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// Runs `op` through the faulty transport: an optional delay, then either the
