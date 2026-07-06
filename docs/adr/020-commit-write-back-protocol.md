@@ -18,6 +18,13 @@ serial fallback, load-bearing lease refresh), implemented per
 notes below are retained for history but are **superseded by ADR-024**; see
 [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback).
 
+The **single read-write fast path** decision below (two sequential writes: the
+committed object then a `current_writer` pointer CAS, no lock, no write-back) is
+**superseded by [ADR-027](027-single-rw-parallel-lock-publish.md)**, which
+publishes a write lock instead of the pointer so the two writes issue in
+parallel, followed by an asynchronous write-back. The rest of this ADR is
+unchanged.
+
 ## Context
 
 [ADR-017](017-shard-object.md), [ADR-018](018-collection-root-membership.md), and
@@ -283,14 +290,18 @@ Every CAS site inherits [ADR-009](009-in-doubt-conditional-writes.md): an
   revalidating, mirroring v1. Multi-key snapshot consistency follows from every
   read still being current at validation; listing read-only uses the root-version
   OCC of ADR-018.
-- **Single read-write**: write the committed transaction object
-  (`write_if_not_exists`), then CAS the key's shard to set
+- **Single read-write** (_superseded by
+  [ADR-027](027-single-rw-parallel-lock-publish.md)_): write the committed
+  transaction object (`write_if_not_exists`), then CAS the key's shard to set
   `current_writer = txid` _only if_ the entry is unchanged and unlocked — two
   operations, no lease, no lock round-trips, no write-back. The shard CAS is the
   effective commit point; if it never lands, the orphan transaction object is
   unreferenced and GC'd. This is the v2 form of v1's logless fast path, and unlike
   v1 it leaves a discoverable committed object (so the [ADR-007](007-single-rw-cache-lost-update.md)
-  lost-update anomaly cannot recur).
+  lost-update anomaly cannot recur). ADR-027 keeps the discoverable committed
+  object but publishes a **write lock** instead of the pointer, so the object and
+  shard writes issue **in parallel**, and an asynchronous write-back converts the
+  lock to the pointer.
 
 ## Consequences
 

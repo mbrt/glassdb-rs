@@ -17,6 +17,13 @@
 //! but let the in-process request deduplication (ADR-025/026) batch across
 //! shapes; comparing the two topologies exposes how much that batching helps.
 //!
+//! Each cell uses **sequential (adaptive) sampling**: all shapes run
+//! concurrently until every shape has committed enough transactions for its
+//! throughput 95% confidence interval to reach `--target-ci` (or `--max-duration`
+//! caps the run). Heavily-contended write shapes therefore run longer to earn
+//! significance instead of returning a noisy fixed-window number, while cheap
+//! read shapes stop being the reason the cell keeps going once they are precise.
+//!
 //! ```text
 //! cargo run --release -p glassdb-bench-scale --bin mixbench
 //! cargo run --release -p glassdb-bench-scale --bin mixbench -- --modes hi --topologies per-shape --json
@@ -31,8 +38,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use futures::future::join_all;
@@ -46,7 +53,7 @@ use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
 use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
-use glassdb_bench_scale::bench::Bench;
+use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
 
 /// The shared collection every shape reads and writes, so all shapes contend on
 /// the same key pool.
@@ -70,9 +77,21 @@ fn key_bytes(i: usize) -> Vec<u8> {
 #[derive(Parser)]
 #[command(about = "Mixed-workload contention grid for glassdb")]
 struct Args {
-    /// Measured duration of each shape within a cell.
+    /// Minimum measured window per cell. The cell keeps running all shapes
+    /// concurrently past this until every shape's throughput estimate reaches
+    /// `--target-ci`, or `--max-duration` is hit.
     #[arg(long, default_value = "2s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
+    /// Upper bound on a cell's measured window: the cell stops here even if a
+    /// shape (typically a heavily-contended write shape) has not yet reached
+    /// `--target-ci`; such a shape's result is flagged not-converged.
+    #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
+    max_duration: Duration,
+    /// Target relative half-width of each shape's throughput 95% confidence
+    /// interval (`0.1` = +/-10%). The cell runs until every shape reaches it or
+    /// `--max-duration`. `0` disables adaptivity: run exactly `--duration`.
+    #[arg(long, default_value_t = 0.1)]
+    target_ci: f64,
     /// Total concurrent workers per shape (held constant across topologies: all
     /// on the one DB for `shared`, split evenly across the shape's K DBs for
     /// `per-shape`).
@@ -94,7 +113,7 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     hot_keys: usize,
     /// Simulated backend latency profile.
-    #[arg(long, default_value = "gcs", value_parser = ["gcs", "s3"])]
+    #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"])]
     delays: String,
     /// Compresses the simulated latencies/rate-limits by this factor (`1.0` =
     /// real-time; smaller runs faster). Must be > 0.
@@ -272,6 +291,12 @@ struct ShapeResult {
     tx_per_sec: f64,
     p50_ms: f64,
     p90_ms: f64,
+    /// Achieved relative half-width of the throughput 95% CI (`z/sqrt(committed)`,
+    /// Poisson approximation); smaller is tighter.
+    rel_ci: f64,
+    /// Whether `rel_ci` met the run's `--target-ci`. `false` means the cell hit
+    /// `--max-duration` first, so read this shape's throughput as indicative.
+    converged: bool,
     /// Present only in the `per-shape` topology (each DB hosts one shape).
     #[serde(skip_serializing_if = "Option::is_none")]
     ops: Option<OpsPerTx>,
@@ -334,9 +359,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Selects and scales the simulated-latency profile.
 fn delay_profile(args: &Args) -> DelayOptions {
     let mut d = match args.delays.as_str() {
-        "s3" => s3_delays(),
-        // clap's value_parser guarantees "gcs" otherwise.
-        _ => gcs_delays(),
+        "gcs" => gcs_delays(),
+        // clap's value_parser guarantees "s3" otherwise.
+        _ => s3_delays(),
     };
     d.scale = args.delay_scale;
     d
@@ -400,7 +425,7 @@ fn run_cell(
             for shape in SHAPES {
                 plans.push(ShapePlan {
                     shape,
-                    bench: Arc::new(Bench::with_time_scale(args.duration, time_scale)),
+                    bench: Arc::new(Bench::with_time_scale(args.max_duration, time_scale)),
                     slots: vec![(0, w)],
                 });
             }
@@ -415,7 +440,7 @@ fn run_cell(
                 }
                 plans.push(ShapePlan {
                     shape,
-                    bench: Arc::new(Bench::with_time_scale(args.duration, time_scale)),
+                    bench: Arc::new(Bench::with_time_scale(args.max_duration, time_scale)),
                     slots,
                 });
             }
@@ -429,13 +454,20 @@ fn run_cell(
     }
 
     let failures = Arc::new(AtomicU64::new(0));
-    let run = handle.block_on(spawn_and_join(
-        &dbs,
-        &plans,
+    let stop = Arc::new(AtomicBool::new(false));
+    let target = samples_for_rel_ci(args.target_ci);
+    let ctx = WorkerCtx {
+        stop: stop.clone(),
         pool_size,
-        args.multi_keys,
-        &failures,
-    ));
+        multi_keys: args.multi_keys,
+        failures: failures.clone(),
+    };
+    let outcome = handle.block_on(async {
+        let handles = spawn_workers(&dbs, &plans, &ctx);
+        let converged =
+            drive_to_significance(&plans, &stop, target, args.duration, args.max_duration).await;
+        join_tasks(handles).await.map(|()| converged)
+    });
 
     for p in &plans {
         p.bench.end();
@@ -448,7 +480,16 @@ fn run_cell(
     for d in &dbs {
         handle.block_on(d.shutdown());
     }
-    run?;
+    let cell_converged = outcome?;
+    if !cell_converged {
+        eprintln!(
+            "  note: mode={} topology={} hit --max-duration before every shape reached \
+             --target-ci={}",
+            mode.label(),
+            topo.label(),
+            args.target_ci,
+        );
+    }
 
     // Build per-shape rows; attribute ops per shape only in `per-shape`.
     let mut shapes = Vec::with_capacity(plans.len());
@@ -479,6 +520,8 @@ fn run_cell(
             tx_per_sec: if secs > 0.0 { count as f64 / secs } else { 0.0 },
             p50_ms: p50,
             p90_ms: p90,
+            rel_ci: res.rate_rel_ci(),
+            converged: target == 0 || count as u64 >= target,
             ops,
         });
     }
@@ -498,14 +541,26 @@ fn run_cell(
     })
 }
 
-/// Spawns every shape's workers across the cell's Databases and awaits them.
-async fn spawn_and_join(
-    dbs: &[Database],
-    plans: &[ShapePlan],
+/// Cell-wide context shared by every worker (cheap to clone: two `Arc`s and two
+/// counts).
+#[derive(Clone)]
+struct WorkerCtx {
+    /// Set by [`drive_to_significance`] to stop all shapes at once.
+    stop: Arc<AtomicBool>,
     pool_size: usize,
     multi_keys: usize,
-    failures: &Arc<AtomicU64>,
-) -> Result<(), GError> {
+    failures: Arc<AtomicU64>,
+}
+
+/// Spawns every shape's workers across the cell's Databases, returning their
+/// join handles. Workers loop until `ctx.stop` is set (by
+/// [`drive_to_significance`]) or their `Bench` deadline (the `--max-duration`
+/// cap) elapses.
+fn spawn_workers(
+    dbs: &[Database],
+    plans: &[ShapePlan],
+    ctx: &WorkerCtx,
+) -> Vec<JoinHandle<Result<(), GError>>> {
     let mut handles: Vec<JoinHandle<Result<(), GError>>> = Vec::new();
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
     for p in plans {
@@ -514,39 +569,75 @@ async fn spawn_and_join(
                 let db = dbs[db_idx].clone();
                 let bench = p.bench.clone();
                 let shape = p.shape;
-                let failures = failures.clone();
+                let ctx = ctx.clone();
                 seed = seed.wrapping_add(0x1000_0000_0000_0001);
-                handles.push(tokio::spawn(worker(
-                    db, shape, bench, pool_size, multi_keys, seed, failures,
-                )));
+                handles.push(tokio::spawn(worker(db, shape, bench, seed, ctx)));
             }
         }
     }
-    join_tasks(handles).await
+    handles
 }
 
-/// One worker: loops its shape's transaction until the shape's `Bench` window
-/// closes, keying from the shared pool. Errors are counted, not fatal (a single
-/// contention timeout must not derail the run).
+/// Runs the cell to statistical significance. With every shape's workers already
+/// spawned, it polls their committed-transaction counts and stops all shapes at
+/// once once each has reached `target` (so its throughput 95% CI is within
+/// `--target-ci`) — but never before `min_dur` and never past `max_dur`. Keeping
+/// every shape running until the last one is precise avoids skewing contention by
+/// letting readers drop out early. Returns whether every shape converged (`false`
+/// = the `max_dur` cap fired first).
+///
+/// `target == 0` disables adaptivity: the cell runs exactly `min_dur` and reports
+/// as converged (the caller asked for a fixed window, not a significance target).
+async fn drive_to_significance(
+    plans: &[ShapePlan],
+    stop: &Arc<AtomicBool>,
+    target: u64,
+    min_dur: Duration,
+    max_dur: Duration,
+) -> bool {
+    let started = Instant::now();
+    // Poll often enough to react promptly, coarsely enough to stay negligible.
+    let step = (max_dur / 40).clamp(Duration::from_millis(20), Duration::from_millis(250));
+    loop {
+        tokio::time::sleep(step).await;
+        let elapsed = started.elapsed();
+        let ready = elapsed >= min_dur
+            && (target == 0
+                || plans
+                    .iter()
+                    .all(|p| p.bench.sample_count() as u64 >= target));
+        if ready {
+            stop.store(true, Ordering::Relaxed);
+            return true;
+        }
+        if elapsed >= max_dur {
+            stop.store(true, Ordering::Relaxed);
+            return false;
+        }
+    }
+}
+
+/// One worker: loops its shape's transaction until the cell's `stop` flag is set
+/// (the significance controller) or the shape's `Bench` deadline elapses, keying
+/// from the shared pool. Errors are counted, not fatal (a single contention
+/// timeout must not derail the run).
 async fn worker(
     db: Database,
     shape: Shape,
     bench: Arc<Bench>,
-    pool_size: usize,
-    multi_keys: usize,
     seed: u64,
-    failures: Arc<AtomicU64>,
+    ctx: WorkerCtx,
 ) -> Result<(), GError> {
     let coll = db.collection(COLL.as_bytes());
     let mut rng = StdRng::seed_from_u64(seed);
     let n = match shape {
-        Shape::RwMany | Shape::RoMulti => multi_keys.min(pool_size).max(1),
+        Shape::RwMany | Shape::RoMulti => ctx.multi_keys.min(ctx.pool_size).max(1),
         Shape::RwSingle | Shape::RoSingle => 1,
     };
-    while !bench.is_finished() {
+    while !ctx.stop.load(Ordering::Relaxed) && !bench.is_finished() {
         // Pick keys before the measured region so the RNG borrow does not span
         // the transaction future.
-        let idxs = pick_keys(&mut rng, pool_size, n);
+        let idxs = pick_keys(&mut rng, ctx.pool_size, n);
         let keys: Vec<Vec<u8>> = idxs.iter().map(|&i| key_bytes(i)).collect();
         let keys = &keys;
         let coll = &coll;
@@ -561,7 +652,7 @@ async fn worker(
             })
             .await;
         if res.is_err() {
-            failures.fetch_add(1, Ordering::Relaxed);
+            ctx.failures.fetch_add(1, Ordering::Relaxed);
         }
     }
     Ok(())
@@ -661,11 +752,23 @@ async fn join_tasks(handles: Vec<JoinHandle<Result<(), GError>>>) -> Result<(), 
 // Text output
 // ---------------------------------------------------------------------------
 
+/// A shape's name, suffixed with `*` when its run was capped before reaching
+/// `--target-ci` (so its throughput should be read as indicative).
+fn shape_label(s: &ShapeResult) -> String {
+    if s.converged {
+        s.shape.clone()
+    } else {
+        format!("{}*", s.shape)
+    }
+}
+
 fn emit_text(args: &Args, cells: &[CellResult]) {
     println!(
-        "mixbench: duration={:?} workers/shape={} clients/shape(K)={} delays={} scale={} \
-         num-keys={} hot-keys={} multi-keys={}",
+        "mixbench: duration={:?}..{:?} target-ci={} workers/shape={} clients/shape(K)={} \
+         delays={} scale={} num-keys={} hot-keys={} multi-keys={}",
         args.duration,
+        args.max_duration,
+        args.target_ci,
         args.workers_per_shape,
         args.clients_per_shape,
         args.delays,
@@ -675,7 +778,8 @@ fn emit_text(args: &Args, cells: &[CellResult]) {
         args.multi_keys,
     );
     println!(
-        "(latency & tx/s are simulated-time, compensated for --delay-scale; ops/tx are counts)"
+        "(latency & tx/s are simulated-time, compensated for --delay-scale; ops/tx are counts; \
+         ci% is the throughput 95% CI half-width, '*' = capped before target-ci)"
     );
     for c in cells {
         println!();
@@ -686,11 +790,12 @@ fn emit_text(args: &Args, cells: &[CellResult]) {
         let per_shape_ops = c.shapes.iter().any(|s| s.ops.is_some());
         if per_shape_ops {
             println!(
-                "{:<10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>10}",
+                "{:<11} {:>10} {:>9} {:>9} {:>7} {:>9} {:>9} {:>9} {:>8} {:>10}",
                 "shape",
                 "tx/s",
                 "p50ms",
                 "p90ms",
+                "ci%",
                 "reads/tx",
                 "writes/tx",
                 "lists/tx",
@@ -700,11 +805,12 @@ fn emit_text(args: &Args, cells: &[CellResult]) {
             for s in &c.shapes {
                 let o = s.ops.expect("per-shape ops present");
                 println!(
-                    "{:<10} {:>10.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>8.2} {:>10.3}",
-                    s.shape,
+                    "{:<11} {:>10.2} {:>9.2} {:>9.2} {:>7.1} {:>9.2} {:>9.2} {:>9.2} {:>8.2} {:>10.3}",
+                    shape_label(s),
                     s.tx_per_sec,
                     s.p50_ms,
                     s.p90_ms,
+                    s.rel_ci * 100.0,
                     o.obj_reads_per_tx,
                     o.obj_writes_per_tx,
                     o.obj_lists_per_tx,
@@ -714,13 +820,17 @@ fn emit_text(args: &Args, cells: &[CellResult]) {
             }
         } else {
             println!(
-                "{:<10} {:>10} {:>9} {:>9}",
-                "shape", "tx/s", "p50ms", "p90ms"
+                "{:<11} {:>10} {:>9} {:>9} {:>7}",
+                "shape", "tx/s", "p50ms", "p90ms", "ci%"
             );
             for s in &c.shapes {
                 println!(
-                    "{:<10} {:>10.2} {:>9.2} {:>9.2}",
-                    s.shape, s.tx_per_sec, s.p50_ms, s.p90_ms
+                    "{:<11} {:>10.2} {:>9.2} {:>9.2} {:>7.1}",
+                    shape_label(s),
+                    s.tx_per_sec,
+                    s.p50_ms,
+                    s.p90_ms,
+                    s.rel_ci * 100.0
                 );
             }
             if let Some(o) = c.aggregate_ops {
