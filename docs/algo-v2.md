@@ -350,16 +350,18 @@ Group B — protocol details:
       (skew-padded) check with an observer-relative (no-skew) no-progress check.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
-      (ADR-020). The single-RW fast path's shard-CAS commit point is a further
-      in-doubt site (see below): a lost ack resolves by reading the shard back,
-      leaving one irreducible in-doubt (a fast follow-on writer moved the pointer).
+      (ADR-020). The single-RW fast path's lock CAS is a further in-doubt site
+      (see below): a lost ack resolves by reading the shard back, leaving one
+      irreducible in-doubt (a fast follow-on writer moved the entry, ADR-027).
 - [x] Read-only fast-path shape in the new layout (ADR-020).
-- [x] Single-RW fast path (ADR-020). A read-write transaction that overwrites a
-      single existing key commits with two operations — write the committed
-      transaction object, then one shard CAS publishing `current_writer` — with
-      no lock, no lease, and no write-back. The shard CAS is the commit point;
-      ineligible transactions (create/delete, multi-key, cross-key reads, stale
-      reads, locked entries) fall back to the full locked + logged path.
+- [x] Single-RW fast path (ADR-020, revised by ADR-027). A read-write transaction
+      that overwrites a single existing key commits with two **parallel** writes —
+      the committed transaction object and one shard CAS that installs a write
+      lock — then an **asynchronous** write-back converts the lock to a
+      `current_writer` pointer. It commits iff both writes land (object committed
+      and lock in the chain); ineligible transactions (create/delete, multi-key,
+      cross-key reads, stale reads, locked entries) fall back to the full locked +
+      logged path.
 
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):

@@ -175,17 +175,33 @@ enum Acquired {
 }
 
 /// Classification of a shard reload after a lost or in-doubt single read-write
-/// publish CAS (see [`Algo::reclassify_single_rw`]).
+/// lock CAS (see [`Algo::reclassify_single_rw`]).
 enum SingleRwReload {
-    /// The key's `current_writer` already names this transaction: our CAS landed
-    /// (idempotent success).
-    Committed,
+    /// The entry's `locked_by` names this transaction (our lock landed), or its
+    /// `current_writer` already names us (a follow-on writer help-forwarded us
+    /// into the chain): we are in the version chain (idempotent success).
+    Landed,
     /// The entry is still committable (unchanged and unlocked): re-issue the CAS
     /// against this freshly loaded shard/version.
     Retry(Shard, Option<backend::Version>),
-    /// The pointer moved to another writer, or the key is now locked: the fast
-    /// path lost the race.
+    /// The pointer moved to another writer, or the key is now locked by someone
+    /// else: the fast path lost the race.
     Moved,
+}
+
+/// Outcome of installing the single read-write fast path's write lock on the
+/// shard (ADR-027). This is the shard side of the two parallel commit writes;
+/// combined with the committed-object write to decide the transaction's fate.
+enum LockPublish {
+    /// The write lock is installed (or we are already in the chain): this
+    /// transaction is inserted into the shard's version history.
+    Landed,
+    /// The entry moved out from under us and our lock definitively did not land:
+    /// the fast path lost the race and must renew.
+    Moved,
+    /// The lock CAS was in-doubt (`Unavailable`) and the entry then moved, so we
+    /// cannot tell whether our lock landed first: irreducibly in-doubt.
+    InDoubt(String),
 }
 
 /// Coordinates transactions: read validation, locking, commit, and write-back.
@@ -415,20 +431,27 @@ impl Algo {
         Ok(())
     }
 
-    /// The single read-write fast path (ADR-020): a transaction that overwrites
-    /// exactly one already-existing key commits with one committed-object write
-    /// plus one shard CAS that publishes `current_writer` — no lock, no lease,
-    /// and no write-back. Reads may only touch that same key (a found RMW or a
-    /// blind put); anything else needs the full path.
+    /// The single read-write fast path (ADR-027, superseding ADR-020): a
+    /// transaction that overwrites exactly one already-existing key commits with
+    /// **two parallel writes** — the committed transaction object and one shard
+    /// CAS that installs a write lock — followed by an asynchronous write-back
+    /// that converts the lock to a `current_writer` pointer. Reads may only touch
+    /// that same key (a found RMW or a blind put); anything else needs the full
+    /// path.
+    ///
+    /// The lock (rather than a bare pointer) is what lets the two writes overlap:
+    /// a locked entry is resolved through the holder's status, which tolerates a
+    /// not-yet-discoverable object, so the object write carries no happens-before
+    /// requirement against the lock write (contrast ADR-020/ADR-007).
     ///
     /// Returns `Ok(Some(()))` on a fast commit; `Ok(None)` when the transaction
     /// is not eligible, in which case *nothing has been written* and the caller
     /// falls back to the full locked path under the **same id**;
-    /// [`TransError::Wounded`] when a lost race forces a renewed re-run (the
-    /// speculatively-written committed object is left unreferenced and GC'd);
-    /// and an in-doubt [`StorageError::Unavailable`] for the one irreducible
-    /// ambiguity (a fast follow-on writer moved the pointer during an in-doubt
-    /// CAS).
+    /// [`TransError::Wounded`] when a lost race (or a wound landing in the
+    /// parallel window) forces a renewed re-run (the speculatively-written
+    /// committed object is left unreferenced and GC'd); and an in-doubt
+    /// [`StorageError::Unavailable`] for the one irreducible ambiguity (a fast
+    /// follow-on writer moved the entry during an in-doubt lock CAS).
     ///
     /// Once the committed object is written the fast path never returns
     /// `Ok(None)`: a fall-back would re-run the body under the same id against an
@@ -476,72 +499,93 @@ impl Algo {
             return Ok(None);
         }
 
-        // Prepare: write the committed transaction object before publishing the
-        // pointer to it (ADR-020 / ADR-007 — the object must be discoverable so
-        // the ADR-007 lost-update anomaly cannot recur). It records the write
-        // and the pointer it supersedes so GC's reverse check can reclaim it
-        // (ADR-022). Unlike `commit_tx` this does *not* populate the value cache:
-        // the shard CAS below is the commit point, so the cache is written only
-        // after it lands, and a fast path that ends up wounded or in-doubt never
-        // leaves a stale entry keyed by an uncommitted writer.
+        // Build the committed transaction object. It records the write (and the
+        // pointer it will supersede, for GC's reverse check) plus the write lock
+        // it holds, so a dead-but-committed object still describes its own
+        // back-references (ADR-022). Unlike `commit_tx` this does *not* populate
+        // the value cache: the cache is written only once the commit is
+        // confirmed, so a fast path that ends up wounded or in-doubt never leaves
+        // a stale entry keyed by an uncommitted writer.
         let recorded_prev = shard
             .lookup(&raw_key)
             .and_then(|e| e.current_writer.clone())
             .unwrap_or_default();
         let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
+        tl.locks = vec![PathLock {
+            path: key_path.to_string(),
+            typ: LockType::Write,
+        }];
         tl.writes.push(TxWrite {
             path: key_path.to_string(),
             value: value.clone(),
             deleted: false,
             prev_writer: recorded_prev,
         });
-        self.mon
-            .set_final_log(&tl)
-            .await
-            .map_err(|e| e.context(format!("writing single-rw tx object for {}", tx.id)))?;
 
-        self.publish_single_rw(
+        // Issue both commit-critical writes concurrently (ADR-027): the committed
+        // object (its existence is the unambiguous, idempotent commit signal) and
+        // the shard lock CAS (which inserts us into the version chain).
+        let object = self.mon.set_final_log(&tl);
+        let lock = self.lock_single_rw(
             tx,
             &prefix,
             idx,
             &raw_key,
             read_version.as_ref(),
-            &value,
             shard,
             ver,
-        )
-        .await
+        );
+        let (object, lock) = tokio::join!(object, lock);
+
+        match (object, lock?) {
+            // Committed: the object is durable and our lock is in the chain.
+            (Ok(()), LockPublish::Landed) => {
+                self.finish_single_rw(&tx.id, &raw_key, &prefix, &value);
+                tx.status = Status::Committed;
+                self.write_back_single_rw(&tx.id, &prefix, idx, &raw_key, &key_path)
+                    .await;
+                Ok(Some(()))
+            }
+            // A wound landed in the parallel window: our object was finalized
+            // `aborted` out from under us. The write did not commit — renew.
+            (Err(TransError::AlreadyFinalized), _) => self.abandon_single_rw(tx),
+            (Err(e), _) => Err(e.context(format!("writing single-rw tx object for {}", tx.id))),
+            // The object committed but our lock never inserted us into the chain
+            // (a follow-on writer built on the old value): the committed object
+            // is an orphan — renew and let GC reclaim it.
+            (Ok(()), LockPublish::Moved) => self.abandon_single_rw(tx),
+            // In-doubt lock CAS whose entry then moved: we cannot tell whether we
+            // committed. Surface it rather than risk a double-apply.
+            (Ok(()), LockPublish::InDoubt(msg)) => {
+                Err(TransError::Storage(StorageError::Unavailable(msg)))
+            }
+        }
     }
 
-    /// Commit point of the single read-write fast path: CAS the shard so the
-    /// key's `current_writer` names this transaction. Handles CAS contention and
-    /// in-doubt outcomes in place without ever re-running the body (the object
-    /// is already committed). `shard`/`ver` are the copy validated by the
-    /// caller; retries reload.
+    /// Installs the single read-write fast path's write lock: CAS the shard so the
+    /// key's entry is `locked_by = [id]` (a write lock), leaving `current_writer`
+    /// untouched. Handles CAS contention and in-doubt outcomes in place without
+    /// ever re-running the body (the committed object is written in parallel).
+    /// `shard`/`ver` are the copy validated by the caller; retries reload.
     #[allow(clippy::too_many_arguments)]
-    async fn publish_single_rw(
+    async fn lock_single_rw(
         &self,
         tx: &mut Handle,
         prefix: &str,
         idx: u32,
         raw_key: &[u8],
         read_version: Option<&TxId>,
-        value: &Arc<[u8]>,
         mut shard: Shard,
         mut ver: Option<backend::Version>,
-    ) -> Result<Option<()>, TransError> {
+    ) -> Result<LockPublish, TransError> {
         for attempt in 0..SINGLE_RW_CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(tx.backoff.next_delay()).await;
             }
-            let superseded = shard
-                .lookup(raw_key)
-                .and_then(|e| e.current_writer.clone())
-                .unwrap_or_default();
             let new_shard = Shard::from_entries(shard.entries().cloned().map(|mut e| {
                 if e.key == raw_key {
-                    e.current_writer = Some(tx.id.clone());
-                    e.deleted = false;
+                    e.lock_type = LockType::Write;
+                    e.locked_by = vec![tx.id.clone()];
                 }
                 e
             }));
@@ -550,69 +594,52 @@ impl Algo {
                 .store_shard(prefix, idx, &new_shard, ver.as_ref())
                 .await
             {
-                // The CAS landed: this is the commit point. Publish the value to
-                // the cache and hand the superseded writer to GC.
-                Ok(true) => {
-                    self.finish_single_rw(&tx.id, raw_key, prefix, value, &superseded);
-                    tx.status = Status::Committed;
-                    return Ok(Some(()));
-                }
+                // The lock landed: we are in the version chain.
+                Ok(true) => return Ok(LockPublish::Landed),
                 // Precondition: the write definitely did not land. Re-classify.
                 Ok(false) => match self
                     .reclassify_single_rw(prefix, idx, raw_key, read_version, &tx.id)
                     .await?
                 {
-                    SingleRwReload::Committed => {
-                        self.finish_single_rw(&tx.id, raw_key, prefix, value, &superseded);
-                        tx.status = Status::Committed;
-                        return Ok(Some(()));
-                    }
+                    SingleRwReload::Landed => return Ok(LockPublish::Landed),
                     SingleRwReload::Retry(s, v) => {
                         shard = s;
                         ver = v;
                     }
-                    // The pointer moved (or the key is now locked): our read is
-                    // stale / the race is lost. The write did not land, so it is
-                    // safe to renew and re-run; the orphan committed object is
-                    // unreferenced and GC'd.
-                    SingleRwReload::Moved => return self.abandon_single_rw(tx),
+                    // The entry moved (or is now locked by someone else): our
+                    // lock did not land. It is safe to renew.
+                    SingleRwReload::Moved => return Ok(LockPublish::Moved),
                 },
-                // In-doubt: read the shard back to decide (ADR-009 / ADR-020).
+                // In-doubt: read the shard back to decide (ADR-009 / ADR-027).
                 Err(StorageError::Unavailable(msg)) => {
                     match self
                         .reclassify_single_rw(prefix, idx, raw_key, read_version, &tx.id)
                         .await?
                     {
-                        SingleRwReload::Committed => {
-                            self.finish_single_rw(&tx.id, raw_key, prefix, value, &superseded);
-                            tx.status = Status::Committed;
-                            return Ok(Some(()));
-                        }
+                        SingleRwReload::Landed => return Ok(LockPublish::Landed),
                         SingleRwReload::Retry(s, v) => {
                             shard = s;
                             ver = v;
                         }
-                        // The one irreducible in-doubt: a fast follow-on writer
-                        // moved the pointer, so we cannot tell whether our CAS
-                        // landed first. Surface it rather than risk a
+                        // The one irreducible in-doubt: our lock CAS was
+                        // uncertain and the entry then moved, so we cannot tell
+                        // whether our lock landed first (and was help-forwarded
+                        // away) or never landed. Surface it rather than risk a
                         // double-apply on a blind re-run.
-                        SingleRwReload::Moved => {
-                            return Err(TransError::Storage(StorageError::Unavailable(msg)));
-                        }
+                        SingleRwReload::Moved => return Ok(LockPublish::InDoubt(msg)),
                     }
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-        // Pure version churn exhausted the budget: renew and re-run. The
-        // committed object is orphaned (nothing published it) and GC'd.
-        self.abandon_single_rw(tx)
+        // Pure version churn exhausted the budget: renew and re-run.
+        Ok(LockPublish::Moved)
     }
 
-    /// Reloads the shard after a lost/uncertain single read-write CAS and
-    /// classifies the entry: already published by us (`Committed`), still
-    /// committable so the CAS can be retried (`Retry`), or moved/locked out from
-    /// under us (`Moved`).
+    /// Reloads the shard after a lost/uncertain single read-write lock CAS and
+    /// classifies the entry: in the chain already — our lock is installed or we
+    /// were help-forwarded (`Landed`), still committable so the CAS can be
+    /// retried (`Retry`), or moved/locked out from under us (`Moved`).
     async fn reclassify_single_rw(
         &self,
         prefix: &str,
@@ -623,7 +650,9 @@ impl Algo {
     ) -> Result<SingleRwReload, TransError> {
         let (shard, ver) = self.shards.load_shard(prefix, idx).await?;
         match shard.lookup(raw_key) {
-            Some(e) if e.current_writer.as_ref() == Some(id) => Ok(SingleRwReload::Committed),
+            Some(e) if e.locked_by.contains(id) || e.current_writer.as_ref() == Some(id) => {
+                Ok(SingleRwReload::Landed)
+            }
             Some(e) if single_rw_committable(e, read_version) => {
                 Ok(SingleRwReload::Retry(shard, ver))
             }
@@ -631,24 +660,54 @@ impl Algo {
         }
     }
 
-    /// Records a fast-path commit: publish the value to the cache keyed by this
-    /// writer (the commit-point CAS has landed) and feed the superseded pointer
-    /// to GC as a reverse-check candidate (ADR-022).
-    fn finish_single_rw(
-        &self,
-        id: &TxId,
-        raw_key: &[u8],
-        prefix: &str,
-        value: &Arc<[u8]>,
-        superseded: &TxId,
-    ) {
+    /// Records a fast-path commit by publishing the value to the cache keyed by
+    /// this writer. The superseded pointer is handed to GC later, from the
+    /// asynchronous write-back that actually overwrites `current_writer`.
+    fn finish_single_rw(&self, id: &TxId, raw_key: &[u8], prefix: &str, value: &Arc<[u8]>) {
         self.values.write(
             &paths::from_key(prefix, raw_key),
             value.clone(),
             Version { writer: id.clone() },
         );
-        if !superseded.is_unset() && superseded != id {
-            self.gc.schedule_tx_cleanup(superseded.clone());
+    }
+
+    /// Converts the fast path's write lock to a published `current_writer`
+    /// pointer and releases it (ADR-027 write-back), reusing the deduplicated
+    /// write-back path (ADR-026). Spawned in the background so commit returns
+    /// without waiting for it; run inline when no background executor exists
+    /// (unit tests, or after shutdown dropped it) so the lock is not left to
+    /// lazy reclaim. Best-effort: the transaction is already committed, so a
+    /// failure only delays lazy lock cleanup. Feeds the superseded writer to GC.
+    async fn write_back_single_rw(
+        &self,
+        id: &TxId,
+        prefix: &str,
+        idx: u32,
+        raw_key: &[u8],
+        key_path: &str,
+    ) {
+        match self.background.as_ref().and_then(|w| w.upgrade()) {
+            Some(bg) => {
+                let locker = self.locker.clone();
+                let gc = self.gc.clone();
+                let id = id.clone();
+                let prefix = prefix.to_string();
+                let raw_key = raw_key.to_vec();
+                let key_path = key_path.to_string();
+                bg.spawn_waited(async move {
+                    let superseded = locker
+                        .write_back_single_put(&id, &prefix, idx, &raw_key, &key_path)
+                        .await;
+                    feed_gc_hints(&gc, superseded);
+                });
+            }
+            None => {
+                let superseded = self
+                    .locker
+                    .write_back_single_put(id, prefix, idx, raw_key, key_path)
+                    .await;
+                feed_gc_hints(&self.gc, superseded);
+            }
         }
     }
 
@@ -1373,9 +1432,12 @@ mod tests {
     }
 
     // CAS-write counts by object kind, the fingerprint of a commit path: the
-    // single read-write fast path is exactly one shard write plus one tx-object
-    // write and no membership write; the full locked path always issues at least
-    // two shard writes (a lock CAS then a write-back CAS).
+    // single read-write fast path (ADR-027) issues one tx-object write and two
+    // shard writes (the lock CAS then the write-back CAS that publishes the
+    // pointer — here inline because tests build the algo with no background
+    // executor) and no membership write; the full locked path also issues at
+    // least two shard writes but writes its tx object differently and may touch
+    // the collection root.
     #[derive(Debug, Default)]
     struct WriteCounts {
         shard: usize,
@@ -1400,9 +1462,10 @@ mod tests {
         c
     }
 
-    // An eligible single-key overwrite commits through the fast path (ADR-020):
-    // one committed `_t/` object write, one `_s/` publish CAS, no lock, and no
-    // membership (`_i`) write — and the new value is durable and readable.
+    // An eligible single-key overwrite commits through the fast path (ADR-027):
+    // one committed `_t/` object write, one `_s/` lock CAS, one `_s/` write-back
+    // CAS (inline here, no background executor), and no membership (`_i`) write —
+    // and the new value is durable and readable.
     #[tokio::test]
     async fn single_rw_overwrite_takes_fast_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -1421,7 +1484,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let c = write_counts(&log);
-        assert_eq!(c.shard, 1, "one shard publish CAS: {c:?}");
+        assert_eq!(c.shard, 2, "one lock CAS plus one write-back CAS: {c:?}");
         assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
         assert_eq!(c.root, 0, "no membership write on the fast path: {c:?}");
 
@@ -1454,10 +1517,68 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let c = write_counts(&log);
-        assert_eq!(c.shard, 1, "one shard publish CAS: {c:?}");
+        assert_eq!(c.shard, 2, "one lock CAS plus one write-back CAS: {c:?}");
         assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
         assert_eq!(c.root, 0, "no membership write: {c:?}");
         assert_eq!(entry(&tctx, b"k").await.unwrap().current_writer, Some(tid));
+    }
+
+    // ADR-027: the fast path's two commit writes are independent. If the lock CAS
+    // never lands (here: sustained shard-CAS contention exhausting the bounded
+    // budget) while the committed object write *did* land, the transaction is not
+    // in the version chain — its committed object is an orphan. The fast path must
+    // renew (surface `Wounded`) rather than report success, and must never
+    // double-apply: a renewed attempt commits the value exactly once.
+    #[tokio::test]
+    async fn single_rw_lock_cas_contention_renews_and_commits_once() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // Fail exactly the fast path's lock-CAS attempts (SINGLE_RW_CAS_RETRIES),
+        // so the object write lands but the lock never does.
+        let flaky = FlakyShardCas::new(mem, SINGLE_RW_CAS_RETRIES);
+        let backend: Arc<dyn Backend> = flaky.clone();
+        let (tm, tctx) = new_algo_from_backend(backend).await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        // Seed over the (unarmed) backend so the key exists and is committable.
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+        let seed_writer = entry(&tctx, b"k").await.unwrap().current_writer.unwrap();
+        let r = do_read(&tctx, &keyp).await;
+
+        flaky.arm();
+        let mut h = tm.begin(Data {
+            reads: vec![r.clone()],
+            writes: vec![wa(&keyp, b"v2")],
+        });
+        let orphan = h.id().clone();
+        let err = tm.commit(&mut h).await.unwrap_err();
+        assert!(
+            matches!(err, TransError::Wounded),
+            "a lock CAS that never lands must renew, got {err:?}"
+        );
+
+        // The whole budget was spent (sustained contention on the lock CAS), and
+        // the orphan committed object never entered the chain: the entry still
+        // points at the seed writer, unlocked.
+        assert_eq!(
+            flaky.remaining(),
+            0,
+            "expected sustained lock-CAS contention"
+        );
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current_writer, Some(seed_writer));
+        assert!(e.locked_by.is_empty());
+
+        // The renewed attempt (same priority, fresh id) commits exactly once.
+        let mut h2 = tm.rebegin(h);
+        assert_ne!(*h2.id(), orphan, "renew mints a fresh id");
+        tm.commit(&mut h2).await.unwrap();
+        tm.end(&mut h2).await.unwrap();
+
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current_writer, Some(h2.id().clone()));
+        assert!(e.locked_by.is_empty());
+        let rv = do_read(&tctx, &keyp).await;
+        assert_eq!(rv.version.unwrap().last_writer, *h2.id());
     }
 
     // Creating a key is a membership change, so it is ineligible and takes the

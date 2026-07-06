@@ -1201,6 +1201,33 @@ impl Locker {
         superseded
     }
 
+    /// Publishes the single read-write fast path's committed pointer and releases
+    /// its write lock on one key (ADR-027): the fast path installs
+    /// `locked_by = [id]` with its own bespoke shard CAS (never through the
+    /// locker's bookkeeping), so this converts that lock to `current_writer = id`
+    /// and drops it. Routed through the same deduplicated write-back path the full
+    /// commit uses (ADR-026), so it batches with any in-flight round for the
+    /// shard. Best-effort and idempotent — a lost race leaves the lock to lazy
+    /// reclaim / lease expiry. Returns the `current_writer` it superseded, a GC
+    /// candidate hint (ADR-022).
+    pub(crate) async fn write_back_single_put(
+        &self,
+        id: &TxId,
+        prefix: &str,
+        idx: u32,
+        raw_key: &[u8],
+        key_path: &str,
+    ) -> Vec<TxId> {
+        let intents = Arc::new(vec![KeyIntent {
+            raw_key: raw_key.to_vec(),
+            key_path: key_path.to_string(),
+            desired: Desired::Put,
+        }]);
+        self.submit_shard_unlock(prefix, idx, id, ShardAction::WriteBack, intents)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Acquires this transaction's locks across every touched shard. Returns the
     /// collections whose root membership lock must still be taken (the shards
     /// that saw a create/delete), or [`ShardsOutcome::Conflict`] if a shard lost
