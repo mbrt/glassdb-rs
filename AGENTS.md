@@ -11,7 +11,8 @@
 
 - No need to update PORTING.md anymore. This project is now independent of the original Go project
 - Keep implementation methods in order of visibility
-- Comments should be used to explain why something is done, not what, and minimize explanations of other code.
+- Comments should be used to explain why something is done, not what
+- Functions' docstring should describe the function's purpose, not its implementation, nor callers
 
 ### Tests
 

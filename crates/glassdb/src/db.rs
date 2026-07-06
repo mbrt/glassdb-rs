@@ -143,6 +143,7 @@ impl DatabaseBuilder {
             gc,
             Some(bg_weak),
             resolver,
+            shards.clone(),
         );
 
         let inner = Arc::new(DbInner {

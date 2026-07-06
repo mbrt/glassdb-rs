@@ -3,26 +3,46 @@
 //! Object storage (S3/GCS) offers no at-most-once request id: if a conditional
 //! write's first attempt lands but its acknowledgement is lost, a retry — at any
 //! layer (the SDK, a proxy, the service) — observes a precondition failure that
-//! is indistinguishable from a genuine conflict. The logless single-RW fast path
-//! has no durable record to disambiguate it, so an exactly-once *transparent*
-//! retry is impossible.
+//! is indistinguishable from a genuine conflict. A backend reports such an
+//! uncertain conditional write as [`BackendError::Unavailable`] rather than a
+//! confident `Precondition`.
 //!
-//! The contract instead is at-most-once + surface in-doubt to the caller: a
-//! backend reports such an uncertain conditional write as
-//! [`BackendError::Unavailable`] rather than a confident `Precondition`, and the
-//! engine surfaces it as [`Error::InDoubt`] without retrying the transaction
-//! transparently (a transparent retry could double-apply a write that actually
-//! landed). The caller decides whether to retry (with its own idempotency) or
+//! In v2 every commit point is a CAS on a coordination object whose durable
+//! state disambiguates the outcome, so the engine recovers most in-doubt
+//! outcomes by reading that object back:
+//!
+//! - The single read-write fast path (ADR-020) publishes its value with one
+//!   shard CAS (`current_writer = txid`), after writing its committed `_t/`
+//!   object. A lost ack on that shard CAS is resolved by reloading the shard: if
+//!   `current_writer` names us the write landed (commit), if it is unchanged the
+//!   write did not land (retry the idempotent CAS). Only a *fast follow-on
+//!   writer* that moves the pointer before we can read it back is irreducibly
+//!   in-doubt — surfaced as [`Error::InDoubt`] rather than risking a
+//!   double-apply on a renewed re-run.
+//! - The logged path's commit point (the `_t/` flip) and its lock CAS (`_s/`)
+//!   are recovered in place the same way (they are idempotent under their own
+//!   preconditions).
+//!
+//! The engine never retries a transaction *transparently* across an in-doubt
+//! commit point in a way that could double-apply a landed write. The caller
+//! decides whether to retry a surfaced in-doubt (with its own idempotency) or
 //! accept the uncertainty.
 //!
-//! These tests drive that contract deterministically with a [`FaultBackend`]
-//! that, on a chosen conditional write, either (a) forwards it to the real
-//! backend so it *lands* and then returns `Unavailable` (modelling a lost ack on
-//! a successful write), or (b) returns a clean `Precondition` *without* applying
-//! it (modelling a genuine conflict). A normal in-memory backend never produces
-//! `Unavailable`, so the harness must inject it.
+//! These tests drive that contract deterministically with a [`HookBackend`],
+//! a small middleware that wraps every conditional write in a `before`/`after`
+//! pair (see [`Before`]/[`After`]): a `before` hook may short-circuit the op
+//! *without* applying it (a clean `Precondition`, or an `Unavailable` for a
+//! write that never landed), while an `after` hook sees the *landed* result and
+//! may transform it (turn an `Ok` into `Unavailable`, modelling a lost ack) and
+//! run async side effects. A normal in-memory backend never produces
+//! `Unavailable`, so the harness injects it. To exercise the fast path's one
+//! irreducible in-doubt an `after` hook can interpose a genuine competing
+//! transaction at the instant a lost-ack write lands, rather than forging any
+//! protocol state.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -31,24 +51,44 @@ use glassdb::backend::{Backend, BackendError, ReadReply, Version};
 use glassdb::{Collection, Database, Error};
 use glassdb_storage::TxCommitStatus;
 
-/// What the [`FaultBackend`] should do when its trap matches a conditional write.
-#[derive(Clone, Copy)]
-enum Action {
-    /// Forward the op (so it really lands), then return `Unavailable`: the write
-    /// succeeded but its acknowledgement was "lost".
-    LostAck,
-    /// Return a clean `Precondition` without applying the op: a genuine conflict
-    /// that never landed.
-    Precondition,
-    /// Return `Unavailable` *without* applying the op: an in-doubt outcome for a
-    /// write that never landed (e.g. the backend exhausted its retry budget on
-    /// transient errors).
-    Unavailable,
+/// The conditional write a [`HookBackend`] hook is inspecting: its kind
+/// (`"write_if"` / `"write_if_not_exists"`), storage path, and object body.
+struct WriteCtx<'a> {
+    kind: &'static str,
+    path: &'a str,
+    value: &'a [u8],
 }
 
-/// Decides, for a conditional write, whether (and how) to fault it. Receives the
-/// op kind, the storage path, and the object body being written.
-type Trap = Box<dyn Fn(&str, &str, &[u8]) -> Option<Action> + Send + Sync>;
+/// A `before` verdict: let the write reach the backend, or short-circuit it
+/// with an error *without* applying it (a write that never landed).
+enum Pre {
+    Proceed,
+    Fail(BackendError),
+}
+
+/// Pre-op hook: runs before a conditional write reaches the backend and may
+/// short-circuit it (see [`Pre`]). Synchronous — every pre-decision is.
+type Before = Box<dyn Fn(&WriteCtx) -> Pre + Send + Sync>;
+
+/// Post-op hook: runs after a conditional write has landed, receiving its
+/// result. It may transform the result (e.g. turn an `Ok` into `Unavailable` to
+/// model a lost ack) and/or run async side effects — e.g. a genuine competing
+/// transaction. The returned future is `'static`, so a hook that needs data
+/// from the [`WriteCtx`] must read it synchronously before building the future.
+type After = Box<
+    dyn Fn(&WriteCtx, Result<Version, BackendError>) -> BoxFuture<Result<Version, BackendError>>
+        + Send
+        + Sync,
+>;
+
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// A one-shot side effect run by an `after` hook the moment a matching write
+/// lands. It exists to interpose a **genuine competing transaction** at exactly
+/// that instant (rather than forging protocol state), so a real concurrent
+/// commit can move a shard pointer in the window between our CAS landing and our
+/// reading it back.
+type Competitor = Box<dyn FnOnce() -> BoxFuture<()> + Send + Sync>;
 
 /// Reports whether `body` is a transaction object that has committed. With the
 /// slimmed tagless backend (ADR-023) the commit status lives in the object body,
@@ -59,55 +99,147 @@ fn is_committed_tx_log(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// A [`Backend`] decorator that injects a single, targeted conditional-write
-/// fault. Reads and unconditional writes pass straight through. Every observed
-/// conditional write is recorded so a test can assert how many times the engine
-/// drove the commit point (a transparent retry would show up as a second
-/// committed-log write).
-struct FaultBackend {
+/// Matches the single-key fast path's commit-point shard CAS: a `write_if`
+/// publishing `current_writer` on a shard object (`/_s/`).
+fn shard_cas(c: &WriteCtx) -> bool {
+    c.kind == "write_if" && c.path.contains("/_s/")
+}
+
+/// Matches the logged path's commit point: writing a *committed* transaction log
+/// object (a `/_t/` path whose body decodes as committed).
+fn committed_log(c: &WriteCtx) -> bool {
+    c.path.contains("/_t/") && is_committed_tx_log(c.value)
+}
+
+/// A one-shot [`Before`] that fails the first conditional write matching `when`
+/// with the error from `err` — the op never reaches the backend — and lets
+/// every other write proceed.
+fn fail_before(
+    when: impl Fn(&WriteCtx) -> bool + Send + Sync + 'static,
+    err: impl Fn() -> BackendError + Send + Sync + 'static,
+) -> Before {
+    let armed = AtomicBool::new(true);
+    Box::new(move |c| {
+        if armed.load(Ordering::SeqCst) && when(c) {
+            armed.store(false, Ordering::SeqCst);
+            Pre::Fail(err())
+        } else {
+            Pre::Proceed
+        }
+    })
+}
+
+/// A one-shot [`After`] that, on the first landed write matching `when`, runs
+/// `competitor` and then reports the ack as lost (`Ok` -> `Unavailable`); all
+/// other writes pass through unchanged.
+fn lost_ack_after_racing(
+    when: impl Fn(&WriteCtx) -> bool + Send + Sync + 'static,
+    competitor: Competitor,
+) -> After {
+    let armed = Mutex::new(Some(competitor));
+    Box::new(move |c, r| {
+        // Fire once, on the first matching write that actually landed. Reading
+        // the context and taking the competitor is synchronous; only the
+        // competitor's own work runs in the returned future.
+        let competitor = if r.is_ok() && when(c) {
+            armed.lock().unwrap().take()
+        } else {
+            None
+        };
+        Box::pin(async move {
+            match competitor {
+                Some(run) => {
+                    run().await;
+                    Err(lost_ack("write"))
+                }
+                None => r,
+            }
+        })
+    })
+}
+
+/// A one-shot [`After`] that lets the first landed write matching `when` lose
+/// its ack (`Ok` -> `Unavailable`), with no competing side effect.
+fn lost_ack_after(when: impl Fn(&WriteCtx) -> bool + Send + Sync + 'static) -> After {
+    lost_ack_after_racing(when, Box::new(|| Box::pin(async {})))
+}
+
+/// A [`Backend`] decorator that wraps every conditional write in a
+/// `before`/`after` middleware pair (see [`Before`]/[`After`]) to inject
+/// targeted in-doubt outcomes. Reads and unconditional writes pass straight
+/// through. Every committed-log write is counted so a test can assert how many
+/// times the engine drove the commit point (a transparent retry would show up
+/// as a second committed-log write).
+struct HookBackend {
     inner: Arc<dyn Backend>,
-    trap: Mutex<Option<Trap>>,
-    /// Count of conditional writes of a committed (`commit-status=committed`)
-    /// transaction log — i.e. how many times a commit point was driven.
+    before: Mutex<Option<Before>>,
+    after: Mutex<Option<After>>,
+    /// Count of conditional writes of a committed transaction log — i.e. how
+    /// many times a commit point was driven.
     committed_log_writes: AtomicUsize,
 }
 
-impl FaultBackend {
+impl HookBackend {
     fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-        Arc::new(FaultBackend {
+        Arc::new(HookBackend {
             inner,
-            trap: Mutex::new(None),
+            before: Mutex::new(None),
+            after: Mutex::new(None),
             committed_log_writes: AtomicUsize::new(0),
         })
     }
 
-    /// Arms the (one-shot) trap. It fires at most once: the first matching
-    /// conditional write consumes it.
-    fn arm(&self, trap: Trap) {
-        *self.trap.lock().unwrap() = Some(trap);
+    /// Installs the pre-op hook.
+    fn arm_before(&self, before: Before) {
+        *self.before.lock().unwrap() = Some(before);
+    }
+
+    /// Installs the post-op hook.
+    fn arm_after(&self, after: After) {
+        *self.after.lock().unwrap() = Some(after);
     }
 
     fn committed_log_writes(&self) -> usize {
         self.committed_log_writes.load(Ordering::SeqCst)
     }
 
-    /// Records the conditional write and, if the armed trap matches, consumes it
-    /// and returns the action to take.
-    fn intercept(&self, kind: &str, path: &str, value: &[u8]) -> Option<Action> {
-        if path.contains("/_t/") && is_committed_tx_log(value) {
+    /// Runs a conditional write through the middleware: count it, consult the
+    /// `before` hook (which may short-circuit it), forward it to the real
+    /// backend, then hand the landed result to the `after` hook. Locks are
+    /// always released before awaiting, so a hook's own backend calls (a genuine
+    /// competing transaction) can re-enter without deadlocking.
+    async fn conditional<Fut>(
+        &self,
+        ctx: WriteCtx<'_>,
+        forward: impl FnOnce() -> Fut,
+    ) -> Result<Version, BackendError>
+    where
+        Fut: Future<Output = Result<Version, BackendError>>,
+    {
+        if committed_log(&ctx) {
             self.committed_log_writes.fetch_add(1, Ordering::SeqCst);
         }
-        let mut t = self.trap.lock().unwrap();
-        let action = t.as_ref().and_then(|trap| trap(kind, path, value));
-        if action.is_some() {
-            *t = None;
+        let verdict = match self.before.lock().unwrap().as_ref() {
+            Some(before) => before(&ctx),
+            None => Pre::Proceed,
+        };
+        let landed = match verdict {
+            Pre::Fail(e) => return Err(e),
+            Pre::Proceed => forward().await,
+        };
+        let after = match self.after.lock().unwrap().as_ref() {
+            Some(after) => Ok(after(&ctx, landed)),
+            None => Err(landed),
+        };
+        match after {
+            Ok(fut) => fut.await,
+            Err(landed) => landed,
         }
-        action
     }
 }
 
 #[async_trait]
-impl Backend for FaultBackend {
+impl Backend for HookBackend {
     async fn read_if_modified(
         &self,
         path: &str,
@@ -131,15 +263,13 @@ impl Backend for FaultBackend {
         value: Vec<u8>,
         expected: &Version,
     ) -> Result<Version, BackendError> {
-        match self.intercept("write_if", path, &value) {
-            Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::Unavailable) => Err(not_applied("write_if")),
-            Some(Action::LostAck) => match self.inner.write_if(path, value, expected).await {
-                Ok(_) => Err(lost_ack("write_if")),
-                Err(e) => Err(e),
-            },
-            None => self.inner.write_if(path, value, expected).await,
-        }
+        let ctx = WriteCtx {
+            kind: "write_if",
+            path,
+            value: &value,
+        };
+        self.conditional(ctx, || self.inner.write_if(path, value.clone(), expected))
+            .await
     }
 
     async fn write_if_not_exists(
@@ -147,15 +277,13 @@ impl Backend for FaultBackend {
         path: &str,
         value: Vec<u8>,
     ) -> Result<Version, BackendError> {
-        match self.intercept("write_if_not_exists", path, &value) {
-            Some(Action::Precondition) => Err(BackendError::Precondition),
-            Some(Action::Unavailable) => Err(not_applied("write_if_not_exists")),
-            Some(Action::LostAck) => match self.inner.write_if_not_exists(path, value).await {
-                Ok(_) => Err(lost_ack("write_if_not_exists")),
-                Err(e) => Err(e),
-            },
-            None => self.inner.write_if_not_exists(path, value).await,
-        }
+        let ctx = WriteCtx {
+            kind: "write_if_not_exists",
+            path,
+            value: &value,
+        };
+        self.conditional(ctx, || self.inner.write_if_not_exists(path, value.clone()))
+            .await
     }
 
     async fn delete(&self, path: &str) -> Result<(), BackendError> {
@@ -189,7 +317,17 @@ async fn seed(coll: &Collection, key: &[u8], v: i64) {
     coll.write(key, &write_int(v)).await.unwrap();
 }
 
-/// A single-key read-modify-write whose commit takes the logless fast path.
+/// Lets a committed transaction's background write-back (the spawned shard CAS
+/// that publishes `current_writer` and releases locks) settle before a hook is
+/// armed, so the hook fires on the operation under test rather than a lingering
+/// write-back's shard CAS. Deterministic under `start_paused`: the paused clock
+/// auto-advances and the ready write-back task is polled to completion.
+async fn settle_writebacks() {
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+/// A single-key read-modify-write over an existing key: its commit takes the
+/// single read-write fast path (ADR-020), whose commit point is one shard CAS.
 async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
     // `coll` is already a reference, so `async move` copies it (references are
     // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
@@ -204,93 +342,113 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
     .await
 }
 
-/// The single-RW fast path: a conditional value write that lands but loses its
-/// ack must surface as in-doubt, and the value must be applied *exactly once* —
-/// never re-applied. This is the bug the in-doubt contract fixes: previously the
-/// lost-ack write was reported as a `Precondition`, the engine treated it as a
-/// conflict, fell back to the locked path, and incremented a second time.
-// Disabled in v2: the logless single-RW fast path (a `write_if` directly on the
-// per-key value object `/_k/`) was removed — values now live in the transaction
-// object and every commit goes through the logged commit point. There is no
-// longer a logless value write to lose an ack on, so this scenario cannot
-// happen. Commit-point in-doubt parity is covered by
-// `logged_commit_lost_ack_retries_transparently` (the `_t/` commit write) and
-// `lock_acquisition_lost_ack_retries_in_place` (the `_s/` lock CAS).
-#[ignore = "logless single-RW value-object path removed in v2"]
+/// The single read-write fast path: a lost ack on the commit-point shard CAS is
+/// *resolved to committed* by reading the shard back — its `current_writer` now
+/// names this transaction, so the write demonstrably landed. The engine returns
+/// success (not in-doubt) and the value is applied exactly once. This is the v2
+/// improvement over the old logless path, whose value write had no durable
+/// pointer to disambiguate a lost ack.
 #[tokio::test(start_paused = true)]
-async fn single_rw_lost_ack_surfaces_in_doubt_without_double_apply() {
+async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = FaultBackend::new(mem);
+    let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
 
-    // Seed the key so the read finds a value and the commit takes the single-RW
-    // fast path (which requires a found read version).
+    // Seed the key so the read finds a value and the overwrite is an eligible
+    // single read-write.
     seed(&coll, b"k", 10).await;
 
-    // Trap the fast path's value write (a `write_if` on a key path `/_k/`): let
-    // it land, then report the ack as lost.
-    backend.arm(Box::new(|kind, path, _value| {
-        if kind == "write_if" && path.contains("/_k/") {
-            Some(Action::LostAck)
-        } else {
-            None
-        }
-    }));
+    settle_writebacks().await;
+
+    // Trap the fast path's commit point (the `write_if` publishing
+    // `current_writer` on the shard `/_s/`): let it land, then lose the ack.
+    backend.arm_after(lost_ack_after(shard_cas));
+
+    increment(&db, &coll, b"k")
+        .await
+        .expect("a landed-but-lost-ack shard CAS resolves to committed via read-back");
+
+    // The write landed exactly once: 11, never 12 (double-apply) nor unchanged.
+    let got = read_int(&coll.read(b"k").await.unwrap());
+    assert_eq!(got, 11, "value must be applied exactly once");
+}
+
+/// The single read-write fast path's one irreducible in-doubt: our commit-point
+/// shard CAS lands but loses its ack *and*, in the window before we read the
+/// shard back, a **genuine competing transaction** overwrites the key and moves
+/// `current_writer` to itself. The read-back then shows another writer, so the
+/// engine can no longer tell whether our CAS landed first; it surfaces
+/// [`Error::InDoubt`] rather than renewing and risking a double-apply.
+#[tokio::test(start_paused = true)]
+async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = HookBackend::new(mem);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"c");
+    coll.create().await.unwrap();
+    seed(&coll, b"k", 10).await;
+
+    // A second, independent client over the same backend is the competitor.
+    let other = Database::open("example", backend.clone()).await.unwrap();
+    let other_coll = other.collection(b"c");
+
+    settle_writebacks().await;
+
+    // The moment our commit-point shard CAS lands (but before its ack is lost),
+    // let the competing client overwrite the key. That is a genuine single
+    // read-write commit that publishes *its own* `current_writer` in one shard
+    // CAS, so our subsequent read-back finds the pointer moved to a real,
+    // committed transaction — not a forged one.
+    backend.arm_after(lost_ack_after_racing(
+        shard_cas,
+        Box::new(move || {
+            Box::pin(async move {
+                other_coll.write(b"k", &write_int(99)).await.unwrap();
+                settle_writebacks().await;
+            })
+        }),
+    ));
 
     let res = increment(&db, &coll, b"k").await;
     assert!(
         matches!(res, Err(Error::InDoubt(_))),
-        "expected an in-doubt error, got {res:?}"
+        "a competing commit that moved the pointer after our lost-ack CAS is \
+         irreducibly in-doubt, got {res:?}"
     );
 
-    // The write landed exactly once. The engine must not have retried and
-    // applied it again: the value is 11, never 12.
-    let got = read_int(&coll.read(b"k").await.unwrap());
-    assert_eq!(
-        got, 11,
-        "value must be applied at most once (no double-apply)"
-    );
+    // The competitor's write is the durable one; our uncertain write did not win.
+    assert_eq!(read_int(&coll.read(b"k").await.unwrap()), 99);
 }
 
-/// The single-RW fast path: an in-doubt outcome on a conditional write that did
-/// *not* land (e.g. the backend exhausted its retry budget on transient errors)
-/// must be recovered transparently. The conditional write is idempotent under
-/// its own precondition, so the engine re-issues the *same* write unchanged: the
-/// object is still untouched, so the retry lands and commits exactly once — no
-/// `Error::InDoubt` is surfaced, and no double-apply happens.
-// Disabled in v2: see `single_rw_lost_ack_surfaces_in_doubt_without_double_apply`.
-// The logless single-RW value write no longer exists; the "in-doubt write that
-// did not land is retried transparently" property is exercised on the v2 commit
-// point by `logged_commit_lost_ack_retries_transparently`.
-#[ignore = "logless single-RW value-object path removed in v2"]
+/// The single read-write fast path: an in-doubt outcome on the commit-point
+/// shard CAS that did *not* land (e.g. the backend exhausted its retry budget on
+/// transient errors) is recovered transparently. Reading the shard back shows
+/// `current_writer` unchanged and the entry still committable, so the engine
+/// re-issues the idempotent CAS; the one-shot fault is spent, the retry lands,
+/// and the value commits exactly once — no `Error::InDoubt`, no double-apply.
 #[tokio::test(start_paused = true)]
 async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = FaultBackend::new(mem);
+    let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
 
-    // Seed the key so the read finds a value and the commit takes the single-RW
-    // fast path (which requires a found read version).
+    // Seed the key so the overwrite is an eligible single read-write.
     seed(&coll, b"k", 10).await;
 
-    // Trap the fast path's value write (a `write_if` on a key path `/_k/`):
-    // report it as in-doubt *without* applying it, modelling a write that never
-    // landed. The trap is one-shot, so the engine's idempotent re-issue lands.
-    backend.arm(Box::new(|kind, path, _value| {
-        if kind == "write_if" && path.contains("/_k/") {
-            Some(Action::Unavailable)
-        } else {
-            None
-        }
-    }));
+    settle_writebacks().await;
+
+    // Trap the commit-point shard CAS (a `write_if` on `/_s/`): report it as
+    // in-doubt *without* applying it, modelling a write that never landed. The
+    // hook is one-shot, so the engine's idempotent re-issue lands.
+    backend.arm_before(fail_before(shard_cas, || not_applied("write_if")));
 
     increment(&db, &coll, b"k")
         .await
-        .expect("an in-doubt write that did not land must be retried, not surfaced");
+        .expect("an in-doubt CAS that did not land must be retried, not surfaced");
 
     // The retry landed exactly once: 11, never 12 (double-apply) and never
     // unchanged (lost write).
@@ -314,7 +472,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 #[tokio::test(start_paused = true)]
 async fn logged_commit_lost_ack_retries_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = FaultBackend::new(mem);
+    let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
@@ -325,12 +483,9 @@ async fn logged_commit_lost_ack_retries_transparently() {
     let before = backend.committed_log_writes();
 
     // Trap the commit point: the transaction log written as committed (a write
-    // to a `/_t/` path tagged `commit-status=committed`). Let it land, then lose
+    // to a `/_t/` path whose body decodes as committed). Let it land, then lose
     // the ack.
-    backend.arm(Box::new(|_kind, path, value| {
-        let committed = path.contains("/_t/") && is_committed_tx_log(value);
-        committed.then_some(Action::LostAck)
-    }));
+    backend.arm_after(lost_ack_after(committed_log));
 
     // Two distinct writes force the locked, log-based commit path. Capture `coll`
     // by reference so the body stays `FnMut` (re-runnable on a retry).
@@ -369,7 +524,7 @@ async fn logged_commit_lost_ack_retries_transparently() {
 #[tokio::test(start_paused = true)]
 async fn lock_acquisition_lost_ack_retries_in_place() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = FaultBackend::new(mem);
+    let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
@@ -379,13 +534,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // Trap the first shard lock CAS (a `write_if` on a shard path `/_s/` — how a
     // lock is installed in v2). Let it land, then lose the ack: the lock is
     // actually applied but the locker observes `Unavailable`.
-    backend.arm(Box::new(|kind, path, _value| {
-        if kind == "write_if" && path.contains("/_s/") {
-            Some(Action::LostAck)
-        } else {
-            None
-        }
-    }));
+    backend.arm_after(lost_ack_after(shard_cas));
 
     // Two writes force the locked, log-based commit path. Capture `coll` by
     // reference so the body stays `FnMut` (re-runnable, though we expect no
@@ -405,35 +554,27 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     assert_eq!(read_int(&coll.read(b"b").await.unwrap()), 1);
 }
 
-/// A *clean* precondition (no lost ack) is a genuine conflict, and the engine
-/// must still resolve it transparently: the single-RW path retries and commits
-/// successfully, applying the increment exactly once. This guards against
-/// over-eagerly treating every precondition as in-doubt, which would break
-/// liveness (and the fault-free exact invariant) under normal contention.
-// Disabled in v2: the logless single-RW fast path it targets (a `write_if` on
-// `/_k/`) was removed. A clean conflict being retried transparently is still
-// covered for the v2 paths by the locker's shard-CAS precondition retry and by
-// the engine-level concurrency suites (e.g. `concurrent_rmw`).
-#[ignore = "logless single-RW value-object path removed in v2"]
+/// A *clean* precondition (no lost ack) on the fast path's commit-point shard
+/// CAS is a genuine lost race, and the engine still resolves it transparently:
+/// reading the shard back shows the entry unchanged and committable, so the CAS
+/// is re-issued and commits, applying the increment exactly once. This guards
+/// against over-eagerly treating every precondition as in-doubt, which would
+/// break liveness (and the fault-free exact invariant) under normal contention.
 #[tokio::test(start_paused = true)]
 async fn clean_conflict_on_single_rw_still_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = FaultBackend::new(mem);
+    let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     seed(&coll, b"k", 41).await;
 
-    // Inject one clean precondition on the first fast-path value write, without
-    // applying it: a genuine conflict that never landed. The fast path should
-    // re-read and retry, and the second attempt (trap consumed) commits.
-    backend.arm(Box::new(|kind, path, _value| {
-        if kind == "write_if" && path.contains("/_k/") {
-            Some(Action::Precondition)
-        } else {
-            None
-        }
-    }));
+    settle_writebacks().await;
+
+    // Inject one clean precondition on the commit-point shard CAS, without
+    // applying it: a genuine lost race that never landed. The fast path should
+    // reload and retry, and the second attempt (hook consumed) commits.
+    backend.arm_before(fail_before(shard_cas, || BackendError::Precondition));
 
     increment(&db, &coll, b"k")
         .await
