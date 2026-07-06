@@ -31,8 +31,8 @@ use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    LockType, PathLock, Shard, ShardEntry, ShardStore, StorageError, TxCommitStatus, TxLog,
-    TxWrite, ValueCache, Version,
+    LockType, PathLock, Shard, ShardStore, StorageError, TxCommitStatus, TxLog, TxWrite,
+    ValueCache, Version,
 };
 
 use crate::error::TransError;
@@ -181,9 +181,10 @@ enum SingleRwReload {
     /// `current_writer` already names us (a follow-on writer help-forwarded us
     /// into the chain): we are in the version chain (idempotent success).
     Landed,
-    /// The entry is still committable (unchanged and unlocked): re-issue the CAS
-    /// against this freshly loaded shard/version.
-    Retry(Shard, Option<backend::Version>),
+    /// The entry is still committable: re-issue the CAS against this freshly
+    /// loaded shard/version, help-forwarding the carried effective writer (the
+    /// resolved committed predecessor to build on).
+    Retry(Shard, Option<backend::Version>, TxId),
     /// The pointer moved to another writer, or the key is now locked by someone
     /// else: the fast path lost the race.
     Moved,
@@ -489,15 +490,18 @@ impl Algo {
         let idx = shard_index(&raw_key);
 
         // Load the shard and check dynamic eligibility before writing anything,
-        // so a create / stale read / locked entry falls back to the full path
-        // with the same id.
+        // so a create / stale read / genuinely-conflicting entry falls back to
+        // the full path with the same id. A lock left by an *already-committed*
+        // writer (its write-back is still pending) does not block us: it is
+        // help-forwarded to its effective writer, which is the predecessor we
+        // build on (ADR-027).
         let (shard, ver) = self.shards.load_shard(&prefix, idx).await?;
-        let committable = shard
-            .lookup(&raw_key)
-            .is_some_and(|e| single_rw_committable(e, read_version.as_ref()));
-        if !committable {
+        let Some(effective) = self
+            .single_rw_effective_writer(&key_path, &shard, &raw_key, read_version.as_ref())
+            .await?
+        else {
             return Ok(None);
-        }
+        };
 
         // Build the committed transaction object. It records the write (and the
         // pointer it will supersede, for GC's reverse check) plus the write lock
@@ -506,10 +510,11 @@ impl Algo {
         // the value cache: the cache is written only once the commit is
         // confirmed, so a fast path that ends up wounded or in-doubt never leaves
         // a stale entry keyed by an uncommitted writer.
-        let recorded_prev = shard
-            .lookup(&raw_key)
-            .and_then(|e| e.current_writer.clone())
-            .unwrap_or_default();
+        //
+        // The recorded predecessor is the resolved effective writer, so it names
+        // the true committed value even when the shard's `current_writer` pointer
+        // still lags behind a help-forwarded holder.
+        let recorded_prev = effective.clone();
         let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
         tl.locks = vec![PathLock {
             path: key_path.to_string(),
@@ -534,6 +539,7 @@ impl Algo {
             read_version.as_ref(),
             shard,
             ver,
+            effective,
         );
         let (object, lock) = tokio::join!(object, lock);
 
@@ -577,6 +583,7 @@ impl Algo {
         read_version: Option<&TxId>,
         mut shard: Shard,
         mut ver: Option<backend::Version>,
+        mut effective: TxId,
     ) -> Result<LockPublish, TransError> {
         for attempt in 0..SINGLE_RW_CAS_RETRIES {
             if attempt > 0 {
@@ -586,6 +593,14 @@ impl Algo {
                 if e.key == raw_key {
                     e.lock_type = LockType::Write;
                     e.locked_by = vec![tx.id.clone()];
+                    // Publish the resolved predecessor into the pointer: if we
+                    // are taking over from a committed-but-not-written-back
+                    // holder, this help-forwards its value so replacing it in
+                    // `locked_by` does not orphan it (its own write-back becomes
+                    // an idempotent no-op). For an already-published pointer this
+                    // is a no-op (ADR-027).
+                    e.current_writer = Some(effective.clone());
+                    e.deleted = false;
                 }
                 e
             }));
@@ -602,9 +617,10 @@ impl Algo {
                     .await?
                 {
                     SingleRwReload::Landed => return Ok(LockPublish::Landed),
-                    SingleRwReload::Retry(s, v) => {
+                    SingleRwReload::Retry(s, v, w) => {
                         shard = s;
                         ver = v;
+                        effective = w;
                     }
                     // The entry moved (or is now locked by someone else): our
                     // lock did not land. It is safe to renew.
@@ -617,9 +633,10 @@ impl Algo {
                         .await?
                     {
                         SingleRwReload::Landed => return Ok(LockPublish::Landed),
-                        SingleRwReload::Retry(s, v) => {
+                        SingleRwReload::Retry(s, v, w) => {
                             shard = s;
                             ver = v;
+                            effective = w;
                         }
                         // The one irreducible in-doubt: our lock CAS was
                         // uncertain and the entry then moved, so we cannot tell
@@ -649,14 +666,61 @@ impl Algo {
         id: &TxId,
     ) -> Result<SingleRwReload, TransError> {
         let (shard, ver) = self.shards.load_shard(prefix, idx).await?;
-        match shard.lookup(raw_key) {
-            Some(e) if e.locked_by.contains(id) || e.current_writer.as_ref() == Some(id) => {
-                Ok(SingleRwReload::Landed)
-            }
-            Some(e) if single_rw_committable(e, read_version) => {
-                Ok(SingleRwReload::Retry(shard, ver))
-            }
-            _ => Ok(SingleRwReload::Moved),
+        // Already in the chain: our lock is installed, or a follow-on writer
+        // help-forwarded us into the pointer.
+        if let Some(e) = shard.lookup(raw_key)
+            && (e.locked_by.contains(id) || e.current_writer.as_ref() == Some(id))
+        {
+            return Ok(SingleRwReload::Landed);
+        }
+        let key_path = paths::from_key(prefix, raw_key);
+        match self
+            .single_rw_effective_writer(&key_path, &shard, raw_key, read_version)
+            .await?
+        {
+            Some(effective) => Ok(SingleRwReload::Retry(shard, ver, effective)),
+            None => Ok(SingleRwReload::Moved),
+        }
+    }
+
+    /// Resolves `raw_key`'s entry in `shard` and returns the effective committed
+    /// writer the single read-write fast path must build on, or `None` when the
+    /// key cannot take the fast path's commit CAS.
+    ///
+    /// The entry is run through the shared [`Resolver`], so a lock held by an
+    /// already-committed writer (whose write-back is still pending) is
+    /// help-forwarded to its committed value rather than treated as a conflict:
+    /// only a *live pending* holder blocks the fast path (ADR-027). It also
+    /// rejects a create / put over a tombstone (a membership change needing the
+    /// collection lock) and, for a read-modify-write, a stale read whose value
+    /// has since been superseded.
+    async fn single_rw_effective_writer(
+        &self,
+        key_path: &str,
+        shard: &Shard,
+        raw_key: &[u8],
+        read_version: Option<&TxId>,
+    ) -> Result<Option<TxId>, TransError> {
+        let Some(entry) = shard.lookup(raw_key) else {
+            return Ok(None);
+        };
+        let res = self.resolver.resolve_holders(key_path, entry, None).await?;
+        // A live holder is a genuine conflict: defer to the full locked path so
+        // it can wound-wait. Committed/aborted holders never reach `pending`.
+        if !res.pending.is_empty() {
+            return Ok(None);
+        }
+        // The key must currently exist; a create or a put over a tombstone is a
+        // membership change that the fast path does not handle.
+        let writer = match res.writer {
+            Some(w) if !res.deleted => w,
+            _ => return Ok(None),
+        };
+        match read_version {
+            // A read-modify-write commits only if its read is still current.
+            Some(rv) if rv != &writer => Ok(None),
+            // A blind put (no read) is last-writer-wins and always serializable.
+            _ => Ok(Some(writer)),
         }
     }
 
@@ -924,24 +988,6 @@ impl Algo {
 fn feed_gc_hints(gc: &Gc, superseded: Vec<TxId>) {
     for prev in superseded {
         gc.schedule_tx_cleanup(prev);
-    }
-}
-
-/// Whether a shard entry can take the single read-write fast path's commit CAS:
-/// the key currently exists (committed value, not tombstoned) and is completely
-/// unlocked, and — when the transaction read it — its `current_writer` still
-/// matches the read version, so the read is not stale. A blind put (no read)
-/// only requires an existing, unlocked entry; last-writer-wins is serializable.
-fn single_rw_committable(entry: &ShardEntry, read_version: Option<&TxId>) -> bool {
-    if !entry.exists() {
-        return false;
-    }
-    if entry.lock_type != LockType::None || !entry.locked_by.is_empty() {
-        return false;
-    }
-    match read_version {
-        Some(rv) => entry.current_writer.as_ref() == Some(rv),
-        None => true,
     }
 }
 
@@ -1521,6 +1567,97 @@ mod tests {
         assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
         assert_eq!(c.root, 0, "no membership write: {c:?}");
         assert_eq!(entry(&tctx, b"k").await.unwrap().current_writer, Some(tid));
+    }
+
+    // ADR-027 regression: the fast path leaves a write lock held by the
+    // *committed* writer until its asynchronous write-back publishes the pointer
+    // and releases it. A single-key writer arriving in that window must treat the
+    // committed holder as effectively unlocked — help-forwarding it as the
+    // predecessor — and stay on the lock-free fast path, rather than bailing to
+    // the full locked path on the mere presence of the lock (the measured
+    // regression). A stale read still bails.
+    #[tokio::test]
+    async fn single_rw_committed_holder_stays_on_fast_path() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+        let idx = shard_index(b"k");
+        let raw = b"k".to_vec();
+
+        // H0 publishes v1; H1 overwrites with v2 through the fast path, leaving
+        // the pointer at H1 with no lock.
+        let h0 = commit_writes(&tm, vec![wa(&keyp, b"v1")])
+            .await
+            .id()
+            .clone();
+        let h1 = commit_writes(&tm, vec![wa(&keyp, b"v2")])
+            .await
+            .id()
+            .clone();
+
+        // Recreate the ADR-027 commit window before write-back: the lock is still
+        // held by the committed H1 while the pointer lags at its predecessor H0.
+        let (shard, ver) = tctx.shards.load_shard(TEST_COLL, idx).await.unwrap();
+        let windowed = Shard::from_entries(shard.entries().cloned().map(|mut e| {
+            if e.key == raw {
+                e.lock_type = LockType::Write;
+                e.locked_by = vec![h1.clone()];
+                e.current_writer = Some(h0.clone());
+                e.deleted = false;
+            }
+            e
+        }));
+        assert!(
+            tctx.shards
+                .store_shard(TEST_COLL, idx, &windowed, ver.as_ref())
+                .await
+                .unwrap()
+        );
+
+        // The window is observably at the committed holder H1 (v2), not the
+        // lagging pointer H0: the shared resolver already help-forwards it.
+        let r = do_read(&tctx, &keyp).await;
+        assert_eq!(r.version.clone().unwrap().last_writer, h1);
+
+        // Eligibility mirrors that resolution: an RMW that read H1 and a blind put
+        // are both committable and build on H1, while a read of the superseded H0
+        // is still rejected as stale.
+        let (shard, _) = tctx.shards.load_shard(TEST_COLL, idx).await.unwrap();
+        assert_eq!(
+            tm.single_rw_effective_writer(&keyp, &shard, &raw, Some(&h1))
+                .await
+                .unwrap(),
+            Some(h1.clone()),
+            "an RMW that read the committed holder builds on it"
+        );
+        assert_eq!(
+            tm.single_rw_effective_writer(&keyp, &shard, &raw, None)
+                .await
+                .unwrap(),
+            Some(h1.clone()),
+            "a blind put builds on the committed holder"
+        );
+        assert_eq!(
+            tm.single_rw_effective_writer(&keyp, &shard, &raw, Some(&h0))
+                .await
+                .unwrap(),
+            None,
+            "a read of the superseded value is still stale"
+        );
+
+        // End to end: the writer commits over H1 (help-forwarding it into the
+        // chain, not orphaning it), and its value reads back.
+        let mut h = tm.begin(Data {
+            reads: vec![r],
+            writes: vec![wa(&keyp, b"v3")],
+        });
+        let h2 = h.id().clone();
+        tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
+
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current_writer, Some(h2.clone()));
+        assert!(e.locked_by.is_empty());
+        assert_eq!(do_read(&tctx, &keyp).await.version.unwrap().last_writer, h2);
     }
 
     // ADR-027: the fast path's two commit writes are independent. If the lock CAS
