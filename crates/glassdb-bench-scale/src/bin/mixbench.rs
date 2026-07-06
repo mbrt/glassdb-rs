@@ -94,7 +94,7 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     hot_keys: usize,
     /// Simulated backend latency profile.
-    #[arg(long, default_value = "gcs", value_parser = ["gcs", "s3"])]
+    #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"])]
     delays: String,
     /// Compresses the simulated latencies/rate-limits by this factor (`1.0` =
     /// real-time; smaller runs faster). Must be > 0.
@@ -334,9 +334,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Selects and scales the simulated-latency profile.
 fn delay_profile(args: &Args) -> DelayOptions {
     let mut d = match args.delays.as_str() {
-        "s3" => s3_delays(),
-        // clap's value_parser guarantees "gcs" otherwise.
-        _ => gcs_delays(),
+        "gcs" => gcs_delays(),
+        // clap's value_parser guarantees "s3" otherwise.
+        _ => s3_delays(),
     };
     d.scale = args.delay_scale;
     d

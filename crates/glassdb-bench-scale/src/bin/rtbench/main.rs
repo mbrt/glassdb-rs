@@ -75,7 +75,7 @@ struct Args {
     #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3", "fakes3"])]
     backend: String,
     /// Delay profile for the memory backend.
-    #[arg(long, default_value = "gcs", value_parser = ["gcs", "s3"])]
+    #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"])]
     delays: String,
     /// Enable throttling (per-object write limit) for the memory backend.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
