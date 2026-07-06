@@ -7,6 +7,151 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## Single RW optimization II (ADR-027)
+
+### compare-refs summary
+
+- base: 80724534f0ea9d3b4a1769aea21cdaabe0d9024b (v1)
+- target: current worktree (v2)
+- ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
+
+### rw9010/balanced
+
+- throughput[strong-read]: ratio b/a min=0.99 median=1.00 max=1.29 (geomean=1.06)
+- throughput[weak-read]: ratio b/a min=0.99 median=1.00 max=1.29 (geomean=1.06)
+- throughput[write]: ratio b/a min=0.99 median=1.00 max=1.29 (geomean=1.06)
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.04 (geomean=1.01)
+- latency-p50[weak-read]: ratio b/a min=0.83 median=1.00 max=1.00 (geomean=0.96)
+- latency-p50[write]: ratio b/a min=0.99 median=1.00 max=1.03 (geomean=1.01)
+- retries: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00)
+- backend-ops/tx: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00)
+
+### rw9010/readheavy
+
+- throughput[strong-read]: ratio b/a min=0.98 median=0.99 max=1.01 (geomean=0.99)
+- throughput[weak-read]: ratio b/a min=0.98 median=0.99 max=1.01 (geomean=0.99)
+- throughput[write]: ratio b/a min=0.98 median=0.99 max=1.01 (geomean=0.99)
+- latency-p50[strong-read]: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+- latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00)
+- latency-p50[write]: ratio b/a min=0.99 median=1.00 max=1.00 (geomean=1.00)
+- retries: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+- backend-ops/tx: ratio b/a min=1.00 median=1.00 max=1.02 (geomean=1.00)
+
+### rw9010/writeheavy
+
+- throughput[strong-read]: ratio b/a min=0.98 median=0.99 max=1.05 (geomean=1.01)
+- throughput[weak-read]: ratio b/a min=0.98 median=0.99 max=1.05 (geomean=1.01)
+- throughput[write]: ratio b/a min=0.98 median=0.99 max=1.05 (geomean=1.01)
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00)
+- latency-p50[weak-read]: ratio b/a min=0.95 median=1.00 max=1.00 (geomean=0.99)
+- latency-p50[write]: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+- retries: ratio b/a min=0.99 median=1.00 max=1.02 (geomean=1.00)
+- backend-ops/tx: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+
+### deadlock
+
+- deadlock-p50: ratio b/a min=0.88 median=0.94 max=1.04 (geomean=0.95)
+- deadlock-p90: ratio b/a min=0.94 median=0.98 max=1.13 (geomean=1.00)
+
+### mixbench
+
+- mix-tps[roMulti]: ratio b/a min=0.98 median=1.07 max=1.44 (geomean=1.13)
+- mix-tps[roSingle]: ratio b/a min=0.98 median=1.01 max=1.09 (geomean=1.02)
+- mix-tps[rwMany]: ratio b/a min=0.63 median=0.87 max=1.00 (geomean=0.83)
+- mix-tps[rwSingle]: ratio b/a min=0.43 median=1.11 max=2.05 (geomean=1.01)
+- mix-ops/tx[hi/roMulti]: ratio b/a min=0.66 median=0.66 max=0.66 (geomean=0.66)
+- mix-ops/tx[hi/roSingle]: ratio b/a min=0.96 median=0.96 max=0.96 (geomean=0.96)
+- mix-ops/tx[hi/rwMany]: ratio b/a min=1.18 median=1.18 max=1.18 (geomean=1.18)
+- mix-ops/tx[hi/rwSingle]: ratio b/a min=1.22 median=1.22 max=1.22 (geomean=1.22)
+- mix-ops/tx[lo/roMulti]: ratio b/a min=0.99 median=0.99 max=0.99 (geomean=0.99)
+- mix-ops/tx[lo/roSingle]: ratio b/a min=0.99 median=0.99 max=0.99 (geomean=0.99)
+- mix-ops/tx[lo/rwMany]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01)
+- mix-ops/tx[lo/rwSingle]: ratio b/a min=1.41 median=1.41 max=1.41 (geomean=1.41)
+- mix-retries/tx[hi]: ratio b/a min=0.35 median=0.88 max=1.20 (geomean=0.74)
+- mix-retries/tx[lo]: ratio b/a min=0.85 median=0.98 max=1.48 (geomean=1.05)
+- mix-agg-ops/tx[hi]: ratio b/a min=0.96 median=0.96 max=0.96 (geomean=0.96)
+- mix-agg-ops/tx[lo]: ratio b/a min=0.87 median=0.87 max=0.87 (geomean=0.87)
+
+### efficiency
+
+- autoresearch-score: v1=967.98 v2=982.09 ratio=1.015
+- autoresearch-cost/tx: ratio b/a min=0.98 median=1.00 max=1.10 (geomean=1.01)
+- autoresearch-ops/tx: ratio b/a min=0.98 median=1.00 max=1.10 (geomean=1.01)
+
+## Single RW optimization (ADR-020)
+
+The end of implementation of ADR-020, which optimizes single read/write
+transactions.
+
+### compare-refs summary
+
+- base: 55b5f7f72ef2919af41faefb4a3681c03349cb15 (v1)
+- target: 80724534f0ea9d3b4a1769aea21cdaabe0d9024b (v2)
+- ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
+
+### rw9010/balanced
+
+- throughput[strong-read]: ratio b/a min=0.91 median=0.98 max=1.02 (geomean=0.97)
+- throughput[weak-read]: ratio b/a min=0.91 median=0.98 max=1.02 (geomean=0.97)
+- throughput[write]: ratio b/a min=0.91 median=0.98 max=1.02 (geomean=0.97)
+- latency-p50[strong-read]: ratio b/a min=0.99 median=1.00 max=1.02 (geomean=1.00)
+- latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.10 (geomean=1.02)
+- latency-p50[write]: ratio b/a min=0.99 median=1.01 max=1.02 (geomean=1.01)
+- retries: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
+- backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
+
+### rw9010/readheavy
+
+- throughput[strong-read]: ratio b/a min=0.99 median=1.00 max=1.03 (geomean=1.00)
+- throughput[weak-read]: ratio b/a min=0.99 median=1.00 max=1.03 (geomean=1.00)
+- throughput[write]: ratio b/a min=0.99 median=1.00 max=1.03 (geomean=1.00)
+- latency-p50[strong-read]: ratio b/a min=0.97 median=0.99 max=1.00 (geomean=0.99)
+- latency-p50[weak-read]: ratio b/a min=0.90 median=1.00 max=1.12 (geomean=1.00)
+- latency-p50[write]: ratio b/a min=0.99 median=1.00 max=1.00 (geomean=0.99)
+- retries: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
+- backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00)
+
+### rw9010/writeheavy
+
+- throughput[strong-read]: ratio b/a min=0.92 median=0.97 max=1.01 (geomean=0.97)
+- throughput[weak-read]: ratio b/a min=0.92 median=0.97 max=1.01 (geomean=0.97)
+- throughput[write]: ratio b/a min=0.92 median=0.97 max=1.01 (geomean=0.97)
+- latency-p50[strong-read]: ratio b/a min=0.98 median=1.00 max=1.00 (geomean=1.00)
+- latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.05 (geomean=1.01)
+- latency-p50[write]: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
+- retries: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+- backend-ops/tx: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+
+### deadlock
+
+- deadlock-p50: ratio b/a min=0.85 median=0.95 max=1.02 (geomean=0.94)
+- deadlock-p90: ratio b/a min=0.89 median=0.98 max=1.02 (geomean=0.97)
+
+### mixbench
+
+- mix-tps[roMulti]: ratio b/a min=0.83 median=1.09 max=1.15 (geomean=1.03)
+- mix-tps[roSingle]: ratio b/a min=0.78 median=1.05 max=1.15 (geomean=1.00)
+- mix-tps[rwMany]: ratio b/a min=0.53 median=1.16 max=1.19 (geomean=0.96)
+- mix-tps[rwSingle]: ratio b/a min=0.41 median=0.80 max=1.36 (geomean=0.77)
+- mix-ops/tx[hi/roMulti]: ratio b/a min=1.07 median=1.07 max=1.07 (geomean=1.07)
+- mix-ops/tx[hi/roSingle]: ratio b/a min=1.05 median=1.05 max=1.05 (geomean=1.05)
+- mix-ops/tx[hi/rwMany]: ratio b/a min=0.98 median=0.98 max=0.98 (geomean=0.98)
+- mix-ops/tx[hi/rwSingle]: ratio b/a min=0.98 median=0.98 max=0.98 (geomean=0.98)
+- mix-ops/tx[lo/roMulti]: ratio b/a min=0.99 median=0.99 max=0.99 (geomean=0.99)
+- mix-ops/tx[lo/roSingle]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00)
+- mix-ops/tx[lo/rwMany]: ratio b/a min=0.98 median=0.98 max=0.98 (geomean=0.98)
+- mix-ops/tx[lo/rwSingle]: ratio b/a min=0.63 median=0.63 max=0.63 (geomean=0.63)
+- mix-retries/tx[hi]: ratio b/a min=0.89 median=1.11 max=1.34 (geomean=1.10)
+- mix-retries/tx[lo]: ratio b/a min=0.86 median=1.00 max=1.67 (geomean=1.09)
+- mix-agg-ops/tx[hi]: ratio b/a min=0.96 median=0.96 max=0.96 (geomean=0.96)
+- mix-agg-ops/tx[lo]: ratio b/a min=0.87 median=0.87 max=0.87 (geomean=0.87)
+
+### efficiency
+
+- autoresearch-score: v1=924.85 v2=942.15 ratio=1.019
+- autoresearch-cost/tx: ratio b/a min=0.87 median=1.00 max=1.27 (geomean=1.02)
+- autoresearch-ops/tx: ratio b/a min=0.88 median=1.00 max=1.29 (geomean=1.03)
+
 ## ADR-025 - ADR-026
 
 Caching improvements and lock-dedup work.
