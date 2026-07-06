@@ -29,11 +29,14 @@
 # the end of every run (same as `--clean`).
 #
 # `--summary` runs every section that feeds summary.md (rw9010 mixes, deadlock,
-# mixbench, efficiency) but with much smaller windows, two concurrency points, a
-# single autoresearch repeat, and no overlay PNGs. It produces the same
-# summary.md sections an order of magnitude faster than the full sweep, at the
-# cost of noisier ratios and no plots. Explicit env tunables still override the
-# fast defaults.
+# mixbench, efficiency) but with much smaller windows, two concurrency points,
+# and no overlay PNGs. It keeps a few repeats for the low-variance signals (the
+# deterministic autoresearch score and the rw9010 sweep) so the digest's
+# min/median/max are not single-sample false precision; the noisy mixbench
+# section stays single-run and is flagged as such in the digest. It produces the
+# same summary.md sections an order of magnitude faster than the full sweep, at
+# the cost of noisier ratios and no plots. Explicit env tunables still override
+# the fast defaults.
 #
 # Usage:
 #   hack/aws-bench/compare-refs.sh            # main (v1) vs current worktree
@@ -51,9 +54,9 @@
 #   DB_LIST=1,10,20,40 / 1,10   rw9010 concurrency points (number of Databases)
 #   NUM_KEYS=5000           rw9010 key count
 #   DURATION=15s / 3s       rw9010 duration per concurrency step
-#   NUM_RUNS=1              repeat each sweep (tighter percentile bands)
+#   NUM_RUNS=1 / 2          repeat each rw9010/deadlock sweep (tighter bands)
 #   DEADLOCK_DURATION=8s / 3s   deadlock duration per contention configuration
-#   COUNT=5 / 1             autoresearch suite repeats (reports the median)
+#   COUNT=5 / 3             autoresearch suite repeats (reports the median)
 #   RW_MIX="balanced readheavy writeheavy"   rw9010 mixes to run
 #   MIX_DURATION=2s / 1s    mixbench measured window per shape
 #   MIX_MODES=lo,hi         mixbench contention modes to sweep
@@ -96,7 +99,13 @@ if [ "$SUMMARY" = "1" ]; then
   DB_LIST="${DB_LIST:-1,10}"
   DURATION="${DURATION:-3s}"
   DEADLOCK_DURATION="${DEADLOCK_DURATION:-3s}"
-  COUNT="${COUNT:-1}"
+  # A few repeats even in the fast path: the autoresearch score and the rw9010
+  # sweep are the low-variance signals worth trusting, and a single sample
+  # collapses the digest's min/median/max into false precision. Cheap because
+  # both are short; the noisy mixbench section stays single-run (flagged as
+  # such in the digest).
+  COUNT="${COUNT:-3}"
+  NUM_RUNS="${NUM_RUNS:-2}"
   MIX_DURATION="${MIX_DURATION:-1s}"
 else
   DELAY_SCALE="${DELAY_SCALE:-0.05}"
@@ -104,10 +113,10 @@ else
   DURATION="${DURATION:-15s}"
   DEADLOCK_DURATION="${DEADLOCK_DURATION:-8s}"
   COUNT="${COUNT:-5}"
+  NUM_RUNS="${NUM_RUNS:-1}"
   MIX_DURATION="${MIX_DURATION:-2s}"
 fi
 NUM_KEYS="${NUM_KEYS:-5000}"
-NUM_RUNS="${NUM_RUNS:-1}"
 RW_MIX="${RW_MIX:-balanced readheavy writeheavy}"
 # mixbench (mixed-workload contention grid) tunables. Skipped automatically for
 # any ref that predates the binary (e.g. an old BASE).
@@ -284,6 +293,12 @@ mkdir -p "$OUT"
   echo "- base: $BASE ($LABEL_A)"
   echo "- target: $TARGET_DESC ($LABEL_B)"
   echo "- ratio = $LABEL_B / $LABEL_A (throughput >1 good; latency/ops/cost <1 good)"
+  echo "- each line ends in a \`=> better/WORSE/~same\` verdict read in that"
+  echo "  metric's own direction, so no axis has to be interpreted by hand"
+  echo "- \`autoresearch-*\` is **deterministic** (single-client backend ops/tx,"
+  echo "  lower is better) — the most trustworthy signal; \`mix-*\` and"
+  echo "  \`deadlock-*\` are **[noisy]** (contention-bound, short windows) and"
+  echo "  \`[low-sample]\` marks a folded cell below the trust floor"
   echo
 } >"$SUMMARY"
 

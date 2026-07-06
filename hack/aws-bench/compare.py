@@ -98,6 +98,29 @@ def _geomean(s: pd.Series) -> float:
     return float(np.exp(np.log(s).mean()))
 
 
+# Below this many committed transactions a folded cell is too small to trust as
+# throughput signal (e.g. mixbench hi-mode `rwMany`, which commits only a handful
+# per short window); its ratio is flagged `[low-sample]` in the digest.
+LOW_SAMPLE_FLOOR = 1000
+
+# Ratios within +/- this of 1.0 are called `~same` rather than better/worse, so
+# run-to-run jitter is not read as a real move.
+SAME_TOL = 0.02
+
+
+def _verdict(ratio: float, lower_is_better: bool | None) -> str:
+    """A direction-aware `=> better/WORSE/~same` tag for a ratio (b/a), or an
+    empty string when the metric has no meaningful direction (or the ratio is
+    NaN). `lower_is_better` encodes the metric's polarity: cost/latency/ops/
+    retries improve as the ratio drops, throughput as it rises."""
+    if lower_is_better is None or ratio != ratio:
+        return ""
+    if abs(ratio - 1.0) <= SAME_TOL:
+        return " => ~same"
+    good = (ratio < 1.0) if lower_is_better else (ratio > 1.0)
+    return " => better" if good else " => WORSE"
+
+
 def backend_ops_series(df: pd.DataFrame) -> pd.Series:
     """Total backend round-trips per row: the `backend-ops` column if present,
     else the sum of whatever per-class op columns exist (back-compat)."""
@@ -267,6 +290,8 @@ def mixbench_shape_table(a: list, b: list) -> pd.DataFrame:
                     "mode": mode,
                     "topology": topo,
                     "shape": shape,
+                    "committed_a": x.get("committed", float("nan")),
+                    "committed_b": y.get("committed", float("nan")),
                     "tps_a": x.get("txPerSec", float("nan")),
                     "tps_b": y.get("txPerSec", float("nan")),
                     "tps-ratio": _ratio(y.get("txPerSec", 0), x.get("txPerSec", 0)),
@@ -337,22 +362,56 @@ def print_table(title: str, df: pd.DataFrame) -> None:
         print(df.to_string(index=False))
 
 
-def summarize(name: str, ratios: pd.Series) -> str:
+def summarize(
+    name: str,
+    ratios: pd.Series,
+    *,
+    lower_is_better: bool | None = None,
+    samples: pd.Series | None = None,
+    noisy: bool = False,
+) -> str:
+    """One digest line for a set of ratios.
+
+    `lower_is_better` adds a direction-aware verdict. `samples` (per-cell
+    committed-transaction counts) surfaces the smallest folded cell so a
+    near-empty measurement is not mistaken for signal, flagging it `[low-sample]`
+    below [`LOW_SAMPLE_FLOOR`]. `noisy` marks metrics that are only indicative
+    (run-to-run variable) rather than deterministic. A single ratio is reported
+    as one value — never as a fake `min=median=max` distribution."""
     r = pd.Series(ratios).dropna()
     if r.empty:
         return f"{name}: no data"
-    return (
-        f"{name}: ratio b/a min={r.min():.2f} median={r.median():.2f} "
-        f"max={r.max():.2f} (geomean={_geomean(r):.2f})"
-    )
+
+    tag = " [noisy]" if noisy else ""
+    n_note = ""
+    if samples is not None:
+        s = pd.Series(samples).dropna()
+        if not s.empty:
+            n_note = f" n_min={int(s.min())}"
+            if s.min() < LOW_SAMPLE_FLOOR:
+                tag += " [low-sample]"
+
+    if len(r) == 1:
+        v = float(r.iloc[0])
+        body = f"ratio b/a={v:.2f} (1 point)"
+        verdict = _verdict(v, lower_is_better)
+    else:
+        body = (
+            f"ratio b/a min={r.min():.2f} median={r.median():.2f} "
+            f"max={r.max():.2f} (geomean={_geomean(r):.2f}, n={len(r)})"
+        )
+        verdict = _verdict(r.median(), lower_is_better)
+    return f"{name}{tag}: {body}{n_note}{verdict}"
 
 
 def append_summary(path: Path, title: str, summaries: list[str]) -> None:
     """Append a small markdown section for this comparison to ``path``.
 
     The shell driver points every comparison at the same file so the result is
-    one compact, trackable digest per run (deterministic for the autoresearch
-    score, noisy but indicative for the rtbench ratios)."""
+    one compact, trackable digest per run. Each line carries its own polarity
+    verdict (`=> better/WORSE/~same`) and, where relevant, a sample-size note and
+    a `[noisy]`/`[low-sample]` tag; the autoresearch section is deterministic,
+    the mixbench and deadlock sections are indicative only."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"## {title or 'comparison'}", ""]
     if summaries:
@@ -527,7 +586,9 @@ def main() -> int:
         cols = ["concurrent", "tx-type", "total-tps_a", "total-tps_b", "ratio"]
         print_table(f"Throughput (total tx/s, {lb}/{la})", tbl[cols])
         for tx_type, grp in tbl.groupby("tx-type"):
-            summaries.append(summarize(f"throughput[{tx_type}]", grp["ratio"]))
+            summaries.append(
+                summarize(f"throughput[{tx_type}]", grp["ratio"], lower_is_better=False)
+            )
 
     a_la, b_la = read_csv(args.a, "samples.csv"), read_csv(args.b, "samples.csv")
     if a_la is not None and b_la is not None:
@@ -545,38 +606,55 @@ def main() -> int:
             f"Latency (ms; p50 values + percentile {lb}/{la} ratios)", tbl[cols]
         )
         for tx_type, grp in tbl.groupby("tx-type"):
-            summaries.append(summarize(f"latency-p50[{tx_type}]", grp["p50-ratio"]))
+            summaries.append(
+                summarize(
+                    f"latency-p50[{tx_type}]", grp["p50-ratio"], lower_is_better=True
+                )
+            )
 
     a_st, b_st = read_csv(args.a, "stats.csv"), read_csv(args.b, "stats.csv")
     if a_st is not None and b_st is not None:
         tbl = retries_table(a_st, b_st, cpd)
         cols = ["concurrent", "retries-per-tx_a", "retries-per-tx_b", "ratio"]
         print_table(f"Retries per transaction ({lb}/{la})", tbl[cols])
-        summaries.append(summarize("retries", tbl["ratio"]))
+        summaries.append(summarize("retries", tbl["ratio"], lower_is_better=True))
 
         tbl = backend_ops_table(a_st, b_st, cpd)
         cols = ["concurrent", "ops-per-tx_a", "ops-per-tx_b", "ratio"]
         print_table(f"Backend round-trips per transaction ({lb}/{la})", tbl[cols])
-        summaries.append(summarize("backend-ops/tx", tbl["ratio"]))
+        summaries.append(
+            summarize("backend-ops/tx", tbl["ratio"], lower_is_better=True)
+        )
 
     a_dl, b_dl = read_csv(args.a, "deadlock.csv"), read_csv(args.b, "deadlock.csv")
     if a_dl is not None and b_dl is not None:
         tbl = deadlock_table(a_dl, b_dl)
         print_table(f"Deadlock latency at 100% overlap (ms, {lb}/{la})", tbl)
-        summaries.append(summarize("deadlock-p50", tbl["p50-ratio"]))
-        summaries.append(summarize("deadlock-p90", tbl["p90-ratio"]))
+        summaries.append(
+            summarize(
+                "deadlock-p50", tbl["p50-ratio"], lower_is_better=True, noisy=True
+            )
+        )
+        summaries.append(
+            summarize(
+                "deadlock-p90", tbl["p90-ratio"], lower_is_better=True, noisy=True
+            )
+        )
 
     a_sc, b_sc = read_json(args.a, "score.json"), read_json(args.b, "score.json")
     if a_sc is not None and b_sc is not None:
         sa, sb = a_sc.get("score"), b_sc.get("score")
         if sa is not None and sb is not None:
             print("\n## Autoresearch primary score (cost/tx geomean, lower = better)\n")
-            print(
-                f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={_ratio(sb, sa):.3f}"
-            )
+            score_ratio = _ratio(sb, sa)
+            print(f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={score_ratio:.3f}")
+            # Deterministic single-client backend-ops-per-tx cost: the direction
+            # is spelled out because a *lower* score is better (unlike throughput),
+            # which is the axis most easily misread.
             summaries.append(
-                f"autoresearch-score: {la}={sa:.2f} {lb}={sb:.2f} "
-                f"ratio={_ratio(sb, sa):.3f}"
+                "autoresearch-score (cost/tx geomean, lower=better) [deterministic]: "
+                f"{la}={sa:.2f} {lb}={sb:.2f} ratio b/a={score_ratio:.3f}"
+                f"{_verdict(score_ratio, True)}"
             )
         tbl = efficiency_table(a_sc, b_sc)
         cols = [
@@ -590,8 +668,25 @@ def main() -> int:
         ]
         print_table(f"Autoresearch per-workload cost/ops per tx ({lb}/{la})", tbl[cols])
         if not tbl.empty:
-            summaries.append(summarize("autoresearch-cost/tx", tbl["cost-ratio"]))
-            summaries.append(summarize("autoresearch-ops/tx", tbl["ops-ratio"]))
+            summaries.append(
+                summarize(
+                    "autoresearch-cost/tx", tbl["cost-ratio"], lower_is_better=True
+                )
+            )
+            summaries.append(
+                summarize("autoresearch-ops/tx", tbl["ops-ratio"], lower_is_better=True)
+            )
+            # Per-workload cost so a big localized change (e.g. singleRMW) is not
+            # diluted by the geomean; this is the deterministic signal that most
+            # cleanly attributes a single-RW / read / batch effect.
+            for _, row in tbl.sort_values("cost-ratio").iterrows():
+                summaries.append(
+                    summarize(
+                        f"autoresearch-cost/tx[{row['workload']}]",
+                        pd.Series([row["cost-ratio"]]),
+                        lower_is_better=True,
+                    )
+                )
 
     a_mx, b_mx = read_json(args.a, "mixbench.json"), read_json(args.b, "mixbench.json")
     if a_mx is not None and b_mx is not None:
@@ -612,27 +707,58 @@ def main() -> int:
             ]
             print_table(f"mixbench per-shape ({lb}/{la})", tbl[cols])
             # Throughput ratio per shape (geomean folds the mode/topology cells).
+            # Marked noisy and carrying the smallest folded commit count: the
+            # hi-contention write shapes commit only a handful per short window,
+            # so their tps ratio is indicative at best (see LOW_SAMPLE_FLOOR).
             for shape, grp in tbl.groupby("shape"):
-                summaries.append(summarize(f"mix-tps[{shape}]", grp["tps-ratio"]))
+                summaries.append(
+                    summarize(
+                        f"mix-tps[{shape}]",
+                        grp["tps-ratio"],
+                        lower_is_better=False,
+                        samples=grp["committed_b"],
+                        noisy=True,
+                    )
+                )
             # ops/tx + retries/tx are per-shape only where a shape owns its DBs
             # (the `per-shape` topology); keep the mode split so the hi-contention
             # dedup signal is not washed out.
             ops = tbl.dropna(subset=["ops-ratio"])
             for (mode, shape), grp in ops.groupby(["mode", "shape"]):
                 summaries.append(
-                    summarize(f"mix-ops/tx[{mode}/{shape}]", grp["ops-ratio"])
+                    summarize(
+                        f"mix-ops/tx[{mode}/{shape}]",
+                        grp["ops-ratio"],
+                        lower_is_better=True,
+                        samples=grp["committed_b"],
+                    )
                 )
             for mode, grp in ops.groupby("mode"):
                 summaries.append(
-                    summarize(f"mix-retries/tx[{mode}]", grp["retries-ratio"])
+                    summarize(
+                        f"mix-retries/tx[{mode}]",
+                        grp["retries-ratio"],
+                        lower_is_better=True,
+                        noisy=True,
+                    )
                 )
         agg = mixbench_aggregate_table(a_mx, b_mx)
         if not agg.empty:
             print_table(f"mixbench shared-DB aggregate ops/tx ({lb}/{la})", agg)
             for mode, grp in agg.groupby("mode"):
-                summaries.append(summarize(f"mix-agg-ops/tx[{mode}]", grp["ops-ratio"]))
+                summaries.append(
+                    summarize(
+                        f"mix-agg-ops/tx[{mode}]",
+                        grp["ops-ratio"],
+                        lower_is_better=True,
+                    )
+                )
 
-    print("\n## Summary (ratio = b/a; throughput >1 good, latency/ops/cost <1 good)\n")
+    print(
+        "\n## Summary (ratio = b/a; throughput >1 good, latency/ops/cost <1 good; "
+        "=> tag reads the right direction per metric; [noisy]/[low-sample] = "
+        "indicative only)\n"
+    )
     for s in summaries:
         print(f"- {s}")
     if not summaries:
