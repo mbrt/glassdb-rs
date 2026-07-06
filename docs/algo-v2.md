@@ -351,11 +351,15 @@ Group B — protocol details:
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
       (ADR-020). The single-RW fast path's shard-CAS commit point is a further
-      in-doubt site that lands with its deferred follow-up (see below).
+      in-doubt site (see below): a lost ack resolves by reading the shard back,
+      leaving one irreducible in-doubt (a fast follow-on writer moved the pointer).
 - [x] Read-only fast-path shape in the new layout (ADR-020).
-- [ ] Single-RW fast path. The integrated engine routes every read-write
-      transaction (including a single-key write touching one shard) through the
-      full locked + logged commit path
+- [x] Single-RW fast path (ADR-020). A read-write transaction that overwrites a
+      single existing key commits with two operations — write the committed
+      transaction object, then one shard CAS publishing `current_writer` — with
+      no lock, no lease, and no write-back. The shard CAS is the commit point;
+      ineligible transactions (create/delete, multi-key, cross-key reads, stale
+      reads, locked entries) fall back to the full locked + logged path.
 
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):

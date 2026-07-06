@@ -377,6 +377,69 @@ impl Monitor {
         })
     }
 
+    /// Writes a transaction's final (committed or aborted) log object with
+    /// create-if-absent + CAS and in-doubt robustness (ADR-009).
+    pub(crate) async fn set_final_log(&self, tlog: &TxLog) -> Result<(), TransError> {
+        let tid = &tlog.id;
+        if tid.is_unset() {
+            return Err(TransError::other("missing required tlog ID"));
+        }
+        let mut last_v = {
+            let st = self.shard_for(tid).lock().unwrap();
+            st.local_tx
+                .get(tid)
+                .map(|e| e.last_version.clone())
+                .unwrap_or_default()
+        };
+
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            let r = if last_v.is_unset() {
+                self.inner.tl.set(tlog).await
+            } else {
+                self.inner.tl.set_if(tlog, &last_v).await
+            };
+            match r {
+                Ok(_) => return Ok(()),
+                Err(StorageError::Precondition) => {
+                    // The version moved under us. Possible races: our own
+                    // `refresh_pending` advancing the pending log, a wound
+                    // from another client writing `aborted`, or our own
+                    // previously-landed write (e.g. an `Unavailable` retry
+                    // below). Re-read and decide:
+                    //   - Status still `Pending`: it's a non-final race; it is
+                    //     always safe to refresh `last_v` and retry.
+                    //   - Status matches what we are writing: either us (only
+                    //     we write `committed` for our own tx id) or a wound
+                    //     that converged to the same outcome we wanted (only
+                    //     possible for `aborted`). Either way the desired
+                    //     final state is durable -> success.
+                    //   - Status final but mismatched (we wanted `committed`,
+                    //     found `aborted`): a wound landed first -> surface as
+                    //     `AlreadyFinalized` so the commit path treats it as a
+                    //     wound.
+                    let st = self.inner.tl.commit_status(tid).await?;
+                    if st.status == tlog.status {
+                        return Ok(());
+                    }
+                    if st.status.is_final() {
+                        return Err(TransError::AlreadyFinalized);
+                    }
+                    last_v = st.version;
+                }
+                // In-doubt outcome: the log write may or may not have landed.
+                // It is always safe to retry as long as the log status was not
+                // final: a not-yet-final log can only become final by a write
+                // that converges on our intent (us or a wound to `aborted`),
+                // and the precondition branch above resolves the matching /
+                // mismatched final outcomes correctly.
+                Err(StorageError::Unavailable(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
+    }
+
     /// Force-aborts a specific pending version of a transaction, the ADR-022 GC
     /// reclaim of a dead pending object. It is the *same* official sequence a
     /// contended lease expiry uses ([`Monitor::force_abort`]): CAS `pending →
@@ -624,67 +687,6 @@ impl Monitor {
             };
             if !alive {
                 return s;
-            }
-            rt::sleep(backoff.next_delay()).await;
-        }
-    }
-
-    async fn set_final_log(&self, tlog: &TxLog) -> Result<(), TransError> {
-        let tid = &tlog.id;
-        if tid.is_unset() {
-            return Err(TransError::other("missing required tlog ID"));
-        }
-        let mut last_v = {
-            let st = self.shard_for(tid).lock().unwrap();
-            st.local_tx
-                .get(tid)
-                .map(|e| e.last_version.clone())
-                .unwrap_or_default()
-        };
-
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            let r = if last_v.is_unset() {
-                self.inner.tl.set(tlog).await
-            } else {
-                self.inner.tl.set_if(tlog, &last_v).await
-            };
-            match r {
-                Ok(_) => return Ok(()),
-                Err(StorageError::Precondition) => {
-                    // The version moved under us. Possible races: our own
-                    // `refresh_pending` advancing the pending log, a wound
-                    // from another client writing `aborted`, or our own
-                    // previously-landed write (e.g. an `Unavailable` retry
-                    // below). Re-read and decide:
-                    //   - Status still `Pending`: it's a non-final race; it is
-                    //     always safe to refresh `last_v` and retry.
-                    //   - Status matches what we are writing: either us (only
-                    //     we write `committed` for our own tx id) or a wound
-                    //     that converged to the same outcome we wanted (only
-                    //     possible for `aborted`). Either way the desired
-                    //     final state is durable -> success.
-                    //   - Status final but mismatched (we wanted `committed`,
-                    //     found `aborted`): a wound landed first -> surface as
-                    //     `AlreadyFinalized` so the commit path treats it as a
-                    //     wound.
-                    let st = self.inner.tl.commit_status(tid).await?;
-                    if st.status == tlog.status {
-                        return Ok(());
-                    }
-                    if st.status.is_final() {
-                        return Err(TransError::AlreadyFinalized);
-                    }
-                    last_v = st.version;
-                }
-                // In-doubt outcome: the log write may or may not have landed.
-                // It is always safe to retry as long as the log status was not
-                // final: a not-yet-final log can only become final by a write
-                // that converges on our intent (us or a wound to `aborted`),
-                // and the precondition branch above resolves the matching /
-                // mismatched final outcomes correctly.
-                Err(StorageError::Unavailable(_)) => {}
-                Err(e) => return Err(e.into()),
             }
             rt::sleep(backoff.next_delay()).await;
         }
