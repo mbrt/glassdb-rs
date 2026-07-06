@@ -32,11 +32,11 @@
 # mixbench, efficiency) but with much smaller windows, two concurrency points,
 # and no overlay PNGs. It keeps a few repeats for the low-variance signals (the
 # deterministic autoresearch score and the rw9010 sweep) so the digest's
-# min/median/max are not single-sample false precision; the noisy mixbench
-# section stays single-run and is flagged as such in the digest. It produces the
+# min/median/max are not single-sample false precision; mixbench self-terminates
+# at a (looser, faster) target CI so its ratios stay significant. It produces the
 # same summary.md sections an order of magnitude faster than the full sweep, at
-# the cost of noisier ratios and no plots. Explicit env tunables still override
-# the fast defaults.
+# the cost of coarser CIs and no plots. Explicit env tunables still override the
+# fast defaults.
 #
 # Usage:
 #   hack/aws-bench/compare-refs.sh            # main (v1) vs current worktree
@@ -58,7 +58,10 @@
 #   DEADLOCK_DURATION=8s / 3s   deadlock duration per contention configuration
 #   COUNT=5 / 3             autoresearch suite repeats (reports the median)
 #   RW_MIX="balanced readheavy writeheavy"   rw9010 mixes to run
-#   MIX_DURATION=2s / 1s    mixbench measured window per shape
+#   MIX_DURATION=2s / 1s    mixbench minimum measured window per cell
+#   MIX_MAX_DURATION=60s / 20s  mixbench per-cell time cap (upper bound)
+#   MIX_TARGET_CI=0.1 / 0.2 mixbench target throughput 95% CI half-width; the
+#                           cell runs until every shape reaches it or the cap
 #   MIX_MODES=lo,hi         mixbench contention modes to sweep
 #   MIX_TOPOLOGIES=shared,per-shape          mixbench Database topologies
 #   MIX_WORKERS=8           mixbench workers per shape
@@ -102,11 +105,13 @@ if [ "$SUMMARY" = "1" ]; then
   # A few repeats even in the fast path: the autoresearch score and the rw9010
   # sweep are the low-variance signals worth trusting, and a single sample
   # collapses the digest's min/median/max into false precision. Cheap because
-  # both are short; the noisy mixbench section stays single-run (flagged as
-  # such in the digest).
+  # both are short. mixbench self-terminates at its target CI (no repeats
+  # needed), but a looser CI and shorter cap keep the fast path fast.
   COUNT="${COUNT:-3}"
   NUM_RUNS="${NUM_RUNS:-2}"
   MIX_DURATION="${MIX_DURATION:-1s}"
+  MIX_MAX_DURATION="${MIX_MAX_DURATION:-20s}"
+  MIX_TARGET_CI="${MIX_TARGET_CI:-0.2}"
 else
   DELAY_SCALE="${DELAY_SCALE:-0.05}"
   DB_LIST="${DB_LIST:-1,10,20,40}"
@@ -115,6 +120,8 @@ else
   COUNT="${COUNT:-5}"
   NUM_RUNS="${NUM_RUNS:-1}"
   MIX_DURATION="${MIX_DURATION:-2s}"
+  MIX_MAX_DURATION="${MIX_MAX_DURATION:-60s}"
+  MIX_TARGET_CI="${MIX_TARGET_CI:-0.1}"
 fi
 NUM_KEYS="${NUM_KEYS:-5000}"
 RW_MIX="${RW_MIX:-balanced readheavy writeheavy}"
@@ -222,16 +229,22 @@ run_side() {
 
   # mixbench: all shapes together over the contention x topology grid. Only
   # when this side actually built the binary (older refs skip it); progress
-  # goes to stderr, the JSON grid to the compared artifact.
+  # goes to stderr, the JSON grid to the compared artifact. Run best-effort: a
+  # ref whose mixbench predates the sequential-sampling flags rejects them, and
+  # that must skip its section rather than abort the whole sweep (set -e).
   if [ -x "$bindir/mixbench" ]; then
     local dm="$OUT/mixbench/$label"
     mkdir -p "$dm"
     log "$label mixbench"
-    "$bindir/mixbench" --delays=s3 --delay-scale="$DELAY_SCALE" \
-      --duration="$MIX_DURATION" --modes="$MIX_MODES" --topologies="$MIX_TOPOLOGIES" \
+    if ! "$bindir/mixbench" --delays=s3 --delay-scale="$DELAY_SCALE" \
+      --duration="$MIX_DURATION" --max-duration="$MIX_MAX_DURATION" \
+      --target-ci="$MIX_TARGET_CI" --modes="$MIX_MODES" --topologies="$MIX_TOPOLOGIES" \
       --workers-per-shape="$MIX_WORKERS" --clients-per-shape="$MIX_CLIENTS" \
       --num-keys="$MIX_NUM_KEYS" --hot-keys="$MIX_HOT_KEYS" --multi-keys="$MIX_MULTI_KEYS" \
-      --json >"$dm/mixbench.json"
+      --json >"$dm/mixbench.json"; then
+      log "NOTE: $label mixbench failed (likely an older ref without --target-ci); skipping"
+      rm -f "$dm/mixbench.json"
+    fi
   else
     log "$label has no mixbench binary; skipping mixbench"
   fi
@@ -296,9 +309,10 @@ mkdir -p "$OUT"
   echo "- each line ends in a \`=> better/WORSE/~same\` verdict read in that"
   echo "  metric's own direction, so no axis has to be interpreted by hand"
   echo "- \`autoresearch-*\` is **deterministic** (single-client backend ops/tx,"
-  echo "  lower is better) — the most trustworthy signal; \`mix-*\` and"
-  echo "  \`deadlock-*\` are **[noisy]** (contention-bound, short windows) and"
-  echo "  \`[low-sample]\` marks a folded cell below the trust floor"
+  echo "  lower is better) — the most trustworthy signal; \`mix-*\` cells run"
+  echo "  until their throughput 95% CI reaches --target-ci, so a converged"
+  echo "  ratio is significant — \`[unconverged]\` marks a cell that hit its time"
+  echo "  cap first (read as indicative); \`deadlock-*\` stay **[noisy]**"
   echo
 } >"$SUMMARY"
 

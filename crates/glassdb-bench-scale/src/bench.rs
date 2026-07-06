@@ -112,6 +112,13 @@ impl Bench {
         Ok(())
     }
 
+    /// Number of samples (successfully timed operations) recorded so far. A
+    /// cheap live progress signal for adaptive/sequential stopping, without
+    /// cloning the whole sample vector.
+    pub fn sample_count(&self) -> usize {
+        self.inner.lock().unwrap().samples.len()
+    }
+
     /// Returns a snapshot of the collected results.
     pub fn results(&self) -> Results {
         let g = self.inner.lock().unwrap();
@@ -171,6 +178,42 @@ impl Results {
             xs[k as usize - 1] + frac * (xs[k as usize] - xs[k as usize - 1])
         };
         Duration::from_secs_f64(secs)
+    }
+
+    /// Relative half-width of this run's throughput 95% confidence interval,
+    /// derived from the sample count (see [`rate_rel_ci`]). Smaller is tighter.
+    pub fn rate_rel_ci(&self) -> f64 {
+        rate_rel_ci(self.samples.len())
+    }
+}
+
+/// z for a two-sided 95% confidence interval (the standard-normal quantile).
+pub const Z_95: f64 = 1.96;
+
+/// Sample count a rate/throughput estimate needs for its 95% confidence interval
+/// to reach `target_rel_ci` relative half-width, under the independent-arrivals
+/// (Poisson) approximation `rel-CI ~= z / sqrt(n)`, so `n ~= (z / target_ci)^2`.
+///
+/// Returns 0 when `target_rel_ci <= 0` (meaning "no target"). Real contention
+/// correlates arrivals, so the true interval is a touch wider — this is the
+/// standard rate-estimate bound, not an exact guarantee. Enables sequential
+/// (adaptive) sampling: run until [`Bench::sample_count`] reaches this value.
+pub fn samples_for_rel_ci(target_rel_ci: f64) -> u64 {
+    if target_rel_ci > 0.0 {
+        (Z_95 / target_rel_ci).powi(2).ceil() as u64
+    } else {
+        0
+    }
+}
+
+/// Achieved relative half-width of a rate/throughput 95% confidence interval
+/// from `n` samples (`z / sqrt(n)`, the [`samples_for_rel_ci`] inverse). Returns
+/// a large finite sentinel for `n == 0` so callers can serialize it.
+pub fn rate_rel_ci(n: usize) -> f64 {
+    if n == 0 {
+        99.0
+    } else {
+        Z_95 / (n as f64).sqrt()
     }
 }
 
@@ -238,5 +281,38 @@ mod tests {
             tot_duration: Duration::ZERO,
         };
         assert_eq!(r.avg(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn samples_for_rel_ci_inverts_rate_rel_ci() {
+        // The target count is the smallest n whose achieved CI meets the target.
+        for target in [0.05, 0.1, 0.15, 0.2] {
+            let n = samples_for_rel_ci(target);
+            assert!(n > 0);
+            assert!(
+                rate_rel_ci(n as usize) <= target,
+                "n={n} should meet target={target}, got {}",
+                rate_rel_ci(n as usize)
+            );
+            assert!(
+                rate_rel_ci(n as usize - 1) > target,
+                "n-1={} should miss target={target}",
+                n - 1
+            );
+        }
+    }
+
+    #[test]
+    fn samples_for_rel_ci_zero_disables_target() {
+        for off in [0.0, -0.1, f64::NAN] {
+            assert_eq!(samples_for_rel_ci(off), 0);
+        }
+    }
+
+    #[test]
+    fn rate_rel_ci_of_empty_is_large_and_finite() {
+        let ci = rate_rel_ci(0);
+        assert!(ci.is_finite() && ci > 1.0);
+        assert_eq!(Results::default().rate_rel_ci(), ci);
     }
 }

@@ -98,9 +98,11 @@ def _geomean(s: pd.Series) -> float:
     return float(np.exp(np.log(s).mean()))
 
 
-# Below this many committed transactions a folded cell is too small to trust as
-# throughput signal (e.g. mixbench hi-mode `rwMany`, which commits only a handful
-# per short window); its ratio is flagged `[low-sample]` in the digest.
+# Fallback only: for mixbench JSON that predates sequential sampling (no
+# per-shape `converged` flag), a folded cell below this many committed
+# transactions is too small to trust and its ratio is flagged `[low-sample]`.
+# Current mixbench runs to a target CI instead, flagging `[unconverged]` when the
+# time cap is hit first, so this floor is not consulted for fresh results.
 LOW_SAMPLE_FLOOR = 1000
 
 # Ratios within +/- this of 1.0 are called `~same` rather than better/worse, so
@@ -292,6 +294,12 @@ def mixbench_shape_table(a: list, b: list) -> pd.DataFrame:
                     "shape": shape,
                     "committed_a": x.get("committed", float("nan")),
                     "committed_b": y.get("committed", float("nan")),
+                    # mixbench sequential sampling: True once the shape's
+                    # throughput CI met --target-ci. Absent (None) for legacy
+                    # JSON, in which case the digest falls back to a sample floor.
+                    "converged_a": x.get("converged"),
+                    "converged_b": y.get("converged"),
+                    "relCi_b": y.get("relCi", float("nan")),
                     "tps_a": x.get("txPerSec", float("nan")),
                     "tps_b": y.get("txPerSec", float("nan")),
                     "tps-ratio": _ratio(y.get("txPerSec", 0), x.get("txPerSec", 0)),
@@ -312,6 +320,18 @@ def mixbench_shape_table(a: list, b: list) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _folded_converged(grp: pd.DataFrame) -> pd.Series | None:
+    """A cell's combined convergence (both sides reached `--target-ci`) for a
+    folded group of mixbench rows, or `None` when the JSON predates sequential
+    sampling (so the digest falls back to the sample-count floor). A missing
+    per-side flag is treated as converged so legacy-vs-new mixes never spuriously
+    report `[unconverged]`."""
+    a, b = grp["converged_a"], grp["converged_b"]
+    if a.isna().all() and b.isna().all():
+        return None
+    return a.fillna(True).astype(bool) & b.fillna(True).astype(bool)
 
 
 def mixbench_aggregate_table(a: list, b: list) -> pd.DataFrame:
@@ -368,15 +388,18 @@ def summarize(
     *,
     lower_is_better: bool | None = None,
     samples: pd.Series | None = None,
+    converged: pd.Series | None = None,
     noisy: bool = False,
 ) -> str:
     """One digest line for a set of ratios.
 
-    `lower_is_better` adds a direction-aware verdict. `samples` (per-cell
-    committed-transaction counts) surfaces the smallest folded cell so a
-    near-empty measurement is not mistaken for signal, flagging it `[low-sample]`
-    below [`LOW_SAMPLE_FLOOR`]. `noisy` marks metrics that are only indicative
-    (run-to-run variable) rather than deterministic. A single ratio is reported
+    `lower_is_better` adds a direction-aware verdict. `converged` (per-cell
+    booleans from mixbench's sequential sampling) flags `[unconverged]` when any
+    folded cell hit its time cap before reaching the target confidence interval,
+    so its throughput is only indicative. When `converged` is absent, `samples`
+    (per-cell committed-transaction counts) is the fallback reliability signal,
+    flagging `[low-sample]` below [`LOW_SAMPLE_FLOOR`]. `noisy` marks metrics that
+    are run-to-run variable rather than deterministic. A single ratio is reported
     as one value — never as a fake `min=median=max` distribution."""
     r = pd.Series(ratios).dropna()
     if r.empty:
@@ -388,8 +411,14 @@ def summarize(
         s = pd.Series(samples).dropna()
         if not s.empty:
             n_note = f" n_min={int(s.min())}"
-            if s.min() < LOW_SAMPLE_FLOOR:
-                tag += " [low-sample]"
+    if converged is not None:
+        c = pd.Series(converged).dropna()
+        if not c.empty and not bool(c.all()):
+            tag += " [unconverged]"
+    elif samples is not None:
+        s = pd.Series(samples).dropna()
+        if not s.empty and s.min() < LOW_SAMPLE_FLOOR:
+            tag += " [low-sample]"
 
     if len(r) == 1:
         v = float(r.iloc[0])
@@ -410,8 +439,9 @@ def append_summary(path: Path, title: str, summaries: list[str]) -> None:
     The shell driver points every comparison at the same file so the result is
     one compact, trackable digest per run. Each line carries its own polarity
     verdict (`=> better/WORSE/~same`) and, where relevant, a sample-size note and
-    a `[noisy]`/`[low-sample]` tag; the autoresearch section is deterministic,
-    the mixbench and deadlock sections are indicative only."""
+    a `[noisy]`/`[unconverged]` tag; the autoresearch section is deterministic,
+    mixbench cells run to a target CI (flagged `[unconverged]` if the time cap is
+    hit first), and the deadlock section is indicative only."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"## {title or 'comparison'}", ""]
     if summaries:
@@ -707,9 +737,10 @@ def main() -> int:
             ]
             print_table(f"mixbench per-shape ({lb}/{la})", tbl[cols])
             # Throughput ratio per shape (geomean folds the mode/topology cells).
-            # Marked noisy and carrying the smallest folded commit count: the
-            # hi-contention write shapes commit only a handful per short window,
-            # so their tps ratio is indicative at best (see LOW_SAMPLE_FLOOR).
+            # mixbench's sequential sampling runs each cell until its throughput
+            # CI meets --target-ci, so a converged tps ratio is significant; a cell
+            # that hit the time cap first is flagged [unconverged] (see
+            # `_folded_converged`).
             for shape, grp in tbl.groupby("shape"):
                 summaries.append(
                     summarize(
@@ -717,7 +748,7 @@ def main() -> int:
                         grp["tps-ratio"],
                         lower_is_better=False,
                         samples=grp["committed_b"],
-                        noisy=True,
+                        converged=_folded_converged(grp),
                     )
                 )
             # ops/tx + retries/tx are per-shape only where a shape owns its DBs
@@ -731,6 +762,7 @@ def main() -> int:
                         grp["ops-ratio"],
                         lower_is_better=True,
                         samples=grp["committed_b"],
+                        converged=_folded_converged(grp),
                     )
                 )
             for mode, grp in ops.groupby("mode"):
@@ -739,7 +771,7 @@ def main() -> int:
                         f"mix-retries/tx[{mode}]",
                         grp["retries-ratio"],
                         lower_is_better=True,
-                        noisy=True,
+                        converged=_folded_converged(grp),
                     )
                 )
         agg = mixbench_aggregate_table(a_mx, b_mx)
@@ -756,8 +788,9 @@ def main() -> int:
 
     print(
         "\n## Summary (ratio = b/a; throughput >1 good, latency/ops/cost <1 good; "
-        "=> tag reads the right direction per metric; [noisy]/[low-sample] = "
-        "indicative only)\n"
+        "=> tag reads the right direction per metric; [noisy] = run-to-run "
+        "variable, [unconverged] = mixbench hit its time cap before reaching "
+        "--target-ci so read as indicative, [low-sample] = legacy fallback)\n"
     )
     for s in summaries:
         print(f"- {s}")
