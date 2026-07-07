@@ -10,7 +10,7 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
-use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, TransError};
+use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -126,7 +126,8 @@ impl DatabaseBuilder {
             retry,
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
-        let locker = Locker::new(shards.clone(), tmon.clone(), retry);
+        let coord = ShardCoordinator::new(shards.clone(), resolver.clone(), tmon.clone(), retry);
+        let locker = Locker::new(coord.clone(), tmon.clone(), retry);
         let gc = Gc::new(
             bg_weak.clone(),
             tl,
@@ -137,13 +138,13 @@ impl DatabaseBuilder {
         gc.start();
         let algo = Algo::new(
             values.clone(),
-            locker,
+            locker.clone(),
+            coord.clone(),
             tmon.clone(),
             clock,
             gc,
             Some(bg_weak),
             resolver,
-            shards.clone(),
         );
 
         let inner = Arc::new(DbInner {
@@ -153,6 +154,8 @@ impl DatabaseBuilder {
             values,
             tmon,
             algo,
+            coord,
+            locker,
             retry,
             stats: Mutex::new(Stats::default()),
             shutting_down: AtomicBool::new(false),
@@ -181,6 +184,8 @@ pub(crate) struct DbInner {
     pub(crate) values: ValueCache,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
+    pub(crate) coord: ShardCoordinator,
+    pub(crate) locker: Locker,
     pub(crate) retry: RetryConfig,
     stats: Mutex<Stats>,
     // Graceful-shutdown bookkeeping. `shutting_down` flips first so any
@@ -254,7 +259,7 @@ impl Database {
         // write-back submits through the locker's dedup, so it must complete
         // before the dedup is closed.
         self.inner.background.shutdown().await;
-        self.inner.algo.close().await;
+        self.inner.coord.close().await;
     }
 
     /// Returns a top-level collection with the given name.
@@ -295,10 +300,11 @@ impl Database {
     /// close. Counters only increase; subtract snapshots for intervals.
     pub fn stats(&self) -> Stats {
         let bstats = self.inner.backend.stats_and_reset();
-        let lstats = self.inner.algo.locker().stats_and_reset();
+        let lock_calls = self.inner.locker.lock_calls_and_reset() as u64;
+        let cas_retries = self.inner.coord.cas_retries_and_reset() as u64;
         let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
-        s.add_lock(&lstats);
+        s.add_lock(lock_calls, cas_retries);
         *s
     }
 
@@ -310,10 +316,9 @@ impl Database {
     /// Pull-only and zero cost unless called: each shard's lock is taken
     /// briefly while collecting counts, then released.
     pub fn diagnostics(&self) -> Diagnostics {
-        let locker = self.inner.algo.locker();
         Diagnostics {
-            locker_dedup: locker.dedup_snapshot(),
-            transactions: locker.tx_locks_snapshot(),
+            locker_dedup: self.inner.coord.dedup_snapshot(),
+            transactions: self.inner.locker.tx_locks_snapshot(),
         }
     }
 }

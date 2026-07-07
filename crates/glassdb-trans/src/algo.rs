@@ -26,19 +26,22 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use glassdb_backend as backend;
+use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    LockType, PathLock, Shard, ShardStore, StorageError, TxCommitStatus, TxLog, TxWrite,
-    ValueCache, Version,
+    LockType, PathLock, ShardEntry, StorageError, TxCommitStatus, TxLog, TxWrite, ValueCache,
+    Version,
 };
 
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
-use crate::resolver::Resolver;
+use crate::resolver::{HolderResolution, Resolver};
+use crate::shard_coord::{
+    FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, Step,
+};
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -59,15 +62,6 @@ const SERIAL_FALLBACK_AFTER: usize = 3;
 /// re-acquires them in the global sorted order, where one contender always
 /// completes. Reuses v1's 5s budget (ADR-002 / architecture.md).
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How many times the single read-write fast path re-issues its shard-publish
-/// CAS against a shard whose version keeps churning (disjoint-key writers) while
-/// the transaction's own key stays committable (ADR-020). The commit point is a
-/// single CAS, so this only absorbs *contention*, not conflict; on exhaustion
-/// the transaction renews its id and re-runs (priority preserved), because once
-/// its committed object is written it must never hand control back to a same-id
-/// body re-run. Kept small: a renewed attempt makes progress by wound-wait rank.
-const SINGLE_RW_CAS_RETRIES: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -174,35 +168,148 @@ enum Acquired {
     Wounded,
 }
 
-/// Classification of a shard reload after a lost or in-doubt single read-write
-/// lock CAS (see [`Algo::reclassify_single_rw`]).
-enum SingleRwReload {
-    /// The entry's `locked_by` names this transaction (our lock landed), or its
-    /// `current_writer` already names us (a follow-on writer help-forwarded us
-    /// into the chain): we are in the version chain (idempotent success).
-    Landed,
-    /// The entry is still committable: re-issue the CAS against this freshly
-    /// loaded shard/version, help-forwarding the carried effective writer (the
-    /// resolved committed predecessor to build on).
-    Retry(Shard, Option<backend::Version>, TxId),
-    /// The pointer moved to another writer, or the key is now locked by someone
-    /// else: the fast path lost the race.
-    Moved,
-}
-
-/// Outcome of installing the single read-write fast path's write lock on the
-/// shard (ADR-027). This is the shard side of the two parallel commit writes;
-/// combined with the committed-object write to decide the transaction's fate.
-enum LockPublish {
+/// The result of installing the single read-write fast path's write lock through
+/// the coordinator (ADR-027 / ADR-028): the shard side of the two parallel
+/// commit writes, combined by [`Algo`] with the committed-object write to decide
+/// the transaction's fate.
+enum InstallOutcome {
     /// The write lock is installed (or we are already in the chain): this
     /// transaction is inserted into the shard's version history.
     Landed,
-    /// The entry moved out from under us and our lock definitively did not land:
-    /// the fast path lost the race and must renew.
+    /// The entry moved out from under us: the fast path lost the race and must
+    /// renew (its committed object, if written, becomes an orphan for GC).
     Moved,
-    /// The lock CAS was in-doubt (`Unavailable`) and the entry then moved, so we
-    /// cannot tell whether our lock landed first: irreducibly in-doubt.
+    /// The lock CAS was in-doubt and the entry then moved, so it cannot be told
+    /// whether the lock landed first: irreducibly in-doubt.
     InDoubt(String),
+}
+
+/// Installs the single read-write fast path's write lock (ADR-027): resolve the
+/// key's effective committed writer against the freshly-folded entry, then stage
+/// `locked_by = [id]` with `current_writer` help-forwarded to that writer.
+/// Commit-critical and self-classifying: unlike the locker's resolvers it reports
+/// its own fate (`Landed` / `Moved` / `InDoubt`) instead of a generic lock, and
+/// consults [`ReloadCause`] to tell a definitive loss from an irreducible
+/// in-doubt. Installed by [`Algo`] on the shard coordinator (ADR-028).
+///
+/// It re-resolves eligibility on **every** fold (never trusting the caller's
+/// pre-check across the round): the fold loads the shard fresh, so a holder
+/// installed after the pre-check must still be observed here or it would be
+/// silently stomped instead of losing the race (ADR-027 / ADR-028).
+struct CommitInstallResolver {
+    id: TxId,
+    raw_key: Vec<u8>,
+    key_path: String,
+    read_version: Option<TxId>,
+}
+
+#[async_trait]
+impl ShardResolver for CommitInstallResolver {
+    async fn resolve(
+        &self,
+        ctx: &ResolveCtx<'_>,
+        staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
+    ) -> Result<Step, TransError> {
+        let cur = staged.get(&self.raw_key);
+
+        // Already in the chain: our lock is installed, or a follow-on writer
+        // help-forwarded us into the pointer (idempotent success, ADR-027).
+        if let Some(e) = cur
+            && (e.locked_by.contains(&self.id) || e.current_writer.as_ref() == Some(&self.id))
+        {
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Landed,
+            });
+        }
+
+        // Re-resolve the effective writer / eligibility against the current
+        // entry: a live pending holder, a moved pointer, or a superseded read
+        // means we lost the race.
+        let res = match cur {
+            Some(e) => {
+                ctx.resolver
+                    .resolve_holders(&self.key_path, e, None)
+                    .await?
+            }
+            None => HolderResolution::default(),
+        };
+        let Some(effective) = eligible_writer(&res, self.read_version.as_ref()) else {
+            // After an in-doubt CAS we cannot tell whether our lock landed first
+            // and was then help-forwarded away, so surface in-doubt; otherwise
+            // the loss is definitive and the fast path renews (ADR-027).
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            let outcome = if in_doubt {
+                FoldOutcome::InDoubt(format!(
+                    "single-rw lock for {} in-doubt: entry moved after uncertain CAS",
+                    self.id
+                ))
+            } else {
+                FoldOutcome::Moved
+            };
+            return Ok(Step::Skip { outcome });
+        };
+
+        // Stage the write lock, publishing the resolved predecessor into the
+        // pointer so replacing a committed-but-not-written-back holder in
+        // `locked_by` help-forwards its value instead of orphaning it (ADR-027).
+        let mut e = cur.cloned().unwrap_or_else(|| ShardEntry {
+            key: self.raw_key.clone(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: None,
+            deleted: false,
+        });
+        e.lock_type = LockType::Write;
+        e.locked_by = vec![self.id.clone()];
+        e.current_writer = Some(effective);
+        e.deleted = false;
+        Ok(Step::Stage {
+            entries: vec![(self.raw_key.clone(), e)],
+            // The lock is installed only once the round's CAS confirms it; on a
+            // precondition/in-doubt the engine re-folds and re-classifies.
+            outcome: FoldOutcome::Landed,
+        })
+    }
+
+    fn reorderable(&self) -> bool {
+        false
+    }
+
+    fn exhausted_outcome(&self) -> FoldOutcome {
+        // Pure version churn exhausted the budget: renew and re-run (the commit
+        // point is a single CAS, so this absorbs contention, not conflict).
+        FoldOutcome::Moved
+    }
+}
+
+/// Decides the effective committed writer the single read-write fast path must
+/// build on from an already-resolved holder view, or `None` when the key cannot
+/// take the fast path's commit CAS.
+///
+/// The [`Resolver`] supplies the raw view (help-forwarding committed holders so
+/// a lock held by an already-committed writer whose write-back is still pending
+/// is not treated as a conflict); this predicate decides eligibility from it:
+/// only a *live pending* holder blocks the fast path, and a create / put over a
+/// tombstone or a read-modify-write whose read was superseded is rejected
+/// (ADR-027).
+fn eligible_writer(res: &HolderResolution, read_version: Option<&TxId>) -> Option<TxId> {
+    // A live holder is a genuine conflict: defer to the full locked path so it
+    // can wound-wait. Committed/aborted holders never reach `pending`.
+    if !res.pending.is_empty() {
+        return None;
+    }
+    // The key must currently exist; a create or a put over a tombstone is a
+    // membership change that the fast path does not handle.
+    let writer = match &res.writer {
+        Some(w) if !res.deleted => w.clone(),
+        _ => return None,
+    };
+    match read_version {
+        // A read-modify-write commits only if its read is still current.
+        Some(rv) if rv != &writer => None,
+        // A blind put (no read) is last-writer-wins and always serializable.
+        _ => Some(writer),
+    }
 }
 
 /// Coordinates transactions: read validation, locking, commit, and write-back.
@@ -211,13 +318,13 @@ pub struct Algo {
     values: ValueCache,
     resolver: Resolver,
     locker: Locker,
+    // The single shard-mutation coordinator (ADR-028), shared with the locker:
+    // the single read-write fast path installs its lock through this — one
+    // deduplicated fold round — instead of a bespoke racing shard CAS.
+    coord: ShardCoordinator,
     mon: Monitor,
     gc: Gc,
     clock: Clock,
-    // Direct shard CAS access for the single read-write fast path (ADR-020),
-    // which bypasses the locker: it publishes `current_writer` in one shard CAS
-    // instead of acquiring a lock and writing back.
-    shards: ShardStore,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -231,34 +338,23 @@ impl Algo {
     pub fn new(
         values: ValueCache,
         locker: Locker,
+        coord: ShardCoordinator,
         mon: Monitor,
         clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
         resolver: Resolver,
-        shards: ShardStore,
     ) -> Self {
         Algo {
             values,
             resolver,
             locker,
+            coord,
             mon,
             gc,
             clock,
-            shards,
             background,
         }
-    }
-
-    /// Releases coordinator resources. A no-op in v2 (the locker spawns no owner
-    /// tasks), kept for call-site stability.
-    pub async fn close(&self) {
-        self.locker.close().await;
-    }
-
-    /// Returns a reference to the underlying [`Locker`] for diagnostics.
-    pub fn locker(&self) -> &Locker {
-        &self.locker
     }
 
     /// Starts a new transaction with the given data. The id's random prefix and
@@ -489,15 +585,13 @@ impl Algo {
             .map_err(|e| TransError::with_source("parsing single-rw key path", e))?;
         let idx = shard_index(&raw_key);
 
-        // Load the shard and check dynamic eligibility before writing anything,
-        // so a create / stale read / genuinely-conflicting entry falls back to
-        // the full path with the same id. A lock left by an *already-committed*
-        // writer (its write-back is still pending) does not block us: it is
-        // help-forwarded to its effective writer, which is the predecessor we
-        // build on (ADR-027).
-        let (shard, ver) = self.shards.load_shard(&prefix, idx).await?;
+        // Check dynamic eligibility before writing anything, so a create / stale
+        // read / genuinely-conflicting entry falls back to the full path with the
+        // same id. A lock left by an *already-committed* writer (its write-back is
+        // still pending) does not block us: it is help-forwarded to its effective
+        // writer, which is the predecessor we build on (ADR-027).
         let Some(effective) = self
-            .single_rw_effective_writer(&key_path, &shard, &raw_key, read_version.as_ref())
+            .single_rw_effective_writer(&key_path, read_version.as_ref())
             .await?
         else {
             return Ok(None);
@@ -514,7 +608,7 @@ impl Algo {
         // The recorded predecessor is the resolved effective writer, so it names
         // the true committed value even when the shard's `current_writer` pointer
         // still lags behind a help-forwarded holder.
-        let recorded_prev = effective.clone();
+        let recorded_prev = effective;
         let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
         tl.locks = vec![PathLock {
             path: key_path.to_string(),
@@ -529,23 +623,24 @@ impl Algo {
 
         // Issue both commit-critical writes concurrently (ADR-027): the committed
         // object (its existence is the unambiguous, idempotent commit signal) and
-        // the shard lock CAS (which inserts us into the version chain).
+        // the shard lock install (which inserts us into the version chain). The
+        // install goes through the shard coordinator (ADR-028), so it merges with
+        // any disjoint-key acquire/write-back on the same shard into one CAS
+        // round instead of racing its own.
         let object = self.mon.set_final_log(&tl);
-        let lock = self.lock_single_rw(
-            tx,
+        let install = self.commit_install(
+            &tx.id,
             &prefix,
             idx,
-            &raw_key,
-            read_version.as_ref(),
-            shard,
-            ver,
-            effective,
+            raw_key.clone(),
+            key_path.to_string(),
+            read_version.clone(),
         );
-        let (object, lock) = tokio::join!(object, lock);
+        let (object, install) = tokio::join!(object, install);
 
-        match (object, lock?) {
+        match (object, install?) {
             // Committed: the object is durable and our lock is in the chain.
-            (Ok(()), LockPublish::Landed) => {
+            (Ok(()), InstallOutcome::Landed) => {
                 self.finish_single_rw(&tx.id, &raw_key, &prefix, &value);
                 tx.status = Status::Committed;
                 self.write_back_single_rw(&tx.id, &prefix, idx, &raw_key, &key_path)
@@ -559,168 +654,69 @@ impl Algo {
             // The object committed but our lock never inserted us into the chain
             // (a follow-on writer built on the old value): the committed object
             // is an orphan — renew and let GC reclaim it.
-            (Ok(()), LockPublish::Moved) => self.abandon_single_rw(tx),
-            // In-doubt lock CAS whose entry then moved: we cannot tell whether we
-            // committed. Surface it rather than risk a double-apply.
-            (Ok(()), LockPublish::InDoubt(msg)) => {
+            (Ok(()), InstallOutcome::Moved) => self.abandon_single_rw(tx),
+            // In-doubt lock install whose entry then moved: we cannot tell whether
+            // we committed. Surface it rather than risk a double-apply.
+            (Ok(()), InstallOutcome::InDoubt(msg)) => {
                 Err(TransError::Storage(StorageError::Unavailable(msg)))
             }
         }
     }
 
-    /// Installs the single read-write fast path's write lock: CAS the shard so the
-    /// key's entry is `locked_by = [id]` (a write lock), leaving `current_writer`
-    /// untouched. Handles CAS contention and in-doubt outcomes in place without
-    /// ever re-running the body (the committed object is written in parallel).
-    /// `shard`/`ver` are the copy validated by the caller; retries reload.
-    #[allow(clippy::too_many_arguments)]
-    async fn lock_single_rw(
-        &self,
-        tx: &mut Handle,
-        prefix: &str,
-        idx: u32,
-        raw_key: &[u8],
-        read_version: Option<&TxId>,
-        mut shard: Shard,
-        mut ver: Option<backend::Version>,
-        mut effective: TxId,
-    ) -> Result<LockPublish, TransError> {
-        for attempt in 0..SINGLE_RW_CAS_RETRIES {
-            if attempt > 0 {
-                rt::sleep(tx.backoff.next_delay()).await;
-            }
-            let new_shard = Shard::from_entries(shard.entries().cloned().map(|mut e| {
-                if e.key == raw_key {
-                    e.lock_type = LockType::Write;
-                    e.locked_by = vec![tx.id.clone()];
-                    // Publish the resolved predecessor into the pointer: if we
-                    // are taking over from a committed-but-not-written-back
-                    // holder, this help-forwards its value so replacing it in
-                    // `locked_by` does not orphan it (its own write-back becomes
-                    // an idempotent no-op). For an already-published pointer this
-                    // is a no-op (ADR-027).
-                    e.current_writer = Some(effective.clone());
-                    e.deleted = false;
-                }
-                e
-            }));
-            match self
-                .shards
-                .store_shard(prefix, idx, &new_shard, ver.as_ref())
-                .await
-            {
-                // The lock landed: we are in the version chain.
-                Ok(true) => return Ok(LockPublish::Landed),
-                // Precondition: the write definitely did not land. Re-classify.
-                Ok(false) => match self
-                    .reclassify_single_rw(prefix, idx, raw_key, read_version, &tx.id)
-                    .await?
-                {
-                    SingleRwReload::Landed => return Ok(LockPublish::Landed),
-                    SingleRwReload::Retry(s, v, w) => {
-                        shard = s;
-                        ver = v;
-                        effective = w;
-                    }
-                    // The entry moved (or is now locked by someone else): our
-                    // lock did not land. It is safe to renew.
-                    SingleRwReload::Moved => return Ok(LockPublish::Moved),
-                },
-                // In-doubt: read the shard back to decide (ADR-009 / ADR-027).
-                Err(StorageError::Unavailable(msg)) => {
-                    match self
-                        .reclassify_single_rw(prefix, idx, raw_key, read_version, &tx.id)
-                        .await?
-                    {
-                        SingleRwReload::Landed => return Ok(LockPublish::Landed),
-                        SingleRwReload::Retry(s, v, w) => {
-                            shard = s;
-                            ver = v;
-                            effective = w;
-                        }
-                        // The one irreducible in-doubt: our lock CAS was
-                        // uncertain and the entry then moved, so we cannot tell
-                        // whether our lock landed first (and was help-forwarded
-                        // away) or never landed. Surface it rather than risk a
-                        // double-apply on a blind re-run.
-                        SingleRwReload::Moved => return Ok(LockPublish::InDoubt(msg)),
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        // Pure version churn exhausted the budget: renew and re-run.
-        Ok(LockPublish::Moved)
-    }
-
-    /// Reloads the shard after a lost/uncertain single read-write lock CAS and
-    /// classifies the entry: in the chain already — our lock is installed or we
-    /// were help-forwarded (`Landed`), still committable so the CAS can be
-    /// retried (`Retry`), or moved/locked out from under us (`Moved`).
-    async fn reclassify_single_rw(
-        &self,
-        prefix: &str,
-        idx: u32,
-        raw_key: &[u8],
-        read_version: Option<&TxId>,
-        id: &TxId,
-    ) -> Result<SingleRwReload, TransError> {
-        let (shard, ver) = self.shards.load_shard(prefix, idx).await?;
-        // Already in the chain: our lock is installed, or a follow-on writer
-        // help-forwarded us into the pointer.
-        if let Some(e) = shard.lookup(raw_key)
-            && (e.locked_by.contains(id) || e.current_writer.as_ref() == Some(id))
-        {
-            return Ok(SingleRwReload::Landed);
-        }
-        let key_path = paths::from_key(prefix, raw_key);
-        match self
-            .single_rw_effective_writer(&key_path, &shard, raw_key, read_version)
-            .await?
-        {
-            Some(effective) => Ok(SingleRwReload::Retry(shard, ver, effective)),
-            None => Ok(SingleRwReload::Moved),
-        }
-    }
-
-    /// Resolves `raw_key`'s entry in `shard` and returns the effective committed
-    /// writer the single read-write fast path must build on, or `None` when the
-    /// key cannot take the fast path's commit CAS.
+    /// Resolves `key_path`'s entry and returns the effective committed writer the
+    /// single read-write fast path must build on, or `None` when the key cannot
+    /// take the fast path's commit CAS.
     ///
-    /// The entry is run through the shared [`Resolver`], so a lock held by an
-    /// already-committed writer (whose write-back is still pending) is
-    /// help-forwarded to its committed value rather than treated as a conflict:
-    /// only a *live pending* holder blocks the fast path (ADR-027). It also
-    /// rejects a create / put over a tombstone (a membership change needing the
-    /// collection lock) and, for a read-modify-write, a stale read whose value
-    /// has since been superseded.
+    /// The entry is loaded and resolved through the shared [`Resolver`], which
+    /// exposes the full holder view; the eligibility policy lives in
+    /// [`eligible_writer`]. A lock held by an already-committed writer (whose
+    /// write-back is still pending) is help-forwarded to its committed value
+    /// rather than treated as a conflict: only a *live pending* holder blocks the
+    /// fast path (ADR-027). It also rejects a create / put over a tombstone (a
+    /// membership change needing the collection lock) and, for a
+    /// read-modify-write, a stale read whose value has since been superseded.
     async fn single_rw_effective_writer(
         &self,
         key_path: &str,
-        shard: &Shard,
-        raw_key: &[u8],
         read_version: Option<&TxId>,
     ) -> Result<Option<TxId>, TransError> {
-        let Some(entry) = shard.lookup(raw_key) else {
-            return Ok(None);
-        };
-        let res = self.resolver.resolve_holders(key_path, entry, None).await?;
-        // A live holder is a genuine conflict: defer to the full locked path so
-        // it can wound-wait. Committed/aborted holders never reach `pending`.
-        if !res.pending.is_empty() {
-            return Ok(None);
-        }
-        // The key must currently exist; a create or a put over a tombstone is a
-        // membership change that the fast path does not handle.
-        let writer = match res.writer {
-            Some(w) if !res.deleted => w,
-            _ => return Ok(None),
-        };
-        match read_version {
-            // A read-modify-write commits only if its read is still current.
-            Some(rv) if rv != &writer => Ok(None),
-            // A blind put (no read) is last-writer-wins and always serializable.
-            _ => Ok(Some(writer)),
+        let res = self.resolver.resolve_key(key_path).await?;
+        Ok(eligible_writer(&res, read_version))
+    }
+
+    /// Installs the single read-write fast path's write lock on `raw_key`'s shard
+    /// through the shard coordinator's fold engine (ADR-028): one deduplicated
+    /// round that merges with disjoint acquires/write-backs on the same shard
+    /// instead of racing its own bespoke CAS. Never waits (a live holder makes it
+    /// [`InstallOutcome::Moved`], not a wait). `read_version` is the read this
+    /// write depends on (for a read-modify-write) or `None` for a blind put; the
+    /// effective predecessor is re-resolved inside the fold against the current
+    /// shard state.
+    async fn commit_install(
+        &self,
+        id: &TxId,
+        prefix: &str,
+        idx: u32,
+        raw_key: Vec<u8>,
+        key_path: String,
+        read_version: Option<TxId>,
+    ) -> Result<InstallOutcome, TransError> {
+        let resolver = Arc::new(CommitInstallResolver {
+            id: id.clone(),
+            raw_key,
+            key_path,
+            read_version,
+        });
+        match self.coord.submit_shard(prefix, idx, id, resolver).await? {
+            Some(FoldOutcome::Landed) => Ok(InstallOutcome::Landed),
+            Some(FoldOutcome::InDoubt(msg)) => Ok(InstallOutcome::InDoubt(msg)),
+            // A shutdown mid-flight leaves the lock un-installed, so the fast
+            // path renews (its committed object, if any, is an orphan for GC).
+            Some(FoldOutcome::Moved) | None => Ok(InstallOutcome::Moved),
+            // Commit-install never waits, releases, or takes a generic lock.
+            Some(_) => Err(TransError::other(
+                "commit-install produced a non-install outcome",
+            )),
         }
     }
 
@@ -1001,7 +997,7 @@ mod tests {
     use glassdb_data::paths;
     use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        CollectionRoot, MAX_STALENESS, ObjectCache, ShardEntry, ShardStore, SharedCache,
+        CollectionRoot, MAX_STALENESS, ObjectCache, Shard, ShardEntry, ShardStore, SharedCache,
         StorageError, TLogger, TxCommitStatus, ValueCache,
     };
 
@@ -1013,6 +1009,7 @@ mod tests {
         tlogger: TLogger,
         tmon: Monitor,
         shards: ShardStore,
+        locker: Locker,
     }
 
     async fn new_algo() -> (Algo, Tctx) {
@@ -1032,7 +1029,13 @@ mod tests {
         let tmon = Monitor::new(values.clone(), tlogger.clone(), bg_weak.clone());
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
-        let locker = Locker::new(shards.clone(), tmon.clone(), RetryConfig::default());
+        let coord = crate::shard_coord::ShardCoordinator::new(
+            shards.clone(),
+            resolver.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+        );
+        let locker = Locker::new(coord.clone(), tmon.clone(), RetryConfig::default());
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
@@ -1052,13 +1055,13 @@ mod tests {
 
         let algo = Algo::new(
             values.clone(),
-            locker,
+            locker.clone(),
+            coord.clone(),
             tmon.clone(),
             Clock::real(),
             gc,
             None,
             resolver,
-            shards.clone(),
         );
         (
             algo,
@@ -1068,6 +1071,7 @@ mod tests {
                 tlogger,
                 tmon,
                 shards,
+                locker,
             },
         )
     }
@@ -1271,8 +1275,8 @@ mod tests {
         // An older holder takes the key's write lock and does not finalize.
         let holder = TxId::with_priority(0, b"holder");
         tctx.tmon.begin_tx(&holder);
-        let held = tm
-            .locker()
+        let held = tctx
+            .locker
             .lock(
                 &holder,
                 &Data {
@@ -1412,6 +1416,326 @@ mod tests {
         async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
             self.inner.list(dir_path).await
         }
+    }
+
+    // Backend that parks the next (revalidating) shard read on a gate while
+    // **armed**, so a test can hold the dedup driver mid-load until a second
+    // contender has queued — forcing them into one merged CAS round. Arming is
+    // deferred so un-gated setup runs first.
+    struct GateBackend {
+        inner: Arc<dyn Backend>,
+        gate: Arc<tokio::sync::Notify>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl GateBackend {
+        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
+            Arc::new(GateBackend {
+                inner,
+                gate: Arc::new(tokio::sync::Notify::new()),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for GateBackend {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.read(path).await
+        }
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.read_if_modified(path, expected).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if(path, value, expected).await
+        }
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    // Backend that, while **armed**, makes the first shard CAS *in-doubt*: it
+    // applies the write to storage but returns `Unavailable`, so the caller
+    // cannot tell whether it landed (ADR-009). Arming is deferred so un-gated
+    // setup runs first.
+    struct InDoubtShardCas {
+        inner: Arc<dyn Backend>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl InDoubtShardCas {
+        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
+            Arc::new(InDoubtShardCas {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for InDoubtShardCas {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read(path).await
+        }
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read_if_modified(path, expected).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            use std::sync::atomic::Ordering;
+            if path.contains("/_s/")
+                && self
+                    .armed
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // Apply the write, then report the ack as lost: the CAS landed but
+                // the caller must re-fold to discover that.
+                let _ = self.inner.write_if(path, value, expected).await;
+                return Err(glassdb_backend::BackendError::Unavailable(
+                    "simulated in-doubt shard CAS".into(),
+                ));
+            }
+            self.inner.write_if(path, value, expected).await
+        }
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    /// A distinct key hashing to the same shard as `base`, for exercising
+    /// disjoint-key contention within one shard object.
+    fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
+        let idx = shard_index(base);
+        for i in 0u32.. {
+            let k = format!("sib-{i}").into_bytes();
+            if k != base && shard_index(&k) == idx {
+                return k;
+            }
+        }
+        unreachable!("a same-shard sibling must exist")
+    }
+
+    fn shard_stores(log: &OpLog, path: &str) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == path && (r.op == "write_if" || r.op == "write_if_not_exists"))
+            .count()
+    }
+
+    // ADR-028: the single read-write commit-install is folded by the same shard
+    // coordinator as ordinary lock acquisition, so an install and a disjoint-key
+    // acquire contending one shard batch into a single CAS round instead of
+    // racing two separate loads+CASes. The install lands its write lock and the
+    // acquire installs its lock in the one store.
+    #[tokio::test(start_paused = true)]
+    async fn single_rw_install_merges_with_disjoint_acquire() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let gate = GateBackend::new(mem);
+        let rec = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let log = rec.log();
+        let (tm, tctx) = new_algo_from_backend(rec).await;
+
+        let ka = b"k".to_vec();
+        let kb = same_shard_sibling(&ka);
+        let idx = shard_index(&ka);
+        let kap = paths::from_key(TEST_COLL, &ka);
+        let kbp = paths::from_key(TEST_COLL, &kb);
+
+        // Seed keys A and B committed: the fast-path install builds on A's
+        // predecessor, and the disjoint acquire overwrites an existing B, so it
+        // takes no membership root lock and the round stays a single shard CAS.
+        commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
+        commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
+
+        let txa = TxId::with_priority(1_000_000_000, b"install");
+        let txb = TxId::with_priority(2_000_000_000, b"acquire");
+        tctx.tmon.begin_tx(&txa);
+        tctx.tmon.begin_tx(&txb);
+
+        let shard_path = paths::from_shard(TEST_COLL, idx);
+        log.lock().unwrap().clear();
+        gate.arm();
+
+        // Submit the install and the disjoint acquire concurrently: the first
+        // becomes the dedup driver and parks in the gated load; the second (an
+        // ordinary lock acquisition on a disjoint key) queues and merges into its
+        // round.
+        let (ca, cb) = (tm.clone(), tctx.locker.clone());
+        let (ta, pa, ka2, kap2) = (txa.clone(), TEST_COLL.to_string(), ka.clone(), kap.clone());
+        let install =
+            tokio::spawn(async move { ca.commit_install(&ta, &pa, idx, ka2, kap2, None).await });
+        let data_b = Data {
+            reads: Vec::new(),
+            writes: vec![wa(&kbp, b"vb2")],
+        };
+        let tb = txb.clone();
+        let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
+
+        // Under paused time this fires only once both tasks are parked (driver in
+        // the gated load, the second queued); then release the load.
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        let install = install.await.unwrap().unwrap();
+        let acquire = acquire.await.unwrap().unwrap();
+        assert!(
+            matches!(install, InstallOutcome::Landed),
+            "the fast-path install must land"
+        );
+        assert!(
+            matches!(acquire, LockOutcome::Locked(_)),
+            "the disjoint acquire must lock"
+        );
+
+        assert_eq!(
+            shard_stores(&log, &shard_path),
+            1,
+            "install and disjoint acquire share one CAS"
+        );
+
+        // Both mutations landed in the shared shard write.
+        let ea = entry(&tctx, &ka).await.unwrap();
+        assert_eq!(ea.locked_by, vec![txa], "install holds A's write lock");
+        let eb = entry(&tctx, &kb).await.unwrap();
+        assert!(eb.locked_by.contains(&txb), "acquire holds B's lock");
+    }
+
+    // ADR-028 regression (batched in-doubt): a commit-install co-batched with a
+    // disjoint-key acquire whose shared CAS comes back in-doubt (`Unavailable`)
+    // recovers idempotently — the engine reloads and re-folds, the install finds
+    // itself already in the chain (`Landed`), and the acquire re-installs its own
+    // lock (`Locked`) without double-applying. No error is surfaced.
+    #[tokio::test(start_paused = true)]
+    async fn commit_install_batched_in_doubt_recovers() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let indoubt = InDoubtShardCas::new(mem);
+        let gate = GateBackend::new(indoubt.clone() as Arc<dyn Backend>);
+        let (tm, tctx) = new_algo_from_backend(gate.clone() as Arc<dyn Backend>).await;
+
+        let ka = b"k".to_vec();
+        let kb = same_shard_sibling(&ka);
+        let idx = shard_index(&ka);
+        let kap = paths::from_key(TEST_COLL, &ka);
+        let kbp = paths::from_key(TEST_COLL, &kb);
+
+        // Seed keys A and B committed (un-gated, before arming): the install has
+        // a predecessor and the acquire overwrites an existing B, so it takes no
+        // membership root lock and the round stays a single shard CAS.
+        commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
+        commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
+
+        let txa = TxId::with_priority(1_000_000_000, b"install");
+        let txb = TxId::with_priority(2_000_000_000, b"acquire");
+        tctx.tmon.begin_tx(&txa);
+        tctx.tmon.begin_tx(&txb);
+
+        // Arm the merge gate and the in-doubt first CAS together.
+        indoubt.arm();
+        gate.arm();
+
+        let (ca, cb) = (tm.clone(), tctx.locker.clone());
+        let (ta, pa, ka2, kap2) = (txa.clone(), TEST_COLL.to_string(), ka.clone(), kap.clone());
+        let install =
+            tokio::spawn(async move { ca.commit_install(&ta, &pa, idx, ka2, kap2, None).await });
+        let data_b = Data {
+            reads: Vec::new(),
+            writes: vec![wa(&kbp, b"vb2")],
+        };
+        let tb = txb.clone();
+        let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
+
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        // The in-doubt CAS actually landed, so the re-fold sees both members in
+        // the chain: the install classifies itself Landed, the acquire re-locks.
+        let install = install.await.unwrap().unwrap();
+        let acquire = acquire.await.unwrap().unwrap();
+        assert!(
+            matches!(install, InstallOutcome::Landed),
+            "the install recovers as landed, not in-doubt"
+        );
+        assert!(
+            matches!(acquire, LockOutcome::Locked(_)),
+            "the co-batched acquire re-locks idempotently"
+        );
+
+        assert_eq!(entry(&tctx, &ka).await.unwrap().locked_by, vec![txa]);
+        assert!(entry(&tctx, &kb).await.unwrap().locked_by.contains(&txb));
     }
 
     // ADR-020/024: CAS contention is resolved *inside* `Algo`. A transaction that
@@ -1621,23 +1945,20 @@ mod tests {
         // Eligibility mirrors that resolution: an RMW that read H1 and a blind put
         // are both committable and build on H1, while a read of the superseded H0
         // is still rejected as stale.
-        let (shard, _) = tctx.shards.load_shard(TEST_COLL, idx).await.unwrap();
         assert_eq!(
-            tm.single_rw_effective_writer(&keyp, &shard, &raw, Some(&h1))
+            tm.single_rw_effective_writer(&keyp, Some(&h1))
                 .await
                 .unwrap(),
             Some(h1.clone()),
             "an RMW that read the committed holder builds on it"
         );
         assert_eq!(
-            tm.single_rw_effective_writer(&keyp, &shard, &raw, None)
-                .await
-                .unwrap(),
+            tm.single_rw_effective_writer(&keyp, None).await.unwrap(),
             Some(h1.clone()),
             "a blind put builds on the committed holder"
         );
         assert_eq!(
-            tm.single_rw_effective_writer(&keyp, &shard, &raw, Some(&h0))
+            tm.single_rw_effective_writer(&keyp, Some(&h0))
                 .await
                 .unwrap(),
             None,
@@ -1660,18 +1981,19 @@ mod tests {
         assert_eq!(do_read(&tctx, &keyp).await.version.unwrap().last_writer, h2);
     }
 
-    // ADR-027: the fast path's two commit writes are independent. If the lock CAS
-    // never lands (here: sustained shard-CAS contention exhausting the bounded
-    // budget) while the committed object write *did* land, the transaction is not
-    // in the version chain — its committed object is an orphan. The fast path must
-    // renew (surface `Wounded`) rather than report success, and must never
-    // double-apply: a renewed attempt commits the value exactly once.
-    #[tokio::test]
+    // ADR-027/028: the fast path's two commit writes are independent. If the lock
+    // install never lands (here: sustained shard-CAS contention exhausting the
+    // coordinator's bounded fold budget) while the committed object write *did*
+    // land, the transaction is not in the version chain — its committed object is
+    // an orphan. The fast path must renew (surface `Wounded`) rather than report
+    // success, and must never double-apply: a renewed attempt commits the value
+    // exactly once.
+    #[tokio::test(start_paused = true)]
     async fn single_rw_lock_cas_contention_renews_and_commits_once() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        // Fail exactly the fast path's lock-CAS attempts (SINGLE_RW_CAS_RETRIES),
-        // so the object write lands but the lock never does.
-        let flaky = FlakyShardCas::new(mem, SINGLE_RW_CAS_RETRIES);
+        // Fail exactly the coordinator's whole fold budget of shard-lock CAS
+        // attempts, so the object write lands but the lock install never does.
+        let flaky = FlakyShardCas::new(mem, crate::shard_coord::CAS_RETRIES);
         let backend: Arc<dyn Backend> = flaky.clone();
         let (tm, tctx) = new_algo_from_backend(backend).await;
         let keyp = paths::from_key(TEST_COLL, b"k");
