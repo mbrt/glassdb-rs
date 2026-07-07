@@ -7,6 +7,153 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-029: GC Shard Coordinator
+
+### compare-refs summary
+
+- base: b789c651741d78f7388dcd71038e95ca095c3974 (v1)
+- target: 736aa6baef008bc725b1cfe49f2d1a974bd47bda (v2)
+- ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
+- each line ends in a `=> better/WORSE/~same` verdict read in that
+  metric's own direction, so no axis has to be interpreted by hand
+- `autoresearch-*` is **deterministic** (single-client backend ops/tx,
+  lower is better) — the most trustworthy signal; `mix-*` cells run
+  until their throughput 95% CI reaches --target-ci, so a converged
+  ratio is significant — `[unconverged]` marks a cell that hit its time
+  cap first (read as indicative); `deadlock-*` stay **[noisy]**
+
+### rw9010/balanced
+
+- throughput[strong-read]: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00, n=2) => ~same
+- throughput[weak-read]: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00, n=2) => ~same
+- throughput[write]: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00, n=2) => ~same
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
+- latency-p50[weak-read]: ratio b/a min=0.97 median=1.02 max=1.08 (geomean=1.02, n=2) => WORSE
+- latency-p50[write]: ratio b/a min=1.01 median=1.01 max=1.02 (geomean=1.01, n=2) => ~same
+- retries: ratio b/a min=0.98 median=1.00 max=1.04 (geomean=1.00, n=5) => ~same
+- backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.03 (geomean=1.00, n=5) => ~same
+
+### rw9010/readheavy
+
+- throughput[strong-read]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- throughput[weak-read]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- throughput[write]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- latency-p50[strong-read]: ratio b/a min=0.98 median=0.98 max=0.99 (geomean=0.98, n=2) => ~same
+- latency-p50[weak-read]: ratio b/a min=0.93 median=1.01 max=1.08 (geomean=1.01, n=2) => ~same
+- latency-p50[write]: ratio b/a min=0.98 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
+- retries: ratio b/a min=1.01 median=1.01 max=1.05 (geomean=1.02, n=5) => ~same
+- backend-ops/tx: ratio b/a min=1.01 median=1.01 max=1.04 (geomean=1.02, n=5) => ~same
+
+### rw9010/writeheavy
+
+- throughput[strong-read]: ratio b/a min=1.03 median=1.07 max=1.11 (geomean=1.07, n=2) => better
+- throughput[weak-read]: ratio b/a min=1.03 median=1.07 max=1.11 (geomean=1.07, n=2) => better
+- throughput[write]: ratio b/a min=1.03 median=1.07 max=1.11 (geomean=1.07, n=2) => better
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- latency-p50[weak-read]: ratio b/a min=0.80 median=0.91 max=1.01 (geomean=0.90, n=2) => better
+- latency-p50[write]: ratio b/a min=0.99 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
+- retries: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00, n=11) => ~same
+- backend-ops/tx: ratio b/a min=0.99 median=1.00 max=1.02 (geomean=1.00, n=11) => ~same
+
+### deadlock
+
+- deadlock-p50 [noisy]: ratio b/a min=0.98 median=1.01 max=1.02 (geomean=1.00, n=6) => ~same
+- deadlock-p90 [noisy]: ratio b/a min=0.99 median=1.02 max=1.05 (geomean=1.02, n=6) => ~same
+
+### mixbench
+
+- mix-tps[roMulti]: ratio b/a min=0.98 median=1.01 max=1.19 (geomean=1.04, n=4) n_min=1260 => ~same
+- mix-tps[roSingle]: ratio b/a min=1.00 median=1.03 max=1.16 (geomean=1.05, n=4) n_min=2297 => better
+- mix-tps[rwMany] [unconverged]: ratio b/a min=0.65 median=1.04 max=1.16 (geomean=0.95, n=4) n_min=62 => better
+- mix-tps[rwSingle]: ratio b/a min=0.94 median=1.02 max=1.14 (geomean=1.03, n=4) n_min=112 => better
+- mix-ops/tx[hi/roMulti]: ratio b/a=1.00 (1 point) n_min=26105 => ~same
+- mix-ops/tx[hi/roSingle]: ratio b/a=0.98 (1 point) n_min=66525 => ~same
+- mix-ops/tx[hi/rwMany] [unconverged]: ratio b/a=1.27 (1 point) n_min=62 => WORSE
+- mix-ops/tx[hi/rwSingle]: ratio b/a=1.02 (1 point) n_min=1541 => ~same
+- mix-ops/tx[lo/roMulti]: ratio b/a=0.96 (1 point) n_min=1260 => better
+- mix-ops/tx[lo/roSingle]: ratio b/a=0.99 (1 point) n_min=2297 => ~same
+- mix-ops/tx[lo/rwMany]: ratio b/a=0.98 (1 point) n_min=149 => better
+- mix-ops/tx[lo/rwSingle]: ratio b/a=1.00 (1 point) n_min=714 => ~same
+- mix-retries/tx[hi] [unconverged]: ratio b/a min=0.85 median=0.97 max=1.32 (geomean=1.01, n=4) => better
+- mix-retries/tx[lo]: ratio b/a min=0.76 median=0.82 max=1.07 (geomean=0.86, n=4) => better
+- mix-agg-ops/tx[hi]: ratio b/a=0.99 (1 point) => ~same
+- mix-agg-ops/tx[lo]: ratio b/a=1.00 (1 point) => ~same
+
+### efficiency
+
+- autoresearch-score (cost/tx geomean, lower=better) [deterministic]: v1=977.99 v2=992.28 ratio b/a=1.015 => ~same
+- autoresearch-cost/tx: ratio b/a min=1.00 median=1.00 max=1.07 (geomean=1.01, n=5) => ~same
+- autoresearch-ops/tx: ratio b/a min=1.00 median=1.00 max=1.07 (geomean=1.01, n=5) => ~same
+- autoresearch-cost/tx[batchRead10]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[readRepeat]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[batchWrite100]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[singleRMW]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[multiRMW10]: ratio b/a=1.07 (1 point) => WORSE
+
+## Shard Coordinator (ADR-028)
+
+### compare-refs summary
+
+- base: 26365c728b7f1892c0dc1d28c1beea79a82e03e0 (v1)
+- target: b789c651741d78f7388dcd71038e95ca095c3974 (v2)
+- ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
+- each line ends in a `=> better/WORSE/~same` verdict read in that
+  metric's own direction, so no axis has to be interpreted by hand
+- `autoresearch-*` is **deterministic** (single-client backend ops/tx,
+  lower is better) — the most trustworthy signal; `mix-*` cells run
+  until their throughput 95% CI reaches --target-ci, so a converged
+  ratio is significant — `[unconverged]` marks a cell that hit its time
+  cap first (read as indicative); `deadlock-*` stay **[noisy]**
+
+### rw9010/balanced
+
+- throughput[strong-read]: ratio b/a min=0.99 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
+- throughput[weak-read]: ratio b/a min=0.99 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
+- throughput[write]: ratio b/a min=0.99 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
+- latency-p50[weak-read]: ratio b/a min=0.75 median=0.84 max=0.92 (geomean=0.83, n=2) => better
+- latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
+- retries: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=4) => ~same
+- backend-ops/tx: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=4) => ~same
+
+### rw9010/readheavy
+
+- throughput[strong-read]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- throughput[weak-read]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- throughput[write]: ratio b/a min=1.01 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
+- latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
+- latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
+- retries: ratio b/a min=0.96 median=0.99 max=1.01 (geomean=0.99, n=4) => ~same
+- backend-ops/tx: ratio b/a min=0.96 median=0.99 max=1.01 (geomean=0.99, n=4) => ~same
+
+### rw9010/writeheavy
+
+- throughput[strong-read]: ratio b/a min=0.93 median=0.96 max=0.99 (geomean=0.96, n=2) => WORSE
+- throughput[weak-read]: ratio b/a min=0.93 median=0.96 max=0.99 (geomean=0.96, n=2) => WORSE
+- throughput[write]: ratio b/a min=0.93 median=0.96 max=0.99 (geomean=0.96, n=2) => WORSE
+- latency-p50[strong-read]: ratio b/a min=1.00 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
+- latency-p50[weak-read]: ratio b/a min=1.02 median=1.04 max=1.06 (geomean=1.04, n=2) => WORSE
+- latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=2) => ~same
+- retries: ratio b/a min=0.97 median=1.00 max=1.03 (geomean=1.00, n=6) => ~same
+- backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00, n=6) => ~same
+
+### deadlock
+
+- deadlock-p50 [noisy]: ratio b/a min=0.26 median=0.34 max=16.78 (geomean=0.63, n=6) => better
+- deadlock-p90 [noisy]: ratio b/a min=0.24 median=0.26 max=14.16 (geomean=0.51, n=6) => better
+
+### efficiency
+
+- autoresearch-score (cost/tx geomean, lower=better) [deterministic]: v1=875.76 v2=975.78 ratio b/a=1.114 => WORSE
+- autoresearch-cost/tx: ratio b/a min=1.00 median=1.00 max=1.69 (geomean=1.11, n=5) => ~same
+- autoresearch-ops/tx: ratio b/a min=1.00 median=1.00 max=1.75 (geomean=1.12, n=5) => ~same
+- autoresearch-cost/tx[batchWrite100]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[batchRead10]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[readRepeat]: ratio b/a=1.00 (1 point) => ~same
+- autoresearch-cost/tx[multiRMW10]: ratio b/a=1.02 (1 point) => ~same
+- autoresearch-cost/tx[singleRMW]: ratio b/a=1.69 (1 point) => WORSE
+
 ## Single RW optimization II (ADR-027)
 
 ### compare-refs summary
