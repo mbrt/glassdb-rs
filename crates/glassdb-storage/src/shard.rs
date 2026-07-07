@@ -40,6 +40,15 @@ impl ShardEntry {
     pub fn exists(&self) -> bool {
         self.current_writer.is_some() && !self.deleted
     }
+
+    /// Reports whether the entry records nothing worth keeping: no lock holder
+    /// and no committed writer (not even a tombstone, which always keeps a
+    /// `current_writer`). Such an entry names no transaction and is
+    /// indistinguishable from an absent one, so a mutation that leaves it this
+    /// way may drop it.
+    pub fn is_vestigial(&self) -> bool {
+        self.locked_by.is_empty() && self.current_writer.is_none()
+    }
 }
 
 /// A decoded shard: the coordination directory for the keys that map to it.

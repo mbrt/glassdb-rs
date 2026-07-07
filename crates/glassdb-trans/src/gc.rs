@@ -29,21 +29,24 @@
 //! `is_expired` gate enforces this) so a stuck owner is neither resurrected by
 //! its own create-if-absent refresher nor left pointing at a prematurely-missing
 //! object.
+//!
+//! Lock reclamation flows through the shard-mutation coordinator (ADR-029): GC
+//! calls the [`Locker`]'s stateless per-object unlock methods rather than issuing
+//! its own shard/root CAS, so every mutation goes through one place.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
-use glassdb_concurr::{Background, Clock, RetryConfig, rt};
+use glassdb_concurr::{Background, Clock, rt};
 use glassdb_data::shard::group_by_owning_shard;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{
-    LockType, PathLock, Shard, ShardEntry, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog,
-};
+use glassdb_storage::{PathLock, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog};
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, PENDING_TX_TIMEOUT, is_expired};
+use crate::tlocker::Locker;
 
 /// How often the collector runs a sweep cycle. Reuses the lease timeout: a
 /// candidate cannot become collectable faster than one lease anyway, so a
@@ -59,10 +62,6 @@ const GC_LIST_PAGE: usize = 128;
 /// a delete, never causes an unsafe one (ADR-022).
 const HINT_QUEUE_CAP: usize = 4096;
 
-/// Bounded CAS retries when releasing a candidate's locks from a contended
-/// shard/root before giving up (a later cycle re-attempts).
-const GC_CAS_RETRIES: usize = 10;
-
 /// Garbage collector for finalized transaction objects (ADR-022).
 #[derive(Clone)]
 pub struct Gc {
@@ -72,6 +71,7 @@ pub struct Gc {
     bg: Weak<Background>,
     tl: TLogger,
     shards: ShardStore,
+    locker: Locker,
     mon: Monitor,
     clock: Clock,
     // Write-back hint feed: txids a fresh commit just superseded (primary
@@ -83,12 +83,14 @@ pub struct Gc {
 }
 
 impl Gc {
-    /// Creates a collector over the transaction log, shard store, and monitor,
-    /// timed off `clock` so its horizon is deterministic under the DST executor.
+    /// Creates a collector over the transaction log, shard store, locker, and
+    /// monitor, timed off `clock` so its horizon is deterministic under the DST
+    /// executor.
     pub fn new(
         bg: Weak<Background>,
         tl: TLogger,
         shards: ShardStore,
+        locker: Locker,
         mon: Monitor,
         clock: Clock,
     ) -> Self {
@@ -96,6 +98,7 @@ impl Gc {
             bg,
             tl,
             shards,
+            locker,
             mon,
             clock,
             hints: Arc::new(Mutex::new(VecDeque::new())),
@@ -327,7 +330,11 @@ impl Gc {
 
     /// Releases `tid` from every shard and root its recorded `locks` name,
     /// grouping the paths so each shard/root is visited once (targeted pruning,
-    /// never a whole-shard-space scan). `current_writer` is never touched.
+    /// never a whole-shard-space scan). Each release flows through the locker's
+    /// coordinator-backed unlock methods (ADR-029) — one deduplicated fold round
+    /// per object that clears `tid` and drops any entry it thereby leaves
+    /// vestigial — so GC issues no shard/root CAS of its own. `current_writer` is
+    /// never touched.
     async fn release_locks(&self, tid: &TxId, locks: &[PathLock]) -> Result<(), TransError> {
         let mut key_locks: Vec<(&str, ())> = Vec::new();
         let mut roots: BTreeSet<String> = BTreeSet::new();
@@ -346,102 +353,13 @@ impl Gc {
         let shards = group_by_owning_shard(key_locks)
             .map_err(|e| TransError::with_source("grouping locks by shard", e))?;
         for (prefix, idx) in shards.into_keys() {
-            self.release_shard_holder(&prefix, idx, tid).await?;
+            self.locker.release_shard(tid, &prefix, idx).await?;
         }
         for prefix in roots {
-            self.release_root_holder(&prefix, tid).await?;
+            self.locker.release_root(&prefix, tid).await?;
         }
         Ok(())
     }
-
-    /// Clears `tid` from the `locked_by` of every entry in shard `idx`, and drops
-    /// any entry it thereby leaves vestigial (no lock, no `current_writer`). One
-    /// idempotent CAS, retried on contention or an in-doubt store (re-clearing an
-    /// already-absent holder is a no-op, inheriting ADR-009 parity).
-    async fn release_shard_holder(
-        &self,
-        prefix: &str,
-        idx: u32,
-        tid: &TxId,
-    ) -> Result<(), TransError> {
-        let mut backoff = RetryConfig::default().backoff();
-        for attempt in 0..GC_CAS_RETRIES {
-            if attempt > 0 {
-                rt::sleep(backoff.next_delay()).await;
-            }
-            let (shard, ver) = self.shards.load_shard(prefix, idx).await?;
-            let Some(ver) = ver else {
-                // No shard object: nothing to release.
-                return Ok(());
-            };
-            let mut changed = false;
-            let mut kept: Vec<ShardEntry> = Vec::new();
-            for mut e in shard.entries().cloned() {
-                if e.locked_by.contains(tid) {
-                    e.locked_by.retain(|h| h != tid);
-                    if e.locked_by.is_empty() {
-                        e.lock_type = LockType::None;
-                    }
-                    changed = true;
-                    if is_vestigial(&e) {
-                        continue;
-                    }
-                }
-                kept.push(e);
-            }
-            if !changed {
-                return Ok(());
-            }
-            let new_shard = Shard::from_entries(kept);
-            match self
-                .shards
-                .store_shard(prefix, idx, &new_shard, Some(&ver))
-                .await
-            {
-                Ok(true) => return Ok(()),
-                // Precondition (shard changed under us) or in-doubt: reload and
-                // retry; clearing our own lock is idempotent.
-                Ok(false) => {}
-                Err(StorageError::Unavailable(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    }
-
-    /// Clears `tid` from the collection root's membership lock, if held. One
-    /// idempotent CAS, retried on contention.
-    async fn release_root_holder(&self, prefix: &str, tid: &TxId) -> Result<(), TransError> {
-        let mut backoff = RetryConfig::default().backoff();
-        for attempt in 0..GC_CAS_RETRIES {
-            if attempt > 0 {
-                rt::sleep(backoff.next_delay()).await;
-            }
-            let (mut root, ver) = match self.shards.load_root(prefix).await {
-                Ok(rv) => rv,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            if !root.membership_locked_by().contains(tid) {
-                return Ok(());
-            }
-            root.clear_membership_lock();
-            match self.shards.store_root(prefix, &root, &ver).await {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(StorageError::Unavailable(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    }
-}
-
-/// A shard entry left with nothing to record: no holders and no committed
-/// writer (not even a tombstone, which always keeps a `current_writer`). GC
-/// drops such entries when it clears the last lock off them.
-fn is_vestigial(e: &ShardEntry) -> bool {
-    e.locked_by.is_empty() && e.current_writer.is_none()
 }
 
 /// Which shard-entry field a liveness check consults for a recorded key: a
@@ -456,9 +374,16 @@ enum CheckKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolver::Resolver;
+    use crate::shard_coord::ShardCoordinator;
+    use crate::tlocker::LockOutcome;
+    use glassdb_backend::middleware::RecordingBackend;
     use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_concurr::RetryConfig;
     use glassdb_data::shard::shard_index;
-    use glassdb_storage::{ObjectCache, SharedCache, TxWrite, ValueCache};
+    use glassdb_storage::{
+        LockType, ObjectCache, Shard, ShardEntry, SharedCache, TxWrite, ValueCache,
+    };
     use std::time::{Duration, SystemTime};
 
     const COLL: &str = "db/coll";
@@ -476,12 +401,16 @@ mod tests {
         gc: Gc,
         tl: TLogger,
         shards: ShardStore,
-        _bg: Arc<Background>,
+        locker: Locker,
+        mon: Monitor,
     }
 
     fn new_ctx() -> Ctx {
+        new_ctx_with(Arc::new(MemoryBackend::new()))
+    }
+
+    fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
         let cache = SharedCache::new(1 << 20);
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(backend, &cache);
         let tl = TLogger::new(objects.clone(), "db");
@@ -495,12 +424,28 @@ mod tests {
             clock.clone(),
             RetryConfig::default(),
         );
-        let gc = Gc::new(Arc::downgrade(&bg), tl.clone(), shards.clone(), mon, clock);
+        let resolver = Resolver::new(shards.clone(), mon.clone());
+        let coord = ShardCoordinator::new(
+            shards.clone(),
+            resolver,
+            mon.clone(),
+            RetryConfig::default(),
+        );
+        let locker = Locker::new(coord, mon.clone(), RetryConfig::default());
+        let gc = Gc::new(
+            Arc::downgrade(&bg),
+            tl.clone(),
+            shards.clone(),
+            locker.clone(),
+            mon.clone(),
+            clock,
+        );
         Ctx {
             gc,
             tl,
             shards,
-            _bg: bg,
+            locker,
+            mon,
         }
     }
 
@@ -729,5 +674,189 @@ mod tests {
         ctx.gc.schedule_tx_cleanup(t.clone());
         ctx.gc.run_once().await;
         assert!(is_gone(&ctx.tl, &t).await);
+    }
+
+    // ADR-029: GC's lock reclamation flows through the shard-mutation coordinator
+    // (via the locker's unlock methods), so a GC release and a live disjoint-key
+    // acquire contending one shard batch into a *single* CAS round instead of GC
+    // racing its own store. The release clears (and prunes) the dead holder's
+    // entry and the acquire installs its lock, all in one shard write.
+    #[tokio::test(start_paused = true)]
+    async fn gc_release_merges_into_live_acquire_round() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let gate = GateBackend::new(mem);
+        let rec = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let log = rec.log();
+        let ctx = new_ctx_with(rec);
+
+        let ka = b"key-a".to_vec();
+        let kb = same_shard_sibling(&ka);
+        let shard_path = paths::from_shard(COLL, shard_index(&ka));
+
+        // Seed both entries in the one shared shard: a dead transaction holds
+        // A's write lock (no committed writer), so GC's release will clear and
+        // prune the now-vestigial entry; B exists committed, so the live
+        // overwrite takes a Write lock (not a Create) and needs no membership
+        // root lock — the round stays one shard CAS.
+        let dead = tx(1);
+        let seed = tx(9);
+        let shard = Shard::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
+        assert!(
+            ctx.shards
+                .store_shard(COLL, shard_index(&ka), &shard, None)
+                .await
+                .unwrap()
+        );
+
+        let live = TxId::with_priority(2_000_000_000, b"live");
+        ctx.mon.begin_tx(&live);
+
+        let before = count_stores(&log, &shard_path);
+        gate.arm();
+
+        // Drive GC's release and the live acquire concurrently: the first becomes
+        // the dedup driver and parks in the gated load; the second queues and
+        // merges into its round.
+        let gc = ctx.gc.clone();
+        let dead2 = dead.clone();
+        let dead_locks = vec![write_lock(&ka)];
+        let release = tokio::spawn(async move { gc.release_locks(&dead2, &dead_locks).await });
+        let locker = ctx.locker.clone();
+        let data = crate::algo::Data {
+            reads: Vec::new(),
+            writes: vec![crate::algo::WriteAccess::put(
+                key_path(&kb).into(),
+                Arc::from(&b"v2"[..]),
+            )],
+        };
+        let live2 = live.clone();
+        let acquire = tokio::spawn(async move { locker.lock(&live2, &data, false).await });
+
+        // Under paused time this fires only once both tasks are parked (driver in
+        // the gated load, the second queued); then release the load.
+        rt::sleep(std::time::Duration::from_millis(50)).await;
+        gate.release();
+
+        release.await.unwrap().unwrap();
+        let outcome = acquire.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, LockOutcome::Locked(_)),
+            "the live acquire must lock"
+        );
+
+        assert_eq!(
+            count_stores(&log, &shard_path) - before,
+            1,
+            "GC release and the live acquire share a single shard CAS"
+        );
+        // The dead holder's entry was cleared and, being vestigial, pruned; the
+        // live acquirer holds B's lock.
+        assert!(
+            lookup_entry(&ctx.shards, &ka).await.is_none(),
+            "GC released and pruned the dead holder's entry"
+        );
+        assert_eq!(
+            lookup_entry(&ctx.shards, &kb).await.unwrap().locked_by,
+            vec![live]
+        );
+    }
+
+    /// Counts the CAS stores (conditional write / create) issued against `path`.
+    fn count_stores(log: &glassdb_backend::middleware::OpLog, path: &str) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == path && (r.op == "write_if" || r.op == "write_if_not_exists"))
+            .count()
+    }
+
+    /// A distinct key that hashes to the same shard as `base`, for exercising a
+    /// GC release and a live acquire contending one shard object.
+    fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
+        let idx = shard_index(base);
+        for i in 0u32.. {
+            let k = format!("sib-{i}").into_bytes();
+            if k != base && shard_index(&k) == idx {
+                return k;
+            }
+        }
+        unreachable!("a same-shard sibling must exist")
+    }
+
+    /// Test backend that, while **armed**, parks the next read on a gate until
+    /// released — so a test can hold the dedup driver mid-load while a second
+    /// contender queues, forcing them into one merged CAS round. Every other call
+    /// passes through. Arming is deferred so un-gated setup runs first.
+    struct GateBackend {
+        inner: Arc<dyn Backend>,
+        gate: Arc<tokio::sync::Notify>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl GateBackend {
+        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
+            Arc::new(GateBackend {
+                inner,
+                gate: Arc::new(tokio::sync::Notify::new()),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for GateBackend {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.read(path).await
+        }
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.read_if_modified(path, expected).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if(path, value, expected).await
+        }
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
     }
 }

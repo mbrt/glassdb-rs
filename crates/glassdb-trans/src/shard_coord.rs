@@ -13,9 +13,10 @@
 //! The coordinator is the *mechanism* and knows nothing of locks, transaction
 //! ids, wound-wait, or commit. For a shard it loads the object once, **folds**
 //! the round's installed [`ShardResolver`]s over a running staged entry map (each
-//! resolver observing the entries staged by the resolvers before it), CASes once,
-//! recovers precondition/in-doubt by reload-and-re-fold, and deposits each
-//! member's outcome. For a collection root it loads once, folds the single
+//! resolver observing the entries staged by the resolvers before it), drops any
+//! entry left vestigial (no holder, no `current_writer`), CASes once, recovers
+//! precondition/in-doubt by reload-and-re-fold, and deposits each member's
+//! outcome (ADR-029). For a collection root it loads once, folds the single
 //! installed [`RootResolver`], and CASes the returned root state. All
 //! lock/transaction *policy* lives in the resolvers the callers install:
 //! [`Locker`](crate::Locker) installs the shard Acquire / WriteBack / Release and
@@ -364,7 +365,15 @@ impl CasWorker {
             }
 
             if staged {
-                let new_shard = glassdb_storage::Shard::from_entries(entries.into_values());
+                // Drop entries a member left vestigial (no holder, no
+                // `current_writer`): they name no transaction and are
+                // indistinguishable from absent, so pruning them here — in the
+                // same CAS that clears the last holder — keeps shards tidy on
+                // every path (acquire / write-back / release, ADR-029) instead
+                // of leaving dead entries for a later GC cycle.
+                let new_shard = glassdb_storage::Shard::from_entries(
+                    entries.into_values().filter(|e| !e.is_vestigial()),
+                );
                 match self
                     .core
                     .shards

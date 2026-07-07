@@ -977,8 +977,16 @@ impl Locker {
     }
 
     /// Installs this transaction's [`ReleaseResolver`] on a shard (drop its
-    /// holds, publish nothing). Best-effort and idempotent.
-    async fn release_shard(&self, id: &TxId, prefix: &str, idx: u32) -> Result<(), TransError> {
+    /// holds, publish nothing). Best-effort and idempotent, and stateless with
+    /// respect to the per-transaction bookkeeping, so GC drives it to reclaim a
+    /// dead transaction's shard holds (ADR-029) without corrupting live
+    /// tracking.
+    pub(crate) async fn release_shard(
+        &self,
+        id: &TxId,
+        prefix: &str,
+        idx: u32,
+    ) -> Result<(), TransError> {
         let resolver = Arc::new(ReleaseResolver { id: id.clone() });
         self.coord
             .submit_shard(prefix, idx, id, resolver)
@@ -1088,8 +1096,10 @@ impl Locker {
     /// Releases this transaction's collection-root membership lock for `prefix`
     /// by installing its [`RootReleaseResolver`] through the shared coordinator.
     /// Best-effort and idempotent; a shutdown mid-flight leaves the lock to lazy
-    /// reclaim / lease expiry.
-    async fn release_root(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
+    /// reclaim / lease expiry. Stateless with respect to the per-transaction
+    /// bookkeeping, so GC drives it to reclaim a dead transaction's membership
+    /// hold (ADR-029).
+    pub(crate) async fn release_root(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
         let resolver = Arc::new(RootReleaseResolver { id: id.clone() });
         self.coord.submit_root(prefix, resolver).await.map(|_| ())
     }
@@ -1479,10 +1489,13 @@ mod tests {
 
         locker.release_locks(&tx).await.unwrap();
 
-        let e = entry_of(&ctx, key).await.unwrap();
-        assert!(e.locked_by.is_empty(), "shard lock released");
-        assert_eq!(e.lock_type, LockType::None);
-        assert_eq!(e.current_writer, None, "a release publishes no value");
+        // The released create-lock left the fresh key with no holder and no
+        // committed writer, so the fold pruned the now-vestigial entry (ADR-029):
+        // a release publishes no value and leaves no dead entry behind.
+        assert!(
+            entry_of(&ctx, key).await.is_none(),
+            "vestigial entry pruned on release"
+        );
 
         let (root, _) = ctx.shards.load_root(COLL).await.unwrap();
         assert!(
@@ -1892,10 +1905,16 @@ mod tests {
             1,
             "two releases on one shard share a single CAS"
         );
-        let ea = entry_of(&ctx, &ka).await.unwrap();
-        assert!(ea.locked_by.is_empty());
-        assert_eq!(ea.current_writer, None, "a release publishes no value");
-        assert!(entry_of(&ctx, &kb).await.unwrap().locked_by.is_empty());
+        // Both released fresh-key entries are now vestigial (no holder, no
+        // committed writer), so the fold pruned them in the shared CAS (ADR-029).
+        assert!(
+            entry_of(&ctx, &ka).await.is_none(),
+            "vestigial entry pruned on release"
+        );
+        assert!(
+            entry_of(&ctx, &kb).await.is_none(),
+            "vestigial entry pruned on release"
+        );
     }
 
     // ADR-028: two writers on the *same* key now share one CAS round. The

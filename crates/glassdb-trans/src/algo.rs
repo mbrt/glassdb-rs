@@ -1040,6 +1040,7 @@ mod tests {
             bg_weak.clone(),
             tlogger.clone(),
             shards.clone(),
+            locker.clone(),
             tmon.clone(),
             Clock::real(),
         );
