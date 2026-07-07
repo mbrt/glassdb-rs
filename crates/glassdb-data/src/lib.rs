@@ -3,7 +3,6 @@
 //! packages.
 
 pub mod base64;
-pub mod gopath;
 pub mod paths;
 pub mod shard;
 mod txid;

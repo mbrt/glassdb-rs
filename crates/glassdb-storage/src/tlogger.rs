@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{TxId, gopath, paths};
+use glassdb_data::{TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -255,7 +255,7 @@ fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog,
     for cw in &tr.writes {
         for w in &cw.writes {
             res.writes.push(TxWrite {
-                path: gopath::join(&[&cw.prefix, &w.suffix]),
+                path: format!("{}/{}", cw.prefix, w.suffix),
                 value: write_value(w),
                 deleted: write_deleted(w),
                 prev_writer: TxId::from_bytes(w.prev_tid.clone()),
@@ -275,7 +275,7 @@ fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog,
             }
             for l in &locks.locks {
                 res.locks.push(PathLock {
-                    path: gopath::join(&[&cw.prefix, &l.suffix]),
+                    path: format!("{}/{}", cw.prefix, l.suffix),
                     typ: parse_lock_type(l.lock_type),
                 });
             }
@@ -332,7 +332,7 @@ fn marshal_write(
         pb::write::ValDelete::Value(e.value.to_vec())
     };
     let write = pb::Write {
-        suffix: gopath::join(&[pr.typ.as_str(), &pr.suffix]),
+        suffix: format!("{}/{}", pr.typ.as_str(), pr.suffix),
         prev_tid: e.prev_writer.as_bytes().to_vec(),
         val_delete: Some(val_delete),
     };
@@ -368,7 +368,7 @@ fn marshal_lock(
         clocks.collection_lock = lt as i32;
     } else {
         clocks.locks.push(pb::Lock {
-            suffix: gopath::join(&[pr.typ.as_str(), &pr.suffix]),
+            suffix: format!("{}/{}", pr.typ.as_str(), pr.suffix),
             lock_type: lt as i32,
         });
     }

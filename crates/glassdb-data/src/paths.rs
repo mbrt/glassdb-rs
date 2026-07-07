@@ -111,7 +111,7 @@ pub fn to_collection(suffix: &str) -> Result<Vec<u8>, PathError> {
 
 /// Returns the storage path for the collection-info object under `prefix`.
 pub fn collection_info(prefix: &str) -> String {
-    crate::gopath::join(&[prefix, "_i"])
+    format!("{prefix}/_i")
 }
 
 /// Reports whether `p` refers to a collection-info object.
