@@ -34,9 +34,9 @@ Underneath the racing CAS sit two structural facts:
 
 - **Duplicated release semantics.** GC's "drop this dead txid's holds from a
   shard/root, publish nothing" is _identical_ to the release the `Locker`
-  already expresses as an installed resolver. GC re-implements it as a separate
-  CAS loop only because the mechanism was not, until ADR-028, a reusable object
-  it could call.
+  already drives through the coordinator. GC re-implements it as a separate CAS
+  loop only because the `Locker`'s per-object unlock step was not exposed as a
+  callable operation.
 - **Pruning is the collector's private extra.** GC does one thing the `Locker`
   release does not: when clearing the last holder leaves an entry **vestigial**
   (no lock, no `current_writer`, not a live tombstone) it removes the entry
@@ -76,15 +76,16 @@ not an aspiration with a footnote.
 - **GC (policy, one responsibility relocated).** GC keeps every ADR-022 policy
   decision — candidate selection, the safety horizon, reverse liveness check,
   the abort-then-release-then-delete ordering, tombstone retention. What changes
-  is purely _how it applies a release_: instead of its own CAS loop, GC becomes
-  a coordinator **caller**, installing the same **release** resolvers the
-  `Locker` installs, keyed by the dead candidate's txid. GC still reads shards
-  and roots directly for its reverse check (a read path, untouched).
-- **The release resolvers (shared policy).** The "drop this id's holds, publish
-  nothing, idempotent and best-effort" shard and root release resolvers become a
-  single shared piece of policy installed by **both** the `Locker` (its
-  serial-fallback release) and **GC** (its reclamation release). One definition,
-  two callers, identical semantics.
+  is purely _how it applies a release_: instead of its own CAS loop, GC calls the
+  `Locker`'s per-object **unlock methods** (shard-holder release and
+  root-membership release), driving them from the dead candidate's recorded lock
+  set. GC still reads shards and roots directly for its reverse check (a read
+  path, untouched).
+- **The release resolvers stay private to the `Locker`.** The "drop this id's
+  holds, publish nothing, idempotent and best-effort" shard and root release
+  resolvers remain an implementation detail of the `Locker`; they are never
+  shared or installed by another module. GC reaches that behaviour only through
+  the `Locker`'s unlock methods, so there is one definition and one installer.
 
 ### Vestigial pruning belongs to the fold, not to any caller
 
@@ -154,10 +155,12 @@ racing CAS.
   extending ADR-028's single-flight batching to reclamation — a GC release now
   merges with any in-flight acquire/write-back on the same shard instead of
   competing with it.
-- **Release semantics live in one place.** The `Locker` and GC install the same
-  shared release resolvers; ADR-022's "targeted pruning" stops being a
-  GC-private CAS and becomes a fold guarantee that tidies every path. GC's
-  reclamation shrinks to candidate policy plus a coordinator submission.
+- **Release semantics live in one place.** The release resolvers stay private to
+  the `Locker`, and GC drives them through the `Locker`'s unlock methods rather
+  than re-implementing or sharing them; ADR-022's "targeted pruning" stops being
+  a GC-private CAS and becomes a fold guarantee that tidies every path. GC's
+  reclamation shrinks to candidate policy plus a call into the `Locker`'s unlock
+  step.
 - **The DST op-stream shape changes.** Fewer, differently-shaped shard writes
   (vestigial entries pruned in the clearing CAS rather than a later GC cycle, GC
   releases interleaved with other rounds). This stays deterministic under the

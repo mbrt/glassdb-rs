@@ -132,6 +132,7 @@ impl DatabaseBuilder {
             bg_weak.clone(),
             tl,
             shards.clone(),
+            locker.clone(),
             tmon.clone(),
             clock.clone(),
         );
