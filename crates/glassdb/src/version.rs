@@ -1,7 +1,6 @@
 //! Database metadata version check. Ported from the Go `version.go`.
 
 use glassdb_backend::Backend;
-use glassdb_data::gopath;
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -32,7 +31,7 @@ pub(crate) async fn check_or_create_db_meta(b: &impl Backend, name: &str) -> Res
 }
 
 async fn check_db_version(b: &impl Backend, name: &str) -> Result<(), Error> {
-    let p = gopath::join(&[name, DB_META_PATH]);
+    let p = format!("{name}/{DB_META_PATH}");
     // The metadata lives in the object body (ADR-023): the slimmed backend
     // trait has no object tags. It is an evolvable protobuf message so new
     // fields can be added without breaking existing databases.
@@ -49,7 +48,7 @@ async fn check_db_version(b: &impl Backend, name: &str) -> Result<(), Error> {
 }
 
 async fn set_db_metadata(b: &impl Backend, name: &str) -> Result<(), Error> {
-    let p = gopath::join(&[name, DB_META_PATH]);
+    let p = format!("{name}/{DB_META_PATH}");
     let body = pb::DatabaseMetadata {
         version: DB_VERSION.to_string(),
     }
@@ -75,7 +74,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_version_is_rejected() {
         let b = MemoryBackend::new();
-        let p = gopath::join(&["mydb", DB_META_PATH]);
+        let p = format!("mydb/{DB_META_PATH}");
         let body = pb::DatabaseMetadata {
             version: "v1".to_string(),
         }
@@ -94,7 +93,7 @@ mod tests {
         // A pre-v2 database stored the version as a naked string, which is not a
         // valid protobuf message; opening it must fail rather than misread.
         let b = MemoryBackend::new();
-        let p = gopath::join(&["mydb", DB_META_PATH]);
+        let p = format!("mydb/{DB_META_PATH}");
         b.write_if_not_exists(&p, b"v0".to_vec()).await.unwrap();
 
         let err = check_or_create_db_meta(&b, "mydb").await.unwrap_err();

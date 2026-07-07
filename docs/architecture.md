@@ -84,7 +84,7 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
 | `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `monitor.rs`, `reader.rs`, `gc.rs`                  | Transaction engine: commit algorithm, distributed locker, lifecycle monitor, read path, log GC                                                |
 | `glassdb-storage`     | `object_cache.rs`, `value_cache.rs`, `shardstore.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Object cache (read/write-through, version-keyed), value cache (writer-keyed, staleness), shard/root CAS store, lock-state value type, transaction-log persistence, version tracking, generic LRU |
-| `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`, `gopath.rs`                              | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
+| `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
 
@@ -673,9 +673,8 @@ Storage paths follow a hierarchical scheme with type markers
 Key names and collection names are base64-encoded in the path to avoid
 conflicts with the type markers and to support arbitrary byte sequences. The
 encoding uses a custom **order-preserving** base64 alphabet
-(`glassdb-data/src/base64.rs`), and `path.Clean`/`path.Join` are reimplemented
-faithfully in `glassdb-data/src/gopath.rs`, so storage keys are byte-identical
-to the Go implementation (anchored by golden vectors).
+(`glassdb-data/src/base64.rs`), so storage keys are stable and anchored by
+golden vectors.
 
 ### Collections
 
