@@ -4,6 +4,13 @@
 
 Accepted — implemented.
 
+The lock-reclamation *mechanism* (the "stale-lock and empty-entry pruning" CAS)
+is refined by [ADR-029](029-gc-through-shard-coordinator.md): GC's release now
+flows through the shard-mutation coordinator ([ADR-028](028-shard-mutation-coordinator.md))
+and vestigial-entry pruning becomes a fold property. The GC *policy* below —
+reverse mark-sweep, the safety horizon, abort-then-release-then-delete, and
+tombstone retention — is unchanged.
+
 Deferred to a follow-up: subcollection teardown (reclaiming orphaned child roots
 and shards), and persisting a wound victim's locks into the aborted object.
 

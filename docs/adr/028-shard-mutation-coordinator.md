@@ -4,6 +4,12 @@
 
 Accepted (implemented).
 
+The one documented exception to the invariant below — GC's out-of-band
+mark-sweep CAS — is closed by
+[ADR-029](029-gc-through-shard-coordinator.md), which routes GC's lock
+reclamation through this coordinator and makes vestigial-entry pruning a fold
+property, so the invariant holds with no exceptions.
+
 Generalizes the deduplication **mechanism** of
 [ADR-025](025-dedup-shard-lock-acquisition.md) and
 [ADR-026](026-dedup-shard-release-write-back.md), and **supersedes the bespoke
