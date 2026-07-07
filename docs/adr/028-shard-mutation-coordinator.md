@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted (implemented).
 
 Generalizes the deduplication **mechanism** of
 [ADR-025](025-dedup-shard-lock-acquisition.md) and

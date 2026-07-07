@@ -5,6 +5,11 @@
 Implemented. Follow-up to [ADR-025](025-dedup-shard-lock-acquisition.md), which
 deduplicated lock **acquisition** but deliberately left the release path direct.
 
+The release and write-back deduplication **mechanism** is generalized by
+[ADR-028](028-shard-mutation-coordinator.md) into the shared `ShardCoordinator`
+(Release and WriteBack become installed resolvers); the batching decision is
+unchanged.
+
 ## Context
 
 ADR-025 routed `Locker::lock_shard` / `lock_root` through a `Dedup` keyed on the

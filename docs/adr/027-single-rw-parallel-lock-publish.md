@@ -6,6 +6,13 @@ Accepted — implemented. Supersedes the **single read-write fast path** decisio
 of [ADR-020](020-commit-write-back-protocol.md) (its "Fast paths →
 Single read-write" bullet); the rest of ADR-020 is unchanged.
 
+Its **bespoke shard-CAS install step** (step 2 "W2 — one shard CAS" and the
+private retry/reclassify loop) is superseded by
+[ADR-028](028-shard-mutation-coordinator.md): the lock install now flows through
+the shared shard coordinator as a `CommitInstall` resolver. The parallel-commit
+decision here (two concurrent writes, the commit point, the one irreducible
+in-doubt) is retained.
+
 ## Context
 
 ADR-020's single read-write fast path commits a lone overwrite of an existing

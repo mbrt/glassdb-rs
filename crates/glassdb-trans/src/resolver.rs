@@ -57,7 +57,9 @@ impl Resolved {
 /// status: the effective committed writer (after help-forwarding), whether that
 /// writer's value is a tombstone, and the foreign holders still live-pending.
 /// The read path uses `writer`/`deleted`; the lock path also wound-waits the
-/// `pending` holders.
+/// `pending` holders. The single read-write fast path consumes the whole view
+/// to decide eligibility (a live `pending` holder is a conflict it cannot take).
+#[derive(Debug, Clone, Default)]
 pub(crate) struct HolderResolution {
     pub writer: Option<TxId>,
     pub deleted: bool,
@@ -156,6 +158,19 @@ impl Resolver {
             .await
             .map_err(trans_to_storage)?;
         Ok(resolved.token())
+    }
+
+    /// Loads `key_path`'s entry and resolves its holders (help-forwarding
+    /// committed ones, collecting the live pending ones) into a
+    /// [`HolderResolution`]. Unlike [`effective_writer`](Self::effective_writer)
+    /// it exposes the full view — including the `pending` conflicts — so the
+    /// single read-write fast path can decide eligibility for itself without the
+    /// resolver embedding that policy. An absent key resolves to an empty view.
+    pub(crate) async fn resolve_key(&self, key_path: &str) -> Result<HolderResolution, TransError> {
+        match self.shards.load_entry(key_path).await? {
+            Some(entry) => self.resolve_holders(key_path, &entry, None).await,
+            None => Ok(HolderResolution::default()),
+        }
     }
 
     /// Interprets `entry`'s holders against transaction status — the step shared

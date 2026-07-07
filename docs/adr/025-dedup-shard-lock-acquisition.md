@@ -11,6 +11,13 @@ Accepted — implemented. Re-introduces v1's request **deduplication** in the v2
 wound-wait/lease semantics (ADR-021), and hold-and-wait conflict resolution
 (ADR-024) are unchanged.
 
+The deduplication **mechanism** described here is generalized by
+[ADR-028](028-shard-mutation-coordinator.md) into a standalone `ShardCoordinator`
+shared by both the `Locker` and the commit algorithm, and this ADR's same-key
+merge **predicate** is dissolved there in favour of a monotonic in-fold
+resolution (both contenders join one round; the loser waits). The batching
+decision itself is unchanged.
+
 ## Context
 
 In v1 the `Locker` wrapped every per-**key** lock/unlock request in
