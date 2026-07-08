@@ -22,8 +22,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use glassdb_backend as backend;
+use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus};
+use glassdb_storage::{Freshness, LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus};
 
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::Monitor;
@@ -160,17 +162,34 @@ impl Resolver {
         Ok(resolved.token())
     }
 
-    /// Loads `key_path`'s entry and resolves its holders (help-forwarding
+    /// Loads `key_path`'s shard and resolves its holders (help-forwarding
     /// committed ones, collecting the live pending ones) into a
-    /// [`HolderResolution`]. Unlike [`effective_writer`](Self::effective_writer)
-    /// it exposes the full view — including the `pending` conflicts — so the
-    /// single read-write fast path can decide eligibility for itself without the
+    /// [`HolderResolution`], returning the shard's current backend version
+    /// alongside. Unlike [`effective_writer`](Self::effective_writer) it exposes
+    /// the full view — including the `pending` conflicts — so the single
+    /// read-write fast path can decide eligibility for itself without the
     /// resolver embedding that policy. An absent key resolves to an empty view.
-    pub(crate) async fn resolve_key(&self, key_path: &str) -> Result<HolderResolution, TransError> {
-        match self.shards.load_entry(key_path).await? {
-            Some(entry) => self.resolve_holders(key_path, &entry, None).await,
-            None => Ok(HolderResolution::default()),
-        }
+    ///
+    /// `freshness` is forwarded to the shard load: the single read-write commit
+    /// passes [`Freshness::AllowStale`] so its eligibility check reuses the shard
+    /// the read already cached, without a revalidation round-trip; a stale copy is
+    /// caught by the commit-install's version-conditional CAS (ADR-030).
+    pub(crate) async fn resolve_key(
+        &self,
+        key_path: &str,
+        freshness: Freshness,
+    ) -> Result<(HolderResolution, Option<backend::Version>), TransError> {
+        let (prefix, raw_key) = paths::split_key(key_path)
+            .map_err(|e| TransError::with_source("parsing key path", e))?;
+        let (shard, ver) = self
+            .shards
+            .load_shard(&prefix, shard_index(&raw_key), freshness)
+            .await?;
+        let holders = match shard.lookup(&raw_key) {
+            Some(entry) => self.resolve_holders(key_path, entry, None).await?,
+            None => HolderResolution::default(),
+        };
+        Ok((holders, ver))
     }
 
     /// Interprets `entry`'s holders against transaction status — the step shared
@@ -287,7 +306,10 @@ mod tests {
     // tombstone.
     async fn seed_writer(store: &ShardStore, key: &[u8], writer: &TxId, deleted: bool) {
         let idx = shard_index(key);
-        let (shard, ver) = store.load_shard(COLL, idx).await.unwrap();
+        let (shard, ver) = store
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
             .entries()
             .cloned()
@@ -333,7 +355,10 @@ mod tests {
     // not the (stale, empty) pointer.
     async fn seed_locked(store: &ShardStore, key: &[u8], holder: &TxId) {
         let idx = shard_index(key);
-        let (shard, ver) = store.load_shard(COLL, idx).await.unwrap();
+        let (shard, ver) = store
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
             .entries()
             .cloned()
@@ -438,6 +463,61 @@ mod tests {
         // The colliding pair means 3 keys span at most 2 shards: a per-key
         // resolve would have read 3 times.
         assert!(distinct.len() < 3, "the colliding pair shares a shard");
+    }
+
+    // `resolve_key` with `AllowStale` reuses a shard already in the resolver's
+    // cache without any backend read, while `Latest` revalidates it with one
+    // conditional read (ADR-030). This is what lets the single read-write
+    // commit's eligibility check reuse the shard the transaction body's read
+    // cached, adding no shard load at commit.
+    #[tokio::test]
+    async fn resolve_key_allow_stale_reuses_cached_shard() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+
+        // Seed through a separate cache so the resolver-under-test starts cold.
+        let seed_store = ShardStore::new(ObjectCache::new(
+            backend.clone(),
+            &SharedCache::new(1 << 20),
+        ));
+        let key = b"rmw-key";
+        let writer = TxId::with_priority(1, b"w");
+        seed_writer(&seed_store, key, &writer, false).await;
+
+        let (resolver, _mon, _bg) = resolver_over(backend.clone());
+        let key_path = paths::from_key(COLL, key);
+
+        // Warm the resolver's own cache with one cold load.
+        resolver
+            .resolve_key(&key_path, Freshness::Latest)
+            .await
+            .unwrap();
+        log.lock().unwrap().clear();
+
+        // AllowStale serves the cached shard: no backend read at all.
+        let (holders, _) = resolver
+            .resolve_key(&key_path, Freshness::AllowStale)
+            .await
+            .unwrap();
+        assert_eq!(holders.writer, Some(writer.clone()), "still resolves");
+        assert_eq!(
+            count_shard_reads(&log),
+            0,
+            "AllowStale reuses the cached shard without a backend read"
+        );
+
+        // Latest revalidates the cached shard with one conditional read.
+        log.lock().unwrap().clear();
+        resolver
+            .resolve_key(&key_path, Freshness::Latest)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_shard_reads(&log),
+            1,
+            "Latest revalidates the cached shard"
+        );
     }
 
     // The singular resolve mirrors the batched one for one key: a live pointer

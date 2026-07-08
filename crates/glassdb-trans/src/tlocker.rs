@@ -35,7 +35,7 @@ use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::shard::{SHARD_COUNT, group_by_owning_shard};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{CollectionRoot, LockType, PathLock, ShardEntry, TxCommitStatus};
+use glassdb_storage::{CollectionRoot, Freshness, LockType, PathLock, ShardEntry, TxCommitStatus};
 
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
@@ -941,7 +941,11 @@ impl Locker {
             id: id.clone(),
             intents: intents.clone(),
         });
-        match self.coord.submit_shard(prefix, idx, id, resolver).await? {
+        match self
+            .coord
+            .submit_shard(prefix, idx, id, resolver, Freshness::Latest)
+            .await?
+        {
             // The lock landed: record the shard hold so the serial-fallback
             // release and diagnostics can find it (the engine no longer tracks
             // this, ADR-028).
@@ -970,7 +974,11 @@ impl Locker {
             id: id.clone(),
             intents,
         });
-        match self.coord.submit_shard(prefix, idx, id, resolver).await? {
+        match self
+            .coord
+            .submit_shard(prefix, idx, id, resolver, Freshness::Latest)
+            .await?
+        {
             Some(FoldOutcome::Released { superseded }) => Ok(superseded),
             _ => Ok(Vec::new()),
         }
@@ -989,7 +997,7 @@ impl Locker {
     ) -> Result<(), TransError> {
         let resolver = Arc::new(ReleaseResolver { id: id.clone() });
         self.coord
-            .submit_shard(prefix, idx, id, resolver)
+            .submit_shard(prefix, idx, id, resolver, Freshness::Latest)
             .await
             .map(|_| ())
     }
@@ -1152,8 +1160,8 @@ mod tests {
     use glassdb_data::paths;
     use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        ObjectCache, Shard, ShardEntry, ShardStore, SharedCache, TLogger, TxCommitStatus,
-        ValueCache,
+        Freshness, ObjectCache, Shard, ShardEntry, ShardStore, SharedCache, TLogger,
+        TxCommitStatus, ValueCache,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1237,7 +1245,11 @@ mod tests {
     }
 
     async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<ShardEntry> {
-        let (shard, _) = ctx.shards.load_shard(COLL, shard_index(key)).await.unwrap();
+        let (shard, _) = ctx
+            .shards
+            .load_shard(COLL, shard_index(key), Freshness::Latest)
+            .await
+            .unwrap();
         shard.lookup(key).cloned()
     }
 
@@ -1547,7 +1559,11 @@ mod tests {
 
         // Install the committed pointer directly in the shard.
         let idx = shard_index(key);
-        let (shard, ver) = ctx.shards.load_shard(COLL, idx).await.unwrap();
+        let (shard, ver) = ctx
+            .shards
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
             .entries()
             .cloned()

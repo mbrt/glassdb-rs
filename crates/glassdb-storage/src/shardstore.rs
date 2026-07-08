@@ -18,7 +18,7 @@ use glassdb_data::paths;
 use glassdb_data::shard::{ShardKeys, group_by_owning_shard, shard_index};
 
 use crate::error::StorageError;
-use crate::object_cache::ObjectCache;
+use crate::object_cache::{Freshness, ObjectCache};
 use crate::root::CollectionRoot;
 use crate::shard::{Shard, ShardEntry};
 
@@ -46,12 +46,20 @@ impl ShardStore {
 
     /// Loads shard `idx` under `prefix`. Returns the empty shard with no version
     /// when it does not exist yet (shards are created lazily on first lock).
+    /// `freshness` chooses whether a cached copy is revalidated
+    /// ([`Freshness::Latest`]) or served as-is ([`Freshness::AllowStale`], for a
+    /// caller that only needs a CAS seed, ADR-030).
     pub async fn load_shard(
         &self,
         prefix: &str,
         idx: u32,
+        freshness: Freshness,
     ) -> Result<(Shard, Option<backend::Version>), StorageError> {
-        match self.objects.read(&paths::from_shard(prefix, idx)).await {
+        match self
+            .objects
+            .read(&paths::from_shard(prefix, idx), freshness)
+            .await
+        {
             Ok(r) => Ok((Shard::decode(&r.value)?, Some(r.version))),
             Err(StorageError::NotFound) => Ok((Shard::new(), None)),
             Err(e) => Err(e),
@@ -71,7 +79,7 @@ impl ShardStore {
     ) -> Result<Vec<(Shard, Option<backend::Version>)>, StorageError> {
         let loads = targets
             .iter()
-            .map(|(prefix, idx)| self.load_shard(prefix, *idx));
+            .map(|(prefix, idx)| self.load_shard(prefix, *idx, Freshness::Latest));
         futures::future::join_all(loads).await.into_iter().collect()
     }
 
@@ -105,7 +113,9 @@ impl ShardStore {
     pub async fn load_entry(&self, key_path: &str) -> Result<Option<ShardEntry>, StorageError> {
         let (prefix, raw_key) = paths::split_key(key_path)
             .map_err(|e| StorageError::with_source("parsing key path", e))?;
-        let (shard, _) = self.load_shard(&prefix, shard_index(&raw_key)).await?;
+        let (shard, _) = self
+            .load_shard(&prefix, shard_index(&raw_key), Freshness::Latest)
+            .await?;
         Ok(shard.lookup(&raw_key).cloned())
     }
 
@@ -138,7 +148,10 @@ impl ShardStore {
         &self,
         prefix: &str,
     ) -> Result<(CollectionRoot, backend::Version), StorageError> {
-        let r = self.objects.read(&paths::collection_info(prefix)).await?;
+        let r = self
+            .objects
+            .read(&paths::collection_info(prefix), Freshness::Latest)
+            .await?;
         Ok((CollectionRoot::decode(&r.value)?, r.version))
     }
 
@@ -227,11 +240,17 @@ mod tests {
         );
 
         let reader = store_over(backend.clone());
-        let (_, v1) = reader.load_shard(COLL, idx).await.unwrap();
+        let (_, v1) = reader
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         assert_eq!(count(&log, "read"), 1, "cold load full-reads");
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        let (_, v2) = reader.load_shard(COLL, idx).await.unwrap();
+        let (_, v2) = reader
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         assert_eq!(count(&log, "read"), 1, "hot load must not full-read");
         assert_eq!(
             count(&log, "read_if_modified"),
@@ -239,6 +258,52 @@ mod tests {
             "hot load revalidates conditionally"
         );
         assert_eq!(v1, v2, "unchanged shard keeps its version");
+    }
+
+    // A cached shard loaded with `AllowStale` is served without any backend op
+    // (neither a full read nor a revalidation), while an uncached shard still
+    // does one full read (ADR-030).
+    #[tokio::test]
+    async fn allow_stale_serves_cached_without_backend_op() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let idx = shard_index(b"k");
+
+        // Seed the shard through a separate cache so the reader starts cold.
+        assert!(
+            store_over(backend.clone())
+                .store_shard(COLL, idx, &Shard::new(), None)
+                .await
+                .unwrap()
+        );
+
+        let reader = store_over(backend.clone());
+        // Warm the cache with one cold full read.
+        reader
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
+        assert_eq!(count(&log, "read"), 1);
+
+        // A cached AllowStale load touches the backend for nothing.
+        reader
+            .load_shard(COLL, idx, Freshness::AllowStale)
+            .await
+            .unwrap();
+        assert_eq!(count(&log, "read"), 1, "cached AllowStale must not read");
+        assert_eq!(
+            count(&log, "read_if_modified"),
+            0,
+            "cached AllowStale must not revalidate"
+        );
+
+        // An uncached shard has nothing to serve, so it falls through to a read.
+        reader
+            .load_shard(COLL, idx.wrapping_add(1), Freshness::AllowStale)
+            .await
+            .unwrap();
+        assert_eq!(count(&log, "read"), 2, "uncached AllowStale falls through");
     }
 
     // A batch load returns one result per target, in order: an existing shard
@@ -351,7 +416,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let (_, v1) = store.load_shard(COLL, idx).await.unwrap();
+        let (_, v1) = store
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         let v1 = v1.expect("shard exists after create");
 
         // CAS a new generation over the loaded version, then confirm the next
@@ -362,7 +430,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let (_, v2) = store.load_shard(COLL, idx).await.unwrap();
+        let (_, v2) = store
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         assert_ne!(Some(v1), v2, "a CAS store advances the version");
     }
 }
