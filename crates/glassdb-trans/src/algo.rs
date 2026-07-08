@@ -31,8 +31,8 @@ use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    LockType, PathLock, ShardEntry, StorageError, TxCommitStatus, TxLog, TxWrite, ValueCache,
-    Version,
+    Freshness, LockType, PathLock, ShardEntry, StorageError, TxCommitStatus, TxLog, TxWrite,
+    ValueCache, Version,
 };
 
 use crate::error::TransError;
@@ -585,15 +585,29 @@ impl Algo {
             .map_err(|e| TransError::with_source("parsing single-rw key path", e))?;
         let idx = shard_index(&raw_key);
 
-        // Check dynamic eligibility before writing anything, so a create / stale
-        // read / genuinely-conflicting entry falls back to the full path with the
-        // same id. A lock left by an *already-committed* writer (its write-back is
+        // Check dynamic eligibility before writing anything, so a create /
+        // genuinely-conflicting entry falls back to the full path with the same
+        // id. A lock left by an *already-committed* writer (its write-back is
         // still pending) does not block us: it is help-forwarded to its effective
         // writer, which is the predecessor we build on (ADR-027).
-        let Some(effective) = self
-            .single_rw_effective_writer(&key_path, read_version.as_ref())
-            .await?
-        else {
+        //
+        // Resolve on the shard the transaction body's read already cached
+        // (`AllowStale`: no revalidation round-trip). The commit-install fold
+        // below re-reads the same shard through the cache (also `AllowStale`), so
+        // a steady-state read-modify-write adds no backend shard load at commit
+        // (ADR-030). Both are cache lookups; deduplicating the decode is a
+        // separate concern (caching decoded objects).
+        //
+        // A stale cached snapshot stays safe: it can only make a superseded
+        // read-modify-write *look* eligible, in which case the fold's
+        // version-conditional CAS misses, the coordinator reloads fresh,
+        // re-folds, and finds the read superseded — the fast path then renews
+        // (`Wounded`).
+        let (holders, _) = self
+            .resolver
+            .resolve_key(&key_path, Freshness::AllowStale)
+            .await?;
+        let Some(effective) = eligible_writer(&holders, read_version.as_ref()) else {
             return Ok(None);
         };
 
@@ -663,27 +677,6 @@ impl Algo {
         }
     }
 
-    /// Resolves `key_path`'s entry and returns the effective committed writer the
-    /// single read-write fast path must build on, or `None` when the key cannot
-    /// take the fast path's commit CAS.
-    ///
-    /// The entry is loaded and resolved through the shared [`Resolver`], which
-    /// exposes the full holder view; the eligibility policy lives in
-    /// [`eligible_writer`]. A lock held by an already-committed writer (whose
-    /// write-back is still pending) is help-forwarded to its committed value
-    /// rather than treated as a conflict: only a *live pending* holder blocks the
-    /// fast path (ADR-027). It also rejects a create / put over a tombstone (a
-    /// membership change needing the collection lock) and, for a
-    /// read-modify-write, a stale read whose value has since been superseded.
-    async fn single_rw_effective_writer(
-        &self,
-        key_path: &str,
-        read_version: Option<&TxId>,
-    ) -> Result<Option<TxId>, TransError> {
-        let res = self.resolver.resolve_key(key_path).await?;
-        Ok(eligible_writer(&res, read_version))
-    }
-
     /// Installs the single read-write fast path's write lock on `raw_key`'s shard
     /// through the shard coordinator's fold engine (ADR-028): one deduplicated
     /// round that merges with disjoint acquires/write-backs on the same shard
@@ -707,7 +700,15 @@ impl Algo {
             key_path,
             read_version,
         });
-        match self.coord.submit_shard(prefix, idx, id, resolver).await? {
+        // The commit's eligibility check just resolved this shard through the
+        // cache, so the fold's first attempt reuses that cached copy without a
+        // revalidation round-trip (`AllowStale`); a stale copy self-corrects via
+        // the version-conditional CAS + reload (ADR-030).
+        match self
+            .coord
+            .submit_shard(prefix, idx, id, resolver, Freshness::AllowStale)
+            .await?
+        {
             Some(FoldOutcome::Landed) => Ok(InstallOutcome::Landed),
             Some(FoldOutcome::InDoubt(msg)) => Ok(InstallOutcome::InDoubt(msg)),
             // A shutdown mid-flight leaves the lock un-installed, so the fast
@@ -1017,7 +1018,14 @@ mod tests {
     }
 
     async fn new_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
-        let cache = SharedCache::new(1024);
+        new_algo_from_backend_with_cache(b, 1024).await
+    }
+
+    async fn new_algo_from_backend_with_cache(
+        b: Arc<dyn Backend>,
+        cache_bytes: usize,
+    ) -> (Algo, Tctx) {
+        let cache = SharedCache::new(cache_bytes);
         let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(b.clone(), &cache);
         let tlogger = TLogger::new(objects.clone(), TEST_COLL);
@@ -1134,7 +1142,7 @@ mod tests {
     async fn entry(tctx: &Tctx, key: &[u8]) -> Option<ShardEntry> {
         let (shard, _) = tctx
             .shards
-            .load_shard(TEST_COLL, shard_index(key))
+            .load_shard(TEST_COLL, shard_index(key), Freshness::Latest)
             .await
             .unwrap();
         shard.lookup(key).cloned()
@@ -1228,26 +1236,31 @@ mod tests {
         assert_eq!(r.version.as_ref().unwrap().last_writer, *h.id());
     }
 
-    // A read whose value moved before it was locked does not abort-and-renew; it
-    // re-runs the body in place (`Retry`) while holding its locks (ADR-024). The
-    // engine validates *after* locking, so unlike a pre-lock check the moved key
-    // is itself locked during the re-run window — the v1 guarantee that the retry
-    // holds all its locks.
+    // Full path (ADR-024): a read whose value moved before it was locked does not
+    // abort-and-renew; it re-runs the body in place (`Retry`) while holding its
+    // locks. The engine validates *after* locking, so unlike a pre-lock check the
+    // moved key is itself locked during the re-run window — the v1 guarantee that
+    // the retry holds all its locks. Two writes force the full locked path (the
+    // single-rw fast path handles a lone write; see the test below).
     #[tokio::test]
     async fn stale_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let ka = paths::from_key(TEST_COLL, b"k");
+        let kb = paths::from_key(TEST_COLL, b"k2");
 
-        commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
-        let ra = do_read(&tctx, &keyp).await;
+        // Seed both keys so the writes are overwrites (not creates), keeping the
+        // transaction on the read-write path rather than a membership change.
+        commit_writes(&tm2, vec![wa(&ka, b"v1")]).await;
+        commit_writes(&tm2, vec![wa(&kb, b"x1")]).await;
+        let ra = do_read(&tctx, &ka).await;
 
-        // Another client overwrites the key, making `ra` stale.
-        commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
+        // Another client overwrites `k`, making `ra` stale.
+        commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
         let mut h = tm.begin(Data {
             reads: vec![ra],
-            writes: vec![wa(&keyp, b"v3")],
+            writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
         });
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
@@ -1258,6 +1271,62 @@ mod tests {
         assert_eq!(e.locked_by, vec![h.id().clone()]);
 
         tm.end(&mut h).await.unwrap();
+    }
+
+    // Single-rw fast path (ADR-030): a lone read-modify-write whose read was
+    // superseded is caught with a transparent retry, never a surfaced error, and
+    // never commits its stale value. The exact retry flavour depends only on
+    // whether the commit's `AllowStale` eligibility snapshot was still cached:
+    // `Wounded` when a stale snapshot passed the check and the seeded CAS then
+    // missed (renew via the regular path, no lock held), or `Retry` when the
+    // snapshot was evicted, so the eligibility read fell through to fresh bytes
+    // and the full path validated after locking. Both converge on a fresh read.
+    #[tokio::test]
+    async fn single_rw_stale_read_renews_and_converges() {
+        let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
+        let ra = do_read(&tctx, &keyp).await;
+
+        // Another client overwrites the key, making `ra` stale.
+        let h2 = commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
+
+        let mut h = tm.begin(Data {
+            reads: vec![ra],
+            writes: vec![wa(&keyp, b"v3")],
+        });
+        let err = tm.commit(&mut h).await.unwrap_err();
+        assert!(
+            matches!(err, TransError::Wounded | TransError::Retry),
+            "a stale read is a transparent retry, got {err:?}"
+        );
+        tm.end(&mut h).await.unwrap();
+
+        // The stale write never committed: v2 is still current (the abandoned
+        // fast-path object is unreferenced, so help-forward cannot promote it).
+        assert_eq!(
+            do_read(&tctx, &keyp).await.version.unwrap().last_writer,
+            *h2.id(),
+            "the stale write did not commit; v2 is still current"
+        );
+
+        // A fresh read + commit converges (the re-run observes v2 and commits).
+        let ra2 = do_read(&tctx, &keyp).await;
+        let h3 = commit_access(
+            &tm,
+            Data {
+                reads: vec![ra2],
+                writes: vec![wa(&keyp, b"v3")],
+            },
+        )
+        .await;
+        assert_eq!(
+            do_read(&tctx, &keyp).await.version.unwrap().last_writer,
+            *h3.id(),
+            "the renewed attempt commits"
+        );
     }
 
     // ADR-024: a suspected deadlock is broken *inside* `Algo`, never surfaced. A
@@ -1631,14 +1700,13 @@ mod tests {
         log.lock().unwrap().clear();
         gate.arm();
 
-        // Submit the install and the disjoint acquire concurrently: the first
-        // becomes the dedup driver and parks in the gated load; the second (an
-        // ordinary lock acquisition on a disjoint key) queues and merges into its
-        // round.
+        // The disjoint acquire is submitted first and becomes the dedup driver,
+        // parking in the gated (`Latest`) load; the single-rw install then joins
+        // that open batch. (Post-ADR-030 the install's own first attempt is
+        // `AllowStale` and would skip the load on a warm cache, so it merges via
+        // the driver's already-loading round rather than racing a solo, cache-
+        // served CAS — which is exactly the ADR-028 single-round behavior.)
         let (ca, cb) = (tm.clone(), tctx.locker.clone());
-        let (ta, pa, ka2, kap2) = (txa.clone(), TEST_COLL.to_string(), ka.clone(), kap.clone());
-        let install =
-            tokio::spawn(async move { ca.commit_install(&ta, &pa, idx, ka2, kap2, None).await });
         let data_b = Data {
             reads: Vec::new(),
             writes: vec![wa(&kbp, b"vb2")],
@@ -1646,8 +1714,14 @@ mod tests {
         let tb = txb.clone();
         let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
 
-        // Under paused time this fires only once both tasks are parked (driver in
-        // the gated load, the second queued); then release the load.
+        // Let the driver park in the gated load before the install joins.
+        rt::sleep(Duration::from_secs(1)).await;
+
+        let (ta, pa, ka2, kap2) = (txa.clone(), TEST_COLL.to_string(), ka.clone(), kap.clone());
+        let install =
+            tokio::spawn(async move { ca.commit_install(&ta, &pa, idx, ka2, kap2, None).await });
+
+        // Once the install has queued into the open batch, release the load.
         rt::sleep(Duration::from_secs(1)).await;
         gate.release();
 
@@ -1833,6 +1907,33 @@ mod tests {
         c
     }
 
+    // Backend reads against shard objects: `read` is a cold full read (cache
+    // miss), `read_if_modified` a revalidation of a cached copy.
+    fn shard_reads(log: &OpLog) -> (usize, usize) {
+        let (mut full, mut revalidate) = (0, 0);
+        for o in log.lock().unwrap().iter() {
+            if !o.path.contains("/_s/") {
+                continue;
+            }
+            if o.op == "read" {
+                full += 1;
+            } else if o.op == "read_if_modified" {
+                revalidate += 1;
+            }
+        }
+        (full, revalidate)
+    }
+
+    // A recording algo with a cache large enough that nothing is evicted, so a
+    // warm-cache op count is deterministic across executors.
+    async fn new_recording_algo_big_cache() -> (Algo, Tctx, OpLog) {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let rec = Arc::new(RecordingBackend::new(mem));
+        let log = rec.log();
+        let (tm, tctx) = new_algo_from_backend_with_cache(rec, 1 << 20).await;
+        (tm, tctx, log)
+    }
+
     // An eligible single-key overwrite commits through the fast path (ADR-027):
     // one committed `_t/` object write, one `_s/` lock CAS, one `_s/` write-back
     // CAS (inline here, no background executor), and no membership (`_i`) write —
@@ -1868,6 +1969,38 @@ mod tests {
         assert_eq!(status.status, TxCommitStatus::Ok);
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.version.unwrap().last_writer, tid);
+    }
+
+    // ADR-030: a warm single read-write commit reuses the shard the read cached
+    // for both its eligibility check and its lock-install fold (`AllowStale`), so
+    // it issues no backend shard read for either — only the inline write-back
+    // revalidates (`Latest`). A revalidating eligibility or install would each
+    // add a `read_if_modified`, so pinning the total to one read guards the
+    // reuse. A large cache keeps this deterministic (nothing is evicted between
+    // the read and the commit).
+    #[tokio::test]
+    async fn single_rw_commit_reuses_cached_shard() {
+        let (tm, tctx, log) = new_recording_algo_big_cache().await;
+        let keyp = paths::from_key(TEST_COLL, b"k");
+
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+        // The read warms the shard in the object cache.
+        let r = do_read(&tctx, &keyp).await;
+
+        log.lock().unwrap().clear();
+        let mut h = tm.begin(Data {
+            reads: vec![r],
+            writes: vec![wa(&keyp, b"v2")],
+        });
+        tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
+
+        let (full, revalidate) = shard_reads(&log);
+        assert_eq!(full, 0, "no cold shard read on a warm commit");
+        assert_eq!(
+            revalidate, 1,
+            "only the write-back revalidates; eligibility and install reuse cache"
+        );
     }
 
     // A blind single-key put over an existing key (no read) is also eligible.
@@ -1921,7 +2054,11 @@ mod tests {
 
         // Recreate the ADR-027 commit window before write-back: the lock is still
         // held by the committed H1 while the pointer lags at its predecessor H0.
-        let (shard, ver) = tctx.shards.load_shard(TEST_COLL, idx).await.unwrap();
+        let (shard, ver) = tctx
+            .shards
+            .load_shard(TEST_COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
         let windowed = Shard::from_entries(shard.entries().cloned().map(|mut e| {
             if e.key == raw {
                 e.lock_type = LockType::Write;
@@ -1943,25 +2080,26 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.version.clone().unwrap().last_writer, h1);
 
-        // Eligibility mirrors that resolution: an RMW that read H1 and a blind put
-        // are both committable and build on H1, while a read of the superseded H0
-        // is still rejected as stale.
+        // Eligibility mirrors that resolution: given the one resolved holder view,
+        // an RMW that read H1 and a blind put are both committable and build on
+        // H1, while a read of the superseded H0 is still rejected as stale.
+        let (res, _) = tm
+            .resolver
+            .resolve_key(&keyp, Freshness::Latest)
+            .await
+            .unwrap();
         assert_eq!(
-            tm.single_rw_effective_writer(&keyp, Some(&h1))
-                .await
-                .unwrap(),
+            eligible_writer(&res, Some(&h1)),
             Some(h1.clone()),
             "an RMW that read the committed holder builds on it"
         );
         assert_eq!(
-            tm.single_rw_effective_writer(&keyp, None).await.unwrap(),
+            eligible_writer(&res, None),
             Some(h1.clone()),
             "a blind put builds on the committed holder"
         );
         assert_eq!(
-            tm.single_rw_effective_writer(&keyp, Some(&h0))
-                .await
-                .unwrap(),
+            eligible_writer(&res, Some(&h0)),
             None,
             "a read of the superseded value is still stale"
         );

@@ -382,7 +382,7 @@ mod tests {
     use glassdb_concurr::RetryConfig;
     use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        LockType, ObjectCache, Shard, ShardEntry, SharedCache, TxWrite, ValueCache,
+        Freshness, LockType, ObjectCache, Shard, ShardEntry, SharedCache, TxWrite, ValueCache,
     };
     use std::time::{Duration, SystemTime};
 
@@ -475,7 +475,10 @@ mod tests {
     }
 
     async fn lookup_entry(shards: &ShardStore, key: &[u8]) -> Option<ShardEntry> {
-        let (shard, _) = shards.load_shard(COLL, shard_index(key)).await.unwrap();
+        let (shard, _) = shards
+            .load_shard(COLL, shard_index(key), Freshness::Latest)
+            .await
+            .unwrap();
         shard.lookup(key).cloned()
     }
 

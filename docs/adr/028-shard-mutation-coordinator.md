@@ -10,6 +10,11 @@ mark-sweep CAS — is closed by
 reclamation through this coordinator and makes vestigial-entry pruning a fold
 property, so the invariant holds with no exceptions.
 
+Routing the single read-write install through the coordinator made it load the
+shard a second time (the fast path's eligibility pre-check already loaded it).
+[ADR-030](030-seed-shard-loads.md) restores the single-load commit by letting a
+round reuse the shard the transaction already cached for its first fold attempt.
+
 Generalizes the deduplication **mechanism** of
 [ADR-025](025-dedup-shard-lock-acquisition.md) and
 [ADR-026](026-dedup-shard-release-write-back.md), and **supersedes the bespoke

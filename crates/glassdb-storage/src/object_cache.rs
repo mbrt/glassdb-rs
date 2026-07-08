@@ -24,6 +24,20 @@ pub struct ObjectRead {
     pub version: backend::Version,
 }
 
+/// Whether a cached coordination object must be revalidated against the backend
+/// before it is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Revalidate a cached copy with a version-conditional read so the caller
+    /// observes the current backend state (the default for coordination reads).
+    Latest,
+    /// Serve a cached copy as-is when present, skipping revalidation. For a
+    /// caller that only needs a compare-and-swap seed and validates the version
+    /// itself (the single read-write commit, ADR-030): a stale copy costs at
+    /// most a failed CAS and a reload, never correctness.
+    AllowStale,
+}
+
 /// Wraps a backend with read-through / write-through caching of coordination
 /// objects, revalidated by the object's backend version.
 #[derive(Clone)]
@@ -44,15 +58,23 @@ impl ObjectCache {
 
     /// Reads the object at `key`, using the cache when possible.
     ///
-    /// A cached entry is revalidated with a version-conditional read: the
-    /// backend returns the body only if it changed, otherwise
-    /// [`backend::BackendError::Precondition`] meaning "your cached copy is
-    /// still current". The backend version changes on every content write, which
-    /// is exactly when the cache must be invalidated (ADR-023).
-    pub async fn read(&self, key: &str) -> Result<ObjectRead, StorageError> {
+    /// With [`Freshness::Latest`] a cached entry is revalidated with a
+    /// version-conditional read: the backend returns the body only if it
+    /// changed, otherwise [`backend::BackendError::Precondition`] meaning "your
+    /// cached copy is still current". The backend version changes on every
+    /// content write, which is exactly when the cache must be invalidated
+    /// (ADR-023). With [`Freshness::AllowStale`] a cached entry is served
+    /// as-is, skipping the revalidation round-trip.
+    pub async fn read(&self, key: &str, freshness: Freshness) -> Result<ObjectRead, StorageError> {
         if let Some(CacheEntry::Object(e)) = self.cache.get(key)
             && !e.version.is_unset()
         {
+            if matches!(freshness, Freshness::AllowStale) {
+                return Ok(ObjectRead {
+                    value: e.bytes,
+                    version: e.version,
+                });
+            }
             match self.backend.read_if_modified(key, &e.version).await {
                 Ok(r) => return Ok(self.cache_read(key, r)),
                 Err(backend::BackendError::Precondition) => {

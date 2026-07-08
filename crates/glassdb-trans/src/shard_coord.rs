@@ -34,7 +34,7 @@ use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
 };
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{CollectionRoot, ShardEntry, ShardStore, StorageError};
+use glassdb_storage::{CollectionRoot, Freshness, ShardEntry, ShardStore, StorageError};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -205,11 +205,15 @@ struct ShardMember {
 #[derive(Clone)]
 enum CasReq {
     /// Mutate keys in a shard. `members` maps each contending transaction to its
-    /// installed resolver and outcome slot.
+    /// installed resolver and outcome slot. `first_freshness` is the cache
+    /// freshness for the round's first fold attempt: `AllowStale` lets a lone
+    /// round reuse a shard the submitter just cached (the single read-write fast
+    /// path) without a revalidation round-trip; any reload uses `Latest`.
     Shard {
         prefix: String,
         idx: u32,
         members: BTreeMap<TxId, ShardMember>,
+        first_freshness: Freshness,
     },
     /// Mutate the collection root's exclusive membership lock. Roots never merge,
     /// so a request always carries one transaction's installed resolver; the
@@ -229,6 +233,7 @@ impl MergeRequest for CasReq {
                     prefix,
                     idx,
                     members: a,
+                    ..
                 },
                 CasReq::Shard { members: b, .. },
             ) => {
@@ -245,6 +250,10 @@ impl MergeRequest for CasReq {
                     prefix: prefix.clone(),
                     idx: *idx,
                     members,
+                    // A merged round has more than one member, so it loads the
+                    // shard fresh; `AllowStale` is only a lone-round fast-path
+                    // optimization and is dropped once contenders join.
+                    first_freshness: Freshness::Latest,
                 })
             }
             // A root takes the single exclusive membership lock, so two root
@@ -316,6 +325,17 @@ impl CasWorker {
         // Why the current fold is running: `Fresh` first, then re-folds carry
         // whether the prior CAS was in-doubt so commit-install can classify.
         let mut cause = ReloadCause::Fresh;
+        // The first fold attempt may reuse a cached shard the submitter just
+        // loaded (a lone single read-write round; `AllowStale` serves it without
+        // a revalidation round-trip, ADR-030). Any later attempt reloads
+        // `Latest`. A stale cached shard only costs a CAS miss and a reload,
+        // never correctness.
+        let first_freshness = match batch.merged() {
+            CasReq::Shard {
+                first_freshness, ..
+            } => first_freshness,
+            CasReq::Root { .. } => Freshness::Latest,
+        };
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
@@ -326,10 +346,17 @@ impl CasWorker {
                 tmon: &self.core.tmon,
                 cause,
             };
-            let (shard, ver) = self.core.shards.load_shard(prefix, idx).await?;
-            // Read the merged set *after* the load so this round absorbs every
-            // member that queued while the load I/O was in flight (ADR-025) — the
-            // window that turns N contenders' loads+CASes into one.
+            let freshness = if attempt == 0 {
+                first_freshness
+            } else {
+                Freshness::Latest
+            };
+            let (shard, ver) = self.core.shards.load_shard(prefix, idx, freshness).await?;
+            // Read the merged set *after* obtaining the shard so this round
+            // absorbs every member that queued while the load I/O was in flight
+            // (ADR-025) — the window that turns N contenders' loads+CASes into
+            // one. A cache-served first attempt still folds every current member
+            // over the cached shard; the CAS arbitrates if that shard was stale.
             let members = shard_members(batch)?;
             let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
                 .entries()
@@ -557,12 +584,19 @@ impl ShardCoordinator {
     /// internally, and deposits the outcome into the slot. Returns `Ok(None)` if
     /// the coordinator was shut down before the round ran, so acquires can error
     /// while best-effort releases / write-backs treat it as a no-op.
+    ///
+    /// `first_freshness` chooses the cache freshness for the round's first fold
+    /// attempt: a submitter that just read this shard (the single read-write fast
+    /// path, for its eligibility check) passes `AllowStale` so the round reuses
+    /// the cached copy instead of revalidating it (ADR-030); callers with no
+    /// fresh cached snapshot pass `Latest`.
     pub(crate) async fn submit_shard(
         &self,
         prefix: &str,
         idx: u32,
         id: &TxId,
         resolver: Arc<dyn ShardResolver>,
+        first_freshness: Freshness,
     ) -> Result<Option<FoldOutcome>, TransError> {
         let shard_path = paths::from_shard(prefix, idx);
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
@@ -578,6 +612,7 @@ impl ShardCoordinator {
             prefix: prefix.to_string(),
             idx,
             members,
+            first_freshness,
         };
         match self.inner.dedup.run(&shard_path, req).await {
             Ok(()) => Ok(Some(
@@ -630,5 +665,608 @@ fn fold_order(a: &TxId, b: &TxId) -> CmpOrdering {
         CmpOrdering::Greater
     } else {
         a.as_bytes().cmp(b.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    use glassdb_backend::Backend;
+    use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_concurr::Background;
+    use glassdb_storage::{LockType, ObjectCache, Shard, SharedCache, TLogger, ValueCache};
+
+    const COLL: &str = "coordp";
+
+    // A coordinator over `backend` with its own (large, non-evicting) cache, plus
+    // the shard store backing it (a clone sharing the cache, so a test can warm or
+    // seed the cache the coordinator reads). The returned `Background` must be
+    // kept alive for the monitor's lifetime.
+    fn coord_over(backend: Arc<dyn Backend>) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+        let cache = SharedCache::new(1 << 20);
+        let values = ValueCache::new(&cache);
+        let objects = ObjectCache::new(backend, &cache);
+        let tl = TLogger::new(objects.clone(), COLL);
+        let bg = Arc::new(Background::new());
+        let mon = Monitor::new(values, tl, Arc::downgrade(&bg));
+        let shards = ShardStore::new(objects);
+        let resolver = Resolver::new(shards.clone(), mon.clone());
+        let coord = ShardCoordinator::new(shards.clone(), resolver, mon, RetryConfig::default());
+        (coord, shards, bg)
+    }
+
+    // A cold shard store over `backend` (its own empty cache), for asserting what
+    // actually landed in storage without touching the coordinator's cache.
+    fn cold_store(backend: Arc<dyn Backend>) -> ShardStore {
+        ShardStore::new(ObjectCache::new(backend, &SharedCache::new(1 << 20)))
+    }
+
+    fn entry(
+        key: &[u8],
+        lock_type: LockType,
+        holder: Option<&TxId>,
+        writer: Option<&TxId>,
+    ) -> ShardEntry {
+        ShardEntry {
+            key: key.to_vec(),
+            lock_type,
+            locked_by: holder.into_iter().cloned().collect(),
+            current_writer: writer.cloned(),
+            deleted: false,
+        }
+    }
+
+    // Replaces shard `idx` with exactly `entries` (a plain CAS, no coordinator).
+    async fn store_shard_entries(store: &ShardStore, idx: u32, entries: Vec<ShardEntry>) {
+        let (_, ver) = store
+            .load_shard(COLL, idx, Freshness::Latest)
+            .await
+            .unwrap();
+        let shard = Shard::from_entries(entries);
+        assert!(
+            store
+                .store_shard(COLL, idx, &shard, ver.as_ref())
+                .await
+                .unwrap()
+        );
+    }
+
+    fn shard_reads(log: &OpLog) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| (r.op == "read" || r.op == "read_if_modified") && r.path.contains("/_s/"))
+            .count()
+    }
+
+    fn shard_stores(log: &OpLog) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                (r.op == "write_if" || r.op == "write_if_not_exists") && r.path.contains("/_s/")
+            })
+            .count()
+    }
+
+    // Stages a write lock for `tx` on `key`, preserving any fields already staged.
+    struct StageLock {
+        key: Vec<u8>,
+        tx: TxId,
+    }
+
+    #[async_trait::async_trait]
+    impl ShardResolver for StageLock {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        ) -> Result<Step, TransError> {
+            let mut e = staged
+                .get(&self.key)
+                .cloned()
+                .unwrap_or_else(|| entry(&self.key, LockType::None, None, None));
+            e.lock_type = LockType::Write;
+            e.locked_by = vec![self.tx.clone()];
+            Ok(Step::Stage {
+                entries: vec![(self.key.clone(), e)],
+                outcome: FoldOutcome::Locked { membership: false },
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self) -> FoldOutcome {
+            FoldOutcome::Conflict
+        }
+    }
+
+    // Stages nothing; always delivers a best-effort `Released`.
+    struct SkipRelease;
+
+    #[async_trait::async_trait]
+    impl ShardResolver for SkipRelease {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        ) -> Result<Step, TransError> {
+            Ok(Step::Skip {
+                outcome: FoldOutcome::Released {
+                    superseded: Vec::new(),
+                },
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            true
+        }
+
+        fn exhausted_outcome(&self) -> FoldOutcome {
+            FoldOutcome::Released {
+                superseded: Vec::new(),
+            }
+        }
+    }
+
+    // The fold trace: each member records its id and the keys it saw already
+    // staged when its turn came, so a test can assert fold order and threading.
+    type FoldTrace = Arc<Mutex<Vec<(TxId, Vec<Vec<u8>>)>>>;
+
+    // Records what it observed mid-fold, then stages its own committed pointer.
+    struct Recorder {
+        key: Vec<u8>,
+        tx: TxId,
+        trace: FoldTrace,
+    }
+
+    #[async_trait::async_trait]
+    impl ShardResolver for Recorder {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        ) -> Result<Step, TransError> {
+            self.trace
+                .lock()
+                .unwrap()
+                .push((self.tx.clone(), staged.keys().cloned().collect()));
+            Ok(Step::Stage {
+                entries: vec![(
+                    self.key.clone(),
+                    entry(&self.key, LockType::None, None, Some(&self.tx)),
+                )],
+                outcome: FoldOutcome::Landed,
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self) -> FoldOutcome {
+            FoldOutcome::Conflict
+        }
+    }
+
+    // Writes the root (created if absent), unconditionally.
+    struct StoreRoot;
+
+    #[async_trait::async_trait]
+    impl RootResolver for StoreRoot {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            root: Option<&CollectionRoot>,
+        ) -> Result<RootStep, TransError> {
+            let root = root
+                .cloned()
+                .unwrap_or_else(|| CollectionRoot::new(glassdb_data::shard::SHARD_COUNT));
+            Ok(RootStep::Store {
+                root,
+                outcome: FoldOutcome::Locked { membership: true },
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self) -> FoldOutcome {
+            FoldOutcome::Conflict
+        }
+    }
+
+    // Stages nothing on the root.
+    struct SkipRoot;
+
+    #[async_trait::async_trait]
+    impl RootResolver for SkipRoot {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            _root: Option<&CollectionRoot>,
+        ) -> Result<RootStep, TransError> {
+            Ok(RootStep::Skip {
+                outcome: FoldOutcome::Released {
+                    superseded: Vec::new(),
+                },
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            true
+        }
+
+        fn exhausted_outcome(&self) -> FoldOutcome {
+            FoldOutcome::Released {
+                superseded: Vec::new(),
+            }
+        }
+    }
+
+    // A backend that parks the next shard read (while armed) until released, so a
+    // test can hold one round's load open and let a second submitter merge into
+    // it. All other operations pass through.
+    struct GateBackend {
+        inner: Arc<dyn Backend>,
+        gate: tokio::sync::Notify,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl GateBackend {
+        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
+            Arc::new(GateBackend {
+                inner,
+                gate: tokio::sync::Notify::new(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+
+        async fn gate_if_armed(&self) {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for GateBackend {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.gate_if_armed().await;
+            self.inner.read(path).await
+        }
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.gate_if_armed().await;
+            self.inner.read_if_modified(path, expected).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if(path, value, expected).await
+        }
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    // A resolver that stages entries drives one CAS, and the staged entry is
+    // durable — the coordinator loads, folds, and CASes the returned state.
+    #[tokio::test]
+    async fn shard_stage_is_cas_persisted() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (coord, _shards, _bg) = coord_over(backend.clone());
+        let tx = TxId::with_priority(1, b"t");
+
+        let out = coord
+            .submit_shard(
+                COLL,
+                0,
+                &tx,
+                Arc::new(StageLock {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                }),
+                Freshness::Latest,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            out,
+            Some(FoldOutcome::Locked { membership: false })
+        ));
+        coord.close().await;
+
+        let (shard, _) = cold_store(backend)
+            .load_shard(COLL, 0, Freshness::Latest)
+            .await
+            .unwrap();
+        let e = shard.lookup(b"k").expect("the staged lock is persisted");
+        assert_eq!(e.lock_type, LockType::Write);
+        assert_eq!(e.locked_by, vec![tx]);
+    }
+
+    // A resolver that stages nothing (`Skip`) still gets its outcome delivered,
+    // and the round issues no CAS.
+    #[tokio::test]
+    async fn shard_skip_delivers_outcome_without_cas() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let (coord, _shards, _bg) = coord_over(backend);
+        let tx = TxId::with_priority(1, b"t");
+
+        let out = coord
+            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(matches!(out, Some(FoldOutcome::Released { .. })));
+        assert_eq!(shard_stores(&log), 0, "a skip stages nothing, so no CAS");
+        coord.close().await;
+    }
+
+    // An entry left with no holder and no committed writer is indistinguishable
+    // from absent, so the CAS that folds the round drops it (ADR-029) while
+    // keeping live pointers and newly staged locks.
+    #[tokio::test]
+    async fn shard_prunes_vestigial_entries_on_cas() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (coord, shards, _bg) = coord_over(backend.clone());
+        let writer = TxId::with_priority(1, b"w");
+        store_shard_entries(
+            &shards,
+            0,
+            vec![
+                entry(b"vestige", LockType::None, None, None),
+                entry(b"live", LockType::None, None, Some(&writer)),
+            ],
+        )
+        .await;
+
+        let tx = TxId::with_priority(2, b"t");
+        coord
+            .submit_shard(
+                COLL,
+                0,
+                &tx,
+                Arc::new(StageLock {
+                    key: b"lock".to_vec(),
+                    tx: tx.clone(),
+                }),
+                Freshness::Latest,
+            )
+            .await
+            .unwrap();
+        coord.close().await;
+
+        let (shard, _) = cold_store(backend)
+            .load_shard(COLL, 0, Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(
+            shard.lookup(b"vestige").is_none(),
+            "the vestigial entry is dropped by the CAS"
+        );
+        assert!(shard.lookup(b"live").is_some(), "the live pointer is kept");
+        assert!(
+            shard.lookup(b"lock").is_some(),
+            "the newly staged lock is kept"
+        );
+    }
+
+    // ADR-030 at the coordinator: a lone round's first attempt reuses the cached
+    // shard when the submitter asks for `AllowStale` (no backend read), while
+    // `Latest` revalidates it with one conditional read.
+    #[tokio::test]
+    async fn allow_stale_first_attempt_reuses_cache() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+
+        // Seed through a separate cache so the coordinator starts cold, then warm
+        // its cache with one cold load.
+        let writer = TxId::with_priority(1, b"w");
+        store_shard_entries(
+            &cold_store(backend.clone()),
+            0,
+            vec![entry(b"seed", LockType::None, None, Some(&writer))],
+        )
+        .await;
+        let (coord, shards, _bg) = coord_over(backend.clone());
+        shards.load_shard(COLL, 0, Freshness::Latest).await.unwrap();
+
+        let tx = TxId::with_priority(2, b"t");
+        log.lock().unwrap().clear();
+        coord
+            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::AllowStale)
+            .await
+            .unwrap();
+        assert_eq!(
+            shard_reads(&log),
+            0,
+            "AllowStale serves the cached shard with no backend read"
+        );
+
+        log.lock().unwrap().clear();
+        coord
+            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .await
+            .unwrap();
+        assert_eq!(
+            shard_reads(&log),
+            1,
+            "Latest revalidates the cached shard once"
+        );
+        coord.close().await;
+    }
+
+    // ADR-028: two transactions contending the same shard merge into one round —
+    // a single shared load and a single CAS — folded oldest-first, with the
+    // younger member observing the older's staged entry (threading).
+    #[tokio::test(start_paused = true)]
+    async fn same_shard_submits_merge_into_one_round() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let gate = GateBackend::new(mem);
+        let recorder = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let log = recorder.log();
+        let (coord, _shards, _bg) = coord_over(recorder as Arc<dyn Backend>);
+
+        let trace: FoldTrace = Arc::new(Mutex::new(Vec::new()));
+        let old = TxId::with_priority(1, b"old");
+        let young = TxId::with_priority(2, b"young");
+
+        // The older member submits first, becomes the dedup driver, and parks in
+        // the gated load; the younger then queues into that open batch.
+        gate.arm();
+        let (c1, t1, tr1) = (coord.clone(), old.clone(), trace.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                COLL,
+                0,
+                &t1,
+                Arc::new(Recorder {
+                    key: b"a".to_vec(),
+                    tx: t1.clone(),
+                    trace: tr1,
+                }),
+                Freshness::Latest,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+
+        let (c2, t2, tr2) = (coord.clone(), young.clone(), trace.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                COLL,
+                0,
+                &t2,
+                Arc::new(Recorder {
+                    key: b"b".to_vec(),
+                    tx: t2.clone(),
+                    trace: tr2,
+                }),
+                Freshness::Latest,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(matches!(
+            driver.await.unwrap().unwrap(),
+            Some(FoldOutcome::Landed)
+        ));
+        assert!(matches!(
+            joiner.await.unwrap().unwrap(),
+            Some(FoldOutcome::Landed)
+        ));
+
+        assert_eq!(shard_reads(&log), 1, "both members share one shard load");
+        assert_eq!(shard_stores(&log), 1, "both members land in one CAS");
+        coord.close().await;
+
+        let trace = trace.lock().unwrap();
+        assert_eq!(trace.len(), 2, "both members are folded once");
+        assert_eq!(trace[0].0, old, "the older member folds first");
+        assert_eq!(trace[1].0, young);
+        assert!(
+            trace[1].1.contains(&b"a".to_vec()),
+            "the younger member observes the older's staged entry"
+        );
+    }
+
+    // A submit after shutdown is a cancelled no-op (`Ok(None)`), so best-effort
+    // callers treat it as done and acquirers can distinguish it.
+    #[tokio::test]
+    async fn submit_after_close_is_cancelled() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (coord, _shards, _bg) = coord_over(backend);
+        coord.close().await;
+
+        let tx = TxId::with_priority(1, b"t");
+        let out = coord
+            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "a submit after shutdown is a cancelled no-op"
+        );
+    }
+
+    // The root worker creates the root when absent and folds a resolver over it;
+    // a later `Skip` delivers its outcome and writes nothing.
+    #[tokio::test]
+    async fn root_store_creates_then_skip_leaves_it() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let (coord, _shards, _bg) = coord_over(backend.clone());
+
+        let out = coord.submit_root(COLL, Arc::new(StoreRoot)).await.unwrap();
+        assert!(matches!(
+            out,
+            Some(FoldOutcome::Locked { membership: true })
+        ));
+        assert!(
+            cold_store(backend).load_root(COLL).await.is_ok(),
+            "the root was created"
+        );
+
+        log.lock().unwrap().clear();
+        let out = coord.submit_root(COLL, Arc::new(SkipRoot)).await.unwrap();
+        assert!(matches!(out, Some(FoldOutcome::Released { .. })));
+        let root_writes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.path.ends_with("/_i") && (r.op == "write_if" || r.op == "write_if_not_exists")
+            })
+            .count();
+        assert_eq!(root_writes, 0, "a root skip writes nothing");
+        coord.close().await;
     }
 }

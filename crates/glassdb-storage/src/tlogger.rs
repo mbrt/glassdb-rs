@@ -14,7 +14,7 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::LockType;
-use crate::object_cache::ObjectCache;
+use crate::object_cache::{Freshness, ObjectCache};
 
 /// The commit state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -121,7 +121,7 @@ impl TLogger {
         {
             return Ok(ts);
         }
-        match self.objects.read(&p).await {
+        match self.objects.read(&p, Freshness::Latest).await {
             Ok(gr) => decode_status(&gr.value, gr.version),
             Err(StorageError::NotFound) => Ok(TxStatus {
                 status: TxCommitStatus::Unknown,
@@ -150,7 +150,7 @@ impl TLogger {
                 return Ok((log, o.version));
             }
         }
-        let gr = self.objects.read(&p).await?;
+        let gr = self.objects.read(&p, Freshness::Latest).await?;
         Ok((decode_tx_log(id, &gr.value)?, gr.version))
     }
 

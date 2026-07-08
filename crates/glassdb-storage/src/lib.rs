@@ -20,7 +20,7 @@ pub use cache::{Cache, Weighable};
 pub use entry::SharedCache;
 pub use error::StorageError;
 pub use lock::LockType;
-pub use object_cache::{ObjectCache, ObjectRead};
+pub use object_cache::{Freshness, ObjectCache, ObjectRead};
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LoadedShard, ShardStore};
