@@ -40,9 +40,10 @@ use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
-use glassdb_data::shard::group_by_owning_shard;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{PathLock, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog};
+use glassdb_storage::{
+    Directory, Freshness, PathLock, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog,
+};
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, PENDING_TX_TIMEOUT, is_expired};
@@ -71,6 +72,7 @@ pub struct Gc {
     bg: Weak<Background>,
     tl: TLogger,
     shards: ShardStore,
+    dir: Directory,
     locker: Locker,
     mon: Monitor,
     clock: Clock,
@@ -94,10 +96,12 @@ impl Gc {
         mon: Monitor,
         clock: Clock,
     ) -> Self {
+        let dir = Directory::new(shards.clone());
         Gc {
             bg,
             tl,
             shards,
+            dir,
             locker,
             mon,
             clock,
@@ -272,11 +276,12 @@ impl Gc {
     /// scanning every shard, because an entry can name `txid` only if `txid` put
     /// it there.
     ///
-    /// The recorded keys are routed to their shards by [`ShardStore::load_by_keys`]
-    /// so each touched shard is fetched once (concurrently) — a write and its
-    /// write-lock name the same key, and sibling keys share a shard, so a
-    /// per-key load would re-read the same shard several times per candidate.
-    /// Each key carries the [`CheckKind`] that says which field to inspect.
+    /// The recorded keys are routed to their leaves by descent
+    /// ([`Directory::group_keys_by_leaf`]) so each touched leaf is fetched once —
+    /// a write and its write-lock name the same key, and sibling keys share a
+    /// leaf, so a per-key load would re-read the same leaf several times per
+    /// candidate. Each key carries the [`CheckKind`] that says which field to
+    /// inspect.
     async fn still_referenced(&self, tid: &TxId, log: &TxLog) -> Result<bool, TransError> {
         let mut items: Vec<(&str, CheckKind)> = log
             .writes
@@ -297,18 +302,20 @@ impl Gc {
             }
         }
 
-        for loaded in self.shards.load_by_keys(items).await? {
-            for (raw_key, kind) in &loaded.keys {
+        for group in self
+            .dir
+            .group_keys_by_leaf(items, Freshness::Latest)
+            .await?
+        {
+            let Some(leaf) = group.node.as_leaf() else {
+                continue;
+            };
+            for (raw_key, kind) in &group.keys {
                 let referenced = match kind {
                     CheckKind::Writer => {
-                        loaded
-                            .shard
-                            .lookup(raw_key)
-                            .and_then(|e| e.current_writer.as_ref())
-                            == Some(tid)
+                        leaf.lookup(raw_key).and_then(|e| e.current_writer.as_ref()) == Some(tid)
                     }
-                    CheckKind::Holder => loaded
-                        .shard
+                    CheckKind::Holder => leaf
                         .lookup(raw_key)
                         .is_some_and(|e| e.locked_by.contains(tid)),
                 };
@@ -328,13 +335,13 @@ impl Gc {
         Ok(false)
     }
 
-    /// Releases `tid` from every shard and root its recorded `locks` name,
-    /// grouping the paths so each shard/root is visited once (targeted pruning,
-    /// never a whole-shard-space scan). Each release flows through the locker's
-    /// coordinator-backed unlock methods (ADR-029) — one deduplicated fold round
-    /// per object that clears `tid` and drops any entry it thereby leaves
-    /// vestigial — so GC issues no shard/root CAS of its own. `current_writer` is
-    /// never touched.
+    /// Releases `tid` from every leaf and root its recorded `locks` name,
+    /// grouping the paths by descent so each leaf/root is visited once (targeted
+    /// pruning, never a whole-key-space scan). Each release flows through the
+    /// locker's coordinator-backed unlock methods (ADR-029) — one deduplicated
+    /// fold round per object that clears `tid` and drops any entry it thereby
+    /// leaves vestigial — so GC issues no leaf/root CAS of its own.
+    /// `current_writer` is never touched.
     async fn release_locks(&self, tid: &TxId, locks: &[PathLock]) -> Result<(), TransError> {
         let mut key_locks: Vec<(&str, ())> = Vec::new();
         let mut roots: BTreeSet<String> = BTreeSet::new();
@@ -350,10 +357,12 @@ impl Gc {
                 _ => {}
             }
         }
-        let shards = group_by_owning_shard(key_locks)
-            .map_err(|e| TransError::with_source("grouping locks by shard", e))?;
-        for (prefix, idx) in shards.into_keys() {
-            self.locker.release_shard(tid, &prefix, idx).await?;
+        for group in self
+            .dir
+            .group_keys_by_leaf(key_locks, Freshness::Latest)
+            .await?
+        {
+            self.locker.release_leaf(tid, &group.path).await?;
         }
         for prefix in roots {
             self.locker.release_root(&prefix, tid).await?;
@@ -380,10 +389,11 @@ mod tests {
     use glassdb_backend::middleware::RecordingBackend;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        Freshness, LockType, ObjectCache, Shard, ShardEntry, SharedCache, TxWrite, ValueCache,
+        Directory, Freshness, LockType, ObjectCache, Shard, ShardEntry, SharedCache, TxWrite,
+        ValueCache,
     };
+    use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
 
     const COLL: &str = "db/coll";
@@ -425,13 +435,14 @@ mod tests {
             RetryConfig::default(),
         );
         let resolver = Resolver::new(shards.clone(), mon.clone());
+        let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::new(
             shards.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
         );
-        let locker = Locker::new(coord, mon.clone(), RetryConfig::default());
+        let locker = Locker::new(coord, dir, mon.clone(), RetryConfig::default());
         let gc = Gc::new(
             Arc::downgrade(&bg),
             tl.clone(),
@@ -464,22 +475,31 @@ mod tests {
         }
     }
 
-    async fn store_entry(shards: &ShardStore, key: &[u8], entry: ShardEntry) {
-        let shard = Shard::from_entries([entry]);
+    async fn store_entry(shards: &ShardStore, _key: &[u8], entry: ShardEntry) {
+        let path = paths::collection_info(COLL);
+        let loaded = shards.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+            .entries
+            .entries()
+            .cloned()
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        entries.insert(entry.key.clone(), entry);
+        let shard = Shard::from_entries(entries.into_values());
         assert!(
             shards
-                .store_shard(COLL, shard_index(key), &shard, None)
+                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
     }
 
     async fn lookup_entry(shards: &ShardStore, key: &[u8]) -> Option<ShardEntry> {
-        let (shard, _) = shards
-            .load_shard(COLL, shard_index(key), Freshness::Latest)
+        let loaded = shards
+            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
             .await
             .unwrap();
-        shard.lookup(key).cloned()
+        loaded.entries.lookup(key).cloned()
     }
 
     fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> TxLog {
@@ -650,7 +670,7 @@ mod tests {
     async fn expired_aborted_releases_root_membership_lock() {
         let ctx = new_ctx();
         let t = tx(1);
-        let mut root = glassdb_storage::CollectionRoot::new(1024);
+        let mut root = glassdb_storage::CollectionRoot::new();
         root.set_membership_lock(LockType::Write, [t.clone()]);
         ctx.shards.create_root(COLL, &root).await.unwrap();
 
@@ -694,19 +714,24 @@ mod tests {
 
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::from_shard(COLL, shard_index(&ka));
+        let shard_path = paths::collection_info(COLL);
 
-        // Seed both entries in the one shared shard: a dead transaction holds
+        // Seed both entries in the one shared leaf `_i`: a dead transaction holds
         // A's write lock (no committed writer), so GC's release will clear and
         // prune the now-vestigial entry; B exists committed, so the live
         // overwrite takes a Write lock (not a Create) and needs no membership
-        // root lock — the round stays one shard CAS.
+        // root lock — the round stays one leaf CAS.
         let dead = tx(1);
         let seed = tx(9);
         let shard = Shard::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
+        let loaded = ctx
+            .shards
+            .load_leaf(&shard_path, Freshness::Latest)
+            .await
+            .unwrap();
         assert!(
             ctx.shards
-                .store_shard(COLL, shard_index(&ka), &shard, None)
+                .store_leaf(&shard_path, &shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
@@ -773,27 +798,27 @@ mod tests {
             .count()
     }
 
-    /// A distinct key that hashes to the same shard as `base`, for exercising a
-    /// GC release and a live acquire contending one shard object.
+    /// A distinct key that shares the collection's single leaf `_i` with `base`
+    /// (ADR-031, split deferred), for exercising a GC release and a live acquire
+    /// contending one leaf object.
     fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
-        let idx = shard_index(base);
-        for i in 0u32.. {
-            let k = format!("sib-{i}").into_bytes();
-            if k != base && shard_index(&k) == idx {
-                return k;
-            }
-        }
-        unreachable!("a same-shard sibling must exist")
+        let sib = b"sibling".to_vec();
+        assert_ne!(sib, base, "sibling must differ from the base key");
+        sib
     }
 
-    /// Test backend that, while **armed**, parks the next read on a gate until
-    /// released — so a test can hold the dedup driver mid-load while a second
-    /// contender queues, forcing them into one merged CAS round. Every other call
-    /// passes through. Arming is deferred so un-gated setup runs first.
+    /// Test backend that, while **armed**, parks the dedup driver's coordination
+    /// leaf load on a gate until released — so a test can hold the driver
+    /// mid-load while a second contender queues, forcing them into one merged CAS
+    /// round. The first `skip` reads after arming pass through: descent reads the
+    /// collection root `_i` to route a key before the coordinator loads the leaf
+    /// (ADR-031), so the gate skips that routing read and parks the coordinator's
+    /// load instead. Arming is deferred so un-gated setup runs first.
     struct GateBackend {
         inner: Arc<dyn Backend>,
         gate: Arc<tokio::sync::Notify>,
         armed: std::sync::atomic::AtomicBool,
+        skip: std::sync::atomic::AtomicUsize,
     }
 
     impl GateBackend {
@@ -802,13 +827,32 @@ mod tests {
                 inner,
                 gate: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
+                skip: std::sync::atomic::AtomicUsize::new(0),
             })
         }
         fn arm(&self) {
+            // Skip the driver's descent (routing) read of `_i`, then gate its
+            // coordinator leaf load.
+            self.skip.store(1, std::sync::atomic::Ordering::SeqCst);
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn release(&self) {
             self.gate.notify_one();
+        }
+        async fn gate_if_armed(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if !self.armed.load(SeqCst) {
+                return;
+            }
+            if self
+                .skip
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return;
+            }
+            self.armed.store(false, SeqCst);
+            self.gate.notified().await;
         }
     }
 
@@ -818,9 +862,7 @@ mod tests {
             &self,
             path: &str,
         ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
+            self.gate_if_armed().await;
             self.inner.read(path).await
         }
         async fn read_if_modified(
@@ -828,9 +870,7 @@ mod tests {
             path: &str,
             expected: &glassdb_backend::Version,
         ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
+            self.gate_if_armed().await;
             self.inner.read_if_modified(path, expected).await
         }
         async fn write(

@@ -21,9 +21,9 @@
 //!   idempotent CAS). Only a *fast follow-on writer* that moves the entry before
 //!   we can read it back is irreducibly in-doubt — surfaced as [`Error::InDoubt`]
 //!   rather than risking a double-apply on a renewed re-run.
-//! - The logged path's commit point (the `_t/` flip) and its lock CAS (`_s/`)
-//!   are recovered in place the same way (they are idempotent under their own
-//!   preconditions).
+//! - The logged path's commit point (the `_t/` flip) and its leaf lock CAS
+//!   (a node `_n/` or the root `_i`) are recovered in place the same way (they
+//!   are idempotent under their own preconditions).
 //!
 //! The engine never retries a transaction *transparently* across an in-doubt
 //! commit point in a way that could double-apply a landed write. The caller
@@ -101,12 +101,14 @@ fn is_committed_tx_log(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Matches a single-key fast path shard CAS: a `write_if` on a shard object
-/// (`/_s/`). In the ADR-027 fast path the first such write installs the write
-/// lock (the in-chain point), and a later one is the write-back that publishes
-/// `current_writer`; the one-shot hooks below target the first (the lock CAS).
+/// Matches a single-key fast path leaf CAS: a `write_if` on a coordination leaf
+/// object — a standalone node `/_n/` or the collection root `/_i`, which holds
+/// the small collection's single leaf entries (ADR-031). In the ADR-027 fast
+/// path the first such write installs the write lock (the in-chain point), and a
+/// later one is the write-back that publishes `current_writer`; the one-shot
+/// hooks below target the first (the lock CAS).
 fn shard_cas(c: &WriteCtx) -> bool {
-    c.kind == "write_if" && c.path.contains("/_s/")
+    c.kind == "write_if" && (c.path.contains("/_n/") || c.path.ends_with("/_i"))
 }
 
 /// Matches the logged path's commit point: writing a *committed* transaction log
@@ -367,8 +369,9 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
 
     settle_writebacks().await;
 
-    // Trap the fast path's lock CAS (the first `write_if` on the shard `/_s/`,
-    // which installs `locked_by`): let it land, then lose the ack.
+    // Trap the fast path's lock CAS (the first `write_if` on the coordination
+    // leaf — the root `/_i` here, which installs `locked_by`): let it land, then
+    // lose the ack.
     backend.arm_after(lost_ack_after(shard_cas));
 
     increment(&db, &coll, b"k")
@@ -447,8 +450,8 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 
     settle_writebacks().await;
 
-    // Trap the fast path's lock CAS (the first `write_if` on `/_s/`): report it
-    // as in-doubt *without* applying it, modelling a write that never landed. The
+    // Trap the fast path's lock CAS (the first `write_if` on the leaf `_i`):
+    // report it as in-doubt *without* applying it, modelling a write that never landed. The
     // hook is one-shot, so the engine's idempotent re-issue lands.
     backend.arm_before(fail_before(shard_cas, || not_applied("write_if")));
 
@@ -537,7 +540,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     seed(&coll, b"a", 0).await;
     seed(&coll, b"b", 0).await;
 
-    // Trap the first shard lock CAS (a `write_if` on a shard path `/_s/` — how a
+    // Trap the first leaf lock CAS (a `write_if` on the leaf `_i` — how a
     // lock is installed in v2). Let it land, then lose the ack: the lock is
     // actually applied but the locker observes `Unavailable`.
     backend.arm_after(lost_ack_after(shard_cas));

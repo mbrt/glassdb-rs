@@ -3,8 +3,8 @@
 //! packages.
 
 pub mod base64;
+mod entropy;
 pub mod paths;
-pub mod shard;
 mod txid;
 
 pub use txid::{TxId, TxIdSet, set_diff, set_intersect, set_union};

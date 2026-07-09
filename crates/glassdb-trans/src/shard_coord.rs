@@ -1,8 +1,9 @@
 //! The shard-mutation coordinator (ADR-028): the single per-object mechanism
 //! through which every shard/root entry mutation flows.
 //!
-//! The only coordination primitive is a content compare-and-swap on a shard
-//! (`{prefix}/_s/<i>`) or a collection root (`{prefix}/_i`). Concurrent
+//! The only coordination primitive is a content compare-and-swap on a B-link
+//! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_i`,
+//! the root leaf while the collection is small, ADR-031). Concurrent
 //! transactions contending one object are **deduplicated** (ADR-025/026): each
 //! per-object mutation is submitted to a [`Dedup`] keyed on the object path, so
 //! several transactions merge into one owner-driven load + CAS. N GET+CAS
@@ -204,14 +205,16 @@ struct ShardMember {
 /// one transaction; a merged request accumulates several compatible ones.
 #[derive(Clone)]
 enum CasReq {
-    /// Mutate keys in a shard. `members` maps each contending transaction to its
-    /// installed resolver and outcome slot. `first_freshness` is the cache
-    /// freshness for the round's first fold attempt: `AllowStale` lets a lone
-    /// round reuse a shard the submitter just cached (the single read-write fast
-    /// path) without a revalidation round-trip; any reload uses `Latest`.
+    /// Mutate keys in a leaf (ADR-031), identified by its object `path` — the
+    /// collection root `_i` for a small collection's single leaf, else a
+    /// standalone node `_n`, resolved by descent. `members` maps each contending
+    /// transaction to its installed resolver and outcome slot. `first_freshness`
+    /// is the cache freshness for the round's first fold attempt: `AllowStale`
+    /// lets a lone round reuse a leaf the submitter just cached (the single
+    /// read-write fast path) without a revalidation round-trip; any reload uses
+    /// `Latest`.
     Shard {
-        prefix: String,
-        idx: u32,
+        path: String,
         members: BTreeMap<TxId, ShardMember>,
         first_freshness: Freshness,
     },
@@ -230,14 +233,11 @@ impl MergeRequest for CasReq {
         match (self, other) {
             (
                 CasReq::Shard {
-                    prefix,
-                    idx,
-                    members: a,
-                    ..
+                    path, members: a, ..
                 },
                 CasReq::Shard { members: b, .. },
             ) => {
-                // Always union shard members into one round (ADR-028): even
+                // Always union leaf members into one round (ADR-028): even
                 // same-key conflicting writers share a single load + CAS. The
                 // fold resolves the conflict in-round by wound-wait order — the
                 // older member stages its lock and the younger emits `Wait` — so
@@ -247,11 +247,10 @@ impl MergeRequest for CasReq {
                     members.insert(tx.clone(), m.clone());
                 }
                 Some(CasReq::Shard {
-                    prefix: prefix.clone(),
-                    idx: *idx,
+                    path: path.clone(),
                     members,
                     // A merged round has more than one member, so it loads the
-                    // shard fresh; `AllowStale` is only a lone-round fast-path
+                    // leaf fresh; `AllowStale` is only a lone-round fast-path
                     // optimization and is dropped once contenders join.
                     first_freshness: Freshness::Latest,
                 })
@@ -317,8 +316,7 @@ impl CasWorker {
     /// while the other members make progress.
     async fn run_shard(
         &self,
-        prefix: &str,
-        idx: u32,
+        path: &str,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
         let mut backoff = self.core.retry.backoff();
@@ -351,14 +349,15 @@ impl CasWorker {
             } else {
                 Freshness::Latest
             };
-            let (shard, ver) = self.core.shards.load_shard(prefix, idx, freshness).await?;
-            // Read the merged set *after* obtaining the shard so this round
+            let loaded = self.core.shards.load_leaf(path, freshness).await?;
+            // Read the merged set *after* obtaining the leaf so this round
             // absorbs every member that queued while the load I/O was in flight
             // (ADR-025) — the window that turns N contenders' loads+CASes into
             // one. A cache-served first attempt still folds every current member
-            // over the cached shard; the CAS arbitrates if that shard was stale.
+            // over the cached leaf; the CAS arbitrates if that leaf was stale.
             let members = shard_members(batch)?;
-            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+                .entries
                 .entries()
                 .cloned()
                 .map(|e| (e.key.clone(), e))
@@ -404,7 +403,7 @@ impl CasWorker {
                 match self
                     .core
                     .shards
-                    .store_shard(prefix, idx, &new_shard, ver.as_ref())
+                    .store_leaf(path, &new_shard, loaded.kind(), loaded.version.as_ref())
                     .await
                 {
                     Ok(true) => {}
@@ -518,7 +517,7 @@ impl Worker<CasReq, TransError> for CasWorker {
         // The dedup key fixes the object kind (shard vs root paths never
         // collide), so the first merged snapshot selects the driver.
         match batch.merged() {
-            CasReq::Shard { prefix, idx, .. } => self.run_shard(&prefix, idx, batch).await,
+            CasReq::Shard { path, .. } => self.run_shard(&path, batch).await,
             CasReq::Root {
                 prefix,
                 resolver,
@@ -586,19 +585,21 @@ impl ShardCoordinator {
     /// while best-effort releases / write-backs treat it as a no-op.
     ///
     /// `first_freshness` chooses the cache freshness for the round's first fold
-    /// attempt: a submitter that just read this shard (the single read-write fast
+    /// attempt: a submitter that just read this leaf (the single read-write fast
     /// path, for its eligibility check) passes `AllowStale` so the round reuses
     /// the cached copy instead of revalidating it (ADR-030); callers with no
     /// fresh cached snapshot pass `Latest`.
+    ///
+    /// `path` is the leaf's object path — the collection root `_i` for a small
+    /// collection's single leaf, else a standalone node `_n` resolved by descent
+    /// ([`Directory`](glassdb_storage::Directory)).
     pub(crate) async fn submit_shard(
         &self,
-        prefix: &str,
-        idx: u32,
+        path: &str,
         id: &TxId,
         resolver: Arc<dyn ShardResolver>,
         first_freshness: Freshness,
     ) -> Result<Option<FoldOutcome>, TransError> {
-        let shard_path = paths::from_shard(prefix, idx);
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
         members.insert(
@@ -609,12 +610,11 @@ impl ShardCoordinator {
             },
         );
         let req = CasReq::Shard {
-            prefix: prefix.to_string(),
-            idx,
+            path: path.to_string(),
             members,
             first_freshness,
         };
-        match self.inner.dedup.run(&shard_path, req).await {
+        match self.inner.dedup.run(path, req).await {
             Ok(()) => Ok(Some(
                 slot.lock().unwrap().take().unwrap_or(FoldOutcome::Conflict),
             )),
@@ -682,6 +682,13 @@ mod tests {
 
     const COLL: &str = "coordp";
 
+    // Every coordination round in these tests targets one leaf object. A
+    // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
+    // entries (no collection metadata), exactly what the shard fold operates on.
+    fn leaf() -> String {
+        paths::from_node(COLL, "L")
+    }
+
     // A coordinator over `backend` with its own (large, non-evicting) cache, plus
     // the shard store backing it (a clone sharing the cache, so a test can warm or
     // seed the cache the coordinator reads). The returned `Background` must be
@@ -720,16 +727,14 @@ mod tests {
         }
     }
 
-    // Replaces shard `idx` with exactly `entries` (a plain CAS, no coordinator).
-    async fn store_shard_entries(store: &ShardStore, idx: u32, entries: Vec<ShardEntry>) {
-        let (_, ver) = store
-            .load_shard(COLL, idx, Freshness::Latest)
-            .await
-            .unwrap();
+    // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
+    // coordinator).
+    async fn store_shard_entries(store: &ShardStore, path: &str, entries: Vec<ShardEntry>) {
+        let loaded = store.load_leaf(path, Freshness::Latest).await.unwrap();
         let shard = Shard::from_entries(entries);
         assert!(
             store
-                .store_shard(COLL, idx, &shard, ver.as_ref())
+                .store_leaf(path, &shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
@@ -739,7 +744,7 @@ mod tests {
         log.lock()
             .unwrap()
             .iter()
-            .filter(|r| (r.op == "read" || r.op == "read_if_modified") && r.path.contains("/_s/"))
+            .filter(|r| (r.op == "read" || r.op == "read_if_modified") && r.path.contains("/_n/"))
             .count()
     }
 
@@ -748,9 +753,18 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|r| {
-                (r.op == "write_if" || r.op == "write_if_not_exists") && r.path.contains("/_s/")
+                (r.op == "write_if" || r.op == "write_if_not_exists") && r.path.contains("/_n/")
             })
             .count()
+    }
+
+    // Loads the leaf's entries from a cold store, for asserting what landed.
+    async fn cold_entries(store: &ShardStore, path: &str) -> Shard {
+        store
+            .load_leaf(path, Freshness::Latest)
+            .await
+            .unwrap()
+            .entries
     }
 
     // Stages a write lock for `tx` on `key`, preserving any fields already staged.
@@ -865,9 +879,7 @@ mod tests {
             _ctx: &ResolveCtx<'_>,
             root: Option<&CollectionRoot>,
         ) -> Result<RootStep, TransError> {
-            let root = root
-                .cloned()
-                .unwrap_or_else(|| CollectionRoot::new(glassdb_data::shard::SHARD_COUNT));
+            let root = root.cloned().unwrap_or_else(CollectionRoot::new);
             Ok(RootStep::Store {
                 root,
                 outcome: FoldOutcome::Locked { membership: true },
@@ -1001,8 +1013,7 @@ mod tests {
 
         let out = coord
             .submit_shard(
-                COLL,
-                0,
+                &leaf(),
                 &tx,
                 Arc::new(StageLock {
                     key: b"k".to_vec(),
@@ -1018,10 +1029,7 @@ mod tests {
         ));
         coord.close().await;
 
-        let (shard, _) = cold_store(backend)
-            .load_shard(COLL, 0, Freshness::Latest)
-            .await
-            .unwrap();
+        let shard = cold_entries(&cold_store(backend), &leaf()).await;
         let e = shard.lookup(b"k").expect("the staged lock is persisted");
         assert_eq!(e.lock_type, LockType::Write);
         assert_eq!(e.locked_by, vec![tx]);
@@ -1038,7 +1046,7 @@ mod tests {
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
-            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::Latest)
             .await
             .unwrap();
         assert!(matches!(out, Some(FoldOutcome::Released { .. })));
@@ -1056,7 +1064,7 @@ mod tests {
         let writer = TxId::with_priority(1, b"w");
         store_shard_entries(
             &shards,
-            0,
+            &leaf(),
             vec![
                 entry(b"vestige", LockType::None, None, None),
                 entry(b"live", LockType::None, None, Some(&writer)),
@@ -1067,8 +1075,7 @@ mod tests {
         let tx = TxId::with_priority(2, b"t");
         coord
             .submit_shard(
-                COLL,
-                0,
+                &leaf(),
                 &tx,
                 Arc::new(StageLock {
                     key: b"lock".to_vec(),
@@ -1080,10 +1087,7 @@ mod tests {
             .unwrap();
         coord.close().await;
 
-        let (shard, _) = cold_store(backend)
-            .load_shard(COLL, 0, Freshness::Latest)
-            .await
-            .unwrap();
+        let shard = cold_entries(&cold_store(backend), &leaf()).await;
         assert!(
             shard.lookup(b"vestige").is_none(),
             "the vestigial entry is dropped by the CAS"
@@ -1109,17 +1113,17 @@ mod tests {
         let writer = TxId::with_priority(1, b"w");
         store_shard_entries(
             &cold_store(backend.clone()),
-            0,
+            &leaf(),
             vec![entry(b"seed", LockType::None, None, Some(&writer))],
         )
         .await;
         let (coord, shards, _bg) = coord_over(backend.clone());
-        shards.load_shard(COLL, 0, Freshness::Latest).await.unwrap();
+        shards.load_leaf(&leaf(), Freshness::Latest).await.unwrap();
 
         let tx = TxId::with_priority(2, b"t");
         log.lock().unwrap().clear();
         coord
-            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::AllowStale)
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::AllowStale)
             .await
             .unwrap();
         assert_eq!(
@@ -1130,7 +1134,7 @@ mod tests {
 
         log.lock().unwrap().clear();
         coord
-            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::Latest)
             .await
             .unwrap();
         assert_eq!(
@@ -1162,8 +1166,7 @@ mod tests {
         let (c1, t1, tr1) = (coord.clone(), old.clone(), trace.clone());
         let driver = tokio::spawn(async move {
             c1.submit_shard(
-                COLL,
-                0,
+                &leaf(),
                 &t1,
                 Arc::new(Recorder {
                     key: b"a".to_vec(),
@@ -1179,8 +1182,7 @@ mod tests {
         let (c2, t2, tr2) = (coord.clone(), young.clone(), trace.clone());
         let joiner = tokio::spawn(async move {
             c2.submit_shard(
-                COLL,
-                0,
+                &leaf(),
                 &t2,
                 Arc::new(Recorder {
                     key: b"b".to_vec(),
@@ -1227,7 +1229,7 @@ mod tests {
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_shard(COLL, 0, &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::Latest)
             .await
             .unwrap();
         assert!(

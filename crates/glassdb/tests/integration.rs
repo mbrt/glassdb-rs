@@ -508,8 +508,10 @@ async fn list_keys() {
     sorted.sort();
     assert_eq!(got, sorted);
 
+    // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
+    // never a directory `list` of an object prefix.
     let stats = db.stats();
-    assert_eq!(stats.obj_lists, 1);
+    assert_eq!(stats.obj_lists, 0);
 }
 
 #[tokio::test(start_paused = true)]

@@ -13,11 +13,12 @@ pub enum Type {
     Collection,
     Transaction,
     CollectionInfo,
-    Shard,
+    /// A B-link tree node object (`_n/<token>`, ADR-031).
+    Node,
 }
 
 impl Type {
-    /// Returns the path type marker string (`_k`, `_c`, `_t`, `_i`, `_s`, or
+    /// Returns the path type marker string (`_k`, `_c`, `_t`, `_i`, `_n`, or
     /// `""`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -26,7 +27,7 @@ impl Type {
             Type::Collection => "_c",
             Type::Transaction => "_t",
             Type::CollectionInfo => "_i",
-            Type::Shard => "_s",
+            Type::Node => "_n",
         }
     }
 }
@@ -154,56 +155,50 @@ pub fn transaction_id_of(path: &str) -> Result<TxId, PathError> {
     Ok(TxId::from_bytes(base64::decode(&pr.suffix)?))
 }
 
-/// Returns the storage path for shard `index` under `prefix`.
+/// Returns the storage path for the B-link node named `token` under `prefix`
+/// (`{prefix}/_n/<token>`, ADR-031).
 ///
-/// The index is a fixed-width zero-padded decimal so shard paths are a stable,
-/// lexicographically ordered function of the index (ADR-017).
-pub fn from_shard(prefix: &str, index: u32) -> String {
-    debug_assert!(
-        index < crate::shard::SHARD_COUNT,
-        "shard index {index} out of range"
-    );
-    format!(
-        "{}/{}/{:0width$}",
-        prefix,
-        Type::Shard.as_str(),
-        index,
-        width = crate::shard::SHARD_INDEX_WIDTH
-    )
+/// The token is an opaque identity string (typically from [`random_node_token`]),
+/// not a computed index: the tree is dynamic, so a node is addressed by
+/// descending to it, never by formula.
+pub fn from_node(prefix: &str, token: &str) -> String {
+    format!("{}/{}/{}", prefix, Type::Node.as_str(), token)
 }
 
-/// Decodes a shard index from a storage path suffix (e.g. `_s/0042`).
-pub fn to_shard(suffix: &str) -> Result<u32, PathError> {
-    let pfx = format!("{}/", Type::Shard.as_str());
-    let rest = suffix
-        .strip_prefix(&pfx)
-        .ok_or_else(|| PathError::WrongPrefix {
-            suffix: suffix.to_string(),
-            expected: Type::Shard.as_str().to_string(),
-        })?;
-    rest.parse()
-        .map_err(|_| PathError::Parse(suffix.to_string()))
+/// Returns the listing prefix for all B-link node objects under `prefix`.
+pub fn nodes_prefix(prefix: &str) -> String {
+    typed_prefix(prefix, Type::Node)
 }
 
-/// Returns the listing prefix for all shards under `prefix`.
-pub fn shards_prefix(prefix: &str) -> String {
-    typed_prefix(prefix, Type::Shard)
-}
-
-/// Decodes the shard index from a full shard object path (`{prefix}/_s/<idx>`),
-/// the inverse of [`from_shard`]. Unlike [`to_shard`] (which decodes a
-/// type-marked suffix), this takes a whole path as returned by a shard listing.
-pub fn shard_index_of(path: &str) -> Result<u32, PathError> {
+/// Decodes a node token from a full node object path (`{prefix}/_n/<token>`),
+/// the inverse of [`from_node`].
+pub fn node_token_of(path: &str) -> Result<String, PathError> {
     let pr = parse(path)?;
-    if pr.typ != Type::Shard {
+    if pr.typ != Type::Node {
         return Err(PathError::WrongPrefix {
             suffix: path.to_string(),
-            expected: Type::Shard.as_str().to_string(),
+            expected: Type::Node.as_str().to_string(),
         });
     }
-    pr.suffix
-        .parse()
-        .map_err(|_| PathError::Parse(path.to_string()))
+    Ok(pr.suffix)
+}
+
+/// Number of random bytes behind a node token. 128 bits of entropy makes
+/// accidental collisions negligible and, crucially, spreads freshly created
+/// nodes across object-store partitions instead of clustering them (ADR-031).
+const NODE_TOKEN_BYTES: usize = 16;
+
+/// Mints a fresh, random B-link node token.
+///
+/// The token is deliberately random rather than monotonic: object stores
+/// partition by key prefix, so monotonically increasing names would pile new
+/// nodes onto one partition and accidentally hot-key the backend (ADR-031). It
+/// draws from the same seeded-under-simulation entropy as [`crate::TxId`], so
+/// DST replays stay byte-identical.
+pub fn random_node_token() -> String {
+    let mut b = [0u8; NODE_TOKEN_BYTES];
+    crate::entropy::fill_random(&mut b);
+    base64::encode(&b)
 }
 
 /// Splits a storage path into its prefix, type, and suffix components.
@@ -224,7 +219,7 @@ pub fn parse(p: &str) -> Result<ParseResult, PathError> {
         "_k" => Type::Key,
         "_c" => Type::Collection,
         "_t" => Type::Transaction,
-        "_s" => Type::Shard,
+        "_n" => Type::Node,
         _ => Type::Unknown,
     };
     Ok(ParseResult {
@@ -291,7 +286,7 @@ mod tests {
         assert_eq!(key, b"Hello");
         // A non-key path is rejected.
         assert!(matches!(
-            split_key(&from_shard("db/coll", 1)),
+            split_key(&from_node("db/coll", "tok")),
             Err(PathError::WrongPrefix { .. })
         ));
         // A malformed path (no type segment) is a parse error.
@@ -320,7 +315,6 @@ mod tests {
     fn keys_prefix_format() {
         assert_eq!(keys_prefix("db/coll"), "db/coll/_k/");
         assert_eq!(collections_prefix("db/coll"), "db/coll/_c/");
-        assert_eq!(shards_prefix("db/coll"), "db/coll/_s/");
         assert_eq!(transactions_prefix("db"), "db/_t/");
     }
 
@@ -338,38 +332,31 @@ mod tests {
     }
 
     #[test]
-    fn shard_round_trip() {
-        let p = from_shard("db/coll", 42);
-        assert_eq!(p, "db/coll/_s/0042");
+    fn node_round_trip_and_errors() {
+        let p = from_node("db/coll", "AbC123");
+        assert_eq!(p, "db/coll/_n/AbC123");
         let r = parse(&p).unwrap();
         assert_eq!(r.prefix, "db/coll");
-        assert_eq!(r.typ, Type::Shard);
-        assert_eq!(r.suffix, "0042");
-        assert_eq!(to_shard(&format!("_s/{}", r.suffix)).unwrap(), 42);
-    }
-
-    #[test]
-    fn to_shard_errors() {
+        assert_eq!(r.typ, Type::Node);
+        assert_eq!(r.suffix, "AbC123");
+        assert_eq!(node_token_of(&p).unwrap(), "AbC123");
+        assert_eq!(nodes_prefix("db/coll"), "db/coll/_n/");
+        // A non-node path is rejected.
         assert!(matches!(
-            to_shard("_k/0042"),
-            Err(PathError::WrongPrefix { .. })
-        ));
-        assert!(matches!(
-            to_shard("_s/notanumber"),
-            Err(PathError::Parse(_))
-        ));
-    }
-
-    #[test]
-    fn shard_index_of_round_trip_and_errors() {
-        assert_eq!(shard_index_of(&from_shard("db/coll", 42)).unwrap(), 42);
-        // A non-shard path is rejected.
-        assert!(matches!(
-            shard_index_of(&from_key("db/coll", b"k")),
+            node_token_of(&from_key("db/coll", b"k")),
             Err(PathError::WrongPrefix { .. })
         ));
         // A malformed path (no type segment) is a parse error.
-        assert!(matches!(shard_index_of("db"), Err(PathError::Parse(_))));
+        assert!(matches!(node_token_of("db"), Err(PathError::Parse(_))));
+    }
+
+    #[test]
+    fn random_node_token_is_a_valid_decodable_token() {
+        let t = random_node_token();
+        // The token round-trips through a node path.
+        assert_eq!(node_token_of(&from_node("db/coll", &t)).unwrap(), t);
+        // It is our order-preserving base64 of 16 random bytes.
+        assert_eq!(base64::decode(&t).unwrap().len(), 16);
     }
 
     // Golden vectors produced by the Go implementation, to guarantee

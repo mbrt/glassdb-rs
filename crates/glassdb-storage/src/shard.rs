@@ -101,14 +101,28 @@ impl Shard {
 
     /// Encodes the shard to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
-        let entries = self.entries.values().map(entry_to_proto).collect();
-        pb::Shard { entries }.encode_to_vec()
+        self.to_pb().encode_to_vec()
     }
 
     /// Decodes a shard from its protobuf body.
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
         let raw = pb::Shard::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling shard", e))?;
+        Ok(Shard::from_pb(raw))
+    }
+
+    /// Builds the canonical protobuf message for the shard's entries. Shared with
+    /// the B-link leaf encoding (ADR-031), where a leaf embeds this as a node
+    /// body.
+    pub(crate) fn to_pb(&self) -> pb::Shard {
+        let entries = self.entries.values().map(entry_to_proto).collect();
+        pb::Shard { entries }
+    }
+
+    /// Rebuilds a shard from its protobuf message, the inverse of [`to_pb`].
+    ///
+    /// [`to_pb`]: Self::to_pb
+    pub(crate) fn from_pb(raw: pb::Shard) -> Self {
         let entries = raw
             .entries
             .into_iter()
@@ -117,7 +131,7 @@ impl Shard {
                 (entry.key.clone(), entry)
             })
             .collect();
-        Ok(Shard { entries })
+        Shard { entries }
     }
 }
 

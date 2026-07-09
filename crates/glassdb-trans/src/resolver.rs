@@ -22,10 +22,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glassdb_backend as backend;
-use glassdb_data::shard::shard_index;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Freshness, LockType, ShardEntry, ShardStore, StorageError, TxCommitStatus};
+use glassdb_storage::{
+    Directory, Freshness, LeafLocator, LockType, ShardEntry, ShardStore, StorageError,
+    TxCommitStatus,
+};
 
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::Monitor;
@@ -73,39 +74,41 @@ pub(crate) struct HolderResolution {
 /// "who currently holds this key's value", shared by the read and commit paths.
 #[derive(Clone)]
 pub struct Resolver {
-    shards: ShardStore,
+    dir: Directory,
     tmon: Monitor,
 }
 
 impl Resolver {
-    /// Creates a resolver over the shard coordination store and the monitor. The
-    /// `shards` store revalidates shard objects by their backend version
+    /// Creates a resolver over the shard coordination store and the monitor. Key
+    /// routing descends the collection's B-link directory (ADR-031) through the
+    /// [`ObjectCache`], which revalidates each node by its backend version
     /// (ADR-023), so a resolve always observes the current coordination state
-    /// without re-transferring an unchanged shard's body.
+    /// without re-transferring an unchanged node's body.
+    ///
+    /// [`ObjectCache`]: glassdb_storage::ObjectCache
     pub fn new(shards: ShardStore, tmon: Monitor) -> Self {
-        Resolver { shards, tmon }
+        Resolver {
+            dir: Directory::new(shards),
+            tmon,
+        }
     }
 
     /// Returns the raw keys that currently exist (committed and not tombstoned)
-    /// in the given shards of `prefix`, help-forwarding committed holders so a
-    /// key whose writer committed but has not yet published its `current_writer`
-    /// pointer (write-back is asynchronous) still lists. The listing path uses
-    /// this instead of reading `current_writer` directly, so a collection's keys
-    /// are visible immediately on commit rather than only after write-back.
-    pub async fn live_keys(
-        &self,
-        prefix: &str,
-        shard_indices: &[u32],
-    ) -> Result<Vec<Vec<u8>>, StorageError> {
-        let targets: Vec<(String, u32)> = shard_indices
-            .iter()
-            .map(|&idx| (prefix.to_string(), idx))
-            .collect();
-        let shards = self.shards.load_shards(&targets).await?;
-
+    /// in `prefix`, in key order, help-forwarding committed holders so a key
+    /// whose writer committed but has not yet published its `current_writer`
+    /// pointer (write-back is asynchronous) still lists. The listing path scans
+    /// the collection's leaves left-to-right (ADR-031) instead of reading
+    /// `current_writer` directly, so a collection's keys are visible immediately
+    /// on commit rather than only after write-back.
+    pub async fn live_keys(&self, prefix: &str) -> Result<Vec<Vec<u8>>, StorageError> {
+        let leaves = self.dir.leaves(prefix, Freshness::Latest).await?;
         let mut keys = Vec::new();
-        for (shard, _) in shards {
-            for e in shard.entries() {
+        for loc in leaves {
+            let leaf = loc
+                .node
+                .as_leaf()
+                .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
+            for e in leaf.entries() {
                 let key_path = paths::from_key(prefix, &e.key);
                 let resolved = self
                     .resolve_entry(&key_path, Some(e))
@@ -121,27 +124,36 @@ impl Resolver {
 
     /// Returns the effective committed writer of every `key` (the validation
     /// tokens): `Some(writer)` if the key currently exists, `None` if it is
-    /// absent or tombstoned. Keys are grouped by shard so each touched shard is
-    /// loaded once (concurrently), then every key in it is resolved against the
-    /// one loaded copy — this is the batched form the commit path validates
-    /// against.
+    /// absent or tombstoned. Keys are routed to their owning leaves by descent
+    /// so each touched leaf is loaded once, then every key in it is resolved
+    /// against the one loaded copy — this is the batched form the commit path
+    /// validates against.
     pub(crate) async fn effective_writers(
         &self,
         keys: &[Arc<str>],
     ) -> Result<HashMap<Arc<str>, Option<TxId>>, StorageError> {
-        // Route the keys to their shards and load each once; the key→shard
-        // grouping (and its deterministic order) lives in `load_by_keys`. Each
-        // key rides along as its own payload so it can key the output map.
+        // Route the keys to their leaves and load each once; the key→leaf
+        // grouping (and its deterministic order) lives in `group_keys_by_leaf`.
+        // Each key rides along as its own payload so it can key the output map.
+        // Collect first so the returned future does not close over a borrowing
+        // iterator (which would not be higher-ranked / `Send` when the commit
+        // path spawns this resolution).
+        let items: Vec<(Arc<str>, Arc<str>)> =
+            keys.iter().map(|k| (k.clone(), k.clone())).collect();
         let groups = self
-            .shards
-            .load_by_keys(keys.iter().map(|k| (k.clone(), k.clone())))
+            .dir
+            .group_keys_by_leaf(items, Freshness::Latest)
             .await?;
 
         let mut out = HashMap::with_capacity(keys.len());
-        for loaded in &groups {
-            for (raw_key, key) in &loaded.keys {
+        for group in &groups {
+            let leaf = group
+                .node
+                .as_leaf()
+                .ok_or_else(|| StorageError::other("descent grouped keys under a non-leaf node"))?;
+            for (raw_key, key) in &group.keys {
                 let resolved = self
-                    .resolve_entry(key, loaded.shard.lookup(raw_key))
+                    .resolve_entry(key, leaf.lookup(raw_key))
                     .await
                     .map_err(trans_to_storage)?;
                 out.insert(key.clone(), resolved.token());
@@ -154,42 +166,52 @@ impl Resolver {
     /// if the key currently exists, `None` if it is absent or tombstoned. The
     /// singular form the read path uses before materializing the value.
     pub(crate) async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
-        let entry = self.shards.load_entry(key).await?;
+        let (prefix, raw_key) =
+            paths::split_key(key).map_err(|e| StorageError::with_source("parsing key path", e))?;
+        let loc = self
+            .dir
+            .leaf_for(&prefix, &raw_key, Freshness::Latest)
+            .await?;
+        let leaf = loc
+            .node
+            .as_leaf()
+            .ok_or_else(|| StorageError::other("descent resolved a non-leaf node"))?;
         let resolved = self
-            .resolve_entry(key, entry.as_ref())
+            .resolve_entry(key, leaf.lookup(&raw_key))
             .await
             .map_err(trans_to_storage)?;
         Ok(resolved.token())
     }
 
-    /// Loads `key_path`'s shard and resolves its holders (help-forwarding
-    /// committed ones, collecting the live pending ones) into a
-    /// [`HolderResolution`], returning the shard's current backend version
-    /// alongside. Unlike [`effective_writer`](Self::effective_writer) it exposes
-    /// the full view — including the `pending` conflicts — so the single
-    /// read-write fast path can decide eligibility for itself without the
-    /// resolver embedding that policy. An absent key resolves to an empty view.
+    /// Resolves `key_path` to its owning leaf and interprets that entry's
+    /// holders (help-forwarding committed ones, collecting the live pending
+    /// ones) into a [`HolderResolution`], returning the located leaf alongside.
+    /// Unlike [`effective_writer`](Self::effective_writer) it exposes the full
+    /// view — including the `pending` conflicts — so the single read-write fast
+    /// path can decide eligibility for itself without the resolver embedding that
+    /// policy. An absent key resolves to an empty view.
     ///
-    /// `freshness` is forwarded to the shard load: the single read-write commit
-    /// passes [`Freshness::AllowStale`] so its eligibility check reuses the shard
+    /// `freshness` is forwarded to the descent: the single read-write commit
+    /// passes [`Freshness::AllowStale`] so its eligibility check reuses the leaf
     /// the read already cached, without a revalidation round-trip; a stale copy is
     /// caught by the commit-install's version-conditional CAS (ADR-030).
     pub(crate) async fn resolve_key(
         &self,
         key_path: &str,
         freshness: Freshness,
-    ) -> Result<(HolderResolution, Option<backend::Version>), TransError> {
+    ) -> Result<(HolderResolution, LeafLocator), TransError> {
         let (prefix, raw_key) = paths::split_key(key_path)
             .map_err(|e| TransError::with_source("parsing key path", e))?;
-        let (shard, ver) = self
-            .shards
-            .load_shard(&prefix, shard_index(&raw_key), freshness)
-            .await?;
-        let holders = match shard.lookup(&raw_key) {
+        let loc = self.dir.leaf_for(&prefix, &raw_key, freshness).await?;
+        let leaf = loc
+            .node
+            .as_leaf()
+            .ok_or_else(|| TransError::other("descent resolved a non-leaf node"))?;
+        let holders = match leaf.lookup(&raw_key) {
             Some(entry) => self.resolve_holders(key_path, entry, None).await?,
             None => HolderResolution::default(),
         };
-        Ok((holders, ver))
+        Ok((holders, loc))
     }
 
     /// Interprets `entry`'s holders against transaction status — the step shared
@@ -274,9 +296,7 @@ impl Resolver {
 mod tests {
     use super::*;
 
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use glassdb_data::shard::shard_index;
+    use std::collections::BTreeMap;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -301,16 +321,14 @@ mod tests {
         (Resolver::new(shards, mon.clone()), mon, bg)
     }
 
-    // Installs a committed pointer for `key` directly in its shard (no lock
-    // holders), so the entry resolves to `writer` — or to no writer when it is a
-    // tombstone.
+    // Installs a committed pointer for `key` directly in the collection's leaf
+    // `_i` (no lock holders), so the entry resolves to `writer` — or to no writer
+    // when it is a tombstone.
     async fn seed_writer(store: &ShardStore, key: &[u8], writer: &TxId, deleted: bool) {
-        let idx = shard_index(key);
-        let (shard, ver) = store
-            .load_shard(COLL, idx, Freshness::Latest)
-            .await
-            .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+        let path = paths::collection_info(COLL);
+        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+            .entries
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
@@ -328,7 +346,7 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_shard(COLL, idx, &new_shard, ver.as_ref())
+                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
@@ -354,12 +372,10 @@ mod tests {
     // case: the effective writer must be discovered from the committed holder,
     // not the (stale, empty) pointer.
     async fn seed_locked(store: &ShardStore, key: &[u8], holder: &TxId) {
-        let idx = shard_index(key);
-        let (shard, ver) = store
-            .load_shard(COLL, idx, Freshness::Latest)
-            .await
-            .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = shard
+        let path = paths::collection_info(COLL);
+        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+            .entries
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
@@ -377,52 +393,37 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_shard(COLL, idx, &new_shard, ver.as_ref())
+                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
-    }
-
-    // Two distinct keys that hash to the same shard, found by a small scan (a
-    // collision is overwhelmingly likely within a few dozen keys for
-    // SHARD_COUNT=1024). Proves the batch collapses same-shard keys to one load.
-    fn colliding_keys() -> (Vec<u8>, Vec<u8>) {
-        let mut seen: HashMap<u32, Vec<u8>> = HashMap::new();
-        for i in 0..100_000u32 {
-            let k = format!("key-{i}").into_bytes();
-            let idx = shard_index(&k);
-            if let Some(prev) = seen.get(&idx) {
-                return (prev.clone(), k);
-            }
-            seen.insert(idx, k);
-        }
-        panic!("no colliding key pair found");
     }
 
     fn count_shard_reads(log: &OpLog) -> usize {
         log.lock()
             .unwrap()
             .iter()
-            .filter(|r| (r.op == "read" || r.op == "read_if_modified") && r.path.contains("/_s/"))
+            .filter(|r| {
+                (r.op == "read" || r.op == "read_if_modified")
+                    && (r.path.contains("/_n/") || r.path.ends_with("/_i"))
+            })
             .count()
     }
 
-    // Keys are grouped by shard: a live pointer, a tombstone, and an absent key
-    // all resolve to the right token, and the batch issues exactly one shard
-    // read per distinct shard — not one per key (the colliding pair loads its
-    // shard once).
+    // With split deferred every key lives in the collection's single leaf `_i`
+    // (ADR-031), so a batch of keys resolves against that one leaf: a live
+    // pointer, a tombstone, and an absent key each resolve to the right token.
     #[tokio::test]
-    async fn effective_writers_batches_by_shard() {
-        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let log = recorder.log();
-        let backend: Arc<dyn Backend> = Arc::new(recorder);
+    async fn effective_writers_resolve_against_the_single_leaf() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
 
         // Seed through a separate cache so the resolver-under-test starts cold.
         let seed_store = ShardStore::new(ObjectCache::new(
             backend.clone(),
             &SharedCache::new(1 << 20),
         ));
-        let (a, b) = colliding_keys();
+        let a = b"apple".to_vec();
+        let b = b"mango".to_vec();
         let c = b"lonely".to_vec();
         let live = TxId::with_priority(1, b"live");
         let tomb = TxId::with_priority(2, b"tomb");
@@ -432,7 +433,6 @@ mod tests {
         // `c` is deliberately left absent.
 
         let (resolver, _mon, _bg) = resolver_over(backend.clone());
-        log.lock().unwrap().clear();
 
         let pa: Arc<str> = paths::from_key(COLL, &a).into();
         let pb: Arc<str> = paths::from_key(COLL, &b).into();
@@ -453,16 +453,6 @@ mod tests {
             Some(None),
             "an absent key resolves to no writer"
         );
-
-        let distinct: BTreeSet<u32> = [&a, &b, &c].iter().map(|k| shard_index(k)).collect();
-        assert_eq!(
-            count_shard_reads(&log),
-            distinct.len(),
-            "each distinct shard is loaded once, regardless of keys per shard"
-        );
-        // The colliding pair means 3 keys span at most 2 shards: a per-key
-        // resolve would have read 3 times.
-        assert!(distinct.len() < 3, "the colliding pair shares a shard");
     }
 
     // `resolve_key` with `AllowStale` reuses a shard already in the resolver's

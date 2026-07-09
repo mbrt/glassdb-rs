@@ -1,12 +1,13 @@
 //! The collection root object: in-memory view and canonical protobuf encoding
-//! (ADR-018).
+//! (ADR-031, superseding ADR-018).
 //!
-//! The root (`{prefix}/_i`) records collection existence, the constant shard
-//! count, the subcollection directory, and the membership lock that serializes
-//! create/delete (write lock) against listing (read lock). Its body is the
-//! compare-and-swap unit and its version is the optimistic-concurrency token for
-//! the whole cross-shard membership read set, so the encoding is canonical
-//! (subcollections and holder sets sorted) and golden-anchored.
+//! The root (`{prefix}/_i`) *is* the B-link tree's root [`Node`] — a leaf while
+//! the collection is small, an index once it grows — and also carries the
+//! collection metadata: existence (the object's presence), the subcollection
+//! directory, and the membership lock that serializes create/delete (write lock)
+//! against listing (read lock). Its body is the compare-and-swap unit and its
+//! version is the optimistic-concurrency token for membership, so the encoding
+//! is canonical (subcollections and holder sets sorted) and golden-anchored.
 //!
 //! This module defines an inert data type plus encode/decode and pure
 //! accessors/mutators. It does no I/O; the membership-coordination protocol is
@@ -20,34 +21,42 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::LockType;
+use crate::node::Node;
+use crate::shard::Shard;
 
-/// A decoded collection root.
+/// A decoded collection root: the B-link root node plus collection metadata.
 ///
 /// Subcollection names are held in a sorted set so iteration and encoding are
 /// canonical regardless of insertion order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRoot {
-    shard_count: u32,
+    node: Node,
     subcollections: BTreeSet<Vec<u8>>,
     membership_lock: LockType,
     membership_locked_by: Vec<TxId>,
 }
 
 impl CollectionRoot {
-    /// Creates an empty root for a collection with `shard_count` shards, no
-    /// subcollections, and no membership lock held.
-    pub fn new(shard_count: u32) -> Self {
+    /// Creates an empty root: an empty leaf spanning the whole key space, no
+    /// subcollections, and no membership lock held — the shape a collection is
+    /// created with.
+    pub fn new() -> Self {
         CollectionRoot {
-            shard_count,
+            node: Node::leaf(Shard::new()),
             subcollections: BTreeSet::new(),
             membership_lock: LockType::None,
             membership_locked_by: Vec::new(),
         }
     }
 
-    /// The shard count `C` this collection was created with.
-    pub fn shard_count(&self) -> u32 {
-        self.shard_count
+    /// The B-link tree root node held in this root object.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
+    /// Replaces the B-link tree root node (e.g. after an in-place root split).
+    pub fn set_node(&mut self, node: Node) {
+        self.node = node;
     }
 
     /// The membership lock type currently held on the root.
@@ -113,7 +122,7 @@ impl CollectionRoot {
             .collect();
         membership_locked_by.sort();
         pb::CollectionRoot {
-            shard_count: self.shard_count,
+            node: Some(self.node.to_pb()),
             subcollections: self.subcollections.iter().cloned().collect(),
             membership_lock: lock_type_to_proto(self.membership_lock) as i32,
             membership_locked_by,
@@ -121,12 +130,16 @@ impl CollectionRoot {
         .encode_to_vec()
     }
 
-    /// Decodes a root from its protobuf body.
+    /// Decodes a root from its protobuf body. A root with no node (the wire
+    /// default) yields an empty leaf, matching [`CollectionRoot::new`].
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
         let raw = pb::CollectionRoot::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling collection root", e))?;
         Ok(CollectionRoot {
-            shard_count: raw.shard_count,
+            node: raw
+                .node
+                .map(Node::from_pb)
+                .unwrap_or_else(|| Node::leaf(Shard::new())),
             subcollections: raw.subcollections.into_iter().collect(),
             membership_lock: lock_type_from_proto(raw.membership_lock),
             membership_locked_by: raw
@@ -135,6 +148,12 @@ impl CollectionRoot {
                 .map(TxId::from_bytes)
                 .collect(),
         })
+    }
+}
+
+impl Default for CollectionRoot {
+    fn default() -> Self {
+        CollectionRoot::new()
     }
 }
 
@@ -162,31 +181,56 @@ fn lock_type_from_proto(t: i32) -> LockType {
 mod tests {
     use super::*;
 
+    use crate::node::NodeBody;
+    use crate::shard::ShardEntry;
+
     #[test]
     fn round_trip() {
-        let mut root = CollectionRoot::new(1024);
+        let mut root = CollectionRoot::new();
         root.add_subcollection(b"users".to_vec());
         root.add_subcollection(b"settings".to_vec());
         root.set_membership_lock(LockType::Write, [TxId::from_bytes(vec![1, 2, 3, 4])]);
 
         let decoded = CollectionRoot::decode(&root.encode()).unwrap();
         assert_eq!(decoded, root);
-        assert_eq!(decoded.shard_count(), 1024);
         assert_eq!(decoded.membership_lock(), LockType::Write);
     }
 
     #[test]
     fn empty_round_trip() {
-        let root = CollectionRoot::new(1024);
+        let root = CollectionRoot::new();
         let decoded = CollectionRoot::decode(&root.encode()).unwrap();
         assert_eq!(decoded, root);
         assert_eq!(decoded.membership_lock(), LockType::None);
         assert_eq!(decoded.subcollections().count(), 0);
+        // A fresh root is an empty leaf spanning the whole key space.
+        assert!(matches!(decoded.node().body(), NodeBody::Leaf(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn round_trip_preserves_root_node_entries() {
+        // The root object carries the B-link root node; for a small collection
+        // that node is a leaf holding the collection's key entries.
+        let mut root = CollectionRoot::new();
+        let mut node = super::Node::leaf(Shard::from_entries([ShardEntry {
+            key: b"apple".to_vec(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: Some(TxId::from_bytes(vec![1])),
+            deleted: false,
+        }]));
+        node.set_high_key(None);
+        root.set_node(node);
+        root.set_membership_lock(LockType::Read, [TxId::from_bytes(vec![9])]);
+
+        let decoded = CollectionRoot::decode(&root.encode()).unwrap();
+        assert_eq!(decoded, root);
+        assert!(decoded.node().as_leaf().unwrap().exists(b"apple"));
     }
 
     #[test]
     fn subcollection_directory_ops() {
-        let mut root = CollectionRoot::new(8);
+        let mut root = CollectionRoot::new();
         assert!(root.add_subcollection(b"a".to_vec()));
         assert!(!root.add_subcollection(b"a".to_vec()));
         assert!(root.contains_subcollection(b"a"));
@@ -197,7 +241,7 @@ mod tests {
 
     #[test]
     fn subcollections_iterate_sorted() {
-        let mut root = CollectionRoot::new(8);
+        let mut root = CollectionRoot::new();
         root.add_subcollection(b"c".to_vec());
         root.add_subcollection(b"a".to_vec());
         root.add_subcollection(b"b".to_vec());
@@ -208,7 +252,7 @@ mod tests {
     #[test]
     fn encoding_is_canonical_regardless_of_input_order() {
         let mk = |order: &[&[u8]]| {
-            let mut r = CollectionRoot::new(16);
+            let mut r = CollectionRoot::new();
             for n in order {
                 r.add_subcollection(n.to_vec());
             }
@@ -222,7 +266,7 @@ mod tests {
     #[test]
     fn encoding_is_canonical_regardless_of_holder_order() {
         let mk = |holders: Vec<TxId>| {
-            let mut r = CollectionRoot::new(16);
+            let mut r = CollectionRoot::new();
             r.set_membership_lock(LockType::Read, holders);
             r
         };
@@ -233,7 +277,7 @@ mod tests {
 
     #[test]
     fn clear_membership_lock_drops_holders() {
-        let mut root = CollectionRoot::new(4);
+        let mut root = CollectionRoot::new();
         root.set_membership_lock(LockType::Write, [TxId::from_bytes(vec![7])]);
         root.clear_membership_lock();
         assert_eq!(root.membership_lock(), LockType::None);
@@ -244,13 +288,13 @@ mod tests {
     // Changing the on-disk format must break this test.
     #[test]
     fn golden_encoding() {
-        let mut root = CollectionRoot::new(1024);
+        let mut root = CollectionRoot::new();
         root.add_subcollection(b"users".to_vec());
         root.set_membership_lock(LockType::Write, [TxId::from_bytes(vec![0xaa, 0xbb])]);
         let got = root.encode();
         let want = [
-            0x08, 0x80, 0x08, 0x12, 0x05, 0x75, 0x73, 0x65, 0x72, 0x73, 0x18, 0x03, 0x22, 0x02,
-            0xaa, 0xbb,
+            0x0a, 0x02, 0x1a, 0x00, 0x12, 0x05, 0x75, 0x73, 0x65, 0x72, 0x73, 0x18, 0x03, 0x22,
+            0x02, 0xaa, 0xbb,
         ];
         assert_eq!(got, want, "collection-root encoding drifted: {got:02x?}");
     }

@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
+use glassdb_storage::{Directory, ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, TransError};
 use tokio::sync::Notify;
 
@@ -126,8 +126,9 @@ impl DatabaseBuilder {
             retry,
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
+        let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::new(shards.clone(), resolver.clone(), tmon.clone(), retry);
-        let locker = Locker::new(coord.clone(), tmon.clone(), retry);
+        let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
         let gc = Gc::new(
             bg_weak.clone(),
             tl,

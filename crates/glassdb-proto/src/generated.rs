@@ -150,6 +150,53 @@ pub struct ShardEntry {
     #[prost(bool, tag = "5")]
     pub deleted: bool,
 }
+/// A B-link tree node: the unit of the dynamic, range-partitioned coordination
+/// directory (ADR-031). It is either a leaf (the per-key coordination entries of
+/// ADR-017 for a contiguous key range) or an index (separator keys mapping
+/// ranges to child nodes). The high-key and right-sibling make tree descent
+/// self-correcting across concurrent splits.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Node {
+    /// Exclusive upper bound of the key range this node owns. Empty means
+    /// +infinity: the rightmost node at its level.
+    #[prost(bytes = "vec", tag = "1")]
+    pub high_key: ::prost::alloc::vec::Vec<u8>,
+    /// Identity token of the right-sibling node at the same level. Empty means
+    /// none: the rightmost node at its level.
+    #[prost(string, tag = "2")]
+    pub right_sibling: ::prost::alloc::string::String,
+    #[prost(oneof = "node::Body", tags = "3, 4")]
+    pub body: ::core::option::Option<node::Body>,
+}
+/// Nested message and enum types in `Node`.
+pub mod node {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Body {
+        /// A leaf node: the per-key coordination entries for its range.
+        #[prost(message, tag = "3")]
+        Leaf(super::Shard),
+        /// An index node: separator keys mapping ranges to child nodes.
+        #[prost(message, tag = "4")]
+        Index(super::IndexNode),
+    }
+}
+/// An index node body: an ordered list of separator entries. The child owning a
+/// key is the last entry whose separator_key is <= the key.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IndexNode {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<IndexEntry>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IndexEntry {
+    /// Inclusive lower bound of the child's key range; sorted so the encoding is
+    /// canonical.
+    #[prost(bytes = "vec", tag = "1")]
+    pub separator_key: ::prost::alloc::vec::Vec<u8>,
+    /// Identity token of the child node.
+    #[prost(string, tag = "2")]
+    pub child: ::prost::alloc::string::String,
+}
 /// Database-level metadata, written once at `{name}/glassdb` when a database is
 /// first opened. Its presence marks the database as initialized; `version` gates
 /// on-disk format compatibility. A message (not a bare string) so new metadata
@@ -160,15 +207,17 @@ pub struct DatabaseMetadata {
     #[prost(string, tag = "1")]
     pub version: ::prost::alloc::string::String,
 }
-/// The collection root object: collection existence, the (constant) shard count,
-/// the subcollection directory, and the membership lock that serializes
-/// create/delete against listing. See ADR-018.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
+/// root node - a leaf while the collection is small, an index once it grows - and
+/// also carries the collection metadata: the subcollection directory and the
+/// membership lock that serializes create/delete against listing. Supersedes
+/// ADR-018's fixed-shard_count root.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionRoot {
-    /// The shard count C this collection was created with. Part of the on-disk
-    /// format; validated against the compile-time SHARD_COUNT on open.
-    #[prost(uint32, tag = "1")]
-    pub shard_count: u32,
+    /// The B-link tree root node. Its high-key is +infinity and its right-sibling
+    /// is empty (the root has no siblings).
+    #[prost(message, optional, tag = "1")]
+    pub node: ::core::option::Option<Node>,
     /// Child collection names (raw bytes), the subcollection directory; sorted so
     /// the encoding is canonical.
     #[prost(bytes = "vec", repeated, tag = "2")]

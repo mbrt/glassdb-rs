@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_data::paths;
-use glassdb_data::shard::SHARD_COUNT;
 use glassdb_storage::CollectionRoot;
 use glassdb_trans::{Reader, Resolver};
 
@@ -101,7 +100,7 @@ impl Collection {
     /// a concurrent creator (another `create`, or the membership-lock auto-create
     /// on the first key write) that won the race is treated as success.
     pub async fn create(&self) -> Result<(), Error> {
-        let root = CollectionRoot::new(SHARD_COUNT);
+        let root = CollectionRoot::new();
         self.db
             .shards
             .create_root(&self.prefix, &root)
@@ -112,32 +111,18 @@ impl Collection {
 
     /// Returns an iterator over the keys in the collection.
     ///
-    /// Keys live in the collection's shard objects (the v2 key directory,
-    /// ADR-017), not in per-key objects. A single `list` of the shard prefix
-    /// enumerates the populated shards; each is read and its live (committed,
-    /// non-tombstoned) entries are unioned, help-forwarding committed holders so
-    /// a just-committed key lists before its (asynchronous) write-back publishes
-    /// the `current_writer` pointer. The result is sorted for a stable listing.
+    /// Keys live in the collection's B-link leaf objects (ADR-031), descending
+    /// from the root `_i`. The listing scans the leaves left-to-right in key
+    /// order, unioning their live (committed, non-tombstoned) entries and
+    /// help-forwarding committed holders so a just-committed key lists before
+    /// its (asynchronous) write-back publishes the `current_writer` pointer.
+    /// The leaves are already ordered, so the union comes out sorted.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
-        let shard_paths = self
-            .db
-            .backend
-            .list(&paths::shards_prefix(&self.prefix))
-            .await
-            .map_err(|e| Error::from_read(e.into()))?;
-        let mut indices = Vec::with_capacity(shard_paths.len());
-        for sp in shard_paths {
-            indices.push(
-                paths::shard_index_of(&sp)
-                    .map_err(|e| Error::with_source(format!("parsing shard path {sp:?}"), e))?,
-            );
-        }
         let resolver = Resolver::new(self.db.shards.clone(), self.db.tmon.clone());
-        let mut keys = resolver
-            .live_keys(&self.prefix, &indices)
+        let keys = resolver
+            .live_keys(&self.prefix)
             .await
             .map_err(Error::from_read)?;
-        keys.sort();
         Ok(KeysIter::new(keys))
     }
 
