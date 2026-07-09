@@ -883,7 +883,7 @@ fn run_read_write_9010(
     let mut client = create_csv(
         &args.client_stats_out,
         "num-db,wall-ms,num-cpu,cpu-user-ms,cpu-sys-ms,cpu-util-pct,\
-         http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-goroutines,tx-failures\n",
+         http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-threads,tx-failures\n",
     )?;
 
     // Deterministic random source, for reproducibility. Re-seeded from the

@@ -35,12 +35,6 @@ one process, this is what tells a *client-side* ceiling (CPU saturation) apart
 from *backend* throttling. The same numbers are logged live per step
 (`clientmetrics num-db=...`), so they show up in `deploy.sh logs`.
 
-> Two columns are best-effort in the Rust port and differ from the Go original
-> (see [porting-go.md](../../docs/porting-go.md#benchmarks)): `new-conns` is always `0`
-> (the SDK HTTP stack does not surface TLS handshakes), and `max-goroutines`
-> holds the peak OS-thread count (the worker model uses threads, not
-> goroutines). The CSV schema is unchanged so the plotting scripts are shared.
-
 ## How it works
 
 `cloudformation.yaml` provisions a **dedicated VPC with a private subnet and no

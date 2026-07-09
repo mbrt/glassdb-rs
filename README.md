@@ -108,19 +108,19 @@ fake-GCS test setup.
 
 This project makes the following specific tradeoffs:
 
-* Optimizes for rare conflicts between transactions (optimistic locking).
-* Readers are rarely blocked.
-* Clients are completely stateless and ephemeral. For example, they can be
+- Optimizes for rare conflicts between transactions (optimistic locking).
+- Readers are rarely blocked.
+- Clients are completely stateless and ephemeral. For example, they can be
   scaled down to zero. We avoid explicit coordination between clients (e.g.
   there's no need for consensus messages).
-* Requires access to object storage (the lowest latency the better) with
+- Requires access to object storage (the lowest latency the better) with
   requests preconditions (both Google GCS and AWS S3 meet the requirements).
-* Assumes that, when transactions race each other, it's better to be slow than
+- Assumes that, when transactions race each other, it's better to be slow than
   to be incorrect.
-* High throughput is better than low latency.
-* Allows stale reads if explicitly requested, but defaults to strong consistency
+- High throughput is better than low latency.
+- Allows stale reads if explicitly requested, but defaults to strong consistency
   in all cases.
-* Values are in the range 1KB to 1MB.
+- Values are in the range 1KB to 1MB.
 
 Glass DB makes sense in contexts where there are many writers that rarely write
 to the same keys or reads are more frequent than writes.
@@ -143,8 +143,8 @@ inconsistent result but retry the transaction.
 The application serves low traffic (e.g. one query per minute). What are the
 choices today?
 
-* Single machine / VM mostly idle.
-* "Serverless" function with a managed database (for example Google Cloud Run +
+- Single machine / VM mostly idle.
+- "Serverless" function with a managed database (for example Google Cloud Run +
   Cloud SQL, or fly.io).
 
 Neither seem cost effective in the scenario. We are talking about $10 a month,
@@ -153,9 +153,9 @@ which is not huge, but can we do better?
 Yes. With Glass DB you only pay for each query and long term storage. In the
 case of GCS (as of 2023) we are talking about:
 
-* $0.020 per GB per month
-* $0.05 per 10k write / list ops
-* $0.004 per 10k read ops
+- $0.020 per GB per month
+- $0.05 per 10k write / list ops
+- $0.004 per 10k read ops
 
 At a rate of one write per minute this would be around $2 a month. Less usage?
 Even less money.
@@ -178,15 +178,15 @@ linearly (See [Performance](#performance)).
 
 We are obviously bound by object storage's latencies which are typically:
 
-Operation | Size     | Mean (ms) | Std Dev (ms) | Median (ms) | 90th % (ms)
-----------|----------|-----------|--------------|-------------|------------
-Download  |    1 KiB |      57.4 |          6.6 |       56.8  |       64.8
-Download  |  100 KiB |      55.4 |          6.7 |       53.3  |       63.1
-Download  |    1 MiB |      56.7 |          3.8 |       57.7  |       59.9
-Metadata  |    1 KiB |      31.5 |          8.0 |       28.1  |       41.3
-Upload    |    1 KiB |      70.4 |         17.3 |       64.7  |       88.8
-Upload    |  100 KiB |      88.9 |         14.6 |       83.1  |      105.0
-Upload    |    1 MiB |     117.5 |         12.6 |      115.9  |      131.0
+| Operation | Size    | Mean (ms) | Std Dev (ms) | Median (ms) | 90th % (ms) |
+| --------- | ------- | --------- | ------------ | ----------- | ----------- |
+| Download  | 1 KiB   | 57.4      | 6.6          | 56.8        | 64.8        |
+| Download  | 100 KiB | 55.4      | 6.7          | 53.3        | 63.1        |
+| Download  | 1 MiB   | 56.7      | 3.8          | 57.7        | 59.9        |
+| Metadata  | 1 KiB   | 31.5      | 8.0          | 28.1        | 41.3        |
+| Upload    | 1 KiB   | 70.4      | 17.3         | 64.7        | 88.8        |
+| Upload    | 100 KiB | 88.9      | 14.6         | 83.1        | 105.0       |
+| Upload    | 1 MiB   | 117.5     | 12.6         | 115.9       | 131.0       |
 
 This is a lot slower than most databases, but still has a few advantages:
 
@@ -202,9 +202,9 @@ See how this translates in a dataset of 50k keys, where we vary the number of
 concurrent clients. Each client DB is performing 10 transactions in parallel,
 split in this way:
 
-* 10% updates (i.e. read + write) two separate random keys.
-* 60% strong reads to two separate random keys.
-* 30% weak reads to one random key (max staleness of 10s).
+- 10% updates (i.e. read + write) two separate random keys.
+- 60% strong reads to two separate random keys.
+- 30% weak reads to one random key (max staleness of 10s).
 
 For example, with 5 concurrent DBs we would have 50 parallel transactions at
 every moment.
@@ -242,11 +242,11 @@ graph of those. Each operation is a key being read or written:
 It's interesting to see that weak reads are losing against strong reads in this
 benchmark, for several reasons:
 
-* Given the uniform distribution of reads, it's unlikely that a weak read will
+- Given the uniform distribution of reads, it's unlikely that a weak read will
   hit the same key twice within the 10 seconds allowed staleness time frame.
-* Weak reads are currently translated into strong reads when the value is not
+- Weak reads are currently translated into strong reads when the value is not
   present in cache.
-* Strong reads operate on two keys in the same transactions, weak reads are a
+- Strong reads operate on two keys in the same transactions, weak reads are a
   "single shot".
 
 Taken all together this means that weak reads in this case translate mostly into
@@ -289,5 +289,5 @@ details.
 
 See [architecture.md](docs/architecture.md) for the design decisions behind the
 implementation (concurrency model, time/determinism, error handling, and
-encoding fidelity), and [porting-go.md](docs/porting-go.md) for the (historical)
+encoding fidelity), and [porting-go.md](docs/historical/porting-go.md) for the (historical)
 Go porting related tradeoffs.

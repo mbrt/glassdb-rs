@@ -2,12 +2,7 @@
 
 ## Status
 
-Accepted — implemented. The trait change is the **cutover** step of the v2
-effort: it landed once the DST oracles were re-pointed at the v2 layout and the
-v1 tag-based commit path was retired (it was the last consumer of tags). The
-storage caching layer (`ObjectCache`, `ValueCache`, `Locker`) is **retained and
-adapted**, not deleted (see
-[Cutover](#cutover--keep-and-re-point-the-caching-layer)).
+Accepted
 
 > Naming note: the caches were later renamed for clarity — `Global` →
 > `ObjectCache` (backend-version-keyed) and `Local` → `ValueCache`
@@ -167,9 +162,11 @@ sequencing is:
   method maps to a primitive S3 and GCS both provide natively — no emulation.
 - The cached conditional-GET read of *Direction at a glance* becomes real: the
   version-conditional `read_if_modified` lets the cache revalidate the tagless
-  coordination objects (Group E in [`docs/algo-v2.md`](../algo-v2.md)).
-- The `ObjectCache` / `Locker` caching layer is **preserved and re-pointed**, not
-  rewritten: the cache logic is reused, with only its revalidation condition
+  coordination objects (Group E in
+  [`docs/historical/algo-v2.md`](../historical/algo-v2.md)).
+- The `ObjectCache` / `Locker` caching layer is **preserved and re-pointed**,
+  not rewritten: the cache logic is reused, with only its revalidation condition
+  
   swapped from the writer tag to the object version.
 - S3 sheds the nonce and the `delete_if` TOCTOU window; GCS's version token
   simplifies to a single generation.

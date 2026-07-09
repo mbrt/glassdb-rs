@@ -411,7 +411,7 @@ Two parts deviate from the Go original by necessity:
   All I/O is registered with one reactor, so a single shared S3 client serves
   every worker — matching the Go design where all goroutines share one client.
 - **Two `client-stats.csv` columns are best-effort.** `new-conns` is always `0`
-  (the aws-sdk HTTP stack does not surface TLS handshakes) and `max-goroutines`
+  (the aws-sdk HTTP stack does not surface TLS handshakes) and `max-threads`
   holds the peak OS-thread count (sampled from `/proc/self/status`). The CSV
   schema and headers are otherwise byte-identical to the Go tool. HTTP request /
   throttle / 5xx / 2xx counts come from an aws-smithy `Intercept`, and CPU time

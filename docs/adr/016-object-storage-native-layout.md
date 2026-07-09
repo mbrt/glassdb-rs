@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -65,9 +65,9 @@ original is **dropped**.
 
 This ADR records only the umbrella direction. The sub-decisions each get their
 own ADR — sharded directory, unified transaction objects, commit/write-back,
-wound-wait at shard granularity, mark-sweep GC, and the slimmed `Backend` trait —
-and the overall effort, staging, and open questions are tracked in
-[`docs/algo-v2.md`](../algo-v2.md).
+wound-wait at shard granularity, mark-sweep GC, and the slimmed `Backend` trait
+— and the overall effort, staging, and open questions are tracked in
+[`docs/historical/algo-v2.md`](../historical/algo-v2.md).
 
 ## Consequences
 

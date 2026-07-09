@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented. Follow-up to [ADR-025](025-dedup-shard-lock-acquisition.md), which
+Accepted. Follow-up to [ADR-025](025-dedup-shard-lock-acquisition.md), which
 deduplicated lock **acquisition** but deliberately left the release path direct.
 
 The release and write-back deduplication **mechanism** is generalized by

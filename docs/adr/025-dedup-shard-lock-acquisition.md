@@ -2,21 +2,14 @@
 
 ## Status
 
-Accepted — implemented. Re-introduces v1's request **deduplication** in the v2
-`Locker`, re-keyed from per-key objects onto the v2 CAS coordination objects
-(shards and collection roots). It builds on the dormant
-[`glassdb_concurr::Dedup`](../../crates/glassdb-concurr/src/dedup.rs) primitive
-(retained but unused since the v2 cutover) and changes **only** the internals of
-`Locker::lock_shard` / `Locker::lock_root`; the five-phase protocol (ADR-020),
-wound-wait/lease semantics (ADR-021), and hold-and-wait conflict resolution
-(ADR-024) are unchanged.
+Accepted
 
 The deduplication **mechanism** described here is generalized by
-[ADR-028](028-shard-mutation-coordinator.md) into a standalone `ShardCoordinator`
-shared by both the `Locker` and the commit algorithm, and this ADR's same-key
-merge **predicate** is dissolved there in favour of a monotonic in-fold
-resolution (both contenders join one round; the loser waits). The batching
-decision itself is unchanged.
+[ADR-028](028-shard-mutation-coordinator.md) into a standalone
+`ShardCoordinator` shared by both the `Locker` and the commit algorithm, and
+this ADR's same-key merge **predicate** is dissolved there in favour of a
+monotonic in-fold resolution (both contenders join one round; the loser waits).
+The batching decision itself is unchanged.
 
 ## Context
 
@@ -32,11 +25,12 @@ moved the coordination unit from the per-key object to the **shard**
 a single content CAS. A transaction groups its accessed keys by shard and locks
 each shard with one read-modify-write CAS. But the v2 `Locker` dropped the
 deduplication: every transaction independently does `load_shard → resolve → CAS`
-per shard, so unrelated transactions touching the same shard **serialize on its
-CAS with bounded retries** (`CAS_RETRIES`). This is the "within-shard false
-sharing" cost documented in ADR-020 and [`docs/algo-v2.md`](../algo-v2.md): two
-transactions writing _different_ keys in one shard never lock-conflict, yet each
-pays its own GET + CAS and races the other, wasting round-trips under contention.
+per shard, so unrelated transactions touching the same shard **serialize on
+  its CAS with bounded retries** (`CAS_RETRIES`). This is the "within-shard
+  false sharing" cost documented in ADR-020 and
+  [`docs/historical/algo-v2.md`](../historical/algo-v2.md): two transactions
+  writing _different_ keys in one shard never lock-conflict, yet each pays its
+  own GET + CAS and races the other, wasting round-trips under contention.
 
 ADR-020 already names the fix — _"batching all of a shard's keys into one CAS is
 the efficiency win the sharded directory buys"_ — but only realised it _within_
