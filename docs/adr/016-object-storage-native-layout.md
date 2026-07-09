@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Accepted. The **fixed compile-time `C` shards** clause (hash key -> shard
+mapping) is superseded by [ADR-031](031-dynamic-range-sharding.md), which
+replaces it with a dynamic, order-preserving, range-partitioned directory
+(B-link tree); the rest of this ADR (MVCC + S2PL on a content-CAS directory, the
+three object kinds, dropping tags) stands.
 
 ## Context
 
@@ -67,7 +71,7 @@ This ADR records only the umbrella direction. The sub-decisions each get their
 own ADR — sharded directory, unified transaction objects, commit/write-back,
 wound-wait at shard granularity, mark-sweep GC, and the slimmed `Backend` trait
 — and the overall effort, staging, and open questions are tracked in
-[`docs/historical/algo-v2.md`](../historical/algo-v2.md).
+[`docs/designs/object-storage-native.md`](../designs/object-storage-native.md).
 
 ## Consequences
 

@@ -28,7 +28,7 @@ deduplication: every transaction independently does `load_shard → resolve → 
 per shard, so unrelated transactions touching the same shard **serialize on
   its CAS with bounded retries** (`CAS_RETRIES`). This is the "within-shard
   false sharing" cost documented in ADR-020 and
-  [`docs/historical/algo-v2.md`](../historical/algo-v2.md): two transactions
+  [`docs/designs/object-storage-native.md`](../designs/object-storage-native.md): two transactions
   writing _different_ keys in one shard never lock-conflict, yet each pays its
   own GET + CAS and races the other, wasting round-trips under contention.
 

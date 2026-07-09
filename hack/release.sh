@@ -5,7 +5,7 @@
 #
 # The nine library crates are published together in lockstep (one shared
 # version); the two glassdb-bench-* crates stay private. See release-plz.toml
-# and docs/releases.md.
+# and docs/guides/releasing.md.
 #
 # Flow (with --no-dry-run):
 #   1. sanity checks (clean tree, on main, tooling + credentials present)

@@ -10,7 +10,7 @@ include a reference to the commit or ADR that introduced the change.
 ## ADR-030: Seed shard loads
 
 Reducing the number of strong shard loads and replacing them with caching in
-some safe places ([ADR-030](adr/030-seed-shard-loads.md)).
+some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 
 ### compare-refs summary
 
@@ -471,7 +471,7 @@ Caching improvements and lock-dedup work.
 
 ## ADR-024
 
-Designed in [ADR-024](adr/024-hold-and-wait-conflict-resolution.md).
+Designed in [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md).
 
 ### compare-refs summary
 
@@ -544,7 +544,7 @@ Designed in [ADR-024](adr/024-hold-and-wait-conflict-resolution.md).
 
 ## v2 MVP
 
-Described in [historical/algo-v2.md](historical/algo-v2.md) and implemented by
+Described in [object-storage-native.md](../designs/object-storage-native.md) and implemented by
 ADRs (016 - 023).
 
 ### compare-refs summary

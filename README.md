@@ -282,12 +282,12 @@ Updating `glassdb-proto` protos require the Protocol Buffers compiler
 
 GlassDB uses deterministic time combined with coverage-guided fuzz testing,
 inspired by FoundationDB, for stress test the implementation while producing
-reproducible failures. See [dst-approach](docs/dst-approach.md) for more
+reproducible failures. See [testing-dst](docs/guides/testing-dst.md) for more
 details.
 
 ## Design notes
 
 See [architecture.md](docs/architecture.md) for the design decisions behind the
 implementation (concurrency model, time/determinism, error handling, and
-encoding fidelity), and [porting-go.md](docs/historical/porting-go.md) for the (historical)
+encoding fidelity), and [porting-go.md](docs/archive/porting-go.md) for the (historical)
 Go porting related tradeoffs.

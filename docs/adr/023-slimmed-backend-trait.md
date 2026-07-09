@@ -163,7 +163,7 @@ sequencing is:
 - The cached conditional-GET read of *Direction at a glance* becomes real: the
   version-conditional `read_if_modified` lets the cache revalidate the tagless
   coordination objects (Group E in
-  [`docs/historical/algo-v2.md`](../historical/algo-v2.md)).
+  [`docs/designs/object-storage-native.md`](../designs/object-storage-native.md)).
 - The `ObjectCache` / `Locker` caching layer is **preserved and re-pointed**,
   not rewritten: the cache logic is reused, with only its revalidation condition
   

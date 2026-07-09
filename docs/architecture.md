@@ -6,7 +6,7 @@ full design narrative and motivation, see the companion blog post:
 Storage](https://blog.mbrt.dev/posts/transactional-object-storage) (written for
 the original Go version, but the design is identical). For the Rust-specific
 porting decisions — the concurrency model, time/determinism, error handling, and
-encoding fidelity — see [porting-go.md](historical/porting-go.md). For usage,
+encoding fidelity — see [porting-go.md](archive/porting-go.md). For usage,
 performance benchmarks, and examples, see the [README](../README.md).
 
 ## Design Goals & Tradeoffs
@@ -93,7 +93,7 @@ implementation detail. Its public API surface is small: `Database`,
 `Transaction`, and `Collection`, plus the re-exported `Backend` trait and the
 in-memory backend and middleware. The deterministic-simulation runtime (the
 `rt`/`exec` seam in `glassdb-concurr`) is compiled only under `--cfg sim`; see
-[dst-approach.md](dst-approach.md).
+[testing-dst.md](guides/testing-dst.md).
 
 ## Component Responsibilities
 
@@ -113,7 +113,7 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
  the
   policy as *resolvers*; the coordinator is the shared mechanism and knows
   nothing of locks or transaction ids. For the full design see
-  [historical/algo-v2.md](historical/algo-v2.md).
+  [designs/object-storage-native.md](designs/object-storage-native.md).
 
 ```
                          glassdb  (public API)
@@ -388,7 +388,7 @@ Because `Database::tx` takes the body by value (`|tx| async move { ... }`) and
 the framework owns the retry loop, a conflict simply reruns the closure.
 Dropping the transaction future at any point is equivalent to a crash: the
 commit protocol recovers any in-flight state (see
-[porting-go.md](historical/porting-go.md), "Cancel-safety contract").
+[porting-go.md](archive/porting-go.md), "Cancel-safety contract").
 
 ### Optimistic Concurrency Control
 
@@ -672,7 +672,7 @@ object of whichever transaction last committed it, so it is identified by that
 updated and whether it has been marked outdated (e.g., because a concurrent
 transaction invalidated it). Relative staleness uses `tokio::time::Instant` so
 it stays deterministic under paused time (see
-[porting-go.md](historical/porting-go.md), "Time and determinism").
+[porting-go.md](archive/porting-go.md), "Time and determinism").
 
 **ObjectCache** (`glassdb-storage/src/object_cache.rs`). The backend-version-keyed,
 read-through / write-through facade for coordination objects (shards, roots,
