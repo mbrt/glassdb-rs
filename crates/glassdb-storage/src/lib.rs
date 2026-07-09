@@ -23,7 +23,7 @@ pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use entry::SharedCache;
 pub use error::StorageError;
 pub use lock::LockType;
-pub use node::{IndexNode, Node, NodeBody, NodeToken};
+pub use node::{IndexNode, Node, NodeBody, NodeToken, SplitPolicy};
 pub use object_cache::{Freshness, ObjectCache, ObjectRead};
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};

@@ -46,6 +46,19 @@ impl LoadedLeaf {
     pub fn kind(&self) -> &LeafKind {
         &self.kind
     }
+
+    /// Reports whether this loaded leaf still owns `key` — i.e. `key` is below
+    /// its high-key. A `false` result means a split moved `key` to a right
+    /// sibling after the key was routed here, so a caller must re-descend rather
+    /// than mutate this (now wrong) leaf (ADR-031). The collection root leaf
+    /// `_i` spans the whole key space until it splits into an index, so it
+    /// always owns `key`.
+    pub fn owns(&self, key: &[u8]) -> bool {
+        match &self.kind {
+            LeafKind::Root(_) => true,
+            LeafKind::Node { high_key, .. } => high_key.as_deref().is_none_or(|hk| key < hk),
+        }
+    }
 }
 
 /// How a leaf's entries are written back to storage, preserving everything the
@@ -132,6 +145,52 @@ impl ShardStore {
             Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Lists the tokens of every standalone node `_n` object under `prefix`
+    /// (ADR-031). The orphan sweep compares this against the set reachable from
+    /// the root to find split siblings a crash left dangling.
+    pub async fn list_node_tokens(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let paths = self.objects.list(&paths::nodes_prefix(prefix)).await?;
+        Ok(paths
+            .iter()
+            .filter_map(|p| paths::node_token_of(p).ok())
+            .collect())
+    }
+
+    /// Deletes the standalone node `_n/<token>`, ignoring a missing object. Used
+    /// by the orphan sweep to reclaim an unreferenced split sibling (ADR-031).
+    pub async fn delete_node(&self, prefix: &str, token: &str) -> Result<(), StorageError> {
+        match self.objects.delete(&paths::from_node(prefix, token)).await {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Durably records that the collection at `prefix` has split activity, so
+    /// the GC orphan sweep enumerates it even after a process restart (ADR-031).
+    /// Idempotent: an existing marker is left as is.
+    pub async fn mark_split_active(&self, prefix: &str) -> Result<(), StorageError> {
+        let marker = paths::split_active_marker(prefix);
+        match self
+            .objects
+            .write_if_not_exists(&marker, Arc::from(&[][..]))
+            .await
+        {
+            Ok(_) | Err(StorageError::Precondition) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Lists the collection prefixes recorded in the database's split-active
+    /// registry (ADR-031). `db_root` is the database name (the leading segment
+    /// of any collection prefix).
+    pub async fn list_split_active(&self, db_root: &str) -> Result<Vec<String>, StorageError> {
+        let paths = self.objects.list(&paths::split_active_dir(db_root)).await?;
+        Ok(paths
+            .iter()
+            .filter_map(|p| paths::split_active_prefix_of(p).ok())
+            .collect())
     }
 
     /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when

@@ -6,7 +6,7 @@ use std::time::Duration;
 use glassdb_backend::Backend;
 use glassdb_data::paths;
 use glassdb_storage::CollectionRoot;
-use glassdb_trans::{Reader, Resolver};
+use glassdb_trans::Reader;
 
 use crate::db::DbInner;
 use crate::error::Error;
@@ -93,12 +93,7 @@ impl Collection {
         self.db.open_collection(p)
     }
 
-    /// Ensures the collection exists in the backend, creating it if necessary.
-    ///
-    /// Existence is the presence of the collection root object `_i`
-    /// ([`CollectionRoot`], ADR-018). The create is an idempotent create-if-absent:
-    /// a concurrent creator (another `create`, or the membership-lock auto-create
-    /// on the first key write) that won the race is treated as success.
+    /// Ensures the collection exists, creating it if necessary.
     pub async fn create(&self) -> Result<(), Error> {
         let root = CollectionRoot::new();
         self.db
@@ -111,26 +106,21 @@ impl Collection {
 
     /// Returns an iterator over the keys in the collection.
     ///
-    /// Keys live in the collection's B-link leaf objects (ADR-031), descending
-    /// from the root `_i`. The listing scans the leaves left-to-right in key
-    /// order, unioning their live (committed, non-tombstoned) entries and
-    /// help-forwarding committed holders so a just-committed key lists before
-    /// its (asynchronous) write-back publishes the `current_writer` pointer.
-    /// The leaves are already ordered, so the union comes out sorted.
+    /// The listing scans the keys in order. The scan runs inside a read-only
+    /// serializable transaction and returns the keys in order.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
-        let resolver = Resolver::new(self.db.shards.clone(), self.db.tmon.clone());
-        let keys = resolver
-            .live_keys(&self.prefix)
-            .await
-            .map_err(Error::from_read)?;
+        let this = self.clone();
+        let keys = self
+            .db
+            .tx(move |tx| {
+                let this = this.clone();
+                async move { tx.keys(&this).await }
+            })
+            .await?;
         Ok(KeysIter::new(keys))
     }
 
     /// Returns an iterator over the sub-collections in this collection.
-    ///
-    /// A sub-collection nests its own objects under `{prefix}/_c/<name>/…`, so a
-    /// single delimited `list` of the `_c/` prefix yields exactly the immediate
-    /// sub-collection directory names.
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
         let cprefix = paths::collections_prefix(&self.prefix);
         let items = self

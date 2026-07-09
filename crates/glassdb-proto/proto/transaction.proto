@@ -117,9 +117,9 @@ message DatabaseMetadata {
 
 // The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
 // root node - a leaf while the collection is small, an index once it grows - and
-// also carries the collection metadata: the subcollection directory and the
-// membership lock that serializes create/delete against listing. Supersedes
-// ADR-018's fixed-shard_count root.
+// also carries the collection metadata: the subcollection directory. Membership
+// (create/delete) is coordinated per-key in the owning leaf, so the root holds
+// no membership lock. Supersedes ADR-018's fixed-shard_count root.
 message CollectionRoot {
     // The B-link tree root node. Its high-key is +infinity and its right-sibling
     // is empty (the root has no siblings).
@@ -127,9 +127,4 @@ message CollectionRoot {
     // Child collection names (raw bytes), the subcollection directory; sorted so
     // the encoding is canonical.
     repeated bytes subcollections = 2;
-    // Membership lock serializing create/delete (write) against listing (read).
-    Lock.LockType membership_lock = 3;
-    // Transactions holding the membership lock (more than one only for read
-    // locks); sorted so the encoding is canonical.
-    repeated bytes membership_locked_by = 4;
 }

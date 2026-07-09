@@ -209,9 +209,9 @@ pub struct DatabaseMetadata {
 }
 /// The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
 /// root node - a leaf while the collection is small, an index once it grows - and
-/// also carries the collection metadata: the subcollection directory and the
-/// membership lock that serializes create/delete against listing. Supersedes
-/// ADR-018's fixed-shard_count root.
+/// also carries the collection metadata: the subcollection directory. Membership
+/// (create/delete) is coordinated per-key in the owning leaf, so the root holds
+/// no membership lock. Supersedes ADR-018's fixed-shard_count root.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionRoot {
     /// The B-link tree root node. Its high-key is +infinity and its right-sibling
@@ -222,11 +222,4 @@ pub struct CollectionRoot {
     /// the encoding is canonical.
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub subcollections: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
-    /// Membership lock serializing create/delete (write) against listing (read).
-    #[prost(enumeration = "lock::LockType", tag = "3")]
-    pub membership_lock: i32,
-    /// Transactions holding the membership lock (more than one only for read
-    /// locks); sorted so the encoding is canonical.
-    #[prost(bytes = "vec", repeated, tag = "4")]
-    pub membership_locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }

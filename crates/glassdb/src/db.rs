@@ -10,7 +10,7 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{Directory, ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
-use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, TransError};
+use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, Splitter, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -136,8 +136,12 @@ impl DatabaseBuilder {
             locker.clone(),
             tmon.clone(),
             clock.clone(),
+            &name,
         );
         gc.start();
+        // Background growth: halve leaves that cross the soft cap, fed by the
+        // coordinator as it writes (ADR-031).
+        Splitter::new(bg_weak.clone(), shards.clone(), &coord).start();
         let algo = Algo::new(
             values.clone(),
             locker.clone(),

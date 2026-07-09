@@ -170,6 +170,43 @@ pub fn nodes_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Node)
 }
 
+/// The database's split-active registry directory (`{db}/_g/`), where the
+/// database name is the leading path segment of a collection prefix. The GC
+/// orphan sweep lists it to rediscover, after a restart, which collections may
+/// hold crash-orphaned split siblings (ADR-031).
+pub fn split_active_dir(db_root: &str) -> String {
+    format!("{db_root}/_g/")
+}
+
+/// The split-active registry marker path for the collection at `prefix`
+/// (`{db}/_g/<base64(prefix)>`). Written durably before a split creates any
+/// node object, so an orphan sibling always has a discoverable marker.
+pub fn split_active_marker(prefix: &str) -> String {
+    format!(
+        "{}/_g/{}",
+        db_root_of(prefix),
+        base64::encode(prefix.as_bytes())
+    )
+}
+
+/// Decodes the collection prefix from a registry marker path, the inverse of
+/// [`split_active_marker`].
+pub fn split_active_prefix_of(path: &str) -> Result<String, PathError> {
+    let token = path.rsplit('/').next().unwrap_or_default();
+    let bytes = base64::decode(token)?;
+    String::from_utf8(bytes)
+        .map_err(|e| PathError::Parse(format!("registry marker is not valid utf8: {e}")))
+}
+
+/// The database name for a collection `prefix`: its leading path segment. A
+/// database name is validated alphanumeric, so it never contains a `/`.
+fn db_root_of(prefix: &str) -> &str {
+    match prefix.find('/') {
+        Some(i) => &prefix[..i],
+        None => prefix,
+    }
+}
+
 /// Decodes a node token from a full node object path (`{prefix}/_n/<token>`),
 /// the inverse of [`from_node`].
 pub fn node_token_of(path: &str) -> Result<String, PathError> {
@@ -348,6 +385,25 @@ mod tests {
         ));
         // A malformed path (no type segment) is a parse error.
         assert!(matches!(node_token_of("db"), Err(PathError::Parse(_))));
+    }
+
+    #[test]
+    fn split_active_marker_round_trip() {
+        // The marker for a top-level collection lives under the db's `_g/` dir,
+        // keyed by the (base64-encoded) full collection prefix.
+        let prefix = "db/_c/RqKoS6_iOrB";
+        let marker = split_active_marker(prefix);
+        assert!(marker.starts_with("db/_g/"));
+        assert_eq!(split_active_prefix_of(&marker).unwrap(), prefix);
+        assert_eq!(split_active_dir("db"), "db/_g/");
+
+        // The db root is the leading path segment even for a nested prefix.
+        let nested = "db/_c/AAA/_c/BBB";
+        assert!(split_active_marker(nested).starts_with("db/_g/"));
+        assert_eq!(
+            split_active_prefix_of(&split_active_marker(nested)).unwrap(),
+            nested
+        );
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! The shard object: in-memory view and canonical protobuf encoding (ADR-017).
 //!
-//! A shard is the v2 coordination unit for the keys that hash to it: it is at
-//! once the per-key lock table, the MVCC current-writer index, and the key
-//! directory. Its body is the compare-and-swap unit, so the encoding is
-//! canonical (entries sorted by key, holder sets sorted) and golden-anchored.
+//! A shard is the coordination unit for a contiguous range of keys (the leaf
+//! body of the ADR-031 B-link tree): it is at once the per-key lock table, the
+//! MVCC current-writer index, and the key directory. Its body is the
+//! compare-and-swap unit, so the encoding is canonical (entries sorted by key,
+//! holder sets sorted) and golden-anchored.
 //!
 //! This module defines an inert data type plus encode/decode and a pure
 //! [`Shard::lookup`]. It has no mutation policy and does no I/O; lock
@@ -99,9 +100,38 @@ impl Shard {
         self.entries.is_empty()
     }
 
+    /// Splits the shard at its median key: retains the lower half in `self` and
+    /// returns the upper half together with the split key — the first key of the
+    /// upper half, which is the inclusive lower bound of the returned shard (and
+    /// the exclusive high-key of the retained one). The single home for the
+    /// B-link leaf half-split (ADR-031). Requires at least two entries; the
+    /// caller must not split a shard that cannot be divided (a single hot key).
+    pub fn split_off_median(&mut self) -> (Shard, Vec<u8>) {
+        debug_assert!(
+            self.entries.len() >= 2,
+            "cannot split a shard with fewer than two entries"
+        );
+        let mid = self.entries.len() / 2;
+        let split_key = self
+            .entries
+            .keys()
+            .nth(mid)
+            .cloned()
+            .expect("median index is in range");
+        // `split_off` keeps keys < split_key in `self` and returns keys >=.
+        let upper = self.entries.split_off(&split_key);
+        (Shard { entries: upper }, split_key)
+    }
+
     /// Encodes the shard to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
+    }
+
+    /// The encoded body length in bytes without materializing the bytes — a
+    /// cheap byte-cap check for the split-candidate feed (ADR-031).
+    pub fn encoded_len(&self) -> usize {
+        self.to_pb().encoded_len()
     }
 
     /// Decodes a shard from its protobuf body.
@@ -302,6 +332,47 @@ mod tests {
         let shard = Shard::from_entries([entry(b"c"), entry(b"a"), entry(b"b")]);
         let keys: Vec<&[u8]> = shard.entries().map(|e| e.key.as_slice()).collect();
         assert_eq!(keys, vec![b"a".as_slice(), b"b", b"c"]);
+    }
+
+    #[test]
+    fn split_off_median_partitions_at_the_split_key() {
+        // Four entries split into two of two; the split key is the first key of
+        // the upper half and is the exclusive bound between the halves.
+        let mut lower = Shard::from_entries([
+            entry(b"apple"),
+            entry(b"cat"),
+            entry(b"mango"),
+            entry(b"pear"),
+        ]);
+        let (upper, split_key) = lower.split_off_median();
+
+        assert_eq!(split_key, b"mango");
+        let lower_keys: Vec<&[u8]> = lower.entries().map(|e| e.key.as_slice()).collect();
+        assert_eq!(lower_keys, vec![b"apple".as_slice(), b"cat"]);
+        let upper_keys: Vec<&[u8]> = upper.entries().map(|e| e.key.as_slice()).collect();
+        assert_eq!(upper_keys, vec![b"mango".as_slice(), b"pear"]);
+        // Every retained key is strictly below the split key; every moved key is
+        // at or above it — the invariant descent relies on.
+        assert!(
+            lower
+                .entries()
+                .all(|e| e.key.as_slice() < split_key.as_slice())
+        );
+        assert!(
+            upper
+                .entries()
+                .all(|e| e.key.as_slice() >= split_key.as_slice())
+        );
+    }
+
+    #[test]
+    fn split_off_median_of_odd_count_keeps_smaller_lower_half() {
+        // Three entries split 1/2: mid = 3/2 = 1, so one stays and two move.
+        let mut lower = Shard::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
+        let (upper, split_key) = lower.split_off_median();
+        assert_eq!(split_key, b"b");
+        assert_eq!(lower.len(), 1);
+        assert_eq!(upper.len(), 2);
     }
 
     // Golden vector: a fixed shard must always encode to these exact bytes.

@@ -2,9 +2,10 @@
 //! object-native engine (ADR-016 … ADR-021).
 //!
 //! A read-write transaction validates its reads and installs its locks with one
-//! read-modify-write CAS per touched shard (plus the collection root for
-//! membership changes), flips its transaction object to committed (the commit
-//! point), then publishes `current_writer` pointers and releases its locks
+//! read-modify-write CAS per touched shard (create/delete is coordinated by the
+//! per-key entry lock in the owning leaf, ADR-031), flips its transaction object
+//! to committed (the commit point), then publishes `current_writer` pointers and
+//! releases its locks
 //! (write-back). A read-only transaction takes a pure optimistic fast path: it
 //! re-resolves each read's effective writer against the shards and commits if
 //! none changed, taking no locks.
@@ -121,11 +122,35 @@ impl WriteAccess {
     }
 }
 
-/// The reads and writes that make up a transaction.
+/// A range/sorted listing performed within a transaction (ADR-031 phantom
+/// prevention). It records the object version of every leaf the scan covered;
+/// commit re-scans the same range and confirms the covered leaves and their
+/// versions are unchanged, so no create/delete — which bumps its leaf's version
+/// — raced the scan. Following the leaf right-sibling chain during the scan
+/// makes a concurrent split visible as a changed cover (one retry), never a
+/// lost or duplicated key.
+#[derive(Debug, Clone)]
+pub struct ScanAccess {
+    /// Collection prefix the scan ranged over.
+    pub prefix: Arc<str>,
+    /// The leaves the scan covered, in key order, each with the object version
+    /// observed at scan time (`None` for an uncreated collection root).
+    pub covered: Vec<LeafCoverage>,
+}
+
+/// One leaf a scan covered: its object path and the version seen at scan time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafCoverage {
+    pub path: Arc<str>,
+    pub version: Option<glassdb_backend::Version>,
+}
+
+/// The reads, writes, and range scans that make up a transaction.
 #[derive(Debug, Clone, Default)]
 pub struct Data {
     pub reads: Vec<ReadAccess>,
     pub writes: Vec<WriteAccess>,
+    pub scans: Vec<ScanAccess>,
 }
 
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
@@ -279,6 +304,13 @@ impl ShardResolver for CommitInstallResolver {
         // point is a single CAS, so this absorbs contention, not conflict).
         FoldOutcome::Moved
     }
+
+    fn owned_keys(&self) -> Vec<&[u8]> {
+        // Installing the write lock may create the entry, so it must land on the
+        // leaf that owns the key — re-route (renew and re-run) if a split moved
+        // it after routing (ADR-031).
+        vec![self.raw_key.as_slice()]
+    }
 }
 
 /// Decides the effective committed writer the single read-write fast path must
@@ -297,8 +329,8 @@ fn eligible_writer(res: &HolderResolution, read_version: Option<&TxId>) -> Optio
     if !res.pending.is_empty() {
         return None;
     }
-    // The key must currently exist; a create or a put over a tombstone is a
-    // membership change that the fast path does not handle.
+    // The key must currently exist; a create or a put over a tombstone has no
+    // predecessor value, which the fast path does not handle.
     let writer = match &res.writer {
         Some(w) if !res.deleted => w.clone(),
         _ => return None,
@@ -406,17 +438,17 @@ impl Algo {
         self.commit_read_write(tx).await
     }
 
-    /// Validates the reads of a read-only transaction (the error-recovery path
-    /// in the db retry loop), returning [`TransError::Retry`] if any read was
-    /// invalidated. It holds no locks and does not back off before signalling
-    /// the retry.
+    /// Validates the reads and range scans of a read-only transaction (the
+    /// error-recovery path in the db retry loop), returning [`TransError::Retry`]
+    /// if any was invalidated. It holds no locks and does not back off before
+    /// signalling the retry.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
         if !tx.data.writes.is_empty() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
             ));
         }
-        if self.validate_reads_inner(&tx.data).await? {
+        if self.validate(&tx.data).await? {
             return Ok(());
         }
         self.invalidate_reads(&tx.data);
@@ -468,7 +500,7 @@ impl Algo {
     ///
     /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if self.validate_reads_inner(&tx.data).await? {
+        if self.validate(&tx.data).await? {
             tx.status = Status::Committed;
             return Ok(());
         }
@@ -476,10 +508,10 @@ impl Algo {
         Err(TransError::Retry)
     }
 
-    /// Read-write path: lock the touched shards (and roots for membership
-    /// changes), validate the reads now that their values are frozen, flip the
-    /// transaction object to committed, then spawn the write-back in the
-    /// background so commit returns without waiting for it.
+    /// Read-write path: lock the touched shards, validate the reads now that
+    /// their values are frozen, flip the transaction object to committed, then
+    /// spawn the write-back in the background so commit returns without waiting
+    /// for it.
     async fn commit_read_write(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
@@ -554,8 +586,8 @@ impl Algo {
     /// already-committed, immutable object holding stale values. It only
     /// completes, renews, or surfaces in-doubt.
     async fn try_commit_single_rw(&self, tx: &mut Handle) -> Result<Option<()>, TransError> {
-        // Static eligibility: exactly one write, and it is a put (a delete is a
-        // membership change that needs the collection root lock).
+        // Static eligibility: exactly one write, and it is a put (a delete
+        // publishes a tombstone, which the fast path does not handle).
         if tx.data.writes.len() != 1 {
             return Ok(None);
         }
@@ -568,7 +600,7 @@ impl Algo {
 
         // Every read must be of the written key and found: a read of another key
         // needs its own shard validated, and a not-found read of the written key
-        // makes this a create (membership change).
+        // makes this a create (no predecessor for the fast path to build on).
         let mut read_version: Option<TxId> = None;
         for r in &tx.data.reads {
             if r.path != key_path {
@@ -915,6 +947,13 @@ impl Algo {
         )
     }
 
+    /// Reports whether the transaction's snapshot still holds: every read's
+    /// effective writer is unchanged (ADR-024) **and** every range scan's
+    /// covered leaves are unchanged (ADR-031 phantom prevention).
+    async fn validate(&self, data: &Data) -> Result<bool, TransError> {
+        Ok(self.validate_reads_inner(data).await? && self.validate_scans_inner(data).await?)
+    }
+
     /// Re-resolves every read's effective writer and reports whether they all
     /// still match what the transaction observed (a consistent snapshot exists).
     /// The read set is resolved in one shard-batched pass (each touched shard is
@@ -928,6 +967,24 @@ impl Algo {
         for r in &data.reads {
             let observed = r.version.as_ref().map(|v| v.last_writer.clone());
             if current.get(&r.path).cloned().flatten() != observed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Re-scans every range the transaction listed and reports whether each
+    /// still covers exactly the same leaves at the same object versions
+    /// (ADR-031). A create/delete in the range bumps its leaf's version and a
+    /// split changes the covered leaf set, so either makes the re-scan differ —
+    /// which fails validation and re-runs the listing over the fresh topology,
+    /// preventing phantom appearances/disappearances. Following the right-link
+    /// chain (via [`Resolver::live_keys_scan`]) keeps the re-scan consistent
+    /// with an in-progress split rather than erroring on it.
+    async fn validate_scans_inner(&self, data: &Data) -> Result<bool, TransError> {
+        for scan in &data.scans {
+            let current = self.resolver.live_keys_scan(&scan.prefix).await?.covered;
+            if current != scan.covered {
                 return Ok(false);
             }
         }
@@ -1050,9 +1107,10 @@ mod tests {
             locker.clone(),
             tmon.clone(),
             Clock::real(),
+            TEST_COLL,
         );
 
-        // Create the collection root so membership locks have a home.
+        // Create the collection root so the test collection exists up front.
         shards
             .create_root(TEST_COLL, &CollectionRoot::new())
             .await
@@ -1130,6 +1188,7 @@ mod tests {
             Data {
                 reads: Vec::new(),
                 writes: ws,
+                scans: Vec::new(),
             },
         )
         .await
@@ -1153,6 +1212,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&keyp, val)],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
@@ -1174,8 +1234,9 @@ mod tests {
     // Regression (review 1.1 / ADR-022): the committed transaction object must
     // record its full lock set, not just its writes, so GC's reverse liveness
     // check and lock pruning operate on real logs. A transaction that reads one
-    // key and creates another records: a read lock on the read key, a write lock
-    // on the created key, and the collection membership (root) lock.
+    // key and creates another records a read lock on the read key and a write
+    // lock on the created key. Membership is coordinated by that per-key entry
+    // lock, so there is no separate root lock to record (ADR-031).
     #[tokio::test]
     async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
@@ -1189,6 +1250,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wa(&writep, b"v")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
@@ -1197,7 +1259,6 @@ mod tests {
         let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
         let locked: std::collections::BTreeSet<&str> =
             txlog.locks.iter().map(|l| l.path.as_str()).collect();
-        let root = paths::collection_info(TEST_COLL);
         assert!(
             locked.contains(readp.as_str()),
             "read lock recorded: {locked:?}"
@@ -1205,10 +1266,6 @@ mod tests {
         assert!(
             locked.contains(writep.as_str()),
             "write lock recorded: {locked:?}"
-        );
-        assert!(
-            locked.contains(root.as_str()),
-            "membership root lock recorded: {locked:?}"
         );
     }
 
@@ -1224,6 +1281,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wa(&keyp, b"v2")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -1257,6 +1315,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![ra],
             writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
+            scans: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
@@ -1292,6 +1351,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![ra],
             writes: vec![wa(&keyp, b"v3")],
+            scans: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(
@@ -1315,6 +1375,7 @@ mod tests {
             Data {
                 reads: vec![ra2],
                 writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
             },
         )
         .await;
@@ -1348,6 +1409,7 @@ mod tests {
                 &Data {
                     reads: Vec::new(),
                     writes: vec![wa(&keyp, b"h")],
+                    scans: Vec::new(),
                 },
                 false,
             )
@@ -1363,6 +1425,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&keyp, b"a")],
+            scans: Vec::new(),
         });
         let id_before = h.id().clone();
         let tm2 = tm.clone();
@@ -1721,6 +1784,7 @@ mod tests {
         let data_b = Data {
             reads: Vec::new(),
             writes: vec![wa(&kbp, b"vb2")],
+            scans: Vec::new(),
         };
         let tb = txb.clone();
         let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
@@ -1809,6 +1873,7 @@ mod tests {
         let data_b = Data {
             reads: Vec::new(),
             writes: vec![wa(&kbp, b"vb2")],
+            scans: Vec::new(),
         };
         let tb = txb.clone();
         let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
@@ -1861,6 +1926,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
+            scans: Vec::new(),
         });
         let id_before = h.id().clone();
         tm.commit(&mut h)
@@ -1900,16 +1966,16 @@ mod tests {
     // single read-write fast path (ADR-027) issues one tx-object write and two
     // shard writes (the lock CAS then the write-back CAS that publishes the
     // pointer — here inline because tests build the algo with no background
-    // executor) and no membership write; the full locked path also issues at
-    // least two shard writes but writes its tx object differently and may touch
-    // the collection root.
+    // executor); the full locked path also issues two shard writes (entry lock +
+    // write-back) but writes its tx object differently. Membership is coordinated
+    // by the per-key entry lock, so neither path issues a separate root CAS
+    // (ADR-031).
     #[derive(Debug, Default)]
     struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
-        // `/_n/` or the collection root `/_i`, which holds both the small
-        // collection's single leaf entries *and* its membership. Entry-lock,
-        // write-back, and membership CAS therefore all land here and cannot be
-        // told apart by path alone.
+        // `/_n/` or the collection root `/_i`, which holds the small collection's
+        // single leaf entries. Entry-lock and write-back CAS both land here and
+        // cannot be told apart by path alone.
         leaf: usize,
         tx: usize,
     }
@@ -1973,6 +2039,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wa(&keyp, b"v2")],
+            scans: Vec::new(),
         });
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
@@ -2016,6 +2083,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wa(&keyp, b"v2")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2040,6 +2108,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&keyp, b"v2")],
+            scans: Vec::new(),
         });
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
@@ -2141,6 +2210,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wa(&keyp, b"v3")],
+            scans: Vec::new(),
         });
         let h2 = h.id().clone();
         tm.commit(&mut h).await.unwrap();
@@ -2178,6 +2248,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r.clone()],
             writes: vec![wa(&keyp, b"v2")],
+            scans: Vec::new(),
         });
         let orphan = h.id().clone();
         let err = tm.commit(&mut h).await.unwrap_err();
@@ -2211,33 +2282,43 @@ mod tests {
         assert_eq!(rv.version.unwrap().last_writer, *h2.id());
     }
 
-    // Creating a key is a membership change, so it is ineligible and takes the
-    // full locked path (which touches the collection root).
+    // Creating a key is ineligible for the single read-write fast path (it has no
+    // predecessor value to build on), so it takes the full locked path. The fast
+    // path never calls the locker, so a non-zero lock-call count proves the full
+    // path was taken. Membership is coordinated by the per-key Create lock, so no
+    // separate root CAS is issued (ADR-031): the leaf-write count is the full
+    // path's entry-lock + write-back, exactly two.
     #[tokio::test]
     async fn single_rw_create_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"new");
 
         log.lock().unwrap().clear();
+        tctx.locker.lock_calls_and_reset();
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&keyp, b"v")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
-        let c = write_counts(&log);
-        // A create is a membership change: the full locked path issues the entry
-        // lock + write-back CAS and, additionally, the membership CAS — all on
-        // `_i` (ADR-031), so the leaf-write count exceeds the fast path's two.
         assert!(
-            c.leaf >= 3,
-            "create takes the full locked path with a membership write: {c:?}"
+            tctx.locker.lock_calls_and_reset() >= 1,
+            "a create takes the full locked path"
+        );
+        let c = write_counts(&log);
+        assert_eq!(
+            c.leaf, 2,
+            "create issues entry-lock + write-back, no membership CAS: {c:?}"
         );
         assert!(entry(&tctx, b"new").await.unwrap().exists());
     }
 
-    // A delete is a membership change: ineligible, full locked path.
+    // A delete is ineligible for the fast path too (it publishes a tombstone, not
+    // a pointer over a predecessor), so it takes the full locked path; the
+    // non-zero lock-call count proves it. No separate membership CAS is issued
+    // (ADR-031).
     #[tokio::test]
     async fn single_rw_delete_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -2247,19 +2328,23 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
+        tctx.locker.lock_calls_and_reset();
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wdel(&keyp)],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
-        let c = write_counts(&log);
-        // A delete is a membership change too: entry lock + write-back plus the
-        // membership CAS, all on `_i`.
         assert!(
-            c.leaf >= 3,
-            "delete takes the full locked path with a membership write: {c:?}"
+            tctx.locker.lock_calls_and_reset() >= 1,
+            "a delete takes the full locked path"
+        );
+        let c = write_counts(&log);
+        assert_eq!(
+            c.leaf, 2,
+            "delete issues entry-lock + write-back, no membership CAS: {c:?}"
         );
         assert!(entry(&tctx, b"k").await.unwrap().deleted);
     }
@@ -2278,6 +2363,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&ka, b"v2"), wa(&kb, b"v2")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2301,6 +2387,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![ra],
             writes: vec![wa(&kb, b"v2")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2323,6 +2410,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2341,6 +2429,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
+            scans: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
@@ -2352,6 +2441,7 @@ mod tests {
             Data {
                 reads: vec![r],
                 writes: Vec::new(),
+                scans: Vec::new(),
             },
         );
         tm.commit(&mut h).await.unwrap();
@@ -2371,6 +2461,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
     }
@@ -2385,6 +2476,7 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: vec![wdel(&keyp)],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2404,11 +2496,260 @@ mod tests {
         let mut h = tm.begin(Data {
             reads: Vec::new(),
             writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
+            scans: Vec::new(),
         });
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
         assert!(entry(&tctx, b"k1").await.unwrap().exists());
         assert!(entry(&tctx, b"k2").await.unwrap().exists());
+    }
+
+    // Installs live committed pointers for `keys` directly in the collection's
+    // root leaf `_i` (no lock holders, no pending write-back), so the leaf's
+    // object version is stable — a scan taken afterwards is not perturbed by an
+    // asynchronous write-back settling.
+    async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
+        let path = paths::collection_info(TEST_COLL);
+        let loaded = tctx
+            .shards
+            .load_leaf(&path, Freshness::Latest)
+            .await
+            .unwrap();
+        let mut entries: std::collections::BTreeMap<Vec<u8>, ShardEntry> = loaded
+            .entries
+            .entries()
+            .cloned()
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            let w = TxId::with_priority((i as u64) + 1, b"seed");
+            entries.insert(
+                k.to_vec(),
+                ShardEntry {
+                    key: k.to_vec(),
+                    lock_type: LockType::None,
+                    locked_by: Vec::new(),
+                    current_writer: Some(w),
+                    deleted: false,
+                },
+            );
+        }
+        let shard = Shard::from_entries(entries.into_values());
+        assert!(
+            tctx.shards
+                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
+                .await
+                .unwrap()
+        );
+    }
+
+    // Builds a read-only listing transaction's [`Data`] from a fresh scan of the
+    // test collection, returning the scan's live keys alongside so a test can
+    // assert on the snapshot and later re-validate the same coverage.
+    async fn scan_data(tctx: &Tctx) -> (Data, Vec<Vec<u8>>) {
+        let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
+        let scan = resolver.live_keys_scan(TEST_COLL).await.unwrap();
+        let data = Data {
+            reads: Vec::new(),
+            writes: Vec::new(),
+            scans: vec![ScanAccess {
+                prefix: TEST_COLL.into(),
+                covered: scan.covered,
+            }],
+        };
+        (data, scan.keys)
+    }
+
+    // ADR-031 phantom prevention: a listing whose covered leaves are unchanged
+    // commits, but one whose leaf a concurrent create mutated (bumping the leaf
+    // version) fails validation and must re-run — so the create can never appear
+    // as a phantom inside an already-validated snapshot.
+    #[tokio::test]
+    async fn scan_detects_racing_create() {
+        let (tm, tctx) = new_algo().await;
+        seed_live_keys(&tctx, &[b"a", b"c"]).await;
+
+        let (data, keys) = scan_data(&tctx).await;
+        assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
+
+        // No concurrent change: the listing validates and commits.
+        let mut h = tm.begin(data.clone());
+        tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
+
+        // A create between the scan and (re-)validation bumps the covered leaf.
+        commit_writes(&tm, vec![wa(&paths::from_key(TEST_COLL, b"b"), b"1")]).await;
+
+        let mut stale = tm.begin(data);
+        let err = tm.commit(&mut stale).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+    }
+
+    // ADR-031 phantom prevention: a delete of a listed key also bumps the covered
+    // leaf's version, so a scan taken before it fails re-validation (the key must
+    // not silently vanish from an already-validated snapshot).
+    #[tokio::test]
+    async fn scan_detects_racing_delete() {
+        let (tm, tctx) = new_algo().await;
+        let bp = paths::from_key(TEST_COLL, b"b");
+        seed_live_keys(&tctx, &[b"a", b"b"]).await;
+
+        let (data, keys) = scan_data(&tctx).await;
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+
+        commit_writes(&tm, vec![wdel(&bp)]).await;
+
+        let mut stale = tm.begin(data);
+        let err = tm.commit(&mut stale).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+    }
+
+    // ADR-031: a split that lands between the scan and validation changes the
+    // covered leaf set (one leaf becomes an index root over two leaves), which
+    // validation detects and re-runs — the listing then re-scans the fresh
+    // topology, following right-links, so no key is dropped or duplicated.
+    #[tokio::test]
+    async fn scan_detects_concurrent_split() {
+        let (tm, tctx) = new_algo().await;
+        seed_live_keys(&tctx, &[b"a", b"m"]).await;
+
+        let (data, _keys) = scan_data(&tctx).await;
+
+        // Grow the tree in place: rewrite `_i` from its single leaf into an index
+        // root pointing at two fresh leaves (the shape the background splitter
+        // produces), so the covered leaf set is no longer just `_i`.
+        split_root_in_place(&tctx).await;
+
+        let mut stale = tm.begin(data);
+        let err = tm.commit(&mut stale).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+    }
+
+    // ADR-031 boundary protection: on a multi-leaf tree a full scan covers every
+    // leaf including the endpoints, so a create landing in the *last* leaf bumps
+    // that covered leaf's version and re-validation fails — a boundary phantom
+    // cannot slip past an already-validated listing.
+    #[tokio::test]
+    async fn scan_detects_boundary_membership_change() {
+        use glassdb_storage::{IndexNode, Node};
+        let (tm, tctx) = new_algo().await;
+
+        // Two-leaf tree: index root over S0(a,c | high "m") -> S1(m,p).
+        let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
+            let mut n = Node::leaf(Shard::from_entries(ks.iter().map(|k| ShardEntry {
+                key: k.to_vec(),
+                lock_type: LockType::None,
+                locked_by: Vec::new(),
+                current_writer: Some(TxId::with_priority(1, b"seed")),
+                deleted: false,
+            })));
+            n.set_high_key(high.map(<[u8]>::to_vec));
+            n.set_right_sibling(right.map(str::to_string));
+            n
+        };
+        tctx.shards
+            .store_node(
+                TEST_COLL,
+                "S0",
+                &leaf(&[b"a", b"c"], Some(b"m"), Some("S1")),
+                None,
+            )
+            .await
+            .unwrap();
+        tctx.shards
+            .store_node(TEST_COLL, "S1", &leaf(&[b"m", b"p"], None, None), None)
+            .await
+            .unwrap();
+        let mut root = CollectionRoot::new();
+        root.set_node(Node::index(IndexNode::from_children([
+            (b"".to_vec(), "S0".to_string()),
+            (b"m".to_vec(), "S1".to_string()),
+        ])));
+        let cur = tctx
+            .shards
+            .load_leaf(&paths::collection_info(TEST_COLL), Freshness::Latest)
+            .await
+            .unwrap();
+        tctx.shards
+            .store_root(TEST_COLL, &root, cur.version.as_ref().unwrap())
+            .await
+            .unwrap();
+
+        let (data, keys) = scan_data(&tctx).await;
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"c".to_vec(), b"m".to_vec(), b"p".to_vec()]
+        );
+
+        // Append a key past the current maximum: it lands in the last covered
+        // leaf S1, bumping its version.
+        let (s1, ver) = tctx
+            .shards
+            .load_node(TEST_COLL, "S1", Freshness::Latest)
+            .await
+            .unwrap();
+        let mut entries: Vec<ShardEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
+        entries.push(ShardEntry {
+            key: b"z".to_vec(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: Some(TxId::with_priority(2, b"boundary")),
+            deleted: false,
+        });
+        let mut new_s1 = Node::leaf(Shard::from_entries(entries));
+        new_s1.set_high_key(None);
+        tctx.shards
+            .store_node(TEST_COLL, "S1", &new_s1, Some(&ver))
+            .await
+            .unwrap();
+
+        let mut stale = tm.begin(data);
+        let err = tm.commit(&mut stale).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+    }
+
+    // Rewrites the test collection's root `_i` (a single leaf holding `a`,`m`)
+    // into a two-level tree: an index root over leaf `S0` (a) and `S1` (m),
+    // chained by right-sibling. A CAS on `_i` makes this the topology-growth
+    // linearization point, mirroring the in-place root split (ADR-031).
+    async fn split_root_in_place(tctx: &Tctx) {
+        use glassdb_storage::{IndexNode, Node};
+
+        let loaded = tctx
+            .shards
+            .load_leaf(&paths::collection_info(TEST_COLL), Freshness::Latest)
+            .await
+            .unwrap();
+        let entries: Vec<ShardEntry> = loaded.entries.entries().cloned().collect();
+        let (lower, upper): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|e| e.key.as_slice() < b"m".as_slice());
+
+        let mut s0 = Node::leaf(Shard::from_entries(lower));
+        s0.set_high_key(Some(b"m".to_vec()));
+        s0.set_right_sibling(Some("S1".to_string()));
+        tctx.shards
+            .store_node(TEST_COLL, "S0", &s0, None)
+            .await
+            .unwrap();
+        let s1 = Node::leaf(Shard::from_entries(upper));
+        tctx.shards
+            .store_node(TEST_COLL, "S1", &s1, None)
+            .await
+            .unwrap();
+
+        let mut root = CollectionRoot::new();
+        root.set_node(Node::index(IndexNode::from_children([
+            (b"".to_vec(), "S0".to_string()),
+            (b"m".to_vec(), "S1".to_string()),
+        ])));
+        assert!(
+            tctx.shards
+                .store_root(TEST_COLL, &root, loaded.version.as_ref().unwrap())
+                .await
+                .unwrap(),
+            "root split CAS must win"
+        );
     }
 }

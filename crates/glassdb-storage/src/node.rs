@@ -13,7 +13,9 @@
 //! Like the shard and root objects, a node body is a compare-and-swap unit, so
 //! the encoding is canonical (leaf entries and index separators sorted, holder
 //! sets sorted) and golden-anchored. This module is inert data plus encode/
-//! decode and pure lookups; the split protocol and descent live above it.
+//! decode, pure lookups, and the in-memory split primitives ([`Node::split`]);
+//! descent lives in `directory.rs` and the background split protocol in the
+//! `glassdb-trans` `split` module.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Included, Unbounded};
@@ -78,6 +80,33 @@ impl IndexNode {
         self.children.is_empty()
     }
 
+    /// Inserts a `(separator, child)` pair, the parent-side effect of a child
+    /// split (ADR-031). A separator already present is overwritten, so a
+    /// re-driven insert is idempotent.
+    pub fn insert_child(&mut self, separator: Vec<u8>, child: NodeToken) {
+        self.children.insert(separator, child);
+    }
+
+    /// Splits the index at its median separator: retains the lower children in
+    /// `self` and returns the upper children together with the separator that
+    /// bounds them (the first separator of the upper half). Used for interior
+    /// and in-place root splits (ADR-031). Requires at least two children.
+    pub fn split_off_median(&mut self) -> (IndexNode, Vec<u8>) {
+        debug_assert!(
+            self.children.len() >= 2,
+            "cannot split an index with fewer than two children"
+        );
+        let mid = self.children.len() / 2;
+        let separator = self
+            .children
+            .keys()
+            .nth(mid)
+            .cloned()
+            .expect("median index is in range");
+        let upper = self.children.split_off(&separator);
+        (IndexNode { children: upper }, separator)
+    }
+
     fn to_pb(&self) -> pb::IndexNode {
         pb::IndexNode {
             entries: self
@@ -98,6 +127,32 @@ impl IndexNode {
                 .into_iter()
                 .map(|e| (e.separator_key, e.child))
                 .collect(),
+        }
+    }
+}
+
+/// The soft caps that trigger a background split (ADR-031). A node over any of
+/// its caps is a split candidate. Injected rather than hard-coded so the split
+/// maintainer's thresholds are tunable and tests can drive splits with tiny
+/// nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitPolicy {
+    /// Maximum leaf entries before it is a split candidate.
+    pub leaf_max_entries: usize,
+    /// Maximum encoded leaf bytes before it is a split candidate.
+    pub leaf_max_bytes: usize,
+    /// Maximum index children (fan-out) before it is a split candidate.
+    pub index_max_children: usize,
+}
+
+impl Default for SplitPolicy {
+    fn default() -> Self {
+        // A ~256-entry leaf soft cap mirrors the old fixed keys-per-shard target
+        // (ADR-017), and keeps each object small for the backend.
+        SplitPolicy {
+            leaf_max_entries: 256,
+            leaf_max_bytes: 256 * 1024,
+            index_max_children: 256,
         }
     }
 }
@@ -195,6 +250,62 @@ impl Node {
         }
     }
 
+    /// Reports whether the node is over any of `policy`'s soft caps, making it a
+    /// background split candidate (ADR-031). A node with fewer than two
+    /// entries/children can never be split, so it is never a candidate however
+    /// large a single entry is (single-hot-key relief is out of scope).
+    pub fn over_soft_cap(&self, policy: &SplitPolicy) -> bool {
+        match &self.body {
+            NodeBody::Leaf(shard) => {
+                shard.len() >= 2
+                    && (shard.len() > policy.leaf_max_entries
+                        || self.encode().len() > policy.leaf_max_bytes)
+            }
+            NodeBody::Index(index) => index.len() >= 2 && index.len() > policy.index_max_children,
+        }
+    }
+
+    /// Halves the node for a B-link split (ADR-031): retains the lower half in
+    /// `self` (bounded above by the split key and linked to `right_token`) and
+    /// returns the newly created right sibling — which inherits `self`'s former
+    /// high-key and right-sibling — together with the split key to promote into
+    /// the parent. Returns `None` when the node is too small to divide (fewer
+    /// than two entries/children), so a caller never produces an empty node.
+    ///
+    /// This is a pure in-memory transform; persisting the two nodes (create the
+    /// sibling, then CAS the shrunk source — the linearization point) is the
+    /// caller's multi-step protocol.
+    pub fn split(&mut self, right_token: &str) -> Option<(Node, Vec<u8>)> {
+        let (right_body, split_key) = match &mut self.body {
+            NodeBody::Leaf(shard) => {
+                if shard.len() < 2 {
+                    return None;
+                }
+                let (upper, split_key) = shard.split_off_median();
+                (NodeBody::Leaf(upper), split_key)
+            }
+            NodeBody::Index(index) => {
+                if index.len() < 2 {
+                    return None;
+                }
+                let (upper, separator) = index.split_off_median();
+                (NodeBody::Index(upper), separator)
+            }
+        };
+        // The right sibling takes over the upper range: the old high-key and the
+        // old right-sibling link now bound and follow it.
+        let right = Node {
+            high_key: self.high_key.take(),
+            right_sibling: self.right_sibling.take(),
+            body: right_body,
+        };
+        // The retained lower half is now bounded by the split key and links to
+        // the new sibling.
+        self.high_key = Some(split_key.clone());
+        self.right_sibling = Some(right_token.to_string());
+        Some((right, split_key))
+    }
+
     /// Encodes the node to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
@@ -283,6 +394,116 @@ mod tests {
         assert_eq!(idx.child_for(b"f"), Some("L1"));
         assert_eq!(idx.child_for(b"kiwi"), Some("L1"));
         assert_eq!(idx.child_for(b"mango"), Some("L2"));
+    }
+
+    #[test]
+    fn leaf_split_moves_upper_half_and_relinks() {
+        // A leaf with an existing high-key and right-sibling splits: the new
+        // sibling inherits both bounds, the source is rebounded to the split key
+        // and linked to the sibling token.
+        let mut src = Node::leaf(Shard::from_entries([
+            entry(b"apple", 1),
+            entry(b"cat", 2),
+            entry(b"mango", 3),
+            entry(b"pear", 4),
+        ]));
+        src.set_high_key(Some(b"tiger".to_vec()));
+        src.set_right_sibling(Some("oldRight".to_string()));
+
+        let (right, split_key) = src.split("newRight").expect("splittable");
+        assert_eq!(split_key, b"mango");
+
+        // Source keeps the lower half, bounded by the split key, linked to the
+        // new sibling.
+        let src_keys: Vec<&[u8]> = src
+            .as_leaf()
+            .unwrap()
+            .entries()
+            .map(|e| e.key.as_slice())
+            .collect();
+        assert_eq!(src_keys, vec![b"apple".as_slice(), b"cat"]);
+        assert_eq!(src.high_key(), Some(b"mango".as_slice()));
+        assert_eq!(src.right_sibling(), Some("newRight"));
+
+        // The sibling holds the upper half and inherits the source's former
+        // high-key and right-sibling.
+        let right_keys: Vec<&[u8]> = right
+            .as_leaf()
+            .unwrap()
+            .entries()
+            .map(|e| e.key.as_slice())
+            .collect();
+        assert_eq!(right_keys, vec![b"mango".as_slice(), b"pear"]);
+        assert_eq!(right.high_key(), Some(b"tiger".as_slice()));
+        assert_eq!(right.right_sibling(), Some("oldRight"));
+    }
+
+    #[test]
+    fn index_split_promotes_separator_and_relinks() {
+        let mut src = Node::index(IndexNode::from_children([
+            (b"".to_vec(), "L0".to_string()),
+            (b"f".to_vec(), "L1".to_string()),
+            (b"m".to_vec(), "L2".to_string()),
+            (b"t".to_vec(), "L3".to_string()),
+        ]));
+        let (right, sep) = src.split("newRight").expect("splittable");
+        assert_eq!(
+            sep, b"m",
+            "promoted separator is the right half's low bound"
+        );
+
+        let left_seps: Vec<&[u8]> = src.as_index().unwrap().children().map(|(s, _)| s).collect();
+        assert_eq!(left_seps, vec![b"".as_slice(), b"f"]);
+        assert_eq!(src.high_key(), Some(b"m".as_slice()));
+        assert_eq!(src.right_sibling(), Some("newRight"));
+
+        let right_seps: Vec<&[u8]> = right
+            .as_index()
+            .unwrap()
+            .children()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(right_seps, vec![b"m".as_slice(), b"t"]);
+    }
+
+    #[test]
+    fn split_of_undersized_node_is_none() {
+        assert!(
+            Node::leaf(Shard::from_entries([entry(b"only", 1)]))
+                .split("r")
+                .is_none()
+        );
+        assert!(Node::leaf(Shard::new()).split("r").is_none());
+        let one_child = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".to_string())]));
+        assert!(one_child.clone().split("r").is_none());
+    }
+
+    #[test]
+    fn over_soft_cap_respects_policy_and_min_size() {
+        let tiny = SplitPolicy {
+            leaf_max_entries: 2,
+            leaf_max_bytes: 1 << 20,
+            index_max_children: 2,
+        };
+        let two = Node::leaf(Shard::from_entries([entry(b"a", 1), entry(b"b", 2)]));
+        assert!(!two.over_soft_cap(&tiny), "at the cap is not over it");
+        let three = Node::leaf(Shard::from_entries([
+            entry(b"a", 1),
+            entry(b"b", 2),
+            entry(b"c", 3),
+        ]));
+        assert!(three.over_soft_cap(&tiny));
+        // A single oversized entry is never a candidate: it cannot be split.
+        let byte_policy = SplitPolicy {
+            leaf_max_entries: 1000,
+            leaf_max_bytes: 1,
+            index_max_children: 1000,
+        };
+        assert!(!Node::leaf(Shard::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy));
+        assert!(
+            three.over_soft_cap(&byte_policy),
+            "multi-entry over the byte cap splits"
+        );
     }
 
     #[test]

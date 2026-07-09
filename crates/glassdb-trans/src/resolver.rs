@@ -28,8 +28,18 @@ use glassdb_storage::{
     TxCommitStatus,
 };
 
+use crate::algo::LeafCoverage;
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::Monitor;
+
+/// The result of a phantom-safe listing scan ([`Resolver::live_keys_scan`]): the
+/// live keys in key order, plus the version of every leaf the scan covered so
+/// commit validation can detect a racing create/delete or split (ADR-031).
+#[derive(Debug, Clone)]
+pub struct ScanResult {
+    pub keys: Vec<Vec<u8>>,
+    pub covered: Vec<LeafCoverage>,
+}
 
 /// A read key grouped for batched resolution: its full storage path (the map
 /// key of the returned effective-writer set) paired with its decoded raw key
@@ -93,17 +103,27 @@ impl Resolver {
         }
     }
 
-    /// Returns the raw keys that currently exist (committed and not tombstoned)
-    /// in `prefix`, in key order, help-forwarding committed holders so a key
-    /// whose writer committed but has not yet published its `current_writer`
-    /// pointer (write-back is asynchronous) still lists. The listing path scans
-    /// the collection's leaves left-to-right (ADR-031) instead of reading
-    /// `current_writer` directly, so a collection's keys are visible immediately
-    /// on commit rather than only after write-back.
-    pub async fn live_keys(&self, prefix: &str) -> Result<Vec<Vec<u8>>, StorageError> {
+    /// Scans `prefix` left-to-right and returns both the raw keys that currently
+    /// exist (committed and not tombstoned, in key order) and the version of
+    /// every leaf the scan covered (ADR-031 phantom prevention).
+    ///
+    /// Committed holders are help-forwarded, so a key whose writer committed but
+    /// has not yet published its `current_writer` pointer (write-back is
+    /// asynchronous) still lists. The scan follows the leaf right-sibling chain
+    /// ([`Directory::leaves`]), so an in-progress split is absorbed rather than
+    /// dropping or duplicating keys. Recording each covered leaf's object
+    /// version lets commit validation detect any create/delete (which bumps its
+    /// leaf's version) or split (which changes the covered set) that raced the
+    /// scan.
+    pub async fn live_keys_scan(&self, prefix: &str) -> Result<ScanResult, StorageError> {
         let leaves = self.dir.leaves(prefix, Freshness::Latest).await?;
         let mut keys = Vec::new();
+        let mut covered = Vec::with_capacity(leaves.len());
         for loc in leaves {
+            covered.push(LeafCoverage {
+                path: loc.path.as_str().into(),
+                version: loc.version.clone(),
+            });
             let leaf = loc
                 .node
                 .as_leaf()
@@ -119,7 +139,7 @@ impl Resolver {
                 }
             }
         }
-        Ok(keys)
+        Ok(ScanResult { keys, covered })
     }
 
     /// Returns the effective committed writer of every `key` (the validation
@@ -202,7 +222,14 @@ impl Resolver {
     ) -> Result<(HolderResolution, LeafLocator), TransError> {
         let (prefix, raw_key) = paths::split_key(key_path)
             .map_err(|e| TransError::with_source("parsing key path", e))?;
-        let loc = self.dir.leaf_for(&prefix, &raw_key, freshness).await?;
+        // Interior index nodes are served from cache (ADR-031 hot-path
+        // invariant); only the terminal leaf honors the caller's `freshness`
+        // (the fast path's `AllowStale` reuse, else `Latest`), so the root `_i`
+        // is not revalidated on every commit.
+        let loc = self
+            .dir
+            .leaf_for_fresh(&prefix, &raw_key, Freshness::AllowStale, freshness)
+            .await?;
         let leaf = loc
             .node
             .as_leaf()
