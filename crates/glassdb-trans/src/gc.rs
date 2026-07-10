@@ -4,15 +4,15 @@
 //! In the v2 object-native layout a committed transaction object *is* the value
 //! store: a key's live value lives in the object its shard entry's
 //! `current_writer` points at, and readers help-forward through it. So a
-//! transaction object is **live** exactly while some shard or root still
-//! references its txid (`current_writer`, `locked_by`, or the root's
-//! `membership_locked_by`), and GC is a reachability problem, not a timer.
+//! transaction object is **live** exactly while some shard still references its
+//! txid (`current_writer` or `locked_by`), and GC is a reachability problem, not
+//! a timer.
 //!
 //! A forward mark (list every shard, union the referenced txids) costs the whole
 //! database per cycle. Instead each candidate `_t/` object records its own
 //! back-references (its `locks ∪ writes`), so GC works **backward**: it reads a
 //! batch of candidates and confirms each one dead by GET-ing only the handful of
-//! shards/root it names — never a database-wide scan. Candidates come from the
+//! shards it names — never a database-wide scan. Candidates come from the
 //! write-back hint ([`Gc::schedule_tx_cleanup`], the `current_writer` a fresh
 //! commit just superseded) and a paged walk of the flat `{db}/_t/` directory
 //! (which makes the candidate set complete regardless of lost hints).
@@ -34,15 +34,16 @@
 //! calls the [`Locker`]'s stateless per-object unlock methods rather than issuing
 //! its own shard/root CAS, so every mutation goes through one place.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
-use glassdb_data::shard::group_by_owning_shard;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{PathLock, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog};
+use glassdb_storage::{
+    Directory, Freshness, PathLock, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog,
+};
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, PENDING_TX_TIMEOUT, is_expired};
@@ -71,6 +72,7 @@ pub struct Gc {
     bg: Weak<Background>,
     tl: TLogger,
     shards: ShardStore,
+    dir: Directory,
     locker: Locker,
     mon: Monitor,
     clock: Clock,
@@ -80,6 +82,15 @@ pub struct Gc {
     // Paged `_t/` list cursor: the last txid visited, so successive cycles walk
     // the flat transaction directory a page at a time and wrap around.
     cursor: Arc<Mutex<Option<TxId>>>,
+    // The database name (leading segment of every collection prefix), so the
+    // orphan sweep can list the durable split-active registry (ADR-031).
+    db_root: String,
+    // Per-collection set of node tokens seen unreferenced in the previous sweep.
+    // The orphan sweep (ADR-031) reclaims a node only once it is unreferenced in
+    // two consecutive sweeps, a generational stand-in for the object mtime the
+    // backend does not expose — a full GC cycle exceeds any split's duration, so
+    // an in-progress sibling is never mistaken for an orphan.
+    orphan_seen: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
 }
 
 impl Gc {
@@ -93,16 +104,21 @@ impl Gc {
         locker: Locker,
         mon: Monitor,
         clock: Clock,
+        db_root: &str,
     ) -> Self {
+        let dir = Directory::new(shards.clone());
         Gc {
             bg,
             tl,
             shards,
+            dir,
             locker,
             mon,
             clock,
             hints: Arc::new(Mutex::new(VecDeque::new())),
             cursor: Arc::new(Mutex::new(None)),
+            db_root: db_root.to_string(),
+            orphan_seen: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -160,6 +176,66 @@ impl Gc {
                 tracing::debug!(tx = %tid, error = %e, "gc candidate check deferred");
             }
         }
+
+        self.sweep_orphans().await;
+    }
+
+    /// Reclaims split siblings a crash left dangling (ADR-031): for each
+    /// split-active collection, the node objects not reachable from the root are
+    /// orphans. The split-active set is read from the durable registry, so the
+    /// sweep recovers orphans even in a fresh process that never observed the
+    /// split. To stay safe without an object mtime, a node is deleted only once
+    /// it has been unreferenced in **two consecutive** sweeps — a full
+    /// [`GC_INTERVAL`] exceeds any split's duration, so a sibling created but not
+    /// yet linked is retained until its split completes. Best-effort: a transient
+    /// error only defers a reclaim.
+    async fn sweep_orphans(&self) {
+        let active = match self.shards.list_split_active(&self.db_root).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(error = %e, "listing split-active collections failed");
+                return;
+            }
+        };
+        for prefix in active {
+            if let Err(e) = self.sweep_collection_orphans(&prefix).await {
+                tracing::debug!(prefix = %prefix, error = %e, "orphan sweep deferred");
+            }
+        }
+    }
+
+    /// One collection's orphan sweep (see [`sweep_orphans`]): reclaim the nodes
+    /// unreferenced this cycle *and* the previous one, then record this cycle's
+    /// unreferenced set for the next comparison.
+    ///
+    /// [`sweep_orphans`]: Self::sweep_orphans
+    async fn sweep_collection_orphans(&self, prefix: &str) -> Result<(), TransError> {
+        let listed: BTreeSet<String> = self
+            .shards
+            .list_node_tokens(prefix)
+            .await?
+            .into_iter()
+            .collect();
+        let reachable = self.dir.reachable_tokens(prefix, Freshness::Latest).await?;
+        let unreferenced: BTreeSet<String> = listed.difference(&reachable).cloned().collect();
+
+        let prev = self
+            .orphan_seen
+            .lock()
+            .unwrap()
+            .get(prefix)
+            .cloned()
+            .unwrap_or_default();
+        for token in &unreferenced {
+            if prev.contains(token) {
+                self.shards.delete_node(prefix, token).await?;
+            }
+        }
+        self.orphan_seen
+            .lock()
+            .unwrap()
+            .insert(prefix.to_string(), unreferenced);
+        Ok(())
     }
 
     /// Returns the next page of the flat `{db}/_t/` directory, advancing the
@@ -224,9 +300,8 @@ impl Gc {
     /// A committed candidate past the horizon is deleted only once its complete
     /// record proves it unreferenced. Any recorded write still pointed at by a
     /// `current_writer`, or any recorded lock still held (the commit→write-back
-    /// gap) or root membership still held, keeps it. A committed object is never
-    /// pruned or force-aborted — its locks become `current_writer` through
-    /// write-back, never through GC.
+    /// gap), keeps it. A committed object is never pruned or force-aborted — its
+    /// locks become `current_writer` through write-back, never through GC.
     async fn reclaim_committed(&self, tid: &TxId, log: &TxLog) -> Result<(), TransError> {
         if self.still_referenced(tid, log).await? {
             return Ok(());
@@ -267,48 +342,45 @@ impl Gc {
     }
 
     /// Reports whether any entry the candidate recorded still names its txid: a
-    /// written key's `current_writer`, a locked key's `locked_by`, or the root's
-    /// `membership_locked_by`. Checking only the recorded set is equivalent to
-    /// scanning every shard, because an entry can name `txid` only if `txid` put
-    /// it there.
+    /// written key's `current_writer` or a locked key's `locked_by`. Checking
+    /// only the recorded set is equivalent to scanning every shard, because an
+    /// entry can name `txid` only if `txid` put it there.
     ///
-    /// The recorded keys are routed to their shards by [`ShardStore::load_by_keys`]
-    /// so each touched shard is fetched once (concurrently) — a write and its
-    /// write-lock name the same key, and sibling keys share a shard, so a
-    /// per-key load would re-read the same shard several times per candidate.
-    /// Each key carries the [`CheckKind`] that says which field to inspect.
+    /// The recorded keys are routed to their leaves by descent
+    /// ([`Directory::group_keys_by_leaf`]) so each touched leaf is fetched once —
+    /// a write and its write-lock name the same key, and sibling keys share a
+    /// leaf, so a per-key load would re-read the same leaf several times per
+    /// candidate. Each key carries the [`CheckKind`] that says which field to
+    /// inspect.
     async fn still_referenced(&self, tid: &TxId, log: &TxLog) -> Result<bool, TransError> {
         let mut items: Vec<(&str, CheckKind)> = log
             .writes
             .iter()
             .map(|w| (w.path.as_str(), CheckKind::Writer))
             .collect();
-        let mut roots: BTreeSet<String> = BTreeSet::new();
         for l in &log.locks {
             let Ok(pr) = paths::parse(&l.path) else {
                 continue;
             };
-            match pr.typ {
-                paths::Type::CollectionInfo => {
-                    roots.insert(pr.prefix);
-                }
-                paths::Type::Key => items.push((l.path.as_str(), CheckKind::Holder)),
-                _ => {}
+            if pr.typ == paths::Type::Key {
+                items.push((l.path.as_str(), CheckKind::Holder));
             }
         }
 
-        for loaded in self.shards.load_by_keys(items).await? {
-            for (raw_key, kind) in &loaded.keys {
+        for group in self
+            .dir
+            .group_keys_by_leaf(items, Freshness::Latest)
+            .await?
+        {
+            let Some(leaf) = group.node.as_leaf() else {
+                continue;
+            };
+            for (raw_key, kind) in &group.keys {
                 let referenced = match kind {
                     CheckKind::Writer => {
-                        loaded
-                            .shard
-                            .lookup(raw_key)
-                            .and_then(|e| e.current_writer.as_ref())
-                            == Some(tid)
+                        leaf.lookup(raw_key).and_then(|e| e.current_writer.as_ref()) == Some(tid)
                     }
-                    CheckKind::Holder => loaded
-                        .shard
+                    CheckKind::Holder => leaf
                         .lookup(raw_key)
                         .is_some_and(|e| e.locked_by.contains(tid)),
                 };
@@ -317,46 +389,32 @@ impl Gc {
                 }
             }
         }
-
-        for prefix in roots {
-            match self.shards.load_root(&prefix).await {
-                Ok((root, _)) if root.membership_locked_by().contains(tid) => return Ok(true),
-                Ok(_) | Err(StorageError::NotFound) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
         Ok(false)
     }
 
-    /// Releases `tid` from every shard and root its recorded `locks` name,
-    /// grouping the paths so each shard/root is visited once (targeted pruning,
-    /// never a whole-shard-space scan). Each release flows through the locker's
-    /// coordinator-backed unlock methods (ADR-029) — one deduplicated fold round
+    /// Releases `tid` from every leaf its recorded `locks` name, grouping the
+    /// paths by descent so each leaf is visited once (targeted pruning, never a
+    /// whole-key-space scan). Each release flows through the locker's
+    /// coordinator-backed unlock method (ADR-029) — one deduplicated fold round
     /// per object that clears `tid` and drops any entry it thereby leaves
-    /// vestigial — so GC issues no shard/root CAS of its own. `current_writer` is
+    /// vestigial — so GC issues no leaf CAS of its own. `current_writer` is
     /// never touched.
     async fn release_locks(&self, tid: &TxId, locks: &[PathLock]) -> Result<(), TransError> {
         let mut key_locks: Vec<(&str, ())> = Vec::new();
-        let mut roots: BTreeSet<String> = BTreeSet::new();
         for l in locks {
             let Ok(pr) = paths::parse(&l.path) else {
                 continue;
             };
-            match pr.typ {
-                paths::Type::CollectionInfo => {
-                    roots.insert(pr.prefix);
-                }
-                paths::Type::Key => key_locks.push((l.path.as_str(), ())),
-                _ => {}
+            if pr.typ == paths::Type::Key {
+                key_locks.push((l.path.as_str(), ()));
             }
         }
-        let shards = group_by_owning_shard(key_locks)
-            .map_err(|e| TransError::with_source("grouping locks by shard", e))?;
-        for (prefix, idx) in shards.into_keys() {
-            self.locker.release_shard(tid, &prefix, idx).await?;
-        }
-        for prefix in roots {
-            self.locker.release_root(&prefix, tid).await?;
+        for group in self
+            .dir
+            .group_keys_by_leaf(key_locks, Freshness::Latest)
+            .await?
+        {
+            self.locker.release_leaf(tid, &group.path).await?;
         }
         Ok(())
     }
@@ -380,10 +438,11 @@ mod tests {
     use glassdb_backend::middleware::RecordingBackend;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::shard::shard_index;
     use glassdb_storage::{
-        Freshness, LockType, ObjectCache, Shard, ShardEntry, SharedCache, TxWrite, ValueCache,
+        CollectionRoot, Directory, Freshness, IndexNode, LockType, Node, ObjectCache, Shard,
+        ShardEntry, SharedCache, TxWrite, ValueCache,
     };
+    use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
 
     const COLL: &str = "db/coll";
@@ -425,13 +484,14 @@ mod tests {
             RetryConfig::default(),
         );
         let resolver = Resolver::new(shards.clone(), mon.clone());
+        let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::new(
             shards.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
         );
-        let locker = Locker::new(coord, mon.clone(), RetryConfig::default());
+        let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
         let gc = Gc::new(
             Arc::downgrade(&bg),
             tl.clone(),
@@ -439,6 +499,7 @@ mod tests {
             locker.clone(),
             mon.clone(),
             clock,
+            "db",
         );
         Ctx {
             gc,
@@ -464,22 +525,31 @@ mod tests {
         }
     }
 
-    async fn store_entry(shards: &ShardStore, key: &[u8], entry: ShardEntry) {
-        let shard = Shard::from_entries([entry]);
+    async fn store_entry(shards: &ShardStore, _key: &[u8], entry: ShardEntry) {
+        let path = paths::collection_info(COLL);
+        let loaded = shards.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+            .entries
+            .entries()
+            .cloned()
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        entries.insert(entry.key.clone(), entry);
+        let shard = Shard::from_entries(entries.into_values());
         assert!(
             shards
-                .store_shard(COLL, shard_index(key), &shard, None)
+                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
     }
 
     async fn lookup_entry(shards: &ShardStore, key: &[u8]) -> Option<ShardEntry> {
-        let (shard, _) = shards
-            .load_shard(COLL, shard_index(key), Freshness::Latest)
+        let loaded = shards
+            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
             .await
             .unwrap();
-        shard.lookup(key).cloned()
+        loaded.entries.lookup(key).cloned()
     }
 
     fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> TxLog {
@@ -645,30 +715,6 @@ mod tests {
         assert!(lookup_entry(&ctx.shards, b"k").await.is_none());
     }
 
-    // An aborted object holding a membership (root) lock has it released too.
-    #[tokio::test(start_paused = true)]
-    async fn expired_aborted_releases_root_membership_lock() {
-        let ctx = new_ctx();
-        let t = tx(1);
-        let mut root = glassdb_storage::CollectionRoot::new(1024);
-        root.set_membership_lock(LockType::Write, [t.clone()]);
-        ctx.shards.create_root(COLL, &root).await.unwrap();
-
-        let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
-        log.timestamp = Some(base() - PAST_HORIZON);
-        log.locks = vec![PathLock {
-            path: paths::collection_info(COLL),
-            typ: LockType::Write,
-        }];
-        ctx.tl.set(&log).await.unwrap();
-
-        ctx.gc.run_once().await;
-
-        assert!(is_gone(&ctx.tl, &t).await);
-        let (root, _) = ctx.shards.load_root(COLL).await.unwrap();
-        assert!(root.membership_locked_by().is_empty());
-    }
-
     // A candidate with no object at all is a harmless no-op.
     #[tokio::test(start_paused = true)]
     async fn missing_candidate_is_noop() {
@@ -694,19 +740,24 @@ mod tests {
 
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::from_shard(COLL, shard_index(&ka));
+        let shard_path = paths::collection_info(COLL);
 
-        // Seed both entries in the one shared shard: a dead transaction holds
+        // Seed both entries in the one shared leaf `_i`: a dead transaction holds
         // A's write lock (no committed writer), so GC's release will clear and
         // prune the now-vestigial entry; B exists committed, so the live
         // overwrite takes a Write lock (not a Create) and needs no membership
-        // root lock — the round stays one shard CAS.
+        // root lock — the round stays one leaf CAS.
         let dead = tx(1);
         let seed = tx(9);
         let shard = Shard::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
+        let loaded = ctx
+            .shards
+            .load_leaf(&shard_path, Freshness::Latest)
+            .await
+            .unwrap();
         assert!(
             ctx.shards
-                .store_shard(COLL, shard_index(&ka), &shard, None)
+                .store_leaf(&shard_path, &shard, loaded.kind(), loaded.version.as_ref())
                 .await
                 .unwrap()
         );
@@ -731,6 +782,7 @@ mod tests {
                 key_path(&kb).into(),
                 Arc::from(&b"v2"[..]),
             )],
+            scans: Vec::new(),
         };
         let live2 = live.clone();
         let acquire = tokio::spawn(async move { locker.lock(&live2, &data, false).await });
@@ -764,6 +816,134 @@ mod tests {
         );
     }
 
+    // Seeds a two-node tree: an index root pointing at the reachable leaf `leaf`.
+    async fn seed_index_root(shards: &ShardStore, leaf: &str) {
+        shards
+            .store_node(COLL, leaf, &Node::leaf(Shard::new()), None)
+            .await
+            .unwrap();
+        let mut root = CollectionRoot::new();
+        root.set_node(Node::index(IndexNode::from_children([(
+            Vec::new(),
+            leaf.to_string(),
+        )])));
+        shards.create_root(COLL, &root).await.unwrap();
+    }
+
+    // Writes a standalone node object that nothing references — a split sibling a
+    // crash left dangling.
+    async fn seed_orphan(shards: &ShardStore, token: &str) {
+        shards
+            .store_node(COLL, token, &Node::leaf(Shard::new()), None)
+            .await
+            .unwrap();
+    }
+
+    async fn node_exists(shards: &ShardStore, token: &str) -> bool {
+        shards
+            .load_node(COLL, token, Freshness::Latest)
+            .await
+            .is_ok()
+    }
+
+    // A node object unreachable from the root is an orphan, but it is reclaimed
+    // only after it has been seen unreferenced in two consecutive sweeps — the
+    // generational safety horizon that stands in for the missing object mtime
+    // (ADR-031). The reachable leaf is never touched.
+    #[tokio::test(start_paused = true)]
+    async fn orphan_node_reclaimed_after_two_consecutive_sweeps() {
+        let ctx = new_ctx();
+        seed_index_root(&ctx.shards, "L").await;
+        seed_orphan(&ctx.shards, "ORPH").await;
+        ctx.shards.mark_split_active(COLL).await.unwrap();
+
+        // First sweep: the orphan is only seen once, so it is retained.
+        ctx.gc.run_once().await;
+        assert!(
+            node_exists(&ctx.shards, "ORPH").await,
+            "not reclaimed on first sighting"
+        );
+
+        // Second sweep: unreferenced twice running, so it is reclaimed.
+        ctx.gc.run_once().await;
+        assert!(
+            !node_exists(&ctx.shards, "ORPH").await,
+            "reclaimed after two consecutive sweeps"
+        );
+        assert!(
+            node_exists(&ctx.shards, "L").await,
+            "the reachable leaf is never reclaimed"
+        );
+    }
+
+    // A sibling that becomes reachable (its split completes) between two sweeps is
+    // retained: the generational rule only deletes what is unreferenced in *both*
+    // cycles, so an in-progress split is never mistaken for an orphan.
+    #[tokio::test(start_paused = true)]
+    async fn sibling_linked_before_second_sweep_is_kept() {
+        let ctx = new_ctx();
+        seed_index_root(&ctx.shards, "L").await;
+        seed_orphan(&ctx.shards, "R").await;
+        ctx.shards.mark_split_active(COLL).await.unwrap();
+
+        // First sweep observes R unreferenced.
+        ctx.gc.run_once().await;
+
+        // The split completes: the root now references R too.
+        let (mut root, ver) = ctx.shards.load_root(COLL).await.unwrap();
+        root.set_node(Node::index(IndexNode::from_children([
+            (Vec::new(), "L".to_string()),
+            (b"m".to_vec(), "R".to_string()),
+        ])));
+        assert!(ctx.shards.store_root(COLL, &root, &ver).await.unwrap());
+
+        // Second sweep sees R reachable, so it is kept despite the prior sighting.
+        ctx.gc.run_once().await;
+        assert!(
+            node_exists(&ctx.shards, "R").await,
+            "a newly linked sibling must not be reclaimed"
+        );
+    }
+
+    // ADR-031 crash/restart recovery: an orphan a split left behind must be
+    // reclaimed even by a fresh process that never observed the split. The split
+    // marks the collection active in the durable registry *before* creating any
+    // node, so a brand-new `Gc` — with an empty in-memory state and no
+    // `note_active` — rediscovers the collection from the registry and reclaims
+    // the orphan after the two generational sweeps. Two independent cache views
+    // over one backend model the crash and restart.
+    #[tokio::test(start_paused = true)]
+    async fn orphan_reclaimed_after_restart_via_durable_registry() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+
+        // Process 1: a split marked the collection active and created a sibling,
+        // then crashed before linking it.
+        let p1 = new_ctx_with(backend.clone());
+        seed_index_root(&p1.shards, "L").await;
+        seed_orphan(&p1.shards, "ORPH").await;
+        p1.shards.mark_split_active(COLL).await.unwrap();
+        drop(p1);
+
+        // Process 2: a fresh GC that never observed the split rediscovers the
+        // collection from the durable registry and reclaims the orphan after the
+        // two generational sweeps.
+        let p2 = new_ctx_with(backend);
+        p2.gc.run_once().await;
+        assert!(
+            node_exists(&p2.shards, "ORPH").await,
+            "retained on the first post-restart sighting"
+        );
+        p2.gc.run_once().await;
+        assert!(
+            !node_exists(&p2.shards, "ORPH").await,
+            "reclaimed after two consecutive sweeps in the fresh process"
+        );
+        assert!(
+            node_exists(&p2.shards, "L").await,
+            "the reachable leaf is never reclaimed"
+        );
+    }
+
     /// Counts the CAS stores (conditional write / create) issued against `path`.
     fn count_stores(log: &glassdb_backend::middleware::OpLog, path: &str) -> usize {
         log.lock()
@@ -773,27 +953,27 @@ mod tests {
             .count()
     }
 
-    /// A distinct key that hashes to the same shard as `base`, for exercising a
-    /// GC release and a live acquire contending one shard object.
+    /// A distinct key that shares the collection's single leaf `_i` with `base`
+    /// (ADR-031, split deferred), for exercising a GC release and a live acquire
+    /// contending one leaf object.
     fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
-        let idx = shard_index(base);
-        for i in 0u32.. {
-            let k = format!("sib-{i}").into_bytes();
-            if k != base && shard_index(&k) == idx {
-                return k;
-            }
-        }
-        unreachable!("a same-shard sibling must exist")
+        let sib = b"sibling".to_vec();
+        assert_ne!(sib, base, "sibling must differ from the base key");
+        sib
     }
 
-    /// Test backend that, while **armed**, parks the next read on a gate until
-    /// released — so a test can hold the dedup driver mid-load while a second
-    /// contender queues, forcing them into one merged CAS round. Every other call
-    /// passes through. Arming is deferred so un-gated setup runs first.
+    /// Test backend that, while **armed**, parks the dedup driver's coordination
+    /// leaf load on a gate until released — so a test can hold the driver
+    /// mid-load while a second contender queues, forcing them into one merged CAS
+    /// round. The first `skip` reads after arming pass through: descent reads the
+    /// collection root `_i` to route a key before the coordinator loads the leaf
+    /// (ADR-031), so the gate skips that routing read and parks the coordinator's
+    /// load instead. Arming is deferred so un-gated setup runs first.
     struct GateBackend {
         inner: Arc<dyn Backend>,
         gate: Arc<tokio::sync::Notify>,
         armed: std::sync::atomic::AtomicBool,
+        skip: std::sync::atomic::AtomicUsize,
     }
 
     impl GateBackend {
@@ -802,13 +982,32 @@ mod tests {
                 inner,
                 gate: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
+                skip: std::sync::atomic::AtomicUsize::new(0),
             })
         }
         fn arm(&self) {
+            // Skip the driver's descent (routing) read of `_i`, then gate its
+            // coordinator leaf load.
+            self.skip.store(1, std::sync::atomic::Ordering::SeqCst);
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn release(&self) {
             self.gate.notify_one();
+        }
+        async fn gate_if_armed(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if !self.armed.load(SeqCst) {
+                return;
+            }
+            if self
+                .skip
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return;
+            }
+            self.armed.store(false, SeqCst);
+            self.gate.notified().await;
         }
     }
 
@@ -818,9 +1017,7 @@ mod tests {
             &self,
             path: &str,
         ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
+            self.gate_if_armed().await;
             self.inner.read(path).await
         }
         async fn read_if_modified(
@@ -828,9 +1025,7 @@ mod tests {
             path: &str,
             expected: &glassdb_backend::Version,
         ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
+            self.gate_if_armed().await;
             self.inner.read_if_modified(path, expected).await
         }
         async fn write(

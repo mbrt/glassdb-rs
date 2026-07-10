@@ -8,15 +8,19 @@ mod monitor;
 mod reader;
 mod resolver;
 mod shard_coord;
+mod split;
 mod tlocker;
 
-pub use algo::{Algo, Data, Handle, ReadAccess, ReadVersion, WriteAccess};
+pub use algo::{
+    Algo, Data, Handle, LeafCoverage, ReadAccess, ReadVersion, ScanAccess, WriteAccess,
+};
 pub use error::TransError;
 pub use gc::Gc;
 pub use monitor::Monitor;
 pub use reader::{ReadValue, Reader};
-pub use resolver::Resolver;
-pub use shard_coord::ShardCoordinator;
+pub use resolver::{Resolver, ScanResult};
+pub use shard_coord::{ShardCoordinator, SplitHinter};
+pub use split::Splitter;
 pub use tlocker::{Locker, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface does not force callers to pull

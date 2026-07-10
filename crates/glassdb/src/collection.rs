@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_data::paths;
-use glassdb_data::shard::SHARD_COUNT;
 use glassdb_storage::CollectionRoot;
-use glassdb_trans::{Reader, Resolver};
+use glassdb_trans::Reader;
 
 use crate::db::DbInner;
 use crate::error::Error;
@@ -94,14 +93,9 @@ impl Collection {
         self.db.open_collection(p)
     }
 
-    /// Ensures the collection exists in the backend, creating it if necessary.
-    ///
-    /// Existence is the presence of the collection root object `_i`
-    /// ([`CollectionRoot`], ADR-018). The create is an idempotent create-if-absent:
-    /// a concurrent creator (another `create`, or the membership-lock auto-create
-    /// on the first key write) that won the race is treated as success.
+    /// Ensures the collection exists, creating it if necessary.
     pub async fn create(&self) -> Result<(), Error> {
-        let root = CollectionRoot::new(SHARD_COUNT);
+        let root = CollectionRoot::new();
         self.db
             .shards
             .create_root(&self.prefix, &root)
@@ -112,40 +106,21 @@ impl Collection {
 
     /// Returns an iterator over the keys in the collection.
     ///
-    /// Keys live in the collection's shard objects (the v2 key directory,
-    /// ADR-017), not in per-key objects. A single `list` of the shard prefix
-    /// enumerates the populated shards; each is read and its live (committed,
-    /// non-tombstoned) entries are unioned, help-forwarding committed holders so
-    /// a just-committed key lists before its (asynchronous) write-back publishes
-    /// the `current_writer` pointer. The result is sorted for a stable listing.
+    /// The listing scans the keys in order. The scan runs inside a read-only
+    /// serializable transaction and returns the keys in order.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
-        let shard_paths = self
+        let this = self.clone();
+        let keys = self
             .db
-            .backend
-            .list(&paths::shards_prefix(&self.prefix))
-            .await
-            .map_err(|e| Error::from_read(e.into()))?;
-        let mut indices = Vec::with_capacity(shard_paths.len());
-        for sp in shard_paths {
-            indices.push(
-                paths::shard_index_of(&sp)
-                    .map_err(|e| Error::with_source(format!("parsing shard path {sp:?}"), e))?,
-            );
-        }
-        let resolver = Resolver::new(self.db.shards.clone(), self.db.tmon.clone());
-        let mut keys = resolver
-            .live_keys(&self.prefix, &indices)
-            .await
-            .map_err(Error::from_read)?;
-        keys.sort();
+            .tx(move |tx| {
+                let this = this.clone();
+                async move { tx.keys(&this).await }
+            })
+            .await?;
         Ok(KeysIter::new(keys))
     }
 
     /// Returns an iterator over the sub-collections in this collection.
-    ///
-    /// A sub-collection nests its own objects under `{prefix}/_c/<name>/…`, so a
-    /// single delimited `list` of the `_c/` prefix yields exactly the immediate
-    /// sub-collection directory names.
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
         let cprefix = paths::collections_prefix(&self.prefix);
         let items = self

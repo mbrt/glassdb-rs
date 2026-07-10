@@ -6,8 +6,8 @@ full design narrative and motivation, see the companion blog post:
 Storage](https://blog.mbrt.dev/posts/transactional-object-storage) (written for
 the original Go version, but the design is identical). For the Rust-specific
 porting decisions — the concurrency model, time/determinism, error handling, and
-encoding fidelity — see [porting-go.md](porting-go.md). For usage, performance
-benchmarks, and examples, see the [README](../README.md).
+encoding fidelity — see [porting-go.md](archive/porting-go.md). For usage,
+performance benchmarks, and examples, see the [README](../README.md).
 
 ## Design Goals & Tradeoffs
 
@@ -82,8 +82,8 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend`     | `lib.rs`, `memory.rs`, `stats.rs`, `middleware/`                             | The `Backend` trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger, fault, recording)                          |
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
-| `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `monitor.rs`, `reader.rs`, `gc.rs`                  | Transaction engine: commit algorithm, distributed locker, lifecycle monitor, read path, log GC                                                |
-| `glassdb-storage`     | `object_cache.rs`, `value_cache.rs`, `shardstore.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Object cache (read/write-through, version-keyed), value cache (writer-keyed, staleness), shard/root CAS store, lock-state value type, transaction-log persistence, version tracking, generic LRU |
+| `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: commit algorithm, distributed locker, shard-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
+| `glassdb-storage`     | `object_cache.rs`, `value_cache.rs`, `shardstore.rs`, `shard.rs`, `root.rs`, `txobject.rs`, `entry.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Object cache (read/write-through, version-keyed), value cache (writer-keyed, staleness), shard/root CAS store, shard & collection-root codecs, unified transaction-object codec, per-key entry, lock-state value type, transaction-log persistence, version tracking, generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
@@ -93,7 +93,7 @@ implementation detail. Its public API surface is small: `Database`,
 `Transaction`, and `Collection`, plus the re-exported `Backend` trait and the
 in-memory backend and middleware. The deterministic-simulation runtime (the
 `rt`/`exec` seam in `glassdb-concurr`) is compiled only under `--cfg sim`; see
-[dst-approach.md](dst-approach.md).
+[testing-dst.md](guides/testing-dst.md).
 
 ## Component Responsibilities
 
@@ -106,11 +106,14 @@ tokens observed at read time, and staged writes — while the `Locker` decides
 objects and the parallel/serial CAS. (`Reader` is likewise shard-aware
 internally but exposes a path-based API.)
 
-> The v2 shard / content-CAS model shown here is authoritative. The *Single
-> read-modify-write* optimization described further below is **not yet
-> implemented** in v2 (its fast path is deferred; see
-> [algo-v2.md](algo-v2.md)) — every read-write transaction currently runs the
-> full locked commit path.
+Every shard/root entry mutation — lock acquire, single read-write commit-install,
+write-back, release, and GC reclamation — flows through **one shard-mutation
+coordinator** that loads the object once, folds the round's operations in
+wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
+ the
+  policy as *resolvers*; the coordinator is the shared mechanism and knows
+  nothing of locks or transaction ids. For the full design see
+  [designs/object-storage-native.md](designs/object-storage-native.md).
 
 ```
                          glassdb  (public API)
@@ -131,15 +134,23 @@ internally but exposes a path-based API.)
       │                    │  ▲ LockedTx (opaque) │               │
       ▼                    ▼  │                    ▼               ▼
  ┌─────────┐   ┌───────────────────────┐   ┌──────────┐   ┌─────────┐
- │ Reader  │   │ Locker — MECHANISM    │   │ Monitor  │   │   Gc    │
+ │ Reader  │   │ Locker — lock POLICY  │   │ Monitor  │   │   Gc    │
  │ effctv. │   │ owns the SHARD model: │   │ tx-log   │   │ tx-log  │
- │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ cleanup │
- │ snapshot│   │ · parallel/serial CAS │   │ wound /  │   │         │
- │ reads + │   │ · wound-wait holders  │   │ wait /   │   │         │
- │ validate│   │ · write-back, release │   │ refresh  │   │         │
+ │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ reverse │
+ │ snapshot│   │ · parallel/serial     │   │ wound /  │   │ liveness│
+ │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ release │
+ │ validate│   │ · installs resolvers  │   │ refresh  │   │ →Locker │
  └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
-      │                    │                    │              │
-      ▼                    ▼                    ▼              ▼
+      │                    │ acquire / write-back / release     │
+      │                    │ + Algo CommitInstall + Gc release  │
+      │                    ▼                                    │
+      │       ┌───────────────────────────────┐                │
+      │       │ ShardCoordinator — MECHANISM  │                │
+      │       │ one round/object: load once · │                │
+      │       │ fold (wound-wait order) · CAS │                │
+      │       │ once · reload-recover in-doubt│                │
+      │       └───────────────┬───────────────┘                │
+      ▼                       ▼            ▼ (tx logs)          ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
   ShardStore (_s shards · _i roots) · TLogger (_t logs)
   ObjectCache (read/write-through) · ValueCache (staleness LRU)
@@ -155,14 +166,25 @@ an opaque `LockedTx` it only passes back to `write_back`. Everything
 shard-shaped — `{prefix}/_s/<i>` objects, `ShardEntry`, `CollectionRoot`, the
 per-shard read-modify-write CAS — lives below the locker boundary.
 
+Beneath the locker boundary, one further split separates **policy from
+mechanism**: every shard/root entry mutation flows through a single
+`ShardCoordinator`, which owns the *mechanism* (one single-flight round per
+object: load once, fold the round's operations, CAS once, recover
+precondition/in-doubt by reload) while the callers supply *policy* as installed
+resolvers — `Locker` installs acquire / write-back / release, `Algo` installs the
+single read-write `CommitInstall`, and `Gc` reclaims through the `Locker`'s unlock
+methods (ADR-028/029). The coordinator is ignorant of locks, transaction ids, and
+wound-wait; the fold visits members oldest-first so it never has to backtrack.
+
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | closures, `Error`            | user body, retry loop, cancel-safety                                                                                  | locks, shards, tx logs              |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry) | **shards**, CAS details, caching    |
-| `Locker`              | lock **mechanism** | `Data`, `TxId`, shard objects | key→shard grouping, parallel & serial acquisition, wound-wait, write-back, release             | retry *policy*, **read validation** (reports `Conflict` only) |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall` | **shards**, CAS details, caching    |
+| `Locker`              | lock **policy** | `Data`, `TxId`, shard objects | key→shard grouping, parallel & serial acquisition strategy, hold-and-wait, installs acquire / write-back / release resolvers | retry *policy*, **read validation** (reports `Conflict` only) |
+| `ShardCoordinator`    | shard/root **mechanism** | object path, resolvers | one round per object: single-flight, load-once, monotonic fold, single CAS, reload-recover, vestigial-entry pruning | locks, `TxId`, wound-wait, commit |
 | `Reader`              | read mechanism   | paths                        | effective-writer resolution, snapshot reads                                                                           | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
-| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged `_t/` walk, update shards                           | commit policy                       |
+| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged `_t/` walk, reclaims via the `Locker`'s coordinator-backed unlock            | commit policy                       |
 
 ### The lock boundary
 
@@ -363,10 +385,10 @@ phase writes the new values back to keys, releases locks, and schedules the
 transaction log for garbage collection.
 
 Because `Database::tx` takes the body by value (`|tx| async move { ... }`) and
-the framework owns the retry loop, a conflict simply reruns the closure. Dropping
-the transaction future at any point is equivalent to a crash: the commit protocol
-recovers any in-flight state (see [porting-go.md](porting-go.md), "Cancel-safety
-contract").
+the framework owns the retry loop, a conflict simply reruns the closure.
+Dropping the transaction future at any point is equivalent to a crash: the
+commit protocol recovers any in-flight state (see
+[porting-go.md](archive/porting-go.md), "Cancel-safety contract").
 
 ### Optimistic Concurrency Control
 
@@ -415,7 +437,8 @@ maps to it, and conditionally rewrite the shard with `write_if` (the
 version/ETag as the precondition). If the version changed (another transaction
 mutated the shard), the operation retries. Keys are grouped by shard so many
 keys collapse into a single GET + CAS (ADR-017/020), and contending transactions
-on the same shard are deduplicated into one owner-driven CAS (ADR-025/026).
+on the same shard batch through the shard-mutation coordinator into one
+owner-driven CAS (ADR-025/026/028) rather than racing separate ones.
 
 **Compatibility rules** (`LockType`: `None`, `Read`, `Write`, `Create`):
 
@@ -513,25 +536,36 @@ one value read plus one metadata read per key, with zero writes.
 
 #### Single read-modify-write
 
-Transactions that read and write exactly one key use a native CAS shortcut:
+A transaction that overwrites exactly one existing key commits with two
+**parallel** writes instead of the full sequence (ADR-027):
 
-1. Read the key's contents and metadata.
-2. If the key is locked, fall back to the full protocol.
-3. Otherwise, do a conditional write (`write_if`) with the version as a
-   precondition.
+1. Load the shard and resolve the key's holders. A committed-but-not-written-back
+   holder is help-forwarded to its effective writer; a *live pending* holder, a
+   create/delete, a missing key, or a read whose version has moved makes the
+   transaction ineligible — nothing has been written yet, so it falls back to the
+   full locked path under the same id.
+2. Issue in parallel: the committed transaction object (`_t/<txid>`, recording
+   its held lock so GC can prune it) **and** one shard CAS that installs a write
+   lock and help-forwards the resolved predecessor into `current_writer`.
+3. Asynchronously, write-back converts the lock into `current_writer = txid` and
+   releases it (through the same deduplicated coordinator path).
 
-This avoids the lock-verify-log-writeback cycle entirely for the common case
-of updating a single key. (The change-detection fix that keeps this path
-lost-update-safe is documented in
+The transaction is committed iff both writes land (the committed object exists
+and the lock is in the shard's chain). Because it holds a lock during the short
+pre-commit window it is a full wound-wait participant — an older concurrent
+writer may wound it, and it renews (priority preserved) and re-runs. The install
+CAS routes through the shard-mutation coordinator as a `CommitInstall` resolver
+(ADR-028), and the shard it already cached during the read is reused for the
+first fold attempt via the `AllowStale` freshness flag (ADR-030), so a
+steady-state single read-write commits with its shard loaded only once. (The
+change-detection reasoning that keeps this path lost-update-safe is in
 [ADR-007](adr/007-single-rw-cache-lost-update.md).)
 
-If the conditional write's outcome is in doubt (`Unavailable` — it may or may
-not have landed), the fast path re-issues the *same* write unchanged. The write
-is idempotent under its own precondition, so the retry lands only if the object
-is still untouched (recovering an in-doubt write that never landed) and is
-rejected by the precondition otherwise. Only an irreducible in-doubt — a
-precondition seen after a re-issue, where our earlier attempt may have committed
-— surfaces to the caller as `Error::InDoubt`. See
+One irreducible in-doubt remains: if the install CAS returns `Unavailable` and
+the shard has moved past the transaction by the time it reads back, whether the
+lock landed (committed, help-forwarded into the chain) or never landed (an
+orphan the transaction renews away from) is unknowable, so it surfaces as
+`Error::InDoubt` rather than risk a double-apply. See
 [ADR-009](adr/009-in-doubt-conditional-writes.md).
 
 #### Retry with locks held
@@ -636,9 +670,9 @@ for user values, with staleness awareness. A value lives in the transaction
 object of whichever transaction last committed it, so it is identified by that
 **writer**, not a backend object version. Each entry tracks when it was last
 updated and whether it has been marked outdated (e.g., because a concurrent
-transaction invalidated it). Relative staleness uses `tokio::time::Instant` so it
-stays deterministic under paused time (see [porting-go.md](porting-go.md), "Time and
-determinism").
+transaction invalidated it). Relative staleness uses `tokio::time::Instant` so
+it stays deterministic under paused time (see
+[porting-go.md](archive/porting-go.md), "Time and determinism").
 
 **ObjectCache** (`glassdb-storage/src/object_cache.rs`). The backend-version-keyed,
 read-through / write-through facade for coordination objects (shards, roots,
@@ -733,6 +767,11 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   race a lock a live transaction has taken but not yet published (ADR-024's lazy
   object materialization). A dead *pending* object is first force-aborted
   (`pending → aborted` CAS) so its death is durable before any lock moves.
+- **Reclamation through the coordinator.** GC releases a dead transaction's locks
+  not with its own CAS but by calling the `Locker`'s per-object unlock methods,
+  so the release batches through the same shard-mutation coordinator as live
+  traffic (ADR-029); the entry left behind is pruned as a fold property when it
+  becomes vestigial (no holder, no `current-writer`).
 - **Background execution.** Sweeps run every `GC_INTERVAL` on the `Background`
   task manager and do not block transaction processing. Background loops are torn
   down via `Drop` when the last `Database` clone is dropped.

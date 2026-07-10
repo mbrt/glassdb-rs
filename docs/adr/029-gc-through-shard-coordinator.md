@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted (implemented).
 
 Closes the one exception carved out by
 [ADR-028](028-shard-mutation-coordinator.md) (the shard-mutation coordinator

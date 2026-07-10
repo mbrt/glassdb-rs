@@ -1,11 +1,11 @@
-//! Compare-and-swap I/O for the v2 coordination objects (ADR-017/018).
+//! Compare-and-swap I/O for the v2 coordination objects (ADR-031).
 //!
-//! Shards (`{prefix}/_s/<i>`) and collection roots (`{prefix}/_i`) are the v2
-//! coordination units. Each store is an unconditional create-if-absent or a
-//! version-conditional compare-and-swap — the only coordination primitive v2
-//! needs (ADR-023).
+//! B-link nodes (`{prefix}/_n/<token>`) and collection roots (`{prefix}/_i`)
+//! are the coordination units. Each store is an unconditional create-if-absent
+//! or a version-conditional compare-and-swap — the only coordination primitive
+//! v2 needs (ADR-023).
 //!
-//! Reads and writes go through the [`ObjectCache`], so a hot shard/root
+//! Reads and writes go through the [`ObjectCache`], so a hot node/root
 //! revalidates with a version-conditional `read_if_modified` and serves its
 //! cached body without a re-transfer. The backend version changes on every
 //! content write — exactly when a cached copy must be invalidated — so this is
@@ -15,27 +15,67 @@ use std::sync::Arc;
 
 use glassdb_backend as backend;
 use glassdb_data::paths;
-use glassdb_data::shard::{ShardKeys, group_by_owning_shard, shard_index};
 
 use crate::error::StorageError;
+use crate::node::Node;
 use crate::object_cache::{Freshness, ObjectCache};
 use crate::root::CollectionRoot;
-use crate::shard::{Shard, ShardEntry};
+use crate::shard::Shard;
 
-/// Reads and compare-and-swaps shard and collection-root objects through the
-/// [`ObjectCache`], the v2 coordination substrate.
+/// Reads and compare-and-swaps B-link node and collection-root objects through
+/// the [`ObjectCache`], the v2 coordination substrate.
 #[derive(Clone)]
 pub struct ShardStore {
     objects: ObjectCache,
 }
 
-/// One shard returned by [`ShardStore::load_by_keys`]: the loaded `shard` and
-/// its `version`, together with the raw `keys` (and their payloads) routed to
-/// it. Callers look each key up in the single loaded `shard`.
-pub struct LoadedShard<T> {
-    pub shard: Shard,
+/// A B-link leaf loaded for one coordination round (ADR-031): its per-key
+/// `entries`, the backing object's `version` (`None` if the object does not
+/// exist yet), and the private [`LeafKind`] context needed to write the entries
+/// back into the right object kind. The leaf is the CAS unit for its keys; it
+/// lives either in the collection root `_i` (a small collection's single leaf)
+/// or in a standalone node `_n`.
+pub struct LoadedLeaf {
+    pub entries: Shard,
     pub version: Option<backend::Version>,
-    pub keys: ShardKeys<T>,
+    kind: LeafKind,
+}
+
+impl LoadedLeaf {
+    /// The reconstruction context handed back to [`ShardStore::store_leaf`].
+    pub fn kind(&self) -> &LeafKind {
+        &self.kind
+    }
+
+    /// Reports whether this loaded leaf still owns `key` — i.e. `key` is below
+    /// its high-key. A `false` result means a split moved `key` to a right
+    /// sibling after the key was routed here, so a caller must re-descend rather
+    /// than mutate this (now wrong) leaf (ADR-031). The collection root leaf
+    /// `_i` spans the whole key space until it splits into an index, so it
+    /// always owns `key`.
+    pub fn owns(&self, key: &[u8]) -> bool {
+        match &self.kind {
+            LeafKind::Root(_) => true,
+            LeafKind::Node { high_key, .. } => high_key.as_deref().is_none_or(|hk| key < hk),
+        }
+    }
+}
+
+/// How a leaf's entries are written back to storage, preserving everything the
+/// entries do not own: the collection metadata when the leaf is the root `_i`,
+/// or the high-key/right-sibling when it is a standalone node `_n`. Opaque:
+/// produced by [`ShardStore::load_leaf`] and consumed by
+/// [`ShardStore::store_leaf`].
+pub enum LeafKind {
+    /// The leaf is the root node carried in the collection root `_i`; the stored
+    /// [`CollectionRoot`] is preserved (subcollections + membership) with only
+    /// its node replaced.
+    Root(CollectionRoot),
+    /// The leaf is a standalone node `_n`; its bounds are preserved.
+    Node {
+        high_key: Option<Vec<u8>>,
+        right_sibling: Option<String>,
+    },
 }
 
 impl ShardStore {
@@ -44,96 +84,207 @@ impl ShardStore {
         ShardStore { objects }
     }
 
-    /// Loads shard `idx` under `prefix`. Returns the empty shard with no version
-    /// when it does not exist yet (shards are created lazily on first lock).
-    /// `freshness` chooses whether a cached copy is revalidated
-    /// ([`Freshness::Latest`]) or served as-is ([`Freshness::AllowStale`], for a
-    /// caller that only needs a CAS seed, ADR-030).
-    pub async fn load_shard(
+    /// Loads the B-link root node from the collection root `_i` under `prefix`,
+    /// or `None` if the collection does not exist yet (ADR-031). The root object
+    /// carries both the node and the collection metadata; this returns just the
+    /// node (a leaf while small, an index once grown) with the root's version.
+    pub async fn load_root_node(
         &self,
         prefix: &str,
-        idx: u32,
         freshness: Freshness,
-    ) -> Result<(Shard, Option<backend::Version>), StorageError> {
+    ) -> Result<Option<(Node, backend::Version)>, StorageError> {
         match self
             .objects
-            .read(&paths::from_shard(prefix, idx), freshness)
+            .read(&paths::collection_info(prefix), freshness)
             .await
         {
-            Ok(r) => Ok((Shard::decode(&r.value)?, Some(r.version))),
-            Err(StorageError::NotFound) => Ok((Shard::new(), None)),
+            Ok(r) => Ok(Some((
+                CollectionRoot::decode(&r.value)?.node().clone(),
+                r.version,
+            ))),
+            Err(StorageError::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Loads several shards concurrently, one `(Shard, version)` per target in
-    /// the given order (a missing shard yields the empty shard with no version,
-    /// as [`load_shard`] does). Callers pass distinct `(prefix, idx)` targets so
-    /// each shard is fetched once; the batched effective-writer resolution
-    /// groups a transaction's read set by shard before calling this.
-    ///
-    /// [`load_shard`]: Self::load_shard
-    pub async fn load_shards(
-        &self,
-        targets: &[(String, u32)],
-    ) -> Result<Vec<(Shard, Option<backend::Version>)>, StorageError> {
-        let loads = targets
-            .iter()
-            .map(|(prefix, idx)| self.load_shard(prefix, *idx, Freshness::Latest));
-        futures::future::join_all(loads).await.into_iter().collect()
-    }
-
-    /// Routes `(key_path, payload)` items to their owning shards and loads those
-    /// shards once each (concurrently), returning one entry per touched shard —
-    /// its loaded `(Shard, version)` together with the raw keys and payloads that
-    /// landed in it, in deterministic shard order.
-    pub async fn load_by_keys<P: AsRef<str>, T>(
-        &self,
-        items: impl IntoIterator<Item = (P, T)>,
-    ) -> Result<Vec<LoadedShard<T>>, StorageError> {
-        let groups = group_by_owning_shard(items)
-            .map_err(|e| StorageError::with_source("grouping keys by shard", e))?;
-        let targets: Vec<(String, u32)> = groups.keys().cloned().collect();
-        let shards = self.load_shards(&targets).await?;
-        Ok(shards
-            .into_iter()
-            .zip(groups.into_values())
-            .map(|((shard, version), keys)| LoadedShard {
-                shard,
-                version,
-                keys,
-            })
-            .collect())
-    }
-
-    /// Loads the coordination entry for `key_path`, or `None` if the key has no
-    /// entry yet. The singular counterpart to [`load_by_keys`]: it routes the one
-    /// key to its owning shard and looks it up, so the caller never computes a
-    /// shard index.
-    pub async fn load_entry(&self, key_path: &str) -> Result<Option<ShardEntry>, StorageError> {
-        let (prefix, raw_key) = paths::split_key(key_path)
-            .map_err(|e| StorageError::with_source("parsing key path", e))?;
-        let (shard, _) = self
-            .load_shard(&prefix, shard_index(&raw_key), Freshness::Latest)
-            .await?;
-        Ok(shard.lookup(&raw_key).cloned())
-    }
-
-    /// Compare-and-swaps shard `idx`. `expected = None` means create-if-absent.
-    /// Returns `false` on a precondition miss (the caller reloads and retries),
-    /// `true` on success.
-    pub async fn store_shard(
+    /// Loads the non-root node named `token` (`{prefix}/_n/<token>`, ADR-031). A
+    /// [`StorageError::NotFound`] means the node is missing — a dangling child or
+    /// right-sibling reference, which a descent surfaces rather than silently
+    /// skips.
+    pub async fn load_node(
         &self,
         prefix: &str,
-        idx: u32,
-        shard: &Shard,
+        token: &str,
+        freshness: Freshness,
+    ) -> Result<(Node, backend::Version), StorageError> {
+        let r = self
+            .objects
+            .read(&paths::from_node(prefix, token), freshness)
+            .await?;
+        Ok((Node::decode(&r.value)?, r.version))
+    }
+
+    /// Compare-and-swaps the non-root node named `token`. `expected = None` means
+    /// create-if-absent (a freshly split-out sibling). Returns `false` on a
+    /// precondition miss, `true` on success.
+    pub async fn store_node(
+        &self,
+        prefix: &str,
+        token: &str,
+        node: &Node,
         expected: Option<&backend::Version>,
     ) -> Result<bool, StorageError> {
-        let path = paths::from_shard(prefix, idx);
-        let body: Arc<[u8]> = Arc::from(shard.encode());
+        let path = paths::from_node(prefix, token);
+        let body: Arc<[u8]> = Arc::from(node.encode());
         let res = match expected {
             Some(v) => self.objects.write_if(&path, body, v).await,
             None => self.objects.write_if_not_exists(&path, body).await,
+        };
+        match res {
+            Ok(_) => Ok(true),
+            Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Lists the tokens of every standalone node `_n` object under `prefix`
+    /// (ADR-031). The orphan sweep compares this against the set reachable from
+    /// the root to find split siblings a crash left dangling.
+    pub async fn list_node_tokens(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let paths = self.objects.list(&paths::nodes_prefix(prefix)).await?;
+        Ok(paths
+            .iter()
+            .filter_map(|p| paths::node_token_of(p).ok())
+            .collect())
+    }
+
+    /// Deletes the standalone node `_n/<token>`, ignoring a missing object. Used
+    /// by the orphan sweep to reclaim an unreferenced split sibling (ADR-031).
+    pub async fn delete_node(&self, prefix: &str, token: &str) -> Result<(), StorageError> {
+        match self.objects.delete(&paths::from_node(prefix, token)).await {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Durably records that the collection at `prefix` has split activity, so
+    /// the GC orphan sweep enumerates it even after a process restart (ADR-031).
+    /// Idempotent: an existing marker is left as is.
+    pub async fn mark_split_active(&self, prefix: &str) -> Result<(), StorageError> {
+        let marker = paths::split_active_marker(prefix);
+        match self
+            .objects
+            .write_if_not_exists(&marker, Arc::from(&[][..]))
+            .await
+        {
+            Ok(_) | Err(StorageError::Precondition) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Lists the collection prefixes recorded in the database's split-active
+    /// registry (ADR-031). `db_root` is the database name (the leading segment
+    /// of any collection prefix).
+    pub async fn list_split_active(&self, db_root: &str) -> Result<Vec<String>, StorageError> {
+        let paths = self.objects.list(&paths::split_active_dir(db_root)).await?;
+        Ok(paths
+            .iter()
+            .filter_map(|p| paths::split_active_prefix_of(p).ok())
+            .collect())
+    }
+
+    /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
+    /// `path` is a collection root `_i`, else a standalone node `_n`. Returns the
+    /// empty leaf with no version when the object does not exist yet (the root
+    /// leaf is created lazily on the first key write). Errors if the object
+    /// exists but its node is an index rather than a leaf — key coordination is
+    /// always routed to a leaf by descent.
+    pub async fn load_leaf(
+        &self,
+        path: &str,
+        freshness: Freshness,
+    ) -> Result<LoadedLeaf, StorageError> {
+        if paths::is_collection_info(path) {
+            match self.objects.read(path, freshness).await {
+                Ok(r) => {
+                    let root = CollectionRoot::decode(&r.value)?;
+                    let entries =
+                        root.node().as_leaf().cloned().ok_or_else(|| {
+                            StorageError::other("collection root node is not a leaf")
+                        })?;
+                    Ok(LoadedLeaf {
+                        entries,
+                        version: Some(r.version),
+                        kind: LeafKind::Root(root),
+                    })
+                }
+                Err(StorageError::NotFound) => Ok(LoadedLeaf {
+                    entries: Shard::new(),
+                    version: None,
+                    kind: LeafKind::Root(CollectionRoot::new()),
+                }),
+                Err(e) => Err(e),
+            }
+        } else {
+            match self.objects.read(path, freshness).await {
+                Ok(r) => {
+                    let node = Node::decode(&r.value)?;
+                    let entries = node
+                        .as_leaf()
+                        .cloned()
+                        .ok_or_else(|| StorageError::other("node is not a leaf"))?;
+                    Ok(LoadedLeaf {
+                        entries,
+                        version: Some(r.version),
+                        kind: LeafKind::Node {
+                            high_key: node.high_key().map(<[u8]>::to_vec),
+                            right_sibling: node.right_sibling().map(str::to_string),
+                        },
+                    })
+                }
+                Err(StorageError::NotFound) => Ok(LoadedLeaf {
+                    entries: Shard::new(),
+                    version: None,
+                    kind: LeafKind::Node {
+                        high_key: None,
+                        right_sibling: None,
+                    },
+                }),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Compare-and-swaps the leaf at object `path`, writing `entries` back into
+    /// the object kind captured by `kind` (root metadata or node bounds are
+    /// preserved). `expected = None` means create-if-absent. Returns `false` on
+    /// a precondition miss (reload and retry), `true` on success.
+    pub async fn store_leaf(
+        &self,
+        path: &str,
+        entries: &Shard,
+        kind: &LeafKind,
+        expected: Option<&backend::Version>,
+    ) -> Result<bool, StorageError> {
+        let body: Arc<[u8]> = match kind {
+            LeafKind::Root(root) => {
+                let mut root = root.clone();
+                root.set_node(Node::leaf(entries.clone()));
+                Arc::from(root.encode())
+            }
+            LeafKind::Node {
+                high_key,
+                right_sibling,
+            } => {
+                let mut node = Node::leaf(entries.clone());
+                node.set_high_key(high_key.clone());
+                node.set_right_sibling(right_sibling.clone());
+                Arc::from(node.encode())
+            }
+        };
+        let res = match expected {
+            Some(v) => self.objects.write_if(path, body, v).await,
+            None => self.objects.write_if_not_exists(path, body).await,
         };
         match res {
             Ok(_) => Ok(true),
@@ -204,12 +355,8 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_data::TxId;
-    use glassdb_data::shard::shard_index;
 
     use crate::entry::SharedCache;
-    use crate::lock::LockType;
-    use crate::shard::ShardEntry;
 
     const COLL: &str = "coll";
 
@@ -221,7 +368,23 @@ mod tests {
         log.lock().unwrap().iter().filter(|r| r.op == op).count()
     }
 
-    // A shard object exists in the backend. A cold cache full-fetches it on the
+    // Seeds an empty node leaf at `path` through a separate store so a later
+    // reader starts with a cold cache. Creates it with a bare `write_if_not_exists`
+    // (no seeding read) so the shared op log reflects only the reader's traffic.
+    async fn seed_empty_leaf(backend: &Arc<dyn Backend>, path: &str) {
+        let kind = LeafKind::Node {
+            high_key: None,
+            right_sibling: None,
+        };
+        assert!(
+            store_over(backend.clone())
+                .store_leaf(path, &Shard::new(), &kind, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    // A node object exists in the backend. A cold cache full-fetches it on the
     // first load; a subsequent hot load revalidates with `read_if_modified`
     // instead of re-fetching, and returns the same version (ADR-023).
     #[tokio::test]
@@ -229,66 +392,51 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let idx = shard_index(b"k");
-
-        // Seed the shard through a separate cache so the reader below starts cold.
-        assert!(
-            store_over(backend.clone())
-                .store_shard(COLL, idx, &Shard::new(), None)
-                .await
-                .unwrap()
-        );
+        let path = paths::from_node(COLL, "tok");
+        seed_empty_leaf(&backend, &path).await;
 
         let reader = store_over(backend.clone());
-        let (_, v1) = reader
-            .load_shard(COLL, idx, Freshness::Latest)
+        let v1 = reader
+            .load_leaf(&path, Freshness::Latest)
             .await
-            .unwrap();
+            .unwrap()
+            .version;
         assert_eq!(count(&log, "read"), 1, "cold load full-reads");
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        let (_, v2) = reader
-            .load_shard(COLL, idx, Freshness::Latest)
+        let v2 = reader
+            .load_leaf(&path, Freshness::Latest)
             .await
-            .unwrap();
+            .unwrap()
+            .version;
         assert_eq!(count(&log, "read"), 1, "hot load must not full-read");
         assert_eq!(
             count(&log, "read_if_modified"),
             1,
             "hot load revalidates conditionally"
         );
-        assert_eq!(v1, v2, "unchanged shard keeps its version");
+        assert_eq!(v1, v2, "unchanged node keeps its version");
     }
 
-    // A cached shard loaded with `AllowStale` is served without any backend op
-    // (neither a full read nor a revalidation), while an uncached shard still
+    // A cached node loaded with `AllowStale` is served without any backend op
+    // (neither a full read nor a revalidation), while an uncached node still
     // does one full read (ADR-030).
     #[tokio::test]
     async fn allow_stale_serves_cached_without_backend_op() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let idx = shard_index(b"k");
-
-        // Seed the shard through a separate cache so the reader starts cold.
-        assert!(
-            store_over(backend.clone())
-                .store_shard(COLL, idx, &Shard::new(), None)
-                .await
-                .unwrap()
-        );
+        let path = paths::from_node(COLL, "tok");
+        seed_empty_leaf(&backend, &path).await;
 
         let reader = store_over(backend.clone());
         // Warm the cache with one cold full read.
-        reader
-            .load_shard(COLL, idx, Freshness::Latest)
-            .await
-            .unwrap();
+        reader.load_leaf(&path, Freshness::Latest).await.unwrap();
         assert_eq!(count(&log, "read"), 1);
 
         // A cached AllowStale load touches the backend for nothing.
         reader
-            .load_shard(COLL, idx, Freshness::AllowStale)
+            .load_leaf(&path, Freshness::AllowStale)
             .await
             .unwrap();
         assert_eq!(count(&log, "read"), 1, "cached AllowStale must not read");
@@ -298,109 +446,13 @@ mod tests {
             "cached AllowStale must not revalidate"
         );
 
-        // An uncached shard has nothing to serve, so it falls through to a read.
+        // An uncached node has nothing to serve, so it falls through to a read.
+        let other = paths::from_node(COLL, "tok2");
         reader
-            .load_shard(COLL, idx.wrapping_add(1), Freshness::AllowStale)
+            .load_leaf(&other, Freshness::AllowStale)
             .await
             .unwrap();
         assert_eq!(count(&log, "read"), 2, "uncached AllowStale falls through");
-    }
-
-    // A batch load returns one result per target, in order: an existing shard
-    // with its version and a missing shard as the empty shard with no version.
-    // Each distinct target is fetched exactly once (one backend read apiece).
-    #[tokio::test]
-    async fn load_shards_returns_aligned_results() {
-        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let log = recorder.log();
-        let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let present = shard_index(b"present");
-        let absent = shard_index(b"absent");
-        assert_ne!(present, absent, "test keys must map to distinct shards");
-
-        // Seed only the `present` shard through a separate cache so the reader
-        // below starts cold and full-reads it.
-        assert!(
-            store_over(backend.clone())
-                .store_shard(COLL, present, &Shard::new(), None)
-                .await
-                .unwrap()
-        );
-
-        let reader = store_over(backend.clone());
-        let out = reader
-            .load_shards(&[(COLL.to_string(), present), (COLL.to_string(), absent)])
-            .await
-            .unwrap();
-
-        assert_eq!(out.len(), 2, "one result per target, in order");
-        assert!(out[0].1.is_some(), "the seeded shard carries a version");
-        assert!(
-            out[1].1.is_none() && out[1].0.is_empty(),
-            "a missing shard is the empty shard with no version"
-        );
-        // Each distinct shard was fetched exactly once.
-        assert_eq!(count(&log, "read"), 2);
-    }
-
-    // load_by_keys routes each key to its owning shard, loads it once, and
-    // returns the raw keys and payloads that landed there alongside the loaded
-    // copy — so a caller looks each key up in the single fetched shard.
-    #[tokio::test]
-    async fn load_by_keys_routes_and_aligns_payloads() {
-        let store = store_over(Arc::new(MemoryBackend::new()));
-        let present = b"present".to_vec();
-        let absent = b"absent".to_vec();
-        assert_ne!(
-            shard_index(&present),
-            shard_index(&absent),
-            "test keys must map to distinct shards"
-        );
-
-        let tid = TxId::from_bytes(vec![1, 2, 3]);
-        let entry = ShardEntry {
-            key: present.clone(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: Some(tid),
-            deleted: false,
-        };
-        store
-            .store_shard(
-                COLL,
-                shard_index(&present),
-                &Shard::from_entries([entry]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let out = store
-            .load_by_keys([
-                (paths::from_key(COLL, &present), "P"),
-                (paths::from_key(COLL, &absent), "A"),
-            ])
-            .await
-            .unwrap();
-
-        assert_eq!(out.len(), 2, "one entry per distinct owning shard");
-
-        let present_group = out.iter().find(|g| g.keys[0].1 == "P").unwrap();
-        assert_eq!(present_group.keys, vec![(present.clone(), "P")]);
-        assert!(
-            present_group.shard.lookup(&present).is_some(),
-            "the seeded entry is visible in its loaded shard"
-        );
-        assert!(
-            present_group.version.is_some(),
-            "seeded shard carries a version"
-        );
-
-        let absent_group = out.iter().find(|g| g.keys[0].1 == "A").unwrap();
-        assert!(
-            absent_group.shard.is_empty() && absent_group.version.is_none(),
-            "a missing shard is the empty shard with no version"
-        );
     }
 
     // A write-through store updates the cache, so a load after a CAS observes the
@@ -408,32 +460,31 @@ mod tests {
     #[tokio::test]
     async fn store_is_visible_to_next_load() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let idx = shard_index(b"k");
+        let path = paths::from_node(COLL, "tok");
 
+        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
         assert!(
             store
-                .store_shard(COLL, idx, &Shard::new(), None)
+                .store_leaf(&path, &Shard::new(), loaded.kind(), None)
                 .await
                 .unwrap()
         );
-        let (_, v1) = store
-            .load_shard(COLL, idx, Freshness::Latest)
-            .await
-            .unwrap();
-        let v1 = v1.expect("shard exists after create");
+        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let v1 = loaded.version.clone().expect("node exists after create");
 
         // CAS a new generation over the loaded version, then confirm the next
         // load reflects it.
         assert!(
             store
-                .store_shard(COLL, idx, &Shard::new(), Some(&v1))
+                .store_leaf(&path, &Shard::new(), loaded.kind(), Some(&v1))
                 .await
                 .unwrap()
         );
-        let (_, v2) = store
-            .load_shard(COLL, idx, Freshness::Latest)
+        let v2 = store
+            .load_leaf(&path, Freshness::Latest)
             .await
-            .unwrap();
+            .unwrap()
+            .version;
         assert_ne!(Some(v1), v2, "a CAS store advances the version");
     }
 }

@@ -72,6 +72,40 @@ message ShardEntry {
     bool deleted = 5;
 }
 
+// A B-link tree node: the unit of the dynamic, range-partitioned coordination
+// directory (ADR-031). It is either a leaf (the per-key coordination entries of
+// ADR-017 for a contiguous key range) or an index (separator keys mapping
+// ranges to child nodes). The high-key and right-sibling make tree descent
+// self-correcting across concurrent splits.
+message Node {
+    // Exclusive upper bound of the key range this node owns. Empty means
+    // +infinity: the rightmost node at its level.
+    bytes high_key = 1;
+    // Identity token of the right-sibling node at the same level. Empty means
+    // none: the rightmost node at its level.
+    string right_sibling = 2;
+    oneof body {
+        // A leaf node: the per-key coordination entries for its range.
+        Shard leaf = 3;
+        // An index node: separator keys mapping ranges to child nodes.
+        IndexNode index = 4;
+    }
+}
+
+// An index node body: an ordered list of separator entries. The child owning a
+// key is the last entry whose separator_key is <= the key.
+message IndexNode {
+    repeated IndexEntry entries = 1;
+}
+
+message IndexEntry {
+    // Inclusive lower bound of the child's key range; sorted so the encoding is
+    // canonical.
+    bytes separator_key = 1;
+    // Identity token of the child node.
+    string child = 2;
+}
+
 // Database-level metadata, written once at `{name}/glassdb` when a database is
 // first opened. Its presence marks the database as initialized; `version` gates
 // on-disk format compatibility. A message (not a bare string) so new metadata
@@ -81,19 +115,16 @@ message DatabaseMetadata {
     string version = 1;
 }
 
-// The collection root object: collection existence, the (constant) shard count,
-// the subcollection directory, and the membership lock that serializes
-// create/delete against listing. See ADR-018.
+// The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
+// root node - a leaf while the collection is small, an index once it grows - and
+// also carries the collection metadata: the subcollection directory. Membership
+// (create/delete) is coordinated per-key in the owning leaf, so the root holds
+// no membership lock. Supersedes ADR-018's fixed-shard_count root.
 message CollectionRoot {
-    // The shard count C this collection was created with. Part of the on-disk
-    // format; validated against the compile-time SHARD_COUNT on open.
-    uint32 shard_count = 1;
+    // The B-link tree root node. Its high-key is +infinity and its right-sibling
+    // is empty (the root has no siblings).
+    Node node = 1;
     // Child collection names (raw bytes), the subcollection directory; sorted so
     // the encoding is canonical.
     repeated bytes subcollections = 2;
-    // Membership lock serializing create/delete (write) against listing (read).
-    Lock.LockType membership_lock = 3;
-    // Transactions holding the membership lock (more than one only for read
-    // locks); sorted so the encoding is canonical.
-    repeated bytes membership_locked_by = 4;
 }

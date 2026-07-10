@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use glassdb_concurr::RetryConfig;
 use glassdb_data::paths;
 use glassdb_storage::{MAX_STALENESS, ShardStore, StorageError, ValueCache};
-use glassdb_trans::{Data, ReadAccess, ReadVersion, Reader, WriteAccess};
+use glassdb_trans::{
+    Data, LeafCoverage, ReadAccess, ReadVersion, Reader, Resolver, ScanAccess, WriteAccess,
+};
 
 use crate::collection::Collection;
 use crate::error::Error;
@@ -32,6 +34,7 @@ use crate::error::Error;
 /// released promptly instead of waiting for lease expiry.
 pub struct Transaction {
     reader: Reader,
+    resolver: Resolver,
     inner: Arc<Mutex<TransactionInner>>,
 }
 
@@ -39,6 +42,7 @@ pub struct Transaction {
 struct TransactionInner {
     staged: HashMap<String, StagedValue>,
     reads: HashMap<String, ReadState>,
+    scans: Vec<ScanAccess>,
     aborted: bool,
 }
 
@@ -101,6 +105,28 @@ impl Transaction {
         Ok(())
     }
 
+    /// Lists the live keys of collection `c` in key order. Repeatable and
+    /// strongly consistent.
+    ///
+    /// Intended for a read-only listing transaction (the [`Collection::keys`]
+    /// entry point). The scan reflects the committed state, not this
+    /// transaction's own staged writes.
+    pub(crate) async fn keys(&self, c: &Collection) -> Result<Vec<Vec<u8>>, Error> {
+        // TODO: Merge staged writes into the scan result so a listing
+        //       transaction sees its own writes.
+        let scan = self
+            .resolver
+            .live_keys_scan(c.prefix())
+            .await
+            .map_err(Error::from_read)?;
+        let covered: Vec<LeafCoverage> = scan.covered;
+        self.inner.lock().unwrap().scans.push(ScanAccess {
+            prefix: c.prefix().into(),
+            covered,
+        });
+        Ok(scan.keys)
+    }
+
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
         let p = paths::from_key(c.prefix(), key);
@@ -125,7 +151,8 @@ impl Transaction {
         retry: RetryConfig,
     ) -> Self {
         Transaction {
-            reader: Reader::new(values, shards, tmon, retry),
+            reader: Reader::new(values, shards.clone(), tmon.clone(), retry),
+            resolver: Resolver::new(shards, tmon),
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }
     }
@@ -136,6 +163,7 @@ impl Transaction {
     pub(crate) fn handle(&self) -> Transaction {
         Transaction {
             reader: self.reader.clone(),
+            resolver: self.resolver.clone(),
             inner: self.inner.clone(),
         }
     }
@@ -148,6 +176,7 @@ impl Transaction {
         let mut inner = self.inner.lock().unwrap();
         inner.staged.clear();
         inner.reads.clear();
+        inner.scans.clear();
     }
 
     pub(crate) fn collect_accesses(&self) -> Data {
@@ -180,7 +209,14 @@ impl Transaction {
         // simulation replay byte-for-byte identical and is harmless in production.
         writes.sort_by(|a, b| a.path.cmp(&b.path));
         reads.sort_by(|a, b| a.path.cmp(&b.path));
-        Data { reads, writes }
+        // Scans are recorded in listing order, which is already deterministic
+        // (leaves scanned left-to-right), so they need no re-sorting.
+        let scans = inner.scans.clone();
+        Data {
+            reads,
+            writes,
+            scans,
+        }
     }
 }
 
@@ -202,4 +238,71 @@ impl StagedValue {
 enum ReadState {
     Found(ReadVersion),
     NotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::{Backend, Database, memory::MemoryBackend};
+
+    // ADR-031 phantom prevention, the in-flight case: when a key is created
+    // *while* a listing transaction is running — after it scanned the leaf but
+    // before it validated — the create rewrites the covered leaf, bumping its
+    // version. The listing's commit validation detects the changed snapshot and
+    // re-runs the transaction; the retry re-scans the fresh leaf and therefore
+    // includes the racing key. A create is never silently dropped from a listing
+    // it raced.
+    #[tokio::test]
+    async fn listing_retries_to_include_a_key_added_during_the_scan() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let db = Database::open("example", backend).await.unwrap();
+        let coll = db.collection(b"phantom-retry");
+        coll.create().await.unwrap();
+
+        let seed: Vec<Vec<u8>> = (0u32..5).map(|i| i.to_be_bytes().to_vec()).collect();
+        for k in &seed {
+            coll.write(k, b"v").await.unwrap();
+        }
+
+        let extra = 999u32.to_be_bytes().to_vec();
+        let first_attempt = AtomicBool::new(true);
+
+        // The listing runs in a read-only transaction. On its first attempt a
+        // concurrent transaction commits a new key *after* the scan recorded the
+        // leaf version, modeling a create that lands mid-listing. That
+        // invalidates the recorded snapshot, forcing the listing to retry.
+        let listed = db
+            .tx(|tx| {
+                let coll = coll.clone();
+                let extra = extra.clone();
+                let first_attempt = &first_attempt;
+                async move {
+                    let keys = tx.keys(&coll).await?;
+                    if first_attempt.swap(false, Ordering::SeqCst) {
+                        coll.write(&extra, b"v").await?;
+                    }
+                    Ok(keys)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            listed.contains(&extra),
+            "the key created during the listing is included after the retry"
+        );
+        let mut expected: Vec<Vec<u8>> = seed;
+        expected.push(extra);
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "the listing observes the full, sorted committed set"
+        );
+        assert!(
+            db.stats().tx_retries >= 1,
+            "the listing must have retried after its snapshot was invalidated"
+        );
+    }
 }

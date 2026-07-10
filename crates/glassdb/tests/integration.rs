@@ -508,8 +508,117 @@ async fn list_keys() {
     sorted.sort();
     assert_eq!(got, sorted);
 
+    // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
+    // never a directory `list` of an object prefix.
     let stats = db.stats();
-    assert_eq!(stats.obj_lists, 1);
+    assert_eq!(stats.obj_lists, 0);
+}
+
+// ADR-031 phantom prevention, end-to-end: a listing that observes a set of keys
+// commits against a validated snapshot, so a key created *after* the scan is
+// never included, and a listing whose snapshot a concurrent commit invalidated
+// transparently re-runs to a fresh, consistent view. The listing is a read-only
+// serializable transaction, so its result is always sorted and internally
+// consistent.
+#[tokio::test]
+async fn keys_listing_is_phantom_safe() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"phantom");
+    coll.create().await.unwrap();
+
+    // Seed a stable set of keys.
+    let seed: Vec<Vec<u8>> = (0u32..20).map(|i| i.to_be_bytes().to_vec()).collect();
+    for k in &seed {
+        coll.write(k, b"v").await.unwrap();
+    }
+
+    // A listing sees exactly the seeded keys, sorted, with no duplicates.
+    let listed: Vec<Vec<u8>> = coll
+        .keys()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut sorted = listed.clone();
+    sorted.sort();
+    assert_eq!(listed, sorted, "listing is sorted");
+    assert_eq!(listed, seed, "listing observes exactly the committed keys");
+
+    // Create a new key, then list again: the fresh listing includes it (its own
+    // consistent snapshot), demonstrating the scan re-resolves membership rather
+    // than caching a stale set.
+    let extra = 999u32.to_be_bytes().to_vec();
+    coll.write(&extra, b"v").await.unwrap();
+    let listed2: Vec<Vec<u8>> = coll
+        .keys()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        listed2.contains(&extra),
+        "new key visible to a later listing"
+    );
+    assert_eq!(listed2.len(), seed.len() + 1);
+    let mut sorted2 = listed2.clone();
+    sorted2.sort();
+    assert_eq!(listed2, sorted2, "listing stays sorted");
+}
+
+// ADR-031 per-leaf membership: a key is "live" only when a committed writer
+// holds it. A transaction that installed a create lock in the leaf but then
+// aborted leaves a dead holder and no committed writer, so the key must be
+// invisible to a listing — an aborted create never becomes a phantom member.
+#[tokio::test]
+async fn listing_hides_keys_from_aborted_transactions() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = PausingBackend::new(mem);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db.collection(b"aborted-vis");
+    coll.create().await.unwrap();
+
+    // Two committed keys the listing must always see.
+    coll.write(b"real-a", b"v").await.unwrap();
+    coll.write(b"real-b", b"v").await.unwrap();
+
+    // A transaction creates two brand-new keys and reaches the commit-log write
+    // (so its create locks are already installed in the leaf), then is cancelled
+    // mid-commit. The `TxAbortGuard` asynchronously marks it aborted: the ghost
+    // keys were "added" by a transaction that never committed.
+    let arrived = backend.arm("/_t/");
+    let stalled = tokio::spawn({
+        let db = db.clone();
+        let coll = coll.clone();
+        async move {
+            let coll_ref = &coll;
+            db.tx(|tx| async move {
+                tx.write(coll_ref, b"ghost-a", b"v")?;
+                tx.write(coll_ref, b"ghost-b", b"v")
+            })
+            .await
+        }
+    });
+    arrived.await.unwrap();
+    stalled.abort();
+    let _ = stalled.await;
+
+    // The listing observes exactly the committed keys, never the ghosts left
+    // behind by the aborted transaction.
+    let listed: Vec<Vec<u8>> = coll
+        .keys()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        listed,
+        vec![b"real-a".to_vec(), b"real-b".to_vec()],
+        "only committed keys are listed"
+    );
+    assert!(
+        !listed.contains(&b"ghost-a".to_vec()) && !listed.contains(&b"ghost-b".to_vec()),
+        "keys from an aborted transaction are invisible"
+    );
 }
 
 #[tokio::test(start_paused = true)]

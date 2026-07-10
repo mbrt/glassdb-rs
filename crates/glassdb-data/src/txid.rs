@@ -2,29 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Fills `b` with random bytes.
-///
-/// In normal builds this draws from the OS via `rand`. Under the deterministic
-/// simulation executor (`--cfg sim`) it draws from the run's seeded RNG instead,
-/// so transaction-log object keys (which embed this prefix) are a deterministic
-/// function of the simulation seed and replays are byte-identical.
-#[cfg(not(sim))]
-fn fill_random(b: &mut [u8]) {
-    use rand::Rng;
-    rand::rng().fill_bytes(b);
-}
-
-#[cfg(sim)]
-fn fill_random(b: &mut [u8]) {
-    // Inside the executor, draw from its seeded entropy. Outside it (e.g.
-    // ordinary tokio tests built with `--cfg sim`), fall back to the OS RNG.
-    if glassdb_concurr::rt::in_sim() {
-        glassdb_concurr::rt::fill_random(b);
-    } else {
-        use rand::Rng;
-        rand::rng().fill_bytes(b);
-    }
-}
+use crate::entropy::fill_random;
 
 /// Total length, in bytes, of a freshly generated transaction ID.
 const TX_ID_LEN: usize = 16;
