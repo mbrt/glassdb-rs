@@ -9,8 +9,8 @@
 //! consecutive ring edges. Because that rotation does not commute, any isolation
 //! or atomicity break splits, shrinks, or grows the ring.
 //!
-//! [`replay_cycle_input`] reads back every node's next-pointer and asserts the
-//! ring is still a single cycle of length `N`; any violation panics, which
+//! The harness reads back every node's next-pointer and asserts the ring is
+//! still a single cycle of length `N`; any violation panics, which
 //! libFuzzer reports as a crash. The invariant holds even with faults active,
 //! since each swap is atomic. `cargo fuzz` overrides the `fuzz/.cargo/config.toml`
 //! rustflags, so `--cfg sim --cfg tokio_unstable` must be passed through the
@@ -23,7 +23,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// The decode-and-run logic lives in `glassdb::sim::replay_cycle_input` so the
-// committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs) exercises
-// the exact same path as the fuzzer.
-fuzz_target!(|data: &[u8]| glassdb::sim::replay_cycle_input(data));
+// The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so
+// the committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs)
+// exercises the exact same path as the fuzzer.
+fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::CycleWorkload>(data));

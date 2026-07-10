@@ -164,7 +164,14 @@ impl Splitter {
     /// owning the candidate feed the coordinator fills through
     /// [`hinter`](Self::hinter).
     pub fn new(bg: Weak<Background>, shards: ShardStore) -> Self {
-        Splitter::with_candidates(bg, shards, SplitCandidates::new(SplitPolicy::default()))
+        Splitter::with_policy(bg, shards, SplitPolicy::default())
+    }
+
+    /// Creates a splitter with an explicit soft-cap `policy`, so a caller can
+    /// drive splits with tiny nodes (e.g. the deterministic-simulation
+    /// harness). The default policy is used by [`Splitter::new`].
+    pub fn with_policy(bg: Weak<Background>, shards: ShardStore, policy: SplitPolicy) -> Self {
+        Splitter::with_candidates(bg, shards, SplitCandidates::new(policy))
     }
 
     /// Creates a splitter over an explicit candidate feed. Lets a test drive the

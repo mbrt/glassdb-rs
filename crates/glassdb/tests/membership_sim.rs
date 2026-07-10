@@ -1,5 +1,5 @@
-//! Deterministic-simulation self-checks for the Cycle fuzz workload (ported from
-//! FoundationDB's `Cycle.cpp`; see ADR-010/011).
+//! Deterministic-simulation self-checks for the membership fuzz workload
+//! (ADR-031 dynamic range sharding).
 //!
 //! These only build under the in-repo simulation executor with the `sim` harness
 //! feature:
@@ -8,20 +8,21 @@
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
 //! ```
 //!
-//! The Cycle workload is the serializability oracle the commutative
-//! RMW-increment workload (`concurrent_sim.rs`) cannot be: each transaction
-//! rotates three consecutive ring edges, an operation that does not commute, so
-//! any isolation or atomicity break splits, shrinks, or grows the ring. The
-//! harness asserts the ring is still a single cycle of length `N`. As with the
-//! increment workload, a fixed (workload, tape, seed) must issue a byte-for-byte
-//! identical backend op stream on every run.
+//! The membership workload drives the B-link tree the increment/cycle workloads
+//! never touch: with a tiny split soft cap a couple of live keys overflow a leaf,
+//! so clients concurrently creating, deleting, and listing keys force leaf/root
+//! splits, right-link traversal, and cross-leaf sorted listing. The harness
+//! asserts every committed listing is strictly sorted and drawn from the key
+//! universe, and that the final key set matches the per-key membership
+//! accounting. As with the other workloads, a fixed (workload, tape, seed) must
+//! issue a byte-for-byte identical backend op stream on every run.
 #![cfg(all(sim, feature = "sim"))]
 
 use glassdb::middleware::{OpRecord, first_divergence};
 use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    CycleWorkload, FaultConfig, pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults,
-    run_and_record, run_and_record_with_faults,
+    FaultConfig, MembOp, MembershipWorkload, pct_record, pct_sweep, run_and_assert,
+    run_and_assert_with_faults, run_and_record, run_and_record_with_faults,
 };
 
 /// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
@@ -55,20 +56,56 @@ fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
     }
 }
 
-/// A contended ring: a small node count with several clients each rotating
-/// overlapping edges, so transactions conflict on shared keys. A few concurrent
-/// ring snapshots run alongside, exercising the read-side serializability oracle
-/// and `Tx`'s concurrent-read path.
-fn contended_cycle() -> CycleWorkload {
-    CycleWorkload {
-        node_count: 6,
-        clients: vec![vec![0, 2, 4, 1], vec![1, 3, 5, 0], vec![2, 4, 0, 3]],
-        snapshot_reads: 3,
+/// A contended membership workload over three clients, each owning a disjoint
+/// slice of the 8-key universe by residue (client `i` owns keys `k` with
+/// `k % 3 == i`): client 0 -> {0,3,6}, client 1 -> {1,4,7}, client 2 -> {2,5}.
+/// Puts, deletes, and lists interleave so keys created by different clients
+/// share leaves and split concurrently with listings.
+fn contended_membership() -> MembershipWorkload {
+    MembershipWorkload {
+        clients: vec![
+            vec![
+                MembOp::Put(0),
+                MembOp::Put(3),
+                MembOp::List,
+                MembOp::Delete(0),
+                MembOp::Put(6),
+                MembOp::List,
+            ],
+            vec![
+                MembOp::Put(1),
+                MembOp::Put(4),
+                MembOp::Put(7),
+                MembOp::List,
+                MembOp::Delete(4),
+            ],
+            vec![
+                MembOp::Put(2),
+                MembOp::List,
+                MembOp::Put(5),
+                MembOp::Delete(2),
+                MembOp::Put(5),
+            ],
+        ],
+    }
+}
+
+/// A workload that fills the whole key universe: every client puts all of its
+/// residue-class keys, so the final live set is all eight keys — which, at a
+/// two-entry leaf cap, cannot fit in one leaf and forces the listing to scan
+/// across split leaves.
+fn fill_all_keys() -> MembershipWorkload {
+    MembershipWorkload {
+        clients: vec![
+            vec![MembOp::Put(0), MembOp::Put(3), MembOp::Put(6), MembOp::List],
+            vec![MembOp::Put(1), MembOp::Put(4), MembOp::Put(7), MembOp::List],
+            vec![MembOp::Put(2), MembOp::Put(5), MembOp::List],
+        ],
     }
 }
 
 /// The op stream recorded for `workload` under `tape(seed)`/`seed`.
-fn record_once(seed: u64, workload: &CycleWorkload) -> Vec<OpRecord> {
+fn record_once(seed: u64, workload: &MembershipWorkload) -> Vec<OpRecord> {
     let w = workload.clone();
     let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
         run_and_record(&w).await
@@ -81,7 +118,7 @@ fn record_once(seed: u64, workload: &CycleWorkload) -> Vec<OpRecord> {
 /// active and guided by `ft`.
 fn record_faults_with_tape(
     seed: u64,
-    workload: &CycleWorkload,
+    workload: &MembershipWorkload,
     faults: FaultConfig,
     ft: Vec<u8>,
 ) -> Vec<OpRecord> {
@@ -97,7 +134,7 @@ fn record_faults_with_tape(
 /// like tape exhaustion that the seed-expanded helper intentionally avoids.
 fn record_with_tapes(
     seed: u64,
-    workload: &CycleWorkload,
+    workload: &MembershipWorkload,
     faults: FaultConfig,
     schedule_tape: Vec<u8>,
     fault_tape: Vec<u8>,
@@ -110,24 +147,9 @@ fn record_with_tapes(
     recorded.clone()
 }
 
-/// Boundary-heavy Cycle workload: larger ring, maximum generated client shape,
-/// and read-only snapshots enabled to exercise concurrent reads.
-fn max_snapshot_cycle() -> CycleWorkload {
-    CycleWorkload {
-        node_count: 12,
-        clients: vec![
-            vec![0, 2, 4, 6, 8, 10, 1, 3],
-            vec![1, 3, 5, 7, 9, 11, 2, 4],
-            vec![2, 4, 6, 8, 10, 0, 3, 5],
-            vec![3, 5, 7, 9, 11, 1, 4, 6],
-        ],
-        snapshot_reads: 8,
-    }
-}
-
 #[test]
 fn op_stream_is_byte_identical_across_runs() {
-    let workload = contended_cycle();
+    let workload = contended_membership();
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
         let first = record_once(seed, &workload);
         let second = record_once(seed, &workload);
@@ -140,11 +162,25 @@ fn op_stream_is_byte_identical_across_runs() {
 }
 
 #[test]
-fn ring_invariant_holds_under_contention() {
-    // run_and_assert panics on any violation; reaching the end means the
-    // ring stayed a single cycle of length N for this tape.
+fn membership_invariant_holds_under_contention() {
+    // run_and_assert panics on any violation; reaching the end means every
+    // committed listing was well-formed and the final set matched the accounting.
     for seed in [0u64, 3, 99, 2024] {
-        let workload = contended_cycle();
+        let workload = contended_membership();
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert(workload).await
+        });
+    }
+}
+
+#[test]
+fn full_universe_lists_every_key_across_leaves() {
+    // Filling all eight keys cannot fit in a two-entry leaf, so a correct
+    // fault-free final listing proves the scan traverses split leaves (via
+    // right-links) without dropping or duplicating a key. The harness's
+    // fault-free verify checks the final set equals the accounting exactly.
+    for seed in [0u64, 5, 77, 4242] {
+        let workload = fill_all_keys();
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
             run_and_assert(workload).await
         });
@@ -155,7 +191,7 @@ fn ring_invariant_holds_under_contention() {
 fn op_stream_is_byte_identical_with_faults() {
     // Determinism must hold even with faults active: scheduling, time,
     // randomness, and the fault schedule are all functions of the tape and seed.
-    let workload = contended_cycle();
+    let workload = contended_membership();
     let faults = FaultConfig::enabled(7);
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
         let first = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
@@ -165,11 +201,12 @@ fn op_stream_is_byte_identical_with_faults() {
 }
 
 #[test]
-fn ring_invariant_holds_under_faults() {
-    // The ring invariant is robust to faults: each swap is atomic, so the ring
-    // stays a single N-cycle whether a swap commits or aborts. A lost or
-    // fabricated write that broke the ring would panic inside the harness.
-    let workload = contended_cycle();
+fn membership_holds_under_faults() {
+    // With faults the invariant relaxes to the in-doubt bound: a listed key must
+    // be either the last committed state or the ambiguous outcome of an op left
+    // in-doubt. A lost or fabricated create/delete outside that bound panics
+    // inside the harness.
+    let workload = contended_membership();
     for seed in [0u64, 3, 99, 2024] {
         let w = workload.clone();
         let ft = fault_tape(seed);
@@ -180,14 +217,13 @@ fn ring_invariant_holds_under_faults() {
 }
 
 #[test]
-fn ring_holds_under_crash_restart_and_outages() {
+fn membership_holds_under_crash_restart_and_outages() {
     // High intensity drives multiple client crashes (-> crash-and-restart on the
     // same backend) and sustained per-client transport outages. Each run must
-    // stay byte-for-byte deterministic per (tape, seed), and the ring invariant
+    // stay byte-for-byte deterministic per (tape, seed), and the membership bound
     // (asserted inside the harness) must survive the recovery paths those faults
-    // exercise: lease expiry, lock-lease recovery, and a restarted client
-    // reclaiming its own orphaned locks.
-    let workload = contended_cycle();
+    // exercise while splits run concurrently in the background.
+    let workload = contended_membership();
     let faults = FaultConfig::enabled(200);
     for seed in [0u64, 1, 7, 42, 99, 1234] {
         let ft = fault_tape(seed);
@@ -199,7 +235,7 @@ fn ring_holds_under_crash_restart_and_outages() {
 
 #[test]
 fn boundary_tapes_replay_deterministically() {
-    let workload = max_snapshot_cycle();
+    let workload = fill_all_keys();
     let faults = FaultConfig::enabled(128);
     for (schedule, fault_tape) in [
         (Vec::new(), Vec::new()),
@@ -208,7 +244,7 @@ fn boundary_tapes_replay_deterministically() {
     ] {
         let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
         let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
-        assert_no_divergence("cycle boundary tape replay", &first, &second);
+        assert_no_divergence("membership boundary tape replay", &first, &second);
     }
 }
 
@@ -216,7 +252,7 @@ fn boundary_tapes_replay_deterministically() {
 fn pct_schedule_is_byte_identical_per_seed() {
     // The PCT policy must be just as reproducible as the tape policy: a fixed
     // seed yields a byte-for-byte identical op stream across runs.
-    let workload = contended_cycle();
+    let workload = contended_membership();
     let faults = FaultConfig::enabled(5);
     for seed in [0u64, 1, 7, 42, 1234] {
         let first = pct_record(&workload, faults, seed);
@@ -228,37 +264,10 @@ fn pct_schedule_is_byte_identical_per_seed() {
 }
 
 #[test]
-fn concurrent_snapshot_reader_runs_and_stays_deterministic() {
-    // The read-only observer must (a) actually run — adding backend reads on top
-    // of the swap-only stream — and (b) keep the run byte-for-byte deterministic
-    // even though it issues all N pointer reads concurrently within one
-    // transaction. (b) is the real test of the concurrent-read path: if joining
-    // the reads introduced any nondeterminism, the two streams would diverge.
-    let with_reader = contended_cycle(); // snapshot_reads = 3
-    let without = CycleWorkload {
-        snapshot_reads: 0,
-        ..contended_cycle()
-    };
-    for seed in [0u64, 1, 42, 1234] {
-        let first = record_once(seed, &with_reader);
-        let second = record_once(seed, &with_reader);
-        assert_no_divergence(&format!("seed {seed}: snapshot-reader"), &first, &second);
-        let baseline = record_once(seed, &without);
-        assert!(
-            first.len() > baseline.len(),
-            "seed {seed}: enabling the snapshot reader added no backend ops \
-             ({} with reader vs {} without) — the observer did not run",
-            first.len(),
-            baseline.len(),
-        );
-    }
-}
-
-#[test]
-fn pct_seed_breadth_holds_ring_invariant() {
-    // Seed-breadth sweep: many PCT schedules over the contended ring, with and
-    // without faults. Any invariant violation panics inside the sweep.
-    let workload = contended_cycle();
+fn pct_seed_breadth_holds_membership() {
+    // Seed-breadth sweep: many PCT schedules over the contended workload, with
+    // and without faults. Any invariant violation panics inside the sweep.
+    let workload = contended_membership();
     pct_sweep(&workload, FaultConfig::enabled(7), 0..32);
     pct_sweep(&workload, FaultConfig::none(), 0..16);
 }

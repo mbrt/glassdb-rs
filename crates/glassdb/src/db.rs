@@ -9,7 +9,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Directory, ObjectCache, ShardStore, SharedCache, TLogger, ValueCache};
+use glassdb_storage::{
+    Directory, ObjectCache, ShardStore, SharedCache, SplitPolicy, TLogger, ValueCache,
+};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, Splitter, TransError};
 use tokio::sync::Notify;
 
@@ -40,6 +42,7 @@ pub struct DatabaseBuilder {
     cache_size: usize,
     deterministic_time: bool,
     retry: RetryConfig,
+    split_policy: SplitPolicy,
 }
 
 impl DatabaseBuilder {
@@ -78,6 +81,12 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Overrides the soft-cap policy that triggers a background leaf/index split.
+    pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
+        self.split_policy = policy;
+        self
+    }
+
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
     pub async fn open(self) -> Result<Database, Error> {
@@ -87,6 +96,7 @@ impl DatabaseBuilder {
             cache_size,
             deterministic_time,
             retry,
+            split_policy,
         } = self;
 
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -128,7 +138,7 @@ impl DatabaseBuilder {
         // Build the splitter first so the coordinator can report over-cap leaf
         // writes into its queue through the SplitHinter seam (ADR-031); the
         // coordinator never names the splitter or its candidate feed.
-        let splitter = Splitter::new(bg_weak.clone(), shards.clone());
+        let splitter = Splitter::with_policy(bg_weak.clone(), shards.clone(), split_policy);
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             resolver.clone(),
@@ -185,6 +195,7 @@ impl DatabaseBuilder {
             cache_size: DEFAULT_CACHE_SIZE,
             deterministic_time: false,
             retry: RetryConfig::default(),
+            split_policy: SplitPolicy::default(),
         }
     }
 }

@@ -25,7 +25,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// The decode-and-run logic lives in `glassdb::sim::replay_fuzz_input` so the
-// committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs) exercises
-// the exact same path as the fuzzer.
-fuzz_target!(|data: &[u8]| glassdb::sim::replay_fuzz_input(data));
+// The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so
+// the committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs)
+// exercises the exact same path as the fuzzer.
+fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::Workload>(data));

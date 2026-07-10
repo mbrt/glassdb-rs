@@ -1,30 +1,36 @@
 //! Deterministic-simulation workload harness for the concurrency fuzzer.
 //!
-//! A [`Workload`] is a set of clients, each a sequence of [`Op`]s, generated
-//! from fuzzer bytes via [`arbitrary`]. The harness runs every client as its own
-//! task over a shared in-process [`MemoryBackend`]; under the deterministic
-//! simulation executor (`--cfg sim`) the executor's scheduler controls how those
-//! tasks interleave, so the whole run is a pure function of the schedule tape and
-//! the seed and a failing run reproduces exactly. A seeded [`FaultConfig`] gives
-//! each client its own [`FaultBackend`] *transport* to the shared store, which
-//! injects latency and faults the client's ops on either side (dropped request /
-//! lost ack) including sustained per-client outages; a crash nemesis cancels
-//! client contexts mid-flight (modelling an abrupt client stop), after which the
-//! client restarts on the same backend.
+//! A [`SimWorkload`] is a set of clients, each a sequence of ops, generated from
+//! fuzzer bytes via [`arbitrary`]. The shared harness ([`run_and_assert`] and
+//! friends) runs every client as its own task over a shared in-process
+//! [`MemoryBackend`]; under the deterministic simulation executor (`--cfg sim`)
+//! the executor's scheduler controls how those tasks interleave, so the whole
+//! run is a pure function of the schedule tape and the seed and a failing run
+//! reproduces exactly. A seeded [`FaultConfig`] gives each client its own
+//! [`FaultBackend`] *transport* to the shared store, which injects latency and
+//! faults the client's ops on either side (dropped request / lost ack) including
+//! sustained per-client outages; a crash nemesis cancels client contexts
+//! mid-flight (modelling an abrupt client stop), after which the client restarts
+//! on the same backend. [`run_and_record`] also captures the ordered stream of
+//! backend operations so two same-seed/tape runs can be compared byte-for-byte
+//! (see the `*_sim` self-checks and ADR-010/011).
 //!
-//! The correctness check is per key `acked <= final <= started`, where `started`
-//! counts increments that entered a transaction and `acked` counts those whose
-//! commit returned `Ok`. An increment is left in-doubt (counted in `started`,
-//! not `acked`) when a client is cancelled mid-commit or a conditional write's
-//! outcome cannot be confirmed (its acknowledgement was lost). In every case the
-//! engine surfaces the failure to the caller and does *not* retry the
-//! transaction transparently, so each op is applied at most once; the bound
-//! tolerates the in-doubt op while still catching lost or fabricated writes. With
-//! faults disabled the three are equal, recovering the exact invariant.
-//! [`run_and_record`] also captures the ordered stream of backend operations so
-//! two same-seed/tape runs can be compared byte-for-byte (see the
-//! `concurrent_sim` self-check and ADR-010/011).
+//! Three workloads implement [`SimWorkload`], each with its own invariant:
+//!
+//! - [`Workload`] — commutative RMW increments; the bound `acked <= final <=
+//!   started` per key (exact equality with faults off). An increment is left
+//!   in-doubt (in `started`, not `acked`) when a client is cancelled mid-commit
+//!   or a conditional write's ack is lost; the engine never retries transparently,
+//!   so each op applies at most once and the bound tolerates the in-doubt op
+//!   while still catching lost or fabricated writes.
+//! - [`CycleWorkload`] — a ring rotation whose non-commuting swaps make any
+//!   isolation break split, shrink, or grow the ring (ported from FoundationDB's
+//!   `Cycle.cpp`).
+//! - [`MembershipWorkload`] — concurrent create/delete/list under a tiny split
+//!   soft cap, exercising the ADR-031 B-link tree: leaf/root splits, right-link
+//!   traversal, and cross-leaf sorted listing.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,6 +42,7 @@ use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::OpRecord;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
+use glassdb_storage::SplitPolicy;
 use tokio_util::sync::CancellationToken;
 
 use crate::{Collection, Database, Error};
@@ -169,7 +176,7 @@ async fn read_int_from_tx(tx: &crate::Transaction, c: &Collection, k: &[u8]) -> 
 
 /// Per-key accounting shared across client tasks. `started` counts increments
 /// that entered a transaction; `acked` counts those whose commit returned `Ok`.
-struct Acct {
+pub struct Acct {
     started: Vec<i64>,
     acked: Vec<i64>,
 }
@@ -243,54 +250,14 @@ async fn run_one(
     Ok(())
 }
 
-/// Runs a client's op sequence in order. Returns the number of ops *consumed*:
-/// `ops.len()` if all succeeded, or `i + 1` if op `i` failed (that op is left
-/// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
-/// RMW would double-apply).
-async fn run_client(
-    db: &Database,
-    coll: &Collection,
-    ops: &[Op],
-    acct: &Mutex<Acct>,
-    consumed: &AtomicUsize,
-) -> usize {
-    for (i, op) in ops.iter().enumerate() {
-        // Bump consumed *before* attempting the op. If the outer crash future
-        // drops us mid-`run_one`, this op is counted as consumed (left in
-        // doubt) and is not replayed by the restart path. We need this counter
-        // on a shared atomic because the `tokio::select!` cancel arm simply
-        // drops this future and cannot read its return value.
-        consumed.store(i + 1, Ordering::SeqCst);
-        if run_one(db, coll, op, acct).await.is_err() {
-            return i + 1;
-        }
-    }
-    consumed.store(ops.len(), Ordering::SeqCst);
-    ops.len()
-}
-
-/// Opens the Database on `backend`, runs `ops`, and closes it. Returns ops consumed
-/// (see [`run_client`]); `0` if the open itself failed (e.g. a crash during
-/// startup).
-async fn open_and_run(
-    backend: &Arc<dyn Backend>,
-    ops: &[Op],
-    acct: &Mutex<Acct>,
-    consumed: &AtomicUsize,
-) {
-    let Ok(db) = open_det_db(backend).await else {
-        return;
-    };
-    let coll = db.collection(COLLECTION);
-    let _ = run_client(&db, &coll, ops, acct, consumed).await;
-    db.shutdown().await;
-}
-
-/// Opens the simulation Database with the deterministic clock the fuzzer relies on
-/// for byte-identical replays.
-async fn open_det_db(backend: &Arc<dyn Backend>) -> Result<Database, Error> {
+/// Opens the simulation Database with the deterministic clock the fuzzer relies
+/// on for byte-identical replays, under the given split `policy` (default caps
+/// for the increment/cycle workloads; a tiny policy for the membership workload
+/// so a handful of keys forces B-link splits).
+async fn open_det_db(backend: &Arc<dyn Backend>, policy: SplitPolicy) -> Result<Database, Error> {
     Database::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
+        .split_policy(policy)
         .open()
         .await
 }
@@ -482,11 +449,117 @@ fn spawn_nemeses(
     (Some(crash), Some(outage))
 }
 
-/// Core harness: seed the store, run the clients as interleaved tasks under the
-/// (optional) fault nemesis, then verify the per-key bound. Always records the
-/// backend op stream and returns it for byte-for-byte determinism comparison.
-async fn run_inner(
-    workload: Workload,
+// ===========================================================================
+// SimWorkload: the shared harness abstraction.
+//
+// Every deterministic-simulation workload (increment RMW, cycle, membership) is
+// the same run: seed a shared store, run each client's op sequence as its own
+// interleaved task over its own fault transport, run the crash/outage nemeses,
+// then read the final committed state and assert an invariant. Only a few points
+// differ per workload — the collection, the seed step, how one op runs, the
+// invariant, an optional concurrent observer, and the split policy — so those
+// are the trait methods; `run_generic` owns everything else.
+// ===========================================================================
+
+/// A deterministic-simulation workload the shared harness ([`run_generic`]) can
+/// drive. Implementors supply only what varies between workloads; the backbone,
+/// per-client transports, crash-and-restart client tasks, and fault nemeses are
+/// all provided by the harness.
+pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
+    /// A single client operation, run in its own transaction.
+    type Op: Clone + Send + Sync + 'static;
+    /// Shared oracle state, updated as ops run and checked in [`verify`]. Carries
+    /// its own interior mutability (e.g. a `Mutex`); use `()` when no state is
+    /// needed.
+    ///
+    /// [`verify`]: SimWorkload::verify
+    type State: Send + Sync + 'static;
+
+    /// The collection every client operates on.
+    const COLLECTION: &'static [u8];
+
+    /// This run's per-client op sequences. Clients run concurrently.
+    fn clients(&self) -> &[Vec<Self::Op>];
+
+    /// A fresh oracle state for one run.
+    fn new_state(&self) -> Self::State;
+
+    /// The split soft-cap policy the databases open with. Defaults to production
+    /// caps; a workload that wants to exercise B-link splits with few keys
+    /// overrides it with a tiny policy.
+    fn split_policy() -> SplitPolicy {
+        SplitPolicy::default()
+    }
+
+    /// Seeds the collection before the clients start, over the faultless
+    /// backbone (so setup cannot fail spuriously). The collection is already
+    /// created.
+    fn seed(&self, db: &Database, coll: &Collection) -> impl Future<Output = ()> + Send;
+
+    /// Runs one op in its own transaction, updating `state`. Returns the op's
+    /// result so the client loop can stop (and leave it in-doubt) on failure.
+    fn run_op(
+        db: &Database,
+        coll: &Collection,
+        op: &Self::Op,
+        state: &Self::State,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Reads the final committed state and asserts the workload invariant.
+    /// Panics on any violation. `faults_enabled` selects the exact vs. relaxed
+    /// (in-doubt-tolerant) form of the invariant.
+    fn verify(
+        &self,
+        coll: &Collection,
+        state: &Self::State,
+        faults_enabled: bool,
+    ) -> impl Future<Output = ()> + Send;
+
+    /// An optional concurrent read-only observer spawned alongside the clients
+    /// (e.g. the Cycle ring snapshotter). Spawned in a fixed order — after the
+    /// clients, before the nemeses — so task ids stay deterministic. Default:
+    /// none.
+    fn spawn_observer(
+        &self,
+        _backbone: &Arc<dyn Backend>,
+        _state: &Arc<Self::State>,
+    ) -> Option<rt::JoinHandle<()>> {
+        None
+    }
+}
+
+/// Runs a client's op sequence in order. Returns the number of ops *consumed*:
+/// `ops.len()` if all succeeded, or `i + 1` if op `i` failed (that op is left
+/// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
+/// op would double-apply).
+async fn run_generic_client<W: SimWorkload>(
+    db: &Database,
+    coll: &Collection,
+    ops: &[W::Op],
+    state: &W::State,
+    consumed: &AtomicUsize,
+) -> usize {
+    for (i, op) in ops.iter().enumerate() {
+        // Bump consumed *before* attempting the op. If the outer crash future
+        // drops us mid-op, this op is counted as consumed (left in doubt) and is
+        // not replayed by the restart path. We need this counter on a shared
+        // atomic because the `tokio::select!` cancel arm simply drops this future
+        // and cannot read its return value.
+        consumed.store(i + 1, Ordering::SeqCst);
+        if W::run_op(db, coll, op, state).await.is_err() {
+            return i + 1;
+        }
+    }
+    consumed.store(ops.len(), Ordering::SeqCst);
+    ops.len()
+}
+
+/// Core harness, generic over the workload: seed the store, run the clients as
+/// interleaved tasks under the (optional) fault nemesis and observer, then let
+/// the workload verify its invariant. Always records the backend op stream and
+/// returns it for byte-for-byte determinism comparison.
+async fn run_generic<W: SimWorkload>(
+    workload: W,
     faults: FaultConfig,
     seed: u64,
     fault_tape: Vec<u8>,
@@ -499,29 +572,21 @@ async fn run_inner(
     // The store and a shared recorder form a faultless backbone; each client gets
     // its own transport (`FaultBackend`) over it.
     let (backbone, log) = make_backbone();
+    let policy = W::split_policy();
 
-    // Initialize the collection and seed every key to zero up front (over the
-    // faultless backbone, so this cannot fail spuriously).
-    let init_db = open_det_db(&backbone).await.expect("open init db");
-    let init_coll = init_db.collection(COLLECTION);
+    // Create the collection and let the workload seed it, over the faultless
+    // backbone so setup cannot fail spuriously.
+    let init_db = open_det_db(&backbone, policy).await.expect("open init db");
+    let init_coll = init_db.collection(W::COLLECTION);
     init_coll.create().await.expect("create collection");
-    let seed_coll = &init_coll;
-    init_db
-        .tx(|tx| async move {
-            for k in 0..KEY_COUNT {
-                tx.write(seed_coll, &key_name(k), &write_int(0))?;
-            }
-            Ok(())
-        })
-        .await
-        .expect("seed keys");
+    workload.seed(&init_db, &init_coll).await;
 
-    let expected = expected_increments(&workload);
-    let acct = Arc::new(Mutex::new(Acct::new()));
+    let state = Arc::new(workload.new_state());
 
     // One transport per client over the shared backbone. Faults are live only
     // while the clients run.
-    let nclients = workload.clients.len();
+    let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
+    let nclients = client_ops.len();
     let (transports, client_backends) =
         build_transports(&backbone, faults, seed, &streams, nclients);
 
@@ -537,46 +602,57 @@ async fn run_inner(
     // captured-task cycle is broken by subsystems holding `Weak<Background>`).
     let mut handles = Vec::with_capacity(nclients);
     let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
-    for (ops, backend) in workload.clients.into_iter().zip(client_backends) {
+    for (ops, backend) in client_ops.into_iter().zip(client_backends) {
         let signal = CancellationToken::new();
         signals.push(signal.clone());
-        let acct = acct.clone();
+        let state = state.clone();
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
             let crashed = {
-                let Ok(db) = open_det_db(&backend).await else {
+                let Ok(db) = open_det_db(&backend, policy).await else {
                     return;
                 };
-                let coll = db.collection(COLLECTION);
+                let coll = db.collection(W::COLLECTION);
                 let crashed = tokio::select! {
                     biased;
                     _ = signal.cancelled() => true,
-                    _ = run_client(&db, &coll, &ops, &acct, &consumed) => false,
+                    _ = run_generic_client::<W>(&db, &coll, &ops, &state, &consumed) => false,
                 };
                 if !crashed {
                     db.shutdown().await;
                 }
                 crashed
             };
-            // Crash-and-restart: a cancelled (crashed) client reopens the Database on
-            // the same backend and finishes its remaining ops, recovering its
-            // own orphaned locks via lease expiry. The in-doubt op it died on
-            // is left for recovery rather than replayed (which would
-            // double-apply a non-idempotent RMW). The restart is uncancellable
-            // so it runs to completion.
+            // Crash-and-restart: a cancelled (crashed) client reopens the Database
+            // on the same backend and finishes its remaining ops, recovering its
+            // own orphaned locks via lease expiry. The in-doubt op it died on is
+            // left for recovery rather than replayed (which would double-apply a
+            // non-idempotent op). The restart is uncancellable so it runs to
+            // completion.
             let n = consumed.load(Ordering::SeqCst);
-            if crashed && n < ops.len() {
+            if crashed
+                && n < ops.len()
+                && let Ok(db) = open_det_db(&backend, policy).await
+            {
+                let coll = db.collection(W::COLLECTION);
                 let dummy = AtomicUsize::new(0);
-                open_and_run(&backend, &ops[n..], &acct, &dummy).await;
+                let _ = run_generic_client::<W>(&db, &coll, &ops[n..], &state, &dummy).await;
+                db.shutdown().await;
             }
         }));
     }
 
-    // The crash and outage nemeses run concurrently with the clients, each on its
-    // own slice of the fault tape (and a distinct fallback seed).
+    // An optional concurrent observer, then the crash and outage nemeses, each on
+    // its own slice of the fault tape (and a distinct fallback seed). The fixed
+    // spawn order (clients, observer, crash, outage) keeps task ids — and thus
+    // the schedule — deterministic.
+    let observer = workload.spawn_observer(&backbone, &state);
     let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
 
     for h in handles {
+        let _ = h.await;
+    }
+    if let Some(h) = observer {
         let _ = h.await;
     }
     if let Some(h) = crash {
@@ -592,58 +668,52 @@ async fn run_inner(
         t.set_active(false);
     }
 
-    // Read every key's final value (driving recovery of any crashed client's
-    // locks via lease expiry) and check the invariant.
-    let mut finals = vec![0i64; KEY_COUNT];
-    for (k, slot) in finals.iter_mut().enumerate() {
-        *slot = read_int(&init_coll.read(&key_name(k)).await.expect("final read"));
-    }
+    // The workload reads the final committed state (driving recovery of any
+    // crashed client's locks via lease expiry) and asserts its invariant.
+    workload.verify(&init_coll, &state, faults.enabled).await;
     init_db.shutdown().await;
-
-    let acct = acct.lock().unwrap();
-    assert_bounds(&acct, &finals, &expected, faults.enabled);
     log
 }
 
 // ---------------------------------------------------------------------------
-// Public entry points. These are plain async fns; the deterministic driver
-// (a `TapeScheduler`/seed under `rt::block_on_with`) is supplied by the fuzz
-// target and the `concurrent_sim` self-check.
+// Public entry points, generic over the workload. These are plain async fns; the
+// deterministic driver (a `TapeScheduler`/seed under `rt::block_on_with`) is
+// supplied by the fuzz target and the `*_sim` self-checks.
 // ---------------------------------------------------------------------------
 
-/// Runs `workload` over a fresh in-memory store and asserts serializability,
+/// Runs `workload` over a fresh in-memory store and asserts its invariant,
 /// without injecting faults.
-pub async fn run_and_assert(workload: Workload) {
-    run_inner(workload, FaultConfig::none(), 0, Vec::new()).await;
+pub async fn run_and_assert<W: SimWorkload>(workload: W) {
+    run_generic(workload, FaultConfig::none(), 0, Vec::new()).await;
 }
 
 /// Like [`run_and_assert`] but injects backend faults and client crashes per
 /// `faults`. `fault_tape` guides the fault schedule (the fuzzer's secondary
 /// tape); once it is exhausted, decisions fall back to `seed`.
-pub async fn run_and_assert_with_faults(
-    workload: Workload,
+pub async fn run_and_assert_with_faults<W: SimWorkload>(
+    workload: W,
     faults: FaultConfig,
     seed: u64,
     fault_tape: Vec<u8>,
 ) {
-    run_inner(workload, faults, seed, fault_tape).await;
+    run_generic(workload, faults, seed, fault_tape).await;
 }
 
 /// Like [`run_and_assert`] but records the ordered stream of backend operations
 /// and returns the log, for byte-for-byte determinism comparison across runs.
-pub async fn run_and_record(workload: &Workload) -> OpLog {
-    run_inner(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
+pub async fn run_and_record<W: SimWorkload>(workload: &W) -> OpLog {
+    run_generic(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
 }
 
 /// Like [`run_and_record`] but with fault injection enabled per `faults`.
 /// `fault_tape` guides the fault schedule; it falls back to `seed` once spent.
-pub async fn run_and_record_with_faults(
-    workload: &Workload,
+pub async fn run_and_record_with_faults<W: SimWorkload>(
+    workload: &W,
     faults: FaultConfig,
     seed: u64,
     fault_tape: Vec<u8>,
 ) -> OpLog {
-    run_inner(workload.clone(), faults, seed, fault_tape).await
+    run_generic(workload.clone(), faults, seed, fault_tape).await
 }
 
 // ---------------------------------------------------------------------------
@@ -694,36 +764,36 @@ where
     }
 }
 
-/// Decodes one libFuzzer input exactly as the `concurrent_tx` target does and
-/// runs it on the deterministic executor, asserting the bound. Panics on any
+/// Decodes one libFuzzer input for workload `W` exactly as its target does and
+/// runs it on the deterministic executor, asserting the invariant. Panics on any
 /// violation. Shared by the fuzz target and the corpus-replay test so the two
 /// can never diverge.
 #[cfg(sim)]
-pub fn replay_fuzz_input(data: &[u8]) {
+pub fn replay_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) {
     let DecodedFuzzInput {
         seed,
         workload,
         faults,
         schedule_tape,
         fault_tape,
-    } = decode_fuzz_input::<Workload>(data);
+    } = decode_fuzz_input::<W>(data);
     rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
         run_and_assert_with_faults(workload, faults, seed, fault_tape).await
     });
 }
 
-/// Decodes one libFuzzer input exactly as [`replay_fuzz_input`] does, runs it,
-/// and returns the recorded backend op stream. Used by corpus replay tests to
-/// prove committed inputs replay byte-for-byte, not just invariant-cleanly.
+/// Decodes one libFuzzer input exactly as [`replay_input`] does, runs it, and
+/// returns the recorded backend op stream. Used by corpus replay tests to prove
+/// committed inputs replay byte-for-byte, not just invariant-cleanly.
 #[cfg(sim)]
-pub fn record_fuzz_input(data: &[u8]) -> Vec<OpRecord> {
+pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<OpRecord> {
     let DecodedFuzzInput {
         seed,
         workload,
         faults,
         schedule_tape,
         fault_tape,
-    } = decode_fuzz_input::<Workload>(data);
+    } = decode_fuzz_input::<W>(data);
     rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
         let log = run_and_record_with_faults(&workload, faults, seed, fault_tape).await;
         let recorded = log.lock().unwrap();
@@ -731,10 +801,10 @@ pub fn record_fuzz_input(data: &[u8]) -> Vec<OpRecord> {
     })
 }
 
-/// Runs `workload` once under a PCT schedule seeded by `seed`, asserting the
-/// serializability bound. Panics on any violation.
+/// Runs `workload` once under a PCT schedule seeded by `seed`, asserting its
+/// invariant. Panics on any violation.
 #[cfg(sim)]
-pub fn pct_assert(workload: &Workload, faults: FaultConfig, seed: u64) {
+pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) {
     let w = workload.clone();
     rt::block_on_with(
         rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
@@ -747,7 +817,7 @@ pub fn pct_assert(workload: &Workload, faults: FaultConfig, seed: u64) {
 /// Runs `workload` under a PCT schedule and returns the recorded backend op
 /// stream, for per-seed determinism comparison.
 #[cfg(sim)]
-pub fn pct_record(workload: &Workload, faults: FaultConfig, seed: u64) -> OpLog {
+pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> OpLog {
     let w = workload.clone();
     rt::block_on_with(
         rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
@@ -760,9 +830,60 @@ pub fn pct_record(workload: &Workload, faults: FaultConfig, seed: u64) -> OpLog 
 /// the invariant on each. This is the seed-loop entry that complements the
 /// coverage-guided tape fuzzer.
 #[cfg(sim)]
-pub fn pct_sweep(workload: &Workload, faults: FaultConfig, seeds: impl IntoIterator<Item = u64>) {
+pub fn pct_sweep<W: SimWorkload>(
+    workload: &W,
+    faults: FaultConfig,
+    seeds: impl IntoIterator<Item = u64>,
+) {
     for seed in seeds {
         pct_assert(workload, faults, seed);
+    }
+}
+
+impl SimWorkload for Workload {
+    type Op = Op;
+    type State = Mutex<Acct>;
+
+    const COLLECTION: &'static [u8] = COLLECTION;
+
+    fn clients(&self) -> &[Vec<Op>] {
+        &self.clients
+    }
+
+    fn new_state(&self) -> Mutex<Acct> {
+        Mutex::new(Acct::new())
+    }
+
+    async fn seed(&self, db: &Database, coll: &Collection) {
+        // Seed every key to zero up front, so a read of an untouched key returns
+        // 0 rather than NotFound and the increment accounting is exact.
+        db.tx(|tx| async move {
+            for k in 0..KEY_COUNT {
+                tx.write(coll, &key_name(k), &write_int(0))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed keys");
+    }
+
+    async fn run_op(
+        db: &Database,
+        coll: &Collection,
+        op: &Op,
+        state: &Mutex<Acct>,
+    ) -> Result<(), Error> {
+        run_one(db, coll, op, state).await
+    }
+
+    async fn verify(&self, coll: &Collection, state: &Mutex<Acct>, faults_enabled: bool) {
+        let expected = expected_increments(self);
+        let mut finals = vec![0i64; KEY_COUNT];
+        for (k, slot) in finals.iter_mut().enumerate() {
+            *slot = read_int(&coll.read(&key_name(k)).await.expect("final read"));
+        }
+        let acct = state.lock().unwrap();
+        assert_bounds(&acct, &finals, &expected, faults_enabled);
     }
 }
 
@@ -923,125 +1044,74 @@ async fn read_ring_snapshot(
     .await
 }
 
-/// Runs a client's swaps in order. Returns the number consumed: `swaps.len()` if
-/// all succeeded, or `i + 1` if swap `i` failed (left for recovery rather than
-/// replayed on restart).
-async fn run_cycle_client(
-    db: &Database,
-    coll: &Collection,
-    swaps: &[usize],
-    consumed: &AtomicUsize,
-) -> usize {
-    for (i, r) in swaps.iter().enumerate() {
-        consumed.store(i + 1, Ordering::SeqCst);
-        if cycle_swap(db, coll, *r).await.is_err() {
-            return i + 1;
-        }
+impl SimWorkload for CycleWorkload {
+    type Op = usize;
+    type State = ();
+
+    const COLLECTION: &'static [u8] = CYCLE_COLLECTION;
+
+    fn clients(&self) -> &[Vec<usize>] {
+        &self.clients
     }
-    consumed.store(swaps.len(), Ordering::SeqCst);
-    swaps.len()
-}
 
-/// Opens the Database on `backend`, runs `swaps`, and closes it. Records swaps
-/// consumed in `consumed` (see [`run_cycle_client`]); leaves it at `0` if the
-/// open itself failed.
-async fn open_and_run_cycle(backend: &Arc<dyn Backend>, swaps: &[usize], consumed: &AtomicUsize) {
-    let Ok(db) = open_det_db(backend).await else {
-        return;
-    };
-    let coll = db.collection(CYCLE_COLLECTION);
-    let _ = run_cycle_client(&db, &coll, swaps, consumed).await;
-    db.shutdown().await;
-}
+    fn new_state(&self) {}
 
-/// Core Cycle harness: lay down the ring, run the clients as interleaved tasks
-/// under the (optional) fault nemesis, then assert the ring invariant. Mirrors
-/// [`run_inner`], reusing the same backbone, transports, and nemeses. Always
-/// records the backend op stream and returns it for determinism comparison.
-async fn run_cycle_inner(
-    workload: CycleWorkload,
-    faults: FaultConfig,
-    seed: u64,
-    fault_tape: Vec<u8>,
-) -> OpLog {
-    let node_count = workload.node_count;
-    let snapshot_reads = workload.snapshot_reads;
-    let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
-
-    let (backbone, log) = make_backbone();
-
-    // Initialize the collection and lay down the ring (key(i) -> (i + 1) % N)
-    // over the faultless backbone, so setup cannot fail spuriously.
-    let init_db = open_det_db(&backbone).await.expect("open init db");
-    let init_coll = init_db.collection(CYCLE_COLLECTION);
-    init_coll.create().await.expect("create collection");
-    let seed_coll = &init_coll;
-    init_db
-        .tx(|tx| async move {
+    async fn seed(&self, db: &Database, coll: &Collection) {
+        // Lay down the ring (key(i) -> (i + 1) % N).
+        let node_count = self.node_count;
+        db.tx(|tx| async move {
             for k in 0..node_count {
-                write_next(&tx, seed_coll, k, (k + 1) % node_count)?;
+                write_next(&tx, coll, k, (k + 1) % node_count)?;
             }
             Ok(())
         })
         .await
         .expect("seed ring");
-
-    // One transport per client over the shared backbone.
-    let nclients = workload.clients.len();
-    let (transports, client_backends) =
-        build_transports(&backbone, faults, seed, &streams, nclients);
-
-    // Each client runs its swaps as its own task so the scheduler interleaves
-    // them; a crashed client restarts on the same backend to finish its
-    // remaining swaps, recovering its own orphaned locks via lease expiry.
-    // On a clean run the Database is gracefully shut down (drain in-flight + dedup
-    // owners); on a crash we drop the Database without shutdown — that's the
-    // in-Rust analog of process death and the whole point of the crash
-    // nemesis. `Background::drop` still aborts spawned background loops in
-    // both cases.
-    let mut handles = Vec::with_capacity(nclients);
-    let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
-    for (swaps, backend) in workload.clients.into_iter().zip(client_backends) {
-        let signal = CancellationToken::new();
-        signals.push(signal.clone());
-        handles.push(rt::spawn(async move {
-            let consumed = Arc::new(AtomicUsize::new(0));
-            let crashed = {
-                let Ok(db) = open_det_db(&backend).await else {
-                    return;
-                };
-                let coll = db.collection(CYCLE_COLLECTION);
-                let crashed = tokio::select! {
-                    biased;
-                    _ = signal.cancelled() => true,
-                    _ = run_cycle_client(&db, &coll, &swaps, &consumed) => false,
-                };
-                if !crashed {
-                    db.shutdown().await;
-                }
-                crashed
-            };
-            let n = consumed.load(Ordering::SeqCst);
-            if crashed && n < swaps.len() {
-                let dummy = AtomicUsize::new(0);
-                open_and_run_cycle(&backend, &swaps[n..], &dummy).await;
-            }
-        }));
     }
 
-    // A concurrent read-only observer: while the swaps mutate the ring it
-    // snapshots all N pointers in one transaction (concurrent reads, unlike the
-    // swaps' dependent walk) and asserts the snapshot is itself a valid ring. A
-    // committed read-only tx sees exactly one committed state under serializable
-    // isolation, and every committed ring state is valid, so a torn snapshot that
-    // still committed is a read-isolation bug `assert_ring` will catch. Runs on
-    // the faultless backbone so it stays a reliable observer regardless of the
-    // per-client transport faults. A panic here propagates out of the run, just
-    // like the final verification.
-    let reader = (snapshot_reads > 0).then(|| {
+    async fn run_op(
+        db: &Database,
+        coll: &Collection,
+        op: &usize,
+        _state: &(),
+    ) -> Result<(), Error> {
+        cycle_swap(db, coll, *op).await
+    }
+
+    async fn verify(&self, coll: &Collection, _state: &(), _faults_enabled: bool) {
+        // Read every node's final next-pointer and assert the ring is still a
+        // single N-cycle. The invariant holds whether or not faults occurred,
+        // since each swap is atomic.
+        let node_count = self.node_count;
+        let mut next = vec![0usize; node_count];
+        for (k, slot) in next.iter_mut().enumerate() {
+            *slot = read_int(&coll.read(&key_name(k)).await.expect("final read")) as usize;
+        }
+        assert_ring(&next);
+    }
+
+    fn spawn_observer(
+        &self,
+        backbone: &Arc<dyn Backend>,
+        _state: &Arc<()>,
+    ) -> Option<rt::JoinHandle<()>> {
+        // A concurrent read-only observer: while the swaps mutate the ring it
+        // snapshots all N pointers in one transaction (concurrent reads, unlike
+        // the swaps' dependent walk) and asserts the snapshot is itself a valid
+        // ring. A committed read-only tx sees exactly one committed state under
+        // serializable isolation, and every committed ring state is valid, so a
+        // torn snapshot that still committed is a read-isolation bug `assert_ring`
+        // will catch. Runs on the faultless backbone so it stays a reliable
+        // observer regardless of the per-client transport faults. A panic here
+        // propagates out of the run, just like the final verification.
+        if self.snapshot_reads == 0 {
+            return None;
+        }
+        let node_count = self.node_count;
+        let snapshot_reads = self.snapshot_reads;
         let backbone = backbone.clone();
-        rt::spawn(async move {
-            let Ok(db) = open_det_db(&backbone).await else {
+        Some(rt::spawn(async move {
+            let Ok(db) = open_det_db(&backbone, Self::split_policy()).await else {
                 return;
             };
             let coll = db.collection(CYCLE_COLLECTION);
@@ -1053,146 +1123,229 @@ async fn run_cycle_inner(
                 }
             }
             db.shutdown().await;
-        })
-    });
-
-    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
-
-    for h in handles {
-        let _ = h.await;
+        }))
     }
-    if let Some(h) = reader {
-        let _ = h.await;
+}
+
+// ===========================================================================
+// Membership workload (ADR-031 dynamic range sharding).
+//
+// Clients concurrently create (put) and delete keys and list the collection,
+// with a tiny split policy so a handful of keys grows the B-link tree — forcing
+// leaf and root splits, right-link traversal, and cross-leaf sorted listing. The
+// oracle is twofold: every committed listing must be strictly sorted and drawn
+// from the key universe (a structural invariant that always holds, even under
+// faults and mid-split), and the final key set must match the per-key membership
+// accounting (exactly with faults off; within the in-doubt bound otherwise).
+//
+// To keep the per-key membership accounting sound under concurrency, each client
+// owns a disjoint subset of the key universe (assigned by residue), so a key's
+// operations are totally ordered by its single owning client. Keys owned by
+// different clients still interleave and can share a leaf, so same-leaf
+// create/delete races and phantom prevention are still exercised.
+// ===========================================================================
+
+/// Size of the membership key universe. With the tiny split policy below a
+/// couple of live keys already overflow a leaf, so this is comfortably enough to
+/// drive multi-level splits.
+const MEMBERSHIP_KEYS: usize = 8;
+/// Collection the membership keys live in.
+const MEMBERSHIP_COLLECTION: &[u8] = b"members";
+
+/// Leaf/index soft caps tight enough that a few keys force splits: a two-entry
+/// leaf is at the cap and a third overflows it, and any three-child index
+/// overflows. Mirrors the `tiny` policy the splitter's own unit tests use.
+fn membership_split_policy() -> SplitPolicy {
+    SplitPolicy {
+        leaf_max_entries: 2,
+        leaf_max_bytes: 1 << 20,
+        index_max_children: 2,
     }
-    if let Some(h) = crash {
-        let _ = h.await;
+}
+
+/// A single membership operation on one key of the universe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembOp {
+    /// Create or overwrite the key (making it live).
+    Put(usize),
+    /// Delete the key (making it not live).
+    Delete(usize),
+    /// List the collection's keys and assert the listing is well-formed.
+    List,
+}
+
+/// A membership workload: one op sequence per client. Each client owns a
+/// disjoint subset of `0..MEMBERSHIP_KEYS` (keys `k` with `k % nclients == i`),
+/// so every key is mutated by a single client and its op history is totally
+/// ordered. Clients run concurrently.
+#[derive(Debug, Clone, Default)]
+pub struct MembershipWorkload {
+    /// Per-client op sequences.
+    pub clients: Vec<Vec<MembOp>>,
+}
+
+impl<'a> Arbitrary<'a> for MembershipWorkload {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        // At least two clients so there is something to interleave.
+        let nclients = 2 + (u.arbitrary::<u8>()? as usize % (MAX_CLIENTS - 1));
+        let mut clients = Vec::with_capacity(nclients);
+        for i in 0..nclients {
+            // This client's disjoint slice of the key universe. Non-empty since
+            // MEMBERSHIP_KEYS >= MAX_CLIENTS >= nclients.
+            let my_keys: Vec<usize> = (0..MEMBERSHIP_KEYS).filter(|k| k % nclients == i).collect();
+            let nops = u.arbitrary::<u8>()? as usize % (MAX_OPS_PER_CLIENT + 1);
+            let mut ops = Vec::with_capacity(nops);
+            for _ in 0..nops {
+                let key = |u: &mut Unstructured<'a>| -> arbitrary::Result<usize> {
+                    Ok(my_keys[u.arbitrary::<u8>()? as usize % my_keys.len()])
+                };
+                ops.push(match u.arbitrary::<u8>()? % 3 {
+                    0 => MembOp::Put(key(u)?),
+                    1 => MembOp::Delete(key(u)?),
+                    _ => MembOp::List,
+                });
+            }
+            clients.push(ops);
+        }
+        Ok(MembershipWorkload { clients })
     }
-    if let Some(h) = outage {
-        let _ = h.await;
+}
+
+/// Per-key membership accounting. `committed[k]` is the definite liveness from
+/// acknowledged ops; `pending[k]` is the ambiguous outcome of an in-flight op
+/// (set before the op runs, cleared on ack), i.e. the in-doubt case a fault can
+/// leave behind.
+pub struct MembershipAcct {
+    committed: Vec<bool>,
+    pending: Vec<Option<bool>>,
+}
+
+impl MembershipAcct {
+    fn new() -> Self {
+        MembershipAcct {
+            committed: vec![false; MEMBERSHIP_KEYS],
+            pending: vec![None; MEMBERSHIP_KEYS],
+        }
     }
 
-    // Heal every transport before verifying so recovery reads cannot fail.
-    for t in &transports {
-        t.set_active(false);
+    /// Marks key `k`'s in-flight op (outcome `live`) as started but unconfirmed.
+    /// If a crash or lost ack leaves it in-doubt, this pending outcome is what
+    /// [`verify`](MembershipWorkload::verify) tolerates.
+    fn begin(&mut self, k: usize, live: bool) {
+        self.pending[k] = Some(live);
     }
 
-    // Read every node's final next-pointer (driving recovery of any crashed
-    // client's locks via lease expiry) and assert the ring is still intact.
-    let mut next = vec![0usize; node_count];
-    for (k, slot) in next.iter_mut().enumerate() {
-        *slot = read_int(&init_coll.read(&key_name(k)).await.expect("final read")) as usize;
+    /// Confirms key `k`'s op committed: its outcome is now definite and no
+    /// longer in-doubt.
+    fn commit(&mut self, k: usize, live: bool) {
+        self.committed[k] = live;
+        self.pending[k] = None;
     }
-    init_db.shutdown().await;
-
-    assert_ring(&next);
-    log
 }
 
-/// Runs a Cycle `workload` over a fresh in-memory ring and asserts the ring
-/// invariant, without injecting faults.
-pub async fn run_cycle_and_assert(workload: CycleWorkload) {
-    run_cycle_inner(workload, FaultConfig::none(), 0, Vec::new()).await;
+/// Asserts a committed listing is well-formed: strictly increasing (hence sorted
+/// and duplicate-free) and drawn entirely from the key universe. Holds for every
+/// committed listing regardless of faults or in-progress splits, since a listing
+/// commits only as a consistent serializable snapshot.
+fn assert_valid_listing(keys: &[Vec<u8>]) {
+    let universe: Vec<Vec<u8>> = (0..MEMBERSHIP_KEYS).map(key_name).collect();
+    for w in keys.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "listing not strictly sorted: {:?} !< {:?}",
+            w[0],
+            w[1]
+        );
+    }
+    for k in keys {
+        assert!(universe.contains(k), "listing contains unknown key {k:?}");
+    }
 }
 
-/// Like [`run_cycle_and_assert`] but injects backend faults and client crashes
-/// per `faults`. The ring invariant holds regardless of how many swaps commit,
-/// since each swap is atomic. `fault_tape` guides the fault schedule; it falls
-/// back to `seed` once spent.
-pub async fn run_cycle_and_assert_with_faults(
-    workload: CycleWorkload,
-    faults: FaultConfig,
-    seed: u64,
-    fault_tape: Vec<u8>,
-) {
-    run_cycle_inner(workload, faults, seed, fault_tape).await;
-}
+impl SimWorkload for MembershipWorkload {
+    type Op = MembOp;
+    type State = Mutex<MembershipAcct>;
 
-/// Like [`run_cycle_and_assert`] but records the ordered backend op stream and
-/// returns the log, for byte-for-byte determinism comparison across runs.
-pub async fn run_cycle_and_record(workload: &CycleWorkload) -> OpLog {
-    run_cycle_inner(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
-}
+    const COLLECTION: &'static [u8] = MEMBERSHIP_COLLECTION;
 
-/// Like [`run_cycle_and_record`] but with fault injection enabled per `faults`.
-pub async fn run_cycle_and_record_with_faults(
-    workload: &CycleWorkload,
-    faults: FaultConfig,
-    seed: u64,
-    fault_tape: Vec<u8>,
-) -> OpLog {
-    run_cycle_inner(workload.clone(), faults, seed, fault_tape).await
-}
+    fn clients(&self) -> &[Vec<MembOp>] {
+        &self.clients
+    }
 
-/// Decodes one libFuzzer input for the `cycle` target and runs it on the
-/// deterministic executor, asserting the ring invariant. Panics on any
-/// violation. Shared by the fuzz target and the corpus-replay test so the two
-/// can never diverge.
-#[cfg(sim)]
-pub fn replay_cycle_input(data: &[u8]) {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-    } = decode_fuzz_input::<CycleWorkload>(data);
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
-        run_cycle_and_assert_with_faults(workload, faults, seed, fault_tape).await
-    });
-}
+    fn new_state(&self) -> Mutex<MembershipAcct> {
+        Mutex::new(MembershipAcct::new())
+    }
 
-/// Decodes one Cycle libFuzzer input exactly as [`replay_cycle_input`] does,
-/// runs it, and returns the recorded backend op stream for byte-identical
-/// corpus replay checks.
-#[cfg(sim)]
-pub fn record_cycle_input(data: &[u8]) -> Vec<OpRecord> {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-    } = decode_fuzz_input::<CycleWorkload>(data);
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
-        let log = run_cycle_and_record_with_faults(&workload, faults, seed, fault_tape).await;
-        let recorded = log.lock().unwrap();
-        recorded.clone()
-    })
-}
+    fn split_policy() -> SplitPolicy {
+        membership_split_policy()
+    }
 
-/// Runs a Cycle `workload` once under a PCT schedule seeded by `seed`, asserting
-/// the ring invariant. Panics on any violation.
-#[cfg(sim)]
-pub fn cycle_pct_assert(workload: &CycleWorkload, faults: FaultConfig, seed: u64) {
-    let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
-        seed,
-        async move { run_cycle_and_assert_with_faults(w, faults, seed, Vec::new()).await },
-    );
-}
+    async fn seed(&self, _db: &Database, _coll: &Collection) {
+        // The collection starts empty; the harness has already created it.
+    }
 
-/// Runs a Cycle `workload` under a PCT schedule and returns the recorded backend
-/// op stream, for per-seed determinism comparison.
-#[cfg(sim)]
-pub fn cycle_pct_record(workload: &CycleWorkload, faults: FaultConfig, seed: u64) -> OpLog {
-    let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
-        seed,
-        async move { run_cycle_and_record_with_faults(&w, faults, seed, Vec::new()).await },
-    )
-}
+    async fn run_op(
+        db: &Database,
+        coll: &Collection,
+        op: &MembOp,
+        state: &Mutex<MembershipAcct>,
+    ) -> Result<(), Error> {
+        match op {
+            MembOp::Put(k) => {
+                // Record the intended outcome before the op so a crash mid-commit
+                // leaves it correctly in-doubt (the store may or may not reflect
+                // it), mirroring the increment harness's started-before/acked-after.
+                state.lock().unwrap().begin(*k, true);
+                let kn = &key_name(*k);
+                db.tx(|tx| async move { tx.write(coll, kn, b"1") }).await?;
+                state.lock().unwrap().commit(*k, true);
+                Ok(())
+            }
+            MembOp::Delete(k) => {
+                state.lock().unwrap().begin(*k, false);
+                let kn = &key_name(*k);
+                db.tx(|tx| async move { tx.delete(coll, kn) }).await?;
+                state.lock().unwrap().commit(*k, false);
+                Ok(())
+            }
+            MembOp::List => {
+                let keys: Vec<Vec<u8>> = coll.keys().await?.collect::<Result<_, _>>()?;
+                assert_valid_listing(&keys);
+                Ok(())
+            }
+        }
+    }
 
-/// Seed-breadth sweep over a Cycle `workload`: one PCT schedule per seed,
-/// asserting the ring invariant on each.
-#[cfg(sim)]
-pub fn cycle_pct_sweep(
-    workload: &CycleWorkload,
-    faults: FaultConfig,
-    seeds: impl IntoIterator<Item = u64>,
-) {
-    for seed in seeds {
-        cycle_pct_assert(workload, faults, seed);
+    async fn verify(&self, coll: &Collection, state: &Mutex<MembershipAcct>, faults_enabled: bool) {
+        let keys: Vec<Vec<u8>> = coll
+            .keys()
+            .await
+            .expect("final listing")
+            .collect::<Result<_, _>>()
+            .expect("final listing");
+        assert_valid_listing(&keys);
+
+        let acct = state.lock().unwrap();
+        for k in 0..MEMBERSHIP_KEYS {
+            let observed = keys.contains(&key_name(k));
+            let base = acct.committed[k];
+            match acct.pending[k] {
+                None => assert_eq!(
+                    observed, base,
+                    "key k{k}: listed={observed} but last committed op set live={base}"
+                ),
+                Some(alt) => {
+                    assert!(
+                        faults_enabled,
+                        "key k{k}: an op was left in-doubt with faults disabled"
+                    );
+                    assert!(
+                        observed == base || observed == alt,
+                        "key k{k}: listed={observed} outside in-doubt bound \
+                         (committed={base}, pending={alt})"
+                    );
+                }
+            }
+        }
     }
 }

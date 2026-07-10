@@ -32,6 +32,10 @@ pub use iter::{CollectionsIter, KeysIter};
 pub use stats::Stats;
 pub use tx::Transaction;
 
+// The split soft-cap policy, so callers can tune when a collection's B-link
+// tree splits (see [`DatabaseBuilder::split_policy`]).
+pub use glassdb_storage::SplitPolicy;
+
 // Re-export the backend abstraction so callers can construct a Database without
 // depending on the backend crate directly.
 pub use glassdb_backend::{self as backend, Backend, memory, middleware};
