@@ -346,6 +346,27 @@ impl ShardStore {
             Err(e) => Err(e),
         }
     }
+
+    /// Records subcollection `name` in the directory of the parent root at
+    /// `parent_prefix`, compare-and-swapping the root until the change lands.
+    ///
+    /// Idempotent: if `name` is already present the root is left untouched.
+    /// Returns [`StorageError::NotFound`] if the parent root does not exist.
+    pub async fn register_subcollection(
+        &self,
+        parent_prefix: &str,
+        name: &[u8],
+    ) -> Result<(), StorageError> {
+        loop {
+            let (mut root, version) = self.load_root(parent_prefix).await?;
+            if !root.add_subcollection(name.to_vec()) {
+                return Ok(());
+            }
+            if self.store_root(parent_prefix, &root, &version).await? {
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[cfg(test)]

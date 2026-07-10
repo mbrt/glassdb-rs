@@ -3,7 +3,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_backend::Backend;
 use glassdb_data::paths;
 use glassdb_storage::CollectionRoot;
 use glassdb_trans::Reader;
@@ -96,12 +95,14 @@ impl Collection {
     /// Ensures the collection exists, creating it if necessary.
     pub async fn create(&self) -> Result<(), Error> {
         let root = CollectionRoot::new();
-        self.db
-            .shards
-            .create_root(&self.prefix, &root)
-            .await
-            .map(|_| ())
-            .map_err(Error::from)
+        self.db.shards.create_root(&self.prefix, &root).await?;
+        if let Some((parent, name)) = paths::parent_collection(&self.prefix) {
+            self.db
+                .shards
+                .register_subcollection(&parent, &name)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Returns an iterator over the keys in the collection.
@@ -120,16 +121,14 @@ impl Collection {
         Ok(KeysIter::new(keys))
     }
 
-    /// Returns an iterator over the sub-collections in this collection.
+    /// Returns an iterator over the sub-collections in this collection, in name
+    /// order.
+    ///
+    /// Listing a collection that does not exist returns [`Error::NotFound`].
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
-        let cprefix = paths::collections_prefix(&self.prefix);
-        let items = self
-            .db
-            .backend
-            .list(&cprefix)
-            .await
-            .map_err(|e| Error::from_read(e.into()))?;
-        Ok(CollectionsIter::new(items))
+        let (root, _version) = self.db.shards.load_root(&self.prefix).await?;
+        let names: Vec<Vec<u8>> = root.subcollections().map(<[u8]>::to_vec).collect();
+        Ok(CollectionsIter::new(names))
     }
 
     pub(crate) fn new(prefix: String, db: Arc<DbInner>) -> Self {

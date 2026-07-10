@@ -125,6 +125,24 @@ pub fn collections_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Collection)
 }
 
+/// Splits a collection `prefix` into its parent collection prefix and this
+/// collection's decoded name, but only when the parent is *itself* a collection
+/// (and thus owns a root `_i` that holds a subcollection directory).
+///
+/// A top-level collection's parent is the database, which has no root, so this
+/// returns `None`. It also returns `None` for any non-collection path.
+pub fn parent_collection(prefix: &str) -> Option<(String, Vec<u8>)> {
+    let pr = parse(prefix).ok()?;
+    if pr.typ != Type::Collection {
+        return None;
+    }
+    if parse(&pr.prefix).map(|p| p.typ) != Ok(Type::Collection) {
+        return None;
+    }
+    let name = base64::decode(&pr.suffix).ok()?;
+    Some((pr.prefix, name))
+}
+
 /// Encodes a transaction ID into a storage path under `prefix`.
 pub fn from_transaction(prefix: &str, id: &TxId) -> String {
     prefix_encode(prefix, Type::Transaction, id.as_bytes())
@@ -353,6 +371,31 @@ mod tests {
         assert_eq!(keys_prefix("db/coll"), "db/coll/_k/");
         assert_eq!(collections_prefix("db/coll"), "db/coll/_c/");
         assert_eq!(transactions_prefix("db"), "db/_t/");
+    }
+
+    #[test]
+    fn parent_collection_identifies_subcollection_owner() {
+        // A top-level collection's parent is the database, which owns no root.
+        assert_eq!(parent_collection(&from_collection("db", b"top")), None);
+
+        // A subcollection's parent is the collection that owns its directory.
+        let parent = from_collection("db", b"parent");
+        let child = from_collection(&parent, b"child");
+        assert_eq!(
+            parent_collection(&child),
+            Some((parent.clone(), b"child".to_vec()))
+        );
+
+        // Nesting composes: the owner is always the direct parent.
+        let grandchild = from_collection(&child, b"grandchild");
+        assert_eq!(
+            parent_collection(&grandchild),
+            Some((child, b"grandchild".to_vec()))
+        );
+
+        // Non-collection paths have no collection parent.
+        assert_eq!(parent_collection(&from_key("db/coll", b"k")), None);
+        assert_eq!(parent_collection("db"), None);
     }
 
     #[test]

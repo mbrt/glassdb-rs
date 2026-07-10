@@ -649,6 +649,59 @@ async fn list_collections() {
     assert_eq!(got, sorted);
 }
 
+async fn list_collections_of(coll: &Collection) -> Vec<Vec<u8>> {
+    coll.collections()
+        .await
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+// The subcollection directory lives in the parent root (ADR-031), so listing is
+// driven by that directory, not a backend prefix scan. A collection with no
+// children lists nothing, and re-creating the same child does not duplicate it.
+#[tokio::test(start_paused = true)]
+async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
+    let db = init_db(mem()).await;
+    let parent = db.collection(b"parent");
+    parent.create().await.unwrap();
+
+    // A freshly created collection has no subcollections.
+    assert!(list_collections_of(&parent).await.is_empty());
+
+    // Creating the same child twice registers it exactly once.
+    parent.collection(b"child").create().await.unwrap();
+    parent.collection(b"child").create().await.unwrap();
+    assert_eq!(list_collections_of(&parent).await, vec![b"child".to_vec()]);
+}
+
+// Subcollection listing is scoped to the direct parent: a grandchild shows up
+// only in its own parent's directory, never in the grandparent's.
+#[tokio::test(start_paused = true)]
+async fn subcollection_listing_is_scoped_to_direct_parent() {
+    let db = init_db(mem()).await;
+    let parent = db.collection(b"parent");
+    parent.create().await.unwrap();
+    let child = parent.collection(b"child");
+    child.create().await.unwrap();
+    child.collection(b"grandchild").create().await.unwrap();
+
+    assert_eq!(list_collections_of(&parent).await, vec![b"child".to_vec()]);
+    assert_eq!(
+        list_collections_of(&child).await,
+        vec![b"grandchild".to_vec()]
+    );
+}
+
+// Listing a collection that was never created has no root to own the directory,
+// so it surfaces as not found rather than an empty listing.
+#[tokio::test(start_paused = true)]
+async fn listing_a_missing_collection_is_not_found() {
+    let db = init_db(mem()).await;
+    let missing = db.collection(b"missing");
+    assert!(matches!(missing.collections().await, Err(Error::NotFound)));
+}
+
 #[tokio::test(start_paused = true)]
 async fn builder_custom_options() {
     use std::time::Duration;
