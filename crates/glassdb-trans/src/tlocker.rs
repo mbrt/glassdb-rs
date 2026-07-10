@@ -657,10 +657,6 @@ impl Locker {
     /// [`LockOutcome::Conflict`] when a CAS race was lost and the caller must
     /// release and re-lock under the same id.
     ///
-    /// Read validation is **not** done here. The engine ([`super::algo::Algo`])
-    /// validates reads *after* every touched key is locked and its value frozen
-    /// (ADR-024); the locker is a pure locking mechanism.
-    ///
     /// `serial` selects the sorted sequential fallback over the default parallel
     /// path (ADR-020).
     pub(crate) async fn lock(

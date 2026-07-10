@@ -43,7 +43,7 @@ use glassdb_storage::{
 };
 
 use crate::error::TransError;
-use crate::shard_coord::ShardCoordinator;
+use crate::shard_coord::SplitHinter;
 
 /// How often the splitter drains its candidate queue. A split is a handful of
 /// CAS round-trips, so a tight cadence keeps overflowing leaves short-lived; the
@@ -77,17 +77,15 @@ pub(crate) struct PendingSeparator {
     new_token: String,
 }
 
-/// The shared feed of leaves that may need splitting (ADR-031). The coordinator
-/// pushes a leaf's path here right after storing it over the soft cap; the
-/// [`Splitter`] drains and re-checks. Cloneable: producer (coordinator) and
-/// consumer (splitter) hold the same queue and policy.
+/// The feed of leaves that may need splitting (ADR-031), owned by the
+/// [`Splitter`]. A handle is handed to the coordinator behind the
+/// [`SplitHinter`] seam: it pushes a leaf's path right after storing it over
+/// the soft cap, and the splitter drains and re-checks. Cloneable (all fields
+/// `Arc`), so the producer handle and the splitter share one queue and policy.
 #[derive(Clone)]
 pub(crate) struct SplitCandidates {
     policy: SplitPolicy,
     queue: Arc<Mutex<VecDeque<String>>>,
-    // Separators a split could not publish on the first try; re-driven each
-    // sweep so the parent index eventually learns them (ADR-031).
-    pending: Arc<Mutex<VecDeque<PendingSeparator>>>,
 }
 
 impl SplitCandidates {
@@ -96,45 +94,12 @@ impl SplitCandidates {
         SplitCandidates {
             policy,
             queue: Arc::new(Mutex::new(VecDeque::new())),
-            pending: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     /// The soft-cap policy shared by the feed and the splitter.
     pub(crate) fn policy(&self) -> &SplitPolicy {
         &self.policy
-    }
-
-    /// Records that `path`'s leaf, now holding `entries`, may be a split
-    /// candidate: over either the entry-count or the encoded-byte soft cap. A
-    /// node needs at least two entries to be divisible, so a single hot key is
-    /// never enqueued however large. The byte size is a hint the splitter
-    /// re-checks authoritatively against the full node (which adds a little
-    /// framing), so this need not account for it. The oldest hint is dropped
-    /// when the queue is full.
-    pub(crate) fn observe_leaf(&self, path: &str, entries: &Shard) {
-        let over_cap = entries.len() >= 2
-            && (entries.len() > self.policy.leaf_max_entries
-                || entries.encoded_len() > self.policy.leaf_max_bytes);
-        if !over_cap {
-            return;
-        }
-        let mut q = self.queue.lock().unwrap();
-        if q.len() >= CANDIDATE_QUEUE_CAP {
-            q.pop_front();
-        }
-        q.push_back(path.to_string());
-    }
-
-    /// Queues a separator whose parent insert must be re-driven by a later
-    /// sweep. The oldest is dropped when full: descent still works via
-    /// right-links, so a dropped retry only defers directory compaction.
-    pub(crate) fn push_pending_separator(&self, sep: PendingSeparator) {
-        let mut p = self.pending.lock().unwrap();
-        if p.len() >= CANDIDATE_QUEUE_CAP {
-            p.pop_front();
-        }
-        p.push_back(sep);
     }
 
     /// Drains every queued candidate, de-duplicated, for one sweep cycle.
@@ -149,10 +114,28 @@ impl SplitCandidates {
         }
         out
     }
+}
 
-    /// Drains the pending separators queued for re-driving this cycle.
-    fn drain_pending(&self) -> Vec<PendingSeparator> {
-        self.pending.lock().unwrap().drain(..).collect()
+impl SplitHinter for SplitCandidates {
+    /// Records that `path`'s leaf, now holding `entries`, may be a split
+    /// candidate: over either the entry-count or the encoded-byte soft cap. A
+    /// node needs at least two entries to be divisible, so a single hot key is
+    /// never enqueued however large. The byte size is a hint the splitter
+    /// re-checks authoritatively against the full node (which adds a little
+    /// framing), so this need not account for it. The oldest hint is dropped
+    /// when the queue is full.
+    fn observe_leaf(&self, path: &str, entries: &Shard) {
+        let over_cap = entries.len() >= 2
+            && (entries.len() > self.policy.leaf_max_entries
+                || entries.encoded_len() > self.policy.leaf_max_bytes);
+        if !over_cap {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if q.len() >= CANDIDATE_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(path.to_string());
     }
 }
 
@@ -166,18 +149,26 @@ pub struct Splitter {
     bg: Weak<Background>,
     shards: ShardStore,
     dir: Directory,
+    // The leaf-candidate feed this splitter owns and drains. The coordinator
+    // fills it through the [`SplitHinter`] seam (see [`Splitter::hinter`]); a
+    // clone here and behind the seam share one queue.
     candidates: SplitCandidates,
+    // Separators a split could not publish on the first try; re-driven each
+    // sweep so the parent index eventually learns them (ADR-031). Purely
+    // splitter-internal — the coordinator never sees it.
+    pending: Arc<Mutex<VecDeque<PendingSeparator>>>,
 }
 
 impl Splitter {
-    /// Creates a splitter that drains `coord`'s split-candidate feed (sharing its
-    /// soft-cap policy) and mutates the tree through `shards`.
-    pub fn new(bg: Weak<Background>, shards: ShardStore, coord: &ShardCoordinator) -> Self {
-        Splitter::with_candidates(bg, shards, coord.split_candidates())
+    /// Creates a splitter over `shards` with the default soft-cap policy,
+    /// owning the candidate feed the coordinator fills through
+    /// [`hinter`](Self::hinter).
+    pub fn new(bg: Weak<Background>, shards: ShardStore) -> Self {
+        Splitter::with_candidates(bg, shards, SplitCandidates::new(SplitPolicy::default()))
     }
 
     /// Creates a splitter over an explicit candidate feed. Lets a test drive the
-    /// splitter with a tiny soft-cap policy independent of a coordinator.
+    /// splitter with a tiny soft-cap policy.
     fn with_candidates(
         bg: Weak<Background>,
         shards: ShardStore,
@@ -189,7 +180,32 @@ impl Splitter {
             shards,
             dir,
             candidates,
+            pending: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    /// A [`SplitHinter`] handle for the coordinator to report over-cap leaf
+    /// writes into this splitter's queue (ADR-031). The returned handle shares
+    /// this splitter's queue and soft-cap policy, so the coordinator depends
+    /// only on the seam, never on the candidate feed's type.
+    pub fn hinter(&self) -> Arc<dyn SplitHinter> {
+        Arc::new(self.candidates.clone())
+    }
+
+    /// Queues a separator whose parent insert must be re-driven by a later
+    /// sweep. The oldest is dropped when full: descent still works via
+    /// right-links, so a dropped retry only defers directory compaction.
+    fn push_pending_separator(&self, sep: PendingSeparator) {
+        let mut p = self.pending.lock().unwrap();
+        if p.len() >= CANDIDATE_QUEUE_CAP {
+            p.pop_front();
+        }
+        p.push_back(sep);
+    }
+
+    /// Drains the pending separators queued for re-driving this cycle.
+    fn drain_pending(&self) -> Vec<PendingSeparator> {
+        self.pending.lock().unwrap().drain(..).collect()
     }
 
     /// Starts the background split loop on the [`Background`] executor: one sweep
@@ -219,7 +235,7 @@ impl Splitter {
         }
         // Re-drive separators a previous cycle could not publish, so the parent
         // index eventually learns them and descent stops relying on right-links.
-        for sep in self.candidates.drain_pending() {
+        for sep in self.drain_pending() {
             if let Err(e) = self
                 .publish_separators(&sep.prefix, &sep.split_key, &sep.new_token)
                 .await
@@ -406,7 +422,7 @@ impl Splitter {
         }
         // Exhausted the retries: re-queue so a later sweep re-drives the
         // publication. Descent keeps working through right-links meanwhile.
-        self.candidates.push_pending_separator(PendingSeparator {
+        self.push_pending_separator(PendingSeparator {
             prefix: prefix.to_string(),
             split_key: split_key.to_vec(),
             new_token: new_token.to_string(),

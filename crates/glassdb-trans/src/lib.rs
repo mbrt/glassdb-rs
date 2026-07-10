@@ -19,7 +19,7 @@ pub use gc::Gc;
 pub use monitor::Monitor;
 pub use reader::{ReadValue, Reader};
 pub use resolver::{Resolver, ScanResult};
-pub use shard_coord::ShardCoordinator;
+pub use shard_coord::{ShardCoordinator, SplitHinter};
 pub use split::Splitter;
 pub use tlocker::{Locker, TxLockSnapshot};
 

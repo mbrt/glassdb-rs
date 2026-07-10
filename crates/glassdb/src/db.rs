@@ -103,8 +103,6 @@ impl DatabaseBuilder {
         let cache = SharedCache::new(cache_size);
         let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(dyn_backend, &cache);
-        // The shard/root coordination store reads/writes through the object
-        // cache, so a hot shard revalidates without re-transferring its body.
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
@@ -127,7 +125,17 @@ impl DatabaseBuilder {
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        let coord = ShardCoordinator::new(shards.clone(), resolver.clone(), tmon.clone(), retry);
+        // Build the splitter first so the coordinator can report over-cap leaf
+        // writes into its queue through the SplitHinter seam (ADR-031); the
+        // coordinator never names the splitter or its candidate feed.
+        let splitter = Splitter::new(bg_weak.clone(), shards.clone());
+        let coord = ShardCoordinator::with_hinter(
+            shards.clone(),
+            resolver.clone(),
+            tmon.clone(),
+            retry,
+            splitter.hinter(),
+        );
         let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
         let gc = Gc::new(
             bg_weak.clone(),
@@ -139,9 +147,7 @@ impl DatabaseBuilder {
             &name,
         );
         gc.start();
-        // Background growth: halve leaves that cross the soft cap, fed by the
-        // coordinator as it writes (ADR-031).
-        Splitter::new(bg_weak.clone(), shards.clone(), &coord).start();
+        splitter.start();
         let algo = Algo::new(
             values.clone(),
             locker.clone(),

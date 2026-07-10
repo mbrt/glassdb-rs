@@ -35,12 +35,11 @@ use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
 };
 use glassdb_data::TxId;
-use glassdb_storage::{Freshness, LockType, ShardEntry, ShardStore, StorageError};
+use glassdb_storage::{Freshness, LockType, Shard, ShardEntry, ShardStore, StorageError};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::resolver::Resolver;
-use crate::split::SplitCandidates;
 
 /// Maximum inner CAS retries on a single shard/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -224,6 +223,28 @@ impl MergeRequest for CasReq {
     }
 }
 
+/// Sink for the leaf-write events the coordinator emits on its CAS path, so a
+/// background growth policy can decide whether to split (ADR-031). The
+/// coordinator depends only on this seam — never on the splitter's queue: it
+/// reports the leaf it just stored and knows nothing of soft caps. The
+/// [`Splitter`](crate::Splitter) supplies the implementation; a coordinator
+/// with none attached uses [`NoSplitHints`].
+pub trait SplitHinter: Send + Sync {
+    /// Notes that `path`'s leaf was just stored holding `shard`. Best-effort: a
+    /// spurious call only costs the splitter a reload and re-check, so the
+    /// coordinator never blocks on it.
+    fn observe_leaf(&self, path: &str, shard: &Shard);
+}
+
+/// The default [`SplitHinter`] that drops every hint: for a coordinator with no
+/// background splitter attached (tests, tools). Leaf growth is never observed,
+/// so the tree only ever grows through an explicitly wired splitter.
+pub(crate) struct NoSplitHints;
+
+impl SplitHinter for NoSplitHints {
+    fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+}
+
 /// State shared by the [`ShardCoordinator`] and its dedup [`CasWorker`]: the
 /// storage handles, retry config, and stats.
 struct CoordCore {
@@ -232,10 +253,10 @@ struct CoordCore {
     resolver: Resolver,
     retry: RetryConfig,
     stats: Stats,
-    // Split-candidate feed: leaves a store just pushed over the soft cap, drained
-    // by the background [`Splitter`](crate::Splitter) (ADR-031). Populated on the
-    // write path so growth needs no key-space enumeration.
-    candidates: SplitCandidates,
+    // Where over-cap leaf writes are reported (ADR-031): the background
+    // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
+    // Emitted on the write path so growth needs no key-space enumeration.
+    hinter: Arc<dyn SplitHinter>,
 }
 
 struct CoordState {
@@ -363,7 +384,7 @@ impl CasWorker {
                     // Hint the background splitter if this write left the leaf
                     // over the soft cap (ADR-031); the splitter reloads and
                     // re-checks, so a spurious hint only costs one load.
-                    Ok(true) => self.core.candidates.observe_leaf(path, &new_shard),
+                    Ok(true) => self.core.hinter.observe_leaf(path, &new_shard),
                     // Precondition: the shard changed under us; reload and
                     // re-fold. The change definitely landed, so commit-install
                     // re-classifies without in-doubt.
@@ -433,25 +454,32 @@ impl ShardCoordinator {
     /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
     /// between hold-and-wait re-polls of a conflicting holder.
     pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
+        Self::with_hinter(shards, resolver, tmon, retry, Arc::new(NoSplitHints))
+    }
+
+    /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
+    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). The
+    /// coordinator only emits leaf-write events; the soft-cap policy and the
+    /// candidate queue live behind the seam, so it never names the splitter.
+    pub fn with_hinter(
+        shards: ShardStore,
+        resolver: Resolver,
+        tmon: Monitor,
+        retry: RetryConfig,
+        hinter: Arc<dyn SplitHinter>,
+    ) -> Self {
         let core = Arc::new(CoordCore {
             tmon,
             shards,
             resolver,
             retry,
             stats: Stats::default(),
-            candidates: SplitCandidates::new(glassdb_storage::SplitPolicy::default()),
+            hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
         ShardCoordinator {
             inner: Arc::new(CoordState { core, dedup }),
         }
-    }
-
-    /// The split-candidate feed this coordinator populates as it writes leaves
-    /// (ADR-031). The background [`Splitter`](crate::Splitter) drains the same
-    /// handle; they share one soft-cap policy.
-    pub(crate) fn split_candidates(&self) -> SplitCandidates {
-        self.inner.core.candidates.clone()
     }
 
     /// Cancels in-flight coordination and awaits any spawned dedup owner tasks,
@@ -512,9 +540,13 @@ impl ShardCoordinator {
             first_freshness,
         };
         match self.inner.dedup.run(path, req).await {
-            Ok(()) => Ok(Some(
-                slot.lock().unwrap().take().unwrap_or(FoldOutcome::Conflict),
-            )),
+            // The worker deposits an outcome for every member before it returns
+            // `Ok` (the CAS-landed and exhaustion paths both fill every slot), so
+            // a completed round always leaves this member's slot filled — the
+            // engine never fabricates a policy outcome of its own.
+            Ok(()) => Ok(Some(slot.lock().unwrap().take().expect(
+                "the CAS worker deposits an outcome for every member on success",
+            ))),
             Err(DedupError::Work(e)) => Err((*e).clone()),
             Err(DedupError::Cancelled) => Ok(None),
         }
