@@ -58,16 +58,46 @@ CAS. Leaves are the shards; interior nodes are the range index.
   the leaf, read the leaf. If a node's high-key shows the key moved (a split raced
   the cache), **follow the right-sibling link** or re-descend from a refreshed
   `_i`. No central read on a cache hit.
-- **Split (grow)** — background; a lock-free half-split driven through the
-  shard-mutation coordinator; a root split grows height **in place** at `_i`
-  (protocol in [ADR-031](../adr/031-dynamic-range-sharding.md#split-grow-background-and-lock-free)).
+- **Split (grow)** — background; a root split grows height **in place** at `_i`.
+  A split takes the node **structure write lock** for priority and mutual
+  exclusion (wound-wait) but keeps ADR-031's **shrink-CAS linearization** and
+  right-link tolerance — it is coordinated, not atomically committed across its
+  objects ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). It holds
+  **one node's structure-W at a time**, releasing it right after the shrink CAS;
+  the parent separator is a separately-locked follow-on, so there is no lock chain
+  and no cross-level deadlock. Non-root index splits recurse upward the same way.
 - **Merge (shrink)** — deferred; the node format reserves sibling links and range
   bounds so it is addable without a format migration.
-- **Membership** — per-leaf: create/delete lock only the target leaf entry;
-  range listing OCC-validates covered leaves and follows right-links across
-  concurrent splits, escalating to per-leaf read locks under contention.
+- **Node locks** — two read/write locks per node beside the per-key entry locks:
+  a **structure** lock (data mutations _and_ escalated scans hold read;
+  split/merge holds write) and a **membership** lock (scans hold read;
+  create/delete hold write; overwrites/reads hold neither)
+  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). Pure reads take
+  neither, so the hot path stays lock-free. Because an escalated scan holds
+  structure-read, it conflicts with a split's structure-write, so no scanner lock
+  is transferred across a split.
+- **Membership** — per-leaf: create/delete take the node **membership write lock**
+  (serializing membership change within a leaf, mirroring v1's collection-level
+  lock at finer granularity) — this is also what distinguishes a delete from an
+  overwrite; overwrites take no membership lock and stay invisible to scans. Range
+  listing OCC-validates covered leaves by **status-aware resolution** of the live
+  key set (help-forwarding committed holders, so value writes and pure splits do
+  not disturb it and a committed-but-unpublished create is still seen); a per-leaf
+  **membership version** (bumped by membership-write activity only, not scanner-R
+  churn) is the fast-path token (equality is sound only when no observed
+  membership intent has since committed). A transaction with **any scan and any
+  write** must predicate-lock every scanned range and revalidate membership under
+  the lock before commit; a read-only scan stays on the OCC fast path and follows
+  right-links across concurrent splits
+  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
+  [ADR-033](../adr/033-transactional-key-iteration.md)).
 - **Wound-wait / leases / GC** — unchanged mechanisms at leaf/index granularity;
-  GC and recovery re-resolve a key's shard through the *current* topology.
+  GC and recovery re-resolve a key's shard through the *current* topology, and a
+  crash-orphaned split sibling is reclaimed from a **structural log entry**
+  recording the split's created node tokens — recovery keeps or deletes them by
+  proving **tree-reachability** (right-link chain, or root-split index entries),
+  with ambiguity resolved by retry, not deletion
+  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)).
 
 ## Tree shape
 
@@ -178,9 +208,21 @@ ADR — this overview and the diagrams above are the map into it.
 
 - **[ADR-031](../adr/031-dynamic-range-sharding.md) — Dynamic range-partitioned
   sharding (B-link tree).** *Proposed.* The umbrella decision: B-link object
-  model and encoding, cached self-correcting descent, the lock-free leaf split
-  and in-place root split, per-range membership and phantom prevention, and what
-  it supersedes/reuses.
+  model and encoding, cached self-correcting descent, the leaf split and in-place
+  root split, per-range membership and phantom prevention, and what it
+  supersedes/reuses. Its per-leaf read-lock escalation is superseded by ADR-032;
+  its lock-free split is refined (structure lock + priority) by ADR-032.
+- **[ADR-032](../adr/032-node-locking-and-coordinated-splits.md) — Node-level
+  locking and coordinated splits.** *Proposed.* The node structure/membership
+  read/write lock taxonomy (create/delete take the membership write lock),
+  splits coordinated by the structure write lock and wound-wait priority (keeping
+  ADR-031's shrink-CAS linearization), the membership version as OCC fast-path
+  token, structural-log orphan recovery, and the conditional progress guarantee
+  with a hard object-size cap. Supersedes ADR-031's read-lock escalation and
+  refines its split coordination.
+- **[ADR-033](../adr/033-transactional-key-iteration.md) — Transactional key
+  iteration.** *Proposed — deferred.* The range/scan API (half-open bounds,
+  keys-only, limit) and its OCC/lock isolation built on the ADR-032 taxonomy.
 
 Planned follow-on ADRs, as the open questions below resolve: merge/rebalance,
 split-point policy, and node fan-out/sizing.
@@ -191,6 +233,11 @@ split-point policy, and node fan-out/sizing.
   in-doubt recovery (format is reserved for it).
 - **Split-point policy.** Median-key vs load-aware; salting to mitigate the
   monotonic-insert hotspot.
+- **Hard object-size cap tuning.** ADR-032 settles the *invariant* — reserve
+  headroom `H` so a split can always install structure-W, hold the worst-case
+  holder/lock metadata, and encode its shrink CAS, rejecting over-cap creates with
+  a retryable error. Open here is the concrete value of `H`, whether an at-cap leaf
+  should also escalate split priority, and the interaction with foreground latency.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
   `AllowStale` seeding).
