@@ -1211,35 +1211,67 @@ impl<'a> Arbitrary<'a> for MembershipWorkload {
     }
 }
 
+/// The set of liveness outcomes an unacknowledged (in-doubt) op may have left in
+/// the store since the last acknowledged op on a key. Empty means no op is
+/// in-doubt. Because a key's ops are totally ordered by its single owning client
+/// but a crashed/failed op may or may not have reached the backend, several
+/// consecutive in-doubt ops can each independently be the last one that applied,
+/// so every one of their outcomes stays possible until an ack makes the value
+/// definite again.
+#[derive(Clone, Copy, Default)]
+struct PendingOutcomes {
+    live: bool,
+    dead: bool,
+}
+
+impl PendingOutcomes {
+    fn is_empty(self) -> bool {
+        !self.live && !self.dead
+    }
+
+    /// Whether the concrete outcome `observed` (live/not-live) is one of the
+    /// possible in-doubt outcomes.
+    fn allows(self, observed: bool) -> bool {
+        if observed { self.live } else { self.dead }
+    }
+}
+
 /// Per-key membership accounting. `committed[k]` is the definite liveness from
-/// acknowledged ops; `pending[k]` is the ambiguous outcome of an in-flight op
-/// (set before the op runs, cleared on ack), i.e. the in-doubt case a fault can
-/// leave behind.
+/// acknowledged ops; `pending[k]` is the set of ambiguous outcomes left by
+/// in-flight ops since the last ack (a possibility is added before each op runs,
+/// and the whole set is cleared on the next ack), i.e. the in-doubt cases a fault
+/// can leave behind.
 pub struct MembershipAcct {
     committed: Vec<bool>,
-    pending: Vec<Option<bool>>,
+    pending: Vec<PendingOutcomes>,
 }
 
 impl MembershipAcct {
     fn new() -> Self {
         MembershipAcct {
             committed: vec![false; MEMBERSHIP_KEYS],
-            pending: vec![None; MEMBERSHIP_KEYS],
+            pending: vec![PendingOutcomes::default(); MEMBERSHIP_KEYS],
         }
     }
 
     /// Marks key `k`'s in-flight op (outcome `live`) as started but unconfirmed.
-    /// If a crash or lost ack leaves it in-doubt, this pending outcome is what
-    /// [`verify`](MembershipWorkload::verify) tolerates.
+    /// If a crash or lost ack leaves it in-doubt, this outcome joins the set
+    /// [`verify`](MembershipWorkload::verify) tolerates. It *accumulates* rather
+    /// than replaces: a second in-doubt op on the same key keeps the earlier
+    /// op's outcome possible, since either may have been the one that applied.
     fn begin(&mut self, k: usize, live: bool) {
-        self.pending[k] = Some(live);
+        if live {
+            self.pending[k].live = true;
+        } else {
+            self.pending[k].dead = true;
+        }
     }
 
-    /// Confirms key `k`'s op committed: its outcome is now definite and no
-    /// longer in-doubt.
+    /// Confirms key `k`'s op committed: its outcome is now definite, which
+    /// resolves every earlier in-doubt op on the key, so the pending set clears.
     fn commit(&mut self, k: usize, live: bool) {
         self.committed[k] = live;
-        self.pending[k] = None;
+        self.pending[k] = PendingOutcomes::default();
     }
 }
 
@@ -1329,22 +1361,24 @@ impl SimWorkload for MembershipWorkload {
         for k in 0..MEMBERSHIP_KEYS {
             let observed = keys.contains(&key_name(k));
             let base = acct.committed[k];
-            match acct.pending[k] {
-                None => assert_eq!(
+            let pending = acct.pending[k];
+            if pending.is_empty() {
+                assert_eq!(
                     observed, base,
                     "key k{k}: listed={observed} but last committed op set live={base}"
-                ),
-                Some(alt) => {
-                    assert!(
-                        faults_enabled,
-                        "key k{k}: an op was left in-doubt with faults disabled"
-                    );
-                    assert!(
-                        observed == base || observed == alt,
-                        "key k{k}: listed={observed} outside in-doubt bound \
-                         (committed={base}, pending={alt})"
-                    );
-                }
+                );
+            } else {
+                assert!(
+                    faults_enabled,
+                    "key k{k}: an op was left in-doubt with faults disabled"
+                );
+                assert!(
+                    observed == base || pending.allows(observed),
+                    "key k{k}: listed={observed} outside in-doubt bound \
+                     (committed={base}, pending live={}, dead={})",
+                    pending.live,
+                    pending.dead,
+                );
             }
         }
     }
