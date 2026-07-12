@@ -2,7 +2,8 @@
 //! on stable (no nightly/cargo-fuzz/sanitizer). This is a regression guard:
 //! every input the fuzzer has ever found interesting must still satisfy its
 //! invariant (the serializability bound for `concurrent_tx`, the ring invariant
-//! for `cycle`, the sorted-listing + membership bound for `membership`).
+//! for `cycle`, the sorted-listing + membership bound for `membership`, and
+//! the modeled transaction-API states for `api_correctness`).
 //!
 //! Like the other simulation self-checks, this only builds under the in-repo
 //! deterministic executor with the `sim` harness feature:
@@ -15,7 +16,7 @@
 use std::path::PathBuf;
 
 use glassdb::middleware::{OpRecord, first_divergence};
-use glassdb::sim::{CycleWorkload, MembershipWorkload, Workload, record_input};
+use glassdb::sim::{ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_input};
 
 fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
     if let Some((idx, a, b)) = first_divergence(first, second) {
@@ -63,7 +64,7 @@ fn replay_committed_corpus(target: &str, replay: fn(&[u8]) -> Vec<OpRecord>) {
 
 #[test]
 fn replays_committed_corpus() {
-    replay_committed_corpus("concurrent_tx", record_input::<Workload>);
+    replay_committed_corpus("concurrent_tx", record_input::<RmwWorkload>);
 }
 
 #[test]
@@ -74,4 +75,9 @@ fn replays_committed_cycle_corpus() {
 #[test]
 fn replays_committed_membership_corpus() {
     replay_committed_corpus("membership", record_input::<MembershipWorkload>);
+}
+
+#[test]
+fn replays_committed_api_correctness_corpus() {
+    replay_committed_corpus("api_correctness", record_input::<ApiWorkload>);
 }

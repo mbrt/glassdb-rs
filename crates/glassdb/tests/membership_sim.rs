@@ -18,43 +18,17 @@
 //! issue a byte-for-byte identical backend op stream on every run.
 #![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::{OpRecord, first_divergence};
+mod sim_support;
+
+use sim_support::{
+    assert_no_divergence, fault_tape, record_faults_with_tape, record_once, record_with_tapes, tape,
+};
+
 use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     FaultConfig, MembOp, MembershipWorkload, pct_record, pct_sweep, run_and_assert,
-    run_and_assert_with_faults, run_and_record, run_and_record_with_faults,
+    run_and_assert_with_faults,
 };
-
-/// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
-/// long enough to cover every scheduling decision a run makes.
-fn tape(seed: u64) -> Vec<u8> {
-    let mut s = seed;
-    (0..8192)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (s >> 33) as u8
-        })
-        .collect()
-}
-
-/// A deterministic fault tape derived from `seed`, distinct from the schedule
-/// tape so the interleaving and the fault schedule vary independently.
-fn fault_tape(seed: u64) -> Vec<u8> {
-    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
-}
-
-fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
-    if let Some((idx, a, b)) = first_divergence(first, second) {
-        panic!(
-            "{label}: op stream diverged at index {idx}\n  \
-             run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-            first.len(),
-            second.len(),
-        );
-    }
-}
 
 /// A contended membership workload over three clients, each owning a disjoint
 /// slice of the 8-key universe by residue (client `i` owns keys `k` with
@@ -102,49 +76,6 @@ fn fill_all_keys() -> MembershipWorkload {
             vec![MembOp::Put(2), MembOp::Put(5), MembOp::List],
         ],
     }
-}
-
-/// The op stream recorded for `workload` under `tape(seed)`/`seed`.
-fn record_once(seed: u64, workload: &MembershipWorkload) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record(&w).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-/// The op stream recorded for `workload` under `tape(seed)`/`seed` with faults
-/// active and guided by `ft`.
-fn record_faults_with_tape(
-    seed: u64,
-    workload: &MembershipWorkload,
-    faults: FaultConfig,
-    ft: Vec<u8>,
-) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record_with_faults(&w, faults, seed, ft).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-/// Records with caller-provided schedule and fault tapes, for boundary cases
-/// like tape exhaustion that the seed-expanded helper intentionally avoids.
-fn record_with_tapes(
-    seed: u64,
-    workload: &MembershipWorkload,
-    faults: FaultConfig,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
-        run_and_record_with_faults(&w, faults, seed, fault_tape).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
 }
 
 #[test]

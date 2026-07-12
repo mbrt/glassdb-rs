@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-# The simulation harness (Workload + run_and_assert) and the in-repo
+# The simulation harness (`SimWorkload` + `run_and_assert`) and the in-repo
 # deterministic executor (`glassdb::rt`, under `--cfg sim`). The `sim` feature
 # pulls in `arbitrary`; no external simulation runtime is needed.
 glassdb = { path = "../crates/glassdb", features = ["sim"] }
@@ -31,6 +31,13 @@ bench = false
 [[bin]]
 name = "membership"
 path = "fuzz_targets/membership.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_correctness"
+path = "fuzz_targets/api_correctness.rs"
 test = false
 doc = false
 bench = false

@@ -1,6 +1,6 @@
 //! Deterministic concurrency fuzz target (see ADR-008 and ADR-011).
 //!
-//! libFuzzer bytes are split into an `rng_seed`, a [`Workload`], a
+//! libFuzzer bytes are split into an `rng_seed`, a [`RmwWorkload`], a
 //! [`FaultConfig`], and the remaining bytes, which are halved into a *schedule
 //! tape* and a *fault tape*. The harness runs every client as its own task over
 //! a shared in-process backend on the in-repo deterministic executor
@@ -28,4 +28,4 @@ use libfuzzer_sys::fuzz_target;
 // The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so
 // the committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs)
 // exercises the exact same path as the fuzzer.
-fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::Workload>(data));
+fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::RmwWorkload>(data));

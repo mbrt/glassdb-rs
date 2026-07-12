@@ -17,43 +17,16 @@
 //! identical backend op stream on every run.
 #![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::{OpRecord, first_divergence};
+mod sim_support;
+
+use sim_support::{
+    assert_no_divergence, fault_tape, record_faults_with_tape, record_once, record_with_tapes, tape,
+};
+
 use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     CycleWorkload, FaultConfig, pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults,
-    run_and_record, run_and_record_with_faults,
 };
-
-/// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
-/// long enough to cover every scheduling decision a run makes.
-fn tape(seed: u64) -> Vec<u8> {
-    let mut s = seed;
-    (0..8192)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (s >> 33) as u8
-        })
-        .collect()
-}
-
-/// A deterministic fault tape derived from `seed`, distinct from the schedule
-/// tape so the interleaving and the fault schedule vary independently.
-fn fault_tape(seed: u64) -> Vec<u8> {
-    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
-}
-
-fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
-    if let Some((idx, a, b)) = first_divergence(first, second) {
-        panic!(
-            "{label}: op stream diverged at index {idx}\n  \
-             run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-            first.len(),
-            second.len(),
-        );
-    }
-}
 
 /// A contended ring: a small node count with several clients each rotating
 /// overlapping edges, so transactions conflict on shared keys. A few concurrent
@@ -65,49 +38,6 @@ fn contended_cycle() -> CycleWorkload {
         clients: vec![vec![0, 2, 4, 1], vec![1, 3, 5, 0], vec![2, 4, 0, 3]],
         snapshot_reads: 3,
     }
-}
-
-/// The op stream recorded for `workload` under `tape(seed)`/`seed`.
-fn record_once(seed: u64, workload: &CycleWorkload) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record(&w).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-/// The op stream recorded for `workload` under `tape(seed)`/`seed` with faults
-/// active and guided by `ft`.
-fn record_faults_with_tape(
-    seed: u64,
-    workload: &CycleWorkload,
-    faults: FaultConfig,
-    ft: Vec<u8>,
-) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record_with_faults(&w, faults, seed, ft).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-/// Records with caller-provided schedule and fault tapes, for boundary cases
-/// like tape exhaustion that the seed-expanded helper intentionally avoids.
-fn record_with_tapes(
-    seed: u64,
-    workload: &CycleWorkload,
-    faults: FaultConfig,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
-        run_and_record_with_faults(&w, faults, seed, fault_tape).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
 }
 
 /// Boundary-heavy Cycle workload: larger ring, maximum generated client shape,

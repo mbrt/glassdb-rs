@@ -15,163 +15,89 @@
 //! result — is what proves the schedule itself replayed deterministically.
 #![cfg(all(sim, feature = "sim"))]
 
-use glassdb::middleware::{OpRecord, first_divergence};
-use glassdb::rt::{TapeScheduler, block_on_with};
-use glassdb::sim::{
-    FaultConfig, Op, Workload, pct_record, pct_sweep, run_and_assert, run_and_assert_with_faults,
-    run_and_record, run_and_record_with_faults,
+mod sim_support;
+
+use sim_support::{
+    assert_no_divergence, fault_tape, record_faults_with_tape, record_once, record_with_tapes, tape,
 };
 
-/// A deterministic schedule tape derived from `seed` (a simple LCG expansion),
-/// long enough to cover every scheduling decision a run makes.
-fn tape(seed: u64) -> Vec<u8> {
-    let mut s = seed;
-    (0..8192)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (s >> 33) as u8
-        })
-        .collect()
-}
-
-/// A deterministic fault tape derived from `seed`, distinct from the schedule
-/// tape so the interleaving and the fault schedule vary independently.
-fn fault_tape(seed: u64) -> Vec<u8> {
-    tape(seed ^ 0xA5A5_A5A5_A5A5_A5A5)
-}
-
-fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
-    if let Some((idx, a, b)) = first_divergence(first, second) {
-        panic!(
-            "{label}: op stream diverged at index {idx}\n  \
-             run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
-            first.len(),
-            second.len(),
-        );
-    }
-}
+use glassdb::rt::{TapeScheduler, block_on_with};
+use glassdb::sim::{
+    FaultConfig, RmwOp, RmwWorkload, pct_record, pct_sweep, run_and_assert,
+    run_and_assert_with_faults,
+};
 
 /// A contended workload: every client hammers overlapping keys with single- and
 /// multi-key increments interleaved with read-only transactions.
-fn contended_workload() -> Workload {
-    Workload {
+fn contended_workload() -> RmwWorkload {
+    RmwWorkload {
         clients: vec![
             vec![
-                Op::Rmw(0),
-                Op::MultiRmw(0, 1),
-                Op::ReadOnly(vec![0, 1, 2]),
-                Op::Rmw(2),
+                RmwOp::Rmw(0),
+                RmwOp::MultiRmw(0, 1),
+                RmwOp::ReadOnly(vec![0, 1, 2]),
+                RmwOp::Rmw(2),
             ],
             vec![
-                Op::Rmw(1),
-                Op::MultiRmw(1, 2),
-                Op::ReadOnly(vec![0, 1, 3]),
-                Op::Rmw(0),
+                RmwOp::Rmw(1),
+                RmwOp::MultiRmw(1, 2),
+                RmwOp::ReadOnly(vec![0, 1, 3]),
+                RmwOp::Rmw(0),
             ],
             vec![
-                Op::MultiRmw(2, 3),
-                Op::Rmw(3),
-                Op::Rmw(0),
-                Op::MultiRmw(0, 3),
+                RmwOp::MultiRmw(2, 3),
+                RmwOp::Rmw(3),
+                RmwOp::Rmw(0),
+                RmwOp::MultiRmw(0, 3),
             ],
         ],
     }
 }
 
-/// The op stream recorded for `workload` under `tape`/`seed`.
-fn record_once(seed: u64, workload: &Workload) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record(&w).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-/// The op stream recorded for `workload` under the schedule `tape(seed)`/`seed`
-/// with faults active and guided by `ft`.
-fn record_faults_with_tape(
-    seed: u64,
-    workload: &Workload,
-    faults: FaultConfig,
-    ft: Vec<u8>,
-) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record_with_faults(&w, faults, seed, ft).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
-/// The op stream recorded for `workload` under `tape`/`seed` with faults active.
-fn record_once_faults(seed: u64, workload: &Workload, faults: FaultConfig) -> Vec<OpRecord> {
-    record_faults_with_tape(seed, workload, faults, fault_tape(seed))
-}
-
-/// Records with caller-provided schedule and fault tapes, for boundary cases
-/// like tape exhaustion that the seed-expanded helper intentionally avoids.
-fn record_with_tapes(
-    seed: u64,
-    workload: &Workload,
-    faults: FaultConfig,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-) -> Vec<OpRecord> {
-    let w = workload.clone();
-    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
-        run_and_record_with_faults(&w, faults, seed, fault_tape).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
 /// A boundary-heavy workload: maximum generated client/op shape, with frequent
 /// read-only transactions mixed into contended writes.
-fn max_read_heavy_workload() -> Workload {
-    Workload {
+fn max_read_heavy_workload() -> RmwWorkload {
+    RmwWorkload {
         clients: vec![
             vec![
-                Op::ReadOnly(vec![0, 1, 2, 3]),
-                Op::Rmw(0),
-                Op::ReadOnly(vec![0, 2]),
-                Op::MultiRmw(0, 1),
-                Op::ReadOnly(vec![1, 3]),
-                Op::Rmw(2),
-                Op::ReadOnly(vec![0, 1, 2, 3]),
-                Op::MultiRmw(2, 3),
+                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
+                RmwOp::Rmw(0),
+                RmwOp::ReadOnly(vec![0, 2]),
+                RmwOp::MultiRmw(0, 1),
+                RmwOp::ReadOnly(vec![1, 3]),
+                RmwOp::Rmw(2),
+                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
+                RmwOp::MultiRmw(2, 3),
             ],
             vec![
-                Op::ReadOnly(vec![3, 2, 1, 0]),
-                Op::Rmw(1),
-                Op::ReadOnly(vec![1, 2]),
-                Op::MultiRmw(1, 2),
-                Op::ReadOnly(vec![0, 3]),
-                Op::Rmw(3),
-                Op::ReadOnly(vec![2, 3]),
-                Op::MultiRmw(0, 3),
+                RmwOp::ReadOnly(vec![3, 2, 1, 0]),
+                RmwOp::Rmw(1),
+                RmwOp::ReadOnly(vec![1, 2]),
+                RmwOp::MultiRmw(1, 2),
+                RmwOp::ReadOnly(vec![0, 3]),
+                RmwOp::Rmw(3),
+                RmwOp::ReadOnly(vec![2, 3]),
+                RmwOp::MultiRmw(0, 3),
             ],
             vec![
-                Op::ReadOnly(vec![]),
-                Op::MultiRmw(2, 0),
-                Op::ReadOnly(vec![0]),
-                Op::Rmw(2),
-                Op::ReadOnly(vec![1, 2, 3]),
-                Op::MultiRmw(3, 1),
-                Op::ReadOnly(vec![0, 1, 2, 3]),
-                Op::Rmw(0),
+                RmwOp::ReadOnly(vec![]),
+                RmwOp::MultiRmw(2, 0),
+                RmwOp::ReadOnly(vec![0]),
+                RmwOp::Rmw(2),
+                RmwOp::ReadOnly(vec![1, 2, 3]),
+                RmwOp::MultiRmw(3, 1),
+                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
+                RmwOp::Rmw(0),
             ],
             vec![
-                Op::ReadOnly(vec![2]),
-                Op::Rmw(3),
-                Op::ReadOnly(vec![0, 3]),
-                Op::MultiRmw(0, 2),
-                Op::ReadOnly(vec![1]),
-                Op::Rmw(1),
-                Op::ReadOnly(vec![0, 1, 2, 3]),
-                Op::MultiRmw(1, 3),
+                RmwOp::ReadOnly(vec![2]),
+                RmwOp::Rmw(3),
+                RmwOp::ReadOnly(vec![0, 3]),
+                RmwOp::MultiRmw(0, 2),
+                RmwOp::ReadOnly(vec![1]),
+                RmwOp::Rmw(1),
+                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
+                RmwOp::MultiRmw(1, 3),
             ],
         ],
     }
@@ -227,8 +153,8 @@ fn op_stream_is_byte_identical_with_faults() {
     let workload = contended_workload();
     let faults = FaultConfig::enabled(7);
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
-        let first = record_once_faults(seed, &workload, faults);
-        let second = record_once_faults(seed, &workload, faults);
+        let first = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
+        let second = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
         assert_no_divergence(&format!("seed {seed}: faulted"), &first, &second);
     }
 }
