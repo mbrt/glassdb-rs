@@ -291,6 +291,13 @@ impl CasWorker {
         // Why the current fold is running: `Fresh` first, then re-folds carry
         // whether the prior CAS was in-doubt so commit-install can classify.
         let mut cause = ReloadCause::Fresh;
+        // In-doubt is *sticky* across re-folds: once any CAS this round came back
+        // in-doubt, its write may have landed durably (and been help-forwarded to
+        // a peer), so a later precondition-miss must not downgrade the ambiguity
+        // to a definitive loss. Commit-install would otherwise misclassify a
+        // landed-but-unacked lock as `Moved` and unsafely abandon-and-rerun a
+        // committed object a peer already observed.
+        let mut saw_in_doubt = false;
         // The first fold attempt may reuse a cached shard the submitter just
         // loaded (a lone single read-write round; `AllowStale` serves it without
         // a revalidation round-trip, ADR-030). Any later attempt reloads
@@ -386,10 +393,13 @@ impl CasWorker {
                     // re-checks, so a spurious hint only costs one load.
                     Ok(true) => self.core.hinter.observe_leaf(path, &new_shard),
                     // Precondition: the shard changed under us; reload and
-                    // re-fold. The change definitely landed, so commit-install
-                    // re-classifies without in-doubt.
+                    // re-fold. This CAS definitely did not land, but an *earlier*
+                    // in-doubt CAS this round might have, so carry the sticky
+                    // in-doubt flag rather than clearing it.
                     Ok(false) => {
-                        cause = ReloadCause::Reloaded { in_doubt: false };
+                        cause = ReloadCause::Reloaded {
+                            in_doubt: saw_in_doubt,
+                        };
                         continue;
                     }
                     // In-doubt lock CAS (ADR-009): re-folding our own resolvers
@@ -397,6 +407,7 @@ impl CasWorker {
                     // by reloading and re-folding. Commit-install must treat a
                     // subsequent move as irreducibly in-doubt (ADR-027).
                     Err(StorageError::Unavailable(_)) => {
+                        saw_in_doubt = true;
                         cause = ReloadCause::Reloaded { in_doubt: true };
                         continue;
                     }
@@ -1167,6 +1178,199 @@ mod tests {
         assert!(
             out.is_none(),
             "a submit after shutdown is a cancelled no-op"
+        );
+    }
+
+    // Backend that fails the first two leaf CAS's of one coordination round in
+    // sequence — the first as an in-doubt `Unavailable` (a landed-but-unacked
+    // write, ADR-009), the second as a plain `Precondition` miss — so a round
+    // goes: in-doubt CAS, then a precondition-miss re-fold. This is the crash
+    // interleaving where a commit-install lock lands but its ack is lost, a peer
+    // then supersedes the entry, and the install's next CAS misses precondition.
+    struct InDoubtThenMiss {
+        inner: Arc<dyn Backend>,
+        leaf_cas: std::sync::atomic::AtomicUsize,
+    }
+
+    impl InDoubtThenMiss {
+        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
+            Arc::new(InDoubtThenMiss {
+                inner,
+                leaf_cas: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for InDoubtThenMiss {
+        async fn read(
+            &self,
+            path: &str,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read(path).await
+        }
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
+            self.inner.read_if_modified(path, expected).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write(path, value).await
+        }
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &glassdb_backend::Version,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            if path.contains("/_n/") || path.ends_with("/_i") {
+                match self.leaf_cas.fetch_add(1, Ordering::SeqCst) {
+                    // First CAS: landed-but-unacked (in-doubt).
+                    0 => {
+                        return Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt leaf CAS".into(),
+                        ));
+                    }
+                    // Second CAS: a peer changed the entry first (precondition miss).
+                    1 => return Err(glassdb_backend::BackendError::Precondition),
+                    _ => {}
+                }
+            }
+            self.inner.write_if(path, value, expected).await
+        }
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
+            self.inner.write_if_not_exists(path, value).await
+        }
+        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
+            self.inner.list(dir_path).await
+        }
+    }
+
+    // A commit-install-shaped resolver: it stages its write lock (issuing a CAS)
+    // on its first two folds, then on the third fold classifies its lost race the
+    // same way `CommitInstallResolver` does — `InDoubt` if any earlier CAS this
+    // round was in-doubt, else a definitive `Moved`. Records the deciding fold's
+    // `in_doubt` cause so the test can pin the coordinator's state machine.
+    struct StickyInstallProbe {
+        key: Vec<u8>,
+        tx: TxId,
+        folds: std::sync::atomic::AtomicUsize,
+        seen_in_doubt: Arc<Mutex<Option<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShardResolver for StickyInstallProbe {
+        async fn resolve(
+            &self,
+            ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        ) -> Result<Step, TransError> {
+            if self.folds.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Ok(Step::Stage {
+                    entries: vec![(
+                        self.key.clone(),
+                        entry(&self.key, LockType::Write, Some(&self.tx), None),
+                    )],
+                    outcome: FoldOutcome::Landed,
+                });
+            }
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            *self.seen_in_doubt.lock().unwrap() = Some(in_doubt);
+            let outcome = if in_doubt {
+                FoldOutcome::InDoubt("lost race after in-doubt CAS".into())
+            } else {
+                FoldOutcome::Moved
+            };
+            Ok(Step::Skip { outcome })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self) -> FoldOutcome {
+            FoldOutcome::Moved
+        }
+
+        fn owned_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+    }
+
+    // Regression (single read-write fast path double-apply): once any CAS in a
+    // round comes back in-doubt, its write may have landed durably and been
+    // help-forwarded to a peer, so the in-doubt classification must stay *sticky*
+    // across a later precondition-miss. Otherwise a commit-install whose lock
+    // landed-but-unacked (then superseded) is misclassified `Moved`, and the fast
+    // path abandons and re-runs a non-idempotent write a peer already observed —
+    // breaking the `final <= started` serializability bound.
+    //
+    // This pins the coordinator half of the fix in isolation: the exact `cause`
+    // state transition, driven with a stubbed member so no concurrent scheduling
+    // is needed. The *end-to-end* manifestation (the real commit-install being
+    // abandoned and double-applying under the true 3-way co-batched interleaving)
+    // is covered deterministically by the committed fuzz reproducer
+    // `fuzz/corpus/concurrent_tx/crash-95084997…`, which the corpus-replay test
+    // (`crates/glassdb/tests/fuzz_corpus.rs`) replays through the sim scheduler.
+    // That interleaving cannot be forced by the plain-tokio in-doubt harness
+    // (`crates/glassdb/tests/in_doubt.rs`), whose 2-step lost-ack→moved case
+    // classifies in-doubt without ever hitting the resetting precondition-miss.
+    #[tokio::test]
+    async fn in_doubt_cas_stays_in_doubt_across_a_later_precondition_miss() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<dyn Backend> = InDoubtThenMiss::new(mem);
+        let (coord, shards, _bg) = coord_over(backend);
+
+        // The leaf must exist so the round's CAS is a `write_if` (the faulted op),
+        // not a create.
+        let seed = TxId::with_priority(1, b"seed");
+        store_shard_entries(
+            &shards,
+            &leaf(),
+            vec![entry(b"seed", LockType::None, None, Some(&seed))],
+        )
+        .await;
+
+        let tx = TxId::with_priority(2, b"install");
+        let seen_in_doubt = Arc::new(Mutex::new(None));
+        let out = coord
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(StickyInstallProbe {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                    folds: std::sync::atomic::AtomicUsize::new(0),
+                    seen_in_doubt: seen_in_doubt.clone(),
+                }),
+                Freshness::Latest,
+            )
+            .await
+            .unwrap();
+        coord.close().await;
+
+        assert_eq!(
+            *seen_in_doubt.lock().unwrap(),
+            Some(true),
+            "the precondition-miss after an in-doubt CAS must keep the cause in-doubt"
+        );
+        assert!(
+            matches!(out, Some(FoldOutcome::InDoubt(_))),
+            "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
+             not Moved (else the fast path abandons and double-applies)"
         );
     }
 }
