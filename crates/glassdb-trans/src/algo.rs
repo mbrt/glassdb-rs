@@ -1048,7 +1048,9 @@ fn feed_gc_hints(gc: &Gc, superseded: Vec<TxId>) {
 mod tests {
     use super::*;
     use crate::reader::Reader;
-    use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_backend::middleware::{
+        BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
+    };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
@@ -1456,25 +1458,40 @@ mod tests {
         tm.end(&mut h).await.unwrap();
     }
 
-    /// A [`Backend`] that, once armed, makes the first `budget` leaf-lock CAS
-    /// writes (`write_if` on a `/_n/` node or `/_i` root leaf) miss their precondition,
-    /// then passes through. Sustained misses force the lock acquisition past the
-    /// parallel deadlock timeout into the serial order and then exhaust the
-    /// serial CAS budget, which is the only way a `Conflict` reaches
-    /// `acquire_locks`.
-    struct FlakyShardCas {
-        inner: Arc<dyn Backend>,
+    /// Controls a hook that makes a bounded number of leaf CASes miss.
+    struct FlakyCas {
         armed: std::sync::atomic::AtomicBool,
         remaining: std::sync::atomic::AtomicUsize,
     }
 
-    impl FlakyShardCas {
-        fn new(inner: Arc<dyn Backend>, budget: usize) -> Arc<Self> {
-            Arc::new(FlakyShardCas {
-                inner,
+    impl FlakyCas {
+        fn wrap(inner: Arc<dyn Backend>, budget: usize) -> (Arc<HookBackend>, Arc<Self>) {
+            let flaky = Arc::new(Self {
                 armed: std::sync::atomic::AtomicBool::new(false),
                 remaining: std::sync::atomic::AtomicUsize::new(budget),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let flaky = flaky.clone();
+                move |op| {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let fail = matches!(op, BackendOp::WriteIf { path, .. }
+                        if path.contains("/_n/") || path.ends_with("/_i"))
+                        && flaky.armed.load(SeqCst)
+                        && flaky
+                            .remaining
+                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                    let result = if fail {
+                        Err(glassdb_backend::BackendError::Precondition)
+                    } else {
+                        Ok(())
+                    };
+                    let future: HookFuture = Box::pin(async move { result });
+                    future
+                }
+            });
+            (backend, flaky)
         }
 
         fn arm(&self) {
@@ -1486,240 +1503,97 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl Backend for FlakyShardCas {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read(path).await
-        }
-
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read_if_modified(path, expected).await
-        }
-
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            use std::sync::atomic::Ordering;
-            if self.armed.load(Ordering::SeqCst)
-                && (path.contains("/_n/") || path.ends_with("/_i"))
-                && self
-                    .remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-            {
-                return Err(glassdb_backend::BackendError::Precondition);
-            }
-            self.inner.write_if(path, value, expected).await
-        }
-
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
-        }
-    }
-
-    // Backend that parks the dedup driver's coordination-object load on a gate
-    // while **armed**, so a test can hold the driver mid-load until a second
-    // contender has queued — forcing them into one merged CAS round. The first
-    // `skip` reads after arming pass through: descent reads the collection root
-    // `_i` to route a key before the coordinator loads the leaf (ADR-031), so the
-    // gate must skip that routing read and park the coordinator's load instead.
-    // Arming is deferred so un-gated setup runs first.
-    struct GateBackend {
-        inner: Arc<dyn Backend>,
-        gate: Arc<tokio::sync::Notify>,
+    /// Controls a hook that skips one routing read, then gates the coordinator load.
+    struct Gate {
+        notify: Arc<tokio::sync::Notify>,
         armed: std::sync::atomic::AtomicBool,
         skip: std::sync::atomic::AtomicUsize,
     }
 
-    impl GateBackend {
-        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-            Arc::new(GateBackend {
-                inner,
-                gate: Arc::new(tokio::sync::Notify::new()),
+    impl Gate {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+            let gate = Arc::new(Self {
+                notify: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
                 skip: std::sync::atomic::AtomicUsize::new(0),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let gate = gate.clone();
+                move |op| {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let wait = matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ) && gate.armed.load(SeqCst)
+                        && gate
+                            .skip
+                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                            .is_err();
+                    if wait {
+                        gate.armed.store(false, SeqCst);
+                    }
+                    let notify = gate.notify.clone();
+                    let future: HookFuture = Box::pin(async move {
+                        if wait {
+                            notify.notified().await;
+                        }
+                        Ok(())
+                    });
+                    future
+                }
+            });
+            (backend, gate)
         }
+
         fn arm(&self) {
-            // Skip the driver's descent (routing) read of `_i`, then gate its
-            // coordinator leaf load.
             self.skip.store(1, std::sync::atomic::Ordering::SeqCst);
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+
         fn release(&self) {
-            self.gate.notify_one();
-        }
-        async fn gate_if_armed(&self) {
-            use std::sync::atomic::Ordering::SeqCst;
-            if !self.armed.load(SeqCst) {
-                return;
-            }
-            if self
-                .skip
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                return;
-            }
-            self.armed.store(false, SeqCst);
-            self.gate.notified().await;
+            self.notify.notify_one();
         }
     }
 
-    #[async_trait::async_trait]
-    impl Backend for GateBackend {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.gate_if_armed().await;
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.gate_if_armed().await;
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
-        }
-    }
-
-    // Backend that, while **armed**, makes the first shard CAS *in-doubt*: it
-    // applies the write to storage but returns `Unavailable`, so the caller
-    // cannot tell whether it landed (ADR-009). Arming is deferred so un-gated
-    // setup runs first.
-    struct InDoubtShardCas {
-        inner: Arc<dyn Backend>,
+    /// Controls a post-hook that reports one successfully landed leaf CAS as in-doubt.
+    struct InDoubtCas {
         armed: std::sync::atomic::AtomicBool,
     }
 
-    impl InDoubtShardCas {
-        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-            Arc::new(InDoubtShardCas {
-                inner,
+    impl InDoubtCas {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+            let in_doubt = Arc::new(Self {
                 armed: std::sync::atomic::AtomicBool::new(false),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_after({
+                let in_doubt = in_doubt.clone();
+                move |op, outcome| {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let fail = outcome.is_success()
+                        && matches!(op, BackendOp::WriteIf { path, .. }
+                            if path.contains("/_n/") || path.ends_with("/_i"))
+                        && in_doubt
+                            .armed
+                            .compare_exchange(true, false, SeqCst, SeqCst)
+                            .is_ok();
+                    let result = if fail {
+                        Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt shard CAS".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                    let future: HookFuture = Box::pin(async move { result });
+                    future
+                }
+            });
+            (backend, in_doubt)
         }
+
         fn arm(&self) {
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for InDoubtShardCas {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            use std::sync::atomic::Ordering;
-            if (path.contains("/_n/") || path.ends_with("/_i"))
-                && self
-                    .armed
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
-                // Apply the write, then report the ack as lost: the CAS landed but
-                // the caller must re-fold to discover that.
-                let _ = self.inner.write_if(path, value, expected).await;
-                return Err(glassdb_backend::BackendError::Unavailable(
-                    "simulated in-doubt shard CAS".into(),
-                ));
-            }
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
         }
     }
 
@@ -1749,8 +1623,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn single_rw_install_merges_with_disjoint_acquire() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let gate = GateBackend::new(mem);
-        let rec = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let (backend, gate) = Gate::wrap(mem);
+        let rec = Arc::new(RecordingBackend::new(backend));
         let log = rec.log();
         let (tm, tctx) = new_algo_from_backend(rec).await;
 
@@ -1837,9 +1711,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn commit_install_batched_in_doubt_recovers() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let indoubt = InDoubtShardCas::new(mem);
-        let gate = GateBackend::new(indoubt.clone() as Arc<dyn Backend>);
-        let (tm, tctx) = new_algo_from_backend(gate.clone() as Arc<dyn Backend>).await;
+        let (backend, indoubt) = InDoubtCas::wrap(mem);
+        let (backend, gate) = Gate::wrap(backend);
+        let (tm, tctx) = new_algo_from_backend(backend).await;
 
         let ka = b"k".to_vec();
         let kb = same_shard_sibling(&ka);
@@ -1912,8 +1786,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cas_contention_relocks_keeping_id() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let flaky = FlakyShardCas::new(mem, 70);
-        let backend: Arc<dyn Backend> = flaky.clone();
+        let (backend, flaky) = FlakyCas::wrap(mem, 70);
         let (tm, tctx) = new_algo_from_backend(backend).await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let keyp2 = paths::from_key(TEST_COLL, b"k2");
@@ -2234,8 +2107,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         // Fail exactly the coordinator's whole fold budget of shard-lock CAS
         // attempts, so the object write lands but the lock install never does.
-        let flaky = FlakyShardCas::new(mem, crate::shard_coord::CAS_RETRIES);
-        let backend: Arc<dyn Backend> = flaky.clone();
+        let (backend, flaky) = FlakyCas::wrap(mem, crate::shard_coord::CAS_RETRIES);
         let (tm, tctx) = new_algo_from_backend(backend).await;
         let keyp = paths::from_key(TEST_COLL, b"k");
 

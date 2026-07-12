@@ -3,9 +3,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::{BackendError, ReadReply, Version};
+use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{Backend, Collection, Database, Error, Transaction};
 use glassdb_storage::TxCommitStatus;
 use tokio::sync::oneshot;
@@ -572,7 +571,7 @@ async fn keys_listing_is_phantom_safe() {
 #[tokio::test]
 async fn listing_hides_keys_from_aborted_transactions() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = PausingBackend::new(mem);
+    let (backend, pause) = PauseControl::wrap(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"aborted-vis");
     coll.create().await.unwrap();
@@ -585,7 +584,7 @@ async fn listing_hides_keys_from_aborted_transactions() {
     // (so its create locks are already installed in the leaf), then is cancelled
     // mid-commit. The `TxAbortGuard` asynchronously marks it aborted: the ghost
     // keys were "added" by a transaction that never committed.
-    let arrived = backend.arm("/_t/");
+    let arrived = pause.arm("/_t/");
     let stalled = tokio::spawn({
         let db = db.clone();
         let coll = coll.clone();
@@ -761,14 +760,8 @@ async fn cancelled_tx_future_does_not_block_followups() {
     assert_eq!(read_int(&val), 2);
 }
 
-/// A [`Backend`] decorator that lets a test pause at a single, known point in
-/// the commit pipeline. It arms a one-shot trap matched by path substring;
-/// the first `write_if_not_exists` whose path matches the substring (1) signals
-/// the test via a `oneshot::Sender`, then (2) parks forever on
-/// `pending().await` so the surrounding future stays alive until the test
-/// drops it.
-struct PausingBackend {
-    inner: Arc<dyn Backend>,
+/// Controls hooks that pause writes at known points in the commit pipeline.
+struct PauseControl {
     trap: Mutex<Option<Trap>>,
     abort_write_gate: Mutex<Option<AbortWriteGate>>,
 }
@@ -783,13 +776,41 @@ struct AbortWriteGate {
     release: oneshot::Receiver<()>,
 }
 
-impl PausingBackend {
-    fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
+impl PauseControl {
+    fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+        let control = Arc::new(Self {
             trap: Mutex::new(None),
             abort_write_gate: Mutex::new(None),
-        })
+        });
+        let backend = HookBackend::new(inner);
+        backend.set_before({
+            let control = control.clone();
+            move |op| {
+                let (abort_gate, path) = match op {
+                    BackendOp::WriteIfNotExists { path, value } => (
+                        control.take_abort_write_gate(path, value),
+                        Some((*path).to_owned()),
+                    ),
+                    _ => (None, None),
+                };
+                let control = control.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if let Some(gate) = abort_gate {
+                        let _ = gate.arrived.send(());
+                        let _ = gate.release.await;
+                    }
+                    if let Some(arrived) = path.as_deref().and_then(|path| control.take_match(path))
+                    {
+                        let _ = arrived.send(());
+                        std::future::pending::<()>().await;
+                        unreachable!("pause should outlive any future that hits it");
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        (backend, control)
     }
 
     /// Arms the (one-shot) trap. Returns a receiver that is fired when the
@@ -840,59 +861,6 @@ fn is_aborted_tx_log(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-#[async_trait]
-impl Backend for PausingBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected: &Version,
-    ) -> Result<ReadReply, BackendError> {
-        self.inner.read_if_modified(path, expected).await
-    }
-
-    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
-        self.inner.read(path).await
-    }
-
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.inner.write(path, value).await
-    }
-
-    async fn write_if(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
-        self.inner.write_if(path, value, expected).await
-    }
-
-    async fn write_if_not_exists(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
-        if let Some(gate) = self.take_abort_write_gate(path, &value) {
-            let _ = gate.arrived.send(());
-            let _ = gate.release.await;
-        }
-        if let Some(arrived) = self.take_match(path) {
-            let _ = arrived.send(());
-            std::future::pending::<()>().await;
-            unreachable!("PausingBackend pause should outlive any future that hits it");
-        }
-        self.inner.write_if_not_exists(path, value).await
-    }
-
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        self.inner.delete(path).await
-    }
-
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.inner.list(dir_path).await
-    }
-}
-
 /// When a `Database::tx` future is dropped *during* its commit (after
 /// `algo.begin` registered the engine-side transaction, before `algo.end`
 /// ran), the `TxAbortGuard` must schedule an async abort so peer
@@ -906,7 +874,7 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     use std::time::Duration;
 
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = PausingBackend::new(mem);
+    let (backend, pause) = PauseControl::wrap(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
@@ -915,7 +883,7 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
 
     // Trap the next commit-log write (`_t/<txid>` path). Setup ops above
     // don't match and pass straight through.
-    let arrived = backend.arm("/_t/");
+    let arrived = pause.arm("/_t/");
 
     // Spawn a tx that writes two distinct keys, so it goes through the
     // standard locked commit path (the single-RW fast path requires 1
@@ -979,15 +947,15 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
     use std::time::Duration;
 
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = PausingBackend::new(mem);
+    let (backend, pause) = PauseControl::wrap(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
     coll.create().await.unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();
     coll.write(b"k2", &write_int(2)).await.unwrap();
 
-    let commit_arrived = backend.arm("/_t/");
-    let (abort_arrived, release_abort) = backend.arm_abort_write_gate();
+    let commit_arrived = pause.arm("/_t/");
+    let (abort_arrived, release_abort) = pause.arm_abort_write_gate();
 
     let stalled = tokio::spawn({
         let db = db.clone();

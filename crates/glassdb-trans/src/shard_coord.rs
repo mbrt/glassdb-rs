@@ -588,7 +588,9 @@ mod tests {
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_backend::middleware::{
+        BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
+    };
     use glassdb_concurr::Background;
     use glassdb_data::paths;
     use glassdb_storage::{LockType, Node, ObjectCache, Shard, SharedCache, TLogger, ValueCache};
@@ -786,22 +788,37 @@ mod tests {
         }
     }
 
-    // A backend that parks the next shard read (while armed) until released, so a
-    // test can hold one round's load open and let a second submitter merge into
-    // it. All other operations pass through.
-    struct GateBackend {
-        inner: Arc<dyn Backend>,
-        gate: tokio::sync::Notify,
+    // A hook that parks the next shard read while armed, letting a second submitter merge.
+    struct Gate {
+        notify: Arc<tokio::sync::Notify>,
         armed: std::sync::atomic::AtomicBool,
     }
 
-    impl GateBackend {
-        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-            Arc::new(GateBackend {
-                inner,
-                gate: tokio::sync::Notify::new(),
+    impl Gate {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+            let gate = Arc::new(Gate {
+                notify: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let gate = gate.clone();
+                move |op| {
+                    let wait = matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ) && gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    let notify = gate.notify.clone();
+                    let future: HookFuture = Box::pin(async move {
+                        if wait {
+                            notify.notified().await;
+                        }
+                        Ok(())
+                    });
+                    future
+                }
+            });
+            (backend, gate)
         }
 
         fn arm(&self) {
@@ -809,60 +826,7 @@ mod tests {
         }
 
         fn release(&self) {
-            self.gate.notify_one();
-        }
-
-        async fn gate_if_armed(&self) {
-            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for GateBackend {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.gate_if_armed().await;
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.gate_if_armed().await;
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
+            self.notify.notify_one();
         }
     }
 
@@ -1094,8 +1058,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn same_shard_submits_merge_into_one_round() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let gate = GateBackend::new(mem);
-        let recorder = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let (backend, gate) = Gate::wrap(mem);
+        let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
         let (coord, _shards, _bg) = coord_over(recorder as Arc<dyn Backend>);
 
@@ -1181,82 +1145,29 @@ mod tests {
         );
     }
 
-    // Backend that fails the first two leaf CAS's of one coordination round in
-    // sequence — the first as an in-doubt `Unavailable` (a landed-but-unacked
-    // write, ADR-009), the second as a plain `Precondition` miss — so a round
-    // goes: in-doubt CAS, then a precondition-miss re-fold. This is the crash
-    // interleaving where a commit-install lock lands but its ack is lost, a peer
-    // then supersedes the entry, and the install's next CAS misses precondition.
-    struct InDoubtThenMiss {
-        inner: Arc<dyn Backend>,
-        leaf_cas: std::sync::atomic::AtomicUsize,
-    }
-
-    impl InDoubtThenMiss {
-        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-            Arc::new(InDoubtThenMiss {
-                inner,
-                leaf_cas: std::sync::atomic::AtomicUsize::new(0),
-            })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for InDoubtThenMiss {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            if path.contains("/_n/") || path.ends_with("/_i") {
-                match self.leaf_cas.fetch_add(1, Ordering::SeqCst) {
-                    // First CAS: landed-but-unacked (in-doubt).
-                    0 => {
-                        return Err(glassdb_backend::BackendError::Unavailable(
+    // Fails two leaf CASes before forwarding to isolate sticky in-doubt classification.
+    fn in_doubt_then_miss(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
+        let backend = HookBackend::new(inner);
+        let leaf_cas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        backend.set_before(move |op| {
+            let result = match op {
+                BackendOp::WriteIf { path, .. }
+                    if path.contains("/_n/") || path.ends_with("/_i") =>
+                {
+                    match leaf_cas.fetch_add(1, Ordering::SeqCst) {
+                        0 => Err(glassdb_backend::BackendError::Unavailable(
                             "simulated in-doubt leaf CAS".into(),
-                        ));
+                        )),
+                        1 => Err(glassdb_backend::BackendError::Precondition),
+                        _ => Ok(()),
                     }
-                    // Second CAS: a peer changed the entry first (precondition miss).
-                    1 => return Err(glassdb_backend::BackendError::Precondition),
-                    _ => {}
                 }
-            }
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
-        }
+                _ => Ok(()),
+            };
+            let future: HookFuture = Box::pin(async move { result });
+            future
+        });
+        backend
     }
 
     // A commit-install-shaped resolver: it stages its write lock (issuing a CAS)
@@ -1331,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn in_doubt_cas_stays_in_doubt_across_a_later_precondition_miss() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let backend: Arc<dyn Backend> = InDoubtThenMiss::new(mem);
+        let backend: Arc<dyn Backend> = in_doubt_then_miss(mem);
         let (coord, shards, _bg) = coord_over(backend);
 
         // The leaf must exist so the round's CAS is a `write_if` (the faulted op),

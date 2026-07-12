@@ -502,6 +502,7 @@ mod tests {
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
     use glassdb_data::TxId;
     use glassdb_storage::{CollectionRoot, LockType, ObjectCache, ShardEntry, SharedCache};
 
@@ -892,7 +893,7 @@ mod tests {
     // re-driven publication land.
     #[tokio::test]
     async fn lost_parent_cas_is_republished_by_a_later_sweep() {
-        let backend = BlockRootWrites::new(Arc::new(MemoryBackend::new()));
+        let (backend, blocker) = RootWriteBlocker::wrap(Arc::new(MemoryBackend::new()));
         let s = ShardStore::new(ObjectCache::new(
             backend.clone() as Arc<dyn Backend>,
             &SharedCache::new(1 << 20),
@@ -913,7 +914,7 @@ mod tests {
 
         // Block the parent `_i` CAS: the split lands (L shrinks, a sibling is
         // created) but the separator publication cannot, so it is re-queued.
-        backend.block(true);
+        blocker.block(true);
         sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
         let (blocked_root, _) = s
             .load_root_node(COLL, Freshness::Latest)
@@ -936,7 +937,7 @@ mod tests {
         );
 
         // Heal and sweep: the re-queued separator is published.
-        backend.block(false);
+        blocker.block(false);
         sp.run_once().await;
         let (healed_root, _) = s
             .load_root_node(COLL, Freshness::Latest)
@@ -950,77 +951,41 @@ mod tests {
         );
     }
 
-    /// Test backend that, while blocked, fails every conditional write to a
-    /// collection root `_i` with a precondition miss, so a split's parent
-    /// separator CAS cannot land. Everything else passes through.
-    struct BlockRootWrites {
-        inner: Arc<dyn Backend>,
+    /// Controls a hook that rejects conditional writes to the collection root.
+    struct RootWriteBlocker {
         blocked: std::sync::atomic::AtomicBool,
     }
 
-    impl BlockRootWrites {
-        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-            Arc::new(BlockRootWrites {
-                inner,
+    impl RootWriteBlocker {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+            let blocker = Arc::new(Self {
                 blocked: std::sync::atomic::AtomicBool::new(false),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let blocker = blocker.clone();
+                move |op| {
+                    let blocked = matches!(
+                        op,
+                        BackendOp::WriteIf { path, .. }
+                            | BackendOp::WriteIfNotExists { path, .. }
+                            if blocker.blocked.load(std::sync::atomic::Ordering::SeqCst)
+                                && path.ends_with("/_i")
+                    );
+                    let result = if blocked {
+                        Err(glassdb_backend::BackendError::Precondition)
+                    } else {
+                        Ok(())
+                    };
+                    let future: HookFuture = Box::pin(async move { result });
+                    future
+                }
+            });
+            (backend, blocker)
         }
+
         fn block(&self, on: bool) {
             self.blocked.store(on, std::sync::atomic::Ordering::SeqCst);
-        }
-        fn blocks(&self, path: &str) -> bool {
-            self.blocked.load(std::sync::atomic::Ordering::SeqCst) && path.ends_with("/_i")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for BlockRootWrites {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            if self.blocks(path) {
-                return Err(glassdb_backend::BackendError::Precondition);
-            }
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            if self.blocks(path) {
-                return Err(glassdb_backend::BackendError::Precondition);
-            }
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
         }
     }
 }

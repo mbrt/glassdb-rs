@@ -47,258 +47,97 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::{Backend, BackendError, ReadReply, Version};
+use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture, HookOutcome};
+use glassdb::backend::{Backend, BackendError};
 use glassdb::{Collection, Database, Error};
 use glassdb_storage::TxCommitStatus;
 
-/// The conditional write a [`HookBackend`] hook is inspecting: its kind
-/// (`"write_if"` / `"write_if_not_exists"`), storage path, and object body.
-struct WriteCtx<'a> {
-    kind: &'static str,
-    path: &'a str,
-    value: &'a [u8],
-}
-
-/// A `before` verdict: let the write reach the backend, or short-circuit it
-/// with an error *without* applying it (a write that never landed).
-enum Pre {
-    Proceed,
-    Fail(BackendError),
-}
-
-/// Pre-op hook: runs before a conditional write reaches the backend and may
-/// short-circuit it (see [`Pre`]). Synchronous — every pre-decision is.
-type Before = Box<dyn Fn(&WriteCtx) -> Pre + Send + Sync>;
-
-/// Post-op hook: runs after a conditional write has landed, receiving its
-/// result. It may transform the result (e.g. turn an `Ok` into `Unavailable` to
-/// model a lost ack) and/or run async side effects — e.g. a genuine competing
-/// transaction. The returned future is `'static`, so a hook that needs data
-/// from the [`WriteCtx`] must read it synchronously before building the future.
-type After = Box<
-    dyn Fn(&WriteCtx, Result<Version, BackendError>) -> BoxFuture<Result<Version, BackendError>>
-        + Send
-        + Sync,
->;
-
+type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + Send + Sync>;
+type After = Box<dyn for<'a, 'b> Fn(&BackendOp<'a>, HookOutcome<'b>) -> HookFuture + Send + Sync>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-/// A one-shot side effect run by an `after` hook the moment a matching write
-/// lands. It exists to interpose a **genuine competing transaction** at exactly
-/// that instant (rather than forging protocol state), so a real concurrent
-/// commit can move a shard pointer in the window between our CAS landing and our
-/// reading it back.
 type Competitor = Box<dyn FnOnce() -> BoxFuture<()> + Send + Sync>;
 
-/// Reports whether `body` is a transaction object that has committed. With the
-/// slimmed tagless backend (ADR-023) the commit status lives in the object body,
-/// so the harness decodes it instead of reading a `commit-status` tag.
 fn is_committed_tx_log(body: &[u8]) -> bool {
     glassdb_storage::txobject::decode(&glassdb_data::TxId::default(), body)
         .map(|l| l.status == TxCommitStatus::Ok)
         .unwrap_or(false)
 }
 
-/// Matches a single-key fast path leaf CAS: a `write_if` on a coordination leaf
-/// object — a standalone node `/_n/` or the collection root `/_i`, which holds
-/// the small collection's single leaf entries (ADR-031). In the ADR-027 fast
-/// path the first such write installs the write lock (the in-chain point), and a
-/// later one is the write-back that publishes `current_writer`; the one-shot
-/// hooks below target the first (the lock CAS).
-fn shard_cas(c: &WriteCtx) -> bool {
-    c.kind == "write_if" && (c.path.contains("/_n/") || c.path.ends_with("/_i"))
+fn shard_cas(op: &BackendOp<'_>) -> bool {
+    matches!(op, BackendOp::WriteIf { path, .. }
+        if path.contains("/_n/") || path.ends_with("/_i"))
 }
 
-/// Matches the logged path's commit point: writing a *committed* transaction log
-/// object (a `/_t/` path whose body decodes as committed).
-fn committed_log(c: &WriteCtx) -> bool {
-    c.path.contains("/_t/") && is_committed_tx_log(c.value)
+fn committed_log(op: &BackendOp<'_>) -> bool {
+    matches!(
+        op,
+        BackendOp::WriteIf { path, value, .. }
+            | BackendOp::WriteIfNotExists { path, value }
+            if path.contains("/_t/") && is_committed_tx_log(value)
+    )
 }
 
-/// A one-shot [`Before`] that fails the first conditional write matching `when`
-/// with the error from `err` — the op never reaches the backend — and lets
-/// every other write proceed.
 fn fail_before(
-    when: impl Fn(&WriteCtx) -> bool + Send + Sync + 'static,
+    when: impl for<'a> Fn(&BackendOp<'a>) -> bool + Send + Sync + 'static,
     err: impl Fn() -> BackendError + Send + Sync + 'static,
 ) -> Before {
     let armed = AtomicBool::new(true);
-    Box::new(move |c| {
-        if armed.load(Ordering::SeqCst) && when(c) {
+    Box::new(move |op| {
+        if armed.load(Ordering::SeqCst) && when(op) {
             armed.store(false, Ordering::SeqCst);
-            Pre::Fail(err())
+            Err(err())
         } else {
-            Pre::Proceed
+            Ok(())
         }
     })
 }
 
-/// A one-shot [`After`] that, on the first landed write matching `when`, runs
-/// `competitor` and then reports the ack as lost (`Ok` -> `Unavailable`); all
-/// other writes pass through unchanged.
 fn lost_ack_after_racing(
-    when: impl Fn(&WriteCtx) -> bool + Send + Sync + 'static,
+    when: impl for<'a> Fn(&BackendOp<'a>) -> bool + Send + Sync + 'static,
     competitor: Competitor,
 ) -> After {
     let armed = Mutex::new(Some(competitor));
-    Box::new(move |c, r| {
-        // Fire once, on the first matching write that actually landed. Reading
-        // the context and taking the competitor is synchronous; only the
-        // competitor's own work runs in the returned future.
-        let competitor = if r.is_ok() && when(c) {
+    Box::new(move |op, outcome| {
+        let competitor = if outcome.is_success() && when(op) {
             armed.lock().unwrap().take()
         } else {
             None
         };
         Box::pin(async move {
-            match competitor {
-                Some(run) => {
-                    run().await;
-                    Err(lost_ack("write"))
-                }
-                None => r,
+            if let Some(run) = competitor {
+                run().await;
+                Err(lost_ack("write"))
+            } else {
+                Ok(())
             }
         })
     })
 }
 
-/// A one-shot [`After`] that lets the first landed write matching `when` lose
-/// its ack (`Ok` -> `Unavailable`), with no competing side effect.
-fn lost_ack_after(when: impl Fn(&WriteCtx) -> bool + Send + Sync + 'static) -> After {
+fn lost_ack_after(when: impl for<'a> Fn(&BackendOp<'a>) -> bool + Send + Sync + 'static) -> After {
     lost_ack_after_racing(when, Box::new(|| Box::pin(async {})))
 }
 
-/// A [`Backend`] decorator that wraps every conditional write in a
-/// `before`/`after` middleware pair (see [`Before`]/[`After`]) to inject
-/// targeted in-doubt outcomes. Reads and unconditional writes pass straight
-/// through. Every committed-log write is counted so a test can assert how many
-/// times the engine drove the commit point (a transparent retry would show up
-/// as a second committed-log write).
-struct HookBackend {
-    inner: Arc<dyn Backend>,
-    before: Mutex<Option<Before>>,
-    after: Mutex<Option<After>>,
-    /// Count of conditional writes of a committed transaction log — i.e. how
-    /// many times a commit point was driven.
-    committed_log_writes: AtomicUsize,
+fn arm_before(backend: &HookBackend, before: Before) {
+    backend.set_before(move |op| {
+        let result = before(op);
+        Box::pin(async move { result })
+    });
 }
 
-impl HookBackend {
-    fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-        Arc::new(HookBackend {
-            inner,
-            before: Mutex::new(None),
-            after: Mutex::new(None),
-            committed_log_writes: AtomicUsize::new(0),
-        })
-    }
-
-    /// Installs the pre-op hook.
-    fn arm_before(&self, before: Before) {
-        *self.before.lock().unwrap() = Some(before);
-    }
-
-    /// Installs the post-op hook.
-    fn arm_after(&self, after: After) {
-        *self.after.lock().unwrap() = Some(after);
-    }
-
-    fn committed_log_writes(&self) -> usize {
-        self.committed_log_writes.load(Ordering::SeqCst)
-    }
-
-    /// Runs a conditional write through the middleware: count it, consult the
-    /// `before` hook (which may short-circuit it), forward it to the real
-    /// backend, then hand the landed result to the `after` hook. Locks are
-    /// always released before awaiting, so a hook's own backend calls (a genuine
-    /// competing transaction) can re-enter without deadlocking.
-    async fn conditional<Fut>(
-        &self,
-        ctx: WriteCtx<'_>,
-        forward: impl FnOnce() -> Fut,
-    ) -> Result<Version, BackendError>
-    where
-        Fut: Future<Output = Result<Version, BackendError>>,
-    {
-        if committed_log(&ctx) {
-            self.committed_log_writes.fetch_add(1, Ordering::SeqCst);
+fn arm_after(backend: &HookBackend, after: After) -> Arc<AtomicUsize> {
+    let committed_log_writes = Arc::new(AtomicUsize::new(0));
+    backend.set_after({
+        let committed_log_writes = committed_log_writes.clone();
+        move |op, outcome| {
+            if committed_log(op) {
+                committed_log_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            after(op, outcome)
         }
-        let verdict = match self.before.lock().unwrap().as_ref() {
-            Some(before) => before(&ctx),
-            None => Pre::Proceed,
-        };
-        let landed = match verdict {
-            Pre::Fail(e) => return Err(e),
-            Pre::Proceed => forward().await,
-        };
-        let after = match self.after.lock().unwrap().as_ref() {
-            Some(after) => Ok(after(&ctx, landed)),
-            None => Err(landed),
-        };
-        match after {
-            Ok(fut) => fut.await,
-            Err(landed) => landed,
-        }
-    }
-}
-
-#[async_trait]
-impl Backend for HookBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected: &Version,
-    ) -> Result<ReadReply, BackendError> {
-        self.inner.read_if_modified(path, expected).await
-    }
-
-    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
-        self.inner.read(path).await
-    }
-
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        // Unconditional overwrite: idempotent, never faulted.
-        self.inner.write(path, value).await
-    }
-
-    async fn write_if(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
-        let ctx = WriteCtx {
-            kind: "write_if",
-            path,
-            value: &value,
-        };
-        self.conditional(ctx, || self.inner.write_if(path, value.clone(), expected))
-            .await
-    }
-
-    async fn write_if_not_exists(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
-        let ctx = WriteCtx {
-            kind: "write_if_not_exists",
-            path,
-            value: &value,
-        };
-        self.conditional(ctx, || self.inner.write_if_not_exists(path, value.clone()))
-            .await
-    }
-
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        self.inner.delete(path).await
-    }
-
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.inner.list(dir_path).await
-    }
+    });
+    committed_log_writes
 }
 
 fn lost_ack(op: &str) -> BackendError {
@@ -372,7 +211,7 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
     // Trap the fast path's lock CAS (the first `write_if` on the coordination
     // leaf — the root `/_i` here, which installs `locked_by`): let it land, then
     // lose the ack.
-    backend.arm_after(lost_ack_after(shard_cas));
+    let _ = arm_after(&backend, lost_ack_after(shard_cas));
 
     increment(&db, &coll, b"k")
         .await
@@ -410,15 +249,18 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     // competing client overwrite the key. It finds our lock, help-forwards our
     // committed value, then commits its own — so our subsequent read-back finds
     // the entry moved past us to a real, committed transaction, not a forged one.
-    backend.arm_after(lost_ack_after_racing(
-        shard_cas,
-        Box::new(move || {
-            Box::pin(async move {
-                other_coll.write(b"k", &write_int(99)).await.unwrap();
-                settle_writebacks().await;
-            })
-        }),
-    ));
+    let _ = arm_after(
+        &backend,
+        lost_ack_after_racing(
+            shard_cas,
+            Box::new(move || {
+                Box::pin(async move {
+                    other_coll.write(b"k", &write_int(99)).await.unwrap();
+                    settle_writebacks().await;
+                })
+            }),
+        ),
+    );
 
     let res = increment(&db, &coll, b"k").await;
     assert!(
@@ -453,7 +295,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     // Trap the fast path's lock CAS (the first `write_if` on the leaf `_i`):
     // report it as in-doubt *without* applying it, modelling a write that never landed. The
     // hook is one-shot, so the engine's idempotent re-issue lands.
-    backend.arm_before(fail_before(shard_cas, || not_applied("write_if")));
+    arm_before(&backend, fail_before(shard_cas, || not_applied("write_if")));
 
     increment(&db, &coll, b"k")
         .await
@@ -489,12 +331,11 @@ async fn logged_commit_lost_ack_retries_transparently() {
     seed(&coll, b"b", 0).await;
 
     // Seeding committed its own logs; count only commit points from here on.
-    let before = backend.committed_log_writes();
 
     // Trap the commit point: the transaction log written as committed (a write
     // to a `/_t/` path whose body decodes as committed). Let it land, then lose
     // the ack.
-    backend.arm_after(lost_ack_after(committed_log));
+    let committed_log_writes = arm_after(&backend, lost_ack_after(committed_log));
 
     // Two distinct writes force the locked, log-based commit path. Capture `coll`
     // by reference so the body stays `FnMut` (re-runnable on a retry).
@@ -518,7 +359,7 @@ async fn logged_commit_lost_ack_retries_transparently() {
     // mean the engine kept hammering the committed-log path instead of
     // recognizing its own landed write.
     assert_eq!(
-        backend.committed_log_writes() - before,
+        committed_log_writes.load(Ordering::SeqCst),
         2,
         "expected one original + one retry attempt on the committed-log path",
     );
@@ -543,7 +384,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // Trap the first leaf lock CAS (a `write_if` on the leaf `_i` — how a
     // lock is installed in v2). Let it land, then lose the ack: the lock is
     // actually applied but the locker observes `Unavailable`.
-    backend.arm_after(lost_ack_after(shard_cas));
+    let _ = arm_after(&backend, lost_ack_after(shard_cas));
 
     // Two writes force the locked, log-based commit path. Capture `coll` by
     // reference so the body stays `FnMut` (re-runnable, though we expect no
@@ -583,7 +424,10 @@ async fn clean_conflict_on_single_rw_still_commits() {
     // Inject one clean precondition on the fast path's lock CAS, without applying
     // it: a genuine lost race that never landed. The fast path should reload and
     // retry, and the second attempt (hook consumed) commits.
-    backend.arm_before(fail_before(shard_cas, || BackendError::Precondition));
+    arm_before(
+        &backend,
+        fail_before(shard_cas, || BackendError::Precondition),
+    );
 
     increment(&db, &coll, b"k")
         .await

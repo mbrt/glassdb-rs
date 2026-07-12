@@ -955,9 +955,10 @@ impl Locker {
 mod tests {
     use super::*;
     use crate::resolver::Resolver;
-    use async_trait::async_trait;
-    use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_backend::{Backend, BackendError, ReadReply, Version, memory::MemoryBackend};
+    use glassdb_backend::middleware::{
+        BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
+    };
+    use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_storage::{
@@ -1377,24 +1378,41 @@ mod tests {
 
     // --- ADR-025: cross-transaction lock-acquisition deduplication ----------
 
-    /// Test backend that, while **armed**, blocks the next `read` on a gate until
+    /// Test hook that, while **armed**, blocks the next read on a gate until
     /// released — so a test can park the dedup driver mid-load while other
     /// contenders queue, forcing them into one merged CAS round. Every other call
     /// passes through. Arming is deferred (`arm`) so a test can run un-gated setup
     /// first, then gate only the phase under test.
-    struct GateBackend {
-        inner: Arc<dyn Backend>,
+    struct Gate {
         gate: Arc<Notify>,
         armed: AtomicBool,
     }
 
-    impl GateBackend {
-        fn new(inner: Arc<dyn Backend>, armed: bool) -> Arc<Self> {
-            Arc::new(GateBackend {
-                inner,
+    impl Gate {
+        fn wrap(inner: Arc<dyn Backend>, armed: bool) -> (Arc<HookBackend>, Arc<Self>) {
+            let gate = Arc::new(Gate {
                 gate: Arc::new(Notify::new()),
                 armed: AtomicBool::new(armed),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let gate = gate.clone();
+                move |op| {
+                    let wait = matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ) && gate.armed.swap(false, Ordering::SeqCst);
+                    let notify = gate.gate.clone();
+                    let future: HookFuture = Box::pin(async move {
+                        if wait {
+                            notify.notified().await;
+                        }
+                        Ok(())
+                    });
+                    future
+                }
+            });
+            (backend, gate)
         }
         /// Gate the next read until [`Self::release`].
         fn arm(&self) {
@@ -1406,65 +1424,18 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl Backend for GateBackend {
-        async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
-            if self.armed.swap(false, Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &Version,
-        ) -> Result<ReadReply, BackendError> {
-            // Gate the cache-revalidation path too: after un-gated setup warms
-            // the object cache, a shard reload arrives here rather than as a cold
-            // `read`, so a deferred-arm test must park it as well.
-            if self.armed.swap(false, Ordering::SeqCst) {
-                self.gate.notified().await;
-            }
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &Version,
-        ) -> Result<Version, BackendError> {
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<Version, BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-            self.inner.list(dir_path).await
-        }
-    }
-
     /// A locker whose backend records ops and gates the first read.
-    fn gated_locker() -> (Locker, TlCtx, OpLog, Arc<GateBackend>) {
+    fn gated_locker() -> (Locker, TlCtx, OpLog, Arc<Gate>) {
         gated_locker_with(true)
     }
 
     /// As [`gated_locker`], but `armed` chooses whether the gate is active from
     /// the start (gate acquisition) or deferred until `arm` (gate a later phase,
     /// e.g. write-back, after un-gated setup).
-    fn gated_locker_with(armed: bool) -> (Locker, TlCtx, OpLog, Arc<GateBackend>) {
+    fn gated_locker_with(armed: bool) -> (Locker, TlCtx, OpLog, Arc<Gate>) {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let gate = GateBackend::new(mem, armed);
-        let recorder = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let (backend, gate) = Gate::wrap(mem, armed);
+        let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
         let (locker, ctx) = new_test_locker(recorder);
         (locker, ctx, log, gate)

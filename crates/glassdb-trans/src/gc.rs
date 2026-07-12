@@ -435,7 +435,7 @@ mod tests {
     use crate::resolver::Resolver;
     use crate::shard_coord::ShardCoordinator;
     use crate::tlocker::LockOutcome;
-    use glassdb_backend::middleware::RecordingBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_storage::{
@@ -733,8 +733,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gc_release_merges_into_live_acquire_round() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let gate = GateBackend::new(mem);
-        let rec = Arc::new(RecordingBackend::new(gate.clone() as Arc<dyn Backend>));
+        let (backend, gate) = Gate::wrap(mem);
+        let rec = Arc::new(RecordingBackend::new(backend));
         let log = rec.log();
         let ctx = new_ctx_with(rec);
 
@@ -962,99 +962,56 @@ mod tests {
         sib
     }
 
-    /// Test backend that, while **armed**, parks the dedup driver's coordination
-    /// leaf load on a gate until released — so a test can hold the driver
-    /// mid-load while a second contender queues, forcing them into one merged CAS
-    /// round. The first `skip` reads after arming pass through: descent reads the
-    /// collection root `_i` to route a key before the coordinator loads the leaf
-    /// (ADR-031), so the gate skips that routing read and parks the coordinator's
-    /// load instead. Arming is deferred so un-gated setup runs first.
-    struct GateBackend {
-        inner: Arc<dyn Backend>,
-        gate: Arc<tokio::sync::Notify>,
+    /// Controls a hook that skips one routing read, then gates the coordinator load.
+    struct Gate {
+        notify: Arc<tokio::sync::Notify>,
         armed: std::sync::atomic::AtomicBool,
         skip: std::sync::atomic::AtomicUsize,
     }
 
-    impl GateBackend {
-        fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-            Arc::new(GateBackend {
-                inner,
-                gate: Arc::new(tokio::sync::Notify::new()),
+    impl Gate {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+            let gate = Arc::new(Self {
+                notify: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
                 skip: std::sync::atomic::AtomicUsize::new(0),
-            })
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let gate = gate.clone();
+                move |op| {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let wait = matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ) && gate.armed.load(SeqCst)
+                        && gate
+                            .skip
+                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                            .is_err();
+                    if wait {
+                        gate.armed.store(false, SeqCst);
+                    }
+                    let notify = gate.notify.clone();
+                    let future: HookFuture = Box::pin(async move {
+                        if wait {
+                            notify.notified().await;
+                        }
+                        Ok(())
+                    });
+                    future
+                }
+            });
+            (backend, gate)
         }
+
         fn arm(&self) {
-            // Skip the driver's descent (routing) read of `_i`, then gate its
-            // coordinator leaf load.
             self.skip.store(1, std::sync::atomic::Ordering::SeqCst);
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        fn release(&self) {
-            self.gate.notify_one();
-        }
-        async fn gate_if_armed(&self) {
-            use std::sync::atomic::Ordering::SeqCst;
-            if !self.armed.load(SeqCst) {
-                return;
-            }
-            if self
-                .skip
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                return;
-            }
-            self.armed.store(false, SeqCst);
-            self.gate.notified().await;
-        }
-    }
 
-    #[async_trait::async_trait]
-    impl Backend for GateBackend {
-        async fn read(
-            &self,
-            path: &str,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.gate_if_armed().await;
-            self.inner.read(path).await
-        }
-        async fn read_if_modified(
-            &self,
-            path: &str,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::ReadReply, glassdb_backend::BackendError> {
-            self.gate_if_armed().await;
-            self.inner.read_if_modified(path, expected).await
-        }
-        async fn write(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write(path, value).await
-        }
-        async fn write_if(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-            expected: &glassdb_backend::Version,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if(path, value, expected).await
-        }
-        async fn write_if_not_exists(
-            &self,
-            path: &str,
-            value: Vec<u8>,
-        ) -> Result<glassdb_backend::Version, glassdb_backend::BackendError> {
-            self.inner.write_if_not_exists(path, value).await
-        }
-        async fn delete(&self, path: &str) -> Result<(), glassdb_backend::BackendError> {
-            self.inner.delete(path).await
-        }
-        async fn list(&self, dir_path: &str) -> Result<Vec<String>, glassdb_backend::BackendError> {
-            self.inner.list(dir_path).await
+        fn release(&self) {
+            self.notify.notify_one();
         }
     }
 }

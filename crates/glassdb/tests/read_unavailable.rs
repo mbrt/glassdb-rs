@@ -18,31 +18,40 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-use async_trait::async_trait;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::{Backend, BackendError, ReadReply, Version};
+use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
+use glassdb::backend::{Backend, BackendError};
 use glassdb::{Database, Error};
 
-/// A [`Backend`] decorator that injects `BackendError::Unavailable` on reads of
-/// coordination leaf objects (a node `/_n/` or the collection root `/_i`), up to
-/// a configurable budget. Every other operation — and reads of non-leaf objects
-/// (transaction objects, values) — passes straight through, so only the value
-/// read's leaf resolution under test is affected.
-struct FaultReadBackend {
-    inner: Arc<dyn Backend>,
+/// Controls a hook that injects `Unavailable` on coordination-leaf reads.
+struct ReadFaults {
     /// Remaining leaf reads to fault. `i64::MAX` models a sustained outage; a
     /// small positive value models a transient blip.
     fail_remaining: AtomicI64,
     key_reads: AtomicUsize,
 }
 
-impl FaultReadBackend {
-    fn new(inner: Arc<dyn Backend>) -> Arc<Self> {
-        Arc::new(FaultReadBackend {
-            inner,
+impl ReadFaults {
+    fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+        let faults = Arc::new(Self {
             fail_remaining: AtomicI64::new(0),
             key_reads: AtomicUsize::new(0),
-        })
+        });
+        let backend = HookBackend::new(inner);
+        backend.set_before({
+            let faults = faults.clone();
+            move |op| {
+                let result = match op {
+                    BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. } => {
+                        faults.maybe_fault(path).map_or(Ok(()), Err)
+                    }
+                    _ => Ok(()),
+                };
+                let future: HookFuture = Box::pin(async move { result });
+                future
+            }
+        });
+        (backend, faults)
     }
 
     /// Faults the next `n` key reads, then lets them through.
@@ -84,56 +93,6 @@ impl FaultReadBackend {
     }
 }
 
-#[async_trait]
-impl Backend for FaultReadBackend {
-    async fn read_if_modified(
-        &self,
-        path: &str,
-        expected: &Version,
-    ) -> Result<ReadReply, BackendError> {
-        if let Some(e) = self.maybe_fault(path) {
-            return Err(e);
-        }
-        self.inner.read_if_modified(path, expected).await
-    }
-
-    async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
-        if let Some(e) = self.maybe_fault(path) {
-            return Err(e);
-        }
-        self.inner.read(path).await
-    }
-
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.inner.write(path, value).await
-    }
-
-    async fn write_if(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
-        self.inner.write_if(path, value, expected).await
-    }
-
-    async fn write_if_not_exists(
-        &self,
-        path: &str,
-        value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
-        self.inner.write_if_not_exists(path, value).await
-    }
-
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        self.inner.delete(path).await
-    }
-
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.inner.list(dir_path).await
-    }
-}
-
 fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
@@ -162,12 +121,12 @@ async fn transient_read_unavailability_is_retried_transparently() {
     seed_shared(mem.clone(), b"k", 10).await;
 
     // A second database with a cold cache reads through the faulty transport.
-    let backend = FaultReadBackend::new(mem.clone());
+    let (backend, faults) = ReadFaults::wrap(mem.clone());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
 
     // Fault the first two key reads; the bounded retry rides over them.
-    backend.fail_next_key_reads(2);
+    faults.fail_next_key_reads(2);
 
     let calls = Arc::new(AtomicUsize::new(0));
     let coll = &coll;
@@ -187,9 +146,9 @@ async fn transient_read_unavailability_is_retried_transparently() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // The two injected faults plus the successful read.
     assert!(
-        backend.key_reads() >= 3,
+        faults.key_reads() >= 3,
         "expected at least 3 key reads (2 faulted + 1 ok), got {}",
-        backend.key_reads()
+        faults.key_reads()
     );
 }
 
@@ -201,11 +160,11 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(mem.clone(), b"k", 10).await;
 
-    let backend = FaultReadBackend::new(mem.clone());
+    let (backend, faults) = ReadFaults::wrap(mem.clone());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db.collection(b"c");
 
-    backend.fail_key_reads_forever();
+    faults.fail_key_reads_forever();
 
     let coll = &coll;
     let res = db.tx(|tx| async move { tx.read(coll, b"k").await }).await;
