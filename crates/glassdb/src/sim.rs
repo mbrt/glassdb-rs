@@ -51,7 +51,9 @@ use crate::{Collection, Database, Error};
 pub const KEY_COUNT: usize = 4;
 const MAX_CLIENTS: usize = 4;
 const MAX_OPS_PER_CLIENT: usize = 8;
-const COLLECTION: &[u8] = b"fuzz";
+/// Collection the increment workload operates on. Each workload owns its own
+/// collection; the harness never needs to know which one.
+const INCREMENT_COLLECTION: &[u8] = b"fuzz";
 const DB_NAME: &str = "fuzz";
 
 /// A single operation performed by a client, all wrapped in their own
@@ -251,10 +253,13 @@ async fn run_one(
 }
 
 /// Opens the simulation Database with the deterministic clock the fuzzer relies
-/// on for byte-identical replays, under the given split `policy` (default caps
-/// for the increment/cycle workloads; a tiny policy for the membership workload
-/// so a handful of keys forces B-link splits).
-async fn open_det_db(backend: &Arc<dyn Backend>, policy: SplitPolicy) -> Result<Database, Error> {
+/// on for byte-identical replays, under the given split `policy`. Workloads open
+/// their databases through this helper (see [`SimWorkload::open_db`]) so the
+/// deterministic clock is applied uniformly regardless of the chosen policy.
+pub(crate) async fn open_det_db(
+    backend: &Arc<dyn Backend>,
+    policy: SplitPolicy,
+) -> Result<Database, Error> {
     Database::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
         .split_policy(policy)
@@ -456,9 +461,11 @@ fn spawn_nemeses(
 // the same run: seed a shared store, run each client's op sequence as its own
 // interleaved task over its own fault transport, run the crash/outage nemeses,
 // then read the final committed state and assert an invariant. Only a few points
-// differ per workload — the collection, the seed step, how one op runs, the
-// invariant, an optional concurrent observer, and the split policy — so those
-// are the trait methods; `run_generic` owns everything else.
+// differ per workload — opening the database, the seed step, how one op runs, the
+// invariant, and an optional concurrent observer — so those are the trait
+// methods. Each workload owns its own collection(s) behind those methods, so the
+// harness works purely with `Database` handles and `run_generic` owns everything
+// else (the backbone, per-client transports, crash/restart, and nemeses).
 // ===========================================================================
 
 /// A deterministic-simulation workload the shared harness ([`run_generic`]) can
@@ -475,32 +482,30 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     /// [`verify`]: SimWorkload::verify
     type State: Send + Sync + 'static;
 
-    /// The collection every client operates on.
-    const COLLECTION: &'static [u8];
-
     /// This run's per-client op sequences. Clients run concurrently.
     fn clients(&self) -> &[Vec<Self::Op>];
 
     /// A fresh oracle state for one run.
     fn new_state(&self) -> Self::State;
 
-    /// The split soft-cap policy the databases open with. Defaults to production
-    /// caps; a workload that wants to exercise B-link splits with few keys
-    /// overrides it with a tiny policy.
-    fn split_policy() -> SplitPolicy {
-        SplitPolicy::default()
+    /// Opens a database for this workload over `backend`. The harness calls this
+    /// for the seed/verify database and for every client (and restart), so the
+    /// workload — not the harness — chooses the split soft-cap policy. The
+    /// default uses production caps; override to exercise B-link splits with few
+    /// keys. Implementations must go through [`open_det_db`] to keep the
+    /// deterministic clock byte-identical replays rely on.
+    fn open_db(backend: &Arc<dyn Backend>) -> impl Future<Output = Result<Database, Error>> + Send {
+        open_det_db(backend, SplitPolicy::default())
     }
 
-    /// Seeds the collection before the clients start, over the faultless
-    /// backbone (so setup cannot fail spuriously). The collection is already
-    /// created.
-    fn seed(&self, db: &Database, coll: &Collection) -> impl Future<Output = ()> + Send;
+    /// Creates and seeds this workload's collection(s) before the clients start,
+    /// over the faultless backbone (so setup cannot fail spuriously).
+    fn seed(&self, db: &Database) -> impl Future<Output = ()> + Send;
 
     /// Runs one op in its own transaction, updating `state`. Returns the op's
     /// result so the client loop can stop (and leave it in-doubt) on failure.
     fn run_op(
         db: &Database,
-        coll: &Collection,
         op: &Self::Op,
         state: &Self::State,
     ) -> impl Future<Output = Result<(), Error>> + Send;
@@ -510,7 +515,7 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     /// (in-doubt-tolerant) form of the invariant.
     fn verify(
         &self,
-        coll: &Collection,
+        db: &Database,
         state: &Self::State,
         faults_enabled: bool,
     ) -> impl Future<Output = ()> + Send;
@@ -534,7 +539,6 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
 /// op would double-apply).
 async fn run_generic_client<W: SimWorkload>(
     db: &Database,
-    coll: &Collection,
     ops: &[W::Op],
     state: &W::State,
     consumed: &AtomicUsize,
@@ -546,7 +550,7 @@ async fn run_generic_client<W: SimWorkload>(
         // atomic because the `tokio::select!` cancel arm simply drops this future
         // and cannot read its return value.
         consumed.store(i + 1, Ordering::SeqCst);
-        if W::run_op(db, coll, op, state).await.is_err() {
+        if W::run_op(db, op, state).await.is_err() {
             return i + 1;
         }
     }
@@ -572,14 +576,11 @@ async fn run_generic<W: SimWorkload>(
     // The store and a shared recorder form a faultless backbone; each client gets
     // its own transport (`FaultBackend`) over it.
     let (backbone, log) = make_backbone();
-    let policy = W::split_policy();
 
-    // Create the collection and let the workload seed it, over the faultless
+    // Let the workload open and seed its collection(s), over the faultless
     // backbone so setup cannot fail spuriously.
-    let init_db = open_det_db(&backbone, policy).await.expect("open init db");
-    let init_coll = init_db.collection(W::COLLECTION);
-    init_coll.create().await.expect("create collection");
-    workload.seed(&init_db, &init_coll).await;
+    let init_db = W::open_db(&backbone).await.expect("open init db");
+    workload.seed(&init_db).await;
 
     let state = Arc::new(workload.new_state());
 
@@ -609,14 +610,13 @@ async fn run_generic<W: SimWorkload>(
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
             let crashed = {
-                let Ok(db) = open_det_db(&backend, policy).await else {
+                let Ok(db) = W::open_db(&backend).await else {
                     return;
                 };
-                let coll = db.collection(W::COLLECTION);
                 let crashed = tokio::select! {
                     biased;
                     _ = signal.cancelled() => true,
-                    _ = run_generic_client::<W>(&db, &coll, &ops, &state, &consumed) => false,
+                    _ = run_generic_client::<W>(&db, &ops, &state, &consumed) => false,
                 };
                 if !crashed {
                     db.shutdown().await;
@@ -632,11 +632,10 @@ async fn run_generic<W: SimWorkload>(
             let n = consumed.load(Ordering::SeqCst);
             if crashed
                 && n < ops.len()
-                && let Ok(db) = open_det_db(&backend, policy).await
+                && let Ok(db) = W::open_db(&backend).await
             {
-                let coll = db.collection(W::COLLECTION);
                 let dummy = AtomicUsize::new(0);
-                let _ = run_generic_client::<W>(&db, &coll, &ops[n..], &state, &dummy).await;
+                let _ = run_generic_client::<W>(&db, &ops[n..], &state, &dummy).await;
                 db.shutdown().await;
             }
         }));
@@ -670,7 +669,7 @@ async fn run_generic<W: SimWorkload>(
 
     // The workload reads the final committed state (driving recovery of any
     // crashed client's locks via lease expiry) and asserts its invariant.
-    workload.verify(&init_coll, &state, faults.enabled).await;
+    workload.verify(&init_db, &state, faults.enabled).await;
     init_db.shutdown().await;
     log
 }
@@ -844,8 +843,6 @@ impl SimWorkload for Workload {
     type Op = Op;
     type State = Mutex<Acct>;
 
-    const COLLECTION: &'static [u8] = COLLECTION;
-
     fn clients(&self) -> &[Vec<Op>] {
         &self.clients
     }
@@ -854,9 +851,12 @@ impl SimWorkload for Workload {
         Mutex::new(Acct::new())
     }
 
-    async fn seed(&self, db: &Database, coll: &Collection) {
+    async fn seed(&self, db: &Database) {
+        let coll = db.collection(INCREMENT_COLLECTION);
+        coll.create().await.expect("create collection");
         // Seed every key to zero up front, so a read of an untouched key returns
         // 0 rather than NotFound and the increment accounting is exact.
+        let coll = &coll;
         db.tx(|tx| async move {
             for k in 0..KEY_COUNT {
                 tx.write(coll, &key_name(k), &write_int(0))?;
@@ -867,16 +867,12 @@ impl SimWorkload for Workload {
         .expect("seed keys");
     }
 
-    async fn run_op(
-        db: &Database,
-        coll: &Collection,
-        op: &Op,
-        state: &Mutex<Acct>,
-    ) -> Result<(), Error> {
-        run_one(db, coll, op, state).await
+    async fn run_op(db: &Database, op: &Op, state: &Mutex<Acct>) -> Result<(), Error> {
+        run_one(db, &db.collection(INCREMENT_COLLECTION), op, state).await
     }
 
-    async fn verify(&self, coll: &Collection, state: &Mutex<Acct>, faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &Mutex<Acct>, faults_enabled: bool) {
+        let coll = db.collection(INCREMENT_COLLECTION);
         let expected = expected_increments(self);
         let mut finals = vec![0i64; KEY_COUNT];
         for (k, slot) in finals.iter_mut().enumerate() {
@@ -1048,17 +1044,18 @@ impl SimWorkload for CycleWorkload {
     type Op = usize;
     type State = ();
 
-    const COLLECTION: &'static [u8] = CYCLE_COLLECTION;
-
     fn clients(&self) -> &[Vec<usize>] {
         &self.clients
     }
 
     fn new_state(&self) {}
 
-    async fn seed(&self, db: &Database, coll: &Collection) {
+    async fn seed(&self, db: &Database) {
+        let coll = db.collection(CYCLE_COLLECTION);
+        coll.create().await.expect("create collection");
         // Lay down the ring (key(i) -> (i + 1) % N).
         let node_count = self.node_count;
+        let coll = &coll;
         db.tx(|tx| async move {
             for k in 0..node_count {
                 write_next(&tx, coll, k, (k + 1) % node_count)?;
@@ -1069,19 +1066,15 @@ impl SimWorkload for CycleWorkload {
         .expect("seed ring");
     }
 
-    async fn run_op(
-        db: &Database,
-        coll: &Collection,
-        op: &usize,
-        _state: &(),
-    ) -> Result<(), Error> {
-        cycle_swap(db, coll, *op).await
+    async fn run_op(db: &Database, op: &usize, _state: &()) -> Result<(), Error> {
+        cycle_swap(db, &db.collection(CYCLE_COLLECTION), *op).await
     }
 
-    async fn verify(&self, coll: &Collection, _state: &(), _faults_enabled: bool) {
+    async fn verify(&self, db: &Database, _state: &(), _faults_enabled: bool) {
         // Read every node's final next-pointer and assert the ring is still a
         // single N-cycle. The invariant holds whether or not faults occurred,
         // since each swap is atomic.
+        let coll = db.collection(CYCLE_COLLECTION);
         let node_count = self.node_count;
         let mut next = vec![0usize; node_count];
         for (k, slot) in next.iter_mut().enumerate() {
@@ -1111,7 +1104,7 @@ impl SimWorkload for CycleWorkload {
         let snapshot_reads = self.snapshot_reads;
         let backbone = backbone.clone();
         Some(rt::spawn(async move {
-            let Ok(db) = open_det_db(&backbone, Self::split_policy()).await else {
+            let Ok(db) = Self::open_db(&backbone).await else {
                 return;
             };
             let coll = db.collection(CYCLE_COLLECTION);
@@ -1298,8 +1291,6 @@ impl SimWorkload for MembershipWorkload {
     type Op = MembOp;
     type State = Mutex<MembershipAcct>;
 
-    const COLLECTION: &'static [u8] = MEMBERSHIP_COLLECTION;
-
     fn clients(&self) -> &[Vec<MembOp>] {
         &self.clients
     }
@@ -1308,20 +1299,26 @@ impl SimWorkload for MembershipWorkload {
         Mutex::new(MembershipAcct::new())
     }
 
-    fn split_policy() -> SplitPolicy {
-        membership_split_policy()
+    async fn open_db(backend: &Arc<dyn Backend>) -> Result<Database, Error> {
+        // A tiny split soft cap so a handful of keys forces B-link splits.
+        open_det_db(backend, membership_split_policy()).await
     }
 
-    async fn seed(&self, _db: &Database, _coll: &Collection) {
-        // The collection starts empty; the harness has already created it.
+    async fn seed(&self, db: &Database) {
+        // The collection starts empty; just create it.
+        db.collection(MEMBERSHIP_COLLECTION)
+            .create()
+            .await
+            .expect("create collection");
     }
 
     async fn run_op(
         db: &Database,
-        coll: &Collection,
         op: &MembOp,
         state: &Mutex<MembershipAcct>,
     ) -> Result<(), Error> {
+        let coll = db.collection(MEMBERSHIP_COLLECTION);
+        let coll = &coll;
         match op {
             MembOp::Put(k) => {
                 // Record the intended outcome before the op so a crash mid-commit
@@ -1348,7 +1345,8 @@ impl SimWorkload for MembershipWorkload {
         }
     }
 
-    async fn verify(&self, coll: &Collection, state: &Mutex<MembershipAcct>, faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &Mutex<MembershipAcct>, faults_enabled: bool) {
+        let coll = db.collection(MEMBERSHIP_COLLECTION);
         let keys: Vec<Vec<u8>> = coll
             .keys()
             .await
