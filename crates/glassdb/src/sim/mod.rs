@@ -53,6 +53,7 @@ pub(super) fn tiny_split_policy() -> SplitPolicy {
         leaf_max_entries: 2,
         leaf_max_bytes: 1 << 20,
         index_max_children: 2,
+        ..SplitPolicy::default()
     }
 }
 

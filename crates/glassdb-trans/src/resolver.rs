@@ -33,8 +33,8 @@ use crate::error::{TransError, trans_to_storage};
 use crate::monitor::Monitor;
 
 /// The result of a phantom-safe listing scan ([`Resolver::live_keys_scan`]): the
-/// live keys in key order, plus the version of every leaf the scan covered so
-/// commit validation can detect a racing create/delete or split (ADR-031).
+/// live keys in key order, plus every covered leaf's membership dependencies so
+/// commit validation can detect a racing create/delete or split (ADR-032).
 #[derive(Debug, Clone)]
 pub struct ScanResult {
     pub keys: Vec<Vec<u8>>,
@@ -104,25 +104,38 @@ impl Resolver {
     }
 
     /// Scans `prefix` left-to-right and returns both the raw keys that currently
-    /// exist (committed and not tombstoned, in key order) and the version of
-    /// every leaf the scan covered (ADR-031 phantom prevention).
+    /// exist (committed and not tombstoned, in key order) and the membership
+    /// dependencies of every leaf the scan covered (ADR-032 phantom prevention).
     ///
     /// Committed holders are help-forwarded, so a key whose writer committed but
     /// has not yet published its `current_writer` pointer (write-back is
     /// asynchronous) still lists. The scan follows the leaf right-sibling chain
     /// ([`Directory::leaves`]), so an in-progress split is absorbed rather than
-    /// dropping or duplicating keys. Recording each covered leaf's object
-    /// version lets commit validation detect any create/delete (which bumps its
-    /// leaf's version) or split (which changes the covered set) that raced the
-    /// scan.
+    /// dropping or duplicating keys. Membership versions and pending membership
+    /// holders detect creates/deletes without conflicting with value overwrites;
+    /// a split is detected by the changed covered-leaf set.
     pub async fn live_keys_scan(&self, prefix: &str) -> Result<ScanResult, StorageError> {
         let leaves = self.dir.leaves(prefix, Freshness::Latest).await?;
         let mut keys = Vec::new();
         let mut covered = Vec::with_capacity(leaves.len());
         for loc in leaves {
+            let mut pending_membership = Vec::new();
+            for holder in loc.node.membership_lock().holders() {
+                if self
+                    .tmon
+                    .tx_status(holder)
+                    .await
+                    .map_err(trans_to_storage)?
+                    == TxCommitStatus::Pending
+                {
+                    pending_membership.push(holder.clone());
+                }
+            }
+            pending_membership.sort();
             covered.push(LeafCoverage {
                 path: loc.path.as_str().into(),
-                version: loc.version.clone(),
+                membership_version: loc.node.membership_version(),
+                pending_membership,
             });
             let leaf = loc
                 .node

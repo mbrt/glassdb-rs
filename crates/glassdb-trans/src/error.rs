@@ -31,6 +31,9 @@ pub enum TransError {
     /// Internal: the single read-write fast path is not applicable.
     #[error("cannot validate transaction with multiple writes")]
     NoSingleWrite,
+    /// User data cannot fit in the configured coordination-object limit.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     /// Any other transaction error, with an optional underlying cause.
     #[error("{msg}")]
     Other {
@@ -71,6 +74,7 @@ impl TransError {
                 msg: format!("{ctx}: {msg}"),
                 source,
             },
+            TransError::InvalidInput(msg) => TransError::InvalidInput(format!("{ctx}: {msg}")),
             sentinel => sentinel,
         }
     }

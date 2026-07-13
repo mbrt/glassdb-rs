@@ -39,9 +39,11 @@ mod tests {
                     locks: vec![Lock {
                         suffix: "_k/H6KgQ6w".to_string(),
                         lock_type: lock::LockType::Write as i32,
+                        scope: lock::Scope::Entry as i32,
                     }],
                 }),
             }],
+            structural_splits: Vec::new(),
         };
 
         let bytes = log.encode_to_vec();

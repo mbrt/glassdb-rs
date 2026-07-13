@@ -20,10 +20,9 @@
 //! outcome (ADR-029). All lock/transaction *policy* lives in the resolvers the
 //! callers install: [`Locker`](crate::Locker) installs the Acquire / WriteBack /
 //! Release resolvers, and [`Algo`](crate::Algo) installs the single read-write
-//! CommitInstall. Membership (create/delete) is coordinated per-key in the
-//! owning leaf, so there is no separate root-membership path (ADR-031). The
-//! per-transaction held-lock bookkeeping lives with its owner, the
-//! [`Locker`](crate::Locker), not in the engine.
+//! CommitInstall. Those resolvers stage entry and node-level coordination in the
+//! same object CAS (ADR-032). The per-transaction held-lock bookkeeping lives
+//! with its owner, the [`Locker`](crate::Locker), not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
@@ -35,7 +34,10 @@ use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
 };
 use glassdb_data::TxId;
-use glassdb_storage::{Freshness, LockType, Shard, ShardEntry, ShardStore, StorageError};
+use glassdb_storage::{
+    Freshness, IndexNode, LeafKind, LockType, Node, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError,
+};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -58,10 +60,9 @@ struct Stats {
 /// engine treats it as an opaque payload it stages and delivers.
 #[derive(Clone)]
 pub(crate) enum FoldOutcome {
-    /// A lock was installed (Acquire), held at the given strength — the
-    /// strongest intent across the acquired keys. Self-describing so the caller
-    /// records the hold from the outcome instead of re-deriving it.
-    Locked(LockType),
+    /// A lock was installed (Acquire), carrying the strongest entry intention
+    /// and the membership scope held on the leaf.
+    Locked { typ: LockType, membership: LockType },
     /// A touched key is held by a live holder this transaction does not
     /// outrank: wait for `holder` to finalize, then re-submit (hold-and-wait,
     /// ADR-024). Nothing was staged for this transaction in the round's CAS.
@@ -85,6 +86,8 @@ pub(crate) enum FoldOutcome {
     /// then moved, so it cannot be told whether the lock landed first: the one
     /// irreducible ambiguity, surfaced rather than risking a double-apply.
     InDoubt(String),
+    /// One key can never fit in a splittable coordination node.
+    InvalidInput(String),
 }
 
 /// Why the fold engine is (re-)running the resolvers this attempt: a `Fresh`
@@ -113,6 +116,8 @@ pub(crate) enum Step {
     /// deliver `outcome` to the member.
     Stage {
         entries: Vec<(Vec<u8>, ShardEntry)>,
+        /// Updated node-level coordination, if this member changed it.
+        node: Option<Node>,
         outcome: FoldOutcome,
     },
     /// Stage nothing; deliver `outcome` to the member regardless of the CAS.
@@ -141,6 +146,7 @@ pub(crate) trait ShardResolver: Send + Sync {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
+        node: &Node,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
     ) -> Result<Step, TransError>;
 
@@ -234,6 +240,11 @@ pub trait SplitHinter: Send + Sync {
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &str, shard: &Shard);
+
+    /// Returns the sizing policy enforced by the coordinator.
+    fn policy(&self) -> SplitPolicy {
+        SplitPolicy::default()
+    }
 }
 
 /// The default [`SplitHinter`] that drops every hint: for a coordinator with no
@@ -257,6 +268,7 @@ struct CoordCore {
     // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
     // Emitted on the write path so growth needs no key-space enumeration.
     hinter: Arc<dyn SplitHinter>,
+    policy: SplitPolicy,
 }
 
 struct CoordState {
@@ -319,7 +331,21 @@ impl CasWorker {
             } else {
                 Freshness::Latest
             };
-            let loaded = self.core.shards.load_leaf(path, freshness).await?;
+            let loaded = match self.core.shards.load_leaf(path, freshness).await {
+                Ok(loaded) => loaded,
+                // A root split can turn the routed root leaf into an index
+                // between grouping and this load. Deliver each resolver's
+                // reroute outcome so its caller rebuilds the current leaf set.
+                Err(StorageError::Precondition) => {
+                    let members = shard_members(batch);
+                    for member in members.values() {
+                        *member.slot.lock().unwrap() = Some(member.resolver.exhausted_outcome());
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut node = loaded.node().clone();
             // Read the merged set *after* obtaining the leaf so this round
             // absorbs every member that queued while the load I/O was in flight
             // (ADR-025) — the window that turns N contenders' loads+CASes into
@@ -357,14 +383,71 @@ impl CasWorker {
                     results.push((tx.clone(), m.resolver.exhausted_outcome()));
                     continue;
                 }
-                match m.resolver.resolve(&ctx, &entries).await? {
+                match m.resolver.resolve(&ctx, &node, &entries).await? {
                     Step::Stage {
                         entries: changes,
+                        node: changed_node,
                         outcome,
                     } => {
+                        let mut candidate_entries = entries.clone();
+                        for (key, entry) in &changes {
+                            candidate_entries.insert(key.clone(), entry.clone());
+                        }
+                        let mut candidate_node = changed_node.unwrap_or_else(|| node.clone());
+                        let candidate_shard = Shard::from_entries(
+                            candidate_entries
+                                .values()
+                                .filter(|e| !e.is_vestigial())
+                                .cloned(),
+                        );
+                        candidate_node.set_leaf(candidate_shard.clone())?;
+                        let content_limit = self
+                            .core
+                            .policy
+                            .node_max_bytes
+                            .saturating_sub(self.core.policy.split_headroom_bytes);
+                        let individually_oversized = changes.iter().any(|(_, entry)| {
+                            let leaf_len = Node::leaf(Shard::from_entries([entry.clone()]))
+                                .content_encoded_len();
+                            let token = "x".repeat(24);
+                            let index_len = Node::index(IndexNode::from_children([
+                                (Vec::new(), token.clone()),
+                                (entry.key.clone(), token),
+                            ]))
+                            .content_encoded_len();
+                            leaf_len > content_limit / 2 || index_len > content_limit
+                        });
+                        if individually_oversized {
+                            results.push((
+                                tx.clone(),
+                                FoldOutcome::InvalidInput(
+                                    "key exceeds the coordination node size limit".into(),
+                                ),
+                            ));
+                            continue;
+                        }
+                        let (content_len, encoded_len) = match loaded.kind() {
+                            LeafKind::Root(root) => {
+                                let mut root = root.clone();
+                                root.set_node(candidate_node.clone());
+                                (root.content_encoded_len(), root.encode().len())
+                            }
+                            LeafKind::Node(_) => (
+                                candidate_node.content_encoded_len(),
+                                candidate_node.encode().len(),
+                            ),
+                        };
+                        if content_len > content_limit
+                            || encoded_len > self.core.policy.node_max_bytes
+                        {
+                            self.core.hinter.observe_leaf(path, &candidate_shard);
+                            results.push((tx.clone(), FoldOutcome::Conflict));
+                            continue;
+                        }
                         for (k, e) in changes {
                             entries.insert(k, e);
                         }
+                        node = candidate_node;
                         staged = true;
                         results.push((tx.clone(), outcome));
                     }
@@ -382,10 +465,11 @@ impl CasWorker {
                 let new_shard = glassdb_storage::Shard::from_entries(
                     entries.into_values().filter(|e| !e.is_vestigial()),
                 );
+                node.set_leaf(new_shard.clone())?;
                 match self
                     .core
                     .shards
-                    .store_leaf(path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                    .store_leaf_node(path, &node, loaded.kind(), loaded.version.as_ref())
                     .await
                 {
                     // Hint the background splitter if this write left the leaf
@@ -485,6 +569,7 @@ impl ShardCoordinator {
             resolver,
             retry,
             stats: Stats::default(),
+            policy: hinter.policy(),
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
@@ -693,6 +778,7 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
+            _node: &Node,
             staged: &BTreeMap<Vec<u8>, ShardEntry>,
         ) -> Result<Step, TransError> {
             let mut e = staged
@@ -703,7 +789,11 @@ mod tests {
             e.locked_by = vec![self.tx.clone()];
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
-                outcome: FoldOutcome::Locked(LockType::Write),
+                node: None,
+                outcome: FoldOutcome::Locked {
+                    typ: LockType::Write,
+                    membership: LockType::None,
+                },
             })
         }
 
@@ -728,6 +818,7 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
+            _node: &Node,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
         ) -> Result<Step, TransError> {
             Ok(Step::Skip {
@@ -764,6 +855,7 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
+            _node: &Node,
             staged: &BTreeMap<Vec<u8>, ShardEntry>,
         ) -> Result<Step, TransError> {
             self.trace
@@ -775,6 +867,7 @@ mod tests {
                     self.key.clone(),
                     entry(&self.key, LockType::None, None, Some(&self.tx)),
                 )],
+                node: None,
                 outcome: FoldOutcome::Landed,
             })
         }
@@ -850,7 +943,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Locked(_))));
+        assert!(matches!(out, Some(FoldOutcome::Locked { .. })));
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -870,14 +963,14 @@ mod tests {
 
         // Seed the leaf as a shrunk left half: it owns keys < "m" and links to a
         // right sibling. "z" now lives in that sibling, not here.
-        let mut node = Node::leaf(Shard::from_entries([entry(
+        let node = Node::leaf(Shard::from_entries([entry(
             b"a",
             LockType::None,
             None,
             None,
-        )]));
-        node.set_high_key(Some(b"m".to_vec()));
-        node.set_right_sibling(Some("R".to_string()));
+        )]))
+        .with_high_key(Some(b"m".to_vec()))
+        .with_right_sibling(Some("R".to_string()));
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
 
         let tx = TxId::with_priority(1, b"t");
@@ -915,8 +1008,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, store, _bg) = coord_over(backend.clone());
 
-        let mut node = Node::leaf(Shard::new());
-        node.set_high_key(Some(b"m".to_vec()));
+        let node = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
 
         let tx = TxId::with_priority(1, b"t");
@@ -932,7 +1024,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Locked(_))));
+        assert!(matches!(out, Some(FoldOutcome::Locked { .. })));
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -1187,6 +1279,7 @@ mod tests {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
+            _node: &Node,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
         ) -> Result<Step, TransError> {
             if self.folds.fetch_add(1, Ordering::SeqCst) < 2 {
@@ -1195,6 +1288,7 @@ mod tests {
                         self.key.clone(),
                         entry(&self.key, LockType::Write, Some(&self.tx), None),
                     )],
+                    node: None,
                     outcome: FoldOutcome::Landed,
                 });
             }

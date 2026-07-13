@@ -42,6 +42,7 @@ pub struct TxLog {
     pub status: TxCommitStatus,
     pub writes: Vec<TxWrite>,
     pub locks: Vec<PathLock>,
+    pub structural_splits: Vec<StructuralSplit>,
 }
 
 impl TxLog {
@@ -53,6 +54,7 @@ impl TxLog {
             status,
             writes: Vec::new(),
             locks: Vec::new(),
+            structural_splits: Vec::new(),
         }
     }
 }
@@ -90,6 +92,47 @@ pub struct TxStatus {
 pub struct PathLock {
     pub path: String,
     pub typ: LockType,
+    pub scope: LockScope,
+}
+
+/// The coordination namespace a transaction-log lock backreference belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LockScope {
+    #[default]
+    Entry,
+    Structure,
+    Membership,
+}
+
+impl std::fmt::Display for LockScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+/// A durable write-ahead record for one structural split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralSplit {
+    pub source_path: String,
+    pub source_version: String,
+    pub created_tokens: Vec<String>,
+    pub split_key: Vec<u8>,
+    pub kind: StructuralSplitKind,
+    pub outcome: StructuralSplitOutcome,
+    pub right_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralSplitKind {
+    NonRoot,
+    Root,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralSplitOutcome {
+    InProgress,
+    Applied,
+    RolledBack,
 }
 
 /// Reads and writes transaction logs under a path prefix.
@@ -146,7 +189,12 @@ impl TLogger {
         let p = paths::from_transaction(&self.prefix, id);
         if let Some(o) = self.objects.peek(&p) {
             let log = decode_tx_log(id, &o.value)?;
-            if log.status.is_final() {
+            if log.status.is_final()
+                && !log
+                    .structural_splits
+                    .iter()
+                    .any(|s| s.outcome == StructuralSplitOutcome::InProgress)
+            {
                 return Ok((log, o.version));
             }
         }
@@ -250,6 +298,7 @@ fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog,
         status,
         writes: Vec::new(),
         locks: Vec::new(),
+        structural_splits: Vec::new(),
     };
 
     for cw in &tr.writes {
@@ -271,16 +320,23 @@ fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog,
                 res.locks.push(PathLock {
                     path: paths::collection_info(&cw.prefix),
                     typ: parse_lock_type(clt),
+                    scope: LockScope::Entry,
                 });
             }
             for l in &locks.locks {
                 res.locks.push(PathLock {
                     path: format!("{}/{}", cw.prefix, l.suffix),
                     typ: parse_lock_type(l.lock_type),
+                    scope: parse_lock_scope(l.scope),
                 });
             }
         }
     }
+    res.structural_splits = tr
+        .structural_splits
+        .iter()
+        .map(parse_structural_split)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(res)
 }
 
@@ -310,6 +366,11 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
         timestamp: Some(system_to_proto_ts(ts)),
         status: status as i32,
         writes: coll_writes.into_values().collect(),
+        structural_splits: l
+            .structural_splits
+            .iter()
+            .map(marshal_structural_split)
+            .collect(),
     };
     Ok(tr.encode_to_vec())
 }
@@ -364,15 +425,88 @@ fn marshal_lock(
         });
     let clocks = coll.locks.get_or_insert_with(pb::CollectionLocks::default);
 
-    if pr.typ == paths::Type::CollectionInfo {
+    if pr.typ == paths::Type::CollectionInfo && e.scope == LockScope::Entry {
         clocks.collection_lock = lt as i32;
     } else {
         clocks.locks.push(pb::Lock {
-            suffix: format!("{}/{}", pr.typ.as_str(), pr.suffix),
+            suffix: if pr.suffix.is_empty() {
+                pr.typ.as_str().to_string()
+            } else {
+                format!("{}/{}", pr.typ.as_str(), pr.suffix)
+            },
             lock_type: lt as i32,
+            scope: lock_scope_to_proto(e.scope) as i32,
         });
     }
     Ok(())
+}
+
+fn lock_scope_to_proto(scope: LockScope) -> pb::lock::Scope {
+    match scope {
+        LockScope::Entry => pb::lock::Scope::Entry,
+        LockScope::Structure => pb::lock::Scope::Structure,
+        LockScope::Membership => pb::lock::Scope::Membership,
+    }
+}
+
+fn parse_lock_scope(scope: i32) -> LockScope {
+    match pb::lock::Scope::try_from(scope) {
+        Ok(pb::lock::Scope::Structure) => LockScope::Structure,
+        Ok(pb::lock::Scope::Membership) => LockScope::Membership,
+        _ => LockScope::Entry,
+    }
+}
+
+fn marshal_structural_split(split: &StructuralSplit) -> pb::StructuralSplit {
+    pb::StructuralSplit {
+        source_path: split.source_path.clone(),
+        source_version: split.source_version.clone(),
+        created_tokens: split.created_tokens.clone(),
+        split_key: split.split_key.clone(),
+        kind: match split.kind {
+            StructuralSplitKind::NonRoot => pb::structural_split::Kind::NonRoot,
+            StructuralSplitKind::Root => pb::structural_split::Kind::Root,
+        } as i32,
+        outcome: match split.outcome {
+            StructuralSplitOutcome::InProgress => pb::structural_split::Outcome::InProgress,
+            StructuralSplitOutcome::Applied => pb::structural_split::Outcome::Applied,
+            StructuralSplitOutcome::RolledBack => pb::structural_split::Outcome::RolledBack,
+        } as i32,
+        right_token: split.right_token.clone(),
+        move_side: pb::structural_split::MoveSide::Upper as i32,
+    }
+}
+
+fn parse_structural_split(raw: &pb::StructuralSplit) -> Result<StructuralSplit, StorageError> {
+    let kind = match raw.kind() {
+        pb::structural_split::Kind::NonRoot => StructuralSplitKind::NonRoot,
+        pb::structural_split::Kind::Root => StructuralSplitKind::Root,
+        pb::structural_split::Kind::UnknownKind => {
+            return Err(StorageError::other("unknown structural split kind"));
+        }
+    };
+    let outcome = match raw.outcome() {
+        pb::structural_split::Outcome::InProgress => StructuralSplitOutcome::InProgress,
+        pb::structural_split::Outcome::Applied => StructuralSplitOutcome::Applied,
+        pb::structural_split::Outcome::RolledBack => StructuralSplitOutcome::RolledBack,
+        pb::structural_split::Outcome::UnknownOutcome => {
+            return Err(StorageError::other("unknown structural split outcome"));
+        }
+    };
+    if raw.move_side() != pb::structural_split::MoveSide::Upper {
+        return Err(StorageError::other(
+            "unsupported structural split move side",
+        ));
+    }
+    Ok(StructuralSplit {
+        source_path: raw.source_path.clone(),
+        source_version: raw.source_version.clone(),
+        created_tokens: raw.created_tokens.clone(),
+        split_key: raw.split_key.clone(),
+        kind,
+        outcome,
+        right_token: raw.right_token.clone(),
+    })
 }
 
 fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
@@ -473,26 +607,32 @@ mod tests {
                 PathLock {
                     path: paths::collection_info("db/root"),
                     typ: LockType::Read,
+                    scope: LockScope::Entry,
                 },
                 PathLock {
                     path: key_path.clone(),
                     typ: LockType::Write,
+                    scope: LockScope::Entry,
                 },
             ],
+            structural_splits: Vec::new(),
         };
         t.set(&log).await.unwrap();
 
         let (got, _) = t.get(&id).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
+        assert_eq!(got.structural_splits, log.structural_splits);
         // Locks include the collection lock and the key lock.
         assert!(got.locks.contains(&PathLock {
             path: paths::collection_info("db/root"),
-            typ: LockType::Read
+            typ: LockType::Read,
+            scope: LockScope::Entry,
         }));
         assert!(got.locks.contains(&PathLock {
             path: key_path,
-            typ: LockType::Write
+            typ: LockType::Write,
+            scope: LockScope::Entry,
         }));
 
         let status = t.commit_status(&id).await.unwrap();
@@ -526,6 +666,26 @@ mod tests {
         assert_eq!(got.writes, log.writes);
         assert_eq!(got.timestamp, log.timestamp);
         assert_eq!(version, stored_v);
+    }
+
+    #[tokio::test]
+    async fn structural_split_round_trip() {
+        let t = new_tlogger();
+        let id = TxId::from_bytes(vec![4, 3, 2, 1]);
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Pending);
+        log.structural_splits.push(StructuralSplit {
+            source_path: paths::from_node("db/root", "left"),
+            source_version: "v1".into(),
+            created_tokens: vec!["right".into()],
+            split_key: b"m".to_vec(),
+            kind: StructuralSplitKind::NonRoot,
+            outcome: StructuralSplitOutcome::InProgress,
+            right_token: "right".into(),
+        });
+        t.set(&log).await.unwrap();
+
+        let (got, _) = t.get(&id).await.unwrap();
+        assert_eq!(got.structural_splits, log.structural_splits);
     }
 
     #[tokio::test]

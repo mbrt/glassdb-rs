@@ -256,14 +256,12 @@ impl Directory {
 
     /// Collects every `_n` node token reachable from the collection root
     /// (ADR-031): all index child pointers and every right-sibling link, walked
-    /// transitively. A node object under the collection's `_n/` prefix whose
-    /// token is absent from this set is an orphan — a split sibling a crash left
-    /// dangling — and the GC sweep may reclaim it. Empty when the collection does
-    /// not exist.
+    /// transitively. Structural split recovery uses this set to decide whether
+    /// its recorded created nodes became reachable. Empty when the collection
+    /// does not exist.
     ///
-    /// Reads at [`Freshness::Latest`] so a just-linked sibling is never mistaken
-    /// for an orphan; a missing (dangling) child reference is skipped rather than
-    /// erroring, since a concurrent reclaim can race the walk.
+    /// Reads at [`Freshness::Latest`] so a just-linked sibling is observed. A
+    /// missing child reference is skipped because there is no node to traverse.
     pub async fn reachable_tokens(
         &self,
         prefix: &str,
@@ -475,10 +473,9 @@ mod tests {
     }
 
     fn leaf(entries: &[&[u8]], high_key: Option<&[u8]>, right: Option<&str>) -> Node {
-        let mut node = Node::leaf(Shard::from_entries(entries.iter().map(|k| live(k))));
-        node.set_high_key(high_key.map(<[u8]>::to_vec));
-        node.set_right_sibling(right.map(str::to_string));
-        node
+        Node::leaf(Shard::from_entries(entries.iter().map(|k| live(k))))
+            .with_high_key(high_key.map(<[u8]>::to_vec))
+            .with_right_sibling(right.map(str::to_string))
     }
 
     // Seeds a two-level tree: root index -> {L0 (apple,cat), L1 (mango,pear)},

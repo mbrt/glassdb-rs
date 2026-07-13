@@ -15,6 +15,7 @@ message TransactionLog {
     google.protobuf.Timestamp timestamp = 1;
     Status status = 2;
     repeated CollectionWrites writes = 3;
+    repeated StructuralSplit structural_splits = 4;
 }
 
 message CollectionWrites {
@@ -48,8 +49,50 @@ message Lock {
         CREATE = 4;
     }
 
+    enum Scope {
+        UNKNOWN_SCOPE = 0;
+        ENTRY = 1;
+        STRUCTURE = 2;
+        MEMBERSHIP = 3;
+    }
+
     string suffix = 1;
     LockType lock_type = 2;
+    Scope scope = 3;
+}
+
+message StructuralSplit {
+    enum Kind {
+        UNKNOWN_KIND = 0;
+        NON_ROOT = 1;
+        ROOT = 2;
+    }
+
+    enum Outcome {
+        UNKNOWN_OUTCOME = 0;
+        IN_PROGRESS = 1;
+        APPLIED = 2;
+        ROLLED_BACK = 3;
+    }
+
+    enum MoveSide {
+        UNKNOWN_SIDE = 0;
+        UPPER = 1;
+    }
+
+    string source_path = 1;
+    string source_version = 2;
+    repeated string created_tokens = 3;
+    bytes split_key = 4;
+    Kind kind = 5;
+    Outcome outcome = 6;
+    string right_token = 7;
+    MoveSide move_side = 8;
+}
+
+message NodeLock {
+    Lock.LockType lock_type = 1;
+    repeated bytes locked_by = 2;
 }
 
 // A shard object: the coordination directory (lock table, MVCC current-writer
@@ -90,6 +133,9 @@ message Node {
         // An index node: separator keys mapping ranges to child nodes.
         IndexNode index = 4;
     }
+    NodeLock structure_lock = 5;
+    NodeLock membership_lock = 6;
+    uint64 membership_version = 7;
 }
 
 // An index node body: an ordered list of separator entries. The child owning a

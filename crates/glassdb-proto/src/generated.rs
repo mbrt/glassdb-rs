@@ -7,6 +7,8 @@ pub struct TransactionLog {
     pub status: i32,
     #[prost(message, repeated, tag = "3")]
     pub writes: ::prost::alloc::vec::Vec<CollectionWrites>,
+    #[prost(message, repeated, tag = "4")]
+    pub structural_splits: ::prost::alloc::vec::Vec<StructuralSplit>,
 }
 /// Nested message and enum types in `TransactionLog`.
 pub mod transaction_log {
@@ -85,6 +87,8 @@ pub struct Lock {
     pub suffix: ::prost::alloc::string::String,
     #[prost(enumeration = "lock::LockType", tag = "2")]
     pub lock_type: i32,
+    #[prost(enumeration = "lock::Scope", tag = "3")]
+    pub scope: i32,
 }
 /// Nested message and enum types in `Lock`.
 pub mod lock {
@@ -123,6 +127,154 @@ pub mod lock {
             }
         }
     }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Scope {
+        UnknownScope = 0,
+        Entry = 1,
+        Structure = 2,
+        Membership = 3,
+    }
+    impl Scope {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::UnknownScope => "UNKNOWN_SCOPE",
+                Self::Entry => "ENTRY",
+                Self::Structure => "STRUCTURE",
+                Self::Membership => "MEMBERSHIP",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "UNKNOWN_SCOPE" => Some(Self::UnknownScope),
+                "ENTRY" => Some(Self::Entry),
+                "STRUCTURE" => Some(Self::Structure),
+                "MEMBERSHIP" => Some(Self::Membership),
+                _ => None,
+            }
+        }
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StructuralSplit {
+    #[prost(string, tag = "1")]
+    pub source_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub source_version: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub created_tokens: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub split_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "structural_split::Kind", tag = "5")]
+    pub kind: i32,
+    #[prost(enumeration = "structural_split::Outcome", tag = "6")]
+    pub outcome: i32,
+    #[prost(string, tag = "7")]
+    pub right_token: ::prost::alloc::string::String,
+    #[prost(enumeration = "structural_split::MoveSide", tag = "8")]
+    pub move_side: i32,
+}
+/// Nested message and enum types in `StructuralSplit`.
+pub mod structural_split {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Kind {
+        UnknownKind = 0,
+        NonRoot = 1,
+        Root = 2,
+    }
+    impl Kind {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::UnknownKind => "UNKNOWN_KIND",
+                Self::NonRoot => "NON_ROOT",
+                Self::Root => "ROOT",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "UNKNOWN_KIND" => Some(Self::UnknownKind),
+                "NON_ROOT" => Some(Self::NonRoot),
+                "ROOT" => Some(Self::Root),
+                _ => None,
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Outcome {
+        UnknownOutcome = 0,
+        InProgress = 1,
+        Applied = 2,
+        RolledBack = 3,
+    }
+    impl Outcome {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::UnknownOutcome => "UNKNOWN_OUTCOME",
+                Self::InProgress => "IN_PROGRESS",
+                Self::Applied => "APPLIED",
+                Self::RolledBack => "ROLLED_BACK",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "UNKNOWN_OUTCOME" => Some(Self::UnknownOutcome),
+                "IN_PROGRESS" => Some(Self::InProgress),
+                "APPLIED" => Some(Self::Applied),
+                "ROLLED_BACK" => Some(Self::RolledBack),
+                _ => None,
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum MoveSide {
+        UnknownSide = 0,
+        Upper = 1,
+    }
+    impl MoveSide {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::UnknownSide => "UNKNOWN_SIDE",
+                Self::Upper => "UPPER",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "UNKNOWN_SIDE" => Some(Self::UnknownSide),
+                "UPPER" => Some(Self::Upper),
+                _ => None,
+            }
+        }
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodeLock {
+    #[prost(enumeration = "lock::LockType", tag = "1")]
+    pub lock_type: i32,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 /// A shard object: the coordination directory (lock table, MVCC current-writer
 /// index, and key directory) for the keys that map to it. See ADR-017.
@@ -165,6 +317,12 @@ pub struct Node {
     /// none: the rightmost node at its level.
     #[prost(string, tag = "2")]
     pub right_sibling: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub structure_lock: ::core::option::Option<NodeLock>,
+    #[prost(message, optional, tag = "6")]
+    pub membership_lock: ::core::option::Option<NodeLock>,
+    #[prost(uint64, tag = "7")]
+    pub membership_version: u64,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }

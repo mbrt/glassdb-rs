@@ -46,6 +46,11 @@ impl CollectionRoot {
         &self.node
     }
 
+    /// Returns the mutable root node for coordination updates.
+    pub fn node_mut_for_coordination(&mut self) -> &mut Node {
+        &mut self.node
+    }
+
     /// Replaces the B-link tree root node (e.g. after an in-place root split).
     pub fn set_node(&mut self, node: Node) {
         self.node = node;
@@ -81,6 +86,13 @@ impl CollectionRoot {
             subcollections: self.subcollections.iter().cloned().collect(),
         }
         .encode_to_vec()
+    }
+
+    /// Returns the encoded size without transient node-lock holders.
+    pub fn content_encoded_len(&self) -> usize {
+        let mut root = self.clone();
+        root.node.clear_node_locks();
+        root.encode().len()
     }
 
     /// Decodes a root from its protobuf body. A root with no node (the wire
@@ -138,14 +150,13 @@ mod tests {
         // The root object carries the B-link root node; for a small collection
         // that node is a leaf holding the collection's key entries.
         let mut root = CollectionRoot::new();
-        let mut node = super::Node::leaf(Shard::from_entries([ShardEntry {
+        let node = super::Node::leaf(Shard::from_entries([ShardEntry {
             key: b"apple".to_vec(),
             lock_type: LockType::None,
             locked_by: Vec::new(),
             current_writer: Some(TxId::from_bytes(vec![1])),
             deleted: false,
         }]));
-        node.set_high_key(None);
         root.set_node(node);
 
         let decoded = CollectionRoot::decode(&root.encode()).unwrap();

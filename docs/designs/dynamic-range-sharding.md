@@ -213,7 +213,8 @@ ADR — this overview and the diagrams above are the map into it.
   supersedes/reuses. Its per-leaf read-lock escalation is superseded by ADR-032;
   its lock-free split is refined (structure lock + priority) by ADR-032.
 - **[ADR-032](../adr/032-node-locking-and-coordinated-splits.md) — Node-level
-  locking and coordinated splits.** *Proposed.* The node structure/membership
+  locking and coordinated splits.** *Accepted — implemented.* The node
+  structure/membership
   read/write lock taxonomy (create/delete take the membership write lock),
   splits coordinated by the structure write lock and wound-wait priority (keeping
   ADR-031's shrink-CAS linearization), the membership version as OCC fast-path
@@ -233,11 +234,11 @@ split-point policy, and node fan-out/sizing.
   in-doubt recovery (format is reserved for it).
 - **Split-point policy.** Median-key vs load-aware; salting to mitigate the
   monotonic-insert hotspot.
-- **Hard object-size cap tuning.** ADR-032 settles the *invariant* — reserve
-  headroom `H` so a split can always install structure-W, hold the worst-case
-  holder/lock metadata, and encode its shrink CAS, rejecting over-cap creates with
-  a retryable error. Open here is the concrete value of `H`, whether an at-cap leaf
-  should also escalate split priority, and the interaction with foreground latency.
+- **Hard object-size cap tuning.** The implemented defaults cap a node at 1 MiB
+  and reserve 64 KiB for transient lock metadata. Content growth stops at the
+  remaining 960 KiB; an individually unsplittable key and an overflowing
+  subcollection directory are permanent invalid-input errors. Future tuning may
+  still adjust those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
   `AllowStale` seeding).

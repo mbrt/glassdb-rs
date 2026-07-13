@@ -7,15 +7,12 @@
 //! candidates the coordinator observes as it writes leaves — never a key-space
 //! enumeration.
 //!
-//! Every split is a sequence of independent, idempotent compare-and-swaps, so a
-//! crash between any two steps leaves the tree correct (descent self-corrects
-//! through the B-link right-links) and any half-built node either becomes
-//! reachable or is reclaimed by the GC orphan sweep:
+//! Every split is a sequence of independent, idempotent compare-and-swaps under
+//! a one-node structure-write lock. A structural transaction record is written
+//! before any node object is created, so recovery can keep or delete created
+//! nodes from tree reachability after a crash:
 //!
-//! 0. Durably record the collection as split-active
-//!    ([`ShardStore::mark_split_active`]) before any node object is created, so
-//!    an orphan a later crash leaves is always discoverable by the GC orphan
-//!    sweep — even in a fresh process that never observed the split.
+//! 0. Write the structural record with the source version and created tokens.
 //! 1. Create the right sibling (`write_if_not_exists`) holding the upper half
 //!    and inheriting the source's former high-key and right-sibling.
 //! 2. **Shrink the source in one CAS** — drop the upper half, set high-key to the
@@ -32,23 +29,26 @@
 //! rewritten into a two-entry index over them, growing the tree's height while
 //! preserving the collection metadata.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use glassdb_concurr::{Background, rt};
-use glassdb_data::paths;
+use glassdb_backend as backend;
+use glassdb_concurr::{Background, Clock, rt};
+use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Directory, Freshness, IndexNode, Node, Shard, ShardStore, SplitPolicy, StorageError,
+    Directory, Freshness, IndexNode, LockScope, LockType, Node, PathLock, Shard, ShardStore,
+    SplitPolicy, StorageError, StructuralSplit, StructuralSplitKind, StructuralSplitOutcome,
+    TLogger, TxCommitStatus, TxLog,
 };
 
 use crate::error::TransError;
+use crate::monitor::Monitor;
+use crate::resolver::Resolver;
 use crate::shard_coord::SplitHinter;
 
 /// How often the splitter drains its candidate queue. A split is a handful of
-/// CAS round-trips, so a tight cadence keeps overflowing leaves short-lived; the
-/// GC orphan sweep runs an order of magnitude slower, which is what makes its
-/// generational safety horizon (ADR-031, M1-S4) longer than any split.
+/// CAS round-trips, so a tight cadence keeps overflowing leaves short-lived.
 const SPLIT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Upper bound on the buffered split-candidate queue. Candidates are only hints:
@@ -85,14 +85,27 @@ pub(crate) struct PendingSeparator {
 #[derive(Clone)]
 pub(crate) struct SplitCandidates {
     policy: SplitPolicy,
-    queue: Arc<Mutex<VecDeque<String>>>,
+    clock: Clock,
+    queue: Arc<Mutex<VecDeque<SplitCandidate>>>,
+}
+
+#[derive(Clone)]
+struct SplitCandidate {
+    path: String,
+    priority: TxId,
 }
 
 impl SplitCandidates {
     /// Creates an empty candidate feed governed by `policy`.
     pub(crate) fn new(policy: SplitPolicy) -> Self {
+        Self::with_clock(policy, Clock::real())
+    }
+
+    /// Creates an empty candidate feed using `clock` for wound-wait priority.
+    fn with_clock(policy: SplitPolicy, clock: Clock) -> Self {
         SplitCandidates {
             policy,
+            clock,
             queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -103,16 +116,35 @@ impl SplitCandidates {
     }
 
     /// Drains every queued candidate, de-duplicated, for one sweep cycle.
-    fn drain(&self) -> Vec<String> {
+    fn drain(&self) -> Vec<SplitCandidate> {
         let mut q = self.queue.lock().unwrap();
-        let mut seen = BTreeSet::new();
-        let mut out = Vec::new();
-        while let Some(p) = q.pop_front() {
-            if seen.insert(p.clone()) {
-                out.push(p);
+        let mut by_path = std::collections::BTreeMap::<String, SplitCandidate>::new();
+        while let Some(candidate) = q.pop_front() {
+            match by_path.get_mut(&candidate.path) {
+                Some(current) if candidate.priority.older(&current.priority) => {
+                    *current = candidate;
+                }
+                None => {
+                    by_path.insert(candidate.path.clone(), candidate);
+                }
+                _ => {}
             }
         }
-        out
+        by_path.into_values().collect()
+    }
+
+    /// Requeues a deferred split without changing its wound-wait priority.
+    fn requeue(&self, candidate: SplitCandidate) {
+        let mut q = self.queue.lock().unwrap();
+        if q.len() >= CANDIDATE_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(candidate);
+    }
+
+    /// Mints an operation id at normal transaction priority.
+    fn new_id(&self) -> TxId {
+        TxId::new_at(self.clock.now())
     }
 }
 
@@ -135,7 +167,14 @@ impl SplitHinter for SplitCandidates {
         if q.len() >= CANDIDATE_QUEUE_CAP {
             q.pop_front();
         }
-        q.push_back(path.to_string());
+        q.push_back(SplitCandidate {
+            path: path.to_string(),
+            priority: self.new_id(),
+        });
+    }
+
+    fn policy(&self) -> SplitPolicy {
+        self.policy
     }
 }
 
@@ -149,6 +188,9 @@ pub struct Splitter {
     bg: Weak<Background>,
     shards: ShardStore,
     dir: Directory,
+    tl: TLogger,
+    mon: Monitor,
+    resolver: Resolver,
     // The leaf-candidate feed this splitter owns and drains. The coordinator
     // fills it through the [`SplitHinter`] seam (see [`Splitter::hinter`]); a
     // clone here and behind the seam share one queue.
@@ -163,15 +205,48 @@ impl Splitter {
     /// Creates a splitter over `shards` with the default soft-cap policy,
     /// owning the candidate feed the coordinator fills through
     /// [`hinter`](Self::hinter).
-    pub fn new(bg: Weak<Background>, shards: ShardStore) -> Self {
-        Splitter::with_policy(bg, shards, SplitPolicy::default())
+    pub fn new(
+        bg: Weak<Background>,
+        shards: ShardStore,
+        tl: TLogger,
+        mon: Monitor,
+        resolver: Resolver,
+    ) -> Self {
+        Splitter::with_policy(bg, shards, tl, mon, resolver, SplitPolicy::default())
     }
 
     /// Creates a splitter with an explicit soft-cap `policy`, so a caller can
     /// drive splits with tiny nodes (e.g. the deterministic-simulation
     /// harness). The default policy is used by [`Splitter::new`].
-    pub fn with_policy(bg: Weak<Background>, shards: ShardStore, policy: SplitPolicy) -> Self {
-        Splitter::with_candidates(bg, shards, SplitCandidates::new(policy))
+    pub fn with_policy(
+        bg: Weak<Background>,
+        shards: ShardStore,
+        tl: TLogger,
+        mon: Monitor,
+        resolver: Resolver,
+        policy: SplitPolicy,
+    ) -> Self {
+        Splitter::with_candidates(bg, shards, tl, mon, resolver, SplitCandidates::new(policy))
+    }
+
+    /// Creates a splitter whose transaction priorities use the supplied clock.
+    pub fn with_policy_and_clock(
+        bg: Weak<Background>,
+        shards: ShardStore,
+        tl: TLogger,
+        mon: Monitor,
+        resolver: Resolver,
+        policy: SplitPolicy,
+        clock: Clock,
+    ) -> Self {
+        Splitter::with_candidates(
+            bg,
+            shards,
+            tl,
+            mon,
+            resolver,
+            SplitCandidates::with_clock(policy, clock),
+        )
     }
 
     /// Creates a splitter over an explicit candidate feed. Lets a test drive the
@@ -179,6 +254,9 @@ impl Splitter {
     fn with_candidates(
         bg: Weak<Background>,
         shards: ShardStore,
+        tl: TLogger,
+        mon: Monitor,
+        resolver: Resolver,
         candidates: SplitCandidates,
     ) -> Self {
         let dir = Directory::new(shards.clone());
@@ -186,6 +264,9 @@ impl Splitter {
             bg,
             shards,
             dir,
+            tl,
+            mon,
+            resolver,
             candidates,
             pending: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -197,6 +278,81 @@ impl Splitter {
     /// only on the seam, never on the candidate feed's type.
     pub fn hinter(&self) -> Arc<dyn SplitHinter> {
         Arc::new(self.candidates.clone())
+    }
+
+    /// Adds a child name to a parent collection under the root's structure-read
+    /// protocol.
+    pub async fn register_subcollection(
+        &self,
+        parent_prefix: &str,
+        name: &[u8],
+    ) -> Result<(), TransError> {
+        let id = self.candidates.new_id();
+        self.mon.begin_tx(&id);
+        let mut acquired = false;
+        for _ in 0..50 {
+            let (mut root, version) = self.shards.load_root(parent_prefix).await?;
+            let node = root.node_mut_for_coordination();
+            if node.structure_lock().lock_type() == LockType::Write
+                && !node.structure_lock().contains(&id)
+            {
+                rt::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            node.add_structure_reader(id.clone());
+            if self
+                .shards
+                .store_root(parent_prefix, &root, &version)
+                .await?
+            {
+                acquired = true;
+                break;
+            }
+        }
+        if !acquired {
+            self.mon.abort_tx(&id).await?;
+            return Err(TransError::Retry);
+        }
+
+        let result = async {
+            loop {
+                let (mut root, version) = self.shards.load_root(parent_prefix).await?;
+                if !root.node().structure_lock().contains(&id) {
+                    return Err(TransError::Retry);
+                }
+                if !root.add_subcollection(name.to_vec()) {
+                    return Ok(());
+                }
+                let content_limit = self
+                    .candidates
+                    .policy()
+                    .node_max_bytes
+                    .saturating_sub(self.candidates.policy().split_headroom_bytes);
+                let mut index_root = root.clone();
+                index_root.set_node(Node::index(IndexNode::from_children([
+                    (Vec::new(), "x".repeat(24)),
+                    (vec![0], "y".repeat(24)),
+                ])));
+                if root.content_encoded_len() > content_limit
+                    || index_root.content_encoded_len() > content_limit
+                {
+                    return Err(TransError::InvalidInput(
+                        "subcollection directory exceeds the node size limit".into(),
+                    ));
+                }
+                if self
+                    .shards
+                    .store_root(parent_prefix, &root, &version)
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        .await;
+        let _ = self.release_structure_write(parent_prefix, None, &id).await;
+        let _ = self.mon.abort_tx(&id).await;
+        result
     }
 
     /// Queues a separator whose parent insert must be re-driven by a later
@@ -235,9 +391,15 @@ impl Splitter {
     /// error on one candidate only defers its split to a later cycle, so it is
     /// logged and the sweep continues.
     async fn run_once(&self) {
-        for path in self.candidates.drain() {
-            if let Err(e) = self.split_path(&path).await {
-                tracing::debug!(path = %path, error = %e, "split candidate deferred");
+        for candidate in self.candidates.drain() {
+            if let Err(e) = self
+                .split_path_with_id(&candidate.path, candidate.priority.renew())
+                .await
+            {
+                tracing::debug!(path = %candidate.path, error = %e, "split candidate deferred");
+                if !matches!(e, TransError::InvalidInput(_)) {
+                    self.candidates.requeue(candidate);
+                }
             }
         }
         // Re-drive separators a previous cycle could not publish, so the parent
@@ -256,103 +418,565 @@ impl Splitter {
     /// in-place root split when `path` is the collection root `_i`, else a
     /// standalone node half-split.
     async fn split_path(&self, path: &str) -> Result<(), TransError> {
+        self.split_path_with_id(path, self.candidates.new_id())
+            .await
+    }
+
+    /// Splits `path` using an already-aged wound-wait priority.
+    async fn split_path_with_id(&self, path: &str, id: TxId) -> Result<(), TransError> {
         let pr = paths::parse(path)
             .map_err(|e| StorageError::with_source("parsing candidate path", e))?;
         if paths::is_collection_info(path) {
-            self.split_root(&pr.prefix).await
+            self.split_root(&pr.prefix, id).await
         } else {
-            self.split_nonroot(&pr.prefix, &pr.suffix).await
+            self.split_nonroot(&pr.prefix, &pr.suffix, id).await
         }
+    }
+
+    /// Acquires the source node's structure-write lock under wound-wait.
+    async fn acquire_structure_write(
+        &self,
+        prefix: &str,
+        token: Option<&str>,
+        id: &TxId,
+    ) -> Result<Option<(Node, backend::Version)>, TransError> {
+        for _ in 0..PARENT_RETRIES {
+            let (mut node, version) = match token {
+                Some(token) => {
+                    self.shards
+                        .load_node(prefix, token, Freshness::Latest)
+                        .await?
+                }
+                None => match self.shards.load_root(prefix).await {
+                    Ok((root, version)) => (root.node().clone(), version),
+                    Err(StorageError::NotFound) => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                },
+            };
+            if node.structure_lock().lock_type() == LockType::Write
+                && node.structure_lock().contains(id)
+            {
+                return Ok(Some((node, version)));
+            }
+
+            let holders = node.structure_lock().holders().to_vec();
+            let mut blocked = false;
+            for holder in &holders {
+                if holder == id {
+                    continue;
+                }
+                if id.older(holder) && self.mon.tx_status(holder).await? == TxCommitStatus::Pending
+                {
+                    self.mon.wound_tx(holder).await?;
+                }
+                if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
+                    blocked = true;
+                }
+            }
+            if blocked {
+                return Ok(None);
+            }
+
+            self.resolve_node_entries(prefix, &mut node, id).await?;
+            for holder in holders {
+                if &holder != id {
+                    node.remove_structure_holder(&holder);
+                }
+            }
+            let membership_holders = node.membership_lock().holders().to_vec();
+            for holder in membership_holders {
+                if &holder != id && self.mon.tx_status(&holder).await? != TxCommitStatus::Pending {
+                    node.remove_membership_holder(&holder);
+                }
+            }
+            node.set_structure_writer(id.clone());
+            if self
+                .store_structural_node(prefix, token, &node, &version)
+                .await?
+            {
+                let (_, locked_version) = match token {
+                    Some(token) => {
+                        self.shards
+                            .load_node(prefix, token, Freshness::Latest)
+                            .await?
+                    }
+                    None => {
+                        let (root, version) = self.shards.load_root(prefix).await?;
+                        (root.node().clone(), version)
+                    }
+                };
+                return Ok(Some((node, locked_version)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Releases a structure-write holder after its node mutation has landed.
+    async fn release_structure_write(
+        &self,
+        prefix: &str,
+        token: Option<&str>,
+        id: &TxId,
+    ) -> Result<(), TransError> {
+        for _ in 0..PARENT_RETRIES {
+            let (mut node, version) = match token {
+                Some(token) => {
+                    self.shards
+                        .load_node(prefix, token, Freshness::Latest)
+                        .await?
+                }
+                None => {
+                    let (root, version) = self.shards.load_root(prefix).await?;
+                    (root.node().clone(), version)
+                }
+            };
+            if !node.remove_structure_holder(id) {
+                return Ok(());
+            }
+            if self
+                .store_structural_node(prefix, token, &node, &version)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(TransError::Retry)
+    }
+
+    /// Stores a complete root or non-root node at an expected version.
+    async fn store_structural_node(
+        &self,
+        prefix: &str,
+        token: Option<&str>,
+        node: &Node,
+        version: &backend::Version,
+    ) -> Result<bool, TransError> {
+        match token {
+            Some(token) => Ok(self
+                .shards
+                .store_node(prefix, token, node, Some(version))
+                .await?),
+            None => {
+                let (mut root, current) = self.shards.load_root(prefix).await?;
+                if current != *version {
+                    return Ok(false);
+                }
+                root.set_node(node.clone());
+                Ok(self.shards.store_root(prefix, &root, version).await?)
+            }
+        }
+    }
+
+    /// Help-forwards finalized entry holders before a split removes their
+    /// structure-read holders.
+    async fn resolve_node_entries(
+        &self,
+        prefix: &str,
+        node: &mut Node,
+        id: &TxId,
+    ) -> Result<(), TransError> {
+        let Some(shard) = node.as_leaf() else {
+            return Ok(());
+        };
+        let mut entries = Vec::with_capacity(shard.len());
+        for entry in shard.entries() {
+            let resolved = self
+                .resolver
+                .resolve_holders(&paths::from_key(prefix, &entry.key), entry, Some(id))
+                .await?;
+            let mut entry = entry.clone();
+            entry.current_writer = resolved.writer;
+            entry.deleted = resolved.deleted;
+            entry
+                .locked_by
+                .retain(|holder| holder == id || resolved.pending.contains(holder));
+            if entry.locked_by.is_empty() {
+                entry.lock_type = LockType::None;
+            }
+            entries.push(entry);
+        }
+        node.set_leaf(Shard::from_entries(entries))?;
+        Ok(())
+    }
+
+    /// Reports whether structural recovery must defer because the source is
+    /// still protected by a live structure writer.
+    async fn source_write_is_live(
+        &self,
+        prefix: &str,
+        token: Option<&str>,
+    ) -> Result<bool, TransError> {
+        let node = match token {
+            Some(token) => match self
+                .shards
+                .load_node(prefix, token, Freshness::Latest)
+                .await
+            {
+                Ok((node, _)) => node,
+                Err(StorageError::NotFound) => return Ok(false),
+                Err(e) => return Err(e.into()),
+            },
+            None => match self
+                .shards
+                .load_root_node(prefix, Freshness::Latest)
+                .await?
+            {
+                Some((node, _)) => node,
+                None => return Ok(false),
+            },
+        };
+        if node.structure_lock().lock_type() != LockType::Write {
+            return Ok(false);
+        }
+        for holder in node.structure_lock().holders() {
+            if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Halves a standalone node `_n` (leaf or interior): create the sibling,
     /// shrink the source (linearization point), then insert the separator into
     /// the parent. A CAS lost to a concurrent mutation simply defers the split.
-    async fn split_nonroot(&self, prefix: &str, token: &str) -> Result<(), TransError> {
-        let (mut node, version) = self
-            .shards
-            .load_node(prefix, token, Freshness::Latest)
-            .await?;
-        if !node.over_soft_cap(self.candidates.policy()) {
-            return Ok(());
-        }
+    async fn split_nonroot(&self, prefix: &str, token: &str, id: TxId) -> Result<(), TransError> {
         let right_token = paths::random_node_token();
-        let Some((right, split_key)) = node.split(&right_token) else {
-            return Ok(());
+        self.mon.begin_tx(&id);
+        let acquired = match self.acquire_structure_write(prefix, Some(token), &id).await {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                let _ = self.mon.abort_tx(&id).await;
+                return Err(e);
+            }
         };
-        // Record split activity durably *before* creating any node object, so a
-        // crash-orphaned sibling is always discoverable by the GC orphan sweep
-        // after a restart (ADR-031).
-        self.shards.mark_split_active(prefix).await?;
-        // 1. Create the right sibling. A fresh random token never collides, so a
-        //    `false` here means someone else created it; defer.
-        if !self
+        let Some((mut node, version)) = acquired else {
+            self.mon.abort_tx(&id).await?;
+            return Err(TransError::Retry);
+        };
+        if !node.over_soft_cap(self.candidates.policy()) {
+            return self.finish_without_split(prefix, Some(token), &id).await;
+        }
+        let Some((right, split_key)) = node.split(&right_token) else {
+            return self.finish_without_split(prefix, Some(token), &id).await;
+        };
+        let structural = StructuralSplit {
+            source_path: paths::from_node(prefix, token),
+            source_version: version.token.to_string(),
+            created_tokens: vec![right_token.clone()],
+            split_key: split_key.clone(),
+            kind: StructuralSplitKind::NonRoot,
+            outcome: StructuralSplitOutcome::InProgress,
+            right_token: right_token.clone(),
+        };
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Pending);
+        log.locks.push(PathLock {
+            path: structural.source_path.clone(),
+            typ: LockType::Write,
+            scope: LockScope::Structure,
+        });
+        log.structural_splits.push(structural);
+        self.mon
+            .record_structural_splits(&id, log.structural_splits.clone());
+        self.mon.record_tx_locks(&id, log.locks.clone());
+        if let Err(e) = self.tl.set(&log).await {
+            let _ = self.release_structure_write(prefix, Some(token), &id).await;
+            self.mon
+                .finish_structural_recovery(&id, TxCommitStatus::Unknown);
+            return Err(e.into());
+        }
+
+        let created = match self
             .shards
             .store_node(prefix, &right_token, &right, None)
-            .await?
+            .await
         {
-            return Ok(());
+            Ok(created) => created,
+            Err(e) => {
+                return self.recover_failed_split(&id, &log, e.into()).await;
+            }
+        };
+        if !created {
+            return self
+                .recover_failed_split(&id, &log, TransError::Retry)
+                .await;
         }
-        // 2. Shrink the source (linearization point). Lost to a concurrent
-        //    locker CAS: leave the orphan sibling for the GC sweep and retry
-        //    next cycle.
-        if !self
+        let shrunk = match self
             .shards
             .store_node(prefix, token, &node, Some(&version))
-            .await?
-        {
-            return Ok(());
-        }
-        // 3. Publish the separator into the parent index; recurse if the parent
-        //    overflows. A lost CAS is re-queued for a later sweep.
-        self.publish_separators(prefix, &split_key, &right_token)
             .await
+        {
+            Ok(shrunk) => shrunk,
+            Err(e) => return self.recover_failed_split(&id, &log, e.into()).await,
+        };
+        if !shrunk {
+            return self
+                .recover_failed_split(&id, &log, TransError::Retry)
+                .await;
+        }
+        if let Err(e) = self.release_structure_write(prefix, Some(token), &id).await {
+            return self.recover_failed_split(&id, &log, e).await;
+        }
+        if let Err(e) = self
+            .publish_separators(prefix, &split_key, &right_token)
+            .await
+        {
+            return self.recover_failed_split(&id, &log, e).await;
+        }
+        match self
+            .finish_structural_log(log.clone(), StructuralSplitOutcome::Applied)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => self.recover_failed_split(&id, &log, e).await,
+        }
     }
 
     /// Grows the collection root in place: the root cannot move, so an
     /// overflowing `_i` splits into two freshly created children and is rewritten
     /// into a two-entry index over them (preserving collection metadata), raising
     /// the tree's height by one.
-    async fn split_root(&self, prefix: &str) -> Result<(), TransError> {
-        let (root, version) = match self.shards.load_root(prefix).await {
-            Ok(rv) => rv,
-            Err(StorageError::NotFound) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        let node = root.node().clone();
-        if !node.over_soft_cap(self.candidates.policy()) {
-            return Ok(());
-        }
+    async fn split_root(&self, prefix: &str, id: TxId) -> Result<(), TransError> {
         let l_token = paths::random_node_token();
         let r_token = paths::random_node_token();
-        let (left, right, split_key) = split_into_children(&node, &r_token);
-        // Record split activity durably before creating any child, so orphaned
-        // children left by a crash are discoverable after a restart (ADR-031).
-        self.shards.mark_split_active(prefix).await?;
-        // Create both children before rewriting the root, so the root never
-        // points at a missing child; on crash the unreferenced children are
-        // reclaimed by the GC sweep.
-        if !self
-            .shards
-            .store_node(prefix, &l_token, &left, None)
-            .await?
-            || !self
-                .shards
-                .store_node(prefix, &r_token, &right, None)
-                .await?
-        {
-            return Ok(());
+        self.mon.begin_tx(&id);
+        let acquired = match self.acquire_structure_write(prefix, None, &id).await {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                let _ = self.mon.abort_tx(&id).await;
+                return Err(e);
+            }
+        };
+        let Some((node, version)) = acquired else {
+            self.mon.abort_tx(&id).await?;
+            return Err(TransError::Retry);
+        };
+        if !node.over_soft_cap(self.candidates.policy()) {
+            return self.finish_without_split(prefix, None, &id).await;
         }
-        let index = Node::index(IndexNode::from_children([
-            (Vec::new(), l_token),
-            (split_key, r_token),
-        ]));
-        let mut new_root = root.clone();
-        new_root.set_node(index);
-        // The root rewrite is the linearization point. A lost CAS orphans the two
-        // children (reclaimed by GC) and defers the split.
-        self.shards.store_root(prefix, &new_root, &version).await?;
+        let (left, right, split_key) = split_into_children(&node, &r_token, &id);
+        let structural = StructuralSplit {
+            source_path: paths::collection_info(prefix),
+            source_version: version.token.to_string(),
+            created_tokens: vec![l_token.clone(), r_token.clone()],
+            split_key: split_key.clone(),
+            kind: StructuralSplitKind::Root,
+            outcome: StructuralSplitOutcome::InProgress,
+            right_token: r_token.clone(),
+        };
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Pending);
+        log.locks.push(PathLock {
+            path: structural.source_path.clone(),
+            typ: LockType::Write,
+            scope: LockScope::Structure,
+        });
+        log.structural_splits.push(structural);
+        self.mon
+            .record_structural_splits(&id, log.structural_splits.clone());
+        self.mon.record_tx_locks(&id, log.locks.clone());
+        if let Err(e) = self.tl.set(&log).await {
+            let _ = self.release_structure_write(prefix, None, &id).await;
+            self.mon
+                .finish_structural_recovery(&id, TxCommitStatus::Unknown);
+            return Err(e.into());
+        }
+
+        let left_created = match self.shards.store_node(prefix, &l_token, &left, None).await {
+            Ok(created) => created,
+            Err(e) => return self.recover_failed_split(&id, &log, e.into()).await,
+        };
+        let right_created = if left_created {
+            match self.shards.store_node(prefix, &r_token, &right, None).await {
+                Ok(created) => created,
+                Err(e) => return self.recover_failed_split(&id, &log, e.into()).await,
+            }
+        } else {
+            false
+        };
+        if !left_created || !right_created {
+            return self
+                .recover_failed_split(&id, &log, TransError::Retry)
+                .await;
+        }
+        let root_index = IndexNode::from_children([(Vec::new(), l_token), (split_key, r_token)]);
+        let mut index = Node::index(root_index);
+        index.set_structure_writer(id.clone());
+        let mut sized_root = match self.shards.load_root(prefix).await {
+            Ok((root, _)) => root,
+            Err(e) => return self.recover_failed_split(&id, &log, e.into()).await,
+        };
+        sized_root.set_node(index.clone());
+        let content_limit = self
+            .candidates
+            .policy()
+            .node_max_bytes
+            .saturating_sub(self.candidates.policy().split_headroom_bytes);
+        if sized_root.content_encoded_len() > content_limit
+            || sized_root.encode().len() > self.candidates.policy().node_max_bytes
+        {
+            return self
+                .recover_failed_split(
+                    &id,
+                    &log,
+                    TransError::InvalidInput(
+                        "root metadata exceeds the coordination node size limit".into(),
+                    ),
+                )
+                .await;
+        }
+        let root_rewritten = match self
+            .store_structural_node(prefix, None, &index, &version)
+            .await
+        {
+            Ok(rewritten) => rewritten,
+            Err(e) => return self.recover_failed_split(&id, &log, e).await,
+        };
+        if !root_rewritten {
+            return self
+                .recover_failed_split(&id, &log, TransError::Retry)
+                .await;
+        }
+        if let Err(e) = self.release_structure_write(prefix, None, &id).await {
+            return self.recover_failed_split(&id, &log, e).await;
+        }
+        match self
+            .finish_structural_log(log.clone(), StructuralSplitOutcome::Applied)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => self.recover_failed_split(&id, &log, e).await,
+        }
+    }
+
+    /// Resolves a structural attempt that can no longer continue in-line.
+    async fn recover_failed_split(
+        &self,
+        id: &TxId,
+        log: &TxLog,
+        original: TransError,
+    ) -> Result<(), TransError> {
+        match self.recover_log(id, log, None).await {
+            Ok(()) => Ok(()),
+            Err(recovery) => {
+                // The task has stopped, so a later GC must treat the durable
+                // pending record as remote rather than indefinitely live-local.
+                self.mon
+                    .finish_structural_recovery(id, TxCommitStatus::Unknown);
+                tracing::debug!(error = %recovery, "inline structural recovery deferred");
+                Err(original)
+            }
+        }
+    }
+
+    /// Releases a structure writer when the candidate no longer needs a split.
+    async fn finish_without_split(
+        &self,
+        prefix: &str,
+        token: Option<&str>,
+        id: &TxId,
+    ) -> Result<(), TransError> {
+        let release = self.release_structure_write(prefix, token, id).await;
+        let abort = self.mon.abort_tx(id).await;
+        release?;
+        abort
+    }
+
+    /// Finalizes and removes a structural-only transaction log.
+    async fn finish_structural_log(
+        &self,
+        mut log: TxLog,
+        outcome: StructuralSplitOutcome,
+    ) -> Result<(), TransError> {
+        for split in &mut log.structural_splits {
+            split.outcome = outcome;
+        }
+        log.locks.clear();
+        log.status = TxCommitStatus::Ok;
+        self.mon.commit_tx(log.clone()).await?;
+        self.tl.delete(&log.id).await?;
         Ok(())
+    }
+
+    /// Recovers one structural write-ahead record from tree reachability.
+    pub(crate) async fn recover_log(
+        &self,
+        id: &TxId,
+        supplied: &TxLog,
+        supplied_version: Option<&backend::Version>,
+    ) -> Result<(), TransError> {
+        let (mut log, mut version) = if let Some(version) = supplied_version {
+            (supplied.clone(), version.clone())
+        } else {
+            self.tl.get(id).await?
+        };
+        let mut recovered_status = TxCommitStatus::Ok;
+
+        for index in 0..log.structural_splits.len() {
+            if log.structural_splits[index].outcome != StructuralSplitOutcome::InProgress {
+                continue;
+            }
+            let split = log.structural_splits[index].clone();
+            let parsed = paths::parse(&split.source_path)
+                .map_err(|e| TransError::with_source("parsing structural source", e))?;
+            let token = if parsed.typ == paths::Type::Node {
+                Some(parsed.suffix.as_str())
+            } else {
+                None
+            };
+            // A GC-driven recovery may overlap the split that wrote this
+            // record. The source lock distinguishes a live operation from a
+            // crashed one; self-recovery passes no supplied version and already
+            // knows that its split attempt has stopped.
+            if supplied_version.is_some()
+                && self.source_write_is_live(&parsed.prefix, token).await?
+            {
+                return Err(TransError::Retry);
+            }
+            let reachable = self
+                .dir
+                .reachable_tokens(&parsed.prefix, Freshness::Latest)
+                .await?;
+            let applied = !split.created_tokens.is_empty()
+                && split
+                    .created_tokens
+                    .iter()
+                    .all(|token| reachable.contains(token));
+
+            self.release_structure_write(&parsed.prefix, token, id)
+                .await?;
+            if applied && split.kind == StructuralSplitKind::NonRoot {
+                self.publish_separators(&parsed.prefix, &split.split_key, &split.right_token)
+                    .await?;
+            }
+            if !applied {
+                recovered_status = TxCommitStatus::Aborted;
+                for token in &split.created_tokens {
+                    self.shards.delete_node(&parsed.prefix, token).await?;
+                }
+            }
+            log.structural_splits[index].outcome = if applied {
+                StructuralSplitOutcome::Applied
+            } else {
+                StructuralSplitOutcome::RolledBack
+            };
+        }
+        log.locks.clear();
+        log.status = recovered_status;
+
+        for _ in 0..PARENT_RETRIES {
+            match self.tl.set_if(&log, &version).await {
+                Ok(_) => {
+                    self.mon.finish_structural_recovery(id, recovered_status);
+                    self.tl.delete(id).await?;
+                    return Ok(());
+                }
+                Err(StorageError::Precondition) => {
+                    let (_, current_version) = self.tl.get(id).await?;
+                    version = current_version;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(TransError::Retry)
     }
 
     /// Publishes the leaf separator(s) a split produced into the parent index so
@@ -382,49 +1006,106 @@ impl Splitter {
                 // No index level (a single-leaf collection): nothing to publish.
                 return Ok(());
             };
-            let Some(index) = parent.node.as_index() else {
+            let parent_token = if paths::is_collection_info(&parent.path) {
+                None
+            } else {
+                Some(
+                    paths::node_token_of(&parent.path)
+                        .map_err(|e| StorageError::with_source("parsing parent token", e))?,
+                )
+            };
+            let lock_id = self.candidates.new_id();
+            self.mon.begin_tx(&lock_id);
+            let acquired = match self
+                .acquire_structure_write(prefix, parent_token.as_deref(), &lock_id)
+                .await
+            {
+                Ok(acquired) => acquired,
+                Err(e) => {
+                    let _ = self.mon.abort_tx(&lock_id).await;
+                    return Err(e);
+                }
+            };
+            let Some((locked_parent, locked_version)) = acquired else {
+                self.mon.abort_tx(&lock_id).await?;
+                continue;
+            };
+            let Some(index) = locked_parent.as_index() else {
+                self.finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                    .await?;
                 return Ok(());
             };
             if index.child_for(split_key) == Some(new_token) {
+                self.finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                    .await?;
                 return Ok(()); // already published
             }
-            let missing = self
-                .missing_separators(prefix, &parent.node, split_key)
-                .await?;
+            let missing = match self
+                .missing_separators(prefix, &locked_parent, split_key)
+                .await
+            {
+                Ok(missing) => missing,
+                Err(e) => {
+                    let _ = self
+                        .finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                        .await;
+                    return Err(e);
+                }
+            };
             if missing.is_empty() {
+                self.finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                    .await?;
                 return Ok(());
             }
             let mut new_index = index.clone();
             for (sep, tok) in &missing {
                 new_index.insert_child(sep.clone(), tok.clone());
             }
-            let mut updated = Node::index(new_index);
-            updated.set_high_key(parent.node.high_key().map(<[u8]>::to_vec));
-            updated.set_right_sibling(parent.node.right_sibling().map(str::to_string));
-
-            let stored = if paths::is_collection_info(&parent.path) {
-                // The root carries metadata the node view drops, so rewrite the
-                // full root at the version we found it.
-                let Some(pv) = parent.version.as_ref() else {
-                    return Ok(());
-                };
-                let mut root = self.shards.load_root(prefix).await?.0;
-                root.set_node(updated.clone());
-                self.shards.store_root(prefix, &root, pv).await?
-            } else {
-                let token = paths::node_token_of(&parent.path)
-                    .map_err(|e| StorageError::with_source("parsing parent token", e))?;
-                self.shards
-                    .store_node(prefix, &token, &updated, parent.version.as_ref())
-                    .await?
+            let mut updated = locked_parent.clone();
+            updated.set_index(new_index)?;
+            let content_limit = self
+                .candidates
+                .policy()
+                .node_max_bytes
+                .saturating_sub(self.candidates.policy().split_headroom_bytes);
+            if updated.content_encoded_len() > content_limit
+                || updated.encode().len() > self.candidates.policy().node_max_bytes
+            {
+                self.finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                    .await?;
+                if locked_parent.over_soft_cap(self.candidates.policy()) {
+                    Box::pin(self.split_path(&parent.path)).await?;
+                    continue;
+                }
+                return Err(TransError::InvalidInput(
+                    "separator exceeds the coordination node size limit".into(),
+                ));
+            }
+            let stored = match self
+                .store_structural_node(prefix, parent_token.as_deref(), &updated, &locked_version)
+                .await
+            {
+                Ok(stored) => stored,
+                Err(e) => {
+                    let _ = self
+                        .finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                        .await;
+                    return Err(e);
+                }
             };
             if stored {
+                self.finish_without_split(prefix, parent_token.as_deref(), &lock_id)
+                    .await?;
                 // The inserts landed; a now-overflowing parent splits in turn.
                 if updated.over_soft_cap(self.candidates.policy()) {
                     Box::pin(self.split_path(&parent.path)).await?;
                 }
                 return Ok(());
             }
+            let _ = self
+                .release_structure_write(prefix, parent_token.as_deref(), &lock_id)
+                .await;
+            self.mon.abort_tx(&lock_id).await?;
             // Precondition miss: the parent changed, re-find and retry.
         }
         // Exhausted the retries: re-queue so a later sweep re-drives the
@@ -434,7 +1115,7 @@ impl Splitter {
             split_key: split_key.to_vec(),
             new_token: new_token.to_string(),
         });
-        Ok(())
+        Err(TransError::Retry)
     }
 
     /// The separators the parent `index` is missing along the leaf right-link
@@ -488,11 +1169,16 @@ impl Splitter {
 /// Splits `node` (a root leaf or root index) into a lower and an upper child for
 /// an in-place root split, returning `(left, right, split_key)`. `left` links to
 /// `right_token`; `right` inherits `node`'s former bounds.
-fn split_into_children(node: &Node, right_token: &str) -> (Node, Node, Vec<u8>) {
+fn split_into_children(
+    node: &Node,
+    right_token: &str,
+    structure_holder: &TxId,
+) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
     let (right, split_key) = source
         .split(right_token)
         .expect("root over the soft cap has at least two entries/children");
+    source.remove_structure_holder(structure_holder);
     (source, right, split_key)
 }
 
@@ -504,7 +1190,9 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
     use glassdb_data::TxId;
-    use glassdb_storage::{CollectionRoot, LockType, ObjectCache, ShardEntry, SharedCache};
+    use glassdb_storage::{
+        CollectionRoot, LockType, ObjectCache, ShardEntry, SharedCache, ValueCache,
+    };
 
     const COLL: &str = "db/coll";
 
@@ -516,6 +1204,7 @@ mod tests {
             leaf_max_entries: 2,
             leaf_max_bytes: 1 << 20,
             index_max_children: 2,
+            ..SplitPolicy::default()
         }
     }
 
@@ -538,17 +1227,31 @@ mod tests {
     }
 
     fn leaf_node(keys: &[&[u8]], high: Option<&[u8]>, right: Option<&str>) -> Node {
-        let mut n = Node::leaf(Shard::from_entries(keys.iter().map(|k| live(k))));
-        n.set_high_key(high.map(<[u8]>::to_vec));
-        n.set_right_sibling(right.map(str::to_string));
-        n
+        Node::leaf(Shard::from_entries(keys.iter().map(|k| live(k))))
+            .with_high_key(high.map(<[u8]>::to_vec))
+            .with_right_sibling(right.map(str::to_string))
     }
 
     fn splitter(shards: &ShardStore, bg: &Arc<Background>, policy: SplitPolicy) -> Splitter {
+        splitter_with_candidates(shards, bg, SplitCandidates::new(policy))
+    }
+
+    fn splitter_with_candidates(
+        shards: &ShardStore,
+        bg: &Arc<Background>,
+        candidates: SplitCandidates,
+    ) -> Splitter {
+        let tl = TLogger::new(shards.object_cache(), "db");
+        let values = ValueCache::new(&SharedCache::new(1 << 20));
+        let mon = Monitor::new(values, tl.clone(), Arc::downgrade(bg));
+        let resolver = Resolver::new(shards.clone(), mon.clone());
         Splitter::with_candidates(
             Arc::downgrade(bg),
             shards.clone(),
-            SplitCandidates::new(policy),
+            tl,
+            mon,
+            resolver,
+            candidates,
         )
     }
 
@@ -770,7 +1473,7 @@ mod tests {
             &paths::collection_info(COLL),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
-        let sp = Splitter::with_candidates(Arc::downgrade(&bg), s.clone(), candidates);
+        let sp = splitter_with_candidates(&s, &bg, candidates);
         sp.run_once().await;
 
         let leaves = Directory::new(s.clone())
@@ -778,6 +1481,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "the fed candidate was split");
+    }
+
+    #[tokio::test]
+    async fn contended_candidate_is_requeued() {
+        let s = store();
+        let holder = TxId::with_priority(0, b"holder");
+        let mut node = Node::leaf(Shard::from_entries(
+            [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
+        ));
+        node.add_structure_reader(holder.clone());
+        let mut root = CollectionRoot::new();
+        root.set_node(node);
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let candidates = SplitCandidates::new(tiny());
+        candidates.observe_leaf(
+            &paths::collection_info(COLL),
+            &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
+        );
+        let sp = splitter_with_candidates(&s, &bg, candidates);
+
+        sp.run_once().await;
+        assert!(
+            s.load_root_node(COLL, Freshness::Latest)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .as_leaf()
+                .is_some(),
+            "an older holder defers the split"
+        );
+
+        let (mut root, version) = s.load_root(COLL).await.unwrap();
+        root.node_mut_for_coordination()
+            .remove_structure_holder(&holder);
+        assert!(s.store_root(COLL, &root, &version).await.unwrap());
+
+        sp.run_once().await;
+        assert!(
+            s.load_root_node(COLL, Freshness::Latest)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .as_index()
+                .is_some(),
+            "the retained candidate splits after the holder leaves"
+        );
     }
 
     // ADR-031 byte cap: a leaf well under the entry cap but over the encoded
@@ -799,6 +1551,7 @@ mod tests {
             leaf_max_entries: 1000,
             leaf_max_bytes: 8,
             index_max_children: 1000,
+            ..SplitPolicy::default()
         };
         let candidates = SplitCandidates::new(policy);
         candidates.observe_leaf(
@@ -806,7 +1559,7 @@ mod tests {
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
 
-        let sp = Splitter::with_candidates(Arc::downgrade(&bg), s.clone(), candidates);
+        let sp = splitter_with_candidates(&s, &bg, candidates);
         sp.run_once().await;
 
         // The only cap crossed is the byte cap, so a split here proves the byte
@@ -853,6 +1606,7 @@ mod tests {
             leaf_max_entries: 2,
             leaf_max_bytes: 1 << 20,
             index_max_children: 100,
+            ..SplitPolicy::default()
         };
         splitter(&s, &bg, policy)
             .split_path(&paths::from_node(COLL, "S"))
@@ -886,9 +1640,8 @@ mod tests {
         }
     }
 
-    // ADR-031 durable retry path: a separator whose parent CAS keeps losing is
-    // re-queued and published by a later sweep, so the directory is not left
-    // permanently reliant on a right-link walk. A backend that blocks writes to
+    // ADR-032 retry path: a separator whose parent CAS keeps losing leaves its
+    // structural record in progress and is re-queued for a later sweep. A backend that blocks writes to
     // the root `_i` forces the publication to give up; healing it lets the
     // re-driven publication land.
     #[tokio::test]
@@ -915,7 +1668,10 @@ mod tests {
         // Block the parent `_i` CAS: the split lands (L shrinks, a sibling is
         // created) but the separator publication cannot, so it is re-queued.
         blocker.block(true);
-        sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
+        assert!(matches!(
+            sp.split_path(&paths::from_node(COLL, "L")).await,
+            Err(TransError::Retry)
+        ));
         let (blocked_root, _) = s
             .load_root_node(COLL, Freshness::Latest)
             .await

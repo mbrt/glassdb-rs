@@ -23,11 +23,14 @@ pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use entry::SharedCache;
 pub use error::StorageError;
 pub use lock::LockType;
-pub use node::{IndexNode, Node, NodeBody, NodeToken, SplitPolicy};
+pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeToken, SplitPolicy};
 pub use object_cache::{Freshness, ObjectCache, ObjectRead};
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LeafKind, LoadedLeaf, ShardStore};
-pub use tlogger::{PathLock, TLogger, TValue, TxCommitStatus, TxLog, TxStatus, TxWrite};
+pub use tlogger::{
+    LockScope, PathLock, StructuralSplit, StructuralSplitKind, StructuralSplitOutcome, TLogger,
+    TValue, TxCommitStatus, TxLog, TxStatus, TxWrite,
+};
 pub use value_cache::{MAX_STALENESS, ValueCache, ValueRead};
 pub use version::Version;

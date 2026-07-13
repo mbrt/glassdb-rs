@@ -47,6 +47,14 @@ impl LoadedLeaf {
         &self.kind
     }
 
+    /// Returns the complete node carrying this leaf's entries and coordination.
+    pub fn node(&self) -> &Node {
+        match &self.kind {
+            LeafKind::Root(root) => root.node(),
+            LeafKind::Node(node) => node,
+        }
+    }
+
     /// Reports whether this loaded leaf still owns `key` — i.e. `key` is below
     /// its high-key. A `false` result means a split moved `key` to a right
     /// sibling after the key was routed here, so a caller must re-descend rather
@@ -56,7 +64,7 @@ impl LoadedLeaf {
     pub fn owns(&self, key: &[u8]) -> bool {
         match &self.kind {
             LeafKind::Root(_) => true,
-            LeafKind::Node { high_key, .. } => high_key.as_deref().is_none_or(|hk| key < hk),
+            LeafKind::Node(node) => node.owns(key),
         }
     }
 }
@@ -72,16 +80,18 @@ pub enum LeafKind {
     /// its node replaced.
     Root(CollectionRoot),
     /// The leaf is a standalone node `_n`; its bounds are preserved.
-    Node {
-        high_key: Option<Vec<u8>>,
-        right_sibling: Option<String>,
-    },
+    Node(Node),
 }
 
 impl ShardStore {
     /// Creates a shard store that reads and compare-and-swaps through `objects`.
     pub fn new(objects: ObjectCache) -> Self {
         ShardStore { objects }
+    }
+
+    /// Returns the shared coordination-object cache backing this store.
+    pub fn object_cache(&self) -> ObjectCache {
+        self.objects.clone()
     }
 
     /// Loads the B-link root node from the collection root `_i` under `prefix`,
@@ -147,19 +157,7 @@ impl ShardStore {
         }
     }
 
-    /// Lists the tokens of every standalone node `_n` object under `prefix`
-    /// (ADR-031). The orphan sweep compares this against the set reachable from
-    /// the root to find split siblings a crash left dangling.
-    pub async fn list_node_tokens(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
-        let paths = self.objects.list(&paths::nodes_prefix(prefix)).await?;
-        Ok(paths
-            .iter()
-            .filter_map(|p| paths::node_token_of(p).ok())
-            .collect())
-    }
-
-    /// Deletes the standalone node `_n/<token>`, ignoring a missing object. Used
-    /// by the orphan sweep to reclaim an unreferenced split sibling (ADR-031).
+    /// Deletes the standalone node `_n/<token>`, ignoring a missing object.
     pub async fn delete_node(&self, prefix: &str, token: &str) -> Result<(), StorageError> {
         match self.objects.delete(&paths::from_node(prefix, token)).await {
             Ok(()) | Err(StorageError::NotFound) => Ok(()),
@@ -167,38 +165,12 @@ impl ShardStore {
         }
     }
 
-    /// Durably records that the collection at `prefix` has split activity, so
-    /// the GC orphan sweep enumerates it even after a process restart (ADR-031).
-    /// Idempotent: an existing marker is left as is.
-    pub async fn mark_split_active(&self, prefix: &str) -> Result<(), StorageError> {
-        let marker = paths::split_active_marker(prefix);
-        match self
-            .objects
-            .write_if_not_exists(&marker, Arc::from(&[][..]))
-            .await
-        {
-            Ok(_) | Err(StorageError::Precondition) => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Lists the collection prefixes recorded in the database's split-active
-    /// registry (ADR-031). `db_root` is the database name (the leading segment
-    /// of any collection prefix).
-    pub async fn list_split_active(&self, db_root: &str) -> Result<Vec<String>, StorageError> {
-        let paths = self.objects.list(&paths::split_active_dir(db_root)).await?;
-        Ok(paths
-            .iter()
-            .filter_map(|p| paths::split_active_prefix_of(p).ok())
-            .collect())
-    }
-
     /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
     /// `path` is a collection root `_i`, else a standalone node `_n`. Returns the
     /// empty leaf with no version when the object does not exist yet (the root
-    /// leaf is created lazily on the first key write). Errors if the object
-    /// exists but its node is an index rather than a leaf — key coordination is
-    /// always routed to a leaf by descent.
+    /// leaf is created lazily on the first key write). Returns
+    /// [`StorageError::Precondition`] if a concurrent split turned the routed
+    /// path into an index, so the caller can re-descend.
     pub async fn load_leaf(
         &self,
         path: &str,
@@ -208,10 +180,11 @@ impl ShardStore {
             match self.objects.read(path, freshness).await {
                 Ok(r) => {
                     let root = CollectionRoot::decode(&r.value)?;
-                    let entries =
-                        root.node().as_leaf().cloned().ok_or_else(|| {
-                            StorageError::other("collection root node is not a leaf")
-                        })?;
+                    let entries = root
+                        .node()
+                        .as_leaf()
+                        .cloned()
+                        .ok_or(StorageError::Precondition)?;
                     Ok(LoadedLeaf {
                         entries,
                         version: Some(r.version),
@@ -229,26 +202,17 @@ impl ShardStore {
             match self.objects.read(path, freshness).await {
                 Ok(r) => {
                     let node = Node::decode(&r.value)?;
-                    let entries = node
-                        .as_leaf()
-                        .cloned()
-                        .ok_or_else(|| StorageError::other("node is not a leaf"))?;
+                    let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
                     Ok(LoadedLeaf {
                         entries,
                         version: Some(r.version),
-                        kind: LeafKind::Node {
-                            high_key: node.high_key().map(<[u8]>::to_vec),
-                            right_sibling: node.right_sibling().map(str::to_string),
-                        },
+                        kind: LeafKind::Node(node),
                     })
                 }
                 Err(StorageError::NotFound) => Ok(LoadedLeaf {
                     entries: Shard::new(),
                     version: None,
-                    kind: LeafKind::Node {
-                        high_key: None,
-                        right_sibling: None,
-                    },
+                    kind: LeafKind::Node(Node::leaf(Shard::new())),
                 }),
                 Err(e) => Err(e),
             }
@@ -269,18 +233,46 @@ impl ShardStore {
         let body: Arc<[u8]> = match kind {
             LeafKind::Root(root) => {
                 let mut root = root.clone();
-                root.set_node(Node::leaf(entries.clone()));
+                let mut node = root.node().clone();
+                node.set_leaf(entries.clone())?;
+                root.set_node(node);
                 Arc::from(root.encode())
             }
-            LeafKind::Node {
-                high_key,
-                right_sibling,
-            } => {
-                let mut node = Node::leaf(entries.clone());
-                node.set_high_key(high_key.clone());
-                node.set_right_sibling(right_sibling.clone());
+            LeafKind::Node(node) => {
+                let mut node = node.clone();
+                node.set_leaf(entries.clone())?;
                 Arc::from(node.encode())
             }
+        };
+        let res = match expected {
+            Some(v) => self.objects.write_if(path, body, v).await,
+            None => self.objects.write_if_not_exists(path, body).await,
+        };
+        match res {
+            Ok(_) => Ok(true),
+            Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Compare-and-swaps a complete leaf node while preserving root metadata.
+    pub async fn store_leaf_node(
+        &self,
+        path: &str,
+        node: &Node,
+        kind: &LeafKind,
+        expected: Option<&backend::Version>,
+    ) -> Result<bool, StorageError> {
+        if node.as_leaf().is_none() {
+            return Err(StorageError::other("node is not a leaf"));
+        }
+        let body: Arc<[u8]> = match kind {
+            LeafKind::Root(root) => {
+                let mut root = root.clone();
+                root.set_node(node.clone());
+                Arc::from(root.encode())
+            }
+            LeafKind::Node(_) => Arc::from(node.encode()),
         };
         let res = match expected {
             Some(v) => self.objects.write_if(path, body, v).await,
@@ -346,27 +338,6 @@ impl ShardStore {
             Err(e) => Err(e),
         }
     }
-
-    /// Records subcollection `name` in the directory of the parent root at
-    /// `parent_prefix`, compare-and-swapping the root until the change lands.
-    ///
-    /// Idempotent: if `name` is already present the root is left untouched.
-    /// Returns [`StorageError::NotFound`] if the parent root does not exist.
-    pub async fn register_subcollection(
-        &self,
-        parent_prefix: &str,
-        name: &[u8],
-    ) -> Result<(), StorageError> {
-        loop {
-            let (mut root, version) = self.load_root(parent_prefix).await?;
-            if !root.add_subcollection(name.to_vec()) {
-                return Ok(());
-            }
-            if self.store_root(parent_prefix, &root, &version).await? {
-                return Ok(());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -393,10 +364,7 @@ mod tests {
     // reader starts with a cold cache. Creates it with a bare `write_if_not_exists`
     // (no seeding read) so the shared op log reflects only the reader's traffic.
     async fn seed_empty_leaf(backend: &Arc<dyn Backend>, path: &str) {
-        let kind = LeafKind::Node {
-            high_key: None,
-            right_sibling: None,
-        };
+        let kind = LeafKind::Node(Node::leaf(Shard::new()));
         assert!(
             store_over(backend.clone())
                 .store_leaf(path, &Shard::new(), &kind, None)

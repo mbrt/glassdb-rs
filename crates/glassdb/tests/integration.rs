@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
-use glassdb::{Backend, Collection, Database, Error, Transaction};
+use glassdb::{Backend, Collection, Database, Error, SplitPolicy, Transaction};
 use glassdb_storage::TxCommitStatus;
 use tokio::sync::oneshot;
 
@@ -64,6 +64,25 @@ async fn rw() {
     assert_eq!(stats.tx_n, 2);
     assert_eq!(stats.tx_writes, 1);
     assert_eq!(stats.tx_retries, 0);
+}
+
+#[tokio::test]
+async fn individually_oversized_key_is_invalid_input() {
+    let policy = SplitPolicy {
+        node_max_bytes: 256,
+        split_headroom_bytes: 64,
+        ..SplitPolicy::default()
+    };
+    let db = Database::builder("example", mem())
+        .split_policy(policy)
+        .open()
+        .await
+        .unwrap();
+    let coll = db.collection(b"demo");
+    coll.create().await.unwrap();
+
+    let err = coll.write(&[b'k'; 128], b"value").await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
 }
 
 // The distributed locker's counters are surfaced through `Database::stats()`

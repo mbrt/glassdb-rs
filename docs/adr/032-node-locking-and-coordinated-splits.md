@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —

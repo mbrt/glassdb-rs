@@ -6,10 +6,10 @@
 //! single read-modify-write CAS: resolve every touched key's holders
 //! (help-forward committed holders, drop aborted ones, wound-wait the live
 //! pending ones), install this transaction's locks, then CAS the shard back.
-//! Membership (create/delete) is coordinated per-key in the owning leaf — the
-//! `Create`/`Write` entry lock the acquire installs — so there is no separate
-//! collection-root membership lock (ADR-031). Write-back republishes
-//! `current_writer` pointers and releases the locks.
+//! Create/delete additionally take the owning leaf's membership-write lock,
+//! while every coordination-object mutation holds its structure-read lock
+//! (ADR-032). Write-back republishes `current_writer` pointers and releases all
+//! three scopes together.
 //!
 //! The [`Locker`] owns the *policy*: how a transaction groups its keys, the
 //! parallel/serial acquisition strategy, the hold-and-wait loop, and the
@@ -35,7 +35,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Directory, Freshness, LockType, PathLock, ShardEntry, TxCommitStatus};
+use glassdb_storage::{
+    Directory, Freshness, LockScope, LockType, Node, PathLock, ShardEntry, TxCommitStatus,
+};
 
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
@@ -44,7 +46,13 @@ use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolve
 
 /// One independent partition of the per-transaction held-lock bookkeeping: the
 /// shard/root paths each transaction holds and their lock type.
-type LockerShard = Mutex<HashMap<TxId, HashMap<String, LockType>>>;
+type LockerShard = Mutex<HashMap<TxId, HashMap<String, HeldLeaf>>>;
+
+#[derive(Clone, Copy)]
+struct HeldLeaf {
+    typ: LockType,
+    membership: LockType,
+}
 
 /// Diagnostic snapshot of one transaction's locally-tracked held locks.
 ///
@@ -86,6 +94,7 @@ struct ShardGroup {
     path: String,
     /// Per-key intentions, in ascending raw-key order.
     intents: Vec<KeyIntent>,
+    membership: LockType,
 }
 
 /// The locks a transaction acquired, returned by [`Locker::lock`] and consumed
@@ -107,6 +116,19 @@ impl LockedTx {
                 out.push(PathLock {
                     path: intent.key_path.clone(),
                     typ: lock_type(intent.desired),
+                    scope: LockScope::Entry,
+                });
+            }
+            out.push(PathLock {
+                path: group.path.clone(),
+                typ: LockType::Read,
+                scope: LockScope::Structure,
+            });
+            if group.membership != LockType::None {
+                out.push(PathLock {
+                    path: group.path.clone(),
+                    typ: group.membership,
+                    scope: LockScope::Membership,
                 });
             }
         }
@@ -120,6 +142,14 @@ fn lock_type(desired: Desired) -> LockType {
     match desired {
         Desired::Read => LockType::Read,
         Desired::Put | Desired::Delete => LockType::Write,
+    }
+}
+
+fn lock_scope_order(scope: LockScope) -> u8 {
+    match scope {
+        LockScope::Entry => 0,
+        LockScope::Structure => 1,
+        LockScope::Membership => 2,
     }
 }
 
@@ -180,8 +210,26 @@ async fn build_groups(
             ShardGroup {
                 path: group.path,
                 intents,
+                membership: LockType::None,
             },
         );
+    }
+    // Lock the current cover, not the body's earlier cover. If a split moved
+    // the range before locking, validation observes the changed paths and
+    // re-runs while the new leaves are protected.
+    for scan in &data.scans {
+        for leaf in dir.leaves(&scan.prefix, Freshness::Latest).await? {
+            let group = groups
+                .entry(leaf.path.clone())
+                .or_insert_with(|| ShardGroup {
+                    path: leaf.path,
+                    intents: Vec::new(),
+                    membership: LockType::None,
+                });
+            if group.membership == LockType::None {
+                group.membership = LockType::Read;
+            }
+        }
     }
     Ok(groups)
 }
@@ -242,7 +290,9 @@ async fn try_reclaim(
 /// transaction's lock (ADR-024).
 struct AcquireResolver {
     id: TxId,
+    path: String,
     intents: Arc<Vec<KeyIntent>>,
+    membership: LockType,
 }
 
 #[async_trait]
@@ -250,13 +300,20 @@ impl ShardResolver for AcquireResolver {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
+        node: &Node,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
     ) -> Result<Step, TransError> {
+        let mut entries = resolve_all_entries(ctx, &self.path, &self.id, staged).await?;
         let mut changes = Vec::with_capacity(self.intents.len());
+        let mut membership = self.membership;
         for intent in self.intents.iter() {
-            let cur = staged.get(&intent.raw_key).cloned();
+            let cur = entries.get(&intent.raw_key).cloned();
             match resolve_and_lock(ctx, &self.id, intent, cur).await? {
-                EntryResolution::Locked(entry) => {
+                EntryResolution::Locked(entry, changes_membership) => {
+                    if changes_membership {
+                        membership = LockType::Write;
+                    }
+                    entries.insert(intent.raw_key.clone(), entry.clone());
                     changes.push((intent.raw_key.clone(), entry));
                 }
                 // A member stages all its keys or none (member atomicity): the
@@ -268,9 +325,111 @@ impl ShardResolver for AcquireResolver {
                 }
             }
         }
+
+        let mut changed_node = node.clone();
+        for holder in finalized_node_holders(
+            ctx,
+            &self.id,
+            changed_node.structure_lock().holders().to_vec(),
+        )
+        .await?
+        {
+            changed_node.remove_structure_holder(&holder);
+        }
+        for holder in finalized_node_holders(
+            ctx,
+            &self.id,
+            changed_node.membership_lock().holders().to_vec(),
+        )
+        .await?
+        {
+            changed_node.remove_membership_holder(&holder);
+        }
+
+        if changed_node.structure_lock().lock_type() == LockType::Write
+            && !changed_node.structure_lock().contains(&self.id)
+        {
+            if let Some(holder) =
+                reclaim_node_holders(ctx, &self.id, changed_node.structure_lock().holders()).await?
+            {
+                return Ok(Step::Skip {
+                    outcome: FoldOutcome::Wait(holder),
+                });
+            }
+            for holder in finalized_node_holders(
+                ctx,
+                &self.id,
+                changed_node.structure_lock().holders().to_vec(),
+            )
+            .await?
+            {
+                changed_node.remove_structure_holder(&holder);
+            }
+        }
+        if changed_node.structure_lock().lock_type() != LockType::Write {
+            changed_node.add_structure_reader(self.id.clone());
+        }
+
+        if membership != LockType::None {
+            let conflicts = match membership {
+                LockType::Read => {
+                    changed_node.membership_lock().lock_type() == LockType::Write
+                        && !changed_node.membership_lock().contains(&self.id)
+                }
+                LockType::Write => {
+                    changed_node.membership_lock().lock_type() != LockType::Write
+                        || !changed_node.membership_lock().contains(&self.id)
+                }
+                _ => false,
+            };
+            if conflicts {
+                if let Some(holder) =
+                    reclaim_node_holders(ctx, &self.id, changed_node.membership_lock().holders())
+                        .await?
+                {
+                    return Ok(Step::Skip {
+                        outcome: FoldOutcome::Wait(holder),
+                    });
+                }
+                for holder in finalized_node_holders(
+                    ctx,
+                    &self.id,
+                    changed_node.membership_lock().holders().to_vec(),
+                )
+                .await?
+                {
+                    changed_node.remove_membership_holder(&holder);
+                }
+            }
+            match membership {
+                LockType::Read if changed_node.membership_lock().lock_type() != LockType::Write => {
+                    changed_node.add_membership_reader(self.id.clone());
+                }
+                LockType::Write
+                    if changed_node.membership_lock().lock_type() != LockType::Write
+                        || !changed_node.membership_lock().contains(&self.id) =>
+                {
+                    changed_node.set_membership_writer(self.id.clone());
+                }
+                _ => {}
+            }
+            membership = changed_node.membership_lock().lock_type();
+        }
+
+        for (key, entry) in entries {
+            if staged.get(&key) != Some(&entry)
+                && !changes.iter().any(|(changed, _)| changed == &key)
+            {
+                changes.push((key, entry));
+            }
+        }
         Ok(Step::Stage {
             entries: changes,
-            outcome: FoldOutcome::Locked(shard_lock_type(&self.intents)),
+            node: Some(changed_node),
+            outcome: FoldOutcome::Locked {
+                typ: shard_lock_type(&self.intents),
+                membership,
+            },
         })
     }
 
@@ -314,6 +473,7 @@ impl ShardResolver for WriteBackResolver {
     async fn resolve(
         &self,
         _ctx: &ResolveCtx<'_>,
+        node: &Node,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
     ) -> Result<Step, TransError> {
         let WritebackStaged {
@@ -321,11 +481,15 @@ impl ShardResolver for WriteBackResolver {
             superseded,
         } = writeback_changes(&self.id, &self.intents, staged);
         let outcome = FoldOutcome::Released { superseded };
-        if changes.is_empty() {
+        let mut changed_node = node.clone();
+        let structure_changed = changed_node.remove_structure_holder(&self.id);
+        let membership_changed = changed_node.remove_membership_holder(&self.id);
+        if changes.is_empty() && !structure_changed && !membership_changed {
             Ok(Step::Skip { outcome })
         } else {
             Ok(Step::Stage {
                 entries: changes,
+                node: Some(changed_node),
                 outcome,
             })
         }
@@ -353,17 +517,22 @@ impl ShardResolver for ReleaseResolver {
     async fn resolve(
         &self,
         _ctx: &ResolveCtx<'_>,
+        node: &Node,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
     ) -> Result<Step, TransError> {
         let changes = release_changes(&self.id, staged);
         let outcome = FoldOutcome::Released {
             superseded: Vec::new(),
         };
-        if changes.is_empty() {
+        let mut changed_node = node.clone();
+        let structure_changed = changed_node.remove_structure_holder(&self.id);
+        let membership_changed = changed_node.remove_membership_holder(&self.id);
+        if changes.is_empty() && !structure_changed && !membership_changed {
             Ok(Step::Skip { outcome })
         } else {
             Ok(Step::Stage {
                 entries: changes,
+                node: Some(changed_node),
                 outcome,
             })
         }
@@ -383,7 +552,7 @@ impl ShardResolver for ReleaseResolver {
 /// Per-key resolution within a shard CAS attempt.
 enum EntryResolution {
     /// The lock is installed in `entry`.
-    Locked(ShardEntry),
+    Locked(ShardEntry, bool),
     /// A live pending holder this transaction does not outrank: wait for it.
     Wait(TxId),
 }
@@ -469,7 +638,74 @@ async fn resolve_and_lock(
             };
         }
     }
-    Ok(EntryResolution::Locked(e))
+    let changes_membership = match intent.desired {
+        Desired::Put => !exists_before,
+        Desired::Delete => exists_before,
+        Desired::Read => false,
+    };
+    Ok(EntryResolution::Locked(e, changes_membership))
+}
+
+/// Resolves all entry holders before finalized node holders are discarded.
+async fn resolve_all_entries(
+    ctx: &ResolveCtx<'_>,
+    path: &str,
+    id: &TxId,
+    entries: &BTreeMap<Vec<u8>, ShardEntry>,
+) -> Result<BTreeMap<Vec<u8>, ShardEntry>, TransError> {
+    let prefix = paths::parse(path)
+        .map_err(|e| TransError::with_source("parsing leaf path", e))?
+        .prefix;
+    let mut resolved_entries = BTreeMap::new();
+    for (key, entry) in entries {
+        let resolved = ctx
+            .resolver
+            .resolve_holders(&paths::from_key(&prefix, key), entry, Some(id))
+            .await?;
+        let mut entry = entry.clone();
+        entry.current_writer = resolved.writer;
+        entry.deleted = resolved.deleted;
+        entry
+            .locked_by
+            .retain(|holder| holder == id || resolved.pending.contains(holder));
+        if entry.locked_by.is_empty() {
+            entry.lock_type = LockType::None;
+        }
+        resolved_entries.insert(key.clone(), entry);
+    }
+    Ok(resolved_entries)
+}
+
+/// Returns node holders whose transaction is no longer pending.
+async fn finalized_node_holders(
+    ctx: &ResolveCtx<'_>,
+    id: &TxId,
+    holders: Vec<TxId>,
+) -> Result<Vec<TxId>, TransError> {
+    let mut finalized = Vec::new();
+    for holder in holders {
+        if &holder != id && ctx.tmon.tx_status(&holder).await? != TxCommitStatus::Pending {
+            finalized.push(holder);
+        }
+    }
+    Ok(finalized)
+}
+
+/// Applies wound-wait to conflicting node holders.
+async fn reclaim_node_holders(
+    ctx: &ResolveCtx<'_>,
+    id: &TxId,
+    holders: &[TxId],
+) -> Result<Option<TxId>, TransError> {
+    for holder in holders {
+        if holder == id {
+            continue;
+        }
+        if matches!(try_reclaim(ctx, id, holder).await?, Reclaim::Wait) {
+            return Ok(Some(holder.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Stages `id`'s write-back on its `intents`: publish the committed pointer
@@ -632,14 +868,26 @@ impl Locker {
                 if locks.is_empty() {
                     continue;
                 }
-                let mut paths: Vec<PathLock> = locks
-                    .iter()
-                    .map(|(p, t)| PathLock {
+                let mut paths = Vec::new();
+                for (p, held) in locks {
+                    paths.push(PathLock {
                         path: p.clone(),
-                        typ: *t,
-                    })
-                    .collect();
-                paths.sort_by(|a, b| a.path.cmp(&b.path));
+                        typ: held.typ,
+                        scope: LockScope::Structure,
+                    });
+                    if held.membership != LockType::None {
+                        paths.push(PathLock {
+                            path: p.clone(),
+                            typ: held.membership,
+                            scope: LockScope::Membership,
+                        });
+                    }
+                }
+                paths.sort_by(|a, b| {
+                    a.path
+                        .cmp(&b.path)
+                        .then_with(|| lock_scope_order(a.scope).cmp(&lock_scope_order(b.scope)))
+                });
                 out.push(TxLockSnapshot {
                     tx_id: tx_id.clone(),
                     locks: paths,
@@ -650,12 +898,10 @@ impl Locker {
         out
     }
 
-    /// Groups the transaction's accessed keys by shard and acquires every lock it
-    /// needs. Create/delete is coordinated by the per-key `Create`/`Write` entry
-    /// lock in the owning leaf, so no separate membership lock is taken
-    /// (ADR-031). Returns a [`LockedTx`] handle to drive write-back on commit, or
-    /// [`LockOutcome::Conflict`] when a CAS race was lost and the caller must
-    /// release and re-lock under the same id.
+    /// Groups the transaction's accessed keys by shard and acquires every entry,
+    /// structure, and membership lock it needs. Returns a [`LockedTx`] handle to
+    /// drive write-back on commit, or [`LockOutcome::Conflict`] when a CAS race
+    /// was lost and the caller must release and re-lock under the same id.
     ///
     /// `serial` selects the sorted sequential fallback over the default parallel
     /// path (ADR-020).
@@ -665,10 +911,13 @@ impl Locker {
         data: &Data,
         serial: bool,
     ) -> Result<LockOutcome, TransError> {
-        let groups = build_groups(&self.dir, data).await?;
+        let mut groups = build_groups(&self.dir, data).await?;
         match self.lock_shards(id, &groups, serial).await? {
             ShardsOutcome::Locked => {}
             ShardsOutcome::Conflict => return Ok(LockOutcome::Conflict),
+        }
+        for group in groups.values_mut() {
+            group.membership = self.held_membership(id, &group.path);
         }
         Ok(LockOutcome::Locked(LockedTx { groups }))
     }
@@ -805,10 +1054,13 @@ impl Locker {
         id: &TxId,
         path: &str,
         intents: Arc<Vec<KeyIntent>>,
+        membership: LockType,
     ) -> Result<FoldOutcome, TransError> {
         let resolver = Arc::new(AcquireResolver {
             id: id.clone(),
+            path: path.to_string(),
             intents: intents.clone(),
+            membership,
         });
         match self
             .coord
@@ -819,8 +1071,8 @@ impl Locker {
             // release and diagnostics can find it (the engine no longer tracks
             // this, ADR-028). The outcome carries the acquired strength, so the
             // caller records it without re-deriving from the intents.
-            Some(outcome @ FoldOutcome::Locked(typ)) => {
-                self.record_leaf_lock(id, path, typ);
+            Some(outcome @ FoldOutcome::Locked { typ, membership }) => {
+                self.record_leaf_lock(id, path, typ, membership);
                 Ok(outcome)
             }
             Some(outcome) => Ok(outcome),
@@ -878,8 +1130,11 @@ impl Locker {
         // finalizes — real progress.
         let mut backoff = self.retry.backoff();
         loop {
-            match self.acquire(id, &group.path, intents.clone()).await? {
-                FoldOutcome::Locked(_) => {
+            match self
+                .acquire(id, &group.path, intents.clone(), group.membership)
+                .await?
+            {
+                FoldOutcome::Locked { .. } => {
                     return Ok(ShardOutcome::Locked);
                 }
                 // Hold-and-wait (ADR-024): if the coordinator reports
@@ -907,6 +1162,7 @@ impl Locker {
                 | FoldOutcome::InDoubt(_) => {
                     return Ok(ShardOutcome::Conflict);
                 }
+                FoldOutcome::InvalidInput(msg) => return Err(TransError::InvalidInput(msg)),
             }
         }
     }
@@ -923,12 +1179,23 @@ impl Locker {
     }
 
     /// Records that `id` holds the leaf at `path` at `typ`.
-    fn record_leaf_lock(&self, id: &TxId, path: &str, typ: LockType) {
+    fn record_leaf_lock(&self, id: &TxId, path: &str, typ: LockType, membership: LockType) {
         let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
         tlocks
             .entry(id.clone())
             .or_default()
-            .insert(path.to_string(), typ);
+            .insert(path.to_string(), HeldLeaf { typ, membership });
+    }
+
+    fn held_membership(&self, id: &TxId, path: &str) -> LockType {
+        self.tlocks
+            .for_key(id.as_bytes())
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|paths| paths.get(path))
+            .map(|held| held.membership)
+            .unwrap_or(LockType::None)
     }
 
     /// The leaf paths `id` currently holds, sorted ascending for a
@@ -1044,6 +1311,7 @@ mod tests {
             ShardGroup {
                 path,
                 intents: vec![intent],
+                membership: LockType::None,
             },
         );
         g
@@ -1076,11 +1344,75 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         lock_ok(&locker, &tx, &groups).await;
 
-        // Creating a key installs a Create lock in the owning leaf; that per-key
-        // lock is the sole membership coordination (ADR-031).
+        // A create installs the entry lock together with structure-R and
+        // membership-W in the same leaf CAS.
         let e = entry_of(&ctx, key).await.expect("entry installed");
         assert_eq!(e.lock_type, LockType::Create);
         assert_eq!(e.locked_by, vec![tx.clone()]);
+        let loaded = ctx
+            .shards
+            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .await
+            .unwrap();
+        assert_eq!(loaded.node().structure_lock().lock_type(), LockType::Read);
+        assert!(loaded.node().structure_lock().contains(&tx));
+        assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Write);
+        assert!(loaded.node().membership_lock().contains(&tx));
+        assert_eq!(loaded.node().membership_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn overwrite_does_not_take_membership_lock() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
+
+        lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
+        let loaded = ctx
+            .shards
+            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(loaded.node().structure_lock().contains(&tx));
+        assert!(loaded.node().membership_lock().holders().is_empty());
+        assert_eq!(loaded.node().membership_version(), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_membership_reader_does_not_bump_version() {
+        let (locker, ctx) = init_tl_test();
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let tx = mk_tid(1, "scan");
+        ctx.monitor.begin_tx(&tx);
+
+        let mut groups = group_of(key, put_intent(key));
+        groups
+            .get_mut(&paths::collection_info(COLL))
+            .unwrap()
+            .membership = LockType::Read;
+        lock_ok(&locker, &tx, &groups).await;
+
+        let path = paths::collection_info(COLL);
+        let loaded = ctx
+            .shards
+            .load_leaf(&path, Freshness::Latest)
+            .await
+            .unwrap();
+        assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
+        assert!(loaded.node().membership_lock().contains(&tx));
+        assert_eq!(loaded.node().membership_version(), 0);
+
+        locker.release_leaf(&tx, &path).await.unwrap();
+        let loaded = ctx
+            .shards
+            .load_leaf(&path, Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(loaded.node().membership_lock().holders().is_empty());
+        assert_eq!(loaded.node().membership_version(), 0);
     }
 
     #[tokio::test]
@@ -1243,6 +1575,14 @@ mod tests {
         assert_eq!(e.lock_type, LockType::None);
         assert!(e.locked_by.is_empty());
         assert_eq!(e.current_writer, Some(tx.clone()));
+        let loaded = ctx
+            .shards
+            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(loaded.node().structure_lock().holders().is_empty());
+        assert!(loaded.node().membership_lock().holders().is_empty());
+        assert_eq!(loaded.node().membership_version(), 2);
         assert!(locker.tx_locks_snapshot().is_empty());
     }
 
@@ -1280,8 +1620,8 @@ mod tests {
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
 
-        // A blind put locks the key's leaf entry with a Create lock — the sole
-        // membership coordination (ADR-031).
+        // A blind put installs both the key Create lock and the leaf
+        // membership-write lock.
         let data = Data {
             reads: Vec::new(),
             writes: vec![crate::algo::WriteAccess::put(
@@ -1501,9 +1841,13 @@ mod tests {
     // so they batch into one CAS round rather than each doing its own load+store.
     #[tokio::test(start_paused = true)]
     async fn concurrent_disjoint_writers_share_one_cas() {
-        let (locker, ctx, log, gate) = gated_locker();
+        let (locker, ctx, log, gate) = gated_locker_with(false);
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
+        seed_committed(&ctx, &ka, b"a").await;
+        seed_committed(&ctx, &kb, b"b").await;
+        log.lock().unwrap().clear();
+        gate.arm();
         let tx1 = mk_tid(1, "w1");
         let tx2 = mk_tid(2, "w2");
         ctx.monitor.begin_tx(&tx1);
@@ -1563,6 +1907,8 @@ mod tests {
 
         let tx1 = mk_tid(1, "w1");
         let tx2 = mk_tid(2, "w2");
+        seed_committed(&ctx, &ka, b"a").await;
+        seed_committed(&ctx, &kb, b"b").await;
         let lt1 = lock_commit(&locker, &ctx, &tx1, &ka).await;
         let lt2 = lock_commit(&locker, &ctx, &tx2, &kb).await;
 
@@ -1642,6 +1988,8 @@ mod tests {
         let tx2 = mk_tid(2, "r2");
         ctx.monitor.begin_tx(&tx1);
         ctx.monitor.begin_tx(&tx2);
+        seed_committed(&ctx, &ka, b"a").await;
+        seed_committed(&ctx, &kb, b"b").await;
         lock_ok(&locker, &tx1, &group_of(&ka, put_intent(&ka))).await;
         lock_ok(&locker, &tx2, &group_of(&kb, put_intent(&kb))).await;
 
@@ -1661,15 +2009,14 @@ mod tests {
             1,
             "two releases on one shard share a single CAS"
         );
-        // Both released fresh-key entries are now vestigial (no holder, no
-        // committed writer), so the fold pruned them in the shared CAS (ADR-029).
+        // Both locks are gone; the seeded committed pointers remain unchanged.
         assert!(
-            entry_of(&ctx, &ka).await.is_none(),
-            "vestigial entry pruned on release"
+            entry_of(&ctx, &ka).await.unwrap().locked_by.is_empty(),
+            "first lock released"
         );
         assert!(
-            entry_of(&ctx, &kb).await.is_none(),
-            "vestigial entry pruned on release"
+            entry_of(&ctx, &kb).await.unwrap().locked_by.is_empty(),
+            "second lock released"
         );
     }
 

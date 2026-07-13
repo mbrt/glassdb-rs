@@ -12,8 +12,8 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    MAX_STALENESS, PathLock, StorageError, TLogger, TValue, TxCommitStatus, TxLog, ValueCache,
-    Version,
+    MAX_STALENESS, PathLock, StorageError, StructuralSplit, TLogger, TValue, TxCommitStatus, TxLog,
+    ValueCache, Version,
 };
 use tokio::sync::oneshot;
 
@@ -68,6 +68,7 @@ struct TxStatusEntry {
     // The lock set this transaction holds, recorded by the engine once it has
     // acquired its locks.
     locks: Vec<PathLock>,
+    structural_splits: Vec<StructuralSplit>,
 }
 
 struct WaitRequest {
@@ -168,6 +169,7 @@ impl Monitor {
                 last_version: backend::Version::default(),
                 refresh_state: RefreshState::NotStarted,
                 locks: Vec::new(),
+                structural_splits: Vec::new(),
             },
         );
     }
@@ -180,6 +182,14 @@ impl Monitor {
         let mut st = self.shard_for(tid).lock().unwrap();
         if let Some(e) = st.local_tx.get_mut(tid) {
             e.locks = locks;
+        }
+    }
+
+    /// Records structural write-ahead state for pending-log refreshes.
+    pub(crate) fn record_structural_splits(&self, tid: &TxId, splits: Vec<StructuralSplit>) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        if let Some(e) = st.local_tx.get_mut(tid) {
+            e.structural_splits = splits;
         }
     }
 
@@ -227,7 +237,7 @@ impl Monitor {
         // point: `set_final_log` creates the committed object when no pending
         // one was written (the short-transaction case where the lazy refresh
         // never fired), or CASes pending -> committed otherwise.
-        if !tl.locks.is_empty() || !tl.writes.is_empty() {
+        if !tl.locks.is_empty() || !tl.writes.is_empty() || !tl.structural_splits.is_empty() {
             tl.status = TxCommitStatus::Ok;
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
             // path can recognize a wound (the log was already aborted out from
@@ -263,14 +273,26 @@ impl Monitor {
     pub(crate) async fn abort_tx(&self, tid: &TxId) -> Result<(), TransError> {
         self.stop_tx_refresh(tid);
 
-        let res = self
-            .set_final_log(&TxLog::new(tid.clone(), TxCommitStatus::Aborted))
-            .await;
+        let mut log = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+        if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
+            log.locks = entry.locks.clone();
+            log.structural_splits = entry.structural_splits.clone();
+        }
+        let res = self.set_final_log(&log).await;
 
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid);
         notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
         res
+    }
+
+    /// Clears local lifecycle state after structural recovery finalized the
+    /// durable record directly.
+    pub(crate) fn finish_structural_recovery(&self, tid: &TxId, status: TxCommitStatus) {
+        self.stop_tx_refresh(tid);
+        let mut st = self.shard_for(tid).lock().unwrap();
+        st.local_tx.remove(tid);
+        notify_waiters(&mut st, tid, status);
     }
 
     /// Forces the given transaction into the aborted state so that a
@@ -451,7 +473,14 @@ impl Monitor {
         tid: &TxId,
         expected: &backend::Version,
     ) -> Result<TxCommitStatus, TransError> {
-        let tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+        let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+        if !expected.is_unset()
+            && let Ok((current, _)) = self.inner.tl.get(tid).await
+        {
+            tlog.writes = current.writes;
+            tlog.locks = current.locks;
+            tlog.structural_splits = current.structural_splits;
+        }
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
@@ -755,6 +784,14 @@ impl Monitor {
                 .get(&tid)
                 .map(|e| e.locks.clone())
                 .unwrap_or_default();
+            tl.structural_splits = self
+                .shard_for(&tid)
+                .lock()
+                .unwrap()
+                .local_tx
+                .get(&tid)
+                .map(|e| e.structural_splits.clone())
+                .unwrap_or_default();
 
             let r = if last_version.is_unset() {
                 // First materialization: create-if-absent so a pre-existing
@@ -810,7 +847,9 @@ mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
-    use glassdb_storage::{LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache};
+    use glassdb_storage::{
+        LockScope, LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache,
+    };
 
     struct TestCtx {
         tl: TLogger,
@@ -874,6 +913,7 @@ mod tests {
         tl.locks = vec![PathLock {
             path: key,
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
@@ -896,6 +936,7 @@ mod tests {
         tl.locks = vec![PathLock {
             path: key.clone(),
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
 
@@ -980,6 +1021,7 @@ mod tests {
         let locks = vec![PathLock {
             path: paths::from_key("example", b"k"),
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }];
         mon.begin_tx(&tx);
         mon.record_tx_locks(&tx, locks.clone());
