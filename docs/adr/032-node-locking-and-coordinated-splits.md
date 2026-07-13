@@ -15,6 +15,11 @@ layered on for priority and mutual exclusion. The B-link object model, encoding,
 cached self-correcting descent, right-links, and the in-place root-split shape
 carry over unchanged.
 
+[ADR-034](034-paginated-listing-and-sharded-transaction-logs.md) supplies the
+primary paginated discovery path for structural records and refines the "next
+descender" recovery path into a best-effort background separator-repair hint.
+The reachability proof and proof-before-delete rules below are unchanged.
+
 ## Context
 
 ADR-031 makes leaf and root splits **lock-free**: a background task shrinks the
