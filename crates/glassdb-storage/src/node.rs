@@ -960,6 +960,41 @@ mod tests {
     }
 
     #[test]
+    fn released_node_lock_is_omitted_from_encoding() {
+        let never_locked = Node::leaf(Shard::from_entries([entry(b"a", 1)]));
+        let mut released = never_locked.clone();
+        let holder = TxId::from_bytes(vec![0x11]);
+        released.add_structure_reader(holder.clone());
+        assert!(released.remove_structure_holder(&holder));
+        assert_eq!(released.encode(), never_locked.encode());
+    }
+
+    // Golden vector for the ADR-032 node-lock fields. Changing their tags,
+    // lock-type values, holder encoding, or membership-version encoding must
+    // break this test.
+    #[test]
+    fn golden_node_locks_encoding() {
+        let mut node = Node::leaf(Shard::from_entries([ShardEntry {
+            key: b"Hello".to_vec(),
+            lock_type: LockType::Write,
+            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
+            current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
+            deleted: false,
+        }]));
+        node.add_structure_reader(TxId::from_bytes(vec![0x11]));
+        node.set_membership_writer(TxId::from_bytes(vec![0x22]));
+
+        let got = node.encode();
+        let want = [
+            0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
+            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x02, 0xaa, 0xbb, 0x2a, 0x05, 0x08, 0x02, 0x12,
+            0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38, 0x01,
+        ];
+        assert_eq!(node.encoded_len(), got.len());
+        assert_eq!(got, want, "node-lock encoding drifted: {got:02x?}");
+    }
+
+    #[test]
     fn golden_index_encoding() {
         let node = Node::index(IndexNode::from_children([
             (b"".to_vec(), "L0".to_string()),

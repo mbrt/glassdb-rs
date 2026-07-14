@@ -1,13 +1,15 @@
 //! Integration tests ported from the Go `glassdb_test.go` (memory-backend
 //! subset). Time-sensitive paths use `tokio::time::pause` for determinism.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{Backend, Collection, Database, Error, SplitPolicy, Transaction};
-use glassdb_storage::TxCommitStatus;
-use tokio::sync::oneshot;
+use glassdb_data::paths;
+use glassdb_storage::{CollectionRoot, TxCommitStatus};
+use tokio::sync::{Barrier, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
     Database::open("example", b).await.unwrap()
@@ -697,6 +699,61 @@ async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
     parent.collection(b"child").create().await.unwrap();
     parent.collection(b"child").create().await.unwrap();
     assert_eq!(list_collections_of(&parent).await, vec![b"child".to_vec()]);
+}
+
+// Two registrations that read the same parent-root version must converge after
+// one loses its CAS, and both temporary structure-read holders must be released.
+#[tokio::test]
+async fn concurrent_subcollection_registration_survives_parent_cas_contention() {
+    let mem = Arc::new(MemoryBackend::new());
+    let backend = HookBackend::new(mem.clone());
+    let parent_prefix = paths::from_collection("example", b"parent");
+    let parent_root = paths::collection_info(&parent_prefix);
+    let barrier = Arc::new(Barrier::new(3));
+    let parent_writes = Arc::new(AtomicUsize::new(0));
+    backend.set_before({
+        let parent_root = parent_root.clone();
+        let barrier = barrier.clone();
+        let parent_writes = parent_writes.clone();
+        move |op| {
+            let block = matches!(op, BackendOp::WriteIf { path, .. } if *path == parent_root)
+                && parent_writes.fetch_add(1, Ordering::SeqCst) < 2;
+            let barrier = barrier.clone();
+            let future: HookFuture = Box::pin(async move {
+                if block {
+                    barrier.wait().await;
+                }
+                Ok(())
+            });
+            future
+        }
+    });
+
+    let db = init_db(backend as Arc<dyn Backend>).await;
+    let parent = db.collection(b"parent");
+    parent.create().await.unwrap();
+    let left = parent.collection(b"left");
+    let right = parent.collection(b"right");
+    let left_create = tokio::spawn(async move { left.create().await });
+    let right_create = tokio::spawn(async move { right.create().await });
+
+    // The first two parent-root CASes now share the same pre-write barrier, so
+    // both were prepared from the same version and one must retry.
+    barrier.wait().await;
+    left_create.await.unwrap().unwrap();
+    right_create.await.unwrap().unwrap();
+
+    assert!(parent_writes.load(Ordering::SeqCst) >= 2);
+    assert_eq!(
+        list_collections_of(&parent).await,
+        vec![b"left".to_vec(), b"right".to_vec()]
+    );
+    let stored = mem.read(&parent_root).await.unwrap();
+    let root = CollectionRoot::decode(&stored.contents).unwrap();
+    assert!(
+        root.node().structure_lock().holders().is_empty(),
+        "registration must release every temporary structure reader"
+    );
 }
 
 // Subcollection listing is scoped to the direct parent: a grandchild shows up

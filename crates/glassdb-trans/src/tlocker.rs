@@ -41,7 +41,9 @@ use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::node_locking::{Reclaim, ReconciledLeaf, try_reclaim};
-use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, Step};
+use crate::shard_coord::{
+    FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
+};
 
 /// One independent partition of the per-transaction held-lock bookkeeping: the
 /// shard/root paths each transaction holds and their lock type.
@@ -255,12 +257,16 @@ impl ShardResolver for AcquireResolver {
     ) -> Result<Step, TransError> {
         let mut leaf = ReconciledLeaf::new(ctx, &self.path, &self.id, staged, staged_locks).await?;
         let mut membership = self.membership;
+        let mut admission = StageAdmission::ExistingKeys;
         for intent in self.intents.iter() {
             let cur = leaf.entry(&intent.raw_key).cloned();
             match resolve_and_lock(ctx, &self.id, intent, cur).await? {
                 EntryResolution::Locked(entry, changes_membership) => {
                     if changes_membership {
                         membership = LockType::Write;
+                        if intent.desired == Desired::Put {
+                            admission = StageAdmission::AddsKey;
+                        }
                     }
                     leaf.insert_entry(intent.raw_key.clone(), entry);
                 }
@@ -286,6 +292,7 @@ impl ShardResolver for AcquireResolver {
         Ok(Step::Stage {
             entries,
             locks,
+            admission,
             outcome: FoldOutcome::Locked {
                 typ: shard_lock_type(&self.intents),
                 membership,
@@ -349,6 +356,7 @@ impl ShardResolver for WriteBackResolver {
             Ok(Step::Stage {
                 entries: changes,
                 locks,
+                admission: StageAdmission::ExistingKeys,
                 outcome,
             })
         }
@@ -391,6 +399,7 @@ impl ShardResolver for ReleaseResolver {
             Ok(Step::Stage {
                 entries: changes,
                 locks,
+                admission: StageAdmission::ExistingKeys,
                 outcome,
             })
         }
@@ -576,24 +585,30 @@ fn release_changes(
 pub(crate) enum LockOutcome {
     /// All locks held; drives write-back on commit.
     Locked(LockedTx),
-    /// Lost a CAS-contention race (the bounded retry budget was exhausted under
-    /// churn). Handled **internally** by [`super::algo::Algo`]: it releases the
-    /// partial locks and re-acquires under the **same id** after a backoff — no
-    /// renew and no body re-run (escalating to the serial order if contention
-    /// persists). Never surfaces to the database retry loop.
+    /// Lost a CAS-contention race or reached the absolute object limit without
+    /// adding a user key. Handled **internally** by [`super::algo::Algo`]: it
+    /// releases the partial locks and re-acquires under the **same id** after a
+    /// backoff — no renew and no body re-run (escalating to the serial order if
+    /// contention persists). Never surfaces to the database retry loop.
     Conflict,
+    /// A create reached a leaf's reserved content cap. The caller releases any
+    /// partial locks, backs off without serial escalation, and retries after the
+    /// background split has had an opportunity to run.
+    LeafFull,
 }
 
 /// Outcome of acquiring locks across all touched shards.
 enum ShardsOutcome {
     Locked,
     Conflict,
+    LeafFull,
 }
 
 /// Outcome of acquiring locks on a single shard (after any hold-and-wait).
 enum ShardOutcome {
     Locked,
     Conflict,
+    LeafFull,
 }
 
 /// How a hold-and-wait wake happened, so the re-poll cadence can be tuned: a
@@ -697,8 +712,10 @@ impl Locker {
 
     /// Groups the transaction's accessed keys by shard and acquires every entry,
     /// structure, and membership lock it needs. Returns a [`LockedTx`] handle to
-    /// drive write-back on commit, or [`LockOutcome::Conflict`] when a CAS race
-    /// was lost and the caller must release and re-lock under the same id.
+    /// drive write-back on commit. A retryable outcome asks the caller to
+    /// release and re-lock under the same id: [`LockOutcome::Conflict`] after
+    /// contention, or [`LockOutcome::LeafFull`] while a pending split relieves
+    /// capacity pressure.
     ///
     /// `serial` selects the sorted sequential fallback over the default parallel
     /// path (ADR-020).
@@ -712,6 +729,7 @@ impl Locker {
         match self.lock_shards(id, &groups, serial).await? {
             ShardsOutcome::Locked => {}
             ShardsOutcome::Conflict => return Ok(LockOutcome::Conflict),
+            ShardsOutcome::LeafFull => return Ok(LockOutcome::LeafFull),
         }
         for group in groups.values_mut() {
             group.membership = self.held_membership(id, &group.path);
@@ -802,10 +820,10 @@ impl Locker {
             .unwrap_or_default()
     }
 
-    /// Acquires this transaction's locks across every touched shard, or returns
-    /// [`ShardsOutcome::Conflict`] if a shard lost its bounded CAS race and the
-    /// transaction must release and re-lock under the same id (the first
-    /// conflicting shard wins, in deterministic shard-path order).
+    /// Acquires this transaction's locks across every touched shard. A
+    /// retryable shard outcome asks the transaction to release and re-lock
+    /// under the same id; the first such outcome wins in deterministic
+    /// shard-path order.
     async fn lock_shards(
         &self,
         id: &TxId,
@@ -827,6 +845,7 @@ impl Locker {
                 match self.lock_shard(id, group).await? {
                     ShardOutcome::Locked => {}
                     ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
+                    ShardOutcome::LeafFull => return Ok(ShardsOutcome::LeafFull),
                 }
             }
         } else {
@@ -835,6 +854,7 @@ impl Locker {
                 match outcome? {
                     ShardOutcome::Locked => {}
                     ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
+                    ShardOutcome::LeafFull => return Ok(ShardsOutcome::LeafFull),
                 }
             }
         }
@@ -948,10 +968,10 @@ impl Locker {
                         backoff = self.retry.backoff();
                     }
                 }
-                // Only `Locked`/`Wait` can reach an acquire; the release,
-                // write-back, and commit-install outcomes never do. A conflict
-                // means the round exhausted its CAS budget. Either way, report a
-                // conflict for a safe release-and-relock.
+                FoldOutcome::LeafFull => return Ok(ShardOutcome::LeafFull),
+                // Release, write-back, and commit-install outcomes cannot reach
+                // an acquire. Treat one defensively as a conflict so the caller
+                // takes the safe release-and-relock path.
                 FoldOutcome::Conflict
                 | FoldOutcome::Released { .. }
                 | FoldOutcome::Landed
@@ -1025,8 +1045,8 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_storage::{
-        Directory, Freshness, ObjectCache, Shard, ShardEntry, ShardStore, SharedCache, TLogger,
-        TxCommitStatus, ValueCache,
+        CollectionRoot, Directory, Freshness, Node, ObjectCache, Shard, ShardEntry, ShardStore,
+        SharedCache, SplitPolicy, TLogger, TxCommitStatus, ValueCache,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1041,6 +1061,10 @@ mod tests {
     }
 
     fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
+        new_test_locker_with_policy(b, SplitPolicy::default())
+    }
+
+    fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
         let cache = SharedCache::new(1024);
         let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(b.clone(), &cache);
@@ -1050,11 +1074,13 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
-        let coord = ShardCoordinator::new(
+        let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
+            policy,
+            Arc::new(crate::shard_coord::NoSplitHints),
         );
         let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
         (
@@ -1127,6 +1153,7 @@ mod tests {
         match locker.lock_shards(id, groups, false).await.unwrap() {
             ShardsOutcome::Locked => {}
             ShardsOutcome::Conflict => panic!("expected lock acquisition to succeed"),
+            ShardsOutcome::LeafFull => panic!("expected leaf to have capacity"),
         }
     }
 
@@ -1155,6 +1182,56 @@ mod tests {
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Write);
         assert!(loaded.node().membership_lock().contains(&tx));
         assert_eq!(loaded.node().membership_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_at_content_cap_reports_leaf_full_without_staging() {
+        let writer = mk_tid(0, "seed");
+        let tx = mk_tid(1, "tx");
+        let existing = ShardEntry {
+            key: b"a".to_vec(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: Some(writer),
+            deleted: false,
+        };
+        let created = ShardEntry {
+            key: b"z".to_vec(),
+            lock_type: LockType::Create,
+            locked_by: vec![tx.clone()],
+            current_writer: None,
+            deleted: false,
+        };
+        let mut node = Node::leaf(Shard::from_entries([existing, created]));
+        node.add_structure_reader(tx.clone());
+        node.set_membership_writer(tx.clone());
+        let mut root = CollectionRoot::new();
+        root.set_node(node);
+        let content_limit = root.content_encoded_len() - 1;
+        let node_max_bytes = root.encoded_len() + 64;
+        let policy = SplitPolicy {
+            node_max_bytes,
+            split_headroom_bytes: node_max_bytes - content_limit,
+            ..SplitPolicy::default()
+        };
+
+        let (locker, ctx) = new_test_locker_with_policy(Arc::new(MemoryBackend::new()), policy);
+        seed_committed(&ctx, b"a", b"old").await;
+        ctx.monitor.begin_tx(&tx);
+
+        let outcome = locker
+            .lock_shards(&tx, &group_of(b"z", put_intent(b"z")), false)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ShardsOutcome::LeafFull));
+        assert!(entry_of(&ctx, b"z").await.is_none());
+        let loaded = ctx
+            .shards
+            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .await
+            .unwrap();
+        assert!(!loaded.node().structure_lock().contains(&tx));
+        assert!(!loaded.node().membership_lock().contains(&tx));
     }
 
     #[tokio::test]

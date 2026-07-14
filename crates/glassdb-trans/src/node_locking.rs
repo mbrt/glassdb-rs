@@ -13,7 +13,7 @@ use glassdb_storage::{LockType, NodeLocks, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, Step};
+use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
 
 /// Result of applying wound-wait to one live holder.
 pub(crate) enum Reclaim {
@@ -296,6 +296,7 @@ impl ShardResolver for StructureWriteResolver {
         Ok(Step::Stage {
             entries,
             locks,
+            admission: StageAdmission::ExistingKeys,
             outcome: FoldOutcome::Locked {
                 typ: LockType::Write,
                 membership: LockType::None,

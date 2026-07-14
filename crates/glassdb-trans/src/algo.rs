@@ -40,7 +40,7 @@ use crate::gc::Gc;
 use crate::monitor::Monitor;
 use crate::resolver::{HolderResolution, Resolver};
 use crate::shard_coord::{
-    FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, Step,
+    FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
 };
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
@@ -298,6 +298,7 @@ impl ShardResolver for CommitInstallResolver {
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
             locks,
+            admission: StageAdmission::ExistingKeys,
             // The lock is installed only once the round's CAS confirms it; on a
             // precondition/in-doubt the engine re-folds and re-classifies.
             outcome: FoldOutcome::Landed,
@@ -899,6 +900,10 @@ impl Algo {
     ///   id** after backing off, so a transaction that merely lost a race never
     ///   discards its executed body. Persistent contention escalates to the
     ///   serial order, which removes the equal-priority livelock.
+    /// - **Leaf capacity** (a create reached the reserved content limit): drop
+    ///   the partial locks and retry under the **same id** after backing off,
+    ///   giving the hinted split time to make room. Capacity pressure does not
+    ///   count toward serial escalation.
     /// - **Suspected deadlock** (the parallel wait exceeded
     ///   [`MAX_DEADLOCK_TIMEOUT`]): drop the out-of-order locks and re-acquire in
     ///   the global serial sorted order, where first-CAS-wins on the lowest
@@ -934,6 +939,13 @@ impl Algo {
                     self.release_for_retry(tx).await?;
                     conflicts += 1;
                     serial = serial || conflicts >= SERIAL_FALLBACK_AFTER;
+                    rt::sleep(tx.backoff.next_delay()).await;
+                }
+                // Capacity is not lock contention: release anything acquired on
+                // other leaves and wait for the hinted split without escalating
+                // to the serial lock order or re-running the transaction body.
+                Ok(LockOutcome::LeafFull) => {
+                    self.release_for_retry(tx).await?;
                     rt::sleep(tx.backoff.next_delay()).await;
                 }
                 // Suspected deadlock: drop the out-of-order locks and re-acquire
@@ -2541,6 +2553,7 @@ mod tests {
         {
             LockOutcome::Locked(locked) => locked,
             LockOutcome::Conflict => panic!("holder lock conflicted"),
+            LockOutcome::LeafFull => panic!("holder leaf unexpectedly full"),
         };
 
         // The scan observes the pending create as absent and records its
