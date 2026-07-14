@@ -33,8 +33,8 @@ use glassdb::sim::{
 /// A contended membership workload over three clients, each owning a disjoint
 /// slice of the 8-key universe by residue (client `i` owns keys `k` with
 /// `k % 3 == i`): client 0 -> {0,3,6}, client 1 -> {1,4,7}, client 2 -> {2,5}.
-/// Puts, deletes, and lists interleave so keys created by different clients
-/// share leaves and split concurrently with listings.
+/// Puts, deletes, full listings, and bounded pages interleave so keys created by
+/// different clients share leaves and split concurrently with scans.
 fn contended_membership() -> MembershipWorkload {
     MembershipWorkload {
         clients: vec![
@@ -44,7 +44,11 @@ fn contended_membership() -> MembershipWorkload {
                 MembOp::List,
                 MembOp::Delete(0),
                 MembOp::Put(6),
-                MembOp::List,
+                MembOp::RangePage {
+                    start: 1,
+                    end: 7,
+                    limit: 2,
+                },
             ],
             vec![
                 MembOp::Put(1),
@@ -52,6 +56,7 @@ fn contended_membership() -> MembershipWorkload {
                 MembOp::Put(7),
                 MembOp::List,
                 MembOp::Delete(4),
+                MembOp::PrefixPage(3),
             ],
             vec![
                 MembOp::Put(2),

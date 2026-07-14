@@ -482,6 +482,18 @@ impl DbInner {
                             stats.tx_retries += 1;
                             continue;
                         }
+                        Err(TransError::Wounded) => {
+                            if let Some(h) = handle.as_mut() {
+                                let _ = self.algo.end(h).await;
+                            }
+                            let old = handle.take().unwrap();
+                            let new = self.algo.rebegin(old);
+                            abort_guard.arm(new.id().clone());
+                            handle = Some(new);
+                            tx.reset();
+                            stats.tx_retries += 1;
+                            continue;
+                        }
                         _ => break Err(ferr),
                     }
                 }

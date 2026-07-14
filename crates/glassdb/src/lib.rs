@@ -18,6 +18,7 @@ mod db;
 pub mod diagnostics;
 mod error;
 mod iter;
+mod scan;
 #[cfg(feature = "sim")]
 pub mod sim;
 mod stats;
@@ -29,6 +30,7 @@ pub use db::{Database, DatabaseBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionsIter, KeysIter};
+pub use scan::{KeyPage, KeyScan};
 pub use stats::Stats;
 pub use tx::Transaction;
 

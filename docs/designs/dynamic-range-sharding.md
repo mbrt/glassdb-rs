@@ -75,10 +75,11 @@ CAS. Leaves are the shards; interior nodes are the range index.
   bounds so it is addable without a format migration.
 - **Node locks** — two read/write locks per node beside the per-key entry locks:
   a **structure** lock (data mutations _and_ escalated scans hold read;
-  split/merge holds write) and a **membership** lock (scans hold read;
+  split/merge holds write) and a **membership** lock (escalated scans hold read;
   create/delete hold write; overwrites/reads hold neither)
-  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). Pure reads take
-  neither, so the hot path stays lock-free. Because an escalated scan holds
+  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). Uncontended
+  pure reads take neither, so the hot path stays lock-free; an invalidated
+  read-only scan escalates on retry. Because an escalated scan holds
   structure-read, it conflicts with a split's structure-write, so no scanner lock
   is transferred across a split.
 - **Membership** — per-leaf: create/delete take the node **membership write lock**
@@ -92,8 +93,9 @@ CAS. Leaves are the shards; interior nodes are the range index.
   churn) is the fast-path token (equality is sound only when no observed
   membership intent has since committed). A transaction with **any scan and any
   write** must predicate-lock every scanned range and revalidate membership under
-  the lock before commit; a read-only scan stays on the OCC fast path and follows
-  right-links across concurrent splits
+  the lock before commit. A read-only scan starts on the OCC fast path and follows
+  right-links across concurrent splits; after an invalidation, retries take the
+  same predicate read locks to bound starvation
   ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
   [ADR-033](../adr/033-transactional-key-iteration.md)).
 - **Wound-wait / leases / GC** — unchanged mechanisms at leaf/index granularity;
@@ -230,8 +232,8 @@ ADR — this overview and the diagrams above are the map into it.
   with a hard object-size cap. Supersedes ADR-031's read-lock escalation and
   refines its split coordination.
 - **[ADR-033](../adr/033-transactional-key-iteration.md) — Transactional key
-  iteration.** *Proposed — deferred.* The range/scan API (half-open bounds,
-  keys-only, limit) and its OCC/lock isolation built on the ADR-032 taxonomy.
+  iteration.** *Accepted — implemented.* The range/scan API (half-open bounds,
+  keys-only, paging) and its OCC/lock isolation built on the ADR-032 taxonomy.
 - **[ADR-034](../adr/034-separate-structural-log-namespace.md) — Separate
   structural-log namespace.** *Accepted — implemented.* Keeps short-lived,
   low-cardinality split recovery records under database-wide `_s`, independent

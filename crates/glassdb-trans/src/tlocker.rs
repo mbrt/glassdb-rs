@@ -216,10 +216,21 @@ async fn build_groups(
         );
     }
     // Lock the current cover, not the body's earlier cover. If a split moved
-    // the range before locking, validation observes the changed paths and
-    // re-runs while the new leaves are protected.
+    // the range before locking, validation reconciles the logical page while
+    // the new leaves are protected.
     for scan in &data.scans {
-        for leaf in dir.leaves(&scan.prefix, Freshness::Latest).await? {
+        if scan.range.is_empty() {
+            continue;
+        }
+        for leaf in dir
+            .leaves_through(
+                &scan.prefix,
+                &scan.range.start,
+                scan.frontier.as_deref(),
+                Freshness::Latest,
+            )
+            .await?
+        {
             let group = groups
                 .entry(leaf.path.clone())
                 .or_insert_with(|| ShardGroup {
