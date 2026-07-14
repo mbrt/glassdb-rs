@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Freshness, LockScope, LockType, Node, PathLock, ShardEntry, StorageError, TxCommitStatus,
+    Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry, StorageError, TxCommitStatus,
     TxLog, TxWrite, ValueCache, Version,
 };
 
@@ -229,8 +229,8 @@ impl ShardResolver for CommitInstallResolver {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
-        node: &Node,
         staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let cur = staged.get(&self.raw_key);
 
@@ -244,8 +244,8 @@ impl ShardResolver for CommitInstallResolver {
             });
         }
 
-        if node.structure_lock().lock_type() == LockType::Write
-            && !node.structure_lock().contains(&self.id)
+        if staged_locks.structure().lock_type() == LockType::Write
+            && !staged_locks.structure().contains(&self.id)
         {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Moved,
@@ -293,11 +293,11 @@ impl ShardResolver for CommitInstallResolver {
         e.locked_by = vec![self.id.clone()];
         e.current_writer = Some(effective);
         e.deleted = false;
-        let mut changed_node = node.clone();
-        changed_node.add_structure_reader(self.id.clone());
+        let mut locks = staged_locks.clone();
+        locks.add_structure_reader(self.id.clone());
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
-            node: Some(changed_node),
+            locks,
             // The lock is installed only once the round's CAS confirms it; on a
             // precondition/in-doubt the engine re-folds and re-classifies.
             outcome: FoldOutcome::Landed,
@@ -1120,28 +1120,22 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        let coord = crate::shard_coord::ShardCoordinator::new(
-            shards.clone(),
-            resolver.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-        );
-        let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
-        let splitter = crate::split::Splitter::with_policy(
+        let (coord, _splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             shards.clone(),
-            tlogger.clone(),
             tmon.clone(),
-            resolver.clone(),
+            Clock::real(),
+            RetryConfig::default(),
+            TEST_COLL,
             glassdb_storage::SplitPolicy::default(),
         );
+        let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
             shards.clone(),
             locker.clone(),
             tmon.clone(),
-            splitter,
             Clock::real(),
         );
 
@@ -2084,6 +2078,7 @@ mod tests {
                 .store_leaf(
                     &leaf_path,
                     &windowed,
+                    &loaded.locks,
                     loaded.kind(),
                     loaded.version.as_ref()
                 )
@@ -2450,7 +2445,13 @@ mod tests {
         let shard = Shard::from_entries(entries.into_values());
         assert!(
             tctx.shards
-                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );

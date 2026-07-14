@@ -135,24 +135,17 @@ impl DatabaseBuilder {
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        // Build the splitter first so the coordinator can report over-cap leaf
-        // writes into its queue through the SplitHinter seam (ADR-031); the
-        // coordinator never names the splitter or its candidate feed.
-        let splitter = Splitter::with_policy_and_clock(
+        // Build the coordinator and splitter as a co-wired pair over one shared
+        // candidate feed: leaf writes report split candidates into the feed,
+        // while leaf splits acquire through the same coordinator.
+        let (coord, splitter) = Splitter::with_coordinator(
             bg_weak.clone(),
             shards.clone(),
-            tl.clone(),
             tmon.clone(),
-            resolver.clone(),
-            split_policy,
             clock.clone(),
-        );
-        let coord = ShardCoordinator::with_hinter(
-            shards.clone(),
-            resolver.clone(),
-            tmon.clone(),
             retry,
-            splitter.hinter(),
+            &name,
+            split_policy,
         );
         let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
         let gc = Gc::new(
@@ -161,7 +154,6 @@ impl DatabaseBuilder {
             shards.clone(),
             locker.clone(),
             tmon.clone(),
-            splitter.clone(),
             clock.clone(),
         );
         gc.start();

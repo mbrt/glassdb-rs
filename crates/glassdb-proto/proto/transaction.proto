@@ -15,7 +15,6 @@ message TransactionLog {
     google.protobuf.Timestamp timestamp = 1;
     Status status = 2;
     repeated CollectionWrites writes = 3;
-    repeated StructuralSplit structural_splits = 4;
 }
 
 message CollectionWrites {
@@ -59,35 +58,6 @@ message Lock {
     string suffix = 1;
     LockType lock_type = 2;
     Scope scope = 3;
-}
-
-message StructuralSplit {
-    enum Kind {
-        UNKNOWN_KIND = 0;
-        NON_ROOT = 1;
-        ROOT = 2;
-    }
-
-    enum Outcome {
-        UNKNOWN_OUTCOME = 0;
-        IN_PROGRESS = 1;
-        APPLIED = 2;
-        ROLLED_BACK = 3;
-    }
-
-    enum MoveSide {
-        UNKNOWN_SIDE = 0;
-        UPPER = 1;
-    }
-
-    string source_path = 1;
-    string source_version = 2;
-    repeated string created_tokens = 3;
-    bytes split_key = 4;
-    Kind kind = 5;
-    Outcome outcome = 6;
-    string right_token = 7;
-    MoveSide move_side = 8;
 }
 
 message NodeLock {
@@ -136,6 +106,17 @@ message Node {
     NodeLock structure_lock = 5;
     NodeLock membership_lock = 6;
     uint64 membership_version = 7;
+}
+
+// A split write-ahead record. It lives at `{db}/_s/<record_id>` until the
+// created nodes are either reachable or reclaimed.
+message StructuralLog {
+    string prefix = 1;
+    string source_token = 2;
+    string source_version = 3;
+    repeated string created_tokens = 4;
+    bytes split_key = 5;
+    bool is_root = 6;
 }
 
 // An index node body: an ordered list of separator entries. The child owning a

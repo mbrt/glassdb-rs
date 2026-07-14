@@ -48,7 +48,6 @@ use glassdb_storage::{
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, PENDING_TX_TIMEOUT, is_expired};
-use crate::split::Splitter;
 use crate::tlocker::Locker;
 
 /// How often the collector runs a sweep cycle. Reuses the lease timeout: a
@@ -76,7 +75,6 @@ pub struct Gc {
     dir: Directory,
     locker: Locker,
     mon: Monitor,
-    splitter: Splitter,
     clock: Clock,
     // Write-back hint feed: txids a fresh commit just superseded (primary
     // candidate source). Deduplicated when drained.
@@ -96,7 +94,6 @@ impl Gc {
         shards: ShardStore,
         locker: Locker,
         mon: Monitor,
-        splitter: Splitter,
         clock: Clock,
     ) -> Self {
         let dir = Directory::new(shards.clone());
@@ -106,7 +103,6 @@ impl Gc {
             dir,
             locker,
             mon,
-            splitter,
             clock,
             hints: Arc::new(Mutex::new(VecDeque::new())),
             cursor: Arc::new(Mutex::new(None)),
@@ -210,15 +206,6 @@ impl Gc {
             Err(StorageError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-
-        if log
-            .structural_splits
-            .iter()
-            .any(|split| split.outcome == glassdb_storage::StructuralSplitOutcome::InProgress)
-        {
-            self.splitter.recover_log(tid, &log, Some(&version)).await?;
-            return Ok(());
-        }
 
         // Within the horizon: keep. A recent pending object may be a live
         // transaction whose lock this non-atomic check has not observed yet
@@ -388,9 +375,8 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_storage::{
-        CollectionRoot, Directory, Freshness, IndexNode, LockScope, LockType, Node, ObjectCache,
-        Shard, ShardEntry, SharedCache, StructuralSplit, StructuralSplitKind,
-        StructuralSplitOutcome, TxWrite, ValueCache,
+        Directory, Freshness, LockScope, LockType, ObjectCache, Shard, ShardEntry, SharedCache,
+        TxWrite, ValueCache,
     };
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
@@ -434,21 +420,13 @@ mod tests {
             RetryConfig::default(),
         );
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let splitter = Splitter::with_policy(
-            Arc::downgrade(&bg),
-            shards.clone(),
-            tl.clone(),
-            mon.clone(),
-            resolver.clone(),
-            glassdb_storage::SplitPolicy::default(),
-        );
-        let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::new(
             shards.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
         );
+        let dir = Directory::new(shards.clone());
         let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
         let gc = Gc::new(
             Arc::downgrade(&bg),
@@ -456,7 +434,6 @@ mod tests {
             shards.clone(),
             locker.clone(),
             mon.clone(),
-            splitter,
             clock,
         );
         Ctx {
@@ -497,7 +474,13 @@ mod tests {
         let shard = Shard::from_entries(entries.into_values());
         assert!(
             shards
-                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -526,7 +509,6 @@ mod tests {
                 })
                 .collect(),
             locks: locks.iter().map(|k| write_lock(k)).collect(),
-            structural_splits: Vec::new(),
         }
     }
 
@@ -717,7 +699,13 @@ mod tests {
             .unwrap();
         assert!(
             ctx.shards
-                .store_leaf(&shard_path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &shard_path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -773,152 +761,6 @@ mod tests {
         assert_eq!(
             lookup_entry(&ctx.shards, &kb).await.unwrap().locked_by,
             vec![live]
-        );
-    }
-
-    // Seeds a two-node tree: an index root pointing at the reachable leaf `leaf`.
-    async fn seed_index_root(shards: &ShardStore, leaf: &str) {
-        shards
-            .store_node(COLL, leaf, &Node::leaf(Shard::new()), None)
-            .await
-            .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            leaf.to_string(),
-        )])));
-        shards.create_root(COLL, &root).await.unwrap();
-    }
-
-    // Writes a standalone node object that nothing references — a split sibling a
-    // crash left dangling.
-    async fn seed_orphan(shards: &ShardStore, token: &str) {
-        shards
-            .store_node(COLL, token, &Node::leaf(Shard::new()), None)
-            .await
-            .unwrap();
-    }
-
-    async fn node_exists(shards: &ShardStore, token: &str) -> bool {
-        shards
-            .load_node(COLL, token, Freshness::Latest)
-            .await
-            .is_ok()
-    }
-
-    async fn seed_structural_record(tl: &TLogger, id: &TxId, token: &str) {
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Pending);
-        log.timestamp = Some(base());
-        log.structural_splits.push(StructuralSplit {
-            source_path: paths::collection_info(COLL),
-            source_version: String::new(),
-            created_tokens: vec![token.to_string()],
-            split_key: b"m".to_vec(),
-            kind: StructuralSplitKind::Root,
-            outcome: StructuralSplitOutcome::InProgress,
-            right_token: token.to_string(),
-        });
-        tl.set(&log).await.unwrap();
-    }
-
-    // Structural recovery deletes a created node when the durable write-ahead
-    // record proves it never became reachable.
-    #[tokio::test(start_paused = true)]
-    async fn unreachable_structural_node_is_reclaimed() {
-        let ctx = new_ctx();
-        seed_index_root(&ctx.shards, "L").await;
-        seed_orphan(&ctx.shards, "ORPH").await;
-        seed_structural_record(&ctx.tl, &tx(90), "ORPH").await;
-        ctx.gc.run_once().await;
-        assert!(
-            !node_exists(&ctx.shards, "ORPH").await,
-            "unreachable recorded node is reclaimed"
-        );
-        assert!(
-            node_exists(&ctx.shards, "L").await,
-            "the reachable leaf is never reclaimed"
-        );
-    }
-
-    // Recovery must not classify a just-created node while the split that owns
-    // the structural record is still active. Once the source writer is gone,
-    // the same record can be resolved from reachability.
-    #[tokio::test(start_paused = true)]
-    async fn live_structural_writer_defers_orphan_recovery() {
-        let ctx = new_ctx();
-        let id = tx(93);
-        seed_index_root(&ctx.shards, "L").await;
-        seed_orphan(&ctx.shards, "ORPH").await;
-
-        let (mut root, version) = ctx.shards.load_root(COLL).await.unwrap();
-        root.node_mut_for_coordination()
-            .set_structure_writer(id.clone());
-        assert!(ctx.shards.store_root(COLL, &root, &version).await.unwrap());
-        seed_structural_record(&ctx.tl, &id, "ORPH").await;
-
-        ctx.gc.run_once().await;
-        assert!(
-            node_exists(&ctx.shards, "ORPH").await,
-            "a live split keeps its not-yet-linked node"
-        );
-
-        let (mut root, version) = ctx.shards.load_root(COLL).await.unwrap();
-        root.node_mut_for_coordination()
-            .remove_structure_holder(&id);
-        assert!(ctx.shards.store_root(COLL, &root, &version).await.unwrap());
-        ctx.gc.run_once().await;
-        assert!(
-            !node_exists(&ctx.shards, "ORPH").await,
-            "recovery resumes after the structural writer leaves"
-        );
-    }
-
-    // A recorded sibling that is reachable is retained and the record finalizes.
-    #[tokio::test(start_paused = true)]
-    async fn sibling_linked_before_second_sweep_is_kept() {
-        let ctx = new_ctx();
-        seed_index_root(&ctx.shards, "L").await;
-        seed_orphan(&ctx.shards, "R").await;
-        seed_structural_record(&ctx.tl, &tx(91), "R").await;
-
-        // The split completes: the root now references R too.
-        let (mut root, ver) = ctx.shards.load_root(COLL).await.unwrap();
-        root.set_node(Node::index(IndexNode::from_children([
-            (Vec::new(), "L".to_string()),
-            (b"m".to_vec(), "R".to_string()),
-        ])));
-        assert!(ctx.shards.store_root(COLL, &root, &ver).await.unwrap());
-
-        ctx.gc.run_once().await;
-        assert!(
-            node_exists(&ctx.shards, "R").await,
-            "a newly linked sibling must not be reclaimed"
-        );
-    }
-
-    // A fresh process discovers structural recovery work from the transaction
-    // log without an in-memory registry.
-    #[tokio::test(start_paused = true)]
-    async fn structural_record_recovers_orphan_after_restart() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-
-        // Process 1 writes ahead and creates a sibling, then crashes before link.
-        let p1 = new_ctx_with(backend.clone());
-        seed_index_root(&p1.shards, "L").await;
-        seed_orphan(&p1.shards, "ORPH").await;
-        seed_structural_record(&p1.tl, &tx(92), "ORPH").await;
-        drop(p1);
-
-        // Process 2 finds the record while paging transaction objects.
-        let p2 = new_ctx_with(backend);
-        p2.gc.run_once().await;
-        assert!(
-            !node_exists(&p2.shards, "ORPH").await,
-            "fresh process reclaims the logged orphan"
-        );
-        assert!(
-            node_exists(&p2.shards, "L").await,
-            "the reachable leaf is never reclaimed"
         );
     }
 

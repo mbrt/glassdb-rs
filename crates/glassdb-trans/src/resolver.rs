@@ -386,7 +386,13 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &new_shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -433,7 +439,13 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &new_shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );

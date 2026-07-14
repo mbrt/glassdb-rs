@@ -17,10 +17,11 @@ use glassdb_backend as backend;
 use glassdb_data::paths;
 
 use crate::error::StorageError;
-use crate::node::Node;
+use crate::node::{Node, NodeLocks};
 use crate::object_cache::{Freshness, ObjectCache};
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
+use crate::structlog::StructuralLog;
 
 /// Reads and compare-and-swaps B-link node and collection-root objects through
 /// the [`ObjectCache`], the v2 coordination substrate.
@@ -37,6 +38,8 @@ pub struct ShardStore {
 /// or in a standalone node `_n`.
 pub struct LoadedLeaf {
     pub entries: Shard,
+    /// Node-level coordination staged independently from topology.
+    pub locks: NodeLocks,
     pub version: Option<backend::Version>,
     kind: LeafKind,
 }
@@ -165,6 +168,61 @@ impl ShardStore {
         }
     }
 
+    /// Creates a split write-ahead record before any node is created.
+    pub async fn write_structural_log(
+        &self,
+        record_id: &str,
+        record: &StructuralLog,
+    ) -> Result<(), StorageError> {
+        let path = paths::structural_log_record(paths::db_root_of(&record.prefix), record_id);
+        match self
+            .objects
+            .write_if_not_exists(&path, Arc::from(record.encode()))
+            .await
+        {
+            Ok(_) | Err(StorageError::Precondition) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Lists every unresolved structural record in a database.
+    pub async fn list_structural_logs(
+        &self,
+        db_root: &str,
+    ) -> Result<Vec<(String, StructuralLog)>, StorageError> {
+        let paths = self
+            .objects
+            .list(&paths::structural_log_dir(db_root))
+            .await?;
+        let mut records = Vec::with_capacity(paths.len());
+        for path in paths {
+            let record_id = paths::structural_log_id_of(&path)
+                .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+            match self.objects.read(&path, Freshness::Latest).await {
+                Ok(read) => records.push((record_id, StructuralLog::decode(&read.value)?)),
+                Err(StorageError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(records)
+    }
+
+    /// Deletes a resolved structural record, ignoring an already-missing one.
+    pub async fn delete_structural_log(
+        &self,
+        db_root: &str,
+        record_id: &str,
+    ) -> Result<(), StorageError> {
+        match self
+            .objects
+            .delete(&paths::structural_log_record(db_root, record_id))
+            .await
+        {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
     /// `path` is a collection root `_i`, else a standalone node `_n`. Returns the
     /// empty leaf with no version when the object does not exist yet (the root
@@ -187,12 +245,14 @@ impl ShardStore {
                         .ok_or(StorageError::Precondition)?;
                     Ok(LoadedLeaf {
                         entries,
+                        locks: root.node().locks().clone(),
                         version: Some(r.version),
                         kind: LeafKind::Root(root),
                     })
                 }
                 Err(StorageError::NotFound) => Ok(LoadedLeaf {
                     entries: Shard::new(),
+                    locks: NodeLocks::default(),
                     version: None,
                     kind: LeafKind::Root(CollectionRoot::new()),
                 }),
@@ -205,12 +265,14 @@ impl ShardStore {
                     let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
                     Ok(LoadedLeaf {
                         entries,
+                        locks: node.locks().clone(),
                         version: Some(r.version),
                         kind: LeafKind::Node(node),
                     })
                 }
                 Err(StorageError::NotFound) => Ok(LoadedLeaf {
                     entries: Shard::new(),
+                    locks: NodeLocks::default(),
                     version: None,
                     kind: LeafKind::Node(Node::leaf(Shard::new())),
                 }),
@@ -219,14 +281,13 @@ impl ShardStore {
         }
     }
 
-    /// Compare-and-swaps the leaf at object `path`, writing `entries` back into
-    /// the object kind captured by `kind` (root metadata or node bounds are
-    /// preserved). `expected = None` means create-if-absent. Returns `false` on
-    /// a precondition miss (reload and retry), `true` on success.
+    /// Compare-and-swaps the leaf at object `path`, writing `entries` and node
+    /// locks back while preserving root metadata and node topology.
     pub async fn store_leaf(
         &self,
         path: &str,
         entries: &Shard,
+        locks: &NodeLocks,
         kind: &LeafKind,
         expected: Option<&backend::Version>,
     ) -> Result<bool, StorageError> {
@@ -235,44 +296,16 @@ impl ShardStore {
                 let mut root = root.clone();
                 let mut node = root.node().clone();
                 node.set_leaf(entries.clone())?;
+                node.set_locks(locks.clone());
                 root.set_node(node);
                 Arc::from(root.encode())
             }
             LeafKind::Node(node) => {
                 let mut node = node.clone();
                 node.set_leaf(entries.clone())?;
+                node.set_locks(locks.clone());
                 Arc::from(node.encode())
             }
-        };
-        let res = match expected {
-            Some(v) => self.objects.write_if(path, body, v).await,
-            None => self.objects.write_if_not_exists(path, body).await,
-        };
-        match res {
-            Ok(_) => Ok(true),
-            Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Compare-and-swaps a complete leaf node while preserving root metadata.
-    pub async fn store_leaf_node(
-        &self,
-        path: &str,
-        node: &Node,
-        kind: &LeafKind,
-        expected: Option<&backend::Version>,
-    ) -> Result<bool, StorageError> {
-        if node.as_leaf().is_none() {
-            return Err(StorageError::other("node is not a leaf"));
-        }
-        let body: Arc<[u8]> = match kind {
-            LeafKind::Root(root) => {
-                let mut root = root.clone();
-                root.set_node(node.clone());
-                Arc::from(root.encode())
-            }
-            LeafKind::Node(_) => Arc::from(node.encode()),
         };
         let res = match expected {
             Some(v) => self.objects.write_if(path, body, v).await,
@@ -367,7 +400,7 @@ mod tests {
         let kind = LeafKind::Node(Node::leaf(Shard::new()));
         assert!(
             store_over(backend.clone())
-                .store_leaf(path, &Shard::new(), &kind, None)
+                .store_leaf(path, &Shard::new(), &NodeLocks::default(), &kind, None)
                 .await
                 .unwrap()
         );
@@ -454,7 +487,7 @@ mod tests {
         let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
         assert!(
             store
-                .store_leaf(&path, &Shard::new(), loaded.kind(), None)
+                .store_leaf(&path, &Shard::new(), &loaded.locks, loaded.kind(), None,)
                 .await
                 .unwrap()
         );
@@ -465,7 +498,13 @@ mod tests {
         // load reflects it.
         assert!(
             store
-                .store_leaf(&path, &Shard::new(), loaded.kind(), Some(&v1))
+                .store_leaf(
+                    &path,
+                    &Shard::new(),
+                    &loaded.locks,
+                    loaded.kind(),
+                    Some(&v1),
+                )
                 .await
                 .unwrap()
         );

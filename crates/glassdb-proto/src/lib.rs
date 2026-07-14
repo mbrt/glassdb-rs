@@ -1,4 +1,4 @@
-//! Protobuf definitions for transaction logs. Ported from the Go
+//! Protobuf definitions for persistent database records. Ported from the Go
 //! `internal/proto` package. The Rust bindings in `generated.rs` are
 //! pre-generated from `proto/transaction.proto` with `prost-build` and
 //! checked into the repo, so building the crate does not require `protoc`.
@@ -43,7 +43,6 @@ mod tests {
                     }],
                 }),
             }],
-            structural_splits: Vec::new(),
         };
 
         let bytes = log.encode_to_vec();

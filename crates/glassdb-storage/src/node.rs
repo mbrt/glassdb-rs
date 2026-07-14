@@ -257,6 +257,90 @@ impl NodeLock {
     }
 }
 
+/// The node-level coordination state threaded through a leaf CAS round.
+///
+/// Keeping this separate from the node's topology prevents transaction-engine
+/// resolvers from replacing bounds, sibling links, or the node body while they
+/// only intend to change locks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeLocks {
+    structure: NodeLock,
+    membership: NodeLock,
+    membership_version: u64,
+}
+
+impl NodeLocks {
+    /// Returns the structure lock guarding the node's physical shape.
+    pub fn structure(&self) -> &NodeLock {
+        &self.structure
+    }
+
+    /// Returns the membership lock guarding a leaf's live key set.
+    pub fn membership(&self) -> &NodeLock {
+        &self.membership
+    }
+
+    /// Returns the membership activity version used by optimistic scans.
+    pub fn membership_version(&self) -> u64 {
+        self.membership_version
+    }
+
+    /// Installs a shared structure holder.
+    pub fn add_structure_reader(&mut self, id: TxId) {
+        self.structure.add_reader(id);
+    }
+
+    /// Installs an exclusive structure holder.
+    pub fn set_structure_writer(&mut self, id: TxId) {
+        self.structure.set_writer(id);
+    }
+
+    /// Removes one structure holder.
+    pub fn remove_structure_holder(&mut self, id: &TxId) -> bool {
+        self.structure.remove(id)
+    }
+
+    /// Installs a shared membership holder without recording write activity.
+    pub fn add_membership_reader(&mut self, id: TxId) {
+        self.membership.add_reader(id);
+    }
+
+    /// Installs an exclusive membership holder and records the activity.
+    pub fn set_membership_writer(&mut self, id: TxId) {
+        if self.membership.lock_type() == LockType::Write
+            && self.membership.holders() == std::slice::from_ref(&id)
+        {
+            return;
+        }
+        self.membership.set_writer(id);
+        self.membership_version = self.membership_version.wrapping_add(1);
+    }
+
+    /// Removes one membership holder and records released write activity.
+    pub fn remove_membership_holder(&mut self, id: &TxId) -> bool {
+        let was_writer =
+            self.membership.lock_type() == LockType::Write && self.membership.contains(id);
+        let removed = self.membership.remove(id);
+        if removed && was_writer {
+            self.membership_version = self.membership_version.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// Removes all node-level holds belonging to `id`.
+    pub fn release(&mut self, id: &TxId) -> bool {
+        let structure_changed = self.remove_structure_holder(id);
+        let membership_changed = self.remove_membership_holder(id);
+        structure_changed || membership_changed
+    }
+
+    /// Clears transient holders while preserving the membership version.
+    fn clear_holders(&mut self) {
+        self.structure.clear();
+        self.membership.clear();
+    }
+}
+
 /// The body of a [`Node`]: either a leaf's per-key entries or an index's
 /// separators.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,9 +360,7 @@ pub struct Node {
     /// Right-sibling token at the same level; `None` means none (rightmost).
     right_sibling: Option<NodeToken>,
     body: NodeBody,
-    structure_lock: NodeLock,
-    membership_lock: NodeLock,
-    membership_version: u64,
+    locks: NodeLocks,
 }
 
 impl Node {
@@ -289,9 +371,7 @@ impl Node {
             high_key: None,
             right_sibling: None,
             body: NodeBody::Leaf(shard),
-            structure_lock: NodeLock::default(),
-            membership_lock: NodeLock::default(),
-            membership_version: 0,
+            locks: NodeLocks::default(),
         }
     }
 
@@ -301,9 +381,7 @@ impl Node {
             high_key: None,
             right_sibling: None,
             body: NodeBody::Index(index),
-            structure_lock: NodeLock::default(),
-            membership_lock: NodeLock::default(),
-            membership_version: 0,
+            locks: NodeLocks::default(),
         }
     }
 
@@ -359,65 +437,62 @@ impl Node {
 
     /// Returns the node's structure lock.
     pub fn structure_lock(&self) -> &NodeLock {
-        &self.structure_lock
+        self.locks.structure()
+    }
+
+    /// Returns the complete node-level coordination state.
+    pub fn locks(&self) -> &NodeLocks {
+        &self.locks
+    }
+
+    /// Replaces the node-level coordination state.
+    pub fn set_locks(&mut self, locks: NodeLocks) {
+        self.locks = locks;
     }
 
     /// Installs a structure-read holder.
     pub fn add_structure_reader(&mut self, id: TxId) {
-        self.structure_lock.add_reader(id);
+        self.locks.add_structure_reader(id);
     }
 
     /// Installs a structure-write holder.
     pub fn set_structure_writer(&mut self, id: TxId) {
-        self.structure_lock.set_writer(id);
+        self.locks.set_structure_writer(id);
     }
 
     /// Removes a structure-lock holder.
     pub fn remove_structure_holder(&mut self, id: &TxId) -> bool {
-        self.structure_lock.remove(id)
+        self.locks.remove_structure_holder(id)
     }
 
     /// Returns the leaf membership lock.
     pub fn membership_lock(&self) -> &NodeLock {
-        &self.membership_lock
+        self.locks.membership()
     }
 
     /// Installs a membership-read holder without recording membership activity.
     pub fn add_membership_reader(&mut self, id: TxId) {
-        self.membership_lock.add_reader(id);
+        self.locks.add_membership_reader(id);
     }
 
     /// Installs a membership-write holder and records the membership activity.
     pub fn set_membership_writer(&mut self, id: TxId) {
-        if self.membership_lock.lock_type() == LockType::Write
-            && self.membership_lock.holders() == std::slice::from_ref(&id)
-        {
-            return;
-        }
-        self.membership_lock.set_writer(id);
-        self.membership_version = self.membership_version.wrapping_add(1);
+        self.locks.set_membership_writer(id);
     }
 
     /// Removes a membership-lock holder and records released write activity.
     pub fn remove_membership_holder(&mut self, id: &TxId) -> bool {
-        let was_writer = self.membership_lock.lock_type() == LockType::Write
-            && self.membership_lock.contains(id);
-        let removed = self.membership_lock.remove(id);
-        if removed && was_writer {
-            self.membership_version = self.membership_version.wrapping_add(1);
-        }
-        removed
+        self.locks.remove_membership_holder(id)
     }
 
     /// Returns the leaf membership activity version.
     pub fn membership_version(&self) -> u64 {
-        self.membership_version
+        self.locks.membership_version()
     }
 
     /// Clears node locks before a split-created node becomes visible.
     pub(crate) fn clear_node_locks(&mut self) {
-        self.structure_lock.clear();
-        self.membership_lock.clear();
+        self.locks.clear_holders();
     }
 
     /// Returns the canonical encoded size without transient node locks.
@@ -505,9 +580,11 @@ impl Node {
             high_key: self.high_key.take(),
             right_sibling: self.right_sibling.take(),
             body: right_body,
-            structure_lock: NodeLock::default(),
-            membership_lock: NodeLock::default(),
-            membership_version: self.membership_version,
+            locks: {
+                let mut locks = self.locks.clone();
+                locks.clear_holders();
+                locks
+            },
         };
         // The retained lower half is now bounded by the split key and links to
         // the new sibling.
@@ -538,10 +615,11 @@ impl Node {
             high_key: self.high_key.clone().unwrap_or_default(),
             right_sibling: self.right_sibling.clone().unwrap_or_default(),
             body: Some(body),
-            structure_lock: (!self.structure_lock.is_empty()).then(|| self.structure_lock.to_pb()),
-            membership_lock: (!self.membership_lock.is_empty())
-                .then(|| self.membership_lock.to_pb()),
-            membership_version: self.membership_version,
+            structure_lock: (!self.locks.structure.is_empty())
+                .then(|| self.locks.structure.to_pb()),
+            membership_lock: (!self.locks.membership.is_empty())
+                .then(|| self.locks.membership.to_pb()),
+            membership_version: self.locks.membership_version,
         }
     }
 
@@ -555,9 +633,11 @@ impl Node {
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
             right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
             body,
-            structure_lock: NodeLock::from_pb(raw.structure_lock),
-            membership_lock: NodeLock::from_pb(raw.membership_lock),
-            membership_version: raw.membership_version,
+            locks: NodeLocks {
+                structure: NodeLock::from_pb(raw.structure_lock),
+                membership: NodeLock::from_pb(raw.membership_lock),
+                membership_version: raw.membership_version,
+            },
         }
     }
 }
@@ -647,7 +727,7 @@ mod tests {
         assert!(!node.remove_membership_holder(&id));
         assert_eq!(node.membership_version(), 2);
 
-        node.membership_version = u64::MAX;
+        node.locks.membership_version = u64::MAX;
         node.set_membership_writer(id);
         assert_eq!(node.membership_version(), 0);
     }

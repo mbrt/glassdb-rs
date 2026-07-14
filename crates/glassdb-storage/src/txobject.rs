@@ -63,7 +63,6 @@ mod tests {
                 prev_writer: TxId::default(),
             }],
             locks: Vec::new(),
-            structural_splits: Vec::new(),
         }
     }
 
@@ -89,7 +88,6 @@ mod tests {
                 typ: LockType::Write,
                 scope: crate::tlogger::LockScope::Entry,
             }],
-            structural_splits: Vec::new(),
         };
         let decoded = decode(&obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Pending);
@@ -107,7 +105,6 @@ mod tests {
             status: TxCommitStatus::Aborted,
             writes: Vec::new(),
             locks: Vec::new(),
-            structural_splits: Vec::new(),
         };
         let decoded = decode(&obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Aborted);

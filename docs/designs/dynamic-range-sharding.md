@@ -50,6 +50,9 @@ CAS. Leaves are the shards; interior nodes are the range index.
     tombstone) sorted by key; also a **high-key** and **right-sibling** link. The
     CAS unit for its keys.
   - _Transaction object_ (`_t/<txid>`): unchanged (status + values + lease).
+  - _Structural record_ (`{db}/_s/<record-id>`): a short-lived split
+    write-ahead note, recovered independently from transaction logs
+    ([ADR-034](../adr/034-separate-structural-log-namespace.md)).
 - **Ordering** — lexicographic over raw key bytes, matching the order-preserving
   path encoding.
 - **Mapping** — descend from the root object `_i`; each node self-describes its
@@ -97,7 +100,9 @@ CAS. Leaves are the shards; interior nodes are the range index.
   recording the split's created node tokens — recovery keeps or deletes them by
   proving **tree-reachability** (right-link chain, or root-split index entries),
   with ambiguity resolved by retry, not deletion
-  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)).
+  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
+  [ADR-034](../adr/034-separate-structural-log-namespace.md)). Transaction and
+  structural records use separate `_t` and `_s` namespaces and recovery loops.
 
 ## Tree shape
 
@@ -224,6 +229,10 @@ ADR — this overview and the diagrams above are the map into it.
 - **[ADR-033](../adr/033-transactional-key-iteration.md) — Transactional key
   iteration.** *Proposed — deferred.* The range/scan API (half-open bounds,
   keys-only, limit) and its OCC/lock isolation built on the ADR-032 taxonomy.
+- **[ADR-034](../adr/034-separate-structural-log-namespace.md) — Separate
+  structural-log namespace.** *Accepted — implemented.* Keeps short-lived,
+  low-cardinality split recovery records under database-wide `_s`, independent
+  from transaction `_t` schema, GC, and scheduling.
 
 Planned follow-on ADRs, as the open questions below resolve: merge/rebalance,
 split-point policy, and node fan-out/sizing.

@@ -188,6 +188,34 @@ pub fn nodes_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Node)
 }
 
+/// Returns the database-wide structural-log directory (`{db}/_s/`).
+pub fn structural_log_dir(db_root: &str) -> String {
+    format!("{db_root}/_s/")
+}
+
+/// Returns the path of one structural-log record (`{db}/_s/<record_id>`).
+pub fn structural_log_record(db_root: &str, record_id: &str) -> String {
+    format!("{db_root}/_s/{record_id}")
+}
+
+/// Decodes the record id from a structural-log record path.
+pub fn structural_log_id_of(path: &str) -> Result<String, PathError> {
+    match path.rsplit('/').next() {
+        Some(id) if !id.is_empty() => Ok(id.to_string()),
+        _ => Err(PathError::Parse(format!(
+            "structural-log path has no record id: {path:?}"
+        ))),
+    }
+}
+
+/// Returns the database name at the start of a collection prefix.
+pub fn db_root_of(prefix: &str) -> &str {
+    match prefix.find('/') {
+        Some(i) => &prefix[..i],
+        None => prefix,
+    }
+}
+
 /// Decodes a node token from a full node object path (`{prefix}/_n/<token>`),
 /// the inverse of [`from_node`].
 pub fn node_token_of(path: &str) -> Result<String, PathError> {
@@ -391,6 +419,16 @@ mod tests {
         ));
         // A malformed path (no type segment) is a parse error.
         assert!(matches!(node_token_of("db"), Err(PathError::Parse(_))));
+    }
+
+    #[test]
+    fn structural_log_record_round_trip() {
+        let record_id = "record";
+        let path = structural_log_record("db", record_id);
+        assert!(path.starts_with(&structural_log_dir("db")));
+        assert_eq!(structural_log_id_of(&path).unwrap(), record_id);
+        assert_eq!(structural_log_dir("db"), "db/_s/");
+        assert_eq!(db_root_of("db/root/child"), "db");
     }
 
     #[test]
