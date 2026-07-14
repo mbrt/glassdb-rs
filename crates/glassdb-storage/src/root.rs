@@ -145,7 +145,7 @@ mod tests {
             current_writer: Some(TxId::from_bytes(vec![1])),
             deleted: false,
         }]));
-        node.set_high_key(None);
+        node.set_bounds(None, None);
         root.set_node(node);
 
         let decoded = CollectionRoot::decode(&root.encode()).unwrap();

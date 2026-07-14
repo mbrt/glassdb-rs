@@ -33,8 +33,9 @@ use crate::error::{TransError, trans_to_storage};
 use crate::monitor::Monitor;
 
 /// The result of a phantom-safe listing scan ([`Resolver::live_keys_scan`]): the
-/// live keys in key order, plus the version of every leaf the scan covered so
-/// commit validation can detect a racing create/delete or split (ADR-031).
+/// live keys in key order, plus each covered leaf's membership version and the
+/// pending membership-W holders it observed, so commit validation can apply the
+/// (a)+(b) OCC condition to detect a racing create/delete or split (ADR-032).
 #[derive(Debug, Clone)]
 pub struct ScanResult {
     pub keys: Vec<Vec<u8>>,
@@ -104,30 +105,46 @@ impl Resolver {
     }
 
     /// Scans `prefix` left-to-right and returns both the raw keys that currently
-    /// exist (committed and not tombstoned, in key order) and the version of
-    /// every leaf the scan covered (ADR-031 phantom prevention).
+    /// exist (committed and not tombstoned, in key order) and, per covered leaf,
+    /// its membership version and the membership-W holders observed pending
+    /// (ADR-032 phantom prevention).
     ///
     /// Committed holders are help-forwarded, so a key whose writer committed but
     /// has not yet published its `current_writer` pointer (write-back is
     /// asynchronous) still lists. The scan follows the leaf right-sibling chain
     /// ([`Directory::leaves`]), so an in-progress split is absorbed rather than
-    /// dropping or duplicating keys. Recording each covered leaf's object
-    /// version lets commit validation detect any create/delete (which bumps its
-    /// leaf's version) or split (which changes the covered set) that raced the
-    /// scan.
+    /// dropping or duplicating keys. Recording each covered leaf's membership
+    /// version and its pending membership-W holders lets commit validation apply
+    /// the (a)+(b) OCC condition: it detects a create/delete (which bumps the
+    /// version, or — if already pending at scan time — is caught by the holder
+    /// recheck) or a split (which changes the covered set), while an overwrite
+    /// (no membership change) never disturbs the scan.
     pub async fn live_keys_scan(&self, prefix: &str) -> Result<ScanResult, StorageError> {
         let leaves = self.dir.leaves(prefix, Freshness::Latest).await?;
         let mut keys = Vec::new();
         let mut covered = Vec::with_capacity(leaves.len());
         for loc in leaves {
-            covered.push(LeafCoverage {
-                path: loc.path.as_str().into(),
-                version: loc.version.clone(),
-            });
             let leaf = loc
                 .node
                 .as_leaf()
                 .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
+            // Record only the membership-W holders that are pending now: a
+            // holder already finalized at scan time is resolved into the key
+            // list (committed → help-forwarded, aborted → dropped) and its
+            // version bump already happened, so it needs no recheck (ADR-032 (b)).
+            let mut pending_membership = Vec::new();
+            for h in &loc.node.locks().membership.holders {
+                if self.tmon.tx_status(h).await.map_err(trans_to_storage)?
+                    == TxCommitStatus::Pending
+                {
+                    pending_membership.push(h.clone());
+                }
+            }
+            covered.push(LeafCoverage {
+                path: loc.path.as_str().into(),
+                membership_version: loc.node.locks().membership_version,
+                pending_membership,
+            });
             for e in leaf.entries() {
                 let key_path = paths::from_key(prefix, &e.key);
                 let resolved = self
@@ -373,7 +390,13 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &new_shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -420,7 +443,13 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &new_shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );

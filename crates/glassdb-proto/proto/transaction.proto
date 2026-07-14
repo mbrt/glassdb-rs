@@ -90,6 +90,60 @@ message Node {
         // An index node: separator keys mapping ranges to child nodes.
         IndexNode index = 4;
     }
+    // The node-level structure lock (ADR-032): guards the node's shape (entry
+    // set as a physical unit, high-key, right-sibling, child pointers). Held
+    // read by every data mutation and escalated scan, write by a split/merge.
+    // Absent means unlocked.
+    NodeLock structure_lock = 5;
+    // The node-level membership lock (ADR-032): guards a leaf's live key set
+    // (the predicate/gap). Held read by an escalated scan, write by create and
+    // delete. Absent means unlocked; meaningful only on leaves.
+    NodeLock membership_lock = 6;
+    // The leaf's membership version (ADR-032): a monotonic counter bumped only
+    // by membership-write activity (create/delete lock install, release, or
+    // write-back), the OCC fast-path token for scans. Never bumped by scanner
+    // read locks or by splits.
+    uint64 membership_version = 7;
+}
+
+// A node-level read/write lock (ADR-032): the structure or membership lock that
+// lives beside the per-key entry locks in a node object. Read locks share
+// (multiple holders); a write lock is exclusive (a single holder).
+message NodeLock {
+    // The strength of the lock; NONE means unlocked.
+    Lock.LockType lock_type = 1;
+    // Transactions holding the lock (more than one only for a read lock);
+    // sorted so the encoding is canonical.
+    repeated bytes holders = 2;
+}
+
+// A structural-log record (ADR-032): the write-ahead note a split writes
+// before creating any node object, so crash recovery can resolve an
+// in-progress split from *structural* state (tree-reachability of the created
+// nodes) rather than transaction status. Lives at `{db}/_s/<record_id>` and is
+// deleted once the split's parent separator is published (or the orphan
+// aborted). Replaces ADR-031's `_g/` split-active registry.
+message StructuralLog {
+    // The collection prefix the split runs in (e.g. `db/coll`), so recovery can
+    // descend the right tree from a single global record listing.
+    string prefix = 1;
+    // The source node token (`_n/<token>`) the split shrinks. Empty when the
+    // source is the collection root `_i` (an in-place root split).
+    string source_token = 2;
+    // The source object's CAS version at the time the record was written — the
+    // version the shrink CAS is guarded by.
+    string source_version = 3;
+    // The freshly created node token(s): one right sibling for a leaf/interior
+    // split, the two children for an in-place root split.
+    repeated string created_tokens = 4;
+    // The split key (the separator to publish into the parent). Empty for a
+    // root split, which is referenced through `_i`'s index entries, not a
+    // right-link separator.
+    bytes split_key = 5;
+    // Set when the source is the collection root `_i`: recovery tests root-split
+    // completion by whether `_i` became an index over the children, not by a
+    // right-link walk.
+    bool is_root = 6;
 }
 
 // An index node body: an ordered list of separator entries. The child owning a

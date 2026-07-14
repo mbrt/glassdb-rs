@@ -35,7 +35,10 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Directory, Freshness, LockType, PathLock, ShardEntry, TxCommitStatus};
+use glassdb_storage::{
+    Directory, Freshness, LockType, NodeLock, NodeLocks, PathLock, Shard, ShardEntry,
+    TxCommitStatus,
+};
 
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
@@ -219,20 +222,107 @@ fn should_wound(me: &TxId, holder: &TxId) -> bool {
 /// hold-and-wait case), or if the holder finalized as committed before the wound
 /// landed (re-resolve via a now-immediate wait so the committed value is
 /// help-forwarded).
-async fn try_reclaim(
-    ctx: &ResolveCtx<'_>,
-    id: &TxId,
-    holder: &TxId,
-) -> Result<Reclaim, TransError> {
+async fn try_reclaim(tmon: &Monitor, id: &TxId, holder: &TxId) -> Result<Reclaim, TransError> {
     if !should_wound(id, holder) {
         return Ok(Reclaim::Wait);
     }
-    ctx.tmon.wound_tx(holder).await?;
-    if ctx.tmon.tx_status(holder).await? == TxCommitStatus::Aborted {
+    tmon.wound_tx(holder).await?;
+    if tmon.tx_status(holder).await? == TxCommitStatus::Aborted {
         Ok(Reclaim::Wounded)
     } else {
         Ok(Reclaim::Wait)
     }
+}
+
+/// Installs `id`'s shared **structure-read** hold on `locks`, the node-level
+/// lock every node-mutating path holds so a split can wound or wait on it
+/// (ADR-032). A conflicting **structure-write** holder (a split) is reconciled
+/// first by wound-wait: it is wounded (and cleared) if `id` outranks it, else
+/// `id` must wait, and the conflicting holder is returned. Idempotent: re-acquiring
+/// an already-held read (or keeping `id`'s own write hold) is a no-op that never
+/// waits.
+pub(crate) async fn hold_structure_read(
+    tmon: &Monitor,
+    id: &TxId,
+    locks: &mut NodeLocks,
+) -> Result<Option<TxId>, TransError> {
+    // Structure-read shares with other read holders; only an exclusive
+    // structure-write holder (a split) conflicts. Reconcile it, then take the
+    // shared read hold.
+    if locks.structure.lock_type == LockType::Write && !locks.structure.holds(id) {
+        let holders: Vec<TxId> = locks.structure.holders.clone();
+        if let Some(waited) = reconcile_node_lock(tmon, id, &mut locks.structure, &holders).await? {
+            return Ok(Some(waited));
+        }
+    }
+    locks.structure.acquire_read(id);
+    Ok(None)
+}
+
+/// Installs `id`'s exclusive **membership-write** hold on `locks`, the marker a
+/// create/delete takes to serialize membership change within the leaf and make
+/// scanners conflict with it (ADR-032). Every other membership holder (creators,
+/// deleters, escalated scanners) conflicts with the exclusive write and is
+/// reconciled first. Installing the lock bumps the membership version (a
+/// membership-write activity). Idempotent: re-acquiring an already-held
+/// membership-write is a no-op that neither waits nor re-bumps.
+async fn hold_membership_write(
+    tmon: &Monitor,
+    id: &TxId,
+    locks: &mut NodeLocks,
+) -> Result<Option<TxId>, TransError> {
+    if locks.membership.lock_type == LockType::Write && locks.membership.holds(id) {
+        return Ok(None);
+    }
+    let holders: Vec<TxId> = locks.membership.other_holders(id).cloned().collect();
+    if let Some(waited) = reconcile_node_lock(tmon, id, &mut locks.membership, &holders).await? {
+        return Ok(Some(waited));
+    }
+    locks.acquire_membership_write(id);
+    Ok(None)
+}
+
+/// Reconciles the conflicting `holders` of a node lock by transaction status,
+/// the node-level analogue of [`Resolver::resolve_holders`] (ADR-032). A
+/// committed holder is **help-forwarded** — its write-back will release the node
+/// lock, and dropping it here completes that on this node — and an
+/// aborted/expired holder is dropped, both by [`NodeLock::release`]. A live
+/// **pending** holder is wound-waited: wounded (and released) if `id` outranks
+/// it, else `id` must wait and that holder is returned. Returns the first holder
+/// `id` must wait on, or `None` when every conflict was cleared so the caller may
+/// install its hold.
+pub(crate) async fn reconcile_node_lock(
+    tmon: &Monitor,
+    id: &TxId,
+    lock: &mut NodeLock,
+    holders: &[TxId],
+) -> Result<Option<TxId>, TransError> {
+    for holder in holders {
+        if holder == id {
+            continue;
+        }
+        match tmon.tx_status(holder).await? {
+            TxCommitStatus::Pending => match try_reclaim(tmon, id, holder).await? {
+                Reclaim::Wounded => lock.release(holder),
+                Reclaim::Wait => return Ok(Some(holder.clone())),
+            },
+            // Committed (help-forwarded away) or dead (aborted/unknown): drop it.
+            _ => lock.release(holder),
+        }
+    }
+    Ok(None)
+}
+
+/// Drops every node-level lock `id` holds on a leaf, the write-back / release
+/// counterpart to [`hold_structure_read`] and the membership-write install
+/// (ADR-032). Releasing the membership-write lock bumps the membership version
+/// (a membership-write activity); releasing structure-read does not. Returns the
+/// updated locks and whether anything changed, so the caller can skip the CAS
+/// when this transaction held no node lock.
+pub(crate) fn release_node_locks(id: &TxId, locks: &NodeLocks) -> (NodeLocks, bool) {
+    let mut out = locks.clone();
+    let changed = out.release(id);
+    (out, changed)
 }
 
 // --- Shard resolvers (the locking policy the Locker installs, ADR-028) ------
@@ -243,6 +333,10 @@ async fn try_reclaim(
 struct AcquireResolver {
     id: TxId,
     intents: Arc<Vec<KeyIntent>>,
+    /// Hard cap on the post-write leaf encoding for a create (ADR-032); a create
+    /// that would exceed it fails with [`TransError::LeafFull`]. `usize::MAX`
+    /// disables the check.
+    leaf_hard_cap_bytes: usize,
 }
 
 #[async_trait]
@@ -251,13 +345,24 @@ impl ShardResolver for AcquireResolver {
         &self,
         ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let mut changes = Vec::with_capacity(self.intents.len());
+        let mut membership_change = false;
+        let mut created = false;
         for intent in self.intents.iter() {
             let cur = staged.get(&intent.raw_key).cloned();
             match resolve_and_lock(ctx, &self.id, intent, cur).await? {
-                EntryResolution::Locked(entry) => {
+                EntryResolution::Locked {
+                    entry,
+                    membership_change: mc,
+                } => {
+                    // A create (absent key → `Create` lock) is the only membership
+                    // change that *grows* the leaf, so only it is hard-cap gated
+                    // (ADR-032); a delete shrinks it and is always admissible.
+                    created |= entry.lock_type == LockType::Create;
                     changes.push((intent.raw_key.clone(), entry));
+                    membership_change |= mc;
                 }
                 // A member stages all its keys or none (member atomicity): the
                 // moment a key must wait, stage nothing and return Wait.
@@ -268,8 +373,45 @@ impl ShardResolver for AcquireResolver {
                 }
             }
         }
+        // Hard-cap invariant (ADR-032): a create is admitted only if the
+        // post-write leaf still encodes under `backend_limit − H`. Over the cap
+        // it fails with a retryable "leaf full, split pending" error, so the
+        // object can never grow past the point where even the split's own shrink
+        // CAS would no longer fit. Overwrites/deletes never grow membership and
+        // skip the check; `usize::MAX` disables it.
+        if created && self.leaf_hard_cap_bytes != usize::MAX {
+            let mut merged: BTreeMap<Vec<u8>, ShardEntry> = staged.clone();
+            for (k, e) in &changes {
+                merged.insert(k.clone(), e.clone());
+            }
+            let post_write = Shard::from_entries(merged.into_values());
+            if post_write.encoded_len() > self.leaf_hard_cap_bytes {
+                return Err(TransError::LeafFull);
+            }
+        }
+        // Every node-mutating acquire holds the node's structure-read lock so a
+        // split can wound or wait on it — no CAS bypasses the structure lock
+        // (ADR-032). Reconcile a conflicting split's structure-write first.
+        let mut locks = staged_locks.clone();
+        if let Some(holder) = hold_structure_read(ctx.tmon, &self.id, &mut locks).await? {
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Wait(holder),
+            });
+        }
+        // A create or delete additionally holds the node's membership-write lock
+        // (ADR-032): it serializes membership change within the leaf and makes a
+        // scanner conflict with it. Reconcile conflicting membership holders
+        // (other creators/deleters, escalated scanners) by wound-wait.
+        if membership_change
+            && let Some(holder) = hold_membership_write(ctx.tmon, &self.id, &mut locks).await?
+        {
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Wait(holder),
+            });
+        }
         Ok(Step::Stage {
             entries: changes,
+            locks,
             outcome: FoldOutcome::Locked(shard_lock_type(&self.intents)),
         })
     }
@@ -315,17 +457,24 @@ impl ShardResolver for WriteBackResolver {
         &self,
         _ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let WritebackStaged {
             changes,
             superseded,
         } = writeback_changes(&self.id, &self.intents, staged);
         let outcome = FoldOutcome::Released { superseded };
-        if changes.is_empty() {
+        // Structure-read is held from acquisition through write-back, then
+        // released here as the mutation completes (ADR-032). A membership
+        // write-back (create/delete) also drops membership-write and bumps the
+        // membership version.
+        let (locks, node_lock_changed) = release_node_locks(&self.id, staged_locks);
+        if changes.is_empty() && !node_lock_changed {
             Ok(Step::Skip { outcome })
         } else {
             Ok(Step::Stage {
                 entries: changes,
+                locks,
                 outcome,
             })
         }
@@ -354,16 +503,21 @@ impl ShardResolver for ReleaseResolver {
         &self,
         _ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let changes = release_changes(&self.id, staged);
         let outcome = FoldOutcome::Released {
             superseded: Vec::new(),
         };
-        if changes.is_empty() {
+        // Releasing a hold also drops this transaction's node-level locks
+        // (structure-read, and membership-write for a create/delete) (ADR-032).
+        let (locks, node_lock_changed) = release_node_locks(&self.id, staged_locks);
+        if changes.is_empty() && !node_lock_changed {
             Ok(Step::Skip { outcome })
         } else {
             Ok(Step::Stage {
                 entries: changes,
+                locks,
                 outcome,
             })
         }
@@ -382,8 +536,13 @@ impl ShardResolver for ReleaseResolver {
 
 /// Per-key resolution within a shard CAS attempt.
 enum EntryResolution {
-    /// The lock is installed in `entry`.
-    Locked(ShardEntry),
+    /// The lock is installed in `entry`. `membership_change` is true when this
+    /// key's lock is a create or delete — a change to the leaf's live key set
+    /// that also takes the node membership-write lock (ADR-032).
+    Locked {
+        entry: ShardEntry,
+        membership_change: bool,
+    },
     /// A live pending holder this transaction does not outrank: wait for it.
     Wait(TxId),
 }
@@ -441,7 +600,7 @@ async fn resolve_and_lock(
         && !matches!(e.lock_type, LockType::Write | LockType::Create);
     if !compatible {
         for holder in &pending {
-            match try_reclaim(ctx, id, holder).await? {
+            match try_reclaim(ctx.tmon, id, holder).await? {
                 Reclaim::Wounded => {}
                 Reclaim::Wait => return Ok(EntryResolution::Wait(holder.clone())),
             }
@@ -449,6 +608,7 @@ async fn resolve_and_lock(
         pending.clear();
     }
 
+    let mut membership_change = false;
     match intent.desired {
         Desired::Read => {
             let mut holders = pending;
@@ -458,18 +618,31 @@ async fn resolve_and_lock(
             e.locked_by = holders;
             e.lock_type = LockType::Read;
         }
-        Desired::Put | Desired::Delete => {
+        Desired::Delete => {
+            // A delete changes the leaf's live key set (removes a live key or
+            // installs a tombstone), so it is always a membership change; the
+            // node membership-write lock is the marker that distinguishes it
+            // from an overwrite (ADR-032). It takes a per-key Write lock.
             e.locked_by = vec![id.clone()];
-            e.lock_type = if exists_before {
-                LockType::Write
-            } else if matches!(intent.desired, Desired::Put) {
-                LockType::Create
+            e.lock_type = LockType::Write;
+            membership_change = true;
+        }
+        Desired::Put => {
+            e.locked_by = vec![id.clone()];
+            if exists_before {
+                // Overwrite of a live key: a value write, not a membership change.
+                e.lock_type = LockType::Write;
             } else {
-                LockType::Write
-            };
+                // Create of an absent key: a membership change.
+                e.lock_type = LockType::Create;
+                membership_change = true;
+            }
         }
     }
-    Ok(EntryResolution::Locked(e))
+    Ok(EntryResolution::Locked {
+        entry: e,
+        membership_change,
+    })
 }
 
 /// Stages `id`'s write-back on its `intents`: publish the committed pointer
@@ -587,6 +760,11 @@ pub struct Locker {
     tmon: Monitor,
     /// Backoff config for the hold-and-wait re-poll cadence.
     retry: RetryConfig,
+    /// Hard cap on a leaf's admissible encoded content (ADR-032): a create whose
+    /// post-write leaf would exceed it is rejected with a retryable
+    /// [`TransError::LeafFull`], so a leaf can never grow past the point where
+    /// its own split's shrink CAS would no longer fit.
+    leaf_hard_cap_bytes: usize,
     /// Per-transaction held-lock bookkeeping (which leaves a transaction
     /// holds): recorded when an acquire lands, read to drive the serial-fallback
     /// release, and surfaced for diagnostics. Shared across clones so the locker
@@ -604,12 +782,19 @@ impl Locker {
     /// configures the exponential backoff applied between hold-and-wait re-polls
     /// of a conflicting holder, so a wait is never busy-retried (its
     /// `max_interval` caps the re-poll cadence).
-    pub fn new(coord: ShardCoordinator, dir: Directory, tmon: Monitor, retry: RetryConfig) -> Self {
+    pub fn new(
+        coord: ShardCoordinator,
+        dir: Directory,
+        tmon: Monitor,
+        retry: RetryConfig,
+        leaf_hard_cap_bytes: usize,
+    ) -> Self {
         Locker {
             coord,
             dir,
             tmon,
             retry,
+            leaf_hard_cap_bytes,
             tlocks: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
             calls: Arc::new(AtomicU64::new(0)),
         }
@@ -809,6 +994,7 @@ impl Locker {
         let resolver = Arc::new(AcquireResolver {
             id: id.clone(),
             intents: intents.clone(),
+            leaf_hard_cap_bytes: self.leaf_hard_cap_bytes,
         });
         match self
             .coord
@@ -993,7 +1179,13 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
         );
-        let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
+            mon.clone(),
+            RetryConfig::default(),
+            usize::MAX,
+        );
         (
             locker,
             TlCtx {
@@ -1370,7 +1562,13 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             ctx.shards
-                .store_leaf(&path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &new_shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -1499,16 +1697,24 @@ mod tests {
 
     // Two concurrent writers on *disjoint* keys of the same shard do not conflict,
     // so they batch into one CAS round rather than each doing its own load+store.
+    // The keys are seeded so the writes are overwrites: a create would take the
+    // exclusive membership-W lock and serialize instead (ADR-032), which
+    // `disjoint_creates_serialize_on_membership_write` covers.
     #[tokio::test(start_paused = true)]
     async fn concurrent_disjoint_writers_share_one_cas() {
-        let (locker, ctx, log, gate) = gated_locker();
+        let (locker, ctx, log, gate) = gated_locker_with(false);
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
+        seed_committed(&ctx, &ka, b"v0").await;
+        seed_committed(&ctx, &kb, b"v0").await;
         let tx1 = mk_tid(1, "w1");
         let tx2 = mk_tid(2, "w2");
         ctx.monitor.begin_tx(&tx1);
         ctx.monitor.begin_tx(&tx2);
 
+        let shard_path = paths::collection_info(COLL);
+        let before = count_stores(&log, &shard_path);
+        gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let g1 = group_of(&ka, put_intent(&ka));
@@ -1522,14 +1728,50 @@ mod tests {
         assert!(matches!(h1.await.unwrap().unwrap(), ShardsOutcome::Locked));
         assert!(matches!(h2.await.unwrap().unwrap(), ShardsOutcome::Locked));
 
-        let shard_path = paths::collection_info(COLL);
         assert_eq!(
-            count_stores(&log, &shard_path),
+            count_stores(&log, &shard_path) - before,
             1,
             "disjoint writers batch into one CAS"
         );
         assert_eq!(entry_of(&ctx, &ka).await.unwrap().locked_by, vec![tx1]);
         assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![tx2]);
+    }
+
+    // Two concurrent *creates* of disjoint keys in one leaf both take the leaf's
+    // exclusive membership-W lock, so they serialize (ADR-032): the older holds
+    // it and the younger waits, proceeding only once the older finalizes.
+    #[tokio::test(start_paused = true)]
+    async fn disjoint_creates_serialize_on_membership_write() {
+        let (locker, ctx) = init_tl_test();
+        let ka = b"key-a".to_vec();
+        let kb = same_shard_sibling(&ka);
+        let old = mk_tid(1, "old");
+        let young = mk_tid(2, "young");
+        ctx.monitor.begin_tx(&old);
+        ctx.monitor.begin_tx(&young);
+
+        // The older create takes membership-W on the leaf.
+        lock_ok(&locker, &old, &group_of(&ka, put_intent(&ka))).await;
+
+        // The younger create of a *different* key must still wait: membership-W
+        // is exclusive per leaf, so disjoint creates do not batch.
+        let (l2, y2) = (locker.clone(), young.clone());
+        let g2 = group_of(&kb, put_intent(&kb));
+        let waiting = tokio::spawn(async move { l2.lock_shards(&y2, &g2, false).await });
+        rt::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a disjoint create must wait on the leaf membership-W holder"
+        );
+
+        // Finalizing the older create releases the membership-W; the younger then
+        // takes it and its own create lands.
+        ctx.monitor.abort_tx(&old).await.unwrap();
+        assert!(matches!(
+            waiting.await.unwrap().unwrap(),
+            ShardsOutcome::Locked
+        ));
+        assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![young]);
     }
 
     // Locks + commits `key` for `tx`, leaving the shard entry holding the write
@@ -1638,6 +1880,11 @@ mod tests {
         let kb = same_shard_sibling(&ka);
         let shard_path = paths::collection_info(COLL);
 
+        // Seed both keys so the locks are overwrites (Write), not creates: two
+        // concurrent creates would serialize on the leaf membership-W lock
+        // (ADR-032), which this test is not about.
+        seed_committed(&ctx, &ka, b"v0").await;
+        seed_committed(&ctx, &kb, b"v0").await;
         let tx1 = mk_tid(1, "r1");
         let tx2 = mk_tid(2, "r2");
         ctx.monitor.begin_tx(&tx1);
@@ -1661,16 +1908,15 @@ mod tests {
             1,
             "two releases on one shard share a single CAS"
         );
-        // Both released fresh-key entries are now vestigial (no holder, no
-        // committed writer), so the fold pruned them in the shared CAS (ADR-029).
-        assert!(
-            entry_of(&ctx, &ka).await.is_none(),
-            "vestigial entry pruned on release"
-        );
-        assert!(
-            entry_of(&ctx, &kb).await.is_none(),
-            "vestigial entry pruned on release"
-        );
+        // The keys were seeded with a committed pointer, so releasing the write
+        // locks leaves each entry non-vestigial (it still names its committed
+        // writer): the hold is dropped but the entry stays.
+        let ea = entry_of(&ctx, &ka).await.unwrap();
+        assert!(ea.locked_by.is_empty(), "release drops the hold");
+        assert!(ea.current_writer.is_some(), "committed pointer preserved");
+        let eb = entry_of(&ctx, &kb).await.unwrap();
+        assert!(eb.locked_by.is_empty(), "release drops the hold");
+        assert!(eb.current_writer.is_some(), "committed pointer preserved");
     }
 
     // ADR-028: two writers on the *same* key now share one CAS round. The

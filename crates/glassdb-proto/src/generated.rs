@@ -165,6 +165,23 @@ pub struct Node {
     /// none: the rightmost node at its level.
     #[prost(string, tag = "2")]
     pub right_sibling: ::prost::alloc::string::String,
+    /// The node-level structure lock (ADR-032): guards the node's shape (entry
+    /// set as a physical unit, high-key, right-sibling, child pointers). Held
+    /// read by every data mutation and escalated scan, write by a split/merge.
+    /// Absent means unlocked.
+    #[prost(message, optional, tag = "5")]
+    pub structure_lock: ::core::option::Option<NodeLock>,
+    /// The node-level membership lock (ADR-032): guards a leaf's live key set
+    /// (the predicate/gap). Held read by an escalated scan, write by create and
+    /// delete. Absent means unlocked; meaningful only on leaves.
+    #[prost(message, optional, tag = "6")]
+    pub membership_lock: ::core::option::Option<NodeLock>,
+    /// The leaf's membership version (ADR-032): a monotonic counter bumped only
+    /// by membership-write activity (create/delete lock install, release, or
+    /// write-back), the OCC fast-path token for scans. Never bumped by scanner
+    /// read locks or by splits.
+    #[prost(uint64, tag = "7")]
+    pub membership_version: u64,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }
@@ -179,6 +196,54 @@ pub mod node {
         #[prost(message, tag = "4")]
         Index(super::IndexNode),
     }
+}
+/// A node-level read/write lock (ADR-032): the structure or membership lock that
+/// lives beside the per-key entry locks in a node object. Read locks share
+/// (multiple holders); a write lock is exclusive (a single holder).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodeLock {
+    /// The strength of the lock; NONE means unlocked.
+    #[prost(enumeration = "lock::LockType", tag = "1")]
+    pub lock_type: i32,
+    /// Transactions holding the lock (more than one only for a read lock);
+    /// sorted so the encoding is canonical.
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub holders: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
+/// A structural-log record (ADR-032): the write-ahead note a split writes
+/// before creating any node object, so crash recovery can resolve an
+/// in-progress split from *structural* state (tree-reachability of the created
+/// nodes) rather than transaction status. Lives at `{db}/_s/<record_id>` and is
+/// deleted once the split's parent separator is published (or the orphan
+/// aborted). Replaces ADR-031's `_g/` split-active registry.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StructuralLog {
+    /// The collection prefix the split runs in (e.g. `db/coll`), so recovery can
+    /// descend the right tree from a single global record listing.
+    #[prost(string, tag = "1")]
+    pub prefix: ::prost::alloc::string::String,
+    /// The source node token (`_n/<token>`) the split shrinks. Empty when the
+    /// source is the collection root `_i` (an in-place root split).
+    #[prost(string, tag = "2")]
+    pub source_token: ::prost::alloc::string::String,
+    /// The source object's CAS version at the time the record was written — the
+    /// version the shrink CAS is guarded by.
+    #[prost(string, tag = "3")]
+    pub source_version: ::prost::alloc::string::String,
+    /// The freshly created node token(s): one right sibling for a leaf/interior
+    /// split, the two children for an in-place root split.
+    #[prost(string, repeated, tag = "4")]
+    pub created_tokens: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The split key (the separator to publish into the parent). Empty for a
+    /// root split, which is referenced through `_i`'s index entries, not a
+    /// right-link separator.
+    #[prost(bytes = "vec", tag = "5")]
+    pub split_key: ::prost::alloc::vec::Vec<u8>,
+    /// Set when the source is the collection root `_i`: recovery tests root-split
+    /// completion by whether `_i` became an index over the children, not by a
+    /// right-link walk.
+    #[prost(bool, tag = "6")]
+    pub is_root: bool,
 }
 /// An index node body: an ordered list of separator entries. The child owning a
 /// key is the last entry whose separator_key is <= the key.

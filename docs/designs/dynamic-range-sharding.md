@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed.** This is the design overview and decision index for replacing the
+**Accepted.** This is the design overview and decision index for replacing the
 fixed compile-time hash sharding of collection metadata with a **dynamic,
 order-preserving, range-partitioned** coordination directory. The umbrella
 decision is [ADR-031](../adr/031-dynamic-range-sharding.md). This document is the
@@ -62,10 +62,17 @@ CAS. Leaves are the shards; interior nodes are the range index.
   A split takes the node **structure write lock** for priority and mutual
   exclusion (wound-wait) but keeps ADR-031's **shrink-CAS linearization** and
   right-link tolerance — it is coordinated, not atomically committed across its
-  objects ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). It holds
-  **one node's structure-W at a time**, releasing it right after the shrink CAS;
-  the parent separator is a separately-locked follow-on, so there is no lock chain
-  and no cross-level deadlock. Non-root index splits recurse upward the same way.
+  objects ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). A
+  **leaf** split acquires that structure-W through the **shard-mutation
+  coordinator** (ADR-028), folding the acquire into the same CAS round as the
+  leaf's concurrent structure-read acquirers so wound-wait resolves in one fold —
+  the split is a coordinator participant, not a competitor racing a separate CAS.
+  An interior-index or root node (which the coordinator does not load as a leaf)
+  acquires with a direct structure-write CAS; only concurrent splits contend
+  there. It holds **one node's structure-W at a time**, releasing it right after
+  the shrink CAS; the parent separator is a separately-locked follow-on, so there
+  is no lock chain and no cross-level deadlock. Non-root index splits recurse
+  upward the same way.
 - **Merge (shrink)** — deferred; the node format reserves sibling links and range
   bounds so it is addable without a format migration.
 - **Node locks** — two read/write locks per node beside the per-key entry locks:
@@ -213,7 +220,7 @@ ADR — this overview and the diagrams above are the map into it.
   supersedes/reuses. Its per-leaf read-lock escalation is superseded by ADR-032;
   its lock-free split is refined (structure lock + priority) by ADR-032.
 - **[ADR-032](../adr/032-node-locking-and-coordinated-splits.md) — Node-level
-  locking and coordinated splits.** *Proposed.* The node structure/membership
+  locking and coordinated splits.** *Accepted.* The node structure/membership
   read/write lock taxonomy (create/delete take the membership write lock),
   splits coordinated by the structure write lock and wound-wait priority (keeping
   ADR-031's shrink-CAS linearization), the membership version as OCC fast-path

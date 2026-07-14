@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Clock, RetryConfig};
+use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
     Directory, ObjectCache, ShardStore, SharedCache, SplitPolicy, TLogger, ValueCache,
@@ -24,6 +24,11 @@ use crate::version::check_or_create_db_meta;
 
 /// Default cache size: 512 MiB, a reasonable middle ground for production.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
+
+/// Backoff between retries of a transaction that hit the hard object-size cap
+/// (ADR-032 `LeafFull`): one background-split cadence, so the retry waits for
+/// the split to relieve the leaf instead of hot-spinning.
+const LEAF_FULL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Fixed wall-clock anchor used when `deterministic_time` is set: 2023-11-14
 /// 22:13:20 UTC. The exact value is irrelevant; it only needs to be constant so
@@ -135,18 +140,28 @@ impl DatabaseBuilder {
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        // Build the splitter first so the coordinator can report over-cap leaf
-        // writes into its queue through the SplitHinter seam (ADR-031); the
-        // coordinator never names the splitter or its candidate feed.
-        let splitter = Splitter::with_policy(bg_weak.clone(), shards.clone(), split_policy);
-        let coord = ShardCoordinator::with_hinter(
+        // Build the coordinator and splitter as a co-wired pair over one shared
+        // candidate feed (ADR-031/032): the coordinator reports over-cap leaf
+        // writes into the feed, and the splitter acquires a leaf split's
+        // structure-write through the coordinator so it folds into the same CAS
+        // round as concurrent mutations rather than racing them. The feed is
+        // owned by neither, so there is no circular initialization to close.
+        let (coord, splitter) = Splitter::with_coordinator(
+            bg_weak.clone(),
             shards.clone(),
-            resolver.clone(),
+            tmon.clone(),
+            clock.clone(),
+            retry,
+            &name,
+            split_policy,
+        );
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
             tmon.clone(),
             retry,
-            splitter.hinter(),
+            split_policy.leaf_hard_cap_bytes,
         );
-        let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
         let gc = Gc::new(
             bg_weak.clone(),
             tl,
@@ -154,7 +169,6 @@ impl DatabaseBuilder {
             locker.clone(),
             tmon.clone(),
             clock.clone(),
-            &name,
         );
         gc.start();
         splitter.start();
@@ -508,6 +522,16 @@ impl DbInner {
                     continue;
                 }
                 Err(TransError::Retry) => {
+                    tx.reset();
+                    stats.tx_retries += 1;
+                    continue;
+                }
+                Err(TransError::LeafFull) => {
+                    // A create hit the hard object-size cap (ADR-032): the leaf
+                    // must split before the key fits. Back off one split cadence
+                    // so the retry does not hot-spin while the background split
+                    // relieves the leaf, then re-run.
+                    rt::sleep(LEAF_FULL_RETRY_BACKOFF).await;
                     tx.reset();
                     stats.tx_retries += 1;
                     continue;

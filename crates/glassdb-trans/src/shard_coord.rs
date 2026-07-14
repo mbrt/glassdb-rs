@@ -35,7 +35,9 @@ use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
 };
 use glassdb_data::TxId;
-use glassdb_storage::{Freshness, LockType, Shard, ShardEntry, ShardStore, StorageError};
+use glassdb_storage::{
+    Freshness, LockType, NodeLocks, Shard, ShardEntry, ShardStore, StorageError,
+};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -109,13 +111,17 @@ type OutcomeSlot = Arc<Mutex<Option<FoldOutcome>>>;
 /// entry changes (threaded to the next resolver) alongside its member outcome,
 /// or stage nothing and just return an outcome (e.g. it must wait).
 pub(crate) enum Step {
-    /// Apply these entry changes to the running staged map; on a confirmed CAS
-    /// deliver `outcome` to the member.
+    /// Apply these entry changes to the running staged map and replace the
+    /// running node-level lock state with `locks` (ADR-032); on a confirmed CAS
+    /// deliver `outcome` to the member. A resolver that touches only the
+    /// per-key entries returns the node locks it observed unchanged.
     Stage {
         entries: Vec<(Vec<u8>, ShardEntry)>,
+        locks: NodeLocks,
         outcome: FoldOutcome,
     },
-    /// Stage nothing; deliver `outcome` to the member regardless of the CAS.
+    /// Stage nothing (neither entries nor node locks); deliver `outcome` to the
+    /// member regardless of the CAS.
     Skip { outcome: FoldOutcome },
 }
 
@@ -135,13 +141,17 @@ pub(crate) struct ResolveCtx<'a> {
 /// ([`Locker`](crate::Locker) and [`Algo`](crate::Algo)), not in the engine.
 #[async_trait]
 pub(crate) trait ShardResolver: Send + Sync {
-    /// Resolves this member against the entries **as currently staged this
-    /// round** (it observes the changes staged by earlier resolvers). Returns
-    /// the changes to stage plus this member's outcome, or stages nothing.
+    /// Resolves this member against the entries and node-level locks **as
+    /// currently staged this round** (it observes the changes staged by earlier
+    /// resolvers). Returns the changes to stage plus this member's outcome, or
+    /// stages nothing. `staged_locks` carries the node's structure/membership
+    /// locks and membership version (ADR-032), which a mutation, scan, or split
+    /// installs into or releases from in the same CAS as the entries.
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError>;
 
     /// Whether this member may join any in-flight round instead of FIFO-blocking
@@ -332,6 +342,11 @@ impl CasWorker {
                 .cloned()
                 .map(|e| (e.key.clone(), e))
                 .collect();
+            // The node-level locks (ADR-032) are threaded alongside the entries:
+            // each staging resolver observes the running state and returns its
+            // updated version, so structure/membership holds and the membership
+            // version are installed or released in the same CAS as the entries.
+            let mut locks: NodeLocks = loaded.locks.clone();
 
             // Fold every member's resolver over the shared entry set, threading
             // the staged changes: resolver N observes the entries as staged by
@@ -357,14 +372,16 @@ impl CasWorker {
                     results.push((tx.clone(), m.resolver.exhausted_outcome()));
                     continue;
                 }
-                match m.resolver.resolve(&ctx, &entries).await? {
+                match m.resolver.resolve(&ctx, &entries, &locks).await? {
                     Step::Stage {
                         entries: changes,
+                        locks: new_locks,
                         outcome,
                     } => {
                         for (k, e) in changes {
                             entries.insert(k, e);
                         }
+                        locks = new_locks;
                         staged = true;
                         results.push((tx.clone(), outcome));
                     }
@@ -385,7 +402,13 @@ impl CasWorker {
                 match self
                     .core
                     .shards
-                    .store_leaf(path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                    .store_leaf(
+                        path,
+                        &new_shard,
+                        &locks,
+                        loaded.kind(),
+                        loaded.version.as_ref(),
+                    )
                     .await
                 {
                     // Hint the background splitter if this write left the leaf
@@ -649,7 +672,13 @@ mod tests {
         let shard = Shard::from_entries(entries);
         assert!(
             store
-                .store_leaf(path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref()
+                )
                 .await
                 .unwrap()
         );
@@ -694,6 +723,7 @@ mod tests {
             &self,
             _ctx: &ResolveCtx<'_>,
             staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let mut e = staged
                 .get(&self.key)
@@ -703,6 +733,7 @@ mod tests {
             e.locked_by = vec![self.tx.clone()];
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
+                locks: staged_locks.clone(),
                 outcome: FoldOutcome::Locked(LockType::Write),
             })
         }
@@ -729,6 +760,7 @@ mod tests {
             &self,
             _ctx: &ResolveCtx<'_>,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             Ok(Step::Skip {
                 outcome: FoldOutcome::Released {
@@ -765,6 +797,7 @@ mod tests {
             &self,
             _ctx: &ResolveCtx<'_>,
             staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             self.trace
                 .lock()
@@ -775,6 +808,7 @@ mod tests {
                     self.key.clone(),
                     entry(&self.key, LockType::None, None, Some(&self.tx)),
                 )],
+                locks: staged_locks.clone(),
                 outcome: FoldOutcome::Landed,
             })
         }
@@ -876,8 +910,7 @@ mod tests {
             None,
             None,
         )]));
-        node.set_high_key(Some(b"m".to_vec()));
-        node.set_right_sibling(Some("R".to_string()));
+        node.set_bounds(Some(b"m".to_vec()), Some("R".to_string()));
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
 
         let tx = TxId::with_priority(1, b"t");
@@ -916,7 +949,7 @@ mod tests {
         let (coord, store, _bg) = coord_over(backend.clone());
 
         let mut node = Node::leaf(Shard::new());
-        node.set_high_key(Some(b"m".to_vec()));
+        node.set_bounds(Some(b"m".to_vec()), None);
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
 
         let tx = TxId::with_priority(1, b"t");
@@ -1188,6 +1221,7 @@ mod tests {
             &self,
             ctx: &ResolveCtx<'_>,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             if self.folds.fetch_add(1, Ordering::SeqCst) < 2 {
                 return Ok(Step::Stage {
@@ -1195,6 +1229,7 @@ mod tests {
                         self.key.clone(),
                         entry(&self.key, LockType::Write, Some(&self.tx), None),
                     )],
+                    locks: staged_locks.clone(),
                     outcome: FoldOutcome::Landed,
                 });
             }

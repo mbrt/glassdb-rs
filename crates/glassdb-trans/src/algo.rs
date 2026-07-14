@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Freshness, LockType, PathLock, ShardEntry, StorageError, TxCommitStatus, TxLog, TxWrite,
-    ValueCache, Version,
+    Freshness, LockType, NodeLocks, PathLock, ShardEntry, StorageError, TxCommitStatus, TxLog,
+    TxWrite, ValueCache, Version,
 };
 
 use crate::error::TransError;
@@ -42,7 +42,7 @@ use crate::resolver::{HolderResolution, Resolver};
 use crate::shard_coord::{
     FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, Step,
 };
-use crate::tlocker::{LockOutcome, LockedTx, Locker};
+use crate::tlocker::{LockOutcome, LockedTx, Locker, hold_structure_read};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
 /// the serial sorted-locking fallback (ADR-020). The parallel path is fast but
@@ -122,27 +122,35 @@ impl WriteAccess {
     }
 }
 
-/// A range/sorted listing performed within a transaction (ADR-031 phantom
-/// prevention). It records the object version of every leaf the scan covered;
-/// commit re-scans the same range and confirms the covered leaves and their
-/// versions are unchanged, so no create/delete — which bumps its leaf's version
-/// — raced the scan. Following the leaf right-sibling chain during the scan
-/// makes a concurrent split visible as a changed cover (one retry), never a
-/// lost or duplicated key.
+/// A range/sorted listing performed within a transaction (ADR-032 phantom
+/// prevention). It records each covered leaf's **membership version** and the
+/// membership-W holders it observed pending; commit re-scans the same range and
+/// validates the (a)+(b) condition (ADR-032): the covered leaf set and every
+/// leaf's membership version are unchanged, and every pending membership-W
+/// holder seen is still non-committed. A create/delete bumps its leaf's
+/// membership version (catching activity begun after the scan) while an
+/// overwrite does not (so value writes never disturb a listing); a split changes
+/// the covered leaf set. Following the leaf right-sibling chain during the scan
+/// keeps a concurrent split visible as a changed cover, never a lost or
+/// duplicated key.
 #[derive(Debug, Clone)]
 pub struct ScanAccess {
     /// Collection prefix the scan ranged over.
     pub prefix: Arc<str>,
-    /// The leaves the scan covered, in key order, each with the object version
-    /// observed at scan time (`None` for an uncreated collection root).
+    /// The leaves the scan covered, in key order, each with the membership
+    /// version and pending membership-W holders observed at scan time.
     pub covered: Vec<LeafCoverage>,
 }
 
-/// One leaf a scan covered: its object path and the version seen at scan time.
+/// One leaf a scan covered (ADR-032): its object path, the membership version
+/// seen at scan time (OCC condition (a)), and the membership-W holders observed
+/// pending in it (OCC condition (b) — a create/delete pending at scan time whose
+/// later commit would not re-bump the version).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafCoverage {
     pub path: Arc<str>,
-    pub version: Option<glassdb_backend::Version>,
+    pub membership_version: u64,
+    pub pending_membership: Vec<TxId>,
 }
 
 /// The reads, writes, and range scans that make up a transaction.
@@ -233,6 +241,7 @@ impl ShardResolver for CommitInstallResolver {
         &self,
         ctx: &ResolveCtx<'_>,
         staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let cur = staged.get(&self.raw_key);
 
@@ -287,8 +296,23 @@ impl ShardResolver for CommitInstallResolver {
         e.locked_by = vec![self.id.clone()];
         e.current_writer = Some(effective);
         e.deleted = false;
+        // The fast path is an overwrite of an existing key: it holds the node
+        // structure-read lock (folded into this same CAS) but no membership lock
+        // (ADR-032). A conflicting split holding structure-write is reconciled by
+        // wound-wait; if it cannot be wounded, treat the install as lost and
+        // renew — the split releases structure-write right after its shrink CAS.
+        let mut locks = staged_locks.clone();
+        if hold_structure_read(ctx.tmon, &self.id, &mut locks)
+            .await?
+            .is_some()
+        {
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Moved,
+            });
+        }
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
+            locks,
             // The lock is installed only once the round's CAS confirms it; on a
             // precondition/in-doubt the engine re-folds and re-classifies.
             outcome: FoldOutcome::Landed,
@@ -973,19 +997,42 @@ impl Algo {
         Ok(true)
     }
 
-    /// Re-scans every range the transaction listed and reports whether each
-    /// still covers exactly the same leaves at the same object versions
-    /// (ADR-031). A create/delete in the range bumps its leaf's version and a
-    /// split changes the covered leaf set, so either makes the re-scan differ —
-    /// which fails validation and re-runs the listing over the fresh topology,
-    /// preventing phantom appearances/disappearances. Following the right-link
-    /// chain (via [`Resolver::live_keys_scan`]) keeps the re-scan consistent
-    /// with an in-progress split rather than erroring on it.
+    /// Re-scans every range the transaction listed and validates the ADR-032
+    /// (a)+(b) OCC condition per covered leaf. A scan is still valid iff the
+    /// covered leaf set is unchanged (a split would change it) and, for each
+    /// leaf, **(a)** its membership version is unchanged since the scan _and_
+    /// **(b)** every membership-W holder the scan saw pending is still
+    /// non-committed. A create/delete begun after the scan bumps the version
+    /// (caught by (a)); one already pending at scan time whose commit does not
+    /// re-bump the version is caught by (b). An overwrite changes neither, so a
+    /// value write never fails a listing. Following the right-link chain (via
+    /// [`Resolver::live_keys_scan`]) keeps the re-scan consistent with an
+    /// in-progress split rather than erroring on it.
     async fn validate_scans_inner(&self, data: &Data) -> Result<bool, TransError> {
         for scan in &data.scans {
             let current = self.resolver.live_keys_scan(&scan.prefix).await?.covered;
-            if current != scan.covered {
+            // Covered leaf set + membership versions (split detection and
+            // condition (a)): same leaves in the same order at the same
+            // membership versions.
+            if current.len() != scan.covered.len() {
                 return Ok(false);
+            }
+            for (recorded, now) in scan.covered.iter().zip(&current) {
+                if recorded.path != now.path
+                    || recorded.membership_version != now.membership_version
+                {
+                    return Ok(false);
+                }
+            }
+            // Condition (b): a membership-W holder pending at scan time that has
+            // since committed changed the live set without re-bumping the
+            // version (a commit flips only the transaction object).
+            for recorded in &scan.covered {
+                for holder in &recorded.pending_membership {
+                    if self.mon.tx_status(holder).await? == TxCommitStatus::Ok {
+                        return Ok(false);
+                    }
+                }
             }
         }
         Ok(true)
@@ -1101,7 +1148,13 @@ mod tests {
             tmon.clone(),
             RetryConfig::default(),
         );
-        let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
+            tmon.clone(),
+            RetryConfig::default(),
+            usize::MAX,
+        );
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
@@ -1109,7 +1162,6 @@ mod tests {
             locker.clone(),
             tmon.clone(),
             Clock::real(),
-            TEST_COLL,
         );
 
         // Create the collection root so the test collection exists up front.
@@ -2042,6 +2094,7 @@ mod tests {
                 .store_leaf(
                     &leaf_path,
                     &windowed,
+                    &loaded.locks,
                     loaded.kind(),
                     loaded.version.as_ref()
                 )
@@ -2410,7 +2463,13 @@ mod tests {
         let shard = Shard::from_entries(entries.into_values());
         assert!(
             tctx.shards
-                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref()
+                )
                 .await
                 .unwrap()
         );
@@ -2516,8 +2575,7 @@ mod tests {
                 current_writer: Some(TxId::with_priority(1, b"seed")),
                 deleted: false,
             })));
-            n.set_high_key(high.map(<[u8]>::to_vec));
-            n.set_right_sibling(right.map(str::to_string));
+            n.set_bounds(high.map(<[u8]>::to_vec), right.map(str::to_string));
             n
         };
         tctx.shards
@@ -2570,7 +2628,15 @@ mod tests {
             deleted: false,
         });
         let mut new_s1 = Node::leaf(Shard::from_entries(entries));
-        new_s1.set_high_key(None);
+        new_s1.set_bounds(None, None);
+        // A real create bumps the leaf's membership version (ADR-032); this
+        // hand-built append simulates that (install + write-back of a create's
+        // membership-write) so the scan's OCC condition (a) fires.
+        let boundary = TxId::with_priority(2, b"boundary");
+        let mut locks = new_s1.locks().clone();
+        locks.acquire_membership_write(&boundary);
+        locks.release(&boundary);
+        new_s1.set_locks(locks);
         tctx.shards
             .store_node(TEST_COLL, "S1", &new_s1, Some(&ver))
             .await
@@ -2599,8 +2665,7 @@ mod tests {
             .partition(|e| e.key.as_slice() < b"m".as_slice());
 
         let mut s0 = Node::leaf(Shard::from_entries(lower));
-        s0.set_high_key(Some(b"m".to_vec()));
-        s0.set_right_sibling(Some("S1".to_string()));
+        s0.set_bounds(Some(b"m".to_vec()), Some("S1".to_string()));
         tctx.shards
             .store_node(TEST_COLL, "S0", &s0, None)
             .await

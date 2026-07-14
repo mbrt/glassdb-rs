@@ -28,6 +28,13 @@ pub enum TransError {
     /// Internal: locking timed out (suspected deadlock).
     #[error("lock timeout")]
     LockTimeout,
+    /// A create would push its leaf past the hard object-size cap
+    /// (`backend_limit − H`, ADR-032). Retryable: the background split will
+    /// relieve the leaf, after which the create fits. The db retry loop re-runs
+    /// the transaction after a backoff, so an over-full leaf never wedges — it
+    /// only delays a create until the split lands.
+    #[error("leaf full, split pending")]
+    LeafFull,
     /// Internal: the single read-write fast path is not applicable.
     #[error("cannot validate transaction with multiple writes")]
     NoSingleWrite,

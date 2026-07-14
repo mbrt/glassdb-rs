@@ -476,8 +476,7 @@ mod tests {
 
     fn leaf(entries: &[&[u8]], high_key: Option<&[u8]>, right: Option<&str>) -> Node {
         let mut node = Node::leaf(Shard::from_entries(entries.iter().map(|k| live(k))));
-        node.set_high_key(high_key.map(<[u8]>::to_vec));
-        node.set_right_sibling(right.map(str::to_string));
+        node.set_bounds(high_key.map(<[u8]>::to_vec), right.map(str::to_string));
         node
     }
 

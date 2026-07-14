@@ -2,7 +2,15 @@
 
 ## Status
 
-Proposed
+Accepted.
+
+Refined by [ADR-032](032-node-locking-and-coordinated-splits.md), which layers a
+node-level structure/membership lock taxonomy onto the split (keeping the
+shrink-CAS linearization) and replaces this ADR's "escalate to per-leaf read
+locks" membership clause and its GC-reclaimed-orphan sweep with, respectively,
+the node-lock taxonomy and structural-log recovery. Full in-transaction range
+iteration is specified separately in
+[ADR-033](033-transactional-key-iteration.md) (deferred).
 
 Supersedes the fixed-hash key→shard mapping and fixed shard count of
 [ADR-016](016-object-storage-native-layout.md) (the "fixed `C` shards" clause),

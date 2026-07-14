@@ -193,7 +193,7 @@ fn entry_from_proto(e: pb::ShardEntry) -> ShardEntry {
     }
 }
 
-fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
+pub(crate) fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
     match t {
         LockType::None => pb::lock::LockType::None,
         LockType::Read => pb::lock::LockType::Read,
@@ -203,7 +203,7 @@ fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
     }
 }
 
-fn lock_type_from_proto(t: i32) -> LockType {
+pub(crate) fn lock_type_from_proto(t: i32) -> LockType {
     match pb::lock::LockType::try_from(t) {
         Ok(pb::lock::LockType::None) => LockType::None,
         Ok(pb::lock::LockType::Read) => LockType::Read,

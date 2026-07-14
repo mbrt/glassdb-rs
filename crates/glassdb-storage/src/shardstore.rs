@@ -17,10 +17,12 @@ use glassdb_backend as backend;
 use glassdb_data::paths;
 
 use crate::error::StorageError;
+use crate::lock::NodeLocks;
 use crate::node::Node;
 use crate::object_cache::{Freshness, ObjectCache};
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
+use crate::structlog::StructuralLog;
 
 /// Reads and compare-and-swaps B-link node and collection-root objects through
 /// the [`ObjectCache`], the v2 coordination substrate.
@@ -37,6 +39,10 @@ pub struct ShardStore {
 /// or in a standalone node `_n`.
 pub struct LoadedLeaf {
     pub entries: Shard,
+    /// The leaf's node-level lock state (ADR-032), threaded through the round so
+    /// a mutation, scan, or split installs or releases its node-level holds in
+    /// the same CAS as the entries.
+    pub locks: NodeLocks,
     pub version: Option<backend::Version>,
     kind: LeafKind,
 }
@@ -167,30 +173,65 @@ impl ShardStore {
         }
     }
 
-    /// Durably records that the collection at `prefix` has split activity, so
-    /// the GC orphan sweep enumerates it even after a process restart (ADR-031).
-    /// Idempotent: an existing marker is left as is.
-    pub async fn mark_split_active(&self, prefix: &str) -> Result<(), StorageError> {
-        let marker = paths::split_active_marker(prefix);
-        match self
-            .objects
-            .write_if_not_exists(&marker, Arc::from(&[][..]))
-            .await
-        {
+    /// Durably writes a split's write-ahead structural-log record under
+    /// `{db}/_s/<record_id>` before any node object is created (ADR-032), so a
+    /// crash mid-split leaves a discoverable note recovery resolves by
+    /// tree-reachability. Create-if-absent: `record_id` is a fresh random token,
+    /// so a `Precondition` (already present) means a retry of the same split and
+    /// is idempotently treated as success.
+    pub async fn write_structural_log(
+        &self,
+        record_id: &str,
+        record: &StructuralLog,
+    ) -> Result<(), StorageError> {
+        let path = paths::structural_log_record(paths::db_root_of(&record.prefix), record_id);
+        let body: Arc<[u8]> = Arc::from(record.encode());
+        match self.objects.write_if_not_exists(&path, body).await {
             Ok(_) | Err(StorageError::Precondition) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    /// Lists the collection prefixes recorded in the database's split-active
-    /// registry (ADR-031). `db_root` is the database name (the leading segment
-    /// of any collection prefix).
-    pub async fn list_split_active(&self, db_root: &str) -> Result<Vec<String>, StorageError> {
-        let paths = self.objects.list(&paths::split_active_dir(db_root)).await?;
-        Ok(paths
-            .iter()
-            .filter_map(|p| paths::split_active_prefix_of(p).ok())
-            .collect())
+    /// Lists every in-progress split's structural-log record in the database,
+    /// each paired with its record id (ADR-032). `db_root` is the database name
+    /// (the leading segment of any collection prefix). Recovery reads these to
+    /// resolve crash-interrupted splits across all collections.
+    pub async fn list_structural_logs(
+        &self,
+        db_root: &str,
+    ) -> Result<Vec<(String, StructuralLog)>, StorageError> {
+        let paths = self
+            .objects
+            .list(&paths::structural_log_dir(db_root))
+            .await?;
+        let mut out = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let Ok(id) = paths::structural_log_id_of(path) else {
+                continue;
+            };
+            match self.objects.read(path, Freshness::Latest).await {
+                Ok(r) => out.push((id, StructuralLog::decode(&r.value)?)),
+                // Concurrently finalized between the list and the read: skip it.
+                Err(StorageError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes a finalized structural-log record, ignoring a missing object
+    /// (ADR-032). Called once a split's parent separator is published, or once
+    /// recovery has aborted an orphaned split.
+    pub async fn delete_structural_log(
+        &self,
+        db_root: &str,
+        record_id: &str,
+    ) -> Result<(), StorageError> {
+        let path = paths::structural_log_record(db_root, record_id);
+        match self.objects.delete(&path).await {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
@@ -208,18 +249,22 @@ impl ShardStore {
             match self.objects.read(path, freshness).await {
                 Ok(r) => {
                     let root = CollectionRoot::decode(&r.value)?;
-                    let entries =
-                        root.node().as_leaf().cloned().ok_or_else(|| {
-                            StorageError::other("collection root node is not a leaf")
-                        })?;
+                    let node = root.node();
+                    let entries = node
+                        .as_leaf()
+                        .cloned()
+                        .ok_or_else(|| StorageError::other("collection root node is not a leaf"))?;
+                    let locks = node.locks().clone();
                     Ok(LoadedLeaf {
                         entries,
+                        locks,
                         version: Some(r.version),
                         kind: LeafKind::Root(root),
                     })
                 }
                 Err(StorageError::NotFound) => Ok(LoadedLeaf {
                     entries: Shard::new(),
+                    locks: NodeLocks::default(),
                     version: None,
                     kind: LeafKind::Root(CollectionRoot::new()),
                 }),
@@ -234,6 +279,7 @@ impl ShardStore {
                         .cloned()
                         .ok_or_else(|| StorageError::other("node is not a leaf"))?;
                     Ok(LoadedLeaf {
+                        locks: node.locks().clone(),
                         entries,
                         version: Some(r.version),
                         kind: LeafKind::Node {
@@ -244,6 +290,7 @@ impl ShardStore {
                 }
                 Err(StorageError::NotFound) => Ok(LoadedLeaf {
                     entries: Shard::new(),
+                    locks: NodeLocks::default(),
                     version: None,
                     kind: LeafKind::Node {
                         high_key: None,
@@ -255,21 +302,25 @@ impl ShardStore {
         }
     }
 
-    /// Compare-and-swaps the leaf at object `path`, writing `entries` back into
-    /// the object kind captured by `kind` (root metadata or node bounds are
-    /// preserved). `expected = None` means create-if-absent. Returns `false` on
-    /// a precondition miss (reload and retry), `true` on success.
+    /// Compare-and-swaps the leaf at object `path`, writing `entries` and the
+    /// node-level `locks` (ADR-032) back into the object kind captured by `kind`
+    /// (root metadata or node bounds are preserved). `expected = None` means
+    /// create-if-absent. Returns `false` on a precondition miss (reload and
+    /// retry), `true` on success.
     pub async fn store_leaf(
         &self,
         path: &str,
         entries: &Shard,
+        locks: &NodeLocks,
         kind: &LeafKind,
         expected: Option<&backend::Version>,
     ) -> Result<bool, StorageError> {
         let body: Arc<[u8]> = match kind {
             LeafKind::Root(root) => {
                 let mut root = root.clone();
-                root.set_node(Node::leaf(entries.clone()));
+                let mut node = Node::leaf(entries.clone());
+                node.set_locks(locks.clone());
+                root.set_node(node);
                 Arc::from(root.encode())
             }
             LeafKind::Node {
@@ -277,8 +328,8 @@ impl ShardStore {
                 right_sibling,
             } => {
                 let mut node = Node::leaf(entries.clone());
-                node.set_high_key(high_key.clone());
-                node.set_right_sibling(right_sibling.clone());
+                node.set_bounds(high_key.clone(), right_sibling.clone());
+                node.set_locks(locks.clone());
                 Arc::from(node.encode())
             }
         };
@@ -399,7 +450,7 @@ mod tests {
         };
         assert!(
             store_over(backend.clone())
-                .store_leaf(path, &Shard::new(), &kind, None)
+                .store_leaf(path, &Shard::new(), &NodeLocks::default(), &kind, None)
                 .await
                 .unwrap()
         );
@@ -486,7 +537,13 @@ mod tests {
         let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
         assert!(
             store
-                .store_leaf(&path, &Shard::new(), loaded.kind(), None)
+                .store_leaf(
+                    &path,
+                    &Shard::new(),
+                    &NodeLocks::default(),
+                    loaded.kind(),
+                    None
+                )
                 .await
                 .unwrap()
         );
@@ -497,7 +554,13 @@ mod tests {
         // load reflects it.
         assert!(
             store
-                .store_leaf(&path, &Shard::new(), loaded.kind(), Some(&v1))
+                .store_leaf(
+                    &path,
+                    &Shard::new(),
+                    &NodeLocks::default(),
+                    loaded.kind(),
+                    Some(&v1),
+                )
                 .await
                 .unwrap()
         );

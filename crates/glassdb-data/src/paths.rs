@@ -188,37 +188,35 @@ pub fn nodes_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Node)
 }
 
-/// The database's split-active registry directory (`{db}/_g/`), where the
-/// database name is the leading path segment of a collection prefix. The GC
-/// orphan sweep lists it to rediscover, after a restart, which collections may
-/// hold crash-orphaned split siblings (ADR-031).
-pub fn split_active_dir(db_root: &str) -> String {
-    format!("{db_root}/_g/")
+/// The database's structural-log directory (`{db}/_s/`), where the database
+/// name is the leading path segment of a collection prefix. Recovery lists it
+/// to rediscover, after a restart, every in-progress split's write-ahead record
+/// across all collections (ADR-032). Replaces ADR-031's `_g/` registry.
+pub fn structural_log_dir(db_root: &str) -> String {
+    format!("{db_root}/_s/")
 }
 
-/// The split-active registry marker path for the collection at `prefix`
-/// (`{db}/_g/<base64(prefix)>`). Written durably before a split creates any
-/// node object, so an orphan sibling always has a discoverable marker.
-pub fn split_active_marker(prefix: &str) -> String {
-    format!(
-        "{}/_g/{}",
-        db_root_of(prefix),
-        base64::encode(prefix.as_bytes())
-    )
+/// The structural-log record path for `record_id` under `db_root`
+/// (`{db}/_s/<record_id>`). `record_id` is a freshly random, collision-free
+/// node token, so concurrent splits never share a record (ADR-032).
+pub fn structural_log_record(db_root: &str, record_id: &str) -> String {
+    format!("{db_root}/_s/{record_id}")
 }
 
-/// Decodes the collection prefix from a registry marker path, the inverse of
-/// [`split_active_marker`].
-pub fn split_active_prefix_of(path: &str) -> Result<String, PathError> {
-    let token = path.rsplit('/').next().unwrap_or_default();
-    let bytes = base64::decode(token)?;
-    String::from_utf8(bytes)
-        .map_err(|e| PathError::Parse(format!("registry marker is not valid utf8: {e}")))
+/// Decodes the record id from a structural-log record path, the inverse of
+/// [`structural_log_record`].
+pub fn structural_log_id_of(path: &str) -> Result<String, PathError> {
+    match path.rsplit('/').next() {
+        Some(id) if !id.is_empty() => Ok(id.to_string()),
+        _ => Err(PathError::Parse(format!(
+            "structural-log path has no record id: {path:?}"
+        ))),
+    }
 }
 
 /// The database name for a collection `prefix`: its leading path segment. A
 /// database name is validated alphanumeric, so it never contains a `/`.
-fn db_root_of(prefix: &str) -> &str {
+pub fn db_root_of(prefix: &str) -> &str {
     match prefix.find('/') {
         Some(i) => &prefix[..i],
         None => prefix,
@@ -431,22 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn split_active_marker_round_trip() {
-        // The marker for a top-level collection lives under the db's `_g/` dir,
-        // keyed by the (base64-encoded) full collection prefix.
-        let prefix = "db/_c/RqKoS6_iOrB";
-        let marker = split_active_marker(prefix);
-        assert!(marker.starts_with("db/_g/"));
-        assert_eq!(split_active_prefix_of(&marker).unwrap(), prefix);
-        assert_eq!(split_active_dir("db"), "db/_g/");
+    fn structural_log_record_round_trip() {
+        // A structural-log record lives under the db's `_s/` dir, keyed by the
+        // split's freshly random record id; the record id decodes back out.
+        let record_id = "RqKoS6_iOrB";
+        let path = structural_log_record("db", record_id);
+        assert_eq!(path, "db/_s/RqKoS6_iOrB");
+        assert!(path.starts_with(&structural_log_dir("db")));
+        assert_eq!(structural_log_id_of(&path).unwrap(), record_id);
+        assert_eq!(structural_log_dir("db"), "db/_s/");
 
-        // The db root is the leading path segment even for a nested prefix.
-        let nested = "db/_c/AAA/_c/BBB";
-        assert!(split_active_marker(nested).starts_with("db/_g/"));
-        assert_eq!(
-            split_active_prefix_of(&split_active_marker(nested)).unwrap(),
-            nested
-        );
+        // The db root of a (nested) collection prefix is its leading segment.
+        assert_eq!(db_root_of("db/_c/AAA/_c/BBB"), "db");
+        assert_eq!(db_root_of("db"), "db");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted.
 
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —
@@ -170,6 +170,17 @@ deadlock** — the vague "child-then-parent, reconciled with the sorted-order
 fallback" ordering is dropped. Concurrent locks a split *does* hold at once (e.g.
 during recovery, several created-node tokens) still follow the global
 sorted-by-path order of ADR-020.
+
+A **leaf** split's structure-W acquire (step 1) joins the **same CAS round** as
+the leaf's concurrent data mutations, through the shard-mutation coordinator
+([ADR-028](028-shard-mutation-coordinator.md)): the acquire is one more member
+folded over the shared leaf load, so it is arbitrated against the round's
+structure-R acquirers by the same monotonic wound-wait order — the split is a
+coordinator *participant*, not a competitor racing a separate CAS. This is what
+makes the anti-starvation argument concrete: there is no leaf CAS outside the
+coordinator for the split to lose to. A node the coordinator does not load as a
+leaf (an interior index, the root) has no data-mutation traffic to co-batch with
+— only other splits contend it — so it acquires structure-W with a direct CAS.
 
 **Non-root index splits** are the same three-step shape one level up: an over-full
 interior node is split under its own structure-W (steps 1–3), and its separator is
