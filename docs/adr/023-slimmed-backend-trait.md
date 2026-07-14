@@ -4,6 +4,11 @@
 
 Accepted
 
+The non-paginated, immediate-directory semantics of `list` are superseded by
+the opaque-cursor recursive-prefix contract in
+[ADR-035](035-paginated-listing-and-sharded-transaction-logs.md). The rest of
+the reduced trait is unchanged.
+
 > Naming note: the caches were later renamed for clarity — `Global` →
 > `ObjectCache` (backend-version-keyed) and `Local` → `ValueCache`
 > (writer-keyed), both now built from a shared LRU. The names below use the

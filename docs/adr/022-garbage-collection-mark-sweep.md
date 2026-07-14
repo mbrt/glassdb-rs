@@ -11,6 +11,10 @@ and vestigial-entry pruning becomes a fold property. The GC *policy* below —
 reverse mark-sweep, the safety horizon, abort-then-release-then-delete, and
 tombstone retention — is unchanged.
 
+[ADR-035](035-paginated-listing-and-sharded-transaction-logs.md) refines the
+flat `_t/` candidate walk into a paginated traversal over deterministic shards.
+The safety policy below remains unchanged.
+
 Deferred to a follow-up: subcollection teardown (reclaiming orphaned child roots
 and shards), and persisting a wound victim's locks into the aborted object.
 

@@ -49,7 +49,9 @@ CAS. Leaves are the shards; interior nodes are the range index.
     the ADR-017 per-key entries (lock type · `locked_by` · `current_writer` ·
     tombstone) sorted by key; also a **high-key** and **right-sibling** link. The
     CAS unit for its keys.
-  - _Transaction object_ (`_t/<txid>`): unchanged (status + values + lease).
+  - _Transaction object_ (`_t/<ss>/<txid>`): unchanged contents (status +
+    values + lease), stored in one of 4,096 deterministic listing shards
+    ([ADR-035](../adr/035-paginated-listing-and-sharded-transaction-logs.md)).
   - _Structural record_ (`{db}/_s/<record-id>`): a short-lived split
     write-ahead note, recovered independently from transaction logs
     ([ADR-034](../adr/034-separate-structural-log-namespace.md)).
@@ -102,7 +104,8 @@ CAS. Leaves are the shards; interior nodes are the range index.
   with ambiguity resolved by retry, not deletion
   ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
   [ADR-034](../adr/034-separate-structural-log-namespace.md)). Transaction and
-  structural records use separate `_t` and `_s` namespaces and recovery loops.
+  structural records use separate `_t/<ss>` and `_s` namespaces and recovery
+  loops.
 
 ## Tree shape
 

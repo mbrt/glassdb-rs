@@ -1318,10 +1318,15 @@ mod tests {
         }
         assert!(s.list_structural_logs("db").await.unwrap().is_empty());
         assert!(
-            TLogger::new(s.object_cache(), "db")
-                .list_transaction_ids()
+            s.object_cache()
+                .list(
+                    &paths::transactions_prefix("db"),
+                    None,
+                    backend::ListLimit::new(1).unwrap(),
+                )
                 .await
                 .unwrap()
+                .objects
                 .is_empty(),
             "a successful split does not create a transaction record"
         );

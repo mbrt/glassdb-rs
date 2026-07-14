@@ -27,8 +27,9 @@ tags. No object tags anywhere.
   - _Shard_ (`_s/<i>`, `C` per collection): lock table + MVCC version index +
     per-shard key directory; the unit of CAS (`If-Match`). Read/write of an
     existing key touches only its shard.
-  - _Transaction_ (`_t/<txid>`): unified; pending (small: lease + lock
-    intentions) → committed (fat: value map) → aborted.
+  - _Transaction_ (`_t/<ss>/<txid>`): unified; pending (small: lease + lock
+    intentions) → committed (fat: value map) → aborted. The first two encoded
+    txid symbols select one of 4,096 deterministic listing shards.
 - **Protocol** — execute → lock (one shard GET + one CAS per shard) → validate
   reads (re-resolve effective writers in `Algo`, post-lock) → commit (CAS the
   transaction object to committed, attaching values) → async per-shard write-back
@@ -192,7 +193,7 @@ Every design decision is captured in its own ADR.
   to ADR-020.
 - **[ADR-019](../adr/019-unified-transaction-object.md) — Values in unified
   transaction objects.** ✅ Written & implemented (data layer + engine). Values
-  live only in the `_t/<txid>` object
+  live only in the `_t/<ss>/<txid>` object
   (shards point via `current_writer`); the object is unified (status + values, no
   split), with a pending (lease + lock intentions) → committed (fat value map) →
   aborted lifecycle whose commit point is the single flip-to-committed CAS.
@@ -238,12 +239,13 @@ Every design decision is captured in its own ADR.
   back-references (`locks ∪ writes`, plus the `prev_writer` an overwrite
   supersedes), so GC checks a _batch_ of `_t/` candidates against only the
   shards/root they name, deletes those past the horizon with no remaining reference,
-  and prunes their own stale locks. A paged `_t/` list makes the candidate set
-  complete (no forward scan); a committed object is freed only once proven
-  unreferenced, while a finalized valueless object is reclaimed past the horizon
-  regardless (a residual stale lock degrades to a missing-object reference the
-  `handle_unknown_tx` grace absorbs). Pruning/deletion touch **only finalized**
-  transactions: a dead _pending_ one is first **force-aborted**
+  and prunes their own stale locks. Paged, shuffled walks over the 4,096
+  `_t/<ss>/` prefixes make the candidate set complete (no forward scan), with a
+  bounded number of listing requests per GC cycle; a committed object is freed
+  only once proven unreferenced, while a finalized valueless object is reclaimed
+  past the horizon regardless (a residual stale lock degrades to a missing-object
+  reference the `handle_unknown_tx` grace absorbs). Pruning/deletion touch
+  **only finalized** transactions: a dead _pending_ one is first **force-aborted**
   (`pending → aborted` CAS, the ADR-021 reclaim) — which loses the race to a
   slow-but-live owner's commit — then has its known locks released, then is deleted,
   so an observing client never sees a lock vanish from under a live owner. An
@@ -436,8 +438,9 @@ Group D — GC & lifecycle:
       loop on the `Clock` / `Background` seam whose steady-state cost is
       proportional to _garbage_, not database size: a **candidate-driven reverse**
       check of a `_t/` batch against only the shards/root each candidate records
-      (cache-amortized), batched deletes, and **no** database-wide scan — a paged
-      `_t/` list makes the candidate set complete. The write-back
+      (cache-amortized), batched deletes, and **no** database-wide scan — paged,
+      shuffled walks over deterministic `_t/<ss>/` prefixes make the candidate
+      set complete while bounding listing calls per cycle. The write-back
       `schedule_tx_cleanup` hook becomes the primary **candidate feed** (the
       `prev_writer` an overwrite just superseded), not a delete queue (ADR-022).
 - [x] Safety horizon to avoid sweeping in-flight transactions: reuse ADR-021's
@@ -455,7 +458,9 @@ Group E — backends:
       — [ADR-023](../adr/023-slimmed-backend-trait.md) implemented: seven methods
       (`read`, `read_if_modified`, `write`, `write_if`, `write_if_not_exists`,
       `delete`, `list`); content CAS only; ADR-009 in-doubt parity
-      (`glassdb-backend`).
+      (`glassdb-backend`). ADR-035 refines `list` to one recursive prefix page
+      with an opaque provider cursor, positive limit, and distinct invalid-cursor
+      error.
 - [x] Cache tagless coordination objects via version/ETag-conditional reads.
       Today `ShardStore` full-fetches every shard/root read (the writer-tag
       `read_if_modified` is unusable on these tagless objects).

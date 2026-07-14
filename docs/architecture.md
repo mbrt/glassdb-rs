@@ -184,7 +184,7 @@ wound-wait; the fold visits members oldest-first so it never has to backtrack.
 | `ShardCoordinator`    | shard/root **mechanism** | object path, resolvers | one round per object: single-flight, load-once, monotonic fold, single CAS, reload-recover, vestigial-entry pruning | locks, `TxId`, wound-wait, commit |
 | `Reader`              | read mechanism   | paths                        | effective-writer resolution, snapshot reads                                                                           | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
-| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged `_t/` walk, reclaims via the `Locker`'s coordinator-backed unlock            | commit policy                       |
+| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
 
 ### The lock boundary
 
@@ -244,7 +244,12 @@ pub trait Backend: Send + Sync {
         &self, path: &str, value: Vec<u8>,
     ) -> Result<Version, BackendError>;
     async fn delete(&self, path: &str) -> Result<(), BackendError>;
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError>;
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError>;
 }
 ```
 
@@ -253,6 +258,13 @@ This is the slimmed, content-CAS-only surface of
 primitive S3 and GCS both provide natively. All coordination state lives in
 object *content* and is mutated *only* by content CAS — there are no tags,
 metadata, or writer ids.
+
+`list` returns one recursive prefix page of actual object paths. Its cursor is
+an opaque provider token valid only for the same backend and prefix, and only a
+page without a next cursor completes the traversal. A rejected token returns
+`InvalidCursor`, allowing the caller to restart that prefix. S3 and GCS map this
+contract directly to their native continuation tokens without a delimiter
+([ADR-035](adr/035-paginated-listing-and-sharded-transaction-logs.md)).
 
 ### Key concepts
 
@@ -460,14 +472,16 @@ Each transaction gets its own log object, stored at a deterministic path based
 on the transaction ID:
 
 ```
-<db-prefix>/_t/<base64-encoded-tx-id>
+<db-prefix>/_t/<first-two-encoded-symbols>/<base64-encoded-tx-id>
 ```
 
 The transaction ID (`glassdb-data::TxId`) is `[8 bytes random prefix][8 bytes
 big-endian UnixNano timestamp]`. The timestamp suffix encodes the wound-wait
 priority (earlier = older), while the random prefix leads so that log keys keep
 a high-entropy prefix and spread across object-store partitions instead of
-clustering sequential commits into one hot partition.
+clustering sequential commits into one hot partition. The first two encoded
+symbols select one of 4,096 independently listable transaction-log shards
+([ADR-035](adr/035-paginated-listing-and-sharded-transaction-logs.md)).
 
 The log is serialized as a Protocol Buffer (`glassdb-proto`, `prost`-generated
 from a copy of `transaction.proto`) and contains:
@@ -544,9 +558,10 @@ A transaction that overwrites exactly one existing key commits with two
    create/delete, a missing key, or a read whose version has moved makes the
    transaction ineligible — nothing has been written yet, so it falls back to the
    full locked path under the same id.
-2. Issue in parallel: the committed transaction object (`_t/<txid>`, recording
-   its held lock so GC can prune it) **and** one shard CAS that installs a write
-   lock and help-forwards the resolved predecessor into `current_writer`.
+2. Issue in parallel: the committed transaction object (`_t/<ss>/<txid>`,
+   recording its held lock so GC can prune it) **and** one shard CAS that
+   installs a write lock and help-forwards the resolved predecessor into
+   `current_writer`.
 3. Asynchronously, write-back converts the lock into `current_writer = txid` and
    releases it (through the same deduplicated coordinator path).
 
@@ -760,8 +775,10 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   the handful of shards/root it names — never a database-wide scan.
 - **Candidate feed.** Candidates come from the write-back hint queue (the
   `current-writer` a fresh commit just superseded, capped at `HINT_QUEUE_CAP`)
-  and a paged walk of the flat `{db}/_t/` directory (`GC_LIST_PAGE` per cycle),
-  which makes the candidate set complete regardless of lost hints.
+  and shuffled passes over the 4,096 `{db}/_t/<ss>/` prefixes, which make the
+  candidate set complete regardless of lost hints. Each cycle stops after one
+  non-empty page or a bounded number of listing requests; an invalid provider
+  cursor restarts only its current shard.
 - **Safety horizon.** The ADR-021 lease acts as the sweep horizon: a candidate
   within the horizon is always kept, because the non-atomic reverse check can
   race a lock a live transaction has taken but not yet published (ADR-024's lazy

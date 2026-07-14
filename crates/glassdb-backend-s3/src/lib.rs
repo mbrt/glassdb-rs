@@ -14,7 +14,11 @@ use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use glassdb_backend::{Backend, BackendError, Cause, ReadReply, Version};
+use glassdb_backend::{
+    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
+};
+
+const MAX_LIST_PAGE_SIZE: usize = 1_000;
 
 // The in-process fake S3 server is compiled for this crate's own tests and,
 // when the `fake-server` feature is on, exposed as a reusable component (used by
@@ -379,47 +383,48 @@ impl Backend for S3Backend {
         .map(|_| ())
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        let prefix = ensure_trailing_slash(dir_path);
-        let mut token: Option<String> = None;
-        let mut keys: Vec<String> = Vec::new();
-        loop {
-            let mut op = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix)
-                .delimiter("/");
-            if let Some(t) = &token {
-                op = op.continuation_token(t);
-            }
-            let out = Self::run(
-                "List",
-                &prefix,
-                op.customize().config_override(self.overrides()).send(),
-            )
-            .await?;
-            for cp in out.common_prefixes() {
-                if let Some(p) = cp.prefix() {
-                    keys.push(p.to_string());
-                }
-            }
-            for o in out.contents() {
-                if let Some(k) = o.key() {
-                    keys.push(k.to_string());
-                }
-            }
-            if out.is_truncated() == Some(true) {
-                token = out.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
-            }
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        validate_list_prefix(prefix)?;
+        let max_keys = i32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
+        let mut op = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(max_keys);
+        if let Some(cursor) = cursor {
+            op = op.continuation_token(cursor.as_str());
         }
-        keys.sort();
-        Ok(keys)
+        let out = op
+            .customize()
+            .config_override(self.overrides())
+            .send()
+            .await
+            .map_err(|e| annotate_list(prefix, cursor.is_some(), e))?;
+        let objects = out
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(str::to_string))
+            .collect();
+        let next = if out.is_truncated() == Some(true) {
+            let token = out
+                .next_continuation_token()
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| {
+                    BackendError::other(format!(
+                        "List({prefix}): truncated response has no continuation token"
+                    ))
+                })?;
+            Some(ListCursor::new(token))
+        } else {
+            None
+        };
+        Ok(ListPage { objects, next })
     }
 }
 
@@ -486,6 +491,23 @@ where
         ));
     }
     annotate(op, path, e)
+}
+
+/// Maps a paginated listing failure, distinguishing a rejected continuation
+/// token so the scanner can restart only this prefix.
+fn annotate_list<E>(prefix: &str, had_cursor: bool, e: SdkError<E>) -> BackendError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let invalid_code = matches!(
+        e.code(),
+        Some("InvalidArgument" | "InvalidToken" | "InvalidContinuationToken")
+    );
+    let bad_request = e.raw_response().map(|r| r.status().as_u16()) == Some(400);
+    if had_cursor && (invalid_code || bad_request) {
+        return BackendError::InvalidCursor;
+    }
+    annotate_read("List", prefix, e)
 }
 
 /// Maps an S3 SDK error onto a [`BackendError`].
@@ -588,10 +610,12 @@ fn conflict_backoff(attempt: u32) -> Duration {
     Duration::from_millis(25u64.saturating_mul(1u64 << attempt)).min(Duration::from_secs(1))
 }
 
-fn ensure_trailing_slash(a: &str) -> String {
-    if a.ends_with('/') {
-        a.to_string()
+fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        Ok(())
     } else {
-        format!("{a}/")
+        Err(BackendError::other(format!(
+            "list prefix must be empty or end in '/': {prefix:?}"
+        )))
     }
 }

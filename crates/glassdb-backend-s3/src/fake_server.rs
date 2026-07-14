@@ -428,6 +428,23 @@ fn list_objects(state: &FakeState, query: &str) -> Response<Full<Bytes>> {
     let params = query_params(query);
     let prefix = params.get("prefix").cloned().unwrap_or_default();
     let delim = params.get("delimiter").cloned().unwrap_or_default();
+    let max_keys = params
+        .get("max-keys")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let after = match params.get("continuation-token") {
+        Some(token) => match decode_page_token(&prefix, token) {
+            Some(after) => Some(after),
+            None => {
+                return xml_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "invalid continuation token",
+                );
+            }
+        },
+        None => None,
+    };
 
     let objs = state.objects.lock().unwrap();
     let mut contents: Vec<String> = Vec::new();
@@ -445,11 +462,26 @@ fn list_objects(state: &FakeState, query: &str) -> Response<Full<Bytes>> {
         contents.push(k.clone());
     }
     contents.sort();
+    if let Some(after) = after {
+        contents.retain(|key| key.as_str() > after);
+    }
+    let truncated = contents.len() > max_keys;
+    contents.truncate(max_keys);
+    let next = truncated
+        .then(|| contents.last())
+        .flatten()
+        .map(|last| encode_page_token(&prefix, last));
 
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
     );
-    xml.push_str(&format!("<Name>test</Name><Prefix>{}</Prefix><MaxKeys>1000</MaxKeys><Delimiter>{}</Delimiter><IsTruncated>false</IsTruncated>", xml_escape(&prefix), xml_escape(&delim)));
+    xml.push_str(&format!("<Name>test</Name><Prefix>{}</Prefix><MaxKeys>{max_keys}</MaxKeys><Delimiter>{}</Delimiter><IsTruncated>{truncated}</IsTruncated>", xml_escape(&prefix), xml_escape(&delim)));
+    if let Some(next) = next {
+        xml.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(&next)
+        ));
+    }
     for k in &contents {
         xml.push_str(&format!(
             "<Contents><Key>{}</Key></Contents>",
@@ -469,6 +501,18 @@ fn list_objects(state: &FakeState, query: &str) -> Response<Full<Bytes>> {
         .header("content-type", "application/xml")
         .body(Full::new(Bytes::from(xml)))
         .unwrap()
+}
+
+fn encode_page_token(prefix: &str, last: &str) -> String {
+    format!("{}:{prefix}{last}", prefix.len())
+}
+
+fn decode_page_token<'a>(prefix: &str, token: &'a str) -> Option<&'a str> {
+    let (prefix_len, body) = token.split_once(':')?;
+    let prefix_len = prefix_len.parse::<usize>().ok()?;
+    let stored_prefix = body.get(..prefix_len)?;
+    let last = body.get(prefix_len..)?;
+    (stored_prefix == prefix && last.starts_with(prefix)).then_some(last)
 }
 
 fn object_response(o: &StoredObject, with_body: bool) -> Response<Full<Bytes>> {

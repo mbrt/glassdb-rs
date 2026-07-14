@@ -104,6 +104,7 @@ impl From<BackendError> for Error {
         match e {
             BackendError::NotFound => Error::NotFound,
             BackendError::Precondition => Error::Precondition,
+            BackendError::InvalidCursor => Error::internal("invalid listing cursor"),
             BackendError::Unavailable(s) => Error::InDoubt(s),
             BackendError::Other { msg, source } => Error::Internal { msg, source },
         }
@@ -115,6 +116,7 @@ impl From<StorageError> for Error {
         match e {
             StorageError::NotFound | StorageError::KeyNotFound => Error::NotFound,
             StorageError::Precondition => Error::Precondition,
+            StorageError::InvalidCursor => Error::internal("invalid listing cursor"),
             StorageError::Unavailable(s) => Error::InDoubt(s),
             StorageError::Other { msg, source } => Error::Internal { msg, source },
         }

@@ -963,7 +963,7 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     coll.write(b"k1", &write_int(1)).await.unwrap();
     coll.write(b"k2", &write_int(2)).await.unwrap();
 
-    // Trap the next commit-log write (`_t/<txid>` path). Setup ops above
+    // Trap the next commit-log write (`_t/<ss>/<txid>` path). Setup ops above
     // don't match and pass straight through.
     let arrived = pause.arm("/_t/");
 

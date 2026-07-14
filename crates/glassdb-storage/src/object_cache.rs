@@ -148,11 +148,14 @@ impl ObjectCache {
         Ok(())
     }
 
-    /// Lists object paths under `dir_path`. Goes straight to the backend: a
-    /// listing enumerates keys rather than fetching bodies, so there is nothing
-    /// to serve from (or store in) the object cache.
-    pub async fn list(&self, dir_path: &str) -> Result<Vec<String>, StorageError> {
-        Ok(self.backend.list(dir_path).await?)
+    /// Lists one page of object paths under `prefix`, bypassing the body cache.
+    pub async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&backend::ListCursor>,
+        limit: backend::ListLimit,
+    ) -> Result<backend::ListPage, StorageError> {
+        Ok(self.backend.list(prefix, cursor, limit).await?)
     }
 
     /// Caches a freshly-read object body and returns it as an [`ObjectRead`].

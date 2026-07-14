@@ -11,6 +11,9 @@ pub enum StorageError {
     /// A conditional operation's precondition failed.
     #[error("precondition failed")]
     Precondition,
+    /// A paginated listing cursor was rejected and that prefix must restart.
+    #[error("invalid listing cursor")]
+    InvalidCursor,
     /// The operation's outcome is unknown (in doubt): it may or may not have
     /// been applied.
     #[error("storage outcome unknown (in doubt): {0}")]
@@ -69,6 +72,7 @@ impl From<BackendError> for StorageError {
         match e {
             BackendError::NotFound => StorageError::NotFound,
             BackendError::Precondition => StorageError::Precondition,
+            BackendError::InvalidCursor => StorageError::InvalidCursor,
             BackendError::Unavailable(s) => StorageError::Unavailable(s),
             BackendError::Other { msg, source } => StorageError::Other { msg, source },
         }
@@ -118,6 +122,10 @@ mod tests {
         assert!(matches!(
             StorageError::Precondition.context("x"),
             StorageError::Precondition
+        ));
+        assert!(matches!(
+            StorageError::InvalidCursor.context("x"),
+            StorageError::InvalidCursor
         ));
     }
 

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// Snapshot of backend operation counters.
 ///
@@ -93,8 +93,13 @@ impl Backend for StatsBackend {
         self.inner.delete(path).await
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
         self.obj_lists.fetch_add(1, Ordering::Relaxed);
-        self.inner.list(dir_path).await
+        self.inner.list(prefix, cursor, limit).await
     }
 }

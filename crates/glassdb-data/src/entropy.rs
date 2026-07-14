@@ -13,6 +13,17 @@ pub(crate) fn fill_random(b: &mut [u8]) {
     rand::rng().fill_bytes(b);
 }
 
+/// Randomizes `values` using the same deterministic-under-simulation entropy as
+/// transaction IDs and node tokens.
+pub fn shuffle<T>(values: &mut [T]) {
+    for upper in (1..values.len()).rev() {
+        let mut bytes = [0; 8];
+        fill_random(&mut bytes);
+        let index = (u64::from_le_bytes(bytes) % (upper as u64 + 1)) as usize;
+        values.swap(upper, index);
+    }
+}
+
 /// Fills `b` with random bytes.
 #[cfg(sim)]
 pub(crate) fn fill_random(b: &mut [u8]) {

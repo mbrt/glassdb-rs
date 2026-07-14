@@ -1,9 +1,13 @@
 //! Storage path encoding/decoding. Ported from the Go `internal/data/paths`
 //! package. Paths have the form `{prefix}/{type}/{base64(payload)}`, except
-//! collection-info objects which are `{prefix}/_i`.
+//! collection-info objects (`{prefix}/_i`) and sharded transaction objects
+//! (`{prefix}/_t/{shard}/{base64(txid)}`).
 
 use crate::base64;
 use crate::txid::TxId;
+
+/// Number of deterministic transaction-log shards (two base64 symbols).
+pub const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
 
 /// The category of a storage path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,12 +149,32 @@ pub fn parent_collection(prefix: &str) -> Option<(String, Vec<u8>)> {
 
 /// Encodes a transaction ID into a storage path under `prefix`.
 pub fn from_transaction(prefix: &str, id: &TxId) -> String {
-    prefix_encode(prefix, Type::Transaction, id.as_bytes())
+    let encoded = base64::encode(id.as_bytes());
+    let shard = transaction_shard_for_encoding(&encoded);
+    format!("{prefix}/{}/{shard}/{encoded}", Type::Transaction.as_str())
 }
 
-/// Decodes a transaction ID from a storage path suffix (e.g. `_t/<b64>`).
+/// Decodes a transaction ID from a sharded storage path suffix
+/// (`_t/<shard>/<b64>`).
 pub fn to_transaction(suffix: &str) -> Result<TxId, PathError> {
-    Ok(TxId::from_bytes(decode(Type::Transaction, suffix)?))
+    let expected = format!("{}/", Type::Transaction.as_str());
+    let Some(rest) = suffix.strip_prefix(&expected) else {
+        return Err(PathError::WrongPrefix {
+            suffix: suffix.to_string(),
+            expected: Type::Transaction.as_str().to_string(),
+        });
+    };
+    let Some((shard, encoded)) = rest.split_once('/') else {
+        return Err(PathError::Parse(suffix.to_string()));
+    };
+    if shard.len() != 2
+        || encoded.is_empty()
+        || encoded.contains('/')
+        || shard != transaction_shard_for_encoding(encoded)
+    {
+        return Err(PathError::Parse(suffix.to_string()));
+    }
+    Ok(TxId::from_bytes(base64::decode(encoded)?))
 }
 
 /// Returns the listing prefix for all transaction objects under `prefix`.
@@ -158,19 +182,44 @@ pub fn transactions_prefix(prefix: &str) -> String {
     typed_prefix(prefix, Type::Transaction)
 }
 
+/// Returns the deterministic shard index for `id`.
+pub fn transaction_shard(id: &TxId) -> usize {
+    let encoded = base64::encode(id.as_bytes());
+    base64::decode_u12(transaction_shard_for_encoding(&encoded))
+        .expect("transaction shard uses the base64 alphabet")
+}
+
+/// Returns the listing prefix for one deterministic transaction-log shard.
+pub fn transaction_shard_prefix(prefix: &str, shard: usize) -> String {
+    assert!(
+        shard < TRANSACTION_SHARD_COUNT,
+        "transaction shard out of range"
+    );
+    let symbols = base64::encode_u12(shard);
+    let symbols = std::str::from_utf8(&symbols).expect("base64 alphabet is ASCII");
+    format!("{prefix}/{}/{symbols}/", Type::Transaction.as_str())
+}
+
 /// Decodes the transaction ID from a full transaction object path
-/// (`{prefix}/_t/<b64>`), the inverse of [`from_transaction`]. Unlike
+/// (`{prefix}/_t/<shard>/<b64>`), the inverse of [`from_transaction`]. Unlike
 /// [`to_transaction`] (which decodes a type-marked suffix), this takes a whole
 /// path as returned by a transaction listing.
 pub fn transaction_id_of(path: &str) -> Result<TxId, PathError> {
-    let pr = parse(path)?;
-    if pr.typ != Type::Transaction {
+    let Some((_prefix, shard, encoded)) = sharded_transaction_parts(path) else {
+        if path_parts_indexes(path).is_none() {
+            return Err(PathError::Parse(path.to_string()));
+        }
         return Err(PathError::WrongPrefix {
             suffix: path.to_string(),
-            expected: Type::Transaction.as_str().to_string(),
+            expected: format!("{}/<shard>/<txid>", Type::Transaction.as_str()),
         });
+    };
+    if shard != transaction_shard_for_encoding(encoded) {
+        return Err(PathError::Parse(format!(
+            "transaction shard does not match id: {path:?}"
+        )));
     }
-    Ok(TxId::from_bytes(base64::decode(&pr.suffix)?))
+    Ok(TxId::from_bytes(base64::decode(encoded)?))
 }
 
 /// Returns the storage path for the B-link node named `token` under `prefix`
@@ -256,6 +305,15 @@ pub fn parse(p: &str) -> Result<ParseResult, PathError> {
             typ: Type::CollectionInfo,
         });
     }
+    if let Some((prefix, shard, suffix)) = sharded_transaction_parts(p)
+        && shard == transaction_shard_for_encoding(suffix)
+    {
+        return Ok(ParseResult {
+            prefix: prefix.to_string(),
+            suffix: suffix.to_string(),
+            typ: Type::Transaction,
+        });
+    }
     let (prefix_idx, type_idx) =
         path_parts_indexes(p).ok_or_else(|| PathError::Parse(p.to_string()))?;
     let prefix = &p[..prefix_idx];
@@ -264,7 +322,6 @@ pub fn parse(p: &str) -> Result<ParseResult, PathError> {
     let typ = match typ_str {
         "_k" => Type::Key,
         "_c" => Type::Collection,
-        "_t" => Type::Transaction,
         "_n" => Type::Node,
         _ => Type::Unknown,
     };
@@ -273,6 +330,18 @@ pub fn parse(p: &str) -> Result<ParseResult, PathError> {
         suffix: suffix.to_string(),
         typ,
     })
+}
+
+fn transaction_shard_for_encoding(encoded: &str) -> &str {
+    encoded.get(..2).unwrap_or("00")
+}
+
+fn sharded_transaction_parts(path: &str) -> Option<(&str, &str, &str)> {
+    let (parent, encoded) = path.rsplit_once('/')?;
+    let (typed, shard) = parent.rsplit_once('/')?;
+    let (prefix, marker) = typed.rsplit_once('/')?;
+    (marker == Type::Transaction.as_str() && shard.len() == 2 && !encoded.is_empty())
+        .then_some((prefix, shard, encoded))
 }
 
 fn path_parts_indexes(p: &str) -> Option<(usize, usize)> {
@@ -352,9 +421,15 @@ mod tests {
     fn transaction_round_trip() {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let p = from_transaction("db", &id);
+        assert_eq!(p, "db/_t/0F/0F8310");
         let r = parse(&p).unwrap();
         assert_eq!(r.typ, Type::Transaction);
-        assert_eq!(to_transaction(&format!("_t/{}", r.suffix)).unwrap(), id);
+        assert_eq!(to_transaction(p.strip_prefix("db/").unwrap()).unwrap(), id);
+        assert!(matches!(
+            to_transaction("_t/0F8310"),
+            Err(PathError::Parse(_))
+        ));
+        assert_eq!(parse("db/_t/0F8310").unwrap().typ, Type::Unknown);
     }
 
     #[test]
@@ -362,6 +437,8 @@ mod tests {
         assert_eq!(keys_prefix("db/coll"), "db/coll/_k/");
         assert_eq!(collections_prefix("db/coll"), "db/coll/_c/");
         assert_eq!(transactions_prefix("db"), "db/_t/");
+        assert_eq!(transaction_shard(&TxId::from_bytes(vec![1, 2, 3, 4])), 16);
+        assert_eq!(transaction_shard_prefix("db", 16), "db/_t/0F/");
     }
 
     #[test]
@@ -393,6 +470,10 @@ mod tests {
     fn transaction_id_of_round_trip_and_errors() {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         assert_eq!(transaction_id_of(&from_transaction("db", &id)).unwrap(), id);
+        assert!(matches!(
+            transaction_id_of("db/_t/00/0F8310"),
+            Err(PathError::Parse(_))
+        ));
         // A non-transaction path is rejected.
         assert!(matches!(
             transaction_id_of(&from_key("db/coll", b"k")),
@@ -451,7 +532,7 @@ mod tests {
         assert_eq!(from_collection("db", b"settings"), "db/_c/RqKoS6_iOrB");
         assert_eq!(
             from_transaction("db", &TxId::from_bytes(vec![1, 2, 3, 4])),
-            "db/_t/0F8310"
+            "db/_t/0F/0F8310"
         );
         assert_eq!(collection_info("db/root"), "db/root/_i");
 

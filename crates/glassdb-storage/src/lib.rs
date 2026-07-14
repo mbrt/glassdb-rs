@@ -31,6 +31,8 @@ pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LeafKind, LoadedLeaf, ShardStore};
 pub use structlog::StructuralLog;
-pub use tlogger::{LockScope, PathLock, TLogger, TValue, TxCommitStatus, TxLog, TxStatus, TxWrite};
+pub use tlogger::{
+    LockScope, PathLock, TLogger, TValue, TxCommitStatus, TxListPage, TxLog, TxStatus, TxWrite,
+};
 pub use value_cache::{MAX_STALENESS, ValueCache, ValueRead};
 pub use version::Version;

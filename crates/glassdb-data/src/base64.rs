@@ -40,6 +40,30 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+fn decode_symbol(symbol: u8) -> Result<u32, DecodeError> {
+    let value = REV[symbol as usize];
+    if value < 0 {
+        Err(DecodeError::InvalidByte(symbol))
+    } else {
+        Ok(value as u32)
+    }
+}
+
+/// Encodes a 12-bit value as exactly two symbols.
+pub(crate) fn encode_u12(value: usize) -> [u8; 2] {
+    assert!(value < 1 << 12, "base64 u12 value out of range");
+    [ALPHABET[value >> 6], ALPHABET[value & 63]]
+}
+
+/// Decodes exactly two symbols into their 12-bit value.
+pub(crate) fn decode_u12(encoded: &str) -> Result<usize, DecodeError> {
+    let bytes = encoded.as_bytes();
+    if bytes.len() != 2 {
+        return Err(DecodeError::InvalidLength);
+    }
+    Ok(((decode_symbol(bytes[0])? << 6) | decode_symbol(bytes[1])?) as usize)
+}
+
 /// Encodes `input` into the custom, order-preserving, unpadded base64 form.
 pub fn encode(input: &[u8]) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(input.len().div_ceil(3) * 4);
@@ -73,22 +97,14 @@ pub fn encode(input: &[u8]) -> String {
 /// Decodes a string produced by [`encode`].
 pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = input.as_bytes();
-    let dc = |c: u8| -> Result<u32, DecodeError> {
-        let v = REV[c as usize];
-        if v < 0 {
-            Err(DecodeError::InvalidByte(c))
-        } else {
-            Ok(v as u32)
-        }
-    };
 
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
     let mut i = 0;
     while i + 4 <= bytes.len() {
-        let n = (dc(bytes[i])? << 18)
-            | (dc(bytes[i + 1])? << 12)
-            | (dc(bytes[i + 2])? << 6)
-            | dc(bytes[i + 3])?;
+        let n = (decode_symbol(bytes[i])? << 18)
+            | (decode_symbol(bytes[i + 1])? << 12)
+            | (decode_symbol(bytes[i + 2])? << 6)
+            | decode_symbol(bytes[i + 3])?;
         out.push((n >> 16) as u8);
         out.push((n >> 8) as u8);
         out.push(n as u8);
@@ -98,11 +114,13 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
         0 => {}
         1 => return Err(DecodeError::InvalidLength),
         2 => {
-            let n = (dc(bytes[i])? << 18) | (dc(bytes[i + 1])? << 12);
+            let n = (decode_symbol(bytes[i])? << 18) | (decode_symbol(bytes[i + 1])? << 12);
             out.push((n >> 16) as u8);
         }
         3 => {
-            let n = (dc(bytes[i])? << 18) | (dc(bytes[i + 1])? << 12) | (dc(bytes[i + 2])? << 6);
+            let n = (decode_symbol(bytes[i])? << 18)
+                | (decode_symbol(bytes[i + 1])? << 12)
+                | (decode_symbol(bytes[i + 2])? << 6);
             out.push((n >> 16) as u8);
             out.push((n >> 8) as u8);
         }
@@ -148,5 +166,19 @@ mod tests {
         encoded.sort();
         let from_sorted: Vec<String> = inputs.iter().map(|i| encode(i)).collect();
         assert_eq!(encoded, from_sorted);
+    }
+
+    #[test]
+    fn u12_round_trip() {
+        for value in 0..1 << 12 {
+            let encoded = encode_u12(value);
+            let encoded = std::str::from_utf8(&encoded).unwrap();
+            assert_eq!(decode_u12(encoded).unwrap(), value);
+        }
+        assert!(matches!(decode_u12("0"), Err(DecodeError::InvalidLength)));
+        assert!(matches!(
+            decode_u12("!0"),
+            Err(DecodeError::InvalidByte(b'!'))
+        ));
     }
 }

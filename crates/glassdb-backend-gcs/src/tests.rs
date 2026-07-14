@@ -2,12 +2,12 @@
 //! fake implementing the JSON-API subset the backend uses (the analog of the
 //! Go tests' `fake-gcs-server`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use glassdb_backend::{Backend, BackendError, Version};
+use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -327,23 +327,35 @@ fn delete(state: &FakeState, name: &str, query: &HashMap<String, String>) -> Res
 fn list(state: &FakeState, query: &HashMap<String, String>) -> Response<Full<Bytes>> {
     let store = state.store.lock().unwrap();
     let prefix = query.get("prefix").cloned().unwrap_or_default();
-    let delim = query.get("delimiter").cloned().unwrap_or_default();
+    let max_results = query
+        .get("maxResults")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let after = match query.get("pageToken") {
+        Some(token) => match decode_page_token(&prefix, token) {
+            Some(after) => Some(after),
+            None => return error_json(StatusCode::BAD_REQUEST, "invalidPageToken"),
+        },
+        None => None,
+    };
 
     let mut items: Vec<&String> = Vec::new();
-    let mut prefixes: BTreeSet<String> = BTreeSet::new();
     for k in store.objects.keys() {
-        let Some(rest) = k.strip_prefix(&prefix) else {
+        if !k.starts_with(&prefix) {
             continue;
-        };
-        if !delim.is_empty()
-            && let Some(idx) = rest.find(&delim)
-        {
-            prefixes.insert(format!("{prefix}{}", &rest[..=idx]));
+        }
+        if after.is_some_and(|after| k.as_str() <= after) {
             continue;
         }
         items.push(k);
     }
     items.sort();
+    let truncated = items.len() > max_results;
+    items.truncate(max_results);
+    let next = truncated
+        .then(|| items.last())
+        .flatten()
+        .map(|last| encode_page_token(&prefix, last));
 
     let items_json: Vec<serde_json::Value> = items
         .iter()
@@ -359,10 +371,22 @@ fn list(state: &FakeState, query: &HashMap<String, String>) -> Response<Full<Byt
     let body = serde_json::json!({
         "kind": "storage#objects",
         "items": items_json,
-        "prefixes": prefixes.into_iter().collect::<Vec<_>>(),
+        "nextPageToken": next,
     })
     .to_string();
     json_response(StatusCode::OK, body)
+}
+
+fn encode_page_token(prefix: &str, last: &str) -> String {
+    format!("{}:{prefix}{last}", prefix.len())
+}
+
+fn decode_page_token<'a>(prefix: &str, token: &'a str) -> Option<&'a str> {
+    let (prefix_len, body) = token.split_once(':')?;
+    let prefix_len = prefix_len.parse::<usize>().ok()?;
+    let stored_prefix = body.get(..prefix_len)?;
+    let last = body.get(prefix_len..)?;
+    (stored_prefix == prefix && last.starts_with(prefix)).then_some(last)
 }
 
 fn resource_json(name: &str, o: &GcsObject) -> String {
@@ -643,16 +667,26 @@ async fn read_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_with_subdirs() {
+async fn list_is_recursive_and_paginated() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
         b.write(name, name.as_bytes().to_vec()).await.unwrap();
     }
-    let got = b.list("d").await.unwrap();
-    assert_eq!(got, vec!["d/a/", "d/c/", "d/root"]);
-    let got = b.list("d/a").await.unwrap();
-    assert_eq!(got, vec!["d/a/1", "d/a/2", "d/a/b/"]);
+    let limit = ListLimit::new(2).unwrap();
+    let first = b.list("d/", None, limit).await.unwrap();
+    assert_eq!(first.objects, vec!["d/a/1", "d/a/2"]);
+    let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
+    assert_eq!(second.objects, vec!["d/a/b/1", "d/c/1"]);
+    let third = b.list("d/", second.next.as_ref(), limit).await.unwrap();
+    assert_eq!(third.objects, vec!["d/root"]);
+    assert!(third.next.is_none());
+
+    let err = b
+        .list("d/", Some(&ListCursor::new("invalid")), limit)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BackendError::InvalidCursor));
 }
 
 // In-doubt contract (ADR-009): a conditional write whose outcome is uncertain

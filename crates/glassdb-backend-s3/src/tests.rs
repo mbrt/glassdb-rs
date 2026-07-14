@@ -3,7 +3,7 @@
 //! `gofakes3` + `httptest.Server`).
 
 use aws_sdk_s3::config::retry::RetryConfig;
-use glassdb_backend::{Backend, BackendError, Version};
+use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, Version};
 use hyper::Method;
 
 use crate::fake_server::FakeS3;
@@ -174,16 +174,26 @@ async fn read_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_with_subdirs() {
+async fn list_is_recursive_and_paginated() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
         b.write(name, name.as_bytes().to_vec()).await.unwrap();
     }
-    let got = b.list("d").await.unwrap();
-    assert_eq!(got, vec!["d/a/", "d/c/", "d/root"]);
-    let got = b.list("d/a").await.unwrap();
-    assert_eq!(got, vec!["d/a/1", "d/a/2", "d/a/b/"]);
+    let limit = ListLimit::new(2).unwrap();
+    let first = b.list("d/", None, limit).await.unwrap();
+    assert_eq!(first.objects, vec!["d/a/1", "d/a/2"]);
+    let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
+    assert_eq!(second.objects, vec!["d/a/b/1", "d/c/1"]);
+    let third = b.list("d/", second.next.as_ref(), limit).await.unwrap();
+    assert_eq!(third.objects, vec!["d/root"]);
+    assert!(third.next.is_none());
+
+    let err = b
+        .list("d/", Some(&ListCursor::new("invalid")), limit)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BackendError::InvalidCursor));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

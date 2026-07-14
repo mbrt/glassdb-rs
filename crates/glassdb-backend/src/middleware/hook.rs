@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// A backend operation presented to a hook before and after it is forwarded.
 #[derive(Debug, Clone, Copy)]
@@ -30,8 +30,12 @@ pub enum BackendOp<'a> {
     WriteIfNotExists { path: &'a str, value: &'a [u8] },
     /// An unconditional object deletion.
     Delete { path: &'a str },
-    /// A directory listing.
-    List { path: &'a str },
+    /// One page of a prefix listing.
+    List {
+        path: &'a str,
+        cursor: Option<&'a ListCursor>,
+        limit: ListLimit,
+    },
 }
 
 impl BackendOp<'_> {
@@ -44,7 +48,7 @@ impl BackendOp<'_> {
             | BackendOp::WriteIf { path, .. }
             | BackendOp::WriteIfNotExists { path, .. }
             | BackendOp::Delete { path }
-            | BackendOp::List { path } => path,
+            | BackendOp::List { path, .. } => path,
         }
     }
 }
@@ -211,10 +215,20 @@ impl Backend for HookBackend {
             .await
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.hooked(BackendOp::List { path: dir_path }, || {
-            self.inner.list(dir_path)
-        })
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        self.hooked(
+            BackendOp::List {
+                path: prefix,
+                cursor,
+                limit,
+            },
+            || self.inner.list(prefix, cursor, limit),
+        )
         .await
     }
 }
@@ -266,7 +280,10 @@ mod tests {
             .await
             .unwrap();
         backend.delete("p").await.unwrap();
-        backend.list("").await.unwrap();
+        backend
+            .list("", None, ListLimit::new(1).unwrap())
+            .await
+            .unwrap();
         assert!(!version.is_unset());
         assert_eq!(seen.load(Ordering::SeqCst), (1 << 7) - 1);
     }
