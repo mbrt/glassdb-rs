@@ -20,10 +20,9 @@
 //! outcome (ADR-029). All lock/transaction *policy* lives in the resolvers the
 //! callers install: [`Locker`](crate::Locker) installs the Acquire / WriteBack /
 //! Release resolvers, and [`Algo`](crate::Algo) installs the single read-write
-//! CommitInstall. Membership (create/delete) is coordinated per-key in the
-//! owning leaf, so there is no separate root-membership path (ADR-031). The
-//! per-transaction held-lock bookkeeping lives with its owner, the
-//! [`Locker`](crate::Locker), not in the engine.
+//! CommitInstall. Those resolvers stage entry and node-level coordination in the
+//! same object CAS (ADR-032). The per-transaction held-lock bookkeeping lives
+//! with its owner, the [`Locker`](crate::Locker), not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
@@ -35,7 +34,10 @@ use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
 };
 use glassdb_data::TxId;
-use glassdb_storage::{Freshness, LockType, Shard, ShardEntry, ShardStore, StorageError};
+use glassdb_storage::{
+    Freshness, LeafKind, LockType, NodeLocks, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError,
+};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -58,16 +60,20 @@ struct Stats {
 /// engine treats it as an opaque payload it stages and delivers.
 #[derive(Clone)]
 pub(crate) enum FoldOutcome {
-    /// A lock was installed (Acquire), held at the given strength — the
-    /// strongest intent across the acquired keys. Self-describing so the caller
-    /// records the hold from the outcome instead of re-deriving it.
-    Locked(LockType),
+    /// A lock was installed (Acquire), carrying the strongest entry intention
+    /// and the membership scope held on the leaf.
+    Locked { typ: LockType, membership: LockType },
     /// A touched key is held by a live holder this transaction does not
     /// outrank: wait for `holder` to finalize, then re-submit (hold-and-wait,
     /// ADR-024). Nothing was staged for this transaction in the round's CAS.
     Wait(TxId),
-    /// The bounded CAS budget was exhausted under churn; release and re-lock.
+    /// The bounded CAS budget was exhausted under churn, or a stage that does
+    /// not add a user key reached the absolute object limit. Release and
+    /// re-lock while the hinted split makes progress.
     Conflict,
+    /// A create would exceed the leaf's reserved content limit. Nothing was
+    /// staged for this member; retry after the pending split relieves the leaf.
+    LeafFull,
     /// A release or write-back completed (ADR-026). Idempotent and best-effort:
     /// there is nothing to wait on and nothing for the caller to retry.
     /// `superseded` carries the `current_writer` transaction ids a write-back
@@ -105,14 +111,27 @@ pub(crate) enum ReloadCause {
 /// caller's future is dropped mid-round.
 type OutcomeSlot = Arc<Mutex<Option<FoldOutcome>>>;
 
-/// One resolver's decision for the current fold step: either stage a set of
-/// entry changes (threaded to the next resolver) alongside its member outcome,
-/// or stage nothing and just return an outcome (e.g. it must wait).
+/// How a staged mutation participates in leaf-capacity admission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageAdmission {
+    /// The stage does not add a user key, so it may consume reserved headroom
+    /// but must still fit under the absolute encoded-object limit.
+    ExistingKeys,
+    /// The stage adds at least one user key and must fit below the content limit
+    /// that reserves headroom for locks and the split's shrink CAS.
+    AddsKey,
+}
+
+/// One resolver's decision for the current fold step: either stage entry and
+/// node-lock changes alongside its member outcome, or stage nothing.
 pub(crate) enum Step {
-    /// Apply these entry changes to the running staged map; on a confirmed CAS
-    /// deliver `outcome` to the member.
+    /// Apply these entry changes and replace the running node-lock state. The
+    /// coordinator alone owns the node's topology, body reconstruction, and
+    /// capacity admission.
     Stage {
         entries: Vec<(Vec<u8>, ShardEntry)>,
+        locks: NodeLocks,
+        admission: StageAdmission,
         outcome: FoldOutcome,
     },
     /// Stage nothing; deliver `outcome` to the member regardless of the CAS.
@@ -135,13 +154,13 @@ pub(crate) struct ResolveCtx<'a> {
 /// ([`Locker`](crate::Locker) and [`Algo`](crate::Algo)), not in the engine.
 #[async_trait]
 pub(crate) trait ShardResolver: Send + Sync {
-    /// Resolves this member against the entries **as currently staged this
-    /// round** (it observes the changes staged by earlier resolvers). Returns
-    /// the changes to stage plus this member's outcome, or stages nothing.
+    /// Resolves this member against entries and node locks as currently staged
+    /// this round. Resolvers cannot mutate node topology.
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError>;
 
     /// Whether this member may join any in-flight round instead of FIFO-blocking
@@ -257,6 +276,7 @@ struct CoordCore {
     // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
     // Emitted on the write path so growth needs no key-space enumeration.
     hinter: Arc<dyn SplitHinter>,
+    policy: SplitPolicy,
 }
 
 struct CoordState {
@@ -319,7 +339,20 @@ impl CasWorker {
             } else {
                 Freshness::Latest
             };
-            let loaded = self.core.shards.load_leaf(path, freshness).await?;
+            let loaded = match self.core.shards.load_leaf(path, freshness).await {
+                Ok(loaded) => loaded,
+                // A root split can turn the routed root leaf into an index
+                // between grouping and this load. Deliver each resolver's
+                // reroute outcome so its caller rebuilds the current leaf set.
+                Err(StorageError::Precondition) => {
+                    let members = shard_members(batch);
+                    for member in members.values() {
+                        *member.slot.lock().unwrap() = Some(member.resolver.exhausted_outcome());
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
             // Read the merged set *after* obtaining the leaf so this round
             // absorbs every member that queued while the load I/O was in flight
             // (ADR-025) — the window that turns N contenders' loads+CASes into
@@ -332,6 +365,7 @@ impl CasWorker {
                 .cloned()
                 .map(|e| (e.key.clone(), e))
                 .collect();
+            let mut locks = loaded.locks.clone();
 
             // Fold every member's resolver over the shared entry set, threading
             // the staged changes: resolver N observes the entries as staged by
@@ -357,14 +391,59 @@ impl CasWorker {
                     results.push((tx.clone(), m.resolver.exhausted_outcome()));
                     continue;
                 }
-                match m.resolver.resolve(&ctx, &entries).await? {
+                match m.resolver.resolve(&ctx, &entries, &locks).await? {
                     Step::Stage {
                         entries: changes,
+                        locks: changed_locks,
+                        admission,
                         outcome,
                     } => {
+                        let mut candidate_entries = entries.clone();
+                        for (key, entry) in &changes {
+                            candidate_entries.insert(key.clone(), entry.clone());
+                        }
+                        let mut candidate_node = loaded.node().clone();
+                        let candidate_shard = Shard::from_entries(
+                            candidate_entries
+                                .values()
+                                .filter(|e| !e.is_vestigial())
+                                .cloned(),
+                        );
+                        candidate_node.set_leaf(candidate_shard.clone())?;
+                        candidate_node.set_locks(changed_locks.clone());
+                        let content_limit = self
+                            .core
+                            .policy
+                            .node_max_bytes
+                            .saturating_sub(self.core.policy.split_headroom_bytes);
+                        let (content_len, encoded_len) = match loaded.kind() {
+                            LeafKind::Root(root) => {
+                                let mut root = root.clone();
+                                root.set_node(candidate_node.clone());
+                                (root.content_encoded_len(), root.encoded_len())
+                            }
+                            LeafKind::Node(_) => (
+                                candidate_node.content_encoded_len(),
+                                candidate_node.encoded_len(),
+                            ),
+                        };
+                        let object_full = encoded_len > self.core.policy.node_max_bytes;
+                        let create_full =
+                            admission == StageAdmission::AddsKey && content_len > content_limit;
+                        if object_full || create_full {
+                            self.core.hinter.observe_leaf(path, &candidate_shard);
+                            let outcome = if admission == StageAdmission::AddsKey {
+                                FoldOutcome::LeafFull
+                            } else {
+                                FoldOutcome::Conflict
+                            };
+                            results.push((tx.clone(), outcome));
+                            continue;
+                        }
                         for (k, e) in changes {
                             entries.insert(k, e);
                         }
+                        locks = changed_locks;
                         staged = true;
                         results.push((tx.clone(), outcome));
                     }
@@ -385,7 +464,13 @@ impl CasWorker {
                 match self
                     .core
                     .shards
-                    .store_leaf(path, &new_shard, loaded.kind(), loaded.version.as_ref())
+                    .store_leaf(
+                        path,
+                        &new_shard,
+                        &locks,
+                        loaded.kind(),
+                        loaded.version.as_ref(),
+                    )
                     .await
                 {
                     // Hint the background splitter if this write left the leaf
@@ -465,18 +550,26 @@ impl ShardCoordinator {
     /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
     /// between hold-and-wait re-polls of a conflicting holder.
     pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
-        Self::with_hinter(shards, resolver, tmon, retry, Arc::new(NoSplitHints))
+        Self::with_hinter(
+            shards,
+            resolver,
+            tmon,
+            retry,
+            SplitPolicy::default(),
+            Arc::new(NoSplitHints),
+        )
     }
 
     /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
-    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). The
-    /// coordinator only emits leaf-write events; the soft-cap policy and the
-    /// candidate queue live behind the seam, so it never names the splitter.
+    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `policy`
+    /// governs the coordinator's hard node-size limit; the hinting seam carries
+    /// only leaf-write observations and never exposes splitter configuration.
     pub fn with_hinter(
         shards: ShardStore,
         resolver: Resolver,
         tmon: Monitor,
         retry: RetryConfig,
+        policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
     ) -> Self {
         let core = Arc::new(CoordCore {
@@ -485,6 +578,7 @@ impl ShardCoordinator {
             resolver,
             retry,
             stats: Stats::default(),
+            policy,
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
@@ -609,6 +703,14 @@ mod tests {
     // seed the cache the coordinator reads). The returned `Background` must be
     // kept alive for the monitor's lifetime.
     fn coord_over(backend: Arc<dyn Backend>) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+        coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints))
+    }
+
+    fn coord_over_with(
+        backend: Arc<dyn Backend>,
+        policy: SplitPolicy,
+        hinter: Arc<dyn SplitHinter>,
+    ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
         let cache = SharedCache::new(1 << 20);
         let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(backend, &cache);
@@ -617,7 +719,14 @@ mod tests {
         let mon = Monitor::new(values, tl, Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord = ShardCoordinator::new(shards.clone(), resolver, mon, RetryConfig::default());
+        let coord = ShardCoordinator::with_hinter(
+            shards.clone(),
+            resolver,
+            mon,
+            RetryConfig::default(),
+            policy,
+            hinter,
+        );
         (coord, shards, bg)
     }
 
@@ -649,7 +758,13 @@ mod tests {
         let shard = Shard::from_entries(entries);
         assert!(
             store
-                .store_leaf(path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -686,6 +801,7 @@ mod tests {
     struct StageLock {
         key: Vec<u8>,
         tx: TxId,
+        admission: StageAdmission,
     }
 
     #[async_trait::async_trait]
@@ -694,16 +810,26 @@ mod tests {
             &self,
             _ctx: &ResolveCtx<'_>,
             staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let mut e = staged
                 .get(&self.key)
                 .cloned()
                 .unwrap_or_else(|| entry(&self.key, LockType::None, None, None));
-            e.lock_type = LockType::Write;
+            e.lock_type = if self.admission == StageAdmission::AddsKey {
+                LockType::Create
+            } else {
+                LockType::Write
+            };
             e.locked_by = vec![self.tx.clone()];
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
-                outcome: FoldOutcome::Locked(LockType::Write),
+                locks: staged_locks.clone(),
+                admission: self.admission,
+                outcome: FoldOutcome::Locked {
+                    typ: LockType::Write,
+                    membership: LockType::None,
+                },
             })
         }
 
@@ -729,6 +855,7 @@ mod tests {
             &self,
             _ctx: &ResolveCtx<'_>,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             Ok(Step::Skip {
                 outcome: FoldOutcome::Released {
@@ -765,6 +892,7 @@ mod tests {
             &self,
             _ctx: &ResolveCtx<'_>,
             staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             self.trace
                 .lock()
@@ -775,6 +903,8 @@ mod tests {
                     self.key.clone(),
                     entry(&self.key, LockType::None, None, Some(&self.tx)),
                 )],
+                locks: staged_locks.clone(),
+                admission: StageAdmission::ExistingKeys,
                 outcome: FoldOutcome::Landed,
             })
         }
@@ -830,6 +960,17 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct HintCounter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SplitHinter for HintCounter {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     // A resolver that stages entries drives one CAS, and the staged entry is
     // durable — the coordinator loads, folds, and CASes the returned state.
     #[tokio::test]
@@ -845,12 +986,13 @@ mod tests {
                 Arc::new(StageLock {
                     key: b"k".to_vec(),
                     tx: tx.clone(),
+                    admission: StageAdmission::ExistingKeys,
                 }),
                 Freshness::Latest,
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Locked(_))));
+        assert!(matches!(out, Some(FoldOutcome::Locked { .. })));
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -870,14 +1012,14 @@ mod tests {
 
         // Seed the leaf as a shrunk left half: it owns keys < "m" and links to a
         // right sibling. "z" now lives in that sibling, not here.
-        let mut node = Node::leaf(Shard::from_entries([entry(
+        let node = Node::leaf(Shard::from_entries([entry(
             b"a",
             LockType::None,
             None,
             None,
-        )]));
-        node.set_high_key(Some(b"m".to_vec()));
-        node.set_right_sibling(Some("R".to_string()));
+        )]))
+        .with_high_key(Some(b"m".to_vec()))
+        .with_right_sibling(Some("R".to_string()));
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
 
         let tx = TxId::with_priority(1, b"t");
@@ -888,6 +1030,7 @@ mod tests {
                 Arc::new(StageLock {
                     key: b"z".to_vec(),
                     tx: tx.clone(),
+                    admission: StageAdmission::ExistingKeys,
                 }),
                 Freshness::Latest,
             )
@@ -915,8 +1058,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, store, _bg) = coord_over(backend.clone());
 
-        let mut node = Node::leaf(Shard::new());
-        node.set_high_key(Some(b"m".to_vec()));
+        let node = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
 
         let tx = TxId::with_priority(1, b"t");
@@ -927,12 +1069,13 @@ mod tests {
                 Arc::new(StageLock {
                     key: b"a".to_vec(),
                     tx: tx.clone(),
+                    admission: StageAdmission::ExistingKeys,
                 }),
                 Freshness::Latest,
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Locked(_))));
+        assert!(matches!(out, Some(FoldOutcome::Locked { .. })));
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -987,6 +1130,7 @@ mod tests {
                 Arc::new(StageLock {
                     key: b"lock".to_vec(),
                     tx: tx.clone(),
+                    admission: StageAdmission::ExistingKeys,
                 }),
                 Freshness::Latest,
             )
@@ -1126,6 +1270,105 @@ mod tests {
         );
     }
 
+    // Capacity is a member-local result: a create that crosses the reserved
+    // content limit is rejected and re-hinted, while an overwrite already
+    // staged in the same merged round still lands. Existing-key mutations may
+    // consume the reserved headroom, but the absolute object limit still holds.
+    #[tokio::test(start_paused = true)]
+    async fn leaf_full_create_does_not_poison_merged_overwrite() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let recorder = Arc::new(RecordingBackend::new(backend));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = recorder;
+
+        let writer = TxId::with_priority(0, b"writer");
+        let old = TxId::with_priority(1, b"old");
+        let young = TxId::with_priority(2, b"young");
+        let seed = entry(b"a", LockType::None, None, Some(&writer));
+        let mut overwritten = seed.clone();
+        overwritten.lock_type = LockType::Write;
+        overwritten.locked_by = vec![old.clone()];
+        let created = entry(b"z", LockType::Create, Some(&young), None);
+
+        let base_len = Node::leaf(Shard::from_entries([seed.clone()])).content_encoded_len();
+        let overwrite_len =
+            Node::leaf(Shard::from_entries([overwritten.clone()])).content_encoded_len();
+        let full_node = Node::leaf(Shard::from_entries([overwritten, created]));
+        let content_limit = overwrite_len - 1;
+        assert!(base_len <= content_limit);
+        assert!(overwrite_len > content_limit);
+        assert!(full_node.content_encoded_len() > content_limit);
+
+        let node_max_bytes = full_node.encoded_len() + 64;
+        let policy = SplitPolicy {
+            node_max_bytes,
+            split_headroom_bytes: node_max_bytes - content_limit,
+            ..SplitPolicy::default()
+        };
+        let hints = Arc::new(HintCounter::default());
+        let (coord, shards, _bg) = coord_over_with(backend.clone(), policy, hints.clone());
+        store_shard_entries(&shards, &leaf(), vec![seed]).await;
+        log.lock().unwrap().clear();
+
+        gate.arm();
+        let (c1, t1) = (coord.clone(), old.clone());
+        let overwrite = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(StageLock {
+                    key: b"a".to_vec(),
+                    tx: t1.clone(),
+                    admission: StageAdmission::ExistingKeys,
+                }),
+                Freshness::Latest,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+
+        let (c2, t2) = (coord.clone(), young.clone());
+        let create = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(StageLock {
+                    key: b"z".to_vec(),
+                    tx: t2.clone(),
+                    admission: StageAdmission::AddsKey,
+                }),
+                Freshness::Latest,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(matches!(
+            overwrite.await.unwrap().unwrap(),
+            Some(FoldOutcome::Locked { .. })
+        ));
+        assert!(matches!(
+            create.await.unwrap().unwrap(),
+            Some(FoldOutcome::LeafFull)
+        ));
+        assert_eq!(shard_stores(&log), 1, "the admitted member still lands");
+        assert_eq!(
+            hints.calls.load(Ordering::SeqCst),
+            2,
+            "one hint follows the admitted store and one re-hints the rejected create"
+        );
+        coord.close().await;
+
+        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        assert_eq!(shard.lookup(b"a").unwrap().locked_by, vec![old]);
+        assert!(
+            shard.lookup(b"z").is_none(),
+            "the full create was not staged"
+        );
+    }
+
     // A submit after shutdown is a cancelled no-op (`Ok(None)`), so best-effort
     // callers treat it as done and acquirers can distinguish it.
     #[tokio::test]
@@ -1188,6 +1431,7 @@ mod tests {
             &self,
             ctx: &ResolveCtx<'_>,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             if self.folds.fetch_add(1, Ordering::SeqCst) < 2 {
                 return Ok(Step::Stage {
@@ -1195,6 +1439,8 @@ mod tests {
                         self.key.clone(),
                         entry(&self.key, LockType::Write, Some(&self.tx), None),
                     )],
+                    locks: staged_locks.clone(),
+                    admission: StageAdmission::ExistingKeys,
                     outcome: FoldOutcome::Landed,
                 });
             }

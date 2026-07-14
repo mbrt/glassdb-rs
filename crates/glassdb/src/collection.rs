@@ -98,7 +98,7 @@ impl Collection {
         self.db.shards.create_root(&self.prefix, &root).await?;
         if let Some((parent, name)) = paths::parent_collection(&self.prefix) {
             self.db
-                .shards
+                .splitter
                 .register_subcollection(&parent, &name)
                 .await?;
         }

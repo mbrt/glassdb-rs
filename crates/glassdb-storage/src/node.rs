@@ -24,7 +24,9 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::shard::Shard;
+use crate::lock::LockType;
+use crate::shard::{Shard, ShardEntry};
+use glassdb_data::TxId;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
 /// root has no token; it lives at the fixed `_i` path.
@@ -143,6 +145,36 @@ pub struct SplitPolicy {
     pub leaf_max_bytes: usize,
     /// Maximum index children (fan-out) before it is a split candidate.
     pub index_max_children: usize,
+    /// Maximum encoded coordination-object size, including transient locks.
+    pub node_max_bytes: usize,
+    /// Bytes reserved for transient node-lock metadata at the hard cap.
+    pub split_headroom_bytes: usize,
+}
+
+impl SplitPolicy {
+    /// Reports whether `key` can fit in both a splittable leaf entry and its
+    /// eventual parent separator under this policy.
+    pub fn key_fits(&self, key: &[u8]) -> bool {
+        let id = TxId::with_priority(0, &[]);
+        let entry = ShardEntry {
+            key: key.to_vec(),
+            lock_type: LockType::Write,
+            locked_by: vec![id.clone()],
+            current_writer: Some(id),
+            deleted: false,
+        };
+        let content_limit = self
+            .node_max_bytes
+            .saturating_sub(self.split_headroom_bytes);
+        let leaf_len = Node::leaf(Shard::from_entries([entry])).content_encoded_len();
+        let token = "x".repeat(24);
+        let index_len = Node::index(IndexNode::from_children([
+            (Vec::new(), token.clone()),
+            (key.to_vec(), token),
+        ]))
+        .content_encoded_len();
+        leaf_len <= content_limit / 2 && index_len <= content_limit
+    }
 }
 
 impl Default for SplitPolicy {
@@ -153,7 +185,185 @@ impl Default for SplitPolicy {
             leaf_max_entries: 256,
             leaf_max_bytes: 256 * 1024,
             index_max_children: 256,
+            node_max_bytes: 1024 * 1024,
+            split_headroom_bytes: 64 * 1024,
         }
+    }
+}
+
+/// One node-level lock and its transaction holders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLock {
+    typ: LockType,
+    locked_by: Vec<TxId>,
+}
+
+impl Default for NodeLock {
+    fn default() -> Self {
+        NodeLock {
+            typ: LockType::None,
+            locked_by: Vec::new(),
+        }
+    }
+}
+
+impl NodeLock {
+    /// Returns the held lock type.
+    pub fn lock_type(&self) -> LockType {
+        self.typ
+    }
+
+    /// Returns the transactions holding the lock.
+    pub fn holders(&self) -> &[TxId] {
+        &self.locked_by
+    }
+
+    /// Reports whether `id` holds this lock.
+    pub fn contains(&self, id: &TxId) -> bool {
+        self.locked_by.contains(id)
+    }
+
+    fn add_reader(&mut self, id: TxId) {
+        if !self.contains(&id) {
+            self.locked_by.push(id);
+            self.locked_by.sort();
+        }
+        self.typ = LockType::Read;
+    }
+
+    fn set_writer(&mut self, id: TxId) {
+        self.typ = LockType::Write;
+        self.locked_by = vec![id];
+    }
+
+    fn remove(&mut self, id: &TxId) -> bool {
+        let old_len = self.locked_by.len();
+        self.locked_by.retain(|holder| holder != id);
+        if self.locked_by.is_empty() {
+            self.typ = LockType::None;
+        }
+        self.locked_by.len() != old_len
+    }
+
+    fn clear(&mut self) {
+        self.typ = LockType::None;
+        self.locked_by.clear();
+    }
+
+    fn to_pb(&self) -> pb::NodeLock {
+        let mut locked_by: Vec<Vec<u8>> = self
+            .locked_by
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect();
+        locked_by.sort();
+        pb::NodeLock {
+            lock_type: lock_type_to_proto(self.typ) as i32,
+            locked_by,
+        }
+    }
+
+    fn from_pb(raw: Option<pb::NodeLock>) -> Self {
+        let Some(raw) = raw else {
+            return NodeLock::default();
+        };
+        let typ = lock_type_from_proto(raw.lock_type);
+        NodeLock {
+            typ: if typ == LockType::Unknown && raw.locked_by.is_empty() {
+                LockType::None
+            } else {
+                typ
+            },
+            locked_by: raw.locked_by.into_iter().map(TxId::from_bytes).collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.locked_by.is_empty() && matches!(self.typ, LockType::None | LockType::Unknown)
+    }
+}
+
+/// The node-level coordination state threaded through a leaf CAS round.
+///
+/// Keeping this separate from the node's topology prevents transaction-engine
+/// resolvers from replacing bounds, sibling links, or the node body while they
+/// only intend to change locks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeLocks {
+    structure: NodeLock,
+    membership: NodeLock,
+    membership_version: u64,
+}
+
+impl NodeLocks {
+    /// Returns the structure lock guarding the node's physical shape.
+    pub fn structure(&self) -> &NodeLock {
+        &self.structure
+    }
+
+    /// Returns the membership lock guarding a leaf's live key set.
+    pub fn membership(&self) -> &NodeLock {
+        &self.membership
+    }
+
+    /// Returns the membership activity version used by optimistic scans.
+    pub fn membership_version(&self) -> u64 {
+        self.membership_version
+    }
+
+    /// Installs a shared structure holder.
+    pub fn add_structure_reader(&mut self, id: TxId) {
+        self.structure.add_reader(id);
+    }
+
+    /// Installs an exclusive structure holder.
+    pub fn set_structure_writer(&mut self, id: TxId) {
+        self.structure.set_writer(id);
+    }
+
+    /// Removes one structure holder.
+    pub fn remove_structure_holder(&mut self, id: &TxId) -> bool {
+        self.structure.remove(id)
+    }
+
+    /// Installs a shared membership holder without recording write activity.
+    pub fn add_membership_reader(&mut self, id: TxId) {
+        self.membership.add_reader(id);
+    }
+
+    /// Installs an exclusive membership holder and records the activity.
+    pub fn set_membership_writer(&mut self, id: TxId) {
+        if self.membership.lock_type() == LockType::Write
+            && self.membership.holders() == std::slice::from_ref(&id)
+        {
+            return;
+        }
+        self.membership.set_writer(id);
+        self.membership_version = self.membership_version.wrapping_add(1);
+    }
+
+    /// Removes one membership holder and records released write activity.
+    pub fn remove_membership_holder(&mut self, id: &TxId) -> bool {
+        let was_writer =
+            self.membership.lock_type() == LockType::Write && self.membership.contains(id);
+        let removed = self.membership.remove(id);
+        if removed && was_writer {
+            self.membership_version = self.membership_version.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// Removes all node-level holds belonging to `id`.
+    pub fn release(&mut self, id: &TxId) -> bool {
+        let structure_changed = self.remove_structure_holder(id);
+        let membership_changed = self.remove_membership_holder(id);
+        structure_changed || membership_changed
+    }
+
+    /// Clears transient holders while preserving the membership version.
+    fn clear_holders(&mut self) {
+        self.structure.clear();
+        self.membership.clear();
     }
 }
 
@@ -176,6 +386,7 @@ pub struct Node {
     /// Right-sibling token at the same level; `None` means none (rightmost).
     right_sibling: Option<NodeToken>,
     body: NodeBody,
+    locks: NodeLocks,
 }
 
 impl Node {
@@ -186,6 +397,7 @@ impl Node {
             high_key: None,
             right_sibling: None,
             body: NodeBody::Leaf(shard),
+            locks: NodeLocks::default(),
         }
     }
 
@@ -195,17 +407,22 @@ impl Node {
             high_key: None,
             right_sibling: None,
             body: NodeBody::Index(index),
+            locks: NodeLocks::default(),
         }
     }
 
-    /// Sets the exclusive upper bound of the owned range (`None` = +infinity).
-    pub fn set_high_key(&mut self, high_key: Option<Vec<u8>>) {
+    /// Returns the node with the given exclusive upper range bound.
+    #[must_use]
+    pub fn with_high_key(mut self, high_key: Option<Vec<u8>>) -> Self {
         self.high_key = high_key;
+        self
     }
 
-    /// Sets the right-sibling token (`None` = none).
-    pub fn set_right_sibling(&mut self, right_sibling: Option<NodeToken>) {
+    /// Returns the node with the given right-sibling link.
+    #[must_use]
+    pub fn with_right_sibling(mut self, right_sibling: Option<NodeToken>) -> Self {
         self.right_sibling = right_sibling;
+        self
     }
 
     /// The exclusive upper bound of the owned range, or `None` for +infinity.
@@ -222,6 +439,98 @@ impl Node {
     /// The node body.
     pub fn body(&self) -> &NodeBody {
         &self.body
+    }
+
+    /// Replaces the leaf body while preserving bounds and node coordination.
+    pub fn set_leaf(&mut self, shard: Shard) -> Result<(), StorageError> {
+        if matches!(self.body, NodeBody::Leaf(_)) {
+            self.body = NodeBody::Leaf(shard);
+            Ok(())
+        } else {
+            Err(StorageError::other("node is not a leaf"))
+        }
+    }
+
+    /// Replaces the index body while preserving bounds and node coordination.
+    pub fn set_index(&mut self, index: IndexNode) -> Result<(), StorageError> {
+        if matches!(self.body, NodeBody::Index(_)) {
+            self.body = NodeBody::Index(index);
+            Ok(())
+        } else {
+            Err(StorageError::other("node is not an index"))
+        }
+    }
+
+    /// Returns the node's structure lock.
+    pub fn structure_lock(&self) -> &NodeLock {
+        self.locks.structure()
+    }
+
+    /// Returns the complete node-level coordination state.
+    pub fn locks(&self) -> &NodeLocks {
+        &self.locks
+    }
+
+    /// Returns the mutable node-level coordination state.
+    pub(crate) fn locks_mut(&mut self) -> &mut NodeLocks {
+        &mut self.locks
+    }
+
+    /// Replaces the node-level coordination state.
+    pub fn set_locks(&mut self, locks: NodeLocks) {
+        self.locks = locks;
+    }
+
+    /// Installs a structure-read holder.
+    pub fn add_structure_reader(&mut self, id: TxId) {
+        self.locks.add_structure_reader(id);
+    }
+
+    /// Installs a structure-write holder.
+    pub fn set_structure_writer(&mut self, id: TxId) {
+        self.locks.set_structure_writer(id);
+    }
+
+    /// Removes a structure-lock holder.
+    pub fn remove_structure_holder(&mut self, id: &TxId) -> bool {
+        self.locks.remove_structure_holder(id)
+    }
+
+    /// Returns the leaf membership lock.
+    pub fn membership_lock(&self) -> &NodeLock {
+        self.locks.membership()
+    }
+
+    /// Installs a membership-read holder without recording membership activity.
+    pub fn add_membership_reader(&mut self, id: TxId) {
+        self.locks.add_membership_reader(id);
+    }
+
+    /// Installs a membership-write holder and records the membership activity.
+    pub fn set_membership_writer(&mut self, id: TxId) {
+        self.locks.set_membership_writer(id);
+    }
+
+    /// Removes a membership-lock holder and records released write activity.
+    pub fn remove_membership_holder(&mut self, id: &TxId) -> bool {
+        self.locks.remove_membership_holder(id)
+    }
+
+    /// Returns the leaf membership activity version.
+    pub fn membership_version(&self) -> u64 {
+        self.locks.membership_version()
+    }
+
+    /// Clears node locks before a split-created node becomes visible.
+    pub(crate) fn clear_node_locks(&mut self) {
+        self.locks.clear_holders();
+    }
+
+    /// Returns the canonical encoded size without transient node locks.
+    pub fn content_encoded_len(&self) -> usize {
+        let mut content = self.clone();
+        content.clear_node_locks();
+        content.encoded_len()
     }
 
     /// The leaf body, or `None` if this is an index node.
@@ -259,9 +568,13 @@ impl Node {
             NodeBody::Leaf(shard) => {
                 shard.len() >= 2
                     && (shard.len() > policy.leaf_max_entries
-                        || self.encode().len() > policy.leaf_max_bytes)
+                        || self.content_encoded_len() > policy.leaf_max_bytes)
             }
-            NodeBody::Index(index) => index.len() >= 2 && index.len() > policy.index_max_children,
+            NodeBody::Index(index) => {
+                index.len() >= 2
+                    && (index.len() > policy.index_max_children
+                        || self.content_encoded_len() > policy.leaf_max_bytes)
+            }
         }
     }
 
@@ -298,6 +611,11 @@ impl Node {
             high_key: self.high_key.take(),
             right_sibling: self.right_sibling.take(),
             body: right_body,
+            locks: {
+                let mut locks = self.locks.clone();
+                locks.clear_holders();
+                locks
+            },
         };
         // The retained lower half is now bounded by the split key and links to
         // the new sibling.
@@ -309,6 +627,11 @@ impl Node {
     /// Encodes the node to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
+    }
+
+    /// Returns the canonical protobuf size without allocating the encoded body.
+    pub fn encoded_len(&self) -> usize {
+        self.to_pb().encoded_len()
     }
 
     /// Decodes a node from its protobuf body. A message with no body is treated
@@ -328,6 +651,11 @@ impl Node {
             high_key: self.high_key.clone().unwrap_or_default(),
             right_sibling: self.right_sibling.clone().unwrap_or_default(),
             body: Some(body),
+            structure_lock: (!self.locks.structure.is_empty())
+                .then(|| self.locks.structure.to_pb()),
+            membership_lock: (!self.locks.membership.is_empty())
+                .then(|| self.locks.membership.to_pb()),
+            membership_version: self.locks.membership_version,
         }
     }
 
@@ -341,7 +669,32 @@ impl Node {
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
             right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
             body,
+            locks: NodeLocks {
+                structure: NodeLock::from_pb(raw.structure_lock),
+                membership: NodeLock::from_pb(raw.membership_lock),
+                membership_version: raw.membership_version,
+            },
         }
+    }
+}
+
+fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
+    match t {
+        LockType::None => pb::lock::LockType::None,
+        LockType::Read => pb::lock::LockType::Read,
+        LockType::Write => pb::lock::LockType::Write,
+        LockType::Create => pb::lock::LockType::Create,
+        LockType::Unknown => pb::lock::LockType::Unknown,
+    }
+}
+
+fn lock_type_from_proto(t: i32) -> LockType {
+    match pb::lock::LockType::try_from(t) {
+        Ok(pb::lock::LockType::None) => LockType::None,
+        Ok(pb::lock::LockType::Read) => LockType::Read,
+        Ok(pb::lock::LockType::Write) => LockType::Write,
+        Ok(pb::lock::LockType::Create) => LockType::Create,
+        _ => LockType::Unknown,
     }
 }
 
@@ -366,15 +719,53 @@ mod tests {
 
     #[test]
     fn leaf_round_trip_preserves_bounds() {
-        let mut node = Node::leaf(Shard::from_entries([entry(b"apple", 1), entry(b"cat", 2)]));
-        node.set_high_key(Some(b"m".to_vec()));
-        node.set_right_sibling(Some("sibToken".to_string()));
+        let node = Node::leaf(Shard::from_entries([entry(b"apple", 1), entry(b"cat", 2)]))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some("sibToken".to_string()));
 
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded, node);
         assert_eq!(decoded.high_key(), Some(b"m".as_slice()));
         assert_eq!(decoded.right_sibling(), Some("sibToken"));
         assert!(decoded.as_leaf().is_some());
+    }
+
+    #[test]
+    fn round_trip_preserves_node_locks_and_membership_version() {
+        let reader = TxId::from_bytes(vec![2]);
+        let writer = TxId::from_bytes(vec![1]);
+        let mut node = Node::leaf(Shard::new());
+        node.add_structure_reader(reader.clone());
+        node.set_membership_writer(writer.clone());
+
+        let decoded = Node::decode(&node.encode()).unwrap();
+        assert_eq!(decoded.structure_lock().holders(), &[reader]);
+        assert_eq!(decoded.membership_lock().holders(), &[writer]);
+        assert_eq!(decoded.membership_version(), 1);
+    }
+
+    #[test]
+    fn membership_version_tracks_write_lock_activity() {
+        let id = TxId::from_bytes(vec![1]);
+        let mut node = Node::leaf(Shard::new());
+
+        node.add_membership_reader(id.clone());
+        assert_eq!(node.membership_version(), 0);
+        assert!(node.remove_membership_holder(&id));
+        assert_eq!(node.membership_version(), 0);
+
+        node.set_membership_writer(id.clone());
+        assert_eq!(node.membership_version(), 1);
+        node.set_membership_writer(id.clone());
+        assert_eq!(node.membership_version(), 1);
+        assert!(node.remove_membership_holder(&id));
+        assert_eq!(node.membership_version(), 2);
+        assert!(!node.remove_membership_holder(&id));
+        assert_eq!(node.membership_version(), 2);
+
+        node.locks.membership_version = u64::MAX;
+        node.set_membership_writer(id);
+        assert_eq!(node.membership_version(), 0);
     }
 
     #[test]
@@ -406,9 +797,9 @@ mod tests {
             entry(b"cat", 2),
             entry(b"mango", 3),
             entry(b"pear", 4),
-        ]));
-        src.set_high_key(Some(b"tiger".to_vec()));
-        src.set_right_sibling(Some("oldRight".to_string()));
+        ]))
+        .with_high_key(Some(b"tiger".to_vec()))
+        .with_right_sibling(Some("oldRight".to_string()));
 
         let (right, split_key) = src.split("newRight").expect("splittable");
         assert_eq!(split_key, b"mango");
@@ -484,6 +875,7 @@ mod tests {
             leaf_max_entries: 2,
             leaf_max_bytes: 1 << 20,
             index_max_children: 2,
+            ..SplitPolicy::default()
         };
         let two = Node::leaf(Shard::from_entries([entry(b"a", 1), entry(b"b", 2)]));
         assert!(!two.over_soft_cap(&tiny), "at the cap is not over it");
@@ -498,6 +890,7 @@ mod tests {
             leaf_max_entries: 1000,
             leaf_max_bytes: 1,
             index_max_children: 1000,
+            ..SplitPolicy::default()
         };
         assert!(!Node::leaf(Shard::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy));
         assert!(
@@ -511,8 +904,7 @@ mod tests {
         let plus_inf = Node::leaf(Shard::new());
         assert!(plus_inf.owns(b"anything"));
 
-        let mut bounded = Node::leaf(Shard::new());
-        bounded.set_high_key(Some(b"m".to_vec()));
+        let bounded = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
         assert!(bounded.owns(b"apple"));
         // The high-key is an exclusive upper bound.
         assert!(!bounded.owns(b"m"));
@@ -548,6 +940,40 @@ mod tests {
     // Changing the on-disk format must break these tests.
     #[test]
     fn golden_leaf_encoding() {
+        let node = Node::leaf(Shard::from_entries([ShardEntry {
+            key: b"Hello".to_vec(),
+            lock_type: LockType::Write,
+            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
+            current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
+            deleted: false,
+        }]))
+        .with_high_key(Some(b"m".to_vec()))
+        .with_right_sibling(Some("sib".to_string()));
+        let got = node.encode();
+        let want = [
+            0x0a, 0x01, 0x6d, 0x12, 0x03, 0x73, 0x69, 0x62, 0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05,
+            0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04, 0x22,
+            0x02, 0xaa, 0xbb,
+        ];
+        assert_eq!(node.encoded_len(), got.len());
+        assert_eq!(got, want, "leaf node encoding drifted: {got:02x?}");
+    }
+
+    #[test]
+    fn released_node_lock_is_omitted_from_encoding() {
+        let never_locked = Node::leaf(Shard::from_entries([entry(b"a", 1)]));
+        let mut released = never_locked.clone();
+        let holder = TxId::from_bytes(vec![0x11]);
+        released.add_structure_reader(holder.clone());
+        assert!(released.remove_structure_holder(&holder));
+        assert_eq!(released.encode(), never_locked.encode());
+    }
+
+    // Golden vector for the ADR-032 node-lock fields. Changing their tags,
+    // lock-type values, holder encoding, or membership-version encoding must
+    // break this test.
+    #[test]
+    fn golden_node_locks_encoding() {
         let mut node = Node::leaf(Shard::from_entries([ShardEntry {
             key: b"Hello".to_vec(),
             lock_type: LockType::Write,
@@ -555,15 +981,17 @@ mod tests {
             current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
             deleted: false,
         }]));
-        node.set_high_key(Some(b"m".to_vec()));
-        node.set_right_sibling(Some("sib".to_string()));
+        node.add_structure_reader(TxId::from_bytes(vec![0x11]));
+        node.set_membership_writer(TxId::from_bytes(vec![0x22]));
+
         let got = node.encode();
         let want = [
-            0x0a, 0x01, 0x6d, 0x12, 0x03, 0x73, 0x69, 0x62, 0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05,
-            0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04, 0x22,
-            0x02, 0xaa, 0xbb,
+            0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
+            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x02, 0xaa, 0xbb, 0x2a, 0x05, 0x08, 0x02, 0x12,
+            0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38, 0x01,
         ];
-        assert_eq!(got, want, "leaf node encoding drifted: {got:02x?}");
+        assert_eq!(node.encoded_len(), got.len());
+        assert_eq!(got, want, "node-lock encoding drifted: {got:02x?}");
     }
 
     #[test]
@@ -577,6 +1005,7 @@ mod tests {
             0x22, 0x0f, 0x0a, 0x04, 0x12, 0x02, 0x4c, 0x30, 0x0a, 0x07, 0x0a, 0x01, 0x6d, 0x12,
             0x02, 0x4c, 0x31,
         ];
+        assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "index node encoding drifted: {got:02x?}");
     }
 }

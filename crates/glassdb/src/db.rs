@@ -81,7 +81,7 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Overrides the soft-cap policy that triggers a background leaf/index split.
+    /// Overrides the node sizing policy, including split triggers and hard cap.
     pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
         self.split_policy = policy;
         self
@@ -135,16 +135,17 @@ impl DatabaseBuilder {
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        // Build the splitter first so the coordinator can report over-cap leaf
-        // writes into its queue through the SplitHinter seam (ADR-031); the
-        // coordinator never names the splitter or its candidate feed.
-        let splitter = Splitter::with_policy(bg_weak.clone(), shards.clone(), split_policy);
-        let coord = ShardCoordinator::with_hinter(
+        // Build the coordinator and splitter as a co-wired pair over one shared
+        // candidate feed: leaf writes report split candidates into the feed,
+        // while leaf splits acquire through the same coordinator.
+        let (coord, splitter) = Splitter::with_coordinator(
+            bg_weak.clone(),
             shards.clone(),
-            resolver.clone(),
             tmon.clone(),
+            clock.clone(),
             retry,
-            splitter.hinter(),
+            &name,
+            split_policy,
         );
         let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
         let gc = Gc::new(
@@ -154,7 +155,6 @@ impl DatabaseBuilder {
             locker.clone(),
             tmon.clone(),
             clock.clone(),
-            &name,
         );
         gc.start();
         splitter.start();
@@ -167,6 +167,7 @@ impl DatabaseBuilder {
             gc,
             Some(bg_weak),
             resolver,
+            split_policy,
         );
 
         let inner = Arc::new(DbInner {
@@ -178,6 +179,7 @@ impl DatabaseBuilder {
             algo,
             coord,
             locker,
+            splitter,
             retry,
             stats: Mutex::new(Stats::default()),
             shutting_down: AtomicBool::new(false),
@@ -209,6 +211,7 @@ pub(crate) struct DbInner {
     pub(crate) algo: Algo,
     pub(crate) coord: ShardCoordinator,
     pub(crate) locker: Locker,
+    pub(crate) splitter: Splitter,
     pub(crate) retry: RetryConfig,
     stats: Mutex<Stats>,
     // Graceful-shutdown bookkeeping. `shutting_down` flips first so any

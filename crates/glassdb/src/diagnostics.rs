@@ -47,7 +47,7 @@ impl fmt::Display for Diagnostics {
         for t in &self.transactions {
             writeln!(f, "    {} ({} locks)", t.tx_id, t.locks.len())?;
             for l in &t.locks {
-                writeln!(f, "      {} {}", l.typ, l.path)?;
+                writeln!(f, "      {} {} {}", l.scope, l.typ, l.path)?;
             }
         }
         Ok(())

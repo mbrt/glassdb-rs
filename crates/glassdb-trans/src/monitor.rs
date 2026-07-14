@@ -263,9 +263,11 @@ impl Monitor {
     pub(crate) async fn abort_tx(&self, tid: &TxId) -> Result<(), TransError> {
         self.stop_tx_refresh(tid);
 
-        let res = self
-            .set_final_log(&TxLog::new(tid.clone(), TxCommitStatus::Aborted))
-            .await;
+        let mut log = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+        if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
+            log.locks = entry.locks.clone();
+        }
+        let res = self.set_final_log(&log).await;
 
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid);
@@ -451,7 +453,13 @@ impl Monitor {
         tid: &TxId,
         expected: &backend::Version,
     ) -> Result<TxCommitStatus, TransError> {
-        let tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+        let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+        if !expected.is_unset()
+            && let Ok((current, _)) = self.inner.tl.get(tid).await
+        {
+            tlog.writes = current.writes;
+            tlog.locks = current.locks;
+        }
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
@@ -755,7 +763,6 @@ impl Monitor {
                 .get(&tid)
                 .map(|e| e.locks.clone())
                 .unwrap_or_default();
-
             let r = if last_version.is_unset() {
                 // First materialization: create-if-absent so a pre-existing
                 // `aborted` object (an older peer's wound) wins.
@@ -810,7 +817,9 @@ mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
-    use glassdb_storage::{LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache};
+    use glassdb_storage::{
+        LockScope, LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache,
+    };
 
     struct TestCtx {
         tl: TLogger,
@@ -874,6 +883,7 @@ mod tests {
         tl.locks = vec![PathLock {
             path: key,
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
@@ -896,6 +906,7 @@ mod tests {
         tl.locks = vec![PathLock {
             path: key.clone(),
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
 
@@ -980,6 +991,7 @@ mod tests {
         let locks = vec![PathLock {
             path: paths::from_key("example", b"k"),
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }];
         mon.begin_tx(&tx);
         mon.record_tx_locks(&tx, locks.clone());

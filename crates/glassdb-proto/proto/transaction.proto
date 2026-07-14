@@ -48,8 +48,21 @@ message Lock {
         CREATE = 4;
     }
 
+    enum Scope {
+        UNKNOWN_SCOPE = 0;
+        ENTRY = 1;
+        STRUCTURE = 2;
+        MEMBERSHIP = 3;
+    }
+
     string suffix = 1;
     LockType lock_type = 2;
+    Scope scope = 3;
+}
+
+message NodeLock {
+    Lock.LockType lock_type = 1;
+    repeated bytes locked_by = 2;
 }
 
 // A shard object: the coordination directory (lock table, MVCC current-writer
@@ -90,6 +103,20 @@ message Node {
         // An index node: separator keys mapping ranges to child nodes.
         IndexNode index = 4;
     }
+    NodeLock structure_lock = 5;
+    NodeLock membership_lock = 6;
+    uint64 membership_version = 7;
+}
+
+// A split write-ahead record. It lives at `{db}/_s/<record_id>` until the
+// created nodes are either reachable or reclaimed.
+message StructuralLog {
+    string prefix = 1;
+    string source_token = 2;
+    string source_version = 3;
+    repeated string created_tokens = 4;
+    bytes split_key = 5;
+    bool is_root = 6;
 }
 
 // An index node body: an ordered list of separator entries. The child owning a

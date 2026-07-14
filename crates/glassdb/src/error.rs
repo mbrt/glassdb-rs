@@ -126,6 +126,7 @@ impl From<TransError> for Error {
         match e {
             TransError::Storage(s) => s.into(),
             TransError::AlreadyFinalized => Error::AlreadyFinalized,
+            TransError::InvalidInput(msg) => Error::InvalidInput(msg),
             TransError::Other { msg, source } => Error::Internal { msg, source },
             TransError::Retry
             | TransError::Wounded

@@ -90,6 +90,22 @@ pub struct TxStatus {
 pub struct PathLock {
     pub path: String,
     pub typ: LockType,
+    pub scope: LockScope,
+}
+
+/// The coordination namespace a transaction-log lock backreference belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LockScope {
+    #[default]
+    Entry,
+    Structure,
+    Membership,
+}
+
+impl std::fmt::Display for LockScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 
 /// Reads and writes transaction logs under a path prefix.
@@ -271,12 +287,14 @@ fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog,
                 res.locks.push(PathLock {
                     path: paths::collection_info(&cw.prefix),
                     typ: parse_lock_type(clt),
+                    scope: LockScope::Entry,
                 });
             }
             for l in &locks.locks {
                 res.locks.push(PathLock {
                     path: format!("{}/{}", cw.prefix, l.suffix),
                     typ: parse_lock_type(l.lock_type),
+                    scope: parse_lock_scope(l.scope),
                 });
             }
         }
@@ -364,15 +382,36 @@ fn marshal_lock(
         });
     let clocks = coll.locks.get_or_insert_with(pb::CollectionLocks::default);
 
-    if pr.typ == paths::Type::CollectionInfo {
+    if pr.typ == paths::Type::CollectionInfo && e.scope == LockScope::Entry {
         clocks.collection_lock = lt as i32;
     } else {
         clocks.locks.push(pb::Lock {
-            suffix: format!("{}/{}", pr.typ.as_str(), pr.suffix),
+            suffix: if pr.suffix.is_empty() {
+                pr.typ.as_str().to_string()
+            } else {
+                format!("{}/{}", pr.typ.as_str(), pr.suffix)
+            },
             lock_type: lt as i32,
+            scope: lock_scope_to_proto(e.scope) as i32,
         });
     }
     Ok(())
+}
+
+fn lock_scope_to_proto(scope: LockScope) -> pb::lock::Scope {
+    match scope {
+        LockScope::Entry => pb::lock::Scope::Entry,
+        LockScope::Structure => pb::lock::Scope::Structure,
+        LockScope::Membership => pb::lock::Scope::Membership,
+    }
+}
+
+fn parse_lock_scope(scope: i32) -> LockScope {
+    match pb::lock::Scope::try_from(scope) {
+        Ok(pb::lock::Scope::Structure) => LockScope::Structure,
+        Ok(pb::lock::Scope::Membership) => LockScope::Membership,
+        _ => LockScope::Entry,
+    }
 }
 
 fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
@@ -473,10 +512,12 @@ mod tests {
                 PathLock {
                     path: paths::collection_info("db/root"),
                     typ: LockType::Read,
+                    scope: LockScope::Entry,
                 },
                 PathLock {
                     path: key_path.clone(),
                     typ: LockType::Write,
+                    scope: LockScope::Entry,
                 },
             ],
         };
@@ -488,11 +529,13 @@ mod tests {
         // Locks include the collection lock and the key lock.
         assert!(got.locks.contains(&PathLock {
             path: paths::collection_info("db/root"),
-            typ: LockType::Read
+            typ: LockType::Read,
+            scope: LockScope::Entry,
         }));
         assert!(got.locks.contains(&PathLock {
             path: key_path,
-            typ: LockType::Write
+            typ: LockType::Write,
+            scope: LockScope::Entry,
         }));
 
         let status = t.commit_status(&id).await.unwrap();

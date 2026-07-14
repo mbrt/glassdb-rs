@@ -5,6 +5,7 @@ mod algo;
 mod error;
 mod gc;
 mod monitor;
+mod node_locking;
 mod reader;
 mod resolver;
 mod shard_coord;

@@ -34,7 +34,7 @@
 //! calls the [`Locker`]'s stateless per-object unlock methods rather than issuing
 //! its own shard/root CAS, so every mutation goes through one place.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
@@ -42,7 +42,8 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Directory, Freshness, PathLock, ShardStore, StorageError, TLogger, TxCommitStatus, TxLog,
+    Directory, Freshness, LockScope, PathLock, ShardStore, StorageError, TLogger, TxCommitStatus,
+    TxLog,
 };
 
 use crate::error::TransError;
@@ -71,7 +72,6 @@ pub struct Gc {
     // `DbInner::background`.
     bg: Weak<Background>,
     tl: TLogger,
-    shards: ShardStore,
     dir: Directory,
     locker: Locker,
     mon: Monitor,
@@ -82,15 +82,6 @@ pub struct Gc {
     // Paged `_t/` list cursor: the last txid visited, so successive cycles walk
     // the flat transaction directory a page at a time and wrap around.
     cursor: Arc<Mutex<Option<TxId>>>,
-    // The database name (leading segment of every collection prefix), so the
-    // orphan sweep can list the durable split-active registry (ADR-031).
-    db_root: String,
-    // Per-collection set of node tokens seen unreferenced in the previous sweep.
-    // The orphan sweep (ADR-031) reclaims a node only once it is unreferenced in
-    // two consecutive sweeps, a generational stand-in for the object mtime the
-    // backend does not expose — a full GC cycle exceeds any split's duration, so
-    // an in-progress sibling is never mistaken for an orphan.
-    orphan_seen: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
 }
 
 impl Gc {
@@ -104,21 +95,17 @@ impl Gc {
         locker: Locker,
         mon: Monitor,
         clock: Clock,
-        db_root: &str,
     ) -> Self {
         let dir = Directory::new(shards.clone());
         Gc {
             bg,
             tl,
-            shards,
             dir,
             locker,
             mon,
             clock,
             hints: Arc::new(Mutex::new(VecDeque::new())),
             cursor: Arc::new(Mutex::new(None)),
-            db_root: db_root.to_string(),
-            orphan_seen: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -176,66 +163,6 @@ impl Gc {
                 tracing::debug!(tx = %tid, error = %e, "gc candidate check deferred");
             }
         }
-
-        self.sweep_orphans().await;
-    }
-
-    /// Reclaims split siblings a crash left dangling (ADR-031): for each
-    /// split-active collection, the node objects not reachable from the root are
-    /// orphans. The split-active set is read from the durable registry, so the
-    /// sweep recovers orphans even in a fresh process that never observed the
-    /// split. To stay safe without an object mtime, a node is deleted only once
-    /// it has been unreferenced in **two consecutive** sweeps — a full
-    /// [`GC_INTERVAL`] exceeds any split's duration, so a sibling created but not
-    /// yet linked is retained until its split completes. Best-effort: a transient
-    /// error only defers a reclaim.
-    async fn sweep_orphans(&self) {
-        let active = match self.shards.list_split_active(&self.db_root).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(error = %e, "listing split-active collections failed");
-                return;
-            }
-        };
-        for prefix in active {
-            if let Err(e) = self.sweep_collection_orphans(&prefix).await {
-                tracing::debug!(prefix = %prefix, error = %e, "orphan sweep deferred");
-            }
-        }
-    }
-
-    /// One collection's orphan sweep (see [`sweep_orphans`]): reclaim the nodes
-    /// unreferenced this cycle *and* the previous one, then record this cycle's
-    /// unreferenced set for the next comparison.
-    ///
-    /// [`sweep_orphans`]: Self::sweep_orphans
-    async fn sweep_collection_orphans(&self, prefix: &str) -> Result<(), TransError> {
-        let listed: BTreeSet<String> = self
-            .shards
-            .list_node_tokens(prefix)
-            .await?
-            .into_iter()
-            .collect();
-        let reachable = self.dir.reachable_tokens(prefix, Freshness::Latest).await?;
-        let unreferenced: BTreeSet<String> = listed.difference(&reachable).cloned().collect();
-
-        let prev = self
-            .orphan_seen
-            .lock()
-            .unwrap()
-            .get(prefix)
-            .cloned()
-            .unwrap_or_default();
-        for token in &unreferenced {
-            if prev.contains(token) {
-                self.shards.delete_node(prefix, token).await?;
-            }
-        }
-        self.orphan_seen
-            .lock()
-            .unwrap()
-            .insert(prefix.to_string(), unreferenced);
-        Ok(())
     }
 
     /// Returns the next page of the flat `{db}/_t/` directory, advancing the
@@ -306,6 +233,7 @@ impl Gc {
         if self.still_referenced(tid, log).await? {
             return Ok(());
         }
+        self.release_locks(tid, &log.locks).await?;
         self.tl.delete(tid).await?;
         Ok(())
     }
@@ -401,12 +329,17 @@ impl Gc {
     /// never touched.
     async fn release_locks(&self, tid: &TxId, locks: &[PathLock]) -> Result<(), TransError> {
         let mut key_locks: Vec<(&str, ())> = Vec::new();
+        let mut leaf_paths = BTreeSet::new();
         for l in locks {
             let Ok(pr) = paths::parse(&l.path) else {
                 continue;
             };
             if pr.typ == paths::Type::Key {
                 key_locks.push((l.path.as_str(), ()));
+            } else if matches!(l.scope, LockScope::Structure | LockScope::Membership)
+                && matches!(pr.typ, paths::Type::CollectionInfo | paths::Type::Node)
+            {
+                leaf_paths.insert(l.path.clone());
             }
         }
         for group in self
@@ -414,7 +347,10 @@ impl Gc {
             .group_keys_by_leaf(key_locks, Freshness::Latest)
             .await?
         {
-            self.locker.release_leaf(tid, &group.path).await?;
+            leaf_paths.insert(group.path);
+        }
+        for path in leaf_paths {
+            self.locker.release_leaf(tid, &path).await?;
         }
         Ok(())
     }
@@ -439,8 +375,8 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_storage::{
-        CollectionRoot, Directory, Freshness, IndexNode, LockType, Node, ObjectCache, Shard,
-        ShardEntry, SharedCache, TxWrite, ValueCache,
+        Directory, Freshness, LockScope, LockType, ObjectCache, Shard, ShardEntry, SharedCache,
+        TxWrite, ValueCache,
     };
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
@@ -484,13 +420,13 @@ mod tests {
             RetryConfig::default(),
         );
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::new(
             shards.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
         );
+        let dir = Directory::new(shards.clone());
         let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
         let gc = Gc::new(
             Arc::downgrade(&bg),
@@ -499,7 +435,6 @@ mod tests {
             locker.clone(),
             mon.clone(),
             clock,
-            "db",
         );
         Ctx {
             gc,
@@ -522,6 +457,7 @@ mod tests {
         PathLock {
             path: key_path(k),
             typ: LockType::Write,
+            scope: LockScope::Entry,
         }
     }
 
@@ -538,7 +474,13 @@ mod tests {
         let shard = Shard::from_entries(entries.into_values());
         assert!(
             shards
-                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -757,7 +699,13 @@ mod tests {
             .unwrap();
         assert!(
             ctx.shards
-                .store_leaf(&shard_path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &shard_path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -813,134 +761,6 @@ mod tests {
         assert_eq!(
             lookup_entry(&ctx.shards, &kb).await.unwrap().locked_by,
             vec![live]
-        );
-    }
-
-    // Seeds a two-node tree: an index root pointing at the reachable leaf `leaf`.
-    async fn seed_index_root(shards: &ShardStore, leaf: &str) {
-        shards
-            .store_node(COLL, leaf, &Node::leaf(Shard::new()), None)
-            .await
-            .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            leaf.to_string(),
-        )])));
-        shards.create_root(COLL, &root).await.unwrap();
-    }
-
-    // Writes a standalone node object that nothing references — a split sibling a
-    // crash left dangling.
-    async fn seed_orphan(shards: &ShardStore, token: &str) {
-        shards
-            .store_node(COLL, token, &Node::leaf(Shard::new()), None)
-            .await
-            .unwrap();
-    }
-
-    async fn node_exists(shards: &ShardStore, token: &str) -> bool {
-        shards
-            .load_node(COLL, token, Freshness::Latest)
-            .await
-            .is_ok()
-    }
-
-    // A node object unreachable from the root is an orphan, but it is reclaimed
-    // only after it has been seen unreferenced in two consecutive sweeps — the
-    // generational safety horizon that stands in for the missing object mtime
-    // (ADR-031). The reachable leaf is never touched.
-    #[tokio::test(start_paused = true)]
-    async fn orphan_node_reclaimed_after_two_consecutive_sweeps() {
-        let ctx = new_ctx();
-        seed_index_root(&ctx.shards, "L").await;
-        seed_orphan(&ctx.shards, "ORPH").await;
-        ctx.shards.mark_split_active(COLL).await.unwrap();
-
-        // First sweep: the orphan is only seen once, so it is retained.
-        ctx.gc.run_once().await;
-        assert!(
-            node_exists(&ctx.shards, "ORPH").await,
-            "not reclaimed on first sighting"
-        );
-
-        // Second sweep: unreferenced twice running, so it is reclaimed.
-        ctx.gc.run_once().await;
-        assert!(
-            !node_exists(&ctx.shards, "ORPH").await,
-            "reclaimed after two consecutive sweeps"
-        );
-        assert!(
-            node_exists(&ctx.shards, "L").await,
-            "the reachable leaf is never reclaimed"
-        );
-    }
-
-    // A sibling that becomes reachable (its split completes) between two sweeps is
-    // retained: the generational rule only deletes what is unreferenced in *both*
-    // cycles, so an in-progress split is never mistaken for an orphan.
-    #[tokio::test(start_paused = true)]
-    async fn sibling_linked_before_second_sweep_is_kept() {
-        let ctx = new_ctx();
-        seed_index_root(&ctx.shards, "L").await;
-        seed_orphan(&ctx.shards, "R").await;
-        ctx.shards.mark_split_active(COLL).await.unwrap();
-
-        // First sweep observes R unreferenced.
-        ctx.gc.run_once().await;
-
-        // The split completes: the root now references R too.
-        let (mut root, ver) = ctx.shards.load_root(COLL).await.unwrap();
-        root.set_node(Node::index(IndexNode::from_children([
-            (Vec::new(), "L".to_string()),
-            (b"m".to_vec(), "R".to_string()),
-        ])));
-        assert!(ctx.shards.store_root(COLL, &root, &ver).await.unwrap());
-
-        // Second sweep sees R reachable, so it is kept despite the prior sighting.
-        ctx.gc.run_once().await;
-        assert!(
-            node_exists(&ctx.shards, "R").await,
-            "a newly linked sibling must not be reclaimed"
-        );
-    }
-
-    // ADR-031 crash/restart recovery: an orphan a split left behind must be
-    // reclaimed even by a fresh process that never observed the split. The split
-    // marks the collection active in the durable registry *before* creating any
-    // node, so a brand-new `Gc` — with an empty in-memory state and no
-    // `note_active` — rediscovers the collection from the registry and reclaims
-    // the orphan after the two generational sweeps. Two independent cache views
-    // over one backend model the crash and restart.
-    #[tokio::test(start_paused = true)]
-    async fn orphan_reclaimed_after_restart_via_durable_registry() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-
-        // Process 1: a split marked the collection active and created a sibling,
-        // then crashed before linking it.
-        let p1 = new_ctx_with(backend.clone());
-        seed_index_root(&p1.shards, "L").await;
-        seed_orphan(&p1.shards, "ORPH").await;
-        p1.shards.mark_split_active(COLL).await.unwrap();
-        drop(p1);
-
-        // Process 2: a fresh GC that never observed the split rediscovers the
-        // collection from the durable registry and reclaims the orphan after the
-        // two generational sweeps.
-        let p2 = new_ctx_with(backend);
-        p2.gc.run_once().await;
-        assert!(
-            node_exists(&p2.shards, "ORPH").await,
-            "retained on the first post-restart sighting"
-        );
-        p2.gc.run_once().await;
-        assert!(
-            !node_exists(&p2.shards, "ORPH").await,
-            "reclaimed after two consecutive sweeps in the fresh process"
-        );
-        assert!(
-            node_exists(&p2.shards, "L").await,
-            "the reachable leaf is never reclaimed"
         );
     }
 

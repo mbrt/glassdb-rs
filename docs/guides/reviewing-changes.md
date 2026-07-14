@@ -27,19 +27,21 @@ its rightful owner?**
   same module, even if orchestrated from elsewhere.
 - For each responsibility touched by the diff, ask "who owns this?" and push back
   on anything that belongs to a different layer.
-
-## Minimal surface
-
 - Question accessors/helpers added just to reach an already-shared object: if a
   caller already holds a handle, it should use that handle directly.
 - Question a method whose sole purpose is to forward to another object's method;
   the caller should reach the target directly.
 - Check visibility: a member only used internally should not be `pub(crate)`.
-- Prefer tests that widened visibility to be reworked to use public APIs with
-  realistic setup instead.
 
-## Verifying the change
+## Code quality
 
+- Single responsibility principle on structs
+- Idiomatic Rust only
+
+## Tests
+
+- Spot tests that require widened visibility to reach internals; ask for using
+  public APIs instead, without widening them only for testing.
 - Confirm `make test-all` passes (format, `clippy -D warnings`, tests).
 - Expect a deterministic regression test with any bug fix; it doubles as
   documentation.

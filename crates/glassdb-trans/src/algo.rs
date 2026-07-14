@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Freshness, LockType, PathLock, ShardEntry, StorageError, TxCommitStatus, TxLog, TxWrite,
-    ValueCache, Version,
+    Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry, SplitPolicy, StorageError,
+    TxCommitStatus, TxLog, TxWrite, ValueCache, Version,
 };
 
 use crate::error::TransError;
@@ -40,7 +40,7 @@ use crate::gc::Gc;
 use crate::monitor::Monitor;
 use crate::resolver::{HolderResolution, Resolver};
 use crate::shard_coord::{
-    FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, Step,
+    FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
 };
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
@@ -123,26 +123,23 @@ impl WriteAccess {
 }
 
 /// A range/sorted listing performed within a transaction (ADR-031 phantom
-/// prevention). It records the object version of every leaf the scan covered;
-/// commit re-scans the same range and confirms the covered leaves and their
-/// versions are unchanged, so no create/delete — which bumps its leaf's version
-/// — raced the scan. Following the leaf right-sibling chain during the scan
-/// makes a concurrent split visible as a changed cover (one retry), never a
-/// lost or duplicated key.
+/// prevention). It records the membership version and pending membership-write
+/// holders of every covered leaf. Commit re-scans the range and validates those
+/// dependencies, while a concurrent split changes the covered leaf set.
 #[derive(Debug, Clone)]
 pub struct ScanAccess {
     /// Collection prefix the scan ranged over.
     pub prefix: Arc<str>,
-    /// The leaves the scan covered, in key order, each with the object version
-    /// observed at scan time (`None` for an uncreated collection root).
+    /// The leaves the scan covered, in key order, with membership dependencies.
     pub covered: Vec<LeafCoverage>,
 }
 
-/// One leaf a scan covered: its object path and the version seen at scan time.
+/// One leaf a scan covered and its membership-only validation dependencies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafCoverage {
     pub path: Arc<str>,
-    pub version: Option<glassdb_backend::Version>,
+    pub membership_version: u64,
+    pub pending_membership: Vec<TxId>,
 }
 
 /// The reads, writes, and range scans that make up a transaction.
@@ -233,6 +230,7 @@ impl ShardResolver for CommitInstallResolver {
         &self,
         ctx: &ResolveCtx<'_>,
         staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let cur = staged.get(&self.raw_key);
 
@@ -243,6 +241,14 @@ impl ShardResolver for CommitInstallResolver {
         {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Landed,
+            });
+        }
+
+        if staged_locks.structure().lock_type() == LockType::Write
+            && !staged_locks.structure().contains(&self.id)
+        {
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Moved,
             });
         }
 
@@ -287,8 +293,12 @@ impl ShardResolver for CommitInstallResolver {
         e.locked_by = vec![self.id.clone()];
         e.current_writer = Some(effective);
         e.deleted = false;
+        let mut locks = staged_locks.clone();
+        locks.add_structure_reader(self.id.clone());
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
+            locks,
+            admission: StageAdmission::ExistingKeys,
             // The lock is installed only once the round's CAS confirms it; on a
             // precondition/in-doubt the engine re-folds and re-classifies.
             outcome: FoldOutcome::Landed,
@@ -356,6 +366,7 @@ pub struct Algo {
     mon: Monitor,
     gc: Gc,
     clock: Clock,
+    split_policy: SplitPolicy,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -375,6 +386,7 @@ impl Algo {
         gc: Gc,
         background: Option<Weak<Background>>,
         resolver: Resolver,
+        split_policy: SplitPolicy,
     ) -> Self {
         Algo {
             values,
@@ -384,6 +396,7 @@ impl Algo {
             mon,
             gc,
             clock,
+            split_policy,
             background,
         }
     }
@@ -428,6 +441,7 @@ impl Algo {
         if tx.data.writes.is_empty() {
             return self.commit_readonly(tx).await;
         }
+        self.validate_coordination_keys(&tx.data)?;
         // Try the single read-write fast path first (ADR-020): a lone overwrite
         // of an existing key commits with one object write + one shard CAS. On
         // ineligibility nothing has been written, so the full locked path takes
@@ -489,6 +503,25 @@ impl Algo {
         });
     }
 
+    /// Rejects keys that can never fit before the transaction has side effects.
+    fn validate_coordination_keys(&self, data: &Data) -> Result<(), TransError> {
+        for path in data
+            .reads
+            .iter()
+            .map(|read| read.path.as_ref())
+            .chain(data.writes.iter().map(|write| write.path.as_ref()))
+        {
+            let (_, key) = paths::split_key(path)
+                .map_err(|e| TransError::with_source("parsing transaction key path", e))?;
+            if !self.split_policy.key_fits(&key) {
+                return Err(TransError::InvalidInput(
+                    "key exceeds the coordination node size limit".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Read-only fast path: re-resolve each read's effective writer against the
     /// shards and commit if none changed. Takes no locks and writes nothing, so
     /// it never registers with the monitor.
@@ -534,13 +567,10 @@ impl Algo {
         let locks = locked.locked_paths();
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
-        // Optimistic read validation (ADR-024): now that every touched key is
-        // locked, its value is frozen, so re-resolve each read's effective
-        // writer and check it still matches what the body observed. A read that
-        // moved before we locked means that our snapshot is stale: re-run the
-        // body to observe the new value, holding our locks and keeping our id.
-        // This is the only conflict that re-runs the body.
-        if !self.validate_reads_inner(&tx.data).await? {
+        // Validate point reads and scans after their entry/predicate locks are
+        // held. A stale dependency re-runs the body under the same id while the
+        // acquired locks prevent another change in the validation-to-commit gap.
+        if !self.validate(&tx.data).await? {
             return self.revalidate(tx).await;
         }
 
@@ -588,7 +618,7 @@ impl Algo {
     async fn try_commit_single_rw(&self, tx: &mut Handle) -> Result<Option<()>, TransError> {
         // Static eligibility: exactly one write, and it is a put (a delete
         // publishes a tombstone, which the fast path does not handle).
-        if tx.data.writes.len() != 1 {
+        if tx.data.writes.len() != 1 || !tx.data.scans.is_empty() {
             return Ok(None);
         }
         let write = &tx.data.writes[0];
@@ -658,10 +688,18 @@ impl Algo {
         // still lags behind a help-forwarded holder.
         let recorded_prev = effective;
         let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
-        tl.locks = vec![PathLock {
-            path: key_path.to_string(),
-            typ: LockType::Write,
-        }];
+        tl.locks = vec![
+            PathLock {
+                path: key_path.to_string(),
+                typ: LockType::Write,
+                scope: LockScope::Entry,
+            },
+            PathLock {
+                path: leaf_path.clone(),
+                typ: LockType::Read,
+                scope: LockScope::Structure,
+            },
+        ];
         tl.writes.push(TxWrite {
             path: key_path.to_string(),
             value: value.clone(),
@@ -862,6 +900,10 @@ impl Algo {
     ///   id** after backing off, so a transaction that merely lost a race never
     ///   discards its executed body. Persistent contention escalates to the
     ///   serial order, which removes the equal-priority livelock.
+    /// - **Leaf capacity** (a create reached the reserved content limit): drop
+    ///   the partial locks and retry under the **same id** after backing off,
+    ///   giving the hinted split time to make room. Capacity pressure does not
+    ///   count toward serial escalation.
     /// - **Suspected deadlock** (the parallel wait exceeded
     ///   [`MAX_DEADLOCK_TIMEOUT`]): drop the out-of-order locks and re-acquire in
     ///   the global serial sorted order, where first-CAS-wins on the lowest
@@ -899,6 +941,13 @@ impl Algo {
                     serial = serial || conflicts >= SERIAL_FALLBACK_AFTER;
                     rt::sleep(tx.backoff.next_delay()).await;
                 }
+                // Capacity is not lock contention: release anything acquired on
+                // other leaves and wait for the hinted split without escalating
+                // to the serial lock order or re-running the transaction body.
+                Ok(LockOutcome::LeafFull) => {
+                    self.release_for_retry(tx).await?;
+                    rt::sleep(tx.backoff.next_delay()).await;
+                }
                 // Suspected deadlock: drop the out-of-order locks and re-acquire
                 // in the cannot-deadlock serial order, keeping our id.
                 Err(TransError::LockTimeout) => {
@@ -920,11 +969,10 @@ impl Algo {
             .map_err(|e| e.context(format!("releasing locks before re-lock for tx {}", tx.id)))
     }
 
-    /// Signals a stale-read re-validation restart (ADR-024): a read's value moved
-    /// before it was locked, so the body must re-run to observe the new value —
-    /// but, unlike [`Algo::restart`], **holding the locks already acquired** and
-    /// **without renewing the id**. Invalidates the stale cached reads so the
-    /// re-run re-reads the authoritative values, then returns
+    /// Signals a stale dependency restart (ADR-024/032): a point read or scan
+    /// changed before its locks were held, so the body must re-run — but, unlike
+    /// [`Algo::restart`], **holding the locks already acquired** and **without
+    /// renewing the id**. Invalidates stale cached reads, then returns
     /// [`TransError::Retry`], which the db retry loop re-runs in place (the
     /// transaction object stays pending and its locks stay installed). Any lock
     /// left on a key the re-run no longer touches is reclaimed lazily by the next
@@ -949,7 +997,7 @@ impl Algo {
 
     /// Reports whether the transaction's snapshot still holds: every read's
     /// effective writer is unchanged (ADR-024) **and** every range scan's
-    /// covered leaves are unchanged (ADR-031 phantom prevention).
+    /// membership dependencies are unchanged (ADR-032 phantom prevention).
     async fn validate(&self, data: &Data) -> Result<bool, TransError> {
         Ok(self.validate_reads_inner(data).await? && self.validate_scans_inner(data).await?)
     }
@@ -974,18 +1022,29 @@ impl Algo {
     }
 
     /// Re-scans every range the transaction listed and reports whether each
-    /// still covers exactly the same leaves at the same object versions
-    /// (ADR-031). A create/delete in the range bumps its leaf's version and a
-    /// split changes the covered leaf set, so either makes the re-scan differ —
-    /// which fails validation and re-runs the listing over the fresh topology,
-    /// preventing phantom appearances/disappearances. Following the right-link
-    /// chain (via [`Resolver::live_keys_scan`]) keeps the re-scan consistent
-    /// with an in-progress split rather than erroring on it.
+    /// still covers the same leaves at the same membership versions (ADR-032).
+    /// Pending membership writers observed by the original scan are rechecked
+    /// because their commit transition does not itself bump the node version.
+    /// A split changes the covered leaf set, so it also invalidates the scan.
     async fn validate_scans_inner(&self, data: &Data) -> Result<bool, TransError> {
         for scan in &data.scans {
             let current = self.resolver.live_keys_scan(&scan.prefix).await?.covered;
-            if current != scan.covered {
+            if current.len() != scan.covered.len()
+                || current.iter().zip(&scan.covered).any(|(now, observed)| {
+                    now.path != observed.path
+                        || now.membership_version != observed.membership_version
+                })
+            {
                 return Ok(false);
+            }
+            for holder in scan
+                .covered
+                .iter()
+                .flat_map(|leaf| &leaf.pending_membership)
+            {
+                if self.mon.tx_status(holder).await? == TxCommitStatus::Ok {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -1095,11 +1154,14 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        let coord = crate::shard_coord::ShardCoordinator::new(
+        let (coord, _splitter) = crate::split::Splitter::with_coordinator(
+            bg_weak.clone(),
             shards.clone(),
-            resolver.clone(),
             tmon.clone(),
+            Clock::real(),
             RetryConfig::default(),
+            TEST_COLL,
+            glassdb_storage::SplitPolicy::default(),
         );
         let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
         let gc = Gc::new(
@@ -1109,7 +1171,6 @@ mod tests {
             locker.clone(),
             tmon.clone(),
             Clock::real(),
-            TEST_COLL,
         );
 
         // Create the collection root so the test collection exists up front.
@@ -1127,6 +1188,7 @@ mod tests {
             gc,
             None,
             resolver,
+            glassdb_storage::SplitPolicy::default(),
         );
         (
             algo,
@@ -1236,9 +1298,8 @@ mod tests {
     // Regression (review 1.1 / ADR-022): the committed transaction object must
     // record its full lock set, not just its writes, so GC's reverse liveness
     // check and lock pruning operate on real logs. A transaction that reads one
-    // key and creates another records a read lock on the read key and a write
-    // lock on the created key. Membership is coordinated by that per-key entry
-    // lock, so there is no separate root lock to record (ADR-031).
+    // key and creates another records both entry locks plus the leaf's structure
+    // and membership scopes (ADR-032).
     #[tokio::test]
     async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
@@ -1269,6 +1330,17 @@ mod tests {
             locked.contains(writep.as_str()),
             "write lock recorded: {locked:?}"
         );
+        let leaf = paths::collection_info(TEST_COLL);
+        assert!(txlog.locks.contains(&PathLock {
+            path: leaf.clone(),
+            typ: LockType::Read,
+            scope: LockScope::Structure,
+        }));
+        assert!(txlog.locks.contains(&PathLock {
+            path: leaf,
+            typ: LockType::Write,
+            scope: LockScope::Membership,
+        }));
     }
 
     #[tokio::test]
@@ -1839,10 +1911,9 @@ mod tests {
     // single read-write fast path (ADR-027) issues one tx-object write and two
     // shard writes (the lock CAS then the write-back CAS that publishes the
     // pointer — here inline because tests build the algo with no background
-    // executor); the full locked path also issues two shard writes (entry lock +
-    // write-back) but writes its tx object differently. Membership is coordinated
-    // by the per-key entry lock, so neither path issues a separate root CAS
-    // (ADR-031).
+    // executor); the full locked path also issues two shard writes (lock install
+    // + write-back) but writes its tx object differently. Node-level locks fold
+    // into those writes rather than adding another CAS (ADR-032).
     #[derive(Debug, Default)]
     struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
@@ -2042,6 +2113,7 @@ mod tests {
                 .store_leaf(
                     &leaf_path,
                     &windowed,
+                    &loaded.locks,
                     loaded.kind(),
                     loaded.version.as_ref()
                 )
@@ -2157,9 +2229,8 @@ mod tests {
     // Creating a key is ineligible for the single read-write fast path (it has no
     // predecessor value to build on), so it takes the full locked path. The fast
     // path never calls the locker, so a non-zero lock-call count proves the full
-    // path was taken. Membership is coordinated by the per-key Create lock, so no
-    // separate root CAS is issued (ADR-031): the leaf-write count is the full
-    // path's entry-lock + write-back, exactly two.
+    // path was taken. The membership-write lock is folded into the same leaf CAS
+    // as the entry lock (ADR-032), so lock install + write-back is exactly two.
     #[tokio::test]
     async fn single_rw_create_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -2182,15 +2253,15 @@ mod tests {
         let c = write_counts(&log);
         assert_eq!(
             c.leaf, 2,
-            "create issues entry-lock + write-back, no membership CAS: {c:?}"
+            "create folds membership locking into lock install + write-back: {c:?}"
         );
         assert!(entry(&tctx, b"new").await.unwrap().exists());
     }
 
     // A delete is ineligible for the fast path too (it publishes a tombstone, not
     // a pointer over a predecessor), so it takes the full locked path; the
-    // non-zero lock-call count proves it. No separate membership CAS is issued
-    // (ADR-031).
+    // non-zero lock-call count proves it. Membership locking folds into the
+    // entry-lock CAS (ADR-032).
     #[tokio::test]
     async fn single_rw_delete_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -2216,7 +2287,7 @@ mod tests {
         let c = write_counts(&log);
         assert_eq!(
             c.leaf, 2,
-            "delete issues entry-lock + write-back, no membership CAS: {c:?}"
+            "delete folds membership locking into lock install + write-back: {c:?}"
         );
         assert!(entry(&tctx, b"k").await.unwrap().deleted);
     }
@@ -2378,9 +2449,8 @@ mod tests {
     }
 
     // Installs live committed pointers for `keys` directly in the collection's
-    // root leaf `_i` (no lock holders, no pending write-back), so the leaf's
-    // object version is stable — a scan taken afterwards is not perturbed by an
-    // asynchronous write-back settling.
+    // root leaf `_i` (no lock holders or pending write-back), giving scan tests a
+    // stable membership baseline.
     async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
         let path = paths::collection_info(TEST_COLL);
         let loaded = tctx
@@ -2410,7 +2480,13 @@ mod tests {
         let shard = Shard::from_entries(entries.into_values());
         assert!(
             tctx.shards
-                .store_leaf(&path, &shard, loaded.kind(), loaded.version.as_ref())
+                .store_leaf(
+                    &path,
+                    &shard,
+                    &loaded.locks,
+                    loaded.kind(),
+                    loaded.version.as_ref(),
+                )
                 .await
                 .unwrap()
         );
@@ -2458,9 +2534,76 @@ mod tests {
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
 
-    // ADR-031 phantom prevention: a delete of a listed key also bumps the covered
-    // leaf's version, so a scan taken before it fails re-validation (the key must
-    // not silently vanish from an already-validated snapshot).
+    #[tokio::test]
+    async fn scan_rechecks_pending_membership_holder_that_commits() {
+        let (tm, tctx) = new_algo().await;
+        let key_path = paths::from_key(TEST_COLL, b"new");
+        let holder = TxId::with_priority(1, b"holder");
+        tctx.tmon.begin_tx(&holder);
+        let holder_data = Data {
+            reads: Vec::new(),
+            writes: vec![wa(&key_path, b"value")],
+            scans: Vec::new(),
+        };
+        let locked = match tctx
+            .locker
+            .lock(&holder, &holder_data, false)
+            .await
+            .unwrap()
+        {
+            LockOutcome::Locked(locked) => locked,
+            LockOutcome::Conflict => panic!("holder lock conflicted"),
+            LockOutcome::LeafFull => panic!("holder leaf unexpectedly full"),
+        };
+
+        // The scan observes the pending create as absent and records its
+        // membership holder as a status dependency.
+        let (scan, keys) = scan_data(&tctx).await;
+        assert!(keys.is_empty());
+
+        // Commit only the transaction object: membership_version is unchanged
+        // until write-back, so the dependency is what must reject validation.
+        let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
+        log.locks = locked.locked_paths();
+        log.writes.push(TxWrite {
+            path: key_path,
+            value: Arc::from(b"value".as_slice()),
+            deleted: false,
+            prev_writer: TxId::default(),
+        });
+        tctx.tmon.commit_tx(log).await.unwrap();
+
+        let mut stale = tm.begin(scan);
+        let err = tm.commit(&mut stale).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn scan_with_write_records_predicate_locks() {
+        let (tm, tctx) = new_algo().await;
+        let key_path = paths::from_key(TEST_COLL, b"a");
+        seed_live_keys(&tctx, &[b"a"]).await;
+        let (mut data, _) = scan_data(&tctx).await;
+        data.writes.push(wa(&key_path, b"updated"));
+
+        let mut handle = tm.begin(data);
+        tm.commit(&mut handle).await.unwrap();
+        let (log, _) = tctx.tlogger.get(handle.id()).await.unwrap();
+        let leaf = paths::collection_info(TEST_COLL);
+        assert!(log.locks.contains(&PathLock {
+            path: leaf.clone(),
+            typ: LockType::Read,
+            scope: LockScope::Structure,
+        }));
+        assert!(log.locks.contains(&PathLock {
+            path: leaf,
+            typ: LockType::Read,
+            scope: LockScope::Membership,
+        }));
+    }
+
+    // ADR-032 phantom prevention: a delete bumps the covered leaf's membership
+    // version, so an earlier scan fails re-validation.
     #[tokio::test]
     async fn scan_detects_racing_delete() {
         let (tm, tctx) = new_algo().await;
@@ -2498,10 +2641,9 @@ mod tests {
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
 
-    // ADR-031 boundary protection: on a multi-leaf tree a full scan covers every
-    // leaf including the endpoints, so a create landing in the *last* leaf bumps
-    // that covered leaf's version and re-validation fails — a boundary phantom
-    // cannot slip past an already-validated listing.
+    // ADR-032 boundary protection: on a multi-leaf tree a full scan covers every
+    // leaf including the endpoints, so a membership change in the final leaf
+    // invalidates the scan.
     #[tokio::test]
     async fn scan_detects_boundary_membership_change() {
         use glassdb_storage::{IndexNode, Node};
@@ -2509,16 +2651,15 @@ mod tests {
 
         // Two-leaf tree: index root over S0(a,c | high "m") -> S1(m,p).
         let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
-            let mut n = Node::leaf(Shard::from_entries(ks.iter().map(|k| ShardEntry {
+            Node::leaf(Shard::from_entries(ks.iter().map(|k| ShardEntry {
                 key: k.to_vec(),
                 lock_type: LockType::None,
                 locked_by: Vec::new(),
                 current_writer: Some(TxId::with_priority(1, b"seed")),
                 deleted: false,
-            })));
-            n.set_high_key(high.map(<[u8]>::to_vec));
-            n.set_right_sibling(right.map(str::to_string));
-            n
+            })))
+            .with_high_key(high.map(<[u8]>::to_vec))
+            .with_right_sibling(right.map(str::to_string))
         };
         tctx.shards
             .store_node(
@@ -2570,7 +2711,9 @@ mod tests {
             deleted: false,
         });
         let mut new_s1 = Node::leaf(Shard::from_entries(entries));
-        new_s1.set_high_key(None);
+        let membership_writer = TxId::with_priority(2, b"membership");
+        new_s1.set_membership_writer(membership_writer.clone());
+        new_s1.remove_membership_holder(&membership_writer);
         tctx.shards
             .store_node(TEST_COLL, "S1", &new_s1, Some(&ver))
             .await
@@ -2598,9 +2741,9 @@ mod tests {
             .into_iter()
             .partition(|e| e.key.as_slice() < b"m".as_slice());
 
-        let mut s0 = Node::leaf(Shard::from_entries(lower));
-        s0.set_high_key(Some(b"m".to_vec()));
-        s0.set_right_sibling(Some("S1".to_string()));
+        let s0 = Node::leaf(Shard::from_entries(lower))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some("S1".to_string()));
         tctx.shards
             .store_node(TEST_COLL, "S0", &s0, None)
             .await

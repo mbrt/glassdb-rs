@@ -86,6 +86,7 @@ mod tests {
             locks: vec![PathLock {
                 path: key_path,
                 typ: LockType::Write,
+                scope: crate::tlogger::LockScope::Entry,
             }],
         };
         let decoded = decode(&obj.id, &encode(&obj).unwrap()).unwrap();
