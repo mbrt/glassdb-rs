@@ -45,7 +45,10 @@ impl Collection {
             self.db.retry,
         );
         match r.read(&p, max_staleness).await {
-            Ok(rv) => Ok(rv.value.to_vec()),
+            Ok(outcome) => outcome
+                .value
+                .map(|rv| rv.value.to_vec())
+                .ok_or(Error::NotFound),
             Err(e) => Err(Error::from_read(e)),
         }
     }

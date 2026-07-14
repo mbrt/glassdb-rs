@@ -442,7 +442,9 @@ impl DbInner {
 
             // Collect the accesses produced by the user function.
             let access = tx.collect_accesses();
+            let metrics = tx.metrics();
             stats.tx_reads += access.reads.len() as u64;
+            stats.tx_cache_hits += metrics.cache_hits;
             stats.tx_writes += access.writes.len() as u64;
 
             let value = match fn_res {

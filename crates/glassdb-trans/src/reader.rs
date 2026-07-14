@@ -37,6 +37,17 @@ pub struct ReadValue {
     pub version: Version,
 }
 
+/// The outcome of reading a key, including whether the value cache supplied
+/// the result. An absent value may still be a cache hit when it is a cached
+/// deletion.
+#[derive(Debug, Clone, Default)]
+pub struct ReadOutcome {
+    /// The resolved value, or `None` when the key is absent or deleted.
+    pub value: Option<ReadValue>,
+    /// Whether the value cache supplied the outcome.
+    pub cache_hit: bool,
+}
+
 /// Reads values by resolving a key's shard entry to its effective committed
 /// writer (via the [`Resolver`]) and materializing the value from that writer's
 /// transaction object.
@@ -64,14 +75,15 @@ impl Reader {
         }
     }
 
-    /// Reads the value for `key`, accepting cached values up to `max_stale`.
+    /// Reads `key`, accepting cached outcomes up to `max_stale` and returning
+    /// `None` when the key is absent or deleted.
     ///
     /// A read is idempotent, so a transient in-doubt (`Unavailable`) outcome is
     /// retried in place with exponential backoff up to
     /// [`READ_UNAVAILABLE_RETRIES`] times. A persistent outage surfaces the last
     /// `Unavailable` error for the caller to classify; the caller cancels by
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
-    pub async fn read(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
+    pub async fn read(&self, key: &str, max_stale: Duration) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
         for _ in 0..READ_UNAVAILABLE_RETRIES {
             match self.read_once(key, max_stale).await {
@@ -86,29 +98,38 @@ impl Reader {
 
     /// A single read attempt: local cache then shard resolution. Wrapped by
     /// [`Reader::read`] for in-place retries.
-    async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadValue, StorageError> {
+    async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadOutcome, StorageError> {
         if let Some(lr) = self.values.read(key, max_stale)
             && !lr.outdated
         {
             if lr.deleted {
-                return Err(StorageError::NotFound);
+                return Ok(ReadOutcome {
+                    value: None,
+                    cache_hit: true,
+                });
             }
-            return Ok(ReadValue {
-                value: lr.value,
-                version: lr.version,
+            return Ok(ReadOutcome {
+                value: Some(ReadValue {
+                    value: lr.value,
+                    version: lr.version,
+                }),
+                cache_hit: true,
             });
         }
-        self.resolve_value(key).await
+        Ok(ReadOutcome {
+            value: self.resolve_value(key).await?,
+            cache_hit: false,
+        })
     }
 
     /// Resolves `key` to its effective writer (via the [`Resolver`]), then
     /// materializes the value from that writer's transaction object.
-    async fn resolve_value(&self, key: &str) -> Result<ReadValue, StorageError> {
+    async fn resolve_value(&self, key: &str) -> Result<Option<ReadValue>, StorageError> {
         let Some(writer) = self.resolver.effective_writer(key).await? else {
             // Absent or tombstoned: not found. (A tombstone could be cached, but
             // the next validation re-resolves the shard anyway, so we keep the
             // read path simple and only cache materialized live values.)
-            return Err(StorageError::NotFound);
+            return Ok(None);
         };
         let cv = self
             .tmon
@@ -117,28 +138,27 @@ impl Reader {
             .map_err(trans_to_storage)?;
         if cv.status != TxCommitStatus::Ok || cv.value.not_written {
             // The writer's value is not authoritatively resolvable yet (e.g. its
-            // object is in-doubt). Report not-found so the caller retries rather
-            // than trusting an empty placeholder.
-            return Err(StorageError::NotFound);
+            // object is in-doubt). Report absence so transaction validation can
+            // retry rather than trusting an empty placeholder.
+            return Ok(None);
         }
-        self.materialize(key, writer, cv.value)
+        Ok(self.materialize(key, writer, cv.value))
     }
 
-    /// Caches and returns a resolved committed value, or reports `NotFound` for a
-    /// tombstone.
+    /// Caches and returns a resolved committed value, or `None` for a tombstone.
     fn materialize(
         &self,
         key: &str,
         writer: glassdb_data::TxId,
         value: glassdb_storage::TValue,
-    ) -> Result<ReadValue, StorageError> {
+    ) -> Option<ReadValue> {
         let version = Version { writer };
         if value.deleted {
             self.values.mark_deleted(key, version);
-            return Err(StorageError::NotFound);
+            return None;
         }
         self.values.write(key, value.value.clone(), version.clone());
-        Ok(ReadValue {
+        Some(ReadValue {
             value: value.value,
             version,
         })

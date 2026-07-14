@@ -125,6 +125,59 @@ async fn stats_report_locker_activity() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stats_report_transactional_value_cache_hits() {
+    let backend = mem();
+    let writer_db = init_db(backend.clone()).await;
+    let reader_db = init_db(backend).await;
+    let writer = writer_db.collection(b"cache-stats");
+    let reader = reader_db.collection(b"cache-stats");
+    let key = b"key";
+    let value = b"value";
+
+    writer.create().await.unwrap();
+    writer.write(key, value).await.unwrap();
+
+    let before_cold = reader_db.stats();
+    assert_eq!(reader.read(key).await.unwrap(), value);
+    let cold = reader_db.stats() - before_cold;
+    assert_eq!(cold.tx_reads, 1);
+    assert_eq!(cold.tx_cache_hits, 0);
+
+    let before_warm = reader_db.stats();
+    let reader_ref = &reader;
+    reader_db
+        .tx(|tx| async move {
+            assert_eq!(tx.read(reader_ref, key).await?, value);
+            assert_eq!(tx.read(reader_ref, key).await?, value);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let warm = reader_db.stats() - before_warm;
+    assert_eq!(warm.tx_reads, 1);
+    assert_eq!(warm.tx_cache_hits, 1);
+
+    let before_stale = reader_db.stats();
+    assert_eq!(
+        reader
+            .read_stale(key, std::time::Duration::MAX)
+            .await
+            .unwrap(),
+        value
+    );
+    let stale = reader_db.stats() - before_stale;
+    assert_eq!(stale.tx_reads, 0);
+    assert_eq!(stale.tx_cache_hits, 0);
+
+    reader.delete(key).await.unwrap();
+    let before_deleted = reader_db.stats();
+    assert!(matches!(reader.read(key).await, Err(Error::NotFound)));
+    let deleted = reader_db.stats() - before_deleted;
+    assert_eq!(deleted.tx_reads, 1);
+    assert_eq!(deleted.tx_cache_hits, 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn delete() {
     let db = init_db(mem()).await;
     let key = b"key1";
