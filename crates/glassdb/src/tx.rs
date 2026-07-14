@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::RetryConfig;
 use glassdb_data::paths;
-use glassdb_storage::{MAX_STALENESS, ShardStore, StorageError, ValueCache};
+use glassdb_storage::{MAX_STALENESS, ShardStore, ValueCache};
 use glassdb_trans::{
     Data, LeafCoverage, ReadAccess, ReadVersion, Reader, Resolver, ScanAccess, WriteAccess,
 };
@@ -46,51 +46,77 @@ struct TransactionInner {
     aborted: bool,
 }
 
+pub(crate) struct TransactionMetrics {
+    pub(crate) cache_hits: u64,
+}
+
+impl TransactionInner {
+    fn record_read(&mut self, path: String, mut state: ReadState) {
+        // Concurrent reads of one path can both miss the transaction-local
+        // state. Preserve a hit observed by either result while still counting
+        // the path once, consistently with `tx_reads`.
+        if self.reads.get(&path).is_some_and(ReadState::cache_hit) {
+            state.set_cache_hit();
+        }
+        self.reads.insert(path, state);
+    }
+}
+
 impl Transaction {
-    /// Reads the value for `key` within the transaction. Repeatable: a value
-    /// read once is returned consistently, and a key not found stays not found
-    /// (avoiding phantom reads).
+    /// Reads the value for `key` within the transaction, returning `None` when
+    /// the key is absent. Repeatable: a value read once is returned consistently,
+    /// and a key not found stays not found (avoiding phantom reads).
     ///
     /// Takes `&self`, so multiple reads can be polled concurrently (e.g. with
     /// `futures::future::join_all`) to fetch keys in parallel.
-    pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Vec<u8>, Error> {
+    pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let p = paths::from_key(c.prefix(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
             if let Some(staged) = inner.staged.get(&p) {
-                return staged.read();
+                return Ok(staged.read());
             }
-            if let Some(ReadState::NotFound) = inner.reads.get(&p) {
+            if let Some(ReadState::NotFound { .. }) = inner.reads.get(&p) {
                 // Be consistent with values not found the first time.
-                return Err(Error::NotFound);
+                return Ok(None);
             }
         }
 
         match self.reader.read(&p, MAX_STALENESS).await {
-            Err(StorageError::NotFound) => {
-                let mut inner = self.inner.lock().unwrap();
-                inner.reads.insert(p, ReadState::NotFound);
-                Err(Error::NotFound)
-            }
+            Ok(outcome) => match outcome.value {
+                None => {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.record_read(
+                        p,
+                        ReadState::NotFound {
+                            cache_hit: outcome.cache_hit,
+                        },
+                    );
+                    Ok(None)
+                }
+                Some(rv) => {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner
+                        .staged
+                        .insert(p.clone(), StagedValue::Read(rv.value.clone()));
+                    inner.record_read(
+                        p,
+                        ReadState::Found {
+                            version: ReadVersion {
+                                last_writer: rv.version.writer,
+                            },
+                            cache_hit: outcome.cache_hit,
+                        },
+                    );
+                    Ok(Some(rv.value.to_vec()))
+                }
+            },
             // A read is side-effect-free; `from_read` centralizes the mapping
             // (notably a sustained outage becomes the retry-safe
             // `Error::Unavailable` rather than `InDoubt`).
             Err(e) => Err(Error::from_read(e)),
-            Ok(rv) => {
-                let mut inner = self.inner.lock().unwrap();
-                inner
-                    .staged
-                    .insert(p.clone(), StagedValue::Read(rv.value.clone()));
-                inner.reads.insert(
-                    p,
-                    ReadState::Found(ReadVersion {
-                        last_writer: rv.version.writer,
-                    }),
-                );
-                Ok(rv.value.to_vec())
-            }
         }
     }
 
@@ -194,8 +220,8 @@ impl Transaction {
         let mut reads = Vec::new();
         for (k, v) in &inner.reads {
             let version = match v {
-                ReadState::Found(version) => Some(version.clone()),
-                ReadState::NotFound => None,
+                ReadState::Found { version, .. } => Some(version.clone()),
+                ReadState::NotFound { .. } => None,
             };
             reads.push(ReadAccess {
                 path: k.as_str().into(),
@@ -218,6 +244,13 @@ impl Transaction {
             scans,
         }
     }
+
+    pub(crate) fn metrics(&self) -> TransactionMetrics {
+        let inner = self.inner.lock().unwrap();
+        TransactionMetrics {
+            cache_hits: inner.reads.values().filter(|r| r.cache_hit()).count() as u64,
+        }
+    }
 }
 
 enum StagedValue {
@@ -227,17 +260,38 @@ enum StagedValue {
 }
 
 impl StagedValue {
-    fn read(&self) -> Result<Vec<u8>, Error> {
+    fn read(&self) -> Option<Vec<u8>> {
         match self {
-            StagedValue::Read(value) | StagedValue::Put(value) => Ok(value.to_vec()),
-            StagedValue::Delete => Err(Error::NotFound),
+            StagedValue::Read(value) | StagedValue::Put(value) => Some(value.to_vec()),
+            StagedValue::Delete => None,
         }
     }
 }
 
 enum ReadState {
-    Found(ReadVersion),
-    NotFound,
+    Found {
+        version: ReadVersion,
+        cache_hit: bool,
+    },
+    NotFound {
+        cache_hit: bool,
+    },
+}
+
+impl ReadState {
+    fn cache_hit(&self) -> bool {
+        match self {
+            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit } => *cache_hit,
+        }
+    }
+
+    fn set_cache_hit(&mut self) {
+        match self {
+            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit } => {
+                *cache_hit = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

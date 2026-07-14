@@ -32,8 +32,8 @@ async fn read_int_from_tx(
     k: &[u8],
 ) -> Result<i64, Error> {
     match tx.read(c, k).await {
-        Ok(v) => Ok(read_int(&v)),
-        Err(Error::NotFound) => Ok(0),
+        Ok(Some(v)) => Ok(read_int(&v)),
+        Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -72,8 +72,8 @@ async fn read_only(db: &Database, coll: &Collection, keys: &[&[u8]]) -> Result<(
     db.tx(|tx| async move {
         for k in keys {
             match tx.read(coll, k).await {
-                Ok(v) => assert!(read_int(&v) >= 0, "negative value for {k:?}"),
-                Err(Error::NotFound) => {}
+                Ok(Some(v)) => assert!(read_int(&v) >= 0, "negative value for {k:?}"),
+                Ok(None) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -125,9 +125,9 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     r2.unwrap();
 
     // Each key's final value must equal the total increments applied to it.
-    let v1 = read_int(&coll1.read(k1).await.unwrap());
-    let v2 = read_int(&coll1.read(k2).await.unwrap());
-    let v3 = read_int(&coll1.read(k3).await.unwrap());
+    let v1 = read_int(&coll1.read(k1).await.unwrap().unwrap());
+    let v2 = read_int(&coll1.read(k2).await.unwrap().unwrap());
+    let v3 = read_int(&coll1.read(k3).await.unwrap().unwrap());
     assert_eq!(v1 as u32, a1 + a2 + b3, "k1 mismatch");
     assert_eq!(v2 as u32, a2 + b1 + b2, "k2 mismatch");
     assert_eq!(v3 as u32, a3 + b2, "k3 mismatch");

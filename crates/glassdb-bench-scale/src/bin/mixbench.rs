@@ -677,7 +677,7 @@ async fn rmw_tx(db: &Database, coll: &Collection, keys: &[Vec<u8>]) -> Result<()
         let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
         for (k, rv) in keys.iter().zip(vals) {
             match rv {
-                Ok(_) | Err(GError::NotFound) => {}
+                Ok(_) => {}
                 Err(e) => return Err(e),
             }
             tx.write(coll, k, &value())?;
@@ -693,7 +693,7 @@ async fn ro_tx(db: &Database, coll: &Collection, keys: &[Vec<u8>]) -> Result<(),
         let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
         for rv in vals {
             match rv {
-                Ok(_) | Err(GError::NotFound) => {}
+                Ok(_) => {}
                 Err(e) => return Err(e),
             }
         }

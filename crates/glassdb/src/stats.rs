@@ -19,6 +19,10 @@ pub struct Stats {
     pub tx_time: Duration,
     /// Number of reads.
     pub tx_reads: u64,
+    /// Number of distinct transactional reads served from the value cache.
+    /// Counted once per key per transaction attempt, including cached
+    /// not-found results.
+    pub tx_cache_hits: u64,
     /// Number of writes.
     pub tx_writes: u64,
     /// Number of retried transactions.
@@ -42,6 +46,7 @@ impl Stats {
         self.tx_n += other.tx_n;
         self.tx_time += other.tx_time;
         self.tx_reads += other.tx_reads;
+        self.tx_cache_hits += other.tx_cache_hits;
         self.tx_writes += other.tx_writes;
         self.tx_retries += other.tx_retries;
         self.obj_reads += other.obj_reads;
@@ -71,6 +76,7 @@ impl Sub for Stats {
             tx_n: self.tx_n.saturating_sub(other.tx_n),
             tx_time: self.tx_time.saturating_sub(other.tx_time),
             tx_reads: self.tx_reads.saturating_sub(other.tx_reads),
+            tx_cache_hits: self.tx_cache_hits.saturating_sub(other.tx_cache_hits),
             tx_writes: self.tx_writes.saturating_sub(other.tx_writes),
             tx_retries: self.tx_retries.saturating_sub(other.tx_retries),
             obj_reads: self.obj_reads.saturating_sub(other.obj_reads),

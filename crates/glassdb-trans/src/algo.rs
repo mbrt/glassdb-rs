@@ -1115,7 +1115,7 @@ mod tests {
     use glassdb_data::paths;
     use glassdb_storage::{
         CollectionRoot, Directory, MAX_STALENESS, ObjectCache, Shard, ShardEntry, ShardStore,
-        SharedCache, StorageError, TLogger, TxCommitStatus, ValueCache,
+        SharedCache, TLogger, TxCommitStatus, ValueCache,
     };
 
     const TEST_COLL: &str = "testp";
@@ -1233,8 +1233,10 @@ mod tests {
             RetryConfig::default(),
         );
         match reader.read(path, MAX_STALENESS).await {
-            Ok(rv) => ra_found(path, rv.version.writer),
-            Err(StorageError::NotFound) => ra_not_found(path),
+            Ok(outcome) => match outcome.value {
+                Some(rv) => ra_found(path, rv.version.writer),
+                None => ra_not_found(path),
+            },
             Err(e) => panic!("reading {path}: {e:?}"),
         }
     }

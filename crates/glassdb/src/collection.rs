@@ -19,24 +19,21 @@ pub struct Collection {
 }
 
 impl Collection {
-    /// Reads the value for `key` with strong (serializable) consistency.
-    pub async fn read(&self, key: &[u8]) -> Result<Vec<u8>, Error> {
-        let res: Option<Vec<u8>> = self
-            .db
-            .tx(|tx| async move {
-                match tx.read(self, key).await {
-                    Ok(v) => Ok(Some(v)),
-                    // We must still validate the transaction even when not found.
-                    Err(Error::NotFound) => Ok(None),
-                    Err(e) => Err(e),
-                }
-            })
-            .await?;
-        res.ok_or(Error::NotFound)
+    /// Reads the value for `key` with strong (serializable) consistency,
+    /// returning `None` when the key is absent.
+    pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.db
+            .tx(|tx| async move { tx.read(self, key).await })
+            .await
     }
 
-    /// Reads the value for `key` allowing stale results up to `max_staleness`.
-    pub async fn read_stale(&self, key: &[u8], max_staleness: Duration) -> Result<Vec<u8>, Error> {
+    /// Reads the value for `key` allowing stale results up to `max_staleness`,
+    /// returning `None` when the key is absent.
+    pub async fn read_stale(
+        &self,
+        key: &[u8],
+        max_staleness: Duration,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
             self.db.values.clone(),
@@ -45,7 +42,7 @@ impl Collection {
             self.db.retry,
         );
         match r.read(&p, max_staleness).await {
-            Ok(rv) => Ok(rv.value.to_vec()),
+            Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),
             Err(e) => Err(Error::from_read(e)),
         }
     }
@@ -77,7 +74,7 @@ impl Collection {
             .tx(move |tx| {
                 let f = f.clone();
                 async move {
-                    let old = tx.read(self, key).await?;
+                    let old = tx.read(self, key).await?.ok_or(Error::NotFound)?;
                     let newb = (f.lock().unwrap())(old)?;
                     tx.write(self, key, &newb)?;
                     Ok(newb)
