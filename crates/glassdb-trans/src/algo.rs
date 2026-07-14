@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry, StorageError, TxCommitStatus,
-    TxLog, TxWrite, ValueCache, Version,
+    Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry, SplitPolicy, StorageError,
+    TxCommitStatus, TxLog, TxWrite, ValueCache, Version,
 };
 
 use crate::error::TransError;
@@ -365,6 +365,7 @@ pub struct Algo {
     mon: Monitor,
     gc: Gc,
     clock: Clock,
+    split_policy: SplitPolicy,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -384,6 +385,7 @@ impl Algo {
         gc: Gc,
         background: Option<Weak<Background>>,
         resolver: Resolver,
+        split_policy: SplitPolicy,
     ) -> Self {
         Algo {
             values,
@@ -393,6 +395,7 @@ impl Algo {
             mon,
             gc,
             clock,
+            split_policy,
             background,
         }
     }
@@ -437,6 +440,7 @@ impl Algo {
         if tx.data.writes.is_empty() {
             return self.commit_readonly(tx).await;
         }
+        self.validate_coordination_keys(&tx.data)?;
         // Try the single read-write fast path first (ADR-020): a lone overwrite
         // of an existing key commits with one object write + one shard CAS. On
         // ineligibility nothing has been written, so the full locked path takes
@@ -496,6 +500,25 @@ impl Algo {
         bg.spawn_waited(async move {
             let _ = mon.abort_tx(&tx_id).await;
         });
+    }
+
+    /// Rejects keys that can never fit before the transaction has side effects.
+    fn validate_coordination_keys(&self, data: &Data) -> Result<(), TransError> {
+        for path in data
+            .reads
+            .iter()
+            .map(|read| read.path.as_ref())
+            .chain(data.writes.iter().map(|write| write.path.as_ref()))
+        {
+            let (_, key) = paths::split_key(path)
+                .map_err(|e| TransError::with_source("parsing transaction key path", e))?;
+            if !self.split_policy.key_fits(&key) {
+                return Err(TransError::InvalidInput(
+                    "key exceeds the coordination node size limit".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Read-only fast path: re-resolve each read's effective writer against the
@@ -760,7 +783,6 @@ impl Algo {
             // A shutdown mid-flight leaves the lock un-installed, so the fast
             // path renews (its committed object, if any, is an orphan for GC).
             Some(FoldOutcome::Moved) | None => Ok(InstallOutcome::Moved),
-            Some(FoldOutcome::InvalidInput(msg)) => Err(TransError::InvalidInput(msg)),
             // Commit-install never waits, releases, or takes a generic lock.
             Some(_) => Err(TransError::other(
                 "commit-install produced a non-install outcome",
@@ -1154,6 +1176,7 @@ mod tests {
             gc,
             None,
             resolver,
+            glassdb_storage::SplitPolicy::default(),
         );
         (
             algo,

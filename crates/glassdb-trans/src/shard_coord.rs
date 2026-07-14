@@ -35,8 +35,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    Freshness, IndexNode, LeafKind, LockType, Node, NodeLocks, Shard, ShardEntry, ShardStore,
-    SplitPolicy, StorageError,
+    Freshness, LeafKind, LockType, NodeLocks, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError,
 };
 
 use crate::error::TransError;
@@ -86,8 +86,6 @@ pub(crate) enum FoldOutcome {
     /// then moved, so it cannot be told whether the lock landed first: the one
     /// irreducible ambiguity, surfaced rather than risking a double-apply.
     InDoubt(String),
-    /// One key can never fit in a splittable coordination node.
-    InvalidInput(String),
 }
 
 /// Why the fold engine is (re-)running the resolvers this attempt: a `Fresh`
@@ -237,11 +235,6 @@ pub trait SplitHinter: Send + Sync {
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &str, shard: &Shard);
-
-    /// Returns the sizing policy enforced by the coordinator.
-    fn policy(&self) -> SplitPolicy {
-        SplitPolicy::default()
-    }
 }
 
 /// The default [`SplitHinter`] that drops every hint: for a coordinator with no
@@ -404,35 +397,15 @@ impl CasWorker {
                             .policy
                             .node_max_bytes
                             .saturating_sub(self.core.policy.split_headroom_bytes);
-                        let individually_oversized = changes.iter().any(|(_, entry)| {
-                            let leaf_len = Node::leaf(Shard::from_entries([entry.clone()]))
-                                .content_encoded_len();
-                            let token = "x".repeat(24);
-                            let index_len = Node::index(IndexNode::from_children([
-                                (Vec::new(), token.clone()),
-                                (entry.key.clone(), token),
-                            ]))
-                            .content_encoded_len();
-                            leaf_len > content_limit / 2 || index_len > content_limit
-                        });
-                        if individually_oversized {
-                            results.push((
-                                tx.clone(),
-                                FoldOutcome::InvalidInput(
-                                    "key exceeds the coordination node size limit".into(),
-                                ),
-                            ));
-                            continue;
-                        }
                         let (content_len, encoded_len) = match loaded.kind() {
                             LeafKind::Root(root) => {
                                 let mut root = root.clone();
                                 root.set_node(candidate_node.clone());
-                                (root.content_encoded_len(), root.encode().len())
+                                (root.content_encoded_len(), root.encoded_len())
                             }
                             LeafKind::Node(_) => (
                                 candidate_node.content_encoded_len(),
-                                candidate_node.encode().len(),
+                                candidate_node.encoded_len(),
                             ),
                         };
                         if content_len > content_limit
@@ -552,18 +525,26 @@ impl ShardCoordinator {
     /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
     /// between hold-and-wait re-polls of a conflicting holder.
     pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
-        Self::with_hinter(shards, resolver, tmon, retry, Arc::new(NoSplitHints))
+        Self::with_hinter(
+            shards,
+            resolver,
+            tmon,
+            retry,
+            SplitPolicy::default(),
+            Arc::new(NoSplitHints),
+        )
     }
 
     /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
-    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). The
-    /// coordinator only emits leaf-write events; the soft-cap policy and the
-    /// candidate queue live behind the seam, so it never names the splitter.
+    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `policy`
+    /// governs the coordinator's hard node-size limit; the hinting seam carries
+    /// only leaf-write observations and never exposes splitter configuration.
     pub fn with_hinter(
         shards: ShardStore,
         resolver: Resolver,
         tmon: Monitor,
         retry: RetryConfig,
+        policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
     ) -> Self {
         let core = Arc::new(CoordCore {
@@ -572,7 +553,7 @@ impl ShardCoordinator {
             resolver,
             retry,
             stats: Stats::default(),
-            policy: hinter.policy(),
+            policy,
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });

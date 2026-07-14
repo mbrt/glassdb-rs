@@ -18,7 +18,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::node::Node;
+use crate::node::{Node, NodeLocks};
 use crate::shard::Shard;
 
 /// A decoded collection root: the B-link root node plus collection metadata.
@@ -46,9 +46,9 @@ impl CollectionRoot {
         &self.node
     }
 
-    /// Returns the mutable root node for coordination updates.
-    pub fn node_mut_for_coordination(&mut self) -> &mut Node {
-        &mut self.node
+    /// Returns the mutable lock state of the B-link tree root node.
+    pub fn node_locks_mut(&mut self) -> &mut NodeLocks {
+        self.node.locks_mut()
     }
 
     /// Replaces the B-link tree root node (e.g. after an in-place root split).
@@ -80,19 +80,19 @@ impl CollectionRoot {
 
     /// Encodes the root to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
-        // Subcollections are already canonical via the BTreeSet.
-        pb::CollectionRoot {
-            node: Some(self.node.to_pb()),
-            subcollections: self.subcollections.iter().cloned().collect(),
-        }
-        .encode_to_vec()
+        self.to_pb().encode_to_vec()
+    }
+
+    /// Returns the canonical protobuf size without allocating the encoded body.
+    pub fn encoded_len(&self) -> usize {
+        self.to_pb().encoded_len()
     }
 
     /// Returns the encoded size without transient node-lock holders.
     pub fn content_encoded_len(&self) -> usize {
         let mut root = self.clone();
         root.node.clear_node_locks();
-        root.encode().len()
+        root.encoded_len()
     }
 
     /// Decodes a root from its protobuf body. A root with no node (the wire
@@ -107,6 +107,14 @@ impl CollectionRoot {
                 .unwrap_or_else(|| Node::leaf(Shard::new())),
             subcollections: raw.subcollections.into_iter().collect(),
         })
+    }
+
+    fn to_pb(&self) -> pb::CollectionRoot {
+        // Subcollections are already canonical via the BTreeSet.
+        pb::CollectionRoot {
+            node: Some(self.node.to_pb()),
+            subcollections: self.subcollections.iter().cloned().collect(),
+        }
     }
 }
 
@@ -209,6 +217,7 @@ mod tests {
         let want = [
             0x0a, 0x02, 0x1a, 0x00, 0x12, 0x05, 0x75, 0x73, 0x65, 0x72, 0x73,
         ];
+        assert_eq!(root.encoded_len(), got.len());
         assert_eq!(got, want, "collection-root encoding drifted: {got:02x?}");
     }
 }

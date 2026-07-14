@@ -25,7 +25,7 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::LockType;
-use crate::shard::Shard;
+use crate::shard::{Shard, ShardEntry};
 use glassdb_data::TxId;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
@@ -149,6 +149,32 @@ pub struct SplitPolicy {
     pub node_max_bytes: usize,
     /// Bytes reserved for transient node-lock metadata at the hard cap.
     pub split_headroom_bytes: usize,
+}
+
+impl SplitPolicy {
+    /// Reports whether `key` can fit in both a splittable leaf entry and its
+    /// eventual parent separator under this policy.
+    pub fn key_fits(&self, key: &[u8]) -> bool {
+        let id = TxId::with_priority(0, &[]);
+        let entry = ShardEntry {
+            key: key.to_vec(),
+            lock_type: LockType::Write,
+            locked_by: vec![id.clone()],
+            current_writer: Some(id),
+            deleted: false,
+        };
+        let content_limit = self
+            .node_max_bytes
+            .saturating_sub(self.split_headroom_bytes);
+        let leaf_len = Node::leaf(Shard::from_entries([entry])).content_encoded_len();
+        let token = "x".repeat(24);
+        let index_len = Node::index(IndexNode::from_children([
+            (Vec::new(), token.clone()),
+            (key.to_vec(), token),
+        ]))
+        .content_encoded_len();
+        leaf_len <= content_limit / 2 && index_len <= content_limit
+    }
 }
 
 impl Default for SplitPolicy {
@@ -445,6 +471,11 @@ impl Node {
         &self.locks
     }
 
+    /// Returns the mutable node-level coordination state.
+    pub(crate) fn locks_mut(&mut self) -> &mut NodeLocks {
+        &mut self.locks
+    }
+
     /// Replaces the node-level coordination state.
     pub fn set_locks(&mut self, locks: NodeLocks) {
         self.locks = locks;
@@ -499,7 +530,7 @@ impl Node {
     pub fn content_encoded_len(&self) -> usize {
         let mut content = self.clone();
         content.clear_node_locks();
-        content.encode().len()
+        content.encoded_len()
     }
 
     /// The leaf body, or `None` if this is an index node.
@@ -596,6 +627,11 @@ impl Node {
     /// Encodes the node to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
+    }
+
+    /// Returns the canonical protobuf size without allocating the encoded body.
+    pub fn encoded_len(&self) -> usize {
+        self.to_pb().encoded_len()
     }
 
     /// Decodes a node from its protobuf body. A message with no body is treated
@@ -919,6 +955,7 @@ mod tests {
             0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04, 0x22,
             0x02, 0xaa, 0xbb,
         ];
+        assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "leaf node encoding drifted: {got:02x?}");
     }
 
@@ -933,6 +970,7 @@ mod tests {
             0x22, 0x0f, 0x0a, 0x04, 0x12, 0x02, 0x4c, 0x30, 0x0a, 0x07, 0x0a, 0x01, 0x6d, 0x12,
             0x02, 0x4c, 0x31,
         ];
+        assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "index node encoding drifted: {got:02x?}");
     }
 }

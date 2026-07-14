@@ -409,7 +409,8 @@ impl ShardResolver for ReleaseResolver {
 
 /// Per-key resolution within a shard CAS attempt.
 enum EntryResolution {
-    /// The lock is installed in `entry`.
+    /// The lock is installed in `entry`. The boolean is true when the intent
+    /// creates or deletes a visible key, requiring a membership write lock.
     Locked(ShardEntry, bool),
     /// A live pending holder this transaction does not outrank: wait for it.
     Wait(TxId),
@@ -958,7 +959,6 @@ impl Locker {
                 | FoldOutcome::InDoubt(_) => {
                     return Ok(ShardOutcome::Conflict);
                 }
-                FoldOutcome::InvalidInput(msg) => return Err(TransError::InvalidInput(msg)),
             }
         }
     }

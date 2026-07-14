@@ -180,10 +180,6 @@ impl SplitHinter for SplitCandidates {
             priority: self.new_id(),
         });
     }
-
-    fn policy(&self) -> SplitPolicy {
-        self.policy
-    }
 }
 
 /// Background executor that halves over-full B-link nodes (ADR-031). Holds no
@@ -232,6 +228,7 @@ impl Splitter {
             resolver.clone(),
             mon.clone(),
             retry,
+            policy,
             Arc::new(candidates.clone()),
         );
         let splitter = Splitter::with_candidates(
@@ -283,14 +280,13 @@ impl Splitter {
         let mut acquired = false;
         for _ in 0..50 {
             let (mut root, version) = self.shards.load_root(parent_prefix).await?;
-            let node = root.node_mut_for_coordination();
-            if node.structure_lock().lock_type() == LockType::Write
-                && !node.structure_lock().contains(&id)
+            let locks = root.node_locks_mut();
+            if locks.structure().lock_type() == LockType::Write && !locks.structure().contains(&id)
             {
                 rt::sleep(Duration::from_millis(5)).await;
                 continue;
             }
-            node.add_structure_reader(id.clone());
+            locks.add_structure_reader(id.clone());
             if self
                 .shards
                 .store_root(parent_prefix, &root, &version)
@@ -796,7 +792,7 @@ impl Splitter {
             .node_max_bytes
             .saturating_sub(self.candidates.policy().split_headroom_bytes);
         if sized_root.content_encoded_len() > content_limit
-            || sized_root.encode().len() > self.candidates.policy().node_max_bytes
+            || sized_root.encoded_len() > self.candidates.policy().node_max_bytes
         {
             self.release_structure_write(prefix, None, id).await?;
             return Err(TransError::InvalidInput(
@@ -1019,7 +1015,7 @@ impl Splitter {
                 .node_max_bytes
                 .saturating_sub(self.candidates.policy().split_headroom_bytes);
             if updated.content_encoded_len() > content_limit
-                || updated.encode().len() > self.candidates.policy().node_max_bytes
+                || updated.encoded_len() > self.candidates.policy().node_max_bytes
             {
                 self.finish_without_split(prefix, parent_token.as_deref(), &lock_id)
                     .await?;
@@ -1215,6 +1211,7 @@ mod tests {
             resolver.clone(),
             mon.clone(),
             RetryConfig::default(),
+            *candidates.policy(),
             Arc::new(candidates.clone()),
         );
         Splitter::with_candidates(
@@ -1539,8 +1536,7 @@ mod tests {
         );
 
         let (mut root, version) = s.load_root(COLL).await.unwrap();
-        root.node_mut_for_coordination()
-            .remove_structure_holder(&holder);
+        root.node_locks_mut().remove_structure_holder(&holder);
         assert!(s.store_root(COLL, &root, &version).await.unwrap());
 
         sp.run_once().await;

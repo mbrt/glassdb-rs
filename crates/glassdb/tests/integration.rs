@@ -80,9 +80,15 @@ async fn individually_oversized_key_is_invalid_input() {
         .unwrap();
     let coll = db.collection(b"demo");
     coll.create().await.unwrap();
+    let before = db.stats();
 
     let err = coll.write(&[b'k'; 128], b"value").await.unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
+    let delta = db.stats() - before;
+    assert_eq!(
+        delta.lock_calls, 0,
+        "invalid keys are rejected before locking"
+    );
 }
 
 // The distributed locker's counters are surfaced through `Database::stats()`

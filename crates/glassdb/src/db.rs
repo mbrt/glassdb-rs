@@ -167,6 +167,7 @@ impl DatabaseBuilder {
             gc,
             Some(bg_weak),
             resolver,
+            split_policy,
         );
 
         let inner = Arc::new(DbInner {
