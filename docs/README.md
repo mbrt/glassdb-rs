@@ -38,6 +38,13 @@ status. Designs are **named by topic, not numbered** (unlike ADRs): they are a
 small, living set referenced by subject rather than a decision sequence. New
 epics use [`designs/_template.md`](designs/_template.md).
 
+- [`designs/object-storage-native.md`](designs/object-storage-native.md) — the
+  content-CAS transaction and storage layout.
+- [`designs/dynamic-range-sharding.md`](designs/dynamic-range-sharding.md) — the
+  order-preserving B-link coordination directory.
+- [`designs/snapshot-reads.md`](designs/snapshot-reads.md) — proposed
+  bounded-staleness, long-lived read-only snapshots.
+
 ## Guides (`guides/`)
 
 - [`releasing.md`](guides/releasing.md) — how releases are cut and published.
