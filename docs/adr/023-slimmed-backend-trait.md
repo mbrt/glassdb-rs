@@ -6,7 +6,7 @@ Accepted
 
 The non-paginated, immediate-directory semantics of `list` are superseded by
 the opaque-cursor recursive-prefix contract in
-[ADR-034](034-paginated-listing-and-sharded-transaction-logs.md). The rest of
+[ADR-035](035-paginated-listing-and-sharded-transaction-logs.md). The rest of
 the reduced trait is unchanged.
 
 > Naming note: the caches were later renamed for clarity — `Global` →

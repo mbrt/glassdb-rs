@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// A [`Backend`] decorator that emits a `tracing` debug event for every
 /// operation, tagged with the configured backend id.
@@ -116,9 +116,21 @@ impl Backend for BackendLogger {
         r
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        let r = self.inner.list(dir_path).await;
-        tracing::debug!(backend_id = %self.id, path = dir_path, err = ?r.as_ref().err(), "List");
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        let r = self.inner.list(prefix, cursor, limit).await;
+        tracing::debug!(
+            backend_id = %self.id,
+            path = prefix,
+            cursor = ?cursor,
+            limit = limit.get(),
+            err = ?r.as_ref().err(),
+            "List"
+        );
         r
     }
 }

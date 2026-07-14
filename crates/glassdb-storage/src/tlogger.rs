@@ -85,6 +85,13 @@ pub struct TxStatus {
     pub version: backend::Version,
 }
 
+/// One backend page of transaction IDs from a deterministic log shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxListPage {
+    pub ids: Vec<TxId>,
+    pub next: Option<backend::ListCursor>,
+}
+
 /// A storage path together with its lock type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathLock {
@@ -199,18 +206,24 @@ impl TLogger {
             .await
     }
 
-    /// Lists every transaction id with a persisted object under this logger's
-    /// prefix. This is the flat `{prefix}/_t/` directory GC pages through to
-    /// make its candidate set complete without any database-wide shard scan
-    /// (ADR-022). Entries that are not transaction paths (e.g. sub-directory
-    /// prefixes a listing may return) are skipped.
-    pub async fn list_transaction_ids(&self) -> Result<Vec<TxId>, StorageError> {
-        let dir = paths::transactions_prefix(&self.prefix);
-        let paths = self.objects.list(&dir).await?;
-        Ok(paths
+    /// Lists one page of transaction IDs from `shard`.
+    pub async fn list_transaction_ids(
+        &self,
+        shard: usize,
+        cursor: Option<&backend::ListCursor>,
+        limit: backend::ListLimit,
+    ) -> Result<TxListPage, StorageError> {
+        let prefix = paths::transaction_shard_prefix(&self.prefix, shard);
+        let page = self.objects.list(&prefix, cursor, limit).await?;
+        let ids = page
+            .objects
             .iter()
-            .filter_map(|p| paths::transaction_id_of(p).ok())
-            .collect())
+            .filter_map(|path| paths::transaction_id_of(path).ok())
+            .collect();
+        Ok(TxListPage {
+            ids,
+            next: page.next,
+        })
     }
 
     /// Removes the log for `id`, ignoring not-found errors.
@@ -572,20 +585,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_transaction_ids_enumerates_the_flat_directory() {
+    async fn list_transaction_ids_pages_one_shard() {
         let t = new_tlogger();
         let ids = [
             TxId::from_bytes(vec![1, 2]),
-            TxId::from_bytes(vec![3, 4]),
-            TxId::from_bytes(vec![5, 6]),
+            TxId::from_bytes(vec![1, 3]),
+            TxId::from_bytes(vec![1, 4]),
         ];
         for id in &ids {
             t.set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
                 .await
                 .unwrap();
         }
-        // A non-transaction object under a different prefix must not appear.
-        let mut listed = t.list_transaction_ids().await.unwrap();
+        let shard = paths::transaction_shard(&ids[0]);
+        assert!(ids.iter().all(|id| paths::transaction_shard(id) == shard));
+        let limit = backend::ListLimit::new(2).unwrap();
+        let first = t.list_transaction_ids(shard, None, limit).await.unwrap();
+        assert_eq!(first.ids.len(), 2);
+        let second = t
+            .list_transaction_ids(shard, first.next.as_ref(), limit)
+            .await
+            .unwrap();
+        assert!(second.next.is_none());
+        let mut listed = first.ids;
+        listed.extend(second.ids);
         listed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         let mut expected: Vec<TxId> = ids.to_vec();
         expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));

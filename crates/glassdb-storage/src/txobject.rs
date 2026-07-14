@@ -1,4 +1,5 @@
-//! The unified transaction object: the canonical `_t/<txid>` body (ADR-019).
+//! The unified transaction object: the canonical `_t/<ss>/<txid>` body
+//! (ADR-019/035).
 //!
 //! Values live *only* in this object. While **pending** it is small (lease +
 //! lock intentions); a single CAS flips it to **committed**, attaching the full

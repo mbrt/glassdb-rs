@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use glassdb_concurr::Tape;
 use glassdb_concurr::rt;
 
-use crate::{Backend, BackendError, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// Probabilities (out of 256) governing transport faults, plus the maximum
 /// injected delay. A probability of zero disables that behaviour.
@@ -238,8 +238,14 @@ impl Backend for FaultBackend {
         self.transport(|| self.inner.delete(path)).await
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.transport(|| self.inner.list(dir_path)).await
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        self.transport(|| self.inner.list(prefix, cursor, limit))
+            .await
     }
 }
 

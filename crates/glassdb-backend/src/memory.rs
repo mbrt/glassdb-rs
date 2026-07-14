@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 #[derive(Clone, Default)]
 struct Object {
@@ -146,30 +146,69 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        let dir = if dir_path.ends_with('/') {
-            dir_path.to_string()
-        } else {
-            format!("{dir_path}/")
-        };
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        validate_list_prefix(prefix)?;
+        let after = cursor
+            .map(|cursor| decode_list_cursor(prefix, cursor))
+            .transpose()?;
         let state = self.state.lock().unwrap();
-        let mut set = std::collections::BTreeSet::new();
-        for k in state.objects.keys() {
-            if !k.starts_with(&dir) {
-                continue;
-            }
-            let rest = &k[dir.len()..];
-            match rest.find('/') {
-                Some(idx) => {
-                    set.insert(k[..dir.len() + idx].to_string());
-                }
-                None => {
-                    set.insert(k.clone());
-                }
-            }
-        }
-        Ok(set.into_iter().collect())
+        let mut matches: Vec<&str> = state
+            .objects
+            .keys()
+            .map(String::as_str)
+            .filter(|key| key.starts_with(prefix))
+            .filter(|key| after.is_none_or(|after| *key > after))
+            .collect();
+        matches.sort_unstable();
+
+        let has_more = matches.len() > limit.get();
+        let objects: Vec<String> = matches
+            .into_iter()
+            .take(limit.get())
+            .map(str::to_string)
+            .collect();
+        let next = if has_more {
+            objects.last().map(|last| encode_list_cursor(prefix, last))
+        } else {
+            None
+        };
+        Ok(ListPage { objects, next })
     }
+}
+
+fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        Ok(())
+    } else {
+        Err(BackendError::other(format!(
+            "list prefix must be empty or end in '/': {prefix:?}"
+        )))
+    }
+}
+
+fn encode_list_cursor(prefix: &str, last: &str) -> ListCursor {
+    ListCursor::new(format!("{}:{prefix}{last}", prefix.len()))
+}
+
+fn decode_list_cursor<'a>(prefix: &str, cursor: &'a ListCursor) -> Result<&'a str, BackendError> {
+    let (prefix_len, body) = cursor
+        .as_str()
+        .split_once(':')
+        .ok_or(BackendError::InvalidCursor)?;
+    let prefix_len = prefix_len
+        .parse::<usize>()
+        .map_err(|_| BackendError::InvalidCursor)?;
+    let stored_prefix = body.get(..prefix_len).ok_or(BackendError::InvalidCursor)?;
+    let last = body.get(prefix_len..).ok_or(BackendError::InvalidCursor)?;
+    if stored_prefix != prefix || !last.starts_with(prefix) {
+        return Err(BackendError::InvalidCursor);
+    }
+    Ok(last)
 }
 
 #[cfg(test)]
@@ -229,15 +268,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_lexicographic_with_subdirs() {
+    async fn list_is_recursive_and_paginated() {
         let b = MemoryBackend::new();
         for p in ["d/b", "d/a", "d/sub/x", "d/sub/y", "other/z"] {
             b.write(p, b"v".to_vec()).await.unwrap();
         }
-        let got = b.list("d").await.unwrap();
-        assert_eq!(
-            got,
-            vec!["d/a".to_string(), "d/b".to_string(), "d/sub".to_string()]
-        );
+        let limit = ListLimit::new(2).unwrap();
+        let first = b.list("d/", None, limit).await.unwrap();
+        assert_eq!(first.objects, vec!["d/a", "d/b"]);
+        let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
+        assert_eq!(second.objects, vec!["d/sub/x", "d/sub/y"]);
+        assert!(second.next.is_none());
+
+        let err = b
+            .list("other/", first.next.as_ref(), limit)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::InvalidCursor));
     }
 }

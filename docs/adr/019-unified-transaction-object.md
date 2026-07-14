@@ -6,7 +6,7 @@ Accepted — implemented (`glassdb-storage::txobject` codec + the transaction
 engine)
 
 The flat `_t/<txid>` path is refined by
-[ADR-034](034-paginated-listing-and-sharded-transaction-logs.md) into a
+[ADR-035](035-paginated-listing-and-sharded-transaction-logs.md) into a
 deterministically sharded transaction-log layout. The unified object and
 lifecycle decided here are unchanged.
 

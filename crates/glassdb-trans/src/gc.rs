@@ -14,8 +14,8 @@
 //! batch of candidates and confirms each one dead by GET-ing only the handful of
 //! shards it names — never a database-wide scan. Candidates come from the
 //! write-back hint ([`Gc::schedule_tx_cleanup`], the `current_writer` a fresh
-//! commit just superseded) and a paged walk of the flat `{db}/_t/` directory
-//! (which makes the candidate set complete regardless of lost hints).
+//! commit just superseded) and paged walks of the sharded `{db}/_t/{ss}/`
+//! namespace (which makes the candidate set complete regardless of lost hints).
 //!
 //! Safety rests on the ADR-021 lease as a horizon (`is_expired`): a candidate
 //! within the horizon is always kept, because the non-atomic reverse check can
@@ -40,7 +40,7 @@ use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
-use glassdb_data::{TxId, paths};
+use glassdb_data::{TxId, paths, shuffle};
 use glassdb_storage::{
     Directory, Freshness, LockScope, PathLock, ShardStore, StorageError, TLogger, TxCommitStatus,
     TxLog,
@@ -55,9 +55,13 @@ use crate::tlocker::Locker;
 /// tighter cadence would only re-GET still-referenced objects.
 const GC_INTERVAL: std::time::Duration = PENDING_TX_TIMEOUT;
 
-/// Maximum number of `_t/` objects visited from the paged list per cycle, so a
-/// large store is walked incrementally instead of all at once.
+/// Maximum number of transaction objects returned by one listing request.
 const GC_LIST_PAGE: usize = 128;
+
+/// Maximum listing requests issued by one cycle. Empty shards still cost a
+/// request, so this bounds work independently of how sparse the log namespace
+/// is.
+const GC_LIST_REQUEST_BUDGET: usize = 64;
 
 /// Upper bound on the buffered write-back hint queue. The paged list guarantees
 /// completeness, so dropping the oldest hint when the queue is full only delays
@@ -79,9 +83,36 @@ pub struct Gc {
     // Write-back hint feed: txids a fresh commit just superseded (primary
     // candidate source). Deduplicated when drained.
     hints: Arc<Mutex<VecDeque<TxId>>>,
-    // Paged `_t/` list cursor: the last txid visited, so successive cycles walk
-    // the flat transaction directory a page at a time and wrap around.
-    cursor: Arc<Mutex<Option<TxId>>>,
+}
+
+/// Task-local traversal state for the transaction-log shards.
+struct TxScan {
+    shards: Vec<usize>,
+    current: usize,
+    cursor: Option<backend::ListCursor>,
+}
+
+impl TxScan {
+    fn shuffled() -> Self {
+        let mut shards = (0..paths::TRANSACTION_SHARD_COUNT).collect::<Vec<_>>();
+        shuffle(&mut shards);
+        TxScan {
+            shards,
+            current: 0,
+            cursor: None,
+        }
+    }
+
+    fn begin_next_pass(&mut self) {
+        shuffle(&mut self.shards);
+        self.current = 0;
+        self.cursor = None;
+    }
+
+    fn finish_shard(&mut self) {
+        self.current += 1;
+        self.cursor = None;
+    }
 }
 
 impl Gc {
@@ -105,7 +136,6 @@ impl Gc {
             mon,
             clock,
             hints: Arc::new(Mutex::new(VecDeque::new())),
-            cursor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -117,10 +147,11 @@ impl Gc {
             return;
         };
         let gc = self.clone();
+        let mut scan = TxScan::shuffled();
         bg.spawn(async move {
             loop {
                 rt::sleep(GC_INTERVAL).await;
-                gc.run_once().await;
+                gc.run_once(&mut scan).await;
             }
         });
     }
@@ -137,11 +168,11 @@ impl Gc {
         q.push_back(tid);
     }
 
-    /// Runs a single sweep cycle: the buffered hints plus one page of the `_t/`
-    /// list, each checked by the reverse liveness check. Best-effort — a
-    /// transient error on one candidate only delays its delete to a later cycle,
-    /// so it is logged and the cycle continues.
-    async fn run_once(&self) {
+    /// Runs a single sweep cycle: the buffered hints plus at most one non-empty
+    /// transaction-log page, each checked by the reverse liveness check.
+    /// Best-effort — a transient error on one candidate only delays its delete
+    /// to a later cycle, so it is logged and the cycle continues.
+    async fn run_once(&self, scan: &mut TxScan) {
         let mut seen: BTreeSet<TxId> = BTreeSet::new();
         let mut candidates: Vec<TxId> = Vec::new();
         {
@@ -152,7 +183,7 @@ impl Gc {
                 }
             }
         }
-        for tid in self.next_list_page().await {
+        for tid in self.next_list_page(scan).await {
             if seen.insert(tid.clone()) {
                 candidates.push(tid);
             }
@@ -165,36 +196,43 @@ impl Gc {
         }
     }
 
-    /// Returns the next page of the flat `{db}/_t/` directory, advancing the
-    /// paging cursor and wrapping to the start once the tail is consumed. The
-    /// list is sorted so paging is stable and deterministic under the DST
-    /// executor.
-    async fn next_list_page(&self) -> Vec<TxId> {
-        let mut all = match self.tl.list_transaction_ids().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "gc list of transaction objects failed");
-                return Vec::new();
-            }
-        };
-        if all.is_empty() {
-            *self.cursor.lock().unwrap() = None;
-            return Vec::new();
-        }
-        all.sort();
+    /// Returns at most one non-empty transaction-log page, advancing through a
+    /// shuffled shard order while staying within the per-cycle request budget.
+    async fn next_list_page(&self, scan: &mut TxScan) -> Vec<TxId> {
+        let limit = backend::ListLimit::new(GC_LIST_PAGE).unwrap();
 
-        let start = match self.cursor.lock().unwrap().clone() {
-            Some(c) => all.iter().position(|t| *t > c).unwrap_or(0),
-            None => 0,
-        };
-        let page: Vec<TxId> = all.iter().skip(start).take(GC_LIST_PAGE).cloned().collect();
-        // Wrap when this page consumed the tail; otherwise resume after it.
-        *self.cursor.lock().unwrap() = if start + page.len() >= all.len() {
-            None
-        } else {
-            page.last().cloned()
-        };
-        page
+        for _ in 0..GC_LIST_REQUEST_BUDGET {
+            if scan.current == scan.shards.len() {
+                scan.begin_next_pass();
+            }
+            let shard = scan.shards[scan.current];
+            let cursor = scan.cursor.clone();
+            match self
+                .tl
+                .list_transaction_ids(shard, cursor.as_ref(), limit)
+                .await
+            {
+                Ok(page) => {
+                    scan.cursor = page.next;
+                    if scan.cursor.is_none() {
+                        scan.finish_shard();
+                    }
+                    if !page.ids.is_empty() {
+                        return page.ids;
+                    }
+                }
+                Err(StorageError::InvalidCursor) => {
+                    // Provider tokens can expire; restarting only this shard
+                    // preserves progress through the rest of the pass.
+                    scan.cursor = None;
+                }
+                Err(e) => {
+                    tracing::debug!(shard, error = %e, "gc transaction-log listing failed");
+                    return Vec::new();
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// The reverse liveness check for one candidate (ADR-022): read it, keep it
@@ -536,6 +574,19 @@ mod tests {
         matches!(tl.get(id).await, Err(StorageError::NotFound))
     }
 
+    fn test_scan(shards: Vec<usize>, cursor: Option<backend::ListCursor>) -> TxScan {
+        TxScan {
+            shards,
+            current: 0,
+            cursor,
+        }
+    }
+
+    async fn run_once(gc: &Gc) {
+        let mut scan = TxScan::shuffled();
+        gc.run_once(&mut scan).await;
+    }
+
     // A committed object whose written key has since been overwritten by a newer
     // writer holds no reference and is swept. Fed via the paged list (no hint),
     // so the list feed is exercised too.
@@ -549,8 +600,9 @@ mod tests {
             .unwrap();
         // The key now points at a newer writer, not `old`.
         store_entry(&ctx.shards, b"k", writer_entry(b"k", &new)).await;
+        let mut scan = test_scan(vec![paths::transaction_shard(&old)], None);
 
-        ctx.gc.run_once().await;
+        ctx.gc.run_once(&mut scan).await;
 
         assert!(is_gone(&ctx.tl, &old).await);
     }
@@ -566,8 +618,9 @@ mod tests {
             .await
             .unwrap();
         store_entry(&ctx.shards, b"k", writer_entry(b"k", &t)).await;
+        ctx.gc.schedule_tx_cleanup(t.clone());
 
-        ctx.gc.run_once().await;
+        run_once(&ctx.gc).await;
 
         let (log, _) = ctx.tl.get(&t).await.unwrap();
         assert_eq!(log.status, TxCommitStatus::Ok);
@@ -584,8 +637,9 @@ mod tests {
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx.shards, b"k", locked_entry(b"k", &t)).await;
+        ctx.gc.schedule_tx_cleanup(t.clone());
 
-        ctx.gc.run_once().await;
+        run_once(&ctx.gc).await;
 
         let (got, _) = ctx.tl.get(&t).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Pending);
@@ -609,7 +663,7 @@ mod tests {
 
         tokio::time::sleep(PAST_HORIZON).await;
         ctx.gc.schedule_tx_cleanup(t.clone());
-        ctx.gc.run_once().await;
+        run_once(&ctx.gc).await;
 
         // Death is durable...
         let (got, _) = ctx.tl.get(&t).await.unwrap();
@@ -631,8 +685,9 @@ mod tests {
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx.shards, b"k", locked_entry(b"k", &t)).await;
+        ctx.gc.schedule_tx_cleanup(t.clone());
 
-        ctx.gc.run_once().await;
+        run_once(&ctx.gc).await;
 
         assert!(!is_gone(&ctx.tl, &t).await);
         let e = lookup_entry(&ctx.shards, b"k").await.unwrap();
@@ -650,8 +705,9 @@ mod tests {
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx.shards, b"k", locked_entry(b"k", &t)).await;
+        ctx.gc.schedule_tx_cleanup(t.clone());
 
-        ctx.gc.run_once().await;
+        run_once(&ctx.gc).await;
 
         assert!(is_gone(&ctx.tl, &t).await);
         assert!(lookup_entry(&ctx.shards, b"k").await.is_none());
@@ -663,7 +719,48 @@ mod tests {
         let ctx = new_ctx();
         let t = tx(9);
         ctx.gc.schedule_tx_cleanup(t.clone());
-        ctx.gc.run_once().await;
+        run_once(&ctx.gc).await;
+        assert!(is_gone(&ctx.tl, &t).await);
+    }
+
+    // Sparse namespaces must not turn one GC cycle into thousands of provider
+    // calls merely because most deterministic shards are empty.
+    #[tokio::test(start_paused = true)]
+    async fn sparse_scan_obeys_request_budget() {
+        let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = rec.log();
+        let ctx = new_ctx_with(rec);
+        let mut scan = test_scan((0..paths::TRANSACTION_SHARD_COUNT).collect(), None);
+
+        assert!(ctx.gc.next_list_page(&mut scan).await.is_empty());
+
+        let lists = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.op == "list")
+            .count();
+        assert_eq!(lists, GC_LIST_REQUEST_BUDGET);
+        assert_eq!(scan.current, GC_LIST_REQUEST_BUDGET);
+    }
+
+    // Provider continuation tokens are opaque and may expire. GC restarts the
+    // affected shard instead of abandoning the pass or discarding its order.
+    #[tokio::test(start_paused = true)]
+    async fn invalid_cursor_restarts_current_shard() {
+        let ctx = new_ctx();
+        let t = tx(1);
+        ctx.tl
+            .set(&committed(t.clone(), PAST_HORIZON, &[], &[]))
+            .await
+            .unwrap();
+        let mut scan = test_scan(
+            vec![paths::transaction_shard(&t)],
+            Some(backend::ListCursor::new("stale")),
+        );
+
+        ctx.gc.run_once(&mut scan).await;
+
         assert!(is_gone(&ctx.tl, &t).await);
     }
 

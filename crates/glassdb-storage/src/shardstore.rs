@@ -23,6 +23,8 @@ use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
 
+const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
+
 /// Reads and compare-and-swaps B-link node and collection-root objects through
 /// the [`ObjectCache`], the v2 coordination substrate.
 #[derive(Clone)]
@@ -190,21 +192,26 @@ impl ShardStore {
         &self,
         db_root: &str,
     ) -> Result<Vec<(String, StructuralLog)>, StorageError> {
-        let paths = self
-            .objects
-            .list(&paths::structural_log_dir(db_root))
-            .await?;
-        let mut records = Vec::with_capacity(paths.len());
-        for path in paths {
-            let record_id = paths::structural_log_id_of(&path)
-                .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
-            match self.objects.read(&path, Freshness::Latest).await {
-                Ok(read) => records.push((record_id, StructuralLog::decode(&read.value)?)),
-                Err(StorageError::NotFound) => {}
-                Err(e) => return Err(e),
+        let prefix = paths::structural_log_dir(db_root);
+        let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let page = self.objects.list(&prefix, cursor.as_ref(), limit).await?;
+            for path in page.objects {
+                let record_id = paths::structural_log_id_of(&path)
+                    .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+                match self.objects.read(&path, Freshness::Latest).await {
+                    Ok(read) => records.push((record_id, StructuralLog::decode(&read.value)?)),
+                    Err(StorageError::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(records),
             }
         }
-        Ok(records)
     }
 
     /// Deletes a resolved structural record, ignoring an already-missing one.
@@ -514,5 +521,29 @@ mod tests {
             .unwrap()
             .version;
         assert_ne!(Some(v1), v2, "a CAS store advances the version");
+    }
+
+    #[tokio::test]
+    async fn structural_log_listing_drains_backend_pages() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
+            store
+                .write_structural_log(
+                    &format!("record-{i:03}"),
+                    &StructuralLog {
+                        prefix: "db/coll".to_string(),
+                        source_token: "source".to_string(),
+                        source_version: "v1".to_string(),
+                        created_tokens: vec![format!("node-{i:03}")],
+                        split_key: vec![i as u8],
+                        is_root: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let records = store.list_structural_logs("db").await.unwrap();
+        assert_eq!(records.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
     }
 }

@@ -8,10 +8,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use glassdb_backend::{Backend, BackendError, Cause, ReadReply, Version};
+use glassdb_backend::{
+    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
+};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, RequestBuilder, StatusCode};
+
+const MAX_LIST_PAGE_SIZE: usize = 1_000;
 use serde::Deserialize;
 
 #[cfg(test)]
@@ -339,29 +343,34 @@ impl Backend for GcsBackend {
         Ok(())
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        let prefix = ensure_trailing_slash(dir_path);
-        let mut page_token: Option<String> = None;
-        let mut keys: Vec<String> = Vec::new();
-        loop {
-            let mut query: Vec<(&str, String)> =
-                vec![("delimiter", "/".to_string()), ("prefix", prefix.clone())];
-            if let Some(t) = &page_token {
-                query.push(("pageToken", t.clone()));
-            }
-            let rb = self.http.get(self.objects_url()).query(&query);
-            let resp = self.send(rb).await?;
-            check_status(resp.status(), "List", &prefix)?;
-            let page: ListResponse = parse_json(resp, "List", &prefix).await?;
-            keys.extend(page.prefixes);
-            keys.extend(page.items.into_iter().filter_map(|o| o.name));
-            match page.next_page_token {
-                Some(t) if !t.is_empty() => page_token = Some(t),
-                _ => break,
-            }
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        validate_list_prefix(prefix)?;
+        let max_results = u32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
+        let mut query = vec![
+            ("prefix", prefix.to_string()),
+            ("maxResults", max_results.to_string()),
+        ];
+        if let Some(cursor) = cursor {
+            query.push(("pageToken", cursor.as_str().to_string()));
         }
-        keys.sort();
-        Ok(keys)
+        let rb = self.http.get(self.objects_url()).query(&query);
+        let resp = self.send(rb).await?;
+        if cursor.is_some() && resp.status() == StatusCode::BAD_REQUEST {
+            return Err(BackendError::InvalidCursor);
+        }
+        check_status(resp.status(), "List", prefix)?;
+        let page: ListResponse = parse_json(resp, "List", prefix).await?;
+        let objects = page.items.into_iter().filter_map(|o| o.name).collect();
+        let next = page
+            .next_page_token
+            .filter(|token| !token.is_empty())
+            .map(ListCursor::new);
+        Ok(ListPage { objects, next })
     }
 }
 
@@ -399,8 +408,6 @@ fn generation_from_headers(resp: &reqwest::Response) -> Version {
 struct ListResponse {
     #[serde(default)]
     items: Vec<ObjectResource>,
-    #[serde(default)]
-    prefixes: Vec<String>,
     #[serde(default, rename = "nextPageToken")]
     next_page_token: Option<String>,
 }
@@ -523,10 +530,12 @@ fn multipart_body(json: &str, value: &[u8]) -> Vec<u8> {
     body
 }
 
-fn ensure_trailing_slash(a: &str) -> String {
-    if a.ends_with('/') {
-        a.to_string()
+fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        Ok(())
     } else {
-        format!("{a}/")
+        Err(BackendError::other(format!(
+            "list prefix must be empty or end in '/': {prefix:?}"
+        )))
     }
 }

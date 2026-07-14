@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// A single recorded backend operation: the method tag, the primary path, and a
 /// canonical encoding of the remaining arguments.
@@ -57,6 +57,16 @@ fn enc_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 
 fn enc_version(buf: &mut Vec<u8>, v: &Version) {
     enc_bytes(buf, v.token.as_bytes());
+}
+
+fn enc_cursor(buf: &mut Vec<u8>, cursor: Option<&ListCursor>) {
+    match cursor {
+        Some(cursor) => {
+            buf.push(1);
+            enc_bytes(buf, cursor.as_str().as_bytes());
+        }
+        None => buf.push(0),
+    }
 }
 
 /// A [`Backend`] decorator that appends every forwarded call to a shared
@@ -148,9 +158,17 @@ impl Backend for RecordingBackend {
         self.inner.delete(path).await
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        self.record("list", dir_path, Vec::new());
-        self.inner.list(dir_path).await
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        let mut args = Vec::new();
+        enc_cursor(&mut args, cursor);
+        args.extend_from_slice(&(limit.get() as u64).to_le_bytes());
+        self.record("list", prefix, args);
+        self.inner.list(prefix, cursor, limit).await
     }
 }
 
@@ -186,16 +204,19 @@ mod tests {
         let v = rec.write("a/b", b"v".to_vec()).await.unwrap();
         let _ = rec.read("a/b").await;
         let _ = rec.read_if_modified("a/b", &v).await;
+        let _ = rec.list("a/", None, ListLimit::new(1).unwrap()).await;
 
         let recorded = log.lock().unwrap();
         let ops: Vec<&str> = recorded.iter().map(|r| r.op).collect();
-        assert_eq!(ops, vec!["write", "read", "read_if_modified"]);
+        assert_eq!(ops, vec!["write", "read", "read_if_modified", "list"]);
         assert_eq!(recorded[0].path, "a/b");
         // The write encoded its value into args; a plain read carries none.
         assert!(!recorded[0].args.is_empty());
         assert!(recorded[1].args.is_empty());
         // read_if_modified encoded the expected version.
         assert!(!recorded[2].args.is_empty());
+        // list records the absent cursor and positive page limit.
+        assert!(!recorded[3].args.is_empty());
     }
 
     #[test]

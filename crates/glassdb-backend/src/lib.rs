@@ -7,6 +7,7 @@
 //! opaque CAS [`Version`] (its ETag/generation), which is the only token used
 //! for conditional reads and writes.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -61,6 +62,10 @@ pub enum BackendError {
     /// it means "not modified" — the caller's cached copy is still current.
     #[error("precondition failed")]
     Precondition,
+    /// A listing cursor is invalid for the requested prefix or was rejected by
+    /// the provider. Callers should restart that prefix from the beginning.
+    #[error("invalid listing cursor")]
+    InvalidCursor,
     /// The operation's outcome is unknown: the request may or may not have been
     /// applied. Returned when a call cannot be completed with a definitive
     /// answer — e.g. a conditional write whose acknowledgement was lost and
@@ -132,6 +137,37 @@ pub struct ReadReply {
     pub version: Version,
 }
 
+/// A provider-issued continuation token for a paginated listing.
+///
+/// The token has no engine-level meaning. Callers may only retain it and pass it
+/// back to the same backend with the same prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListCursor(Arc<str>);
+
+impl ListCursor {
+    /// Wraps the provider token returned by a backend implementation.
+    pub fn new(token: impl Into<Arc<str>>) -> Self {
+        ListCursor(token.into())
+    }
+
+    /// Returns the provider token for forwarding to the underlying store.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A positive upper bound on the objects returned by one listing call.
+pub type ListLimit = NonZeroUsize;
+
+/// One page of object paths returned by [`Backend::list`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListPage {
+    /// Actual object paths matching the requested prefix.
+    pub objects: Vec<String>,
+    /// The opaque cursor for the next page, or `None` when traversal completed.
+    pub next: Option<ListCursor>,
+}
+
 /// The contract with an object store (ADR-023).
 ///
 /// The surface is content-CAS only: there are no metadata tags, and the opaque
@@ -177,9 +213,17 @@ pub trait Backend: Send + Sync {
     /// Unconditionally deletes the object.
     async fn delete(&self, path: &str) -> Result<(), BackendError>;
 
-    /// Lists object paths under `dir_path` (separator `/`), lexicographically.
-    /// Immediate sub-directory prefixes are returned, not their contents.
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError>;
+    /// Lists one page of object paths recursively under `prefix`.
+    ///
+    /// `prefix` is empty or ends in `/`. `cursor`, when present, must have been
+    /// returned by this backend for the same prefix. Result order is unspecified
+    /// and only `ListPage::next == None` means traversal is complete.
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError>;
 }
 
 /// Transparent delegation so any `Arc<B: Backend>` (including
@@ -226,7 +270,12 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         (**self).delete(path).await
     }
 
-    async fn list(&self, dir_path: &str) -> Result<Vec<String>, BackendError> {
-        (**self).list(dir_path).await
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        (**self).list(prefix, cursor, limit).await
     }
 }
