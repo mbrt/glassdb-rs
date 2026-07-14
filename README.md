@@ -55,18 +55,17 @@ async fn main() -> Result<(), glassdb::Error> {
 
     // Single-key helpers run in their own transaction.
     users.write(b"alice", b"hello").await?;
-    let v = users.read(b"alice").await?;
+    let v = users.read(b"alice").await?.expect("alice exists");
     assert_eq!(v, b"hello");
 
     // Multi-key serializable transaction with automatic conflict retries.
     // `tx` is an owned handle.
     let users = &users;
     db.tx(|tx| async move {
-        let cur = match tx.read(users, b"counter").await {
-            Ok(v) => v,
-            Err(glassdb::Error::NotFound) => b"0".to_vec(),
-            Err(e) => return Err(e),
-        };
+        let cur = tx
+            .read(users, b"counter")
+            .await?
+            .unwrap_or_else(|| b"0".to_vec());
         let next = String::from_utf8_lossy(&cur).parse::<i64>().unwrap_or(0) + 1;
         tx.write(users, b"counter", next.to_string().as_bytes())
     })

@@ -179,8 +179,8 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
     // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
     db.tx(|tx| async move {
         let cur = match tx.read(coll, key).await {
-            Ok(v) => read_int(&v),
-            Err(Error::NotFound) => 0,
+            Ok(Some(v)) => read_int(&v),
+            Ok(None) => 0,
             Err(e) => return Err(e),
         };
         tx.write(coll, key, &write_int(cur + 1))
@@ -218,7 +218,7 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
         .expect("a landed-but-lost-ack lock CAS resolves to committed via read-back");
 
     // The write landed exactly once: 11, never 12 (double-apply) nor unchanged.
-    let got = read_int(&coll.read(b"k").await.unwrap());
+    let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
     assert_eq!(got, 11, "value must be applied exactly once");
 }
 
@@ -270,7 +270,7 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     );
 
     // The competitor's write is the durable one; our uncertain write did not win.
-    assert_eq!(read_int(&coll.read(b"k").await.unwrap()), 99);
+    assert_eq!(read_int(&coll.read(b"k").await.unwrap().unwrap()), 99);
 }
 
 /// The single read-write fast path: an in-doubt outcome on the lock CAS that did
@@ -303,7 +303,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 
     // The retry landed exactly once: 11, never 12 (double-apply) and never
     // unchanged (lost write).
-    let got = read_int(&coll.read(b"k").await.unwrap());
+    let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
     assert_eq!(got, 11, "the increment must be applied exactly once");
 }
 
@@ -341,8 +341,8 @@ async fn logged_commit_lost_ack_retries_transparently() {
     // by reference so the body stays `FnMut` (re-runnable on a retry).
     let coll = &coll;
     db.tx(|tx| async move {
-        let a = read_int(&tx.read(coll, b"a").await.unwrap());
-        let b = read_int(&tx.read(coll, b"b").await.unwrap());
+        let a = read_int(&tx.read(coll, b"a").await.unwrap().unwrap());
+        let b = read_int(&tx.read(coll, b"b").await.unwrap().unwrap());
         tx.write(coll, b"a", &write_int(a + 1))?;
         tx.write(coll, b"b", &write_int(b + 1))
     })
@@ -350,8 +350,8 @@ async fn logged_commit_lost_ack_retries_transparently() {
     .expect("the logged commit must retry the in-doubt log write transparently");
 
     // Each write applied exactly once — the safety invariant.
-    assert_eq!(read_int(&coll.read(b"a").await.unwrap()), 1);
-    assert_eq!(read_int(&coll.read(b"b").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 1);
 
     // Bound the retry: the engine drives the commit point exactly twice (the
     // original lost-ack write, then a single retry that observes the landed
@@ -391,8 +391,8 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // closure re-run here — the lock retry is invisible to `Database::tx`).
     let coll = &coll;
     db.tx(|tx| async move {
-        let a = read_int(&tx.read(coll, b"a").await.unwrap());
-        let b = read_int(&tx.read(coll, b"b").await.unwrap());
+        let a = read_int(&tx.read(coll, b"a").await.unwrap().unwrap());
+        let b = read_int(&tx.read(coll, b"b").await.unwrap().unwrap());
         tx.write(coll, b"a", &write_int(a + 1))?;
         tx.write(coll, b"b", &write_int(b + 1))
     })
@@ -400,8 +400,8 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     .expect("a pre-commit in-doubt lock outcome must be recovered in place");
 
     // Each write applied exactly once — the safety invariant.
-    assert_eq!(read_int(&coll.read(b"a").await.unwrap()), 1);
-    assert_eq!(read_int(&coll.read(b"b").await.unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 1);
 }
 
 /// A *clean* precondition (no lost ack) on the fast path's lock CAS is a genuine
@@ -433,6 +433,6 @@ async fn clean_conflict_on_single_rw_still_commits() {
         .await
         .expect("a clean conflict must be retried transparently, not surfaced");
 
-    let got = read_int(&coll.read(b"k").await.unwrap());
+    let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
     assert_eq!(got, 42, "the increment must be applied exactly once");
 }

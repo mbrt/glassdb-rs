@@ -576,8 +576,8 @@ fn independent_single_rmw(
                         .measure(|| async move {
                             db.tx(|tx| async move {
                                 let v = match tx.read(coll, b"key").await {
-                                    Ok(v) => v,
-                                    Err(GError::NotFound) => Vec::new(),
+                                    Ok(Some(v)) => v,
+                                    Ok(None) => Vec::new(),
                                     Err(e) => return Err(e),
                                 };
                                 tx.write(coll, b"key", &v)
@@ -627,8 +627,8 @@ fn independent_multi_rmw(
                                 .await;
                                 for (k, rv) in keys.iter().zip(vals) {
                                     let v = match rv {
-                                        Ok(v) => v,
-                                        Err(GError::NotFound) => Vec::new(),
+                                        Ok(Some(v)) => v,
+                                        Ok(None) => Vec::new(),
                                         Err(e) => return Err(e),
                                     };
                                     tx.write(coll, k, &v)?;
@@ -703,7 +703,7 @@ fn overlapping_multi_rmw(
                                 )
                                 .await;
                                 for (k, rv) in keys.iter().zip(vals) {
-                                    let v = rv?;
+                                    let v = rv?.ok_or(GError::NotFound)?;
                                     tx.write(coll, k, &v)?;
                                 }
                                 Ok(())
@@ -1120,8 +1120,8 @@ async fn write_tx(db: &Database, coll: &Collection, k0: &[u8], k1: &[u8]) -> Res
     db.tx(|tx| async move {
         // Read both keys in parallel, then swap their values.
         let (r0, r1) = tokio::join!(tx.read(coll, k0), tx.read(coll, k1));
-        let v0 = r0?;
-        let v1 = r1?;
+        let v0 = r0?.ok_or(GError::NotFound)?;
+        let v1 = r1?.ok_or(GError::NotFound)?;
         tx.write(coll, k0, &v1)?;
         tx.write(coll, k1, &v0)?;
         Ok(())

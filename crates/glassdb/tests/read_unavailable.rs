@@ -141,7 +141,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
         .await
         .expect("a transient read outage must be retried, not surfaced");
 
-    assert_eq!(read_int(&got), 10);
+    assert_eq!(read_int(&got.unwrap()), 10);
     // The retry happened inside the reader, not as a whole-transaction retry.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // The two injected faults plus the successful read.

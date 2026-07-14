@@ -80,8 +80,8 @@ impl<'a> Arbitrary<'a> for RmwWorkload {
 
 async fn read_int_from_tx(tx: &crate::Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
-        Ok(v) => Ok(read_int(&v)),
-        Err(Error::NotFound) => Ok(0),
+        Ok(Some(v)) => Ok(read_int(&v)),
+        Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -239,7 +239,13 @@ impl SimWorkload for RmwWorkload {
         let expected = expected_increments(self);
         let mut finals = vec![0i64; RMW_KEY_COUNT];
         for (k, slot) in finals.iter_mut().enumerate() {
-            *slot = read_int(&coll.read(&key_name(k)).await.expect("final read"));
+            *slot = read_int(
+                &coll
+                    .read(&key_name(k))
+                    .await
+                    .expect("final read")
+                    .expect("final value"),
+            );
         }
         let acct = state.lock().unwrap();
         assert_bounds(&acct, &finals, &expected, faults_enabled);

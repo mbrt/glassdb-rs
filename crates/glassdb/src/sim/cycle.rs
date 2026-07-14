@@ -91,7 +91,10 @@ impl<'a> Arbitrary<'a> for CycleWorkload {
 
 /// Reads node `idx`'s next-pointer within `tx`.
 async fn read_next(tx: &crate::Transaction, coll: &Collection, idx: usize) -> Result<usize, Error> {
-    let v = tx.read(coll, &key_name(idx)).await?;
+    let v = tx
+        .read(coll, &key_name(idx))
+        .await?
+        .ok_or(Error::NotFound)?;
     Ok(read_int(&v) as usize)
 }
 
@@ -205,7 +208,13 @@ impl SimWorkload for CycleWorkload {
         let node_count = self.node_count;
         let mut next = vec![0usize; node_count];
         for (k, slot) in next.iter_mut().enumerate() {
-            *slot = read_int(&coll.read(&key_name(k)).await.expect("final read")) as usize;
+            *slot = read_int(
+                &coll
+                    .read(&key_name(k))
+                    .await
+                    .expect("final read")
+                    .expect("final value"),
+            ) as usize;
         }
         assert_ring(&next);
     }

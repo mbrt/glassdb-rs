@@ -170,7 +170,7 @@ async fn run_api_program(
                 match action {
                     ApiAction::Read(key) => {
                         let actual = match tx.read(collection, &key_name(*key)).await {
-                            Ok(value) => {
+                            Ok(Some(value)) => {
                                 assert_eq!(
                                     value.len(),
                                     1,
@@ -178,7 +178,7 @@ async fn run_api_program(
                                 );
                                 Some(value[0])
                             }
-                            Err(Error::NotFound) => None,
+                            Ok(None) => None,
                             Err(error) => return Err(error),
                         };
                         if let Some(expected) = staged[*key] {
@@ -275,7 +275,7 @@ impl SimWorkload for ApiWorkload {
         for key in 0..API_KEYS {
             let name = key_name(key);
             let value = match collection.read(&name).await {
-                Ok(value) => {
+                Ok(Some(value)) => {
                     assert_eq!(
                         value.len(),
                         1,
@@ -287,7 +287,7 @@ impl SimWorkload for ApiWorkload {
                     );
                     Some(value[0])
                 }
-                Err(Error::NotFound) => {
+                Ok(None) => {
                     assert!(
                         !listed.contains(&name),
                         "API key k{key} listed but not readable"

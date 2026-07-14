@@ -63,24 +63,24 @@ impl TransactionInner {
 }
 
 impl Transaction {
-    /// Reads the value for `key` within the transaction. Repeatable: a value
-    /// read once is returned consistently, and a key not found stays not found
-    /// (avoiding phantom reads).
+    /// Reads the value for `key` within the transaction, returning `None` when
+    /// the key is absent. Repeatable: a value read once is returned consistently,
+    /// and a key not found stays not found (avoiding phantom reads).
     ///
     /// Takes `&self`, so multiple reads can be polled concurrently (e.g. with
     /// `futures::future::join_all`) to fetch keys in parallel.
-    pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Vec<u8>, Error> {
+    pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let p = paths::from_key(c.prefix(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
             if let Some(staged) = inner.staged.get(&p) {
-                return staged.read();
+                return Ok(staged.read());
             }
             if let Some(ReadState::NotFound { .. }) = inner.reads.get(&p) {
                 // Be consistent with values not found the first time.
-                return Err(Error::NotFound);
+                return Ok(None);
             }
         }
 
@@ -94,7 +94,7 @@ impl Transaction {
                             cache_hit: outcome.cache_hit,
                         },
                     );
-                    Err(Error::NotFound)
+                    Ok(None)
                 }
                 Some(rv) => {
                     let mut inner = self.inner.lock().unwrap();
@@ -110,7 +110,7 @@ impl Transaction {
                             cache_hit: outcome.cache_hit,
                         },
                     );
-                    Ok(rv.value.to_vec())
+                    Ok(Some(rv.value.to_vec()))
                 }
             },
             // A read is side-effect-free; `from_read` centralizes the mapping
@@ -260,10 +260,10 @@ enum StagedValue {
 }
 
 impl StagedValue {
-    fn read(&self) -> Result<Vec<u8>, Error> {
+    fn read(&self) -> Option<Vec<u8>> {
         match self {
-            StagedValue::Read(value) | StagedValue::Put(value) => Ok(value.to_vec()),
-            StagedValue::Delete => Err(Error::NotFound),
+            StagedValue::Read(value) | StagedValue::Put(value) => Some(value.to_vec()),
+            StagedValue::Delete => None,
         }
     }
 }

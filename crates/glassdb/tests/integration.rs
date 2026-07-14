@@ -31,9 +31,9 @@ fn read_int(b: &[u8]) -> i64 {
 
 async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
-        Ok(v) => Ok(read_int(&v)),
+        Ok(Some(v)) => Ok(read_int(&v)),
         // Treat a missing value as zero (i.e. initialize it).
-        Err(Error::NotFound) => Ok(0),
+        Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
 }
@@ -59,7 +59,7 @@ async fn rw() {
     coll.create().await.unwrap();
 
     coll.write(key, val).await.unwrap();
-    let buf = coll.read(key).await.unwrap();
+    let buf = coll.read(key).await.unwrap().unwrap();
     assert_eq!(buf, val);
 
     let stats = db.stats();
@@ -138,7 +138,7 @@ async fn stats_report_transactional_value_cache_hits() {
     writer.write(key, value).await.unwrap();
 
     let before_cold = reader_db.stats();
-    assert_eq!(reader.read(key).await.unwrap(), value);
+    assert_eq!(reader.read(key).await.unwrap().unwrap(), value);
     let cold = reader_db.stats() - before_cold;
     assert_eq!(cold.tx_reads, 1);
     assert_eq!(cold.tx_cache_hits, 0);
@@ -147,8 +147,8 @@ async fn stats_report_transactional_value_cache_hits() {
     let reader_ref = &reader;
     reader_db
         .tx(|tx| async move {
-            assert_eq!(tx.read(reader_ref, key).await?, value);
-            assert_eq!(tx.read(reader_ref, key).await?, value);
+            assert_eq!(tx.read(reader_ref, key).await?.unwrap(), value);
+            assert_eq!(tx.read(reader_ref, key).await?.unwrap(), value);
             Ok(())
         })
         .await
@@ -162,6 +162,7 @@ async fn stats_report_transactional_value_cache_hits() {
         reader
             .read_stale(key, std::time::Duration::MAX)
             .await
+            .unwrap()
             .unwrap(),
         value
     );
@@ -171,7 +172,7 @@ async fn stats_report_transactional_value_cache_hits() {
 
     reader.delete(key).await.unwrap();
     let before_deleted = reader_db.stats();
-    assert!(matches!(reader.read(key).await, Err(Error::NotFound)));
+    assert!(reader.read(key).await.unwrap().is_none());
     let deleted = reader_db.stats() - before_deleted;
     assert_eq!(deleted.tx_reads, 1);
     assert_eq!(deleted.tx_cache_hits, 1);
@@ -189,10 +190,12 @@ async fn delete() {
     coll.write(key, val).await.unwrap();
     coll.delete(key).await.unwrap();
 
-    let err = coll.read(key).await.unwrap_err();
+    assert!(coll.read(key).await.unwrap().is_none());
     assert!(
-        matches!(err, Error::NotFound),
-        "expected not-found, got {err:?}"
+        coll.read_stale(key, std::time::Duration::MAX)
+            .await
+            .unwrap()
+            .is_none()
     );
 
     let stats = db.stats();
@@ -222,7 +225,7 @@ async fn read_then_delete_single_tx() {
     let coll = &coll;
     let prev = db
         .tx(|tx| async move {
-            let v = tx.read(coll, key).await?;
+            let v = tx.read(coll, key).await?.ok_or(Error::NotFound)?;
             tx.delete(coll, key)?;
             Ok(v)
         })
@@ -230,11 +233,7 @@ async fn read_then_delete_single_tx() {
         .expect("a single read-then-delete transaction must commit");
     assert_eq!(prev, val);
 
-    let err = coll.read(key).await.unwrap_err();
-    assert!(
-        matches!(err, Error::NotFound),
-        "expected not-found after delete, got {err:?}"
-    );
+    assert!(coll.read(key).await.unwrap().is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -250,7 +249,7 @@ async fn read_from_another() {
     db1.collection(coll).create().await.unwrap();
     db1.collection(coll).write(key, val).await.unwrap();
 
-    let buf = db2.collection(coll).read(key).await.unwrap();
+    let buf = db2.collection(coll).read(key).await.unwrap().unwrap();
     assert_eq!(buf, val);
 }
 
@@ -286,12 +285,8 @@ async fn read_deleted_from_another() {
 
     let (key1_read, key2_found) = db1
         .tx(|tx| async move {
-            let k1 = tx.read(db1coll, key1).await?;
-            let found = match tx.read(db1coll, key2).await {
-                Ok(_) => true,
-                Err(Error::NotFound) => false,
-                Err(e) => return Err(e),
-            };
+            let k1 = tx.read(db1coll, key1).await?.ok_or(Error::NotFound)?;
+            let found = tx.read(db1coll, key2).await?.is_some();
             Ok((k1, found))
         })
         .await
@@ -316,7 +311,7 @@ async fn rmw_single() {
     assert_eq!(stats.tx_writes, 30);
     assert_eq!(stats.tx_retries, 0);
 
-    let val = coll.read(key).await.unwrap();
+    let val = coll.read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 30);
 }
 
@@ -355,7 +350,7 @@ async fn concurrent_rmw() {
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2.collection(coll_name).read(key).await.unwrap();
+    let val = db2.collection(coll_name).read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
@@ -369,7 +364,7 @@ async fn multiple_rmw_single() {
     coll.create().await.unwrap();
     multiple_rmw(&db, &coll, key1, key2, 30).await.unwrap();
 
-    let val = coll.read(key1).await.unwrap();
+    let val = coll.read(key1).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 30);
 
     let stats = db.stats();
@@ -397,9 +392,9 @@ async fn concurrent_multiple_rmw() {
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2.collection(coll_name).read(key1).await.unwrap();
+    let val = db2.collection(coll_name).read(key1).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
-    let val = db2.collection(coll_name).read(key2).await.unwrap();
+    let val = db2.collection(coll_name).read(key2).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
@@ -431,7 +426,7 @@ async fn concurrent_reads() {
         db.tx(|tx| async move {
             let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             for (k, r) in keys.iter().zip(vals) {
-                let cur = read_int(&r?);
+                let cur = read_int(&r?.ok_or(Error::NotFound)?);
                 tx.write(coll, k, &write_int(cur + 1))?;
             }
             Ok(())
@@ -445,7 +440,7 @@ async fn concurrent_reads() {
     assert_eq!(stats.tx_retries, 0);
 
     for k in keys {
-        let b = coll.read(k).await.unwrap();
+        let b = coll.read(k).await.unwrap().unwrap();
         assert_eq!(read_int(&b), 30);
     }
 }
@@ -473,7 +468,7 @@ async fn read_stale() {
         .await
         .unwrap();
 
-        let val = coll.read_stale(key, staleness).await.unwrap();
+        let val = coll.read_stale(key, staleness).await.unwrap().unwrap();
         let read_num = read_int(&val);
         assert!(read_num <= i, "weak read {read_num} should be <= {i}");
         if i >= max_behind {
@@ -851,7 +846,7 @@ async fn builder_custom_options() {
     let coll = db.collection(b"demo-coll");
     coll.create().await.unwrap();
     coll.write(b"key1", b"value1").await.unwrap();
-    let buf = coll.read(b"key1").await.unwrap();
+    let buf = coll.read(b"key1").await.unwrap().unwrap();
     assert_eq!(buf, b"value1");
 }
 
@@ -886,12 +881,12 @@ async fn cancelled_tx_future_does_not_block_followups() {
     assert!(r.is_err(), "expected timeout, got {r:?}");
 
     // The cancelled tx never committed, so the original value still wins.
-    let val = coll.read(b"k").await.unwrap();
+    let val = coll.read(b"k").await.unwrap().unwrap();
     assert_eq!(read_int(&val), 1);
 
     // A normal RMW still runs and commits without contention.
     rmw(&db, &coll, b"k", 1).await.unwrap();
-    let val = coll.read(b"k").await.unwrap();
+    let val = coll.read(b"k").await.unwrap().unwrap();
     assert_eq!(read_int(&val), 2);
 }
 
@@ -1067,9 +1062,9 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
 
     // The cancelled tx never committed (its values 42/43 are gone); the
     // peer's reads observed the original values and incremented from there.
-    let v1 = coll.read(b"k1").await.unwrap();
+    let v1 = coll.read(b"k1").await.unwrap().unwrap();
     assert_eq!(read_int(&v1), 11);
-    let v2 = coll.read(b"k2").await.unwrap();
+    let v2 = coll.read(b"k2").await.unwrap().unwrap();
     assert_eq!(read_int(&v2), 12);
 }
 
