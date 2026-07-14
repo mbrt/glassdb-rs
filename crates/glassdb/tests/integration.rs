@@ -1,7 +1,7 @@
 //! Integration tests ported from the Go `glassdb_test.go` (memory-backend
 //! subset). Time-sensitive paths use `tokio::time::pause` for determinism.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
@@ -586,6 +586,160 @@ async fn list_keys() {
     // never a directory `list` of an object prefix.
     let stats = db.stats();
     assert_eq!(stats.obj_lists, 0);
+}
+
+#[tokio::test]
+async fn transactional_key_scan_supports_ranges_prefixes_and_paging() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"key-scan");
+    coll.create().await.unwrap();
+    for key in [
+        b"a".as_slice(),
+        b"aa",
+        b"ab",
+        b"b",
+        b"\xfe\xff",
+        b"\xff",
+        b"\xff\x00",
+        b"\xff\xff",
+    ] {
+        coll.write(key, b"v").await.unwrap();
+    }
+
+    let range = coll
+        .scan_keys(glassdb::KeyScan::range(b"a", b"b"))
+        .await
+        .unwrap();
+    assert_eq!(
+        range.keys(),
+        &[b"a".to_vec(), b"aa".to_vec(), b"ab".to_vec()]
+    );
+
+    let prefix = coll
+        .scan_keys(glassdb::KeyScan::prefix(b"\xff"))
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix.keys(),
+        &[b"\xff".to_vec(), b"\xff\x00".to_vec(), b"\xff\xff".to_vec()]
+    );
+
+    let first = coll
+        .scan_keys(glassdb::KeyScan::all().limit(3))
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 3);
+    let second = coll
+        .scan_keys(
+            glassdb::KeyScan::all()
+                .after(first.next_after().unwrap())
+                .limit(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.keys(),
+        &[b"b".to_vec(), b"\xfe\xff".to_vec(), b"\xff".to_vec()]
+    );
+    assert!(first.keys().iter().all(|key| !second.keys().contains(key)));
+}
+
+#[tokio::test]
+async fn transactional_key_scan_reflects_staged_membership() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"scan-own-writes");
+    coll.create().await.unwrap();
+    coll.write(b"a", b"old").await.unwrap();
+    coll.write(b"c", b"old").await.unwrap();
+
+    let coll = &coll;
+    let scan = glassdb::KeyScan::range(b"a", b"z");
+    db.tx(|tx| async move {
+        tx.write(coll, b"a", b"new")?;
+        tx.write(coll, b"b", b"new")?;
+        tx.delete(coll, b"c")?;
+        let first = tx.scan_keys(coll, scan).await?;
+        assert_eq!(first.keys(), &[b"a".to_vec(), b"b".to_vec()]);
+
+        tx.write(coll, b"d", b"new")?;
+        let second = tx.scan_keys(coll, scan).await?;
+        assert_eq!(
+            second.keys(),
+            &[b"a".to_vec(), b"b".to_vec(), b"d".to_vec()]
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scan_then_create_prevents_phantom_write_skew() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"scan-write-skew");
+    coll.create().await.unwrap();
+    let first_scans = Arc::new(Barrier::new(2));
+
+    let run = |key: &'static [u8]| {
+        let db = db.clone();
+        let coll = coll.clone();
+        let first_scans = first_scans.clone();
+        tokio::spawn(async move {
+            let first_attempt = Arc::new(AtomicBool::new(true));
+            db.tx(move |tx| {
+                let coll = coll.clone();
+                let first_scans = first_scans.clone();
+                let first_attempt = first_attempt.clone();
+                async move {
+                    let page = tx.scan_keys(&coll, glassdb::KeyScan::all()).await?;
+                    if first_attempt.swap(false, Ordering::SeqCst) {
+                        first_scans.wait().await;
+                    }
+                    if page.is_empty() {
+                        tx.write(&coll, key, b"created")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        })
+    };
+
+    let left = run(b"left");
+    let right = run(b"right");
+    left.await.unwrap().unwrap();
+    right.await.unwrap().unwrap();
+
+    let keys = coll
+        .scan_keys(glassdb::KeyScan::all())
+        .await
+        .unwrap()
+        .into_keys();
+    assert_eq!(keys.len(), 1, "only one create-if-empty may commit");
+    assert!(db.stats().tx_retries >= 1);
+}
+
+#[tokio::test]
+async fn key_scan_validates_ranges_and_collection_existence() {
+    let db = init_db(mem()).await;
+    let missing = db.collection(b"missing-scan");
+    assert!(matches!(
+        missing.scan_keys(glassdb::KeyScan::all()).await,
+        Err(glassdb::Error::NotFound)
+    ));
+
+    let coll = db.collection(b"scan-validation");
+    coll.create().await.unwrap();
+    assert!(matches!(
+        coll.scan_keys(glassdb::KeyScan::range(b"z", b"a")).await,
+        Err(glassdb::Error::InvalidInput(_))
+    ));
+    assert!(
+        coll.scan_keys(glassdb::KeyScan::all().limit(0))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ADR-031 phantom prevention, end-to-end: a listing that observes a set of keys

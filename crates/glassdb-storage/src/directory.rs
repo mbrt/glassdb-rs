@@ -107,6 +107,74 @@ impl Directory {
             .into_locator())
     }
 
+    /// Returns the existing leaf that owns `key`, or `None` when the collection
+    /// does not exist.
+    pub async fn first_leaf_at(
+        &self,
+        prefix: &str,
+        key: &[u8],
+        freshness: Freshness,
+    ) -> Result<Option<LeafLocator>, StorageError> {
+        let Some((node, version)) = self.shards.load_root_node(prefix, freshness).await? else {
+            return Ok(None);
+        };
+        let cur = Located {
+            node,
+            path: paths::collection_info(prefix),
+            version: Some(version),
+        };
+        Ok(Some(
+            self.descend_to_leaf(prefix, cur, key, freshness)
+                .await?
+                .into_locator(),
+        ))
+    }
+
+    /// Returns the right sibling of `leaf`, or `None` for the rightmost leaf.
+    pub async fn next_leaf(
+        &self,
+        prefix: &str,
+        leaf: &LeafLocator,
+        freshness: Freshness,
+    ) -> Result<Option<LeafLocator>, StorageError> {
+        let Some(token) = leaf.node.right_sibling() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.load_child(prefix, token, freshness)
+                .await?
+                .into_locator(),
+        ))
+    }
+
+    /// Returns the leaves from the one owning `start` through the one owning
+    /// the inclusive `end`; `None` scans through positive infinity.
+    pub async fn leaves_through(
+        &self,
+        prefix: &str,
+        start: &[u8],
+        end: Option<&[u8]>,
+        freshness: Freshness,
+    ) -> Result<Vec<LeafLocator>, StorageError> {
+        let Some(mut leaf) = self.first_leaf_at(prefix, start, freshness).await? else {
+            return Err(StorageError::NotFound);
+        };
+        let mut out = Vec::new();
+        loop {
+            let done = end.is_some_and(|end| leaf.node.owns(end));
+            let next = if done {
+                None
+            } else {
+                self.next_leaf(prefix, &leaf, freshness).await?
+            };
+            out.push(leaf);
+            match next {
+                Some(right) => leaf = right,
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Resolves the owning leaf while keeping interior-node revalidation off the
     /// hot path (ADR-031): descends the index spine at `interior` freshness
     /// (served from cache — a stale misroute self-corrects via right-links) and

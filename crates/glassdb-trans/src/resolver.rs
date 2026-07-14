@@ -19,7 +19,7 @@
 //! place and none re-implement help-forwarding. It reads shards fresh (no value
 //! cache), so every resolve observes the authoritative coordination state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use glassdb_data::{TxId, paths};
@@ -28,17 +28,18 @@ use glassdb_storage::{
     TxCommitStatus,
 };
 
-use crate::algo::LeafCoverage;
+use crate::algo::{LeafCoverage, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::Monitor;
 
-/// The result of a phantom-safe listing scan ([`Resolver::live_keys_scan`]): the
-/// live keys in key order, plus every covered leaf's membership dependencies so
-/// commit validation can detect a racing create/delete or split (ADR-032).
+/// The result of a phantom-safe scan: the live keys in key order, the covered
+/// leaves' membership dependencies, and the effective page frontier.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
     pub keys: Vec<Vec<u8>>,
     pub covered: Vec<LeafCoverage>,
+    /// Inclusive validation/locking frontier; `None` means positive infinity.
+    pub frontier: Option<Vec<u8>>,
 }
 
 /// A read key grouped for batched resolution: its full storage path (the map
@@ -113,14 +114,159 @@ impl Resolver {
     /// ([`Directory::leaves`]), so an in-progress split is absorbed rather than
     /// dropping or duplicating keys. Membership versions and pending membership
     /// holders detect creates/deletes without conflicting with value overwrites;
-    /// a split is detected by the changed covered-leaf set.
+    /// a changed covered-leaf set falls back to logical page validation.
     pub async fn live_keys_scan(&self, prefix: &str) -> Result<ScanResult, StorageError> {
-        let leaves = self.dir.leaves(prefix, Freshness::Latest).await?;
+        self.scan_keys(prefix, &ScanRange::all(), &[], None, None)
+            .await
+    }
+
+    /// Resolves one bounded, forward page and its membership dependencies.
+    /// `cap` is an optional inclusive validation frontier that prevents a
+    /// limited-page recheck from reading beyond the range already protected.
+    pub async fn scan_keys(
+        &self,
+        prefix: &str,
+        range: &ScanRange,
+        overlay: &[ScanMutation],
+        own_lock_holder: Option<&TxId>,
+        cap: Option<&[u8]>,
+    ) -> Result<ScanResult, StorageError> {
+        let Some(mut loc) = self
+            .dir
+            .first_leaf_at(prefix, &range.start, Freshness::Latest)
+            .await?
+        else {
+            return Err(StorageError::NotFound);
+        };
+
+        if range.is_empty() {
+            return Ok(ScanResult {
+                keys: Vec::new(),
+                covered: Vec::new(),
+                frontier: Some(range.start.clone()),
+            });
+        }
+
+        let mut overlay: BTreeMap<Vec<u8>, bool> = overlay
+            .iter()
+            .filter(|mutation| in_scan_window(range, &mutation.key, cap))
+            .map(|mutation| (mutation.key.clone(), mutation.present))
+            .collect();
         let mut keys = Vec::new();
+        let mut covered = Vec::new();
+
+        loop {
+            covered.push(self.leaf_coverage(&loc, own_lock_holder).await?);
+            let leaf = loc
+                .node
+                .as_leaf()
+                .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
+            let mut candidates: BTreeSet<Vec<u8>> = leaf
+                .entries()
+                .filter(|entry| in_scan_window(range, &entry.key, cap))
+                .map(|entry| entry.key.clone())
+                .collect();
+            let overlay_keys: Vec<Vec<u8>> = overlay
+                .keys()
+                .take_while(|key| loc.node.owns(key))
+                .cloned()
+                .collect();
+            let leaf_overlay: BTreeMap<Vec<u8>, bool> = overlay_keys
+                .into_iter()
+                .map(|key| {
+                    let present = overlay
+                        .remove(&key)
+                        .expect("overlay key was selected from the map");
+                    (key, present)
+                })
+                .collect();
+            candidates.extend(leaf_overlay.keys().cloned());
+
+            for key in candidates {
+                let present = match leaf_overlay.get(key.as_slice()) {
+                    Some(present) => *present,
+                    None => {
+                        let key_path = paths::from_key(prefix, &key);
+                        self.resolve_entry(&key_path, leaf.lookup(&key), own_lock_holder)
+                            .await
+                            .map_err(trans_to_storage)?
+                            .token()
+                            .is_some()
+                    }
+                };
+                if !present {
+                    continue;
+                }
+                keys.push(key);
+                if range.limit.is_some_and(|limit| keys.len() == limit) {
+                    return Ok(ScanResult {
+                        frontier: keys.last().cloned(),
+                        keys,
+                        covered,
+                    });
+                }
+            }
+
+            let target = cap.or(range.end.as_deref());
+            if target.is_some_and(|target| loc.node.owns(target)) {
+                break;
+            }
+            let Some(next) = self.dir.next_leaf(prefix, &loc, Freshness::Latest).await? else {
+                break;
+            };
+            loc = next;
+        }
+
+        Ok(ScanResult {
+            keys,
+            covered,
+            frontier: cap.map(<[u8]>::to_vec).or_else(|| range.end.clone()),
+        })
+    }
+
+    /// Loads only a scan's physical validation dependencies, without resolving
+    /// the leaf entries themselves.
+    pub(crate) async fn scan_coverage(
+        &self,
+        prefix: &str,
+        range: &ScanRange,
+        frontier: Option<&[u8]>,
+        own_lock_holder: Option<&TxId>,
+    ) -> Result<Vec<LeafCoverage>, StorageError> {
+        if range.is_empty() {
+            if self
+                .dir
+                .first_leaf_at(prefix, &range.start, Freshness::Latest)
+                .await?
+                .is_none()
+            {
+                return Err(StorageError::NotFound);
+            }
+            return Ok(Vec::new());
+        }
+
+        let leaves = self
+            .dir
+            .leaves_through(prefix, &range.start, frontier, Freshness::Latest)
+            .await?;
         let mut covered = Vec::with_capacity(leaves.len());
-        for loc in leaves {
-            let mut pending_membership = Vec::new();
+        for leaf in leaves {
+            covered.push(self.leaf_coverage(&leaf, own_lock_holder).await?);
+        }
+        Ok(covered)
+    }
+
+    async fn leaf_coverage(
+        &self,
+        loc: &LeafLocator,
+        own_lock_holder: Option<&TxId>,
+    ) -> Result<LeafCoverage, StorageError> {
+        let mut pending_membership = Vec::new();
+        if loc.node.membership_lock().lock_type() == LockType::Write {
             for holder in loc.node.membership_lock().holders() {
+                if own_lock_holder == Some(holder) {
+                    continue;
+                }
                 if self
                     .tmon
                     .tx_status(holder)
@@ -131,28 +277,13 @@ impl Resolver {
                     pending_membership.push(holder.clone());
                 }
             }
-            pending_membership.sort();
-            covered.push(LeafCoverage {
-                path: loc.path.as_str().into(),
-                membership_version: loc.node.membership_version(),
-                pending_membership,
-            });
-            let leaf = loc
-                .node
-                .as_leaf()
-                .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
-            for e in leaf.entries() {
-                let key_path = paths::from_key(prefix, &e.key);
-                let resolved = self
-                    .resolve_entry(&key_path, Some(e))
-                    .await
-                    .map_err(trans_to_storage)?;
-                if resolved.token().is_some() {
-                    keys.push(e.key.clone());
-                }
-            }
         }
-        Ok(ScanResult { keys, covered })
+        pending_membership.sort();
+        Ok(LeafCoverage {
+            path: loc.path.as_str().into(),
+            membership_version: loc.node.membership_version(),
+            pending_membership,
+        })
     }
 
     /// Returns the effective committed writer of every `key` (the validation
@@ -186,7 +317,7 @@ impl Resolver {
                 .ok_or_else(|| StorageError::other("descent grouped keys under a non-leaf node"))?;
             for (raw_key, key) in &group.keys {
                 let resolved = self
-                    .resolve_entry(key, leaf.lookup(raw_key))
+                    .resolve_entry(key, leaf.lookup(raw_key), None)
                     .await
                     .map_err(trans_to_storage)?;
                 out.insert(key.clone(), resolved.token());
@@ -210,7 +341,7 @@ impl Resolver {
             .as_leaf()
             .ok_or_else(|| StorageError::other("descent resolved a non-leaf node"))?;
         let resolved = self
-            .resolve_entry(key, leaf.lookup(&raw_key))
+            .resolve_entry(key, leaf.lookup(&raw_key), None)
             .await
             .map_err(trans_to_storage)?;
         Ok(resolved.token())
@@ -258,8 +389,9 @@ impl Resolver {
     /// by read resolution and lock acquisition (the locker): help-forward a
     /// committed exclusive holder's value (one that committed but has not yet
     /// published its `current_writer` pointer), drop aborted/unknown holders,
-    /// and collect the live pending ones. `skip` is the caller's own id, never
-    /// treated as a foreign holder. Only an exclusive (write/create) entry
+    /// and collect the live pending ones. `own_lock_holder` identifies the
+    /// caller's own lock, which is never treated as a foreign holder. Only an
+    /// exclusive (write/create) entry
     /// help-forwards; a read-locked entry's holders never change the value but
     /// are still classified so a writer can wound-wait them. `key_path` is the
     /// full storage path of the key, used to fetch a help-forwarded writer's
@@ -268,14 +400,14 @@ impl Resolver {
         &self,
         key_path: &str,
         entry: &ShardEntry,
-        skip: Option<&TxId>,
+        own_lock_holder: Option<&TxId>,
     ) -> Result<HolderResolution, TransError> {
         let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
         let mut writer = entry.current_writer.clone();
         let mut deleted = entry.deleted;
         let mut pending = Vec::new();
         for holder in &entry.locked_by {
-            if Some(holder) == skip {
+            if Some(holder) == own_lock_holder {
                 continue;
             }
             match self.tmon.tx_status(holder).await? {
@@ -309,6 +441,7 @@ impl Resolver {
         &self,
         key_path: &str,
         entry: Option<&ShardEntry>,
+        own_lock_holder: Option<&TxId>,
     ) -> Result<Resolved, TransError> {
         let Some(e) = entry else {
             return Ok(Resolved::default());
@@ -324,12 +457,16 @@ impl Resolver {
             });
         }
 
-        let r = self.resolve_holders(key_path, e, None).await?;
+        let r = self.resolve_holders(key_path, e, own_lock_holder).await?;
         Ok(Resolved {
             writer: r.writer,
             deleted: r.deleted,
         })
     }
+}
+
+fn in_scan_window(range: &ScanRange, key: &[u8], cap: Option<&[u8]>) -> bool {
+    range.contains(key) && cap.is_none_or(|cap| key <= cap)
 }
 
 #[cfg(test)]

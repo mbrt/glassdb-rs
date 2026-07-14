@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 
-use crate::{Database, Error};
+use crate::{Database, Error, KeyScan};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, assert_valid_listing, key_name, tiny_split_policy};
@@ -43,6 +43,17 @@ pub enum MembOp {
     Delete(usize),
     /// List the collection's keys and assert the listing is well-formed.
     List,
+    /// Scan one bounded range into a limited materialized page.
+    RangePage {
+        /// Inclusive key-universe index.
+        start: usize,
+        /// Exclusive key-universe index.
+        end: usize,
+        /// Maximum number of returned keys.
+        limit: usize,
+    },
+    /// Scan the common `k` prefix into a limited materialized page.
+    PrefixPage(usize),
 }
 
 /// A membership workload: one op sequence per client. Each client owns a
@@ -70,10 +81,20 @@ impl<'a> Arbitrary<'a> for MembershipWorkload {
                 let key = |u: &mut Unstructured<'a>| -> arbitrary::Result<usize> {
                     Ok(my_keys[u.arbitrary::<u8>()? as usize % my_keys.len()])
                 };
-                ops.push(match u.arbitrary::<u8>()? % 3 {
+                ops.push(match u.arbitrary::<u8>()? % 5 {
                     0 => MembOp::Put(key(u)?),
                     1 => MembOp::Delete(key(u)?),
-                    _ => MembOp::List,
+                    2 => MembOp::List,
+                    3 => {
+                        let a = u.arbitrary::<u8>()? as usize % (MEMBERSHIP_KEYS + 1);
+                        let b = u.arbitrary::<u8>()? as usize % (MEMBERSHIP_KEYS + 1);
+                        MembOp::RangePage {
+                            start: a.min(b),
+                            end: a.max(b),
+                            limit: u.arbitrary::<u8>()? as usize % (MEMBERSHIP_KEYS + 1),
+                        }
+                    }
+                    _ => MembOp::PrefixPage(u.arbitrary::<u8>()? as usize % (MEMBERSHIP_KEYS + 1)),
                 });
             }
             clients.push(ops);
@@ -199,6 +220,29 @@ impl SimWorkload for MembershipWorkload {
             MembOp::List => {
                 let keys: Vec<Vec<u8>> = coll.keys().await?.collect::<Result<_, _>>()?;
                 assert_valid_listing(&keys, MEMBERSHIP_KEYS);
+                Ok(())
+            }
+            MembOp::RangePage { start, end, limit } => {
+                let start_key = key_name(*start);
+                let end_key = key_name(*end);
+                let page = coll
+                    .scan_keys(KeyScan::range(&start_key, &end_key).limit(*limit))
+                    .await?;
+                assert!(page.len() <= *limit);
+                assert_valid_listing(page.keys(), MEMBERSHIP_KEYS);
+                assert!(
+                    page.keys()
+                        .iter()
+                        .all(|key| start_key.as_slice() <= key.as_slice()
+                            && key.as_slice() < end_key.as_slice())
+                );
+                Ok(())
+            }
+            MembOp::PrefixPage(limit) => {
+                let page = coll.scan_keys(KeyScan::prefix(b"k").limit(*limit)).await?;
+                assert!(page.len() <= *limit);
+                assert_valid_listing(page.keys(), MEMBERSHIP_KEYS);
+                assert!(page.keys().iter().all(|key| key.starts_with(b"k")));
                 Ok(())
             }
         }

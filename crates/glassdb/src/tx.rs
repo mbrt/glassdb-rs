@@ -17,11 +17,12 @@ use glassdb_concurr::RetryConfig;
 use glassdb_data::paths;
 use glassdb_storage::{MAX_STALENESS, ShardStore, ValueCache};
 use glassdb_trans::{
-    Data, LeafCoverage, ReadAccess, ReadVersion, Reader, Resolver, ScanAccess, WriteAccess,
+    Data, ReadAccess, ReadVersion, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess,
 };
 
 use crate::collection::Collection;
 use crate::error::Error;
+use crate::scan::{KeyPage, KeyScan};
 
 /// An active database transaction. Reads and writes are buffered and only
 /// applied atomically when the surrounding [`crate::Database::tx`] commits.
@@ -120,6 +121,51 @@ impl Transaction {
         }
     }
 
+    /// Materializes one sorted page of keys within this transaction.
+    ///
+    /// The scan participates in serializable validation and reflects writes and
+    /// deletes staged before this call. Values remain separate tracked reads.
+    pub async fn scan_keys(&self, c: &Collection, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
+        let range = scan.normalize()?;
+        let limit = range.limit;
+        let mut overlay = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .staged
+                .iter()
+                .filter_map(|(path, value)| {
+                    let (prefix, key) = paths::split_key(path).ok()?;
+                    if prefix != c.prefix() {
+                        return None;
+                    }
+                    let present = match value {
+                        StagedValue::Read(_) => return None,
+                        StagedValue::Put(_) => true,
+                        StagedValue::Delete => false,
+                    };
+                    Some(ScanMutation { key, present })
+                })
+                .collect::<Vec<_>>()
+        };
+        overlay.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let result = self
+            .resolver
+            .scan_keys(c.prefix(), &range, &overlay, None, None)
+            .await
+            .map_err(Error::from_read)?;
+        let keys = result.keys;
+        self.inner.lock().unwrap().scans.push(ScanAccess {
+            prefix: c.prefix().into(),
+            range,
+            overlay,
+            keys: keys.clone(),
+            frontier: result.frontier,
+            covered: result.covered,
+        });
+        Ok(KeyPage::new(keys, limit))
+    }
+
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let p = paths::from_key(c.prefix(), key);
@@ -129,28 +175,6 @@ impl Transaction {
             .staged
             .insert(p, StagedValue::Put(Arc::from(value)));
         Ok(())
-    }
-
-    /// Lists the live keys of collection `c` in key order. Repeatable and
-    /// strongly consistent.
-    ///
-    /// Intended for a read-only listing transaction (the [`Collection::keys`]
-    /// entry point). The scan reflects the committed state, not this
-    /// transaction's own staged writes.
-    pub(crate) async fn keys(&self, c: &Collection) -> Result<Vec<Vec<u8>>, Error> {
-        // TODO: Merge staged writes into the scan result so a listing
-        //       transaction sees its own writes.
-        let scan = self
-            .resolver
-            .live_keys_scan(c.prefix())
-            .await
-            .map_err(Error::from_read)?;
-        let covered: Vec<LeafCoverage> = scan.covered;
-        self.inner.lock().unwrap().scans.push(ScanAccess {
-            prefix: c.prefix().into(),
-            covered,
-        });
-        Ok(scan.keys)
     }
 
     /// Marks `key` for deletion within the transaction.
@@ -299,7 +323,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use crate::{Backend, Database, memory::MemoryBackend};
+    use crate::{Backend, Database, KeyScan, memory::MemoryBackend};
 
     // ADR-031 phantom prevention, the in-flight case: when a key is created
     // *while* a listing transaction is running — after it scanned the leaf but
@@ -333,7 +357,7 @@ mod tests {
                 let extra = extra.clone();
                 let first_attempt = &first_attempt;
                 async move {
-                    let keys = tx.keys(&coll).await?;
+                    let keys = tx.scan_keys(&coll, KeyScan::all()).await?.into_keys();
                     if first_attempt.swap(false, Ordering::SeqCst) {
                         coll.write(&extra, b"v").await?;
                     }

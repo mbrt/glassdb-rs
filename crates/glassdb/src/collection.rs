@@ -10,6 +10,7 @@ use glassdb_trans::Reader;
 use crate::db::DbInner;
 use crate::error::Error;
 use crate::iter::{CollectionsIter, KeysIter};
+use crate::scan::{KeyPage, KeyScan};
 
 /// A named group of key-value pairs within a database.
 #[derive(Clone)]
@@ -107,15 +108,16 @@ impl Collection {
     /// The listing scans the keys in order. The scan runs inside a read-only
     /// serializable transaction and returns the keys in order.
     pub async fn keys(&self) -> Result<KeysIter, Error> {
-        let this = self.clone();
-        let keys = self
-            .db
-            .tx(move |tx| {
-                let this = this.clone();
-                async move { tx.keys(&this).await }
-            })
-            .await?;
-        Ok(KeysIter::new(keys))
+        Ok(KeysIter::new(
+            self.scan_keys(KeyScan::all()).await?.into_keys(),
+        ))
+    }
+
+    /// Materializes one serializable, sorted page of collection keys.
+    pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
+        self.db
+            .tx(|tx| async move { tx.scan_keys(self, scan).await })
+            .await
     }
 
     /// Returns an iterator over the sub-collections in this collection, in name

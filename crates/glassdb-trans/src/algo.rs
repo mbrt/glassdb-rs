@@ -5,10 +5,9 @@
 //! read-modify-write CAS per touched shard (create/delete is coordinated by the
 //! per-key entry lock in the owning leaf, ADR-031), flips its transaction object
 //! to committed (the commit point), then publishes `current_writer` pointers and
-//! releases its locks
-//! (write-back). A read-only transaction takes a pure optimistic fast path: it
-//! re-resolves each read's effective writer against the shards and commits if
-//! none changed, taking no locks.
+//! releases its locks (write-back). A read-only transaction starts on a pure
+//! optimistic fast path. If validation fails, retries lock their point reads
+//! and scan predicates so sustained churn cannot make them retry forever.
 //!
 //! Concurrency control (ADR-002 / ADR-020 / ADR-021 / ADR-024): strict two-phase
 //! locking with wound-wait and leases for crash recovery. On a conflict it cannot
@@ -123,15 +122,74 @@ impl WriteAccess {
 }
 
 /// A range/sorted listing performed within a transaction (ADR-031 phantom
-/// prevention). It records the membership version and pending membership-write
-/// holders of every covered leaf. Commit re-scans the range and validates those
-/// dependencies, while a concurrent split changes the covered leaf set.
+/// prevention). It records the logical page plus the membership version and
+/// pending membership-write holders of every covered leaf. Commit validates
+/// those dependencies and falls back to the logical page after physical churn.
 #[derive(Debug, Clone)]
 pub struct ScanAccess {
     /// Collection prefix the scan ranged over.
     pub prefix: Arc<str>,
+    /// Normalized logical range and page limit.
+    pub range: ScanRange,
+    /// Staged membership mutations visible when the scan ran.
+    pub overlay: Vec<ScanMutation>,
+    /// Keys surfaced to the transaction body.
+    pub keys: Vec<Vec<u8>>,
+    /// Inclusive validation/locking frontier; `None` means positive infinity.
+    pub frontier: Option<Vec<u8>>,
     /// The leaves the scan covered, in key order, with membership dependencies.
     pub covered: Vec<LeafCoverage>,
+}
+
+/// A normalized half-open key range used by the transaction engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRange {
+    /// Inclusive lower bound before applying `start_exclusive`.
+    pub start: Vec<u8>,
+    /// Whether the lower-bound key itself is excluded.
+    pub start_exclusive: bool,
+    /// Exclusive upper bound; `None` means positive infinity.
+    pub end: Option<Vec<u8>>,
+    /// Maximum number of keys to surface; `None` is unbounded.
+    pub limit: Option<usize>,
+}
+
+impl ScanRange {
+    /// Returns the unbounded range over every raw key.
+    pub fn all() -> Self {
+        Self {
+            start: Vec::new(),
+            start_exclusive: false,
+            end: None,
+            limit: None,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.limit == Some(0)
+            || self
+                .end
+                .as_deref()
+                .is_some_and(|end| self.start.as_slice() >= end)
+    }
+
+    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+        let above_start = if self.start_exclusive {
+            key > self.start.as_slice()
+        } else {
+            key >= self.start.as_slice()
+        };
+        above_start && self.end.as_deref().is_none_or(|end| key < end)
+    }
+}
+
+/// One staged membership mutation captured at scan time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanMutation {
+    /// Raw collection key.
+    pub key: Vec<u8>,
+    /// Whether the staged state makes the key present.
+    pub present: bool,
 }
 
 /// One leaf a scan covered and its membership-only validation dependencies.
@@ -161,6 +219,9 @@ pub struct Handle {
     /// so [`Algo::end`] knows it must abort (a pure read-only fast path never
     /// engages, so it has nothing to release).
     engaged: bool,
+    /// An optimistic read-only validation failed, so the next attempt must
+    /// validate through the locked path.
+    lock_reads_on_retry: bool,
     /// Per-transaction backoff for the internal CAS-contention retry in
     /// [`Algo::acquire_locks`] (a lost shard/root CAS race): advanced before each
     /// same-id re-lock so churning contenders spread out instead of busy-looping.
@@ -173,6 +234,12 @@ impl Handle {
     /// The transaction's ID.
     pub fn id(&self) -> &TxId {
         &self.id
+    }
+
+    /// Whether this read-only attempt is past its optimistic first try and must
+    /// use the locked validation path.
+    fn should_lock_reads(&self) -> bool {
+        self.lock_reads_on_retry || self.status == Status::Validating || self.attempts > 0
     }
 }
 
@@ -187,6 +254,25 @@ enum Acquired {
     /// A higher-priority peer aborted this transaction: renew the id and re-run
     /// ([`TransError::Wounded`]).
     Wounded,
+}
+
+/// Describes whether validation runs before locks are acquired or while the
+/// transaction's own locks are visible in the coordination tree.
+#[derive(Clone, Copy)]
+enum ValidationContext<'a> {
+    Optimistic,
+    LocksHeldBy(&'a TxId),
+}
+
+impl<'a> ValidationContext<'a> {
+    /// Identifies the lock holder that scan resolution must treat as the
+    /// validating transaction itself rather than as a concurrent writer.
+    fn own_lock_holder(self) -> Option<&'a TxId> {
+        match self {
+            Self::Optimistic => None,
+            Self::LocksHeldBy(tx_id) => Some(tx_id),
+        }
+    }
 }
 
 /// The result of installing the single read-write fast path's write lock through
@@ -411,6 +497,7 @@ impl Algo {
             id,
             attempts: 0,
             engaged: false,
+            lock_reads_on_retry: false,
             backoff: RetryConfig::default().backoff(),
         }
     }
@@ -426,6 +513,7 @@ impl Algo {
             status: Status::New,
             attempts: old.attempts + 1,
             engaged: false,
+            lock_reads_on_retry: old.lock_reads_on_retry,
             backoff: old.backoff,
         }
     }
@@ -439,6 +527,10 @@ impl Algo {
     /// deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.data.writes.is_empty() {
+            if tx.should_lock_reads() {
+                self.validate_coordination_keys(&tx.data)?;
+                return self.commit_locked(tx).await;
+            }
             return self.commit_readonly(tx).await;
         }
         self.validate_coordination_keys(&tx.data)?;
@@ -449,22 +541,29 @@ impl Algo {
         if self.try_commit_single_rw(tx).await?.is_some() {
             return Ok(());
         }
-        self.commit_read_write(tx).await
+        self.commit_locked(tx).await
     }
 
     /// Validates the reads and range scans of a read-only transaction (the
     /// error-recovery path in the db retry loop), returning [`TransError::Retry`]
-    /// if any was invalidated. It holds no locks and does not back off before
-    /// signalling the retry.
+    /// if any was invalidated. The first attempt is optimistic; after a failure,
+    /// the next attempt validates with point and predicate read locks.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
         if !tx.data.writes.is_empty() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
             ));
         }
-        if self.validate(&tx.data).await? {
+        if tx.should_lock_reads() {
+            return self.validate_locked_reads(tx).await;
+        }
+        if self
+            .validate(&tx.data, ValidationContext::Optimistic)
+            .await?
+        {
             return Ok(());
         }
+        tx.lock_reads_on_retry = true;
         self.invalidate_reads(&tx.data);
         Err(TransError::Retry)
     }
@@ -480,8 +579,8 @@ impl Algo {
     }
 
     /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
-    /// by marking its transaction object aborted). A pure read-only transaction
-    /// never engaged, so there is nothing to abort.
+    /// by marking its transaction object aborted). An optimistic read-only
+    /// attempt never engaged, so there is nothing to abort.
     pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
@@ -523,8 +622,8 @@ impl Algo {
     }
 
     /// Read-only fast path: re-resolve each read's effective writer against the
-    /// shards and commit if none changed. Takes no locks and writes nothing, so
-    /// it never registers with the monitor.
+    /// shards and commit if none changed. The first attempt takes no locks; a
+    /// failed validation makes the next attempt use the locked path.
     ///
     /// A failed validation does not back off before signalling [`Retry`]: the
     /// re-run re-reads the authoritative values (the cache was just invalidated)
@@ -533,19 +632,20 @@ impl Algo {
     ///
     /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if self.validate(&tx.data).await? {
+        if self
+            .validate(&tx.data, ValidationContext::Optimistic)
+            .await?
+        {
             tx.status = Status::Committed;
             return Ok(());
         }
+        tx.lock_reads_on_retry = true;
         self.invalidate_reads(&tx.data);
         Err(TransError::Retry)
     }
 
-    /// Read-write path: lock the touched shards, validate the reads now that
-    /// their values are frozen, flip the transaction object to committed, then
-    /// spawn the write-back in the background so commit returns without waiting
-    /// for it.
-    async fn commit_read_write(&self, tx: &mut Handle) -> Result<(), TransError> {
+    /// Locked path for read-write transactions and escalated read-only retries.
+    async fn commit_locked(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::New {
             self.mon.begin_tx(&tx.id);
             tx.status = Status::Validating;
@@ -570,7 +670,10 @@ impl Algo {
         // Validate point reads and scans after their entry/predicate locks are
         // held. A stale dependency re-runs the body under the same id while the
         // acquired locks prevent another change in the validation-to-commit gap.
-        if !self.validate(&tx.data).await? {
+        if !self
+            .validate(&tx.data, ValidationContext::LocksHeldBy(&tx.id))
+            .await?
+        {
             return self.revalidate(tx).await;
         }
 
@@ -587,6 +690,30 @@ impl Algo {
 
         self.write_back(&tx.id, locked).await;
         Ok(())
+    }
+
+    /// Acquires and validates an escalated read-only attempt whose user body
+    /// returned an error. The caller will abort through [`Algo::end`] after a
+    /// successful validation, so this deliberately does not commit the handle.
+    async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
+        self.validate_coordination_keys(&tx.data)?;
+        if tx.status == Status::New {
+            self.mon.begin_tx(&tx.id);
+            tx.status = Status::Validating;
+            tx.engaged = true;
+        }
+        let locked = match self.acquire_locks(tx).await? {
+            Acquired::Locked(locked) => locked,
+            Acquired::Wounded => return self.restart(tx).await,
+        };
+        self.mon.record_tx_locks(&tx.id, locked.locked_paths());
+        if self
+            .validate(&tx.data, ValidationContext::LocksHeldBy(&tx.id))
+            .await?
+        {
+            return Ok(());
+        }
+        self.revalidate(tx).await
     }
 
     /// The single read-write fast path (ADR-027, superseding ADR-020): a
@@ -998,8 +1125,17 @@ impl Algo {
     /// Reports whether the transaction's snapshot still holds: every read's
     /// effective writer is unchanged (ADR-024) **and** every range scan's
     /// membership dependencies are unchanged (ADR-032 phantom prevention).
-    async fn validate(&self, data: &Data) -> Result<bool, TransError> {
-        Ok(self.validate_reads_inner(data).await? && self.validate_scans_inner(data).await?)
+    /// When locks are already held, scan resolution ignores this transaction's
+    /// own holder ID so it is not mistaken for a concurrent membership change.
+    async fn validate(
+        &self,
+        data: &Data,
+        context: ValidationContext<'_>,
+    ) -> Result<bool, TransError> {
+        Ok(self.validate_reads_inner(data).await?
+            && self
+                .validate_scans_inner(data, context.own_lock_holder())
+                .await?)
     }
 
     /// Re-resolves every read's effective writer and reports whether they all
@@ -1025,26 +1161,56 @@ impl Algo {
     /// still covers the same leaves at the same membership versions (ADR-032).
     /// Pending membership writers observed by the original scan are rechecked
     /// because their commit transition does not itself bump the node version.
-    /// A split changes the covered leaf set, so it also invalidates the scan.
-    async fn validate_scans_inner(&self, data: &Data) -> Result<bool, TransError> {
+    /// If physical coverage changed, status-aware resolution distinguishes a
+    /// harmless split from a logical page change.
+    async fn validate_scans_inner(
+        &self,
+        data: &Data,
+        own_lock_holder: Option<&TxId>,
+    ) -> Result<bool, TransError> {
         for scan in &data.scans {
-            let current = self.resolver.live_keys_scan(&scan.prefix).await?.covered;
-            if current.len() != scan.covered.len()
-                || current.iter().zip(&scan.covered).any(|(now, observed)| {
+            let current = self
+                .resolver
+                .scan_coverage(
+                    &scan.prefix,
+                    &scan.range,
+                    scan.frontier.as_deref(),
+                    own_lock_holder,
+                )
+                .await?;
+            let mut fast = current.len() == scan.covered.len()
+                && !current.iter().zip(&scan.covered).any(|(now, observed)| {
                     now.path != observed.path
                         || now.membership_version != observed.membership_version
-                })
-            {
-                return Ok(false);
-            }
-            for holder in scan
-                .covered
-                .iter()
-                .flat_map(|leaf| &leaf.pending_membership)
-            {
-                if self.mon.tx_status(holder).await? == TxCommitStatus::Ok {
-                    return Ok(false);
+                });
+            if fast {
+                for holder in scan
+                    .covered
+                    .iter()
+                    .flat_map(|leaf| &leaf.pending_membership)
+                {
+                    if self.mon.tx_status(holder).await? == TxCommitStatus::Ok {
+                        fast = false;
+                        break;
+                    }
                 }
+            }
+            if fast {
+                continue;
+            }
+
+            let resolved = self
+                .resolver
+                .scan_keys(
+                    &scan.prefix,
+                    &scan.range,
+                    &scan.overlay,
+                    own_lock_holder,
+                    scan.frontier.as_deref(),
+                )
+                .await?;
+            if resolved.keys != scan.keys {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -2362,34 +2528,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_after_remote_change_retries() {
+    async fn readonly_retry_locks_its_complete_point_read_set() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let ka = paths::from_key(TEST_COLL, b"a");
+        let kb = paths::from_key(TEST_COLL, b"b");
 
-        commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
-        let r = do_read(&tctx, &keyp).await;
-        commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
+        commit_writes(&tm2, vec![wa(&ka, b"a1"), wa(&kb, b"b1")]).await;
+        let ra = do_read(&tctx, &ka).await;
+        let rb = do_read(&tctx, &kb).await;
+        commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
         let mut h = tm.begin(Data {
-            reads: vec![r],
+            reads: vec![ra, rb],
             writes: Vec::new(),
             scans: Vec::new(),
         });
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert!(h.should_lock_reads());
+        for key in [b"a".as_slice(), b"b"] {
+            assert_eq!(
+                entry(&tctx, key).await.unwrap().lock_type,
+                LockType::None,
+                "the failed OCC attempt must not lock"
+            );
+        }
 
-        // After re-reading, validation passes.
-        let r = do_read(&tctx, &keyp).await;
+        // The retry re-reads, then its second validation acquires locks for the
+        // complete fresh read set before deciding whether it can commit.
+        let ra = do_read(&tctx, &ka).await;
+        let rb = do_read(&tctx, &kb).await;
         tm.reset(
             &mut h,
             Data {
-                reads: vec![r],
+                reads: vec![ra, rb],
                 writes: Vec::new(),
                 scans: Vec::new(),
             },
         );
         tm.commit(&mut h).await.unwrap();
+        let (log, _) = tctx.tlogger.get(h.id()).await.unwrap();
+        for path in [&ka, &kb] {
+            assert!(log.locks.contains(&PathLock {
+                path: path.clone(),
+                typ: LockType::Read,
+                scope: LockScope::Entry,
+            }));
+        }
     }
 
     #[tokio::test]
@@ -2497,18 +2683,30 @@ mod tests {
     // Builds a read-only listing transaction's [`Data`] from a fresh scan of the
     // test collection, returning the scan's live keys alongside so a test can
     // assert on the snapshot and later re-validate the same coverage.
-    async fn scan_data(tctx: &Tctx) -> (Data, Vec<Vec<u8>>) {
+    async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
         let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
-        let scan = resolver.live_keys_scan(TEST_COLL).await.unwrap();
+        let scan = resolver
+            .scan_keys(TEST_COLL, &range, &[], None, None)
+            .await
+            .unwrap();
+        let keys = scan.keys.clone();
         let data = Data {
             reads: Vec::new(),
             writes: Vec::new(),
             scans: vec![ScanAccess {
                 prefix: TEST_COLL.into(),
+                range,
+                overlay: Vec::new(),
+                keys: keys.clone(),
+                frontier: scan.frontier,
                 covered: scan.covered,
             }],
         };
-        (data, scan.keys)
+        (data, keys)
+    }
+
+    async fn scan_data(tctx: &Tctx) -> (Data, Vec<Vec<u8>>) {
+        scan_data_for_range(tctx, ScanRange::all()).await
     }
 
     // ADR-031 phantom prevention: a listing whose covered leaves are unchanged
@@ -2524,9 +2722,11 @@ mod tests {
         assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 
         // No concurrent change: the listing validates and commits.
+        tctx.locker.lock_calls_and_reset();
         let mut h = tm.begin(data.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
+        assert_eq!(tctx.locker.lock_calls_and_reset(), 0);
 
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&paths::from_key(TEST_COLL, b"b"), b"1")]).await;
@@ -2534,6 +2734,25 @@ mod tests {
         let mut stale = tm.begin(data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert!(
+            stale.should_lock_reads(),
+            "scan retry escalates to read locks"
+        );
+
+        // The retry computes a fresh page, then commits through the locked path.
+        let (fresh, keys) = scan_data(&tctx).await;
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        tm.reset(&mut stale, fresh);
+        tctx.locker.lock_calls_and_reset();
+        tm.commit(&mut stale).await.unwrap();
+        assert!(tctx.locker.lock_calls_and_reset() >= 1);
+        let (log, _) = tctx.tlogger.get(stale.id()).await.unwrap();
+        assert!(
+            log.locks
+                .iter()
+                .any(|lock| { lock.scope == LockScope::Membership && lock.typ == LockType::Read })
+        );
+        tm.end(&mut stale).await.unwrap();
     }
 
     #[tokio::test]
@@ -2604,6 +2823,54 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn limited_scan_retry_expands_its_locked_frontier() {
+        let (tm, tctx) = new_algo().await;
+        seed_live_keys(&tctx, &[b"a", b"b", b"m", b"z"]).await;
+        split_root_in_place(&tctx).await;
+
+        let range = ScanRange {
+            start: Vec::new(),
+            start_exclusive: false,
+            end: None,
+            limit: Some(2),
+        };
+        let (mut stale, keys) = scan_data_for_range(&tctx, range.clone()).await;
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(stale.scans[0].frontier.as_deref(), Some(b"b".as_slice()));
+        stale
+            .writes
+            .push(wa(&paths::from_key(TEST_COLL, b"a"), b"updated"));
+
+        // Removing the old frontier means the refreshed two-key page reaches
+        // into S1. The first locked validation only owns S0 and must retry.
+        commit_writes(&tm, vec![wdel(&paths::from_key(TEST_COLL, b"b"))]).await;
+        let mut handle = tm.begin(stale);
+        let err = tm.commit(&mut handle).await.unwrap_err();
+        assert!(matches!(err, TransError::Retry), "got {err:?}");
+
+        // The body re-runs while S0 stays locked. Its new frontier is `m`, so
+        // the next validation adds S1 before committing.
+        let (mut fresh, keys) = scan_data_for_range(&tctx, range).await;
+        assert_eq!(keys, vec![b"a".to_vec(), b"m".to_vec()]);
+        assert_eq!(fresh.scans[0].frontier.as_deref(), Some(b"m".as_slice()));
+        fresh
+            .writes
+            .push(wa(&paths::from_key(TEST_COLL, b"a"), b"updated"));
+        tm.reset(&mut handle, fresh);
+        tm.commit(&mut handle).await.unwrap();
+
+        let (log, _) = tctx.tlogger.get(handle.id()).await.unwrap();
+        for token in ["S0", "S1"] {
+            assert!(log.locks.contains(&PathLock {
+                path: paths::from_node(TEST_COLL, token),
+                typ: LockType::Read,
+                scope: LockScope::Membership,
+            }));
+        }
+        tm.end(&mut handle).await.unwrap();
+    }
+
     // ADR-032 phantom prevention: a delete bumps the covered leaf's membership
     // version, so an earlier scan fails re-validation.
     #[tokio::test]
@@ -2622,12 +2889,10 @@ mod tests {
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
 
-    // ADR-031: a split that lands between the scan and validation changes the
-    // covered leaf set (one leaf becomes an index root over two leaves), which
-    // validation detects and re-runs — the listing then re-scans the fresh
-    // topology, following right-links, so no key is dropped or duplicated.
+    // A pure split changes physical coverage but not logical membership. The
+    // fallback re-resolves the page and accepts it without a false retry.
     #[tokio::test]
-    async fn scan_detects_concurrent_split() {
+    async fn scan_accepts_concurrent_split_with_unchanged_membership() {
         let (tm, tctx) = new_algo().await;
         seed_live_keys(&tctx, &[b"a", b"m"]).await;
 
@@ -2638,9 +2903,9 @@ mod tests {
         // produces), so the covered leaf set is no longer just `_i`.
         split_root_in_place(&tctx).await;
 
-        let mut stale = tm.begin(data);
-        let err = tm.commit(&mut stale).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        let mut stable = tm.begin(data);
+        tm.commit(&mut stable).await.unwrap();
+        tm.end(&mut stable).await.unwrap();
     }
 
     // ADR-032 boundary protection: on a multi-leaf tree a full scan covers every
