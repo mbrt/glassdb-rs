@@ -6,14 +6,16 @@
 fixed compile-time hash sharding of collection metadata with a **dynamic,
 order-preserving, range-partitioned** coordination directory. The umbrella
 decision is [ADR-031](../adr/031-dynamic-range-sharding.md). This document is the
-living companion to that (frozen) ADR; it captures the shape, the rationale, the
-invariants, and the open questions.
+living companion to that proposed ADR; it captures the shape, the rationale,
+the invariants, and the open questions.
 
 It builds on the object-storage-native layout of
-[`object-storage-native.md`](object-storage-native.md): the shard *entry* model, transaction
-objects, commit/write-back, wound-wait/leases, GC, and the shard-mutation
-coordinator all carry over. Only the **key→shard mapping** and the **directory
-structure** change.
+[`object-storage-native.md`](object-storage-native.md): for this redesign, the
+shard *entry* model, transaction objects, commit/write-back, wound-wait/leases,
+GC, and the shard-mutation coordinator all carry over. Only the **key→shard
+mapping** and the **directory structure** change. Proposed snapshot ADRs 038–040
+would later revise value placement, retention, and catalog authority without
+replacing the B-link topology.
 
 ## Why
 
@@ -39,7 +41,11 @@ CAS. Leaves are the shards; interior nodes are the range index.
 - **Objects**
   - _Root object_ (`_i`, fixed well-known path): **is** the tree's current root
     node — a leaf while the collection is small, an index node once it grows —
-    and also carries the collection metadata (existence + subcollection list).
+    and under ADR-031 also carries collection metadata (existence +
+    subcollection list). Proposed
+    [ADR-041](../adr/041-epoch-versioned-collection-catalog.md) moves logical
+    authority for that metadata to a versioned catalog while retaining `_i` as
+    the routing root.
     There is no separate anchor: the root keeps a fixed address, so height grows
     by **splitting the root in place** and every descent starts at `_i`.
   - _Index node_ (interior, incl. the root at height ≥ 2): ordered separator keys
@@ -49,9 +55,8 @@ CAS. Leaves are the shards; interior nodes are the range index.
     the ADR-017 per-key entries (lock type · `locked_by` · `current_writer` ·
     tombstone) sorted by key; also a **high-key** and **right-sibling** link. The
     CAS unit for its keys.
-  - _Transaction object_ (`_t/<ss>/<txid>`): unchanged contents (status +
-    values + lease), stored in one of 4,096 deterministic listing shards
-    ([ADR-035](../adr/035-paginated-listing-and-sharded-transaction-logs.md)).
+  - _Transaction object_ (`_t/<ss>/<txid>`): unchanged by range sharding (status +
+    values + lease); proposed ADR-039 later splits values into per-key payloads.
   - _Structural record_ (`{db}/_s/<record-id>`): a short-lived split
     write-ahead note, recovered independently from transaction logs
     ([ADR-034](../adr/034-separate-structural-log-namespace.md)).
@@ -119,7 +124,7 @@ single GET/CAS on `_i`.
 
 ```mermaid
 graph TD
-    Root["_i — root (leaf)<br/>range (-∞, +∞) · high-key +∞<br/>right-sibling → nil<br/>entries: user:42 → {lock, writer, …}<br/>+ collection metadata (subcollections)"]
+    Root["_i — root (leaf)<br/>range (-∞, +∞) · high-key +∞<br/>right-sibling → nil<br/>entries: user:42 → {lock, writer, …}<br/>+ ADR-031 collection metadata"]
 
     classDef root fill:#e8ecff,stroke:#5566aa,color:#111
     class Root root
@@ -132,7 +137,7 @@ them (height 1 → 2):
 
 ```mermaid
 graph TD
-    Root["_i — root (index) · high-key +∞<br/>(-∞, m) → L0<br/>[m, +∞) → L1<br/>+ collection metadata"]
+    Root["_i — root (index) · high-key +∞<br/>(-∞, m) → L0<br/>[m, +∞) → L1<br/>+ ADR-031 collection metadata"]
     Root --> L0["Leaf L0<br/>(-∞, m) · hi m<br/>apple, cat"]
     Root --> L1["Leaf L1<br/>[m, +∞) · hi +∞<br/>mango, pear"]
 
@@ -161,7 +166,7 @@ height 3). Only leaves hold key entries; interior nodes map ranges to children.
 
 ```mermaid
 graph TD
-    Root["_i — root (index) · hi +∞<br/>(-∞, m) → I1<br/>[m, +∞) → I2<br/>+ collection metadata"]
+    Root["_i — root (index) · hi +∞<br/>(-∞, m) → I1<br/>[m, +∞) → I2<br/>+ ADR-031 collection metadata"]
 
     Root --> I1["Index I1 · hi m<br/>(-∞, f) → L0<br/>[f, m) → L1"]
     Root --> I2["Index I2 · hi +∞<br/>[m, t) → L2<br/>[t, +∞) → L3"]
@@ -207,7 +212,8 @@ Notes:
   the range's start leaf and stops when a leaf's low bound passes the range end.
 - Only leaves hold key entries (lock/MVCC state); index nodes hold separator keys
   → child pointers. The root is the `_i` object itself — once the tree has grown
-  it holds separators (plus the collection metadata), not keys.
+  it holds separators (plus ADR-031's collection metadata), not keys. Proposed
+  ADR-041 moves the metadata's logical authority out of this routing object.
 
 ## Constituent ADRs
 
@@ -250,18 +256,24 @@ split-point policy, and node fan-out/sizing.
   monotonic-insert hotspot.
 - **Hard object-size cap tuning.** The implemented defaults cap a node at 1 MiB
   and reserve 64 KiB for transient lock metadata. Content growth stops at the
-  remaining 960 KiB; an individually unsplittable key and an overflowing
-  subcollection directory are permanent invalid-input errors. Future tuning may
-  still adjust those configurable defaults and their foreground-latency trade-off.
+  remaining 960 KiB; an individually unsplittable key and, under ADR-031, an
+  overflowing subcollection directory are permanent invalid-input errors.
+  Proposed ADR-041 removes the latter from `_i`. Future tuning may still adjust
+  those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
   `AllowStale` seeding).
-- **Fast paths.** How the single read-write fast path (ADR-027) and read-only
-  fast path interact with a stale cached descent.
-- **Subcollection directory.** It lives in the root object `_i`; whether it should
-  be split out or itself range-sharded when subcollections grow unbounded
-  (ADR-018's deferred item), and how much its churn coupling with root-level
-  index rewrites matters in practice.
+- **Cached-descent fast paths.** How ADR-027's single read-write path and the
+  existing strict read-only fast path recover when their cached descent is
+  stale.
+- **Snapshot and fast paths.** The proposed
+  [snapshot-read design](snapshot-reads.md) routes historical logical versions
+  through the latest B-link topology. Its correctness baseline replaces
+  ADR-027's parallel first-intent path. A specialized replacement is optional
+  and would require its own proof.
+- **Subcollection directory.** ADR-031 keeps it in `_i`; proposed ADR-041 moves
+  logical authority to an epoch-versioned catalog. If that proposal is not
+  accepted, unbounded growth and root-rewrite coupling remain open here.
 - **Node fan-out / sizing.** Interior fan-out and leaf soft cap vs tree height,
   CAS cost, and cache footprint — to be pinned by a benchmark plan.
 
@@ -273,6 +285,8 @@ and **reuses unchanged** everything else in the object-storage-native stack — 
 shard *entry* model (ADR-017), transaction object (ADR-019), commit/write-back
 (ADR-020), wound-wait/leases (ADR-021), GC (ADR-022), the slimmed backend trait
 (ADR-023), and the shard-mutation coordinator (ADR-028/029), which the split
-plugs into as another coordinator-driven mutation. See the
+plugs into as another coordinator-driven mutation. Proposed snapshot ADRs
+038–040 would subsequently replace value placement, historical liveness, and
+root-local catalog authority while retaining the B-link topology. See the
 [ADR-031 status](../adr/031-dynamic-range-sharding.md#status) for the exact
 clauses.

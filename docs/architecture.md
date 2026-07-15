@@ -62,6 +62,21 @@ ephemeral — they can scale to zero and back without any coordination. The only
 shared state is the object storage bucket, which provides strong consistency for
 single-object operations and conditional writes for atomic state transitions.
 
+## Snapshot reads (proposed)
+
+Strict serializability remains the default. The proposed
+[bounded-staleness snapshot design](designs/snapshot-reads.md) adds an explicit
+snapshot-preferred read-only transaction. A snapshot execution binds one sealed
+global epoch and reads historical data at that cut without locks or commit
+validation. Epoch sealing is cooperative and activity-driven; long readers use
+a fixed retention window rather than durable reader pins.
+
+Read-write transactions keep the lock-and-revalidate protocol below and admit
+their terminal writes into the global epoch frontier only after their
+serialization dependencies and immutable payload manifest are fixed. Snapshot
+acquisition may fall back before execution to a strict OCC implementation of the
+same read facade; the closure is side-effect-free and may be replayed.
+
 ## Crate Structure
 
 The port is a Cargo workspace whose crates mirror the original Go `internal/`
