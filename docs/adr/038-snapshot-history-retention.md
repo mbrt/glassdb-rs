@@ -32,8 +32,10 @@ minimum history window from the persisted policy:
 maximum begin staleness + maximum read lifetime + safety guard
 ```
 
-The guard covers the policy's maximum cross-client duration-clock uncertainty,
-final history certification, GC cadence, and operation margin. Policy validation
+The guard covers the policy's maximum end-to-end reader-versus-GC duration-clock
+uncertainty, final history certification, GC cadence, and operation margin. The
+clock allowance is one relative bound partitioned between reader under-count and
+GC over-count, not a full separate budget for each side. Policy validation
 rejects a retention setting below the derived minimum.
 
 Measure a version's retention from when it is superseded, not when it originally
@@ -43,18 +45,26 @@ committed. For the oldest cut that may still be read, retain:
 - the first certified version at or before it, the floor version.
 
 Do not trust an unbounded writer timestamp to prove supersession age. GC may
-start the full retention delay from its own monotonic observation; after
-recovery, a helper that cannot conservatively prove elapsed time waits again.
-This intentionally permits excess retention rather than early reclamation.
+start the full retention delay from its own qualified suspension-aware
+duration-clock observation; after recovery, a helper that cannot conservatively
+prove elapsed time waits again. This intentionally permits excess retention
+rather than early reclamation.
 
 Reader and GC duration clocks must advance through process and machine
 suspension and remain within the policy's bounded rate uncertainty over the
-retention horizon. A database cannot enable pin-free snapshots when that clock
-contract is unavailable.
+retention horizon. Clients without a healthy qualified clock fall back or fail
+before snapshot execution, and active snapshots that lose clock proof discard
+their results. Each role conservatively monitors its clock against an
+independent coarse elapsed-time signal; disagreement can mark it unhealthy but
+cannot qualify an unsupported platform. GC without clock proof performs no
+time-authorized reclamation.
 
 Count history and catalog predecessor references as GC roots. Retain transaction
 certification metadata while any data or catalog history entry needs it. Reclaim
-independent per-key values when their own history no longer needs them.
+independent per-key values when their own history no longer needs them. A
+tombstoned leaf's key-directory entry and history head remain roots while any
+admissible or live cut may observe a present floor version; prune them only after
+all such cuts observe absence.
 
 Treat a durable preparation manifest as a GC root for every named payload and
 physical collection root until terminal commit or abort. Reclaiming prepared
@@ -77,6 +87,11 @@ reader pins, this means waiting the full maximum lifetime plus the safety guard
 from the durable admission-disable fence and retaining history whenever elapsed
 time cannot be proved conservatively.
 
+The operational state does not remove snapshot capability or the mandatory
+writer format. Its transitions and recovery are ownerless, idempotent, and
+helpable; uncertain drain or rebuild progress rejects new snapshot binds and
+retains history.
+
 Re-enable admission only after durably entering `rebuilding`, closing and
 resolving the latest-only GC reclamation generation—or fencing every authorized
 delete against delayed execution—and then fencing and sealing a current-state
@@ -93,7 +108,7 @@ reclaims required history early.
 - Storage use is bounded by policy and write volume rather than reader crashes,
   but the worst-case retained volume can still be large.
 - Disabling new snapshots is an operational pressure valve, not permission to
-  invalidate existing transactions.
+  invalidate existing transactions or immediate permission to reclaim history.
 - Re-enabling after compaction requires a baseline-building transition, not a
   Boolean flip.
 - GC must become history-aware and preserve floor versions, tombstones, catalog

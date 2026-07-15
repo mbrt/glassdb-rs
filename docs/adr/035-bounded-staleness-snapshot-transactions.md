@@ -34,6 +34,13 @@ operations against the same fixed epoch and remaining deadline. Writes are not
 available through the facade. Caller-selected historical epochs and portable
 continuation tokens are not supported.
 
+Acquisition obtains or reuses a same-client freshness certificate, then strongly
+reads the snapshot control record to bind the newest admissible sealed epoch. If
+the certificate expires before that read returns, acquisition discards the
+prospective bind without invoking the closure and retries within the original
+begin timeout. Exhaustion selects the configured strict fallback or
+`FreshSnapshotUnavailable`; no retry resets the begin timeout.
+
 Snapshot acquisition has its own bounded timeout. By default, failure to acquire
 an admissible epoch falls back before execution to a strict read-only OCC
 implementation of the same facade. Ranges and pages in that mode remain in one
@@ -57,14 +64,21 @@ A strict fallback starts its deadline immediately before the first closure
 invocation. The same deadline covers every retry and never resets. Crossing it
 cancels the closure attempt, discards an operation or page result, and returns
 `ReadTransactionExpired`; no operation completing after expiry is observable.
-The deadline source must advance through suspension and satisfy the bounded
-duration uncertainty included in the retention policy.
+The deadline source must be a qualified BOOTTIME-class duration clock that
+advances through suspension and satisfies the bounded duration uncertainty in
+the retention policy. Conservatively monitor it against an independent coarse
+elapsed-time signal; disagreement beyond the remaining uncertainty budget marks
+it unhealthy but agreement does not qualify an otherwise unsupported platform.
+An unavailable or unhealthy clock causes pre-execution fallback or failure;
+loss of clock proof during a snapshot discards its result as expired.
 
 Store one immutable `SnapshotPolicy` in database metadata. It defines maximum
 staleness, acquisition timeout, maximum lifetime, duration-clock uncertainty,
 epoch cadence, writer grace, and the minimum derived retention guarantee.
 Per-call requests may be stricter but never exceed the database policy. Online
-policy reconfiguration is deferred.
+policy reconfiguration is deferred. Every database in this format has this
+policy and snapshot capability; neither creation nor an operational switch lets
+strict transactions avoid the epoch, certification, and history protocol.
 
 Existing `Database::tx` retains its strict, retryable behavior even when a
 particular execution produces no writes.
@@ -77,7 +91,13 @@ particular execution produces no writes.
   making possible closure replay explicit in its type and documentation. Both
   modes expose the same operation surface and fixed overall deadline.
 - Callers needing predictable snapshot execution can reject fallback.
+- Strict fallback may replay for the full fixed lifetime and has no separate
+  retry-count cap; callers can request a shorter lifetime or require a snapshot.
 - The fixed deadline bounds storage retention and prevents abandoned readers
   from pinning history indefinitely.
 - Sealed epochs, historical data, pin-free retention, and a versioned catalog
   require the separate decisions in ADR-036 through ADR-039.
+- Acceptance requires the living design's
+  [performance gate](../designs/snapshot-reads.md#performance-acceptance-gate).
+  If the mandatory write-path cost is unreasonable, reject this design rather
+  than add a snapshot opt-out or strict-only format.

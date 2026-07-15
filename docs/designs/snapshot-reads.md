@@ -8,9 +8,17 @@ transactions over a fixed historical database cut. The umbrella API decision is
 historical data, retention, and the collection catalog are split into the
 focused ADRs indexed below.
 
-This document is the living companion to those frozen decisions. In particular,
-the numeric defaults and the possible single-read-write optimization may evolve
-here without changing the snapshot contract.
+Snapshot capability is part of the one database format in this proposal. There
+is no creation-time or operational mode that lets read-write transactions avoid
+the epoch, manifest, certification, and history protocol. If that mandatory
+work imposes an unreasonable burden on strict transactions, the proposal is
+rejected rather than split into snapshot-capable and strict-only formats. The
+[performance acceptance gate](#performance-acceptance-gate) must be completed
+before these ADRs can be accepted.
+
+This document is the living companion to those proposed decisions. In
+particular, the numeric defaults and optional implementation optimizations may
+evolve while the proposal is reviewed.
 
 ## Goal & scope
 
@@ -32,6 +40,19 @@ Explicit historical time travel, collection deletion, portable continuation
 tokens, snapshot migration between clients, and online policy reconfiguration
 are out of scope. The storage format is greenfield; existing databases need not
 be upgraded or backfilled.
+
+### Terms
+
+| Term | Meaning |
+|---|---|
+| **Admission generation** | The currently appendable global writer generation. Fencing it orders every earlier admission before the fence and sends later admissions to the next generation. An empty fenced generation proves freshness without publishing an empty epoch. |
+| **Epoch** | A non-empty, monotonically ordered generation of read-write transaction admissions. |
+| **Lane** | One of zero or more client-owned CAS append structures registered inside an epoch. A lane batches metadata operations, never transaction semantics or outcomes. |
+| **Admission** | A durable transaction entry naming its preparation manifest. It is a promise to reach committed-and-discoverable or aborted-and-fenced, not a commit. |
+| **Sealed cut** | The complete logical database state through one sealed epoch: a downward-closed prefix of the strict-serializable order, not a copied database. |
+| **Freshness certificate** | Same-client evidence that every commit omitted by a candidate cut is newer than a retained local duration-clock sample. |
+| **Snapshot control record** | Strongly read database metadata containing the operational-state generation and contiguous `latest_sealed` frontier used to linearize a bind. |
+| **History head / floor version** | A leaf entry's pointer into one key's retained history / the first certified version at or before the oldest still-readable cut. |
 
 ## User contract
 
@@ -78,9 +99,10 @@ current indefinitely while there are no omitted writes, so an idle database
 creates no empty sealed epochs or heartbeat writes.
 
 Snapshot begin proves that bound with a local freshness certificate, not an
-untrusted cross-client timestamp. It samples its monotonic clock immediately
-before issuing the admission-generation fence CAS, then freezes the registered
-lanes and seals every pre-fence admission or proves the frozen suffix empty.
+untrusted cross-client timestamp. It samples its suspension-aware duration clock
+immediately before issuing the admission-generation fence CAS, then freezes the
+registered lanes and seals every pre-fence admission or proves the frozen suffix
+empty.
 Admissions after the fence use the next generation and cannot commit before
 being admitted, so any omitted commit is newer than that pre-request sample.
 The sample is retained while an in-doubt CAS is resolved; it may be replaced
@@ -97,6 +119,28 @@ rechecked when the read returns. Another client establishes its own proof. An
 idle begin may rotate an empty admission generation to obtain this proof, but
 does not publish an empty epoch.
 
+Concretely, begin is one bounded loop:
+
+1. establish the original begin deadline, which no retry resets;
+2. obtain a certificate by sampling immediately before the fence CAS, retaining
+   that sample through in-doubt recovery, and resolving the pre-fence suffix—or
+   reuse an unexpired certificate owned by the same logical client;
+3. reject the candidate if no positive freshness budget remains after the
+   policy's total duration-clock uncertainty;
+4. record a prospective `started_at`, then strongly read the snapshot control
+   record and validate its operational-state generation;
+5. select the newest `latest_sealed` cut no older than the certified frontier;
+6. sample again after the control read; if the certificate's budget has expired,
+   discard the prospective bind without invoking the closure and restart at step
+   2 only if the original begin deadline permits; and
+7. otherwise bind the cut and the fixed `started_at + lifetime` deadline. If no
+   further acquisition attempt fits, use strict fallback or return
+   `FreshSnapshotUnavailable` according to the call option.
+
+Only the successful final control-read attempt supplies the snapshot execution
+start. Retrying acquisition may replace a failed prospective start, but it never
+extends the original begin timeout.
+
 The acquisition deadline is capped by both the begin timeout and the requested
 staleness budget after deducting the policy's maximum duration-clock
 uncertainty. If the pre-fence suffix cannot be resolved in that time, or the
@@ -111,12 +155,39 @@ accepted just inside the freshness bound still receives the full configured
 lifetime from the start of binding; the epoch's prior age does not reduce it.
 Strict fallback retries share the same start and never reset it.
 
-The deadline clock must be monotonic, advance through process and machine
+With the proposed one-hour maximum, a strict fallback may replay the complete
+closure for as long as that fixed deadline permits. This proposal deliberately
+adds no separate retry-count cap: a count would make availability depend on
+contention rather than the requested time budget. Callers that cannot tolerate
+that replay window can request a shorter lifetime or set `require_snapshot`.
+Fallback retry count and time spent retrying are reported separately.
+
+The duration clock must be monotonic, advance through process and machine
 suspension, and stay within the policy's bounded duration uncertainty over the
-full retention horizon. Wall-clock adjustment cannot extend a deadline. A platform
-that cannot provide that duration contract cannot safely enable pin-free
-snapshots; otherwise a suspended reader could resume after GC reclaimed its
-history.
+full retention horizon. This is a BOOTTIME-class contract; a generic monotonic
+API is insufficient unless its platform implementation is qualified to include
+suspension. Wall-clock adjustment cannot extend a deadline.
+
+Clock capability and health fail closed by role. A client that cannot prove the
+duration contract may still execute strict reads and writes, but snapshot begin
+falls back or fails before invoking the closure. Losing that proof during an
+active snapshot conservatively expires and discards its result. A GC worker with
+an unhealthy or unsupported duration clock retains history and performs no
+time-authorized reclamation.
+
+Each reader and GC process must also maintain a conservative runtime health
+check against an independent coarse elapsed-time signal. It checks before
+snapshot admission or time-authorized deletion and whenever control returns
+after a wait or possible suspension. When both elapsed deltas are usable, a
+disagreement larger than that role's allocated uncertainty marks the duration
+clock unhealthy; an inconclusive comparison fails closed. The default allocation
+is 15 seconds of reader under-count and 15 seconds of GC over-count, whose sum is
+the policy's 30-second end-to-end maximum. The comparison anchor is retained for
+the full certificate, active-read, or GC retention interval and is not reset by
+a successful intermediate check. This check can reject a clock but cannot make
+an unqualified platform safe, and a timestamp written by a different client
+cannot prove the local clock's rate. Arbitrary platform or hypervisor violations
+shared by both signals remain an environmental fault assumption.
 
 The implementation races the whole closure future against the deadline, checks
 before and after every storage await, and checks again when the closure returns.
@@ -131,6 +202,8 @@ deadline.
 Every client reads the persisted policy; a conflicting local configuration is
 an open error rather than a new opinion about retention. Per-call options may
 request a shorter lifetime or a stricter freshness bound, never a larger one.
+Every database in this format has this policy and emits snapshot history; there
+is no strict-only capability or creation-time opt-out.
 
 | Setting | Proposed default | Purpose |
 |---|---:|---|
@@ -138,7 +211,7 @@ request a shorter lifetime or a stricter freshness bound, never a larger one.
 | Maximum snapshot staleness | 90 seconds | Hard omission-age budget for sealing and acquisition |
 | Snapshot begin timeout | 30 seconds | Time allowed to help produce an admissible cut |
 | Maximum read lifetime | 1 hour | Supports cold object-store scans and analytics |
-| Maximum duration-clock uncertainty | 30 seconds | Bounds freshness, lifetime, and GC duration error; clocks include suspension |
+| Maximum duration-clock uncertainty | 30 seconds | Total worst-case reader-under-count versus GC-over-count across the full horizon; clocks include suspension |
 | Final-phase writer grace | 15 seconds | Time before a stalled admitted writer is resolved or aborted |
 | Minimum history retention | 70 minutes | Derived safety floor; see ADR-038 |
 
@@ -148,7 +221,9 @@ epoch target. A caller may choose a smaller bound and accept more sealing work o
 more strict fallbacks. With a one-hour lifetime, the 70-minute retention floor
 leaves an 8.5-minute guard beyond maximum staleness plus lifetime for history
 duration-clock uncertainty, history certification, GC cadence, and operation
-margin.
+margin. The clock term is one end-to-end relative bound between the slowest
+supported reader clock and fastest supported GC clock, not a separate allowance
+that each side may consume independently.
 
 A persisted operational state may stop new snapshot admission. Strict
 transactions continue to use epochs and durable certification, and existing
@@ -174,6 +249,15 @@ Only after verifying and sealing that floor may the control record admit
 snapshots at or after it. The operational states are
 `enabled -> draining -> disabled -> rebuilding -> enabled`.
 
+Every operational transition and recovery step is ownerless, idempotent, and
+helpable after the initiating client disappears. `draining` and `rebuilding`
+both reject new snapshot binds and retain history when progress is uncertain.
+Disable is therefore delayed pressure relief, not an emergency delete switch:
+with the proposed defaults, existing reads may keep the full history obligation
+for roughly an hour plus the guard. Rebuilding may require a database-wide
+baseline scan while writers continue; implementations must expose its progress,
+restart state, and required temporary storage headroom.
+
 ### Errors and observability
 
 - `FreshSnapshotUnavailable`: no admissible cut before the begin timeout and
@@ -184,10 +268,16 @@ snapshots at or after it. The operational states are
   window is a corruption/invariant error, never `NotFound`.
 - Backend unavailability cannot be turned into a freshness promise; snapshot
   begin fails closed or uses the explicit strict fallback.
+- An unavailable or unhealthy duration clock follows the same pre-execution
+  fallback rule; loss of clock proof after binding conservatively returns
+  `ReadTransactionExpired` and discards the result.
 
 Statistics should distinguish snapshot selection, strict fallback, helped
-sealing, freshness rejection, expiry, and historical objects traversed. These
-are operational outcomes, not changes to user-visible consistency.
+sealing, freshness-certificate retries, fence CAS conflicts, clock-health
+rejection, expiry, forced live-writer aborts, strict fallback retries, history
+certification backlog, sealed-frontier lag, rebuild progress, and historical
+objects traversed. These are operational outcomes, not changes to user-visible
+consistency.
 
 ## Design at a glance
 
@@ -210,10 +300,20 @@ Writers use the correctness-first sequence:
 6. publish a terminal commit certificate that names that manifest; and
 7. certify per-key history and release locks asynchronously.
 
+This overview counts execution of the user body. ADR-036's six protocol steps
+begin with lock acquisition after that body has produced its candidate read and
+write sets.
+
 Admission happens only after the serialization dependencies are fixed. Thus any
 transaction that depends on this writer must observe its intent or wait for its
 outcome before entering a later epoch. Every serialization edge `T -> U`
 therefore implies `epoch(T) <= epoch(U)`.
+
+This proof includes predicates, not only point values. Every epoch-bearing
+transaction must lock and revalidate every point, absence/membership, range,
+catalog, and structure predicate on which its writes may depend before
+admission. Any optimization that admits an epoch-bearing transaction without
+preserving those predicate edges invalidates the sealed-cut proof.
 
 The preparation manifest is a GC root from before its named objects are created
 until terminal commit or abort. The terminal CAS is allowed only after all
@@ -246,6 +346,13 @@ when they share a process. It is physical group commit only; each entry retains
 its own transaction identity and outcome. High-throughput clients may use
 several lanes; idle databases and inactive clients create none.
 
+Snapshot execution does not mutate coordination state, but acquisition can: an
+uncached begin CAS-fences the shared admission generation and every successful
+bind strongly reads the snapshot control record. One `Database` clone family
+shares certificate state and singleflights concurrent acquisition; independent
+clients establish their own proofs. Expected uncached begin QPS, fence-CAS
+retries, and control-record read concentration are part of the performance gate.
+
 Closing the epoch root freezes its registered lane set. CAS-closing each lane
 then total-orders every append against closure. A new epoch may accept writers
 after the prior epoch's admissions are frozen; it need not wait for the prior
@@ -259,6 +366,15 @@ first; otherwise the abort fence wins permanently and the writer retries in a
 new transaction. Time chooses when to force progress, while the CAS and durable
 fence—not elapsed time—prove safety. A helper that cannot conservatively prove
 the close age waits a full grace interval from its own observation.
+
+The grace starts at lane close, not admission. Payload and root preparation has
+already completed before admission. A transaction that is still pending after
+the grace may therefore lose the terminal CAS race even when its owner is
+healthy and retry as a new transaction. A transaction whose commit certificate
+already landed cannot be force-aborted; sealers instead help its history become
+discoverable. The default grace is an availability trade-off chosen from
+admission-to-terminal and object-store tail-latency measurements, not a safety
+timeout.
 
 The sealer resolves every frozen admission to one of two durable states:
 
@@ -302,6 +418,14 @@ it was absent historically. All writes from one transaction share the same
 commit certificate and epoch, preserving cross-key and cross-collection
 atomicity. A committed certificate with a missing or mismatched manifest payload
 is corruption, never a partial transaction.
+
+A leaf key-directory entry with a retained history head is not vestigial. After
+a delete, retain that entry and its history-head pointer while any admissible or
+still-live snapshot cut may resolve the key to a present version, including a
+floor version that may have committed long before the retention window began.
+Only after GC proves every such cut observes absence may it prune the directory
+entry, tombstone, and obsolete history. Point lookup and both scan directions
+depend on this enumeration invariant.
 
 The value cache is keyed by `(logical path, writer)`. A separate latest-value
 alias may accelerate strict reads, but a historical value can never populate or
@@ -368,11 +492,11 @@ current for years and is replaced immediately after a snapshot begins must still
 remain readable for that snapshot's full lifetime.
 
 GC does not trust an unbounded client timestamp to establish supersession age.
-It may wait the full retention interval from its own monotonic observation of
-the supersession; after a crash or ownership change, inability to prove elapsed
-time restarts that conservative wait. A bounded persisted clock may shorten the
-delay only with its configured uncertainty deducted. This can over-retain but
-cannot reclaim early.
+It may wait the full retention interval from its own suspension-aware
+duration-clock observation of the supersession; after a crash or ownership
+change, inability to prove elapsed time restarts that conservative wait. A
+bounded persisted clock may shorten the delay only with its configured
+uncertainty deducted. This can over-retain but cannot reclaim early.
 
 Epoch and lane records provide an ordered GC candidate stream; the current small
 paged walk of transaction objects is not sufficient at the target write rate.
@@ -381,7 +505,7 @@ history early. During the operational `disabled` state it retains latest-state
 roots and compact epoch fences; rebuilding a new history floor is required
 before snapshot admission resumes.
 
-## The single read-write fast path
+## Mandatory write path and optional single read-write optimization
 
 ADR-027's exact one-wave fast path deliberately publishes its transaction object
 and its first write intent in parallel. That is the opposite of the baseline's
@@ -392,30 +516,95 @@ the wrong direction.
 
 The current fast path therefore falls back to the intention-first protocol under
 this design. Epoch admission remains part of the write protocol even while the
-operational switch rejects new snapshots. Preserving the exact critical path
-remains an isolated design goal, not a prerequisite for snapshot correctness.
+operational switch rejects new snapshots. The proposal does not require the same
+storage-wave shape as ADR-027 or any particular replacement fast path. It is
+acceptable only if the resulting user-visible latency and throughput pass the
+workload gate below.
 
-The credible future optimization remains deliberately narrow: one put of an
-existing key, with reads limited to that same key or none. It would issue lane
-admission, immutable candidate payload, and provisional leaf install in one
-parallel wave, but only when a lane is already registered in that epoch. A cold
-client or newly opened epoch first pays lane registration unless registration
-and first append gain a separately proved atomic form.
+An epoch-aware single-write optimization remains possible future work. Any such
+optimization needs its own ADR and must preserve the epoch-edge, durability, and
+abort-fencing proofs. It is not a prerequisite for accepting snapshot reads.
 
-The leaf install is authoritative for the actual predecessor. Every ordinary
-read-write point reader must, after receiving its epoch, durably raise the
-entry's monotonic `max_rw_reader_epoch` in the same CAS that releases its read
-lock. A delayed older install that reloads after that release is rejected; an
-install racing earlier still encounters the lock. Aborted readers do not raise
-the frontier. This post-admission release write is the principal cost of the
-optimization. A common resolver for readers, wound-wait, sealing, and GC must
-prove or fence all three candidate artifacts before declaring committed or
-aborted.
+## Performance acceptance gate
 
-Creates, deletes, scans, and catalog writes remain ineligible, so general
-membership or predicate epoch frontiers are unnecessary. This optimization needs
-its own ADR and deterministic proof before it can supersede ADR-027; until then,
-the baseline is always available with identical snapshot semantics.
+Snapshot capability cannot be opted out, including by applications that never
+call `read_tx`. Consequently ADR-035 through ADR-039 remain **Proposed** until a
+reviewed benchmark report shows reasonable latency and throughput for the
+mandatory format/protocol across the primary workloads below. An operationally
+`disabled` snapshot state is not an escape hatch: it changes retention and
+admission, not write format or commit work.
+
+The benchmark plan compares the proposed format with the current ADR-020/027
+format under the same backend latency, concurrency, logical work, value sizes,
+and fault profile. It is explicitly outcome-based: storage-wave count, lane
+layout, and use of a specialized fast path are not pass criteria.
+
+For every primary workload cell below, the initial reasonableness budget is p95
+and p99 latency at most `1.25x` baseline and statistically converged throughput
+at least `0.85x` baseline. A favorable aggregate cannot hide a failing primary
+cell. A cell is one predeclared tuple of operation, strict/snapshot mode, key or
+result count, value-size bucket, contention level, client state, and—where
+applicable—scan direction. Each tuple is evaluated separately; the benchmark
+report fixes the finite matrix before collecting comparison results.
+
+Proposed strict executions are compared with the current strict API. A proposed
+snapshot cell is compared with the current strict read-only execution of the
+same logical operation when one exists. For a new operation with no current
+equivalent—most notably bounded or reverse scans—the baseline is a frozen
+benchmark-only control that traverses the same B-link data and fetches the same
+logical result without epoch, history, or transaction work. That control is not
+a product mode or snapshot opt-out. The same `1.25x` latency and `0.85x`
+throughput budgets apply. These ratios may be revised only while the design is
+**Proposed**, before running the acceptance comparison, with an explicit
+rationale and review.
+
+The four primary workload families are:
+
+- **single-key operations:** strict and snapshot point reads, blind overwrites,
+  read-modify-write, create, and delete;
+- **multi-key read-only:** fixed-size point batches and cross-collection reads in
+  both strict and snapshot mode;
+- **multi-key read-write:** fixed-size disjoint-key, same-leaf, and
+  cross-collection transactions; and
+- **scans:** forward and reverse range reads and pagination in strict and
+  snapshot mode, plus scan-then-write, using fixed result sizes and reporting
+  both transactions and logical keys/bytes per second.
+
+Use representative fan-outs and values from 1 KiB through 1 MiB, including hot
+keys and concurrent writers. A throughput sample is valid only after history
+certification and write-back queues reach a stationary bound at the offered
+load; queue stability is measurement validity, not a separate performance
+budget.
+
+Within the read-only families, include acquisition cells matching the project's
+existing 500-client scale profile: 500 independent active clients renewing
+certificates uniformly every 50 seconds (ten uncached fences per second, leaving
+margin inside the 90-second staleness bound after the 30-second uncertainty
+deduction), plus a cold burst of 100 independent clients. For the cold case,
+which has no current equivalent, the predeclared absolute targets are at least
+ten uncached begins per second in steady state and at least 99% of the burst
+binding within the 30-second begin timeout. Clone-family cached binds are
+separate cells. These are read-workload latency and throughput targets, not a
+required acquisition mechanism.
+
+Run the matrix when no snapshot is ever requested as well as with concurrent
+snapshot reads. Separate warm registered lanes, newly opened epochs, cold
+clients, clone-family begins, and independently opened clients. Repeat under
+healthy operation, object-store tail latency, CAS contention, lost replies, and
+history-certification backlog.
+
+Report foreground p50/p95/p99 latency and storage waves, scale-out throughput,
+backend reads/writes/CAS retries per committed transaction, bytes written and
+retained, asynchronous backlog, forced abort/retry rate, and estimated object
+operation and storage cost. Metrics other than the latency, throughput, and
+stationary-queue validity check diagnose the result but do not mandate a
+particular implementation. Cold registration is reported separately rather than
+hidden in the average.
+
+If any primary workload cannot meet the predeclared latency and throughput
+budgets without invalidating the epoch-edge or durability proofs, reject this
+snapshot design. Do not add a strict-only database format or make snapshot
+correctness conditional on an opt-out.
 
 ## Comparison
 
@@ -454,20 +643,33 @@ plan must cover:
 - admission append versus lane close in both CAS orders, a next-generation
   commit before the fence reply, competing sealers, and crash recovery after
   every transition;
+- certificate reuse and expiry before, during, and after the final control read,
+  proving that acquisition retries neither invoke the closure nor reset the
+  original begin timeout, and that exhaustion selects exactly fallback or
+  `FreshSnapshotUnavailable`;
 - partial manifests, commit versus forced abort of a live lease, lost
   acknowledgements, root tombstone/recreate versus delayed reclamation, and
   delayed artifacts after an epoch seals;
+- serialization-edge tests for point, absence/membership, range, catalog, and
+  structure predicates, including delayed older installs and later-epoch
+  readers;
 - point, range, pagination, split, and catalog reads checked against an oracle
   reconstructed from the transactions certified in each sealed epoch;
 - create/delete/recreate history, committed holders awaiting write-back,
-  malformed predecessor chains, and exact GC floor-version boundaries;
+  malformed predecessor chains, and exact GC floor-version boundaries; after a
+  delete and pruning at each boundary, point lookup plus forward and reverse
+  scans must agree on whether the historical key exists;
 - expiry around every storage await and while the user closure future is
   pending, including simulated process suspension, with late results discarded
   and page failure remaining atomic;
+- qualified and unqualified duration-clock behavior under suspension, forward
+  jumps, disagreement with the coarse detector, and recovery: an unhealthy
+  reader discards its result while an unhealthy GC worker retains history;
 - bind versus disable in both object-orderings, plus delayed GC operations
-  across disable/drain/rebuild at exact retention boundaries; and
-- mixed baseline and future fast-path writers, should the one-wave optimization
-  be admitted by a later ADR.
+  across disable/drain/rebuild at exact retention boundaries, with crash/restart
+  after every ownerless transition and rebuild step;
+- clone-family acquisition singleflight and independent-client fence contention
+  under the workload and regression budgets in the performance gate.
 
 The existing deterministic-simulation tape replay, PCT schedules, cycle and
 membership workloads, fault injection, and byte-identical operation replay are
@@ -495,10 +697,17 @@ freshness.
 
 ## Open questions / future work
 
-- Prove and benchmark the certified one-wave single read-write path before
-  recording the decision that supersedes ADR-027.
+- Complete the mandatory performance gate before accepting any constituent ADR.
+  Reject the design if any of the four primary workload families misses its
+  predeclared latency or throughput budget.
+- Consider an epoch-aware single-write fast path only if profiling justifies its
+  complexity; it is not an acceptance prerequisite.
+- Qualify the supported platform clock matrix and runtime health detector for
+  the BOOTTIME-class contract, including suspension tests and fail-closed
+  behavior.
 - Tune lane segmentation, local batch size, and the number of lanes per active
-  client without adding an intentional batching delay.
+  client without adding an intentional batching delay. Choose final-phase grace
+  from measured admission-to-terminal and backend tail latency.
 - Choose history-chunk and sparse-index sizing from hot-key and range-scan
   benchmarks while preserving a bounded lookup.
 - Add safe online `SnapshotPolicy` enlargement/shrinkage if operational demand
@@ -527,6 +736,6 @@ dynamic range-sharding B-link topology. On acceptance:
   fallback pages share and validate one retryable OCC attempt. Both directions
   are supported.
 
-On acceptance, ADR-036 partially supersedes ADR-027 by replacing its parallel
-first-intent path with the intention-first baseline. A future certified
-fast-path ADR may supersede that fallback without changing snapshot semantics.
+On acceptance, ADR-036 partially supersedes ADR-027 by replacing its current
+parallel first-intent path with the intention-first baseline. A future certified
+fast-path ADR may optimize that baseline without changing snapshot semantics.

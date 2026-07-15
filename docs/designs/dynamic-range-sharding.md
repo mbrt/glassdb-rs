@@ -6,8 +6,8 @@
 fixed compile-time hash sharding of collection metadata with a **dynamic,
 order-preserving, range-partitioned** coordination directory. The umbrella
 decision is [ADR-031](../adr/031-dynamic-range-sharding.md). This document is the
-living companion to that (frozen) ADR; it captures the shape, the rationale, the
-invariants, and the open questions.
+living companion to that proposed ADR; it captures the shape, the rationale,
+the invariants, and the open questions.
 
 It builds on the object-storage-native layout of
 [`object-storage-native.md`](object-storage-native.md): for this redesign, the
@@ -268,9 +268,9 @@ split-point policy, and node fan-out/sizing.
   stale.
 - **Snapshot and fast paths.** The proposed
   [snapshot-read design](snapshot-reads.md) routes historical logical versions
-  through the latest B-link topology. Its correctness baseline temporarily
-  falls back from ADR-027's parallel first-intent path; an exact one-wave
-  replacement remains separately proved and benchmarked.
+  through the latest B-link topology. Its correctness baseline replaces
+  ADR-027's parallel first-intent path. A specialized replacement is optional
+  and would require its own proof.
 - **Subcollection directory.** ADR-031 keeps it in `_i`; proposed ADR-039 moves
   logical authority to an epoch-versioned catalog. If that proposal is not
   accepted, unbounded growth and root-rewrite coupling remain open here.

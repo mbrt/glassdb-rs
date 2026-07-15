@@ -40,7 +40,10 @@ versions, preserving create, delete, and recreate history.
 
 Index retained immutable history by epoch so lookup finds the newest certified
 version at or before a cut with bounded work rather than a linear walk through
-every overwrite. The current leaf entry identifies the history head.
+every overwrite. The current leaf entry identifies the history head. After a
+delete, retain that key-directory entry and head while any admissible or live cut
+can resolve the key to a present version; prune it only after all such cuts
+observe absence. Point lookup and scans in both directions use this invariant.
 
 Treat a committed certificate with a missing or mismatched manifest payload as
 corruption, never as absence or a partial transaction.
@@ -51,5 +54,7 @@ corruption, never as absence or a partial transaction.
 - Preparing and verifying the manifest adds work before the commit point.
 - Multi-key atomicity depends on retaining the one certification record shared
   by every corresponding history entry.
+- Deleted keys may retain directory entries and old floor versions until no
+  permitted cut can observe them.
 - The format creates more immutable objects and needs history-index compaction
   and sizing policies.
