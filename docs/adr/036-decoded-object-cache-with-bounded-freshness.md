@@ -2,15 +2,28 @@
 
 ## Status
 
-Proposed.
+Accepted (implemented).
 
-When implemented, this supersedes
-[ADR-030](030-seed-shard-loads.md)'s `Latest` / `AllowStale` cache-freshness API
-while preserving its reuse optimization as an `Any` read followed by CAS.
-It refines only the caching part of
-[ADR-023](023-slimmed-backend-trait.md): the slim `Backend` trait, opaque content
-versions, and version-conditional read remain unchanged. ADR-030 remains
-authoritative while this proposal is unimplemented.
+The decoded object cache is realized as a single `CachedStore`
+([`crates/glassdb-storage/src/cached_store.rs`](../../crates/glassdb-storage/src/cached_store.rs))
+keyed by physical path, with a per-entry validation watermark, `Present` /
+`Absent` / `Missing` states, `Revision`, `Observation`, and coalesced
+version-conditional revalidation. The typed `ObjectCache` facade caches raw
+bodies over it, and `ValueCache` was removed — key values are derived from the
+cached node plus the decoded transaction object. Reads serve any usable copy
+(`Requirement::Any`) and commit-time validation revalidates against current
+coordination state (`Requirement::AtLeast(now)`).
+
+[ADR-030](030-seed-shard-loads.md)'s `Latest` / `AllowStale` freshness enum is
+**removed**: call sites speak the `Requirement` model directly. A former
+`AllowStale` read becomes `Any`. A former `Latest` read becomes either `Any`
+(when a following version-conditional CAS is the real validation) or `AtLeast(T)`
+against a bound **captured once at the OCC boundary and propagated** — never
+`now()` re-sampled at each read site (see "Capturing and propagating the bound"
+below, which was the ambiguity that misled the first implementation). This
+refines only the caching part of [ADR-023](023-slimmed-backend-trait.md): the
+slim `Backend` trait, opaque content versions, and version-conditional read
+remain unchanged.
 
 ## Context
 
@@ -176,6 +189,66 @@ terminal leaf during validation. The database cannot infer that other clients
 did not write after the cached leaf was last validated. Removing that floor
 would require a stronger primitive such as a freshness lease, exclusive-client
 mode, or change stream.
+
+### Capturing and propagating the bound (implementation guidance)
+
+The bound `T` in `AtLeast(T)` is one `ValidationTime` **captured once** per
+transaction phase and **threaded** through every dependent read of that phase. It
+is not re-sampled at the point of each read.
+
+Introducing the concept of `now` (e.g. `AtLeast(now())`), re-sampling the clock
+at a read site, is an anti-pattern that silently defeats the model. A `now`
+bound is unsatisfiable by any existing cache entry and therefore always forces a
+backend validation. That is exactly the unconditional "always revalidate"
+behavior (the removed `Latest`) that this design replaces, wearing a bound as a
+disguise: it carries no evidence, enables no reuse, and makes every call site
+independently pessimistic. The whole value of a bound is that it is older than
+the reads and locks a transaction already performed, so their evidence satisfies
+it for free.
+
+Two consequences for the API surface:
+
+- The typed stores expose **no per-call "read latest" accessor**. A clock read
+  appears only where a barrier is deliberately _captured_, at the OCC boundary.
+  Every legitimate caller either accepts `Any` or already holds a captured bound
+  to pass down.
+- A read issued only to **seed a following version-conditional CAS uses `Any`**,
+  not a fresh bound. The CAS is the validation: a stale seed makes it miss, and
+  the retry reloads. Paying for a strong read first to avoid an occasional CAS
+  miss is not worthwhile, and manufacturing a `now()` bound to force that read
+  is the same anti-pattern.
+
+### Locked dependencies validate at the lock's landing, not the leaf's version
+
+A held lock pins a key's logical value independently of its physical leaf. Other
+keys in the same leaf may be locked or written, advancing the leaf's backend
+version, yet the locked key cannot change. Validation exploits this: the
+read-write barrier is captured **before** lock acquisition, so each lock's
+install CAS lands after the barrier and its write-through advances that leaf's
+evidence past the bound. The locked key then validates against
+`AtLeast(barrier)` from that evidence with **no additional read**, even when the
+leaf's version has since moved for unrelated keys. This generalizes the
+single-read/write optimization to every locked key across every leaf a
+transaction touches, and is the primary source of the "several strong reads
+saved" per commit.
+
+A revision-conditional check ("is the leaf's version still the one I read?")
+must **not** be substituted for the `ValidationTime` bound here. It conflates
+the physical object version with the logical freshness of a locked key, so
+unrelated churn in the same leaf reports a change and forces a wasteful re-read
+and re-derivation of a value that provably did not change. The bound exists
+precisely to separate "this object was rewritten" from "the value I depend on
+was current as of `T`". That separation is what makes three distinct reuses
+possible, all of which a revision-only "revalidate" flag would lose:
+
+- **Batching** — many keys under one leaf, and many leaves under one range scan,
+  are satisfied by evidence advanced once against the shared bound.
+- **Cross-transaction** — another client's write-through that lands after the
+  bound advances the same shared evidence, so this transaction's validation of
+  that leaf becomes free while remaining correct (the writer/membership
+  comparison still runs against the newer, consistent state).
+- **Locked keys** — as above, validated from the lock's landing evidence without
+  touching the backend.
 
 ### Mutation outcomes update knowledge conservatively
 
