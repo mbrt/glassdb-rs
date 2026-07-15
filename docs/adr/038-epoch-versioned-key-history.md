@@ -1,4 +1,4 @@
-# ADR-037: Epoch-versioned key history
+# ADR-038: Epoch-versioned key history
 
 ## Status
 
@@ -43,7 +43,8 @@ version at or before a cut with bounded work rather than a linear walk through
 every overwrite. The current leaf entry identifies the history head. After a
 delete, retain that key-directory entry and head while any admissible or live cut
 can resolve the key to a present version; prune it only after all such cuts
-observe absence. Point lookup and scans in both directions use this invariant.
+observe absence. Point lookup and forward `KeyScan` traversal use this
+invariant.
 
 Treat a committed certificate with a missing or mismatched manifest payload as
 corruption, never as absence or a partial transaction.

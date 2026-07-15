@@ -1,4 +1,4 @@
-# ADR-038: Snapshot history retention
+# ADR-039: Snapshot history retention
 
 ## Status
 
@@ -10,7 +10,7 @@ Constituent decision of the
 On acceptance, this supersedes ADR-022's current-reference-only liveness rule
 for committed values and its deletion of outcome evidence needed to fence
 delayed epoch-protocol artifacts. Pending-lock reclamation remains, extended by
-ADR-036's final-phase grace for admitted writers.
+ADR-037's final-phase grace for admitted writers.
 
 ## Context
 
@@ -65,6 +65,12 @@ independent per-key values when their own history no longer needs them. A
 tombstoned leaf's key-directory entry and history head remain roots while any
 admissible or live cut may observe a present floor version; prune them only after
 all such cuts observe absence.
+
+ADR-035's paginated, sharded transaction-log walk remains the completeness
+mechanism for bulky transaction and pre-admission preparation cleanup. Snapshot
+history additionally uses epoch/lane outcome and history indexes as GC roots and
+candidate sources; those records do not change the backend's opaque-cursor
+listing contract.
 
 Treat a durable preparation manifest as a GC root for every named payload and
 physical collection root until terminal commit or abort. Reclaiming prepared

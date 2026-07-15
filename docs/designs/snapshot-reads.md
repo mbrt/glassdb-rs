@@ -4,7 +4,7 @@
 
 **Proposed.** This design adds long-lived, internally consistent, read-only
 transactions over a fixed historical database cut. The umbrella API decision is
-[ADR-035](../adr/035-bounded-staleness-snapshot-transactions.md); sealed cuts,
+[ADR-036](../adr/036-bounded-staleness-snapshot-transactions.md); sealed cuts,
 historical data, retention, and the collection catalog are split into the
 focused ADRs indexed below.
 
@@ -32,14 +32,16 @@ unchanged for the execution's lifetime. Reads at that cut are:
 - valid for a bounded but analytics-friendly lifetime; and
 - independent of later epoch closure or reclamation decisions.
 
-The API supports point reads, ordered key and value ranges, pagination,
-collection and subcollection enumeration, and cross-collection reads. Read-write
+The API supports point reads, ADR-033's forward keys-only range scans and
+materialized pages, collection and subcollection enumeration, and
+cross-collection reads. Callers obtain values for a scanned page through point
+reads in the same transaction and therefore at the same cut. Read-write
 transactions keep their existing strict-serializable semantics.
 
-Explicit historical time travel, collection deletion, portable continuation
-tokens, snapshot migration between clients, and online policy reconfiguration
-are out of scope. The storage format is greenfield; existing databases need not
-be upgraded or backfilled.
+Explicit historical time travel, collection deletion, portable snapshot-bearing
+continuation tokens, snapshot migration between clients, and online policy
+reconfiguration are out of scope. The storage format is greenfield; existing
+databases need not be upgraded or backfilled.
 
 ### Terms
 
@@ -73,9 +75,10 @@ timeout falls back to a strict read-only OCC implementation of the same
 `ReadTransaction` facade. The fallback is current rather than stale, but it may
 replay the complete closure during validation conflicts. Point reads and every
 range page contribute to one attempt's accumulated read and predicate set; a
-retry starts a new attempt and invalidates its old cursors. Shipping transparent
-fallback therefore requires strict implementations of the complete operation
-surface, rather than delegating pagination to independent transactions.
+retry starts a new attempt and reconstructs every materialized page. Shipping
+transparent fallback therefore requires the facade to use
+`Transaction::scan_keys` inside that attempt, rather than delegate pages to
+independent `Collection::scan_keys` transactions.
 
 A per-call `require_snapshot` option disables this fallback. In that mode an
 admission failure returns `FreshSnapshotUnavailable` before the closure runs.
@@ -213,7 +216,7 @@ is no strict-only capability or creation-time opt-out.
 | Maximum read lifetime | 1 hour | Supports cold object-store scans and analytics |
 | Maximum duration-clock uncertainty | 30 seconds | Total worst-case reader-under-count versus GC-over-count across the full horizon; clocks include suspension |
 | Final-phase writer grace | 15 seconds | Time before a stalled admitted writer is resolved or aborted |
-| Minimum history retention | 70 minutes | Derived safety floor; see ADR-038 |
+| Minimum history retention | 70 minutes | Derived safety floor; see ADR-039 |
 
 The 90-second value is a hard admission boundary, not normal lag: under healthy
 operation snapshots should usually trail by no more than the roughly five-second
@@ -300,7 +303,7 @@ Writers use the correctness-first sequence:
 6. publish a terminal commit certificate that names that manifest; and
 7. certify per-key history and release locks asynchronously.
 
-This overview counts execution of the user body. ADR-036's six protocol steps
+This overview counts execution of the user body. ADR-037's six protocol steps
 begin with lock acquisition after that body has produced its candidate read and
 write sets.
 
@@ -314,6 +317,12 @@ transaction must lock and revalidate every point, absence/membership, range,
 catalog, and structure predicate on which its writes may depend before
 admission. Any optimization that admits an epoch-bearing transaction without
 preserving those predicate edges invalidates the sealed-cut proof.
+
+ADR-033 supplies the concrete range rule: any transaction containing both a
+scan and a write takes structure-read and membership-read locks on every leaf
+covered through each scan's effective frontier, then revalidates while holding
+them. If a limited page's frontier moves outward, it retains the locks, extends
+the covered range, and repeats to a fixpoint before epoch admission.
 
 The preparation manifest is a GC root from before its named objects are created
 until terminal commit or abort. The terminal CAS is allowed only after all
@@ -424,8 +433,8 @@ a delete, retain that entry and its history-head pointer while any admissible or
 still-live snapshot cut may resolve the key to a present version, including a
 floor version that may have committed long before the retention window began.
 Only after GC proves every such cut observes absence may it prune the directory
-entry, tombstone, and obsolete history. Point lookup and both scan directions
-depend on this enumeration invariant.
+entry, tombstone, and obsolete history. Point lookup and forward `KeyScan`
+traversal depend on this enumeration invariant.
 
 The value cache is keyed by `(logical path, writer)`. A separate latest-value
 alias may accelerate strict reads, but a historical value can never populate or
@@ -453,31 +462,43 @@ This makes collection existence, subcollection enumeration, and data reads share
 one global cut. Physical B-link roots remain routing objects rather than the
 logical source of historical collection existence.
 
-### Point, range, and paginated reads
+### Point reads and transactional key scans
 
-Historical reads in both directions route through the latest physical B-link
-topology and resolve logical versions at the selected epoch. Copy-before-shrink
-splits guarantee that a scan sees either the pre-split source or the post-split
-sibling chain. Terminal leaves are revalidated with `Latest`; interior nodes may
-use the existing self-correcting cache.
+`ReadTransaction::scan_keys` reuses ADR-033's `KeyScan` and `KeyPage` contract:
+forward, keys-only scans over raw bytes; half-open `range`, plus `prefix` and
+`all`; an exclusive `after` bound; and an optional `limit` on one materialized,
+sorted page. `KeyPage::next_after` returns the last key only when a positive
+limit filled, without promising that another key exists. Reverse scans and
+stateful cursors remain out of scope. Callers needing values issue ordinary
+point reads for the returned keys before the transaction ends.
+
+In snapshot mode, every point read and `scan_keys` call resolves logical state
+at the transaction's one fixed epoch. Scans enter the latest physical B-link
+topology at the lower bound and follow the forward right-sibling chain.
+Copy-before-shrink and current-topology revalidation absorb concurrent splits;
+history resolution supplies membership and values at the bound epoch. Snapshot
+scans register no predicate read set, acquire no data locks, and perform no
+commit validation. A collection missing at that epoch returns `NotFound`.
+
+Pagination is repeated `scan_keys` calls inside the same `read_tx` closure,
+passing a page's `next_after()` key back through `KeyScan::after`. The resume key
+is an ordinary exclusive bound, not an opaque or process-local cursor. Every
+such call shares the fixed epoch and deadline. A separate `read_tx` call may
+bind a later cut, just as separate `Collection::scan_keys` calls remain separate
+strict transactions under ADR-033.
+
+Strict fallback invokes the existing `Transaction::scan_keys` operation inside
+one OCC attempt. All pages contribute their accepted logical results and
+effective-frontier predicates to that attempt; validation failure replays the
+whole closure and rebuilds the pages. This preserves ADR-033's lock-free first
+attempt and full-read-set locked retry without introducing a second strict
+scanner. Its scan-plus-write locking rules continue to apply to ordinary
+read-write transactions.
 
 History pointers and any routing needed by a live snapshot cannot be removed.
 Future merge or collection teardown must retain forwarding topology through the
-maximum lifetime.
-
-A page cursor is process-local and belongs to one `ReadTransaction` attempt. It
-binds:
-
-- epoch, original start, and deadline;
-- collection incarnation and original bounds/direction; and
-- an exclusive resume key.
-
-Continuation uses an exclusive bound: `key > resume_key` when moving forward
-and `key < resume_key` in reverse. It never manufactures a successor key,
-selects a new epoch, or extends the deadline. Tokens are not serialized,
-authenticated, transferred, or resumed after process restart. In strict
-fallback, all pages remain in one OCC attempt and their union is validated; a
-replay constructs new cursors.
+maximum lifetime. Expiry discards an in-flight materialized page rather than
+returning a partial result.
 
 ### Retention and GC
 
@@ -498,12 +519,15 @@ change, inability to prove elapsed time restarts that conservative wait. A
 bounded persisted clock may shorten the delay only with its configured
 uncertainty deducted. This can over-retain but cannot reclaim early.
 
-Epoch and lane records provide an ordered GC candidate stream; the current small
-paged walk of transaction objects is not sufficient at the target write rate.
-GC may retain excess history during an outage, but it never deletes promised
-history early. During the operational `disabled` state it retains latest-state
-roots and compact epoch fences; rebuilding a new history floor is required
-before snapshot admission resumes.
+ADR-035's paginated, shuffled walk over deterministic `_t/<ss>/` shards remains
+the completeness mechanism for transaction and pre-admission preparation
+cleanup. Snapshot history adds compact epoch/lane outcomes and history indexes
+as GC roots and candidate sources; it does not replace the backend's opaque
+provider cursor contract. Those backend cursors are unrelated to
+`KeyScan::after`. GC may retain excess history during an outage, but it never
+deletes promised history early. During the operational `disabled` state it
+retains latest-state roots and compact epoch fences; rebuilding a new history
+floor is required before snapshot admission resumes.
 
 ## Mandatory write path and optional single read-write optimization
 
@@ -528,7 +552,7 @@ abort-fencing proofs. It is not a prerequisite for accepting snapshot reads.
 ## Performance acceptance gate
 
 Snapshot capability cannot be opted out, including by applications that never
-call `read_tx`. Consequently ADR-035 through ADR-039 remain **Proposed** until a
+call `read_tx`. Consequently ADR-036 through ADR-040 remain **Proposed** until a
 reviewed benchmark report shows reasonable latency and throughput for the
 mandatory format/protocol across the primary workloads below. An operationally
 `disabled` snapshot state is not an escape hatch: it changes retention and
@@ -543,20 +567,18 @@ For every primary workload cell below, the initial reasonableness budget is p95
 and p99 latency at most `1.25x` baseline and statistically converged throughput
 at least `0.85x` baseline. A favorable aggregate cannot hide a failing primary
 cell. A cell is one predeclared tuple of operation, strict/snapshot mode, key or
-result count, value-size bucket, contention level, client state, and—where
-applicable—scan direction. Each tuple is evaluated separately; the benchmark
+result count, applicable value-size bucket, contention level, client state, and
+scan shape where applicable. Each tuple is evaluated separately; the benchmark
 report fixes the finite matrix before collecting comparison results.
 
 Proposed strict executions are compared with the current strict API. A proposed
 snapshot cell is compared with the current strict read-only execution of the
-same logical operation when one exists. For a new operation with no current
-equivalent—most notably bounded or reverse scans—the baseline is a frozen
-benchmark-only control that traverses the same B-link data and fetches the same
-logical result without epoch, history, or transaction work. That control is not
-a product mode or snapshot opt-out. The same `1.25x` latency and `0.85x`
-throughput budgets apply. These ratios may be revised only while the design is
-**Proposed**, before running the acceptance comparison, with an explicit
-rationale and review.
+same logical operation. In particular, scan baselines use the accepted
+`Transaction::scan_keys` implementation with the identical `KeyScan`; no
+benchmark-only iterator or reverse-scan control is introduced. The same `1.25x`
+latency and `0.85x` throughput budgets apply. These ratios may be revised only
+while the design is **Proposed**, before running the acceptance comparison, with
+an explicit rationale and review.
 
 The four primary workload families are:
 
@@ -566,12 +588,21 @@ The four primary workload families are:
   both strict and snapshot mode;
 - **multi-key read-write:** fixed-size disjoint-key, same-leaf, and
   cross-collection transactions; and
-- **scans:** forward and reverse range reads and pagination in strict and
-  snapshot mode, plus scan-then-write, using fixed result sizes and reporting
-  both transactions and logical keys/bytes per second.
+- **scans:** a bounded forward `KeyScan::range` page, a multi-page walk using
+  `next_after`/`after` inside one transaction, and a scan followed by point reads
+  of the returned values, each in strict and snapshot mode; plus strict
+  scan-then-write. The finite matrix includes small and large results, mid-leaf
+  and cross-leaf bounds, stable membership and create/delete churn, and reports
+  both transactions and logical keys/bytes per second. `prefix` and `all` are
+  conformance cases over the same primitive rather than separate performance
+  families.
 
-Use representative fan-outs and values from 1 KiB through 1 MiB, including hot
-keys and concurrent writers. A throughput sample is valid only after history
+Use representative fan-outs and values from 1 KiB through 1 MiB where the
+operation actually reads or writes values, including hot keys and concurrent
+writers. Keys-only scan cells vary result bytes rather than unrelated value
+payload size. Add baseline scan benchmark wrappers around the accepted
+`KeyScan` API; the rebase introduced the implementation and conformance tests,
+not benchmark coverage. A throughput sample is valid only after history
 certification and write-back queues reach a stationary bound at the offered
 load; queue stability is measurement validity, not a separate performance
 budget.
@@ -653,12 +684,27 @@ plan must cover:
 - serialization-edge tests for point, absence/membership, range, catalog, and
   structure predicates, including delayed older installs and later-epoch
   readers;
-- point, range, pagination, split, and catalog reads checked against an oracle
-  reconstructed from the transactions certified in each sealed epoch;
+- shared strict/snapshot conformance tests for ADR-033's half-open `range`,
+  `prefix`, `all`, exclusive `after`, `limit`, `next_after`, sorted materialized
+  pages, zero limit, invalid bounds, and a collection missing at the selected
+  cut; strict-only tests retain staged create/delete/overwrite behavior;
+- the existing ADR-033 conflict cases under strict fallback: pending committed
+  membership holders, create/delete races, logical-page acceptance across value
+  overwrites and pure splits, the lock-free first read-only attempt followed by
+  full-read-set locked retry, and expanding-frontier scan-plus-write locking;
+- a strict-fallback conflict after the first page and before the second, proving
+  that the whole closure restarts from its first `scan_keys` call and no resume
+  state or page from the failed attempt enters the returned result;
+- point, forward `KeyScan`, pagination, split, and catalog reads checked against
+  an oracle reconstructed from the transactions certified in each sealed epoch;
+- a multi-page walk bound at epoch `E` while create, delete, overwrite, and split
+  operations occur between pages, proving the final keys have no gaps or
+  duplicates and all point-read values match `E`; a separate `read_tx` is
+  explicitly allowed to bind a later cut;
 - create/delete/recreate history, committed holders awaiting write-back,
   malformed predecessor chains, and exact GC floor-version boundaries; after a
-  delete and pruning at each boundary, point lookup plus forward and reverse
-  scans must agree on whether the historical key exists;
+  delete and pruning at each boundary, point lookup plus forward `KeyScan`
+  predicates must agree on whether the historical key exists;
 - expiry around every storage await and while the user closure future is
   pending, including simulated process suspension, with late results discarded
   and page failure remaining atomic;
@@ -679,19 +725,19 @@ freshness.
 
 ## Constituent ADRs
 
-- **[ADR-035](../adr/035-bounded-staleness-snapshot-transactions.md) —
+- **[ADR-036](../adr/036-bounded-staleness-snapshot-transactions.md) —
   Bounded-staleness snapshot transactions.** *Proposed.* Defines the public
   read-only contract, fallback, fixed cut/deadline, and persisted policy.
-- **[ADR-036](../adr/036-cooperative-sealed-epochs.md) — Cooperative sealed
+- **[ADR-037](../adr/037-cooperative-sealed-epochs.md) — Cooperative sealed
   epochs.** *Proposed.* Defines the global frontier, sparse admission lanes,
   intention-first writers, cooperative sealing, and fail-closed liveness.
-- **[ADR-037](../adr/037-epoch-versioned-key-history.md) — Epoch-versioned key
+- **[ADR-038](../adr/038-epoch-versioned-key-history.md) — Epoch-versioned key
   history.** *Proposed.* Defines independently reclaimable values and indexed
   per-key history.
-- **[ADR-038](../adr/038-snapshot-history-retention.md) — Snapshot history
+- **[ADR-039](../adr/039-snapshot-history-retention.md) — Snapshot history
   retention.** *Proposed.* Defines pin-free retention, floor versions,
   supersession-based GC, and the admission disable switch.
-- **[ADR-039](../adr/039-epoch-versioned-collection-catalog.md) —
+- **[ADR-040](../adr/040-epoch-versioned-collection-catalog.md) —
   Epoch-versioned collection catalog.** *Proposed.* Makes collection existence
   and parent-child membership part of the same global cut as data.
 
@@ -720,22 +766,25 @@ freshness.
 This design extends the object-storage-native transaction protocol and the
 dynamic range-sharding B-link topology. On acceptance:
 
-- ADR-036 inserts epoch admission into ADR-020's commit sequence.
-- ADR-037 supersedes ADR-019's unified value placement and adds retained per-key
+- ADR-037 inserts epoch admission into ADR-020's commit sequence.
+- ADR-038 supersedes ADR-019's unified value placement and adds retained per-key
   history to the current-writer model.
-- ADR-038 supersedes ADR-022's current-reference-only liveness for committed
+- ADR-039 supersedes ADR-022's current-reference-only liveness for committed
   values and its cleanup of outcome evidence needed as an epoch fence, while
-  retaining its pending-lock recovery machinery.
-- ADR-039 supersedes ADR-016, ADR-018, and ADR-031 where they make the physical
+  retaining its pending-lock recovery machinery and ADR-035's paginated,
+  sharded discovery of transaction and pre-admission preparation garbage.
+- ADR-040 supersedes ADR-016, ADR-018, and ADR-031 where they make the physical
   `_i` root authoritative for collection existence and parent-child membership,
   plus ADR-022's unconditional deletion of reusable root paths.
 - ADR-031/032's copy-before-shrink topology remains the physical routing proof;
   history retention adds the no-premature-teardown constraint.
-- ADR-035 supersedes ADR-033's page-per-transaction and stateless-pagination
-  choices for `ReadTransaction`: snapshot pages share one cut, while strict
-  fallback pages share and validate one retryable OCC attempt. Both directions
-  are supported.
+- ADR-036 extends rather than supersedes ADR-033: `ReadTransaction` uses the same
+  forward `KeyScan`/`KeyPage` surface. Calls inside one snapshot execution share
+  a fixed cut, strict fallback calls share one retryable OCC attempt, and
+  separate `Collection::scan_keys` calls retain ADR-033's current behavior.
+- ADR-035's opaque backend-list cursor is independent of key-based
+  `KeyScan::after`; neither carries a snapshot between `read_tx` calls.
 
-On acceptance, ADR-036 partially supersedes ADR-027 by replacing its current
+On acceptance, ADR-037 partially supersedes ADR-027 by replacing its current
 parallel first-intent path with the intention-first baseline. A future certified
 fast-path ADR may optimize that baseline without changing snapshot semantics.

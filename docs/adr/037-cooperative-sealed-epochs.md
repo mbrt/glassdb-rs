@@ -1,4 +1,4 @@
-# ADR-036: Cooperative sealed epochs
+# ADR-037: Cooperative sealed epochs
 
 ## Status
 
@@ -48,6 +48,11 @@ every sealed epoch a downward-closed prefix of the strict-serializable order.
 Every epoch-bearing transaction must lock and revalidate all point,
 absence/membership, range, catalog, and structure predicates on which its writes
 depend; an optimization that loses one of those edges cannot use this proof.
+Concretely, ADR-033 requires any transaction containing both a scan and a write
+to take structure-read and membership-read locks through every scan's effective
+frontier and revalidate. If a limited frontier moves outward, the transaction
+retains its locks and extends the range to a fixpoint before preparation and
+epoch admission.
 
 Implement admission with sparse per-client lanes. One logical `Database` client
 and its clones may physically batch independent admissions into one lane CAS

@@ -13,7 +13,7 @@ It builds on the object-storage-native layout of
 [`object-storage-native.md`](object-storage-native.md): for this redesign, the
 shard *entry* model, transaction objects, commit/write-back, wound-wait/leases,
 GC, and the shard-mutation coordinator all carry over. Only the **key→shard
-mapping** and the **directory structure** change. Proposed snapshot ADRs 037–039
+mapping** and the **directory structure** change. Proposed snapshot ADRs 038–040
 would later revise value placement, retention, and catalog authority without
 replacing the B-link topology.
 
@@ -43,7 +43,7 @@ CAS. Leaves are the shards; interior nodes are the range index.
     node — a leaf while the collection is small, an index node once it grows —
     and under ADR-031 also carries collection metadata (existence +
     subcollection list). Proposed
-    [ADR-039](../adr/039-epoch-versioned-collection-catalog.md) moves logical
+    [ADR-040](../adr/040-epoch-versioned-collection-catalog.md) moves logical
     authority for that metadata to a versioned catalog while retaining `_i` as
     the routing root.
     There is no separate anchor: the root keeps a fixed address, so height grows
@@ -56,7 +56,7 @@ CAS. Leaves are the shards; interior nodes are the range index.
     tombstone) sorted by key; also a **high-key** and **right-sibling** link. The
     CAS unit for its keys.
   - _Transaction object_ (`_t/<ss>/<txid>`): unchanged by range sharding (status +
-    values + lease); proposed ADR-037 later splits values into per-key payloads.
+    values + lease); proposed ADR-038 later splits values into per-key payloads.
   - _Structural record_ (`{db}/_s/<record-id>`): a short-lived split
     write-ahead note, recovered independently from transaction logs
     ([ADR-034](../adr/034-separate-structural-log-namespace.md)).
@@ -213,7 +213,7 @@ Notes:
 - Only leaves hold key entries (lock/MVCC state); index nodes hold separator keys
   → child pointers. The root is the `_i` object itself — once the tree has grown
   it holds separators (plus ADR-031's collection metadata), not keys. Proposed
-  ADR-039 moves the metadata's logical authority out of this routing object.
+  ADR-040 moves the metadata's logical authority out of this routing object.
 
 ## Constituent ADRs
 
@@ -258,7 +258,7 @@ split-point policy, and node fan-out/sizing.
   and reserve 64 KiB for transient lock metadata. Content growth stops at the
   remaining 960 KiB; an individually unsplittable key and, under ADR-031, an
   overflowing subcollection directory are permanent invalid-input errors.
-  Proposed ADR-039 removes the latter from `_i`. Future tuning may still adjust
+  Proposed ADR-040 removes the latter from `_i`. Future tuning may still adjust
   those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
@@ -271,7 +271,7 @@ split-point policy, and node fan-out/sizing.
   through the latest B-link topology. Its correctness baseline replaces
   ADR-027's parallel first-intent path. A specialized replacement is optional
   and would require its own proof.
-- **Subcollection directory.** ADR-031 keeps it in `_i`; proposed ADR-039 moves
+- **Subcollection directory.** ADR-031 keeps it in `_i`; proposed ADR-040 moves
   logical authority to an epoch-versioned catalog. If that proposal is not
   accepted, unbounded growth and root-rewrite coupling remain open here.
 - **Node fan-out / sizing.** Interior fan-out and leaf soft cap vs tree height,
@@ -286,7 +286,7 @@ shard *entry* model (ADR-017), transaction object (ADR-019), commit/write-back
 (ADR-020), wound-wait/leases (ADR-021), GC (ADR-022), the slimmed backend trait
 (ADR-023), and the shard-mutation coordinator (ADR-028/029), which the split
 plugs into as another coordinator-driven mutation. Proposed snapshot ADRs
-037–039 would subsequently replace value placement, historical liveness, and
+038–040 would subsequently replace value placement, historical liveness, and
 root-local catalog authority while retaining the B-link topology. See the
 [ADR-031 status](../adr/031-dynamic-range-sharding.md#status) for the exact
 clauses.

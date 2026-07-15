@@ -1,4 +1,4 @@
-# ADR-035: Bounded-staleness snapshot transactions
+# ADR-036: Bounded-staleness snapshot transactions
 
 ## Status
 
@@ -23,16 +23,18 @@ lifetime are acceptable.
 ## Decision
 
 Add an explicit snapshot-preferred, read-only `Database::read_tx` API. Its
-closure receives one `ReadTransaction` facade with point, range, pagination,
-collection/subcollection, and cross-collection operations in either execution
-mode.
+closure receives one `ReadTransaction` facade with point reads, ADR-033's
+forward keys-only `KeyScan`/`KeyPage` operations, collection/subcollection
+enumeration, and cross-collection operations in either execution mode. Values
+for scanned keys are ordinary tracked point reads at the same cut.
 
 Each snapshot execution binds the freshest sealed database epoch satisfying the
 call's freshness request before invoking the closure. Reads take no data locks,
 perform no commit validation, and may internally retry only idempotent
 operations against the same fixed epoch and remaining deadline. Writes are not
 available through the facade. Caller-selected historical epochs and portable
-continuation tokens are not supported.
+snapshot-bearing continuation tokens are not supported; `KeyScan::after` is
+only an exclusive raw-key bound and carries no cut or deadline.
 
 Acquisition obtains or reuses a same-client freshness certificate, then strongly
 reads the snapshot control record to bind the newest admissible sealed epoch. If
@@ -43,11 +45,11 @@ begin timeout. Exhaustion selects the configured strict fallback or
 
 Snapshot acquisition has its own bounded timeout. By default, failure to acquire
 an admissible epoch falls back before execution to a strict read-only OCC
-implementation of the same facade. Ranges and pages in that mode remain in one
-attempt and contribute to its accumulated predicate read set. A conflict
-replays the complete closure; it never continues a cursor in a different
-attempt. This strict implementation is a prerequisite for shipping transparent
-fallback for every advertised operation.
+implementation of the same facade. Repeated `scan_keys` calls in that mode
+remain in one attempt and contribute to its accumulated predicate read set. A
+conflict replays the complete closure and reconstructs every materialized page.
+This strict implementation is a prerequisite for shipping transparent fallback
+for every advertised operation.
 
 The API accepts `FnMut` and requires side-effect-free transaction bodies in both
 modes; exact-once closure execution is a goal of the snapshot implementation,
@@ -95,8 +97,11 @@ particular execution produces no writes.
   retry-count cap; callers can request a shorter lifetime or require a snapshot.
 - The fixed deadline bounds storage retention and prevents abandoned readers
   from pinning history indefinitely.
+- ADR-033 remains authoritative for scan bounds, ordering, page shape, and strict
+  validation. Calls made inside one snapshot execution additionally share its
+  fixed epoch; separate `Collection::scan_keys` transactions do not.
 - Sealed epochs, historical data, pin-free retention, and a versioned catalog
-  require the separate decisions in ADR-036 through ADR-039.
+  require the separate decisions in ADR-037 through ADR-040.
 - Acceptance requires the living design's
   [performance gate](../designs/snapshot-reads.md#performance-acceptance-gate).
   If the mandatory write-path cost is unreasonable, reject this design rather
