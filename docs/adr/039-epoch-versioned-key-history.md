@@ -1,4 +1,4 @@
-# ADR-038: Epoch-versioned key history
+# ADR-039: Epoch-versioned key history
 
 ## Status
 

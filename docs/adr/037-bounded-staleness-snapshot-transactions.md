@@ -1,4 +1,4 @@
-# ADR-036: Bounded-staleness snapshot transactions
+# ADR-037: Bounded-staleness snapshot transactions
 
 ## Status
 
@@ -101,7 +101,7 @@ particular execution produces no writes.
   validation. Calls made inside one snapshot execution additionally share its
   fixed epoch; separate `Collection::scan_keys` transactions do not.
 - Sealed epochs, historical data, pin-free retention, and a versioned catalog
-  require the separate decisions in ADR-037 through ADR-040.
+  require the separate decisions in ADR-038 through ADR-041.
 - Acceptance requires the living design's
   [performance gate](../designs/snapshot-reads.md#performance-acceptance-gate).
   If the mandatory write-path cost is unreasonable, reject this design rather

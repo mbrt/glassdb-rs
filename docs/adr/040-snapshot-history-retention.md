@@ -1,4 +1,4 @@
-# ADR-039: Snapshot history retention
+# ADR-040: Snapshot history retention
 
 ## Status
 
@@ -10,7 +10,7 @@ Constituent decision of the
 On acceptance, this supersedes ADR-022's current-reference-only liveness rule
 for committed values and its deletion of outcome evidence needed to fence
 delayed epoch-protocol artifacts. Pending-lock reclamation remains, extended by
-ADR-037's final-phase grace for admitted writers.
+ADR-038's final-phase grace for admitted writers.
 
 ## Context
 

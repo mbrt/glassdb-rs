@@ -1,4 +1,4 @@
-# ADR-040: Epoch-versioned collection catalog
+# ADR-041: Epoch-versioned collection catalog
 
 ## Status
 

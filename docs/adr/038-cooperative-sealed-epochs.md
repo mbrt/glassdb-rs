@@ -1,4 +1,4 @@
-# ADR-037: Cooperative sealed epochs
+# ADR-038: Cooperative sealed epochs
 
 ## Status
 

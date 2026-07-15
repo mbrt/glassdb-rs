@@ -4,7 +4,7 @@
 
 **Proposed.** This design adds long-lived, internally consistent, read-only
 transactions over a fixed historical database cut. The umbrella API decision is
-[ADR-036](../adr/036-bounded-staleness-snapshot-transactions.md); sealed cuts,
+[ADR-037](../adr/037-bounded-staleness-snapshot-transactions.md); sealed cuts,
 historical data, retention, and the collection catalog are split into the
 focused ADRs indexed below.
 
@@ -216,7 +216,7 @@ is no strict-only capability or creation-time opt-out.
 | Maximum read lifetime | 1 hour | Supports cold object-store scans and analytics |
 | Maximum duration-clock uncertainty | 30 seconds | Total worst-case reader-under-count versus GC-over-count across the full horizon; clocks include suspension |
 | Final-phase writer grace | 15 seconds | Time before a stalled admitted writer is resolved or aborted |
-| Minimum history retention | 70 minutes | Derived safety floor; see ADR-039 |
+| Minimum history retention | 70 minutes | Derived safety floor; see ADR-040 |
 
 The 90-second value is a hard admission boundary, not normal lag: under healthy
 operation snapshots should usually trail by no more than the roughly five-second
@@ -303,7 +303,7 @@ Writers use the correctness-first sequence:
 6. publish a terminal commit certificate that names that manifest; and
 7. certify per-key history and release locks asynchronously.
 
-This overview counts execution of the user body. ADR-037's six protocol steps
+This overview counts execution of the user body. ADR-038's six protocol steps
 begin with lock acquisition after that body has produced its candidate read and
 write sets.
 
@@ -552,7 +552,7 @@ abort-fencing proofs. It is not a prerequisite for accepting snapshot reads.
 ## Performance acceptance gate
 
 Snapshot capability cannot be opted out, including by applications that never
-call `read_tx`. Consequently ADR-036 through ADR-040 remain **Proposed** until a
+call `read_tx`. Consequently ADR-037 through ADR-041 remain **Proposed** until a
 reviewed benchmark report shows reasonable latency and throughput for the
 mandatory format/protocol across the primary workloads below. An operationally
 `disabled` snapshot state is not an escape hatch: it changes retention and
@@ -725,19 +725,19 @@ freshness.
 
 ## Constituent ADRs
 
-- **[ADR-036](../adr/036-bounded-staleness-snapshot-transactions.md) —
+- **[ADR-037](../adr/037-bounded-staleness-snapshot-transactions.md) —
   Bounded-staleness snapshot transactions.** *Proposed.* Defines the public
   read-only contract, fallback, fixed cut/deadline, and persisted policy.
-- **[ADR-037](../adr/037-cooperative-sealed-epochs.md) — Cooperative sealed
+- **[ADR-038](../adr/038-cooperative-sealed-epochs.md) — Cooperative sealed
   epochs.** *Proposed.* Defines the global frontier, sparse admission lanes,
   intention-first writers, cooperative sealing, and fail-closed liveness.
-- **[ADR-038](../adr/038-epoch-versioned-key-history.md) — Epoch-versioned key
+- **[ADR-039](../adr/039-epoch-versioned-key-history.md) — Epoch-versioned key
   history.** *Proposed.* Defines independently reclaimable values and indexed
   per-key history.
-- **[ADR-039](../adr/039-snapshot-history-retention.md) — Snapshot history
+- **[ADR-040](../adr/040-snapshot-history-retention.md) — Snapshot history
   retention.** *Proposed.* Defines pin-free retention, floor versions,
   supersession-based GC, and the admission disable switch.
-- **[ADR-040](../adr/040-epoch-versioned-collection-catalog.md) —
+- **[ADR-041](../adr/041-epoch-versioned-collection-catalog.md) —
   Epoch-versioned collection catalog.** *Proposed.* Makes collection existence
   and parent-child membership part of the same global cut as data.
 
@@ -766,25 +766,25 @@ freshness.
 This design extends the object-storage-native transaction protocol and the
 dynamic range-sharding B-link topology. On acceptance:
 
-- ADR-037 inserts epoch admission into ADR-020's commit sequence.
-- ADR-038 supersedes ADR-019's unified value placement and adds retained per-key
+- ADR-038 inserts epoch admission into ADR-020's commit sequence.
+- ADR-039 supersedes ADR-019's unified value placement and adds retained per-key
   history to the current-writer model.
-- ADR-039 supersedes ADR-022's current-reference-only liveness for committed
+- ADR-040 supersedes ADR-022's current-reference-only liveness for committed
   values and its cleanup of outcome evidence needed as an epoch fence, while
   retaining its pending-lock recovery machinery and ADR-035's paginated,
   sharded discovery of transaction and pre-admission preparation garbage.
-- ADR-040 supersedes ADR-016, ADR-018, and ADR-031 where they make the physical
+- ADR-041 supersedes ADR-016, ADR-018, and ADR-031 where they make the physical
   `_i` root authoritative for collection existence and parent-child membership,
   plus ADR-022's unconditional deletion of reusable root paths.
 - ADR-031/032's copy-before-shrink topology remains the physical routing proof;
   history retention adds the no-premature-teardown constraint.
-- ADR-036 extends rather than supersedes ADR-033: `ReadTransaction` uses the same
+- ADR-037 extends rather than supersedes ADR-033: `ReadTransaction` uses the same
   forward `KeyScan`/`KeyPage` surface. Calls inside one snapshot execution share
   a fixed cut, strict fallback calls share one retryable OCC attempt, and
   separate `Collection::scan_keys` calls retain ADR-033's current behavior.
 - ADR-035's opaque backend-list cursor is independent of key-based
   `KeyScan::after`; neither carries a snapshot between `read_tx` calls.
 
-On acceptance, ADR-037 partially supersedes ADR-027 by replacing its current
+On acceptance, ADR-038 partially supersedes ADR-027 by replacing its current
 parallel first-intent path with the intention-first baseline. A future certified
 fast-path ADR may optimize that baseline without changing snapshot semantics.

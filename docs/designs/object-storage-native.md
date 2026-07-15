@@ -518,7 +518,7 @@ rather than a follow-on version:
   per-prefix PUT rate limit is an accepted, documented limit or whether shard
   paths should be spread to mitigate it.
 - **Root creation and catalog visibility.** Proposed
-  [ADR-040](../adr/040-epoch-versioned-collection-catalog.md) precreates a
+  [ADR-041](../adr/041-epoch-versioned-collection-catalog.md) precreates a
   physical root bound to an incarnation, then atomically publishes collection
   existence and parent membership; an aborted reusable root is CAS-compacted to
   a tombstone rather than unconditionally deleted.
