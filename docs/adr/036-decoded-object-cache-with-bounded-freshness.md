@@ -218,6 +218,35 @@ Two consequences for the API surface:
   miss is not worthwhile, and manufacturing a `now()` bound to force that read
   is the same anti-pattern.
 
+### The shared batch load of a deduplicating coordinator is not a seed read
+
+The seed-read rule above governs a **single caller** that reads then CASes on
+its own. It does not govern the **shared load of a deduplicating CAS coordinator**
+(the shard/leaf mutation coordinator, ADR-025/028), which is a distinct case and
+the one exception where the load deliberately requires `AtLeast(now())`.
+
+That coordinator collapses N contending transactions on one object into a single
+owner-driven load + fold + CAS. The interval in which co-scheduled contenders
+join the round — the merge window — **is** the driver's shared load: a contender
+that arrives while the driver is loading folds into the same CAS; one that
+arrives after the load completes starts a fresh round. So the load's duration is
+the batching primitive, and a cache-served (`Any`) load on a warm object is
+instantaneous, collapsing the window to zero and defeating the N->1 batching the
+coordinator exists for.
+
+The driver therefore captures **one** `ValidationTime` per round as a coordination
+barrier and loads with `AtLeast(now())`. This is not the per-read anti-pattern:
+it is a single read **amortized across every member of the batch** (the N->1
+primitive itself), and it doubles as the fold's current-state input. Under
+contention `1 read + 1 CAS` beats `N cache-hits + N CASes`. This is the only
+place a coordinator load takes a fresh bound; every other coordination read that
+merely seeds its own CAS still uses `Any`.
+
+One caller opts out: the single read-write commit-install fast path submits `Any`,
+because it just read the leaf for its eligibility check and expects to be solo or
+to merge into an acquire's already-open windowed round — so it reuses its warm
+cache without a revalidation round-trip (ADR-030).
+
 ### Locked dependencies validate at the lock's landing, not the leaf's version
 
 A held lock pins a key's logical value independently of its physical leaf. Other

@@ -9,9 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{
-    Directory, ObjectCache, ShardStore, SharedCache, SplitPolicy, TLogger, ValueCache,
-};
+use glassdb_storage::{Directory, ObjectCache, ShardStore, SharedCache, SplitPolicy, TLogger};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, Splitter, TransError};
 use tokio::sync::Notify;
 
@@ -108,10 +106,9 @@ impl DatabaseBuilder {
 
         let backend = Arc::new(StatsBackend::new(b));
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        // One shared LRU sized by `cache_size` backs both cache facades: the
-        // writer-keyed value cache and the backend-version-keyed object cache.
+        // One decoded, path-keyed object cache sized by `cache_size` backs all
+        // coordination reads and key-value derivation (ADR-036).
         let cache = SharedCache::new(cache_size);
-        let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(dyn_backend, &cache);
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
@@ -126,13 +123,7 @@ impl DatabaseBuilder {
         // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::with_config(
-            values.clone(),
-            tl.clone(),
-            bg_weak.clone(),
-            clock.clone(),
-            retry,
-        );
+        let tmon = Monitor::with_config(tl.clone(), bg_weak.clone(), clock.clone(), retry);
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         // Build the coordinator and splitter as a co-wired pair over one shared
@@ -159,7 +150,6 @@ impl DatabaseBuilder {
         gc.start();
         splitter.start();
         let algo = Algo::new(
-            values.clone(),
             locker.clone(),
             coord.clone(),
             tmon.clone(),
@@ -174,7 +164,6 @@ impl DatabaseBuilder {
             name,
             backend,
             shards,
-            values,
             tmon,
             algo,
             coord,
@@ -206,7 +195,6 @@ pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) backend: Arc<StatsBackend>,
     pub(crate) shards: ShardStore,
-    pub(crate) values: ValueCache,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
     pub(crate) coord: ShardCoordinator,
@@ -416,12 +404,7 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let tx = Transaction::new(
-            self.shards.clone(),
-            self.values.clone(),
-            self.tmon.clone(),
-            self.retry,
-        );
+        let tx = Transaction::new(self.shards.clone(), self.tmon.clone(), self.retry);
         let mut handle = None;
         // RAII safety net: if this future is dropped between `algo.begin` and
         // `algo.end` (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),

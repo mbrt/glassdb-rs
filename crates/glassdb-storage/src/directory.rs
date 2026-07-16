@@ -19,9 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use glassdb_backend as backend;
 use glassdb_data::paths;
 
+use crate::cached_store::{Requirement, ValidationTime};
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
-use crate::object_cache::Freshness;
 use crate::shard::Shard;
 use crate::shardstore::ShardStore;
 
@@ -75,6 +75,12 @@ impl Directory {
         Directory { shards }
     }
 
+    /// The current logical time; pass `Requirement::AtLeast(dir.now())` for a
+    /// "latest" (revalidating) descent.
+    pub fn now(&self) -> ValidationTime {
+        self.shards.now()
+    }
+
     /// Resolves the leaf that owns `key`, descending from the root `_i` and
     /// following right-sibling links to self-correct past in-progress splits.
     ///
@@ -85,7 +91,7 @@ impl Directory {
         &self,
         prefix: &str,
         key: &[u8],
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<LeafLocator, StorageError> {
         let cur = match self.shards.load_root_node(prefix, freshness).await? {
             Some((node, version)) => Located {
@@ -113,7 +119,7 @@ impl Directory {
         &self,
         prefix: &str,
         key: &[u8],
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
         let Some((node, version)) = self.shards.load_root_node(prefix, freshness).await? else {
             return Ok(None);
@@ -135,7 +141,7 @@ impl Directory {
         &self,
         prefix: &str,
         leaf: &LeafLocator,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
         let Some(token) = leaf.node.right_sibling() else {
             return Ok(None);
@@ -154,7 +160,7 @@ impl Directory {
         prefix: &str,
         start: &[u8],
         end: Option<&[u8]>,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Vec<LeafLocator>, StorageError> {
         let Some(mut leaf) = self.first_leaf_at(prefix, start, freshness).await? else {
             return Err(StorageError::NotFound);
@@ -187,8 +193,8 @@ impl Directory {
         &self,
         prefix: &str,
         key: &[u8],
-        interior: Freshness,
-        leaf: Freshness,
+        interior: Requirement,
+        leaf: Requirement,
     ) -> Result<LeafLocator, StorageError> {
         let loc = self.leaf_for(prefix, key, interior).await?;
         // Same freshness, or an uncreated root leaf (nothing to revalidate).
@@ -212,7 +218,7 @@ impl Directory {
     pub async fn leftmost_leaf(
         &self,
         prefix: &str,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
         let Some((node, version)) = self.shards.load_root_node(prefix, freshness).await? else {
             return Ok(None);
@@ -251,7 +257,7 @@ impl Directory {
     pub async fn leaves(
         &self,
         prefix: &str,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Vec<LeafLocator>, StorageError> {
         let Some(first) = self.leftmost_leaf(prefix, freshness).await? else {
             return Ok(Vec::new());
@@ -283,7 +289,7 @@ impl Directory {
     pub async fn group_keys_by_leaf<P: AsRef<str>, T>(
         &self,
         items: impl IntoIterator<Item = (P, T)>,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Vec<LeafGroup<T>>, StorageError> {
         self.group_keys_by_leaf_fresh(items, freshness, freshness)
             .await
@@ -298,8 +304,8 @@ impl Directory {
     pub async fn group_keys_by_leaf_fresh<P: AsRef<str>, T>(
         &self,
         items: impl IntoIterator<Item = (P, T)>,
-        interior: Freshness,
-        leaf: Freshness,
+        interior: Requirement,
+        leaf: Requirement,
     ) -> Result<Vec<LeafGroup<T>>, StorageError> {
         let mut groups: BTreeMap<String, LeafGroup<T>> = BTreeMap::new();
         for (path, payload) in items {
@@ -328,12 +334,13 @@ impl Directory {
     /// its recorded created nodes became reachable. Empty when the collection
     /// does not exist.
     ///
-    /// Reads at [`Freshness::Latest`] so a just-linked sibling is observed. A
-    /// missing child reference is skipped because there is no node to traverse.
+    /// Reads at the caller's `req` (pass `AtLeast(now())`) so a just-linked
+    /// sibling is observed. A missing child reference is skipped because there is
+    /// no node to traverse.
     pub async fn reachable_tokens(
         &self,
         prefix: &str,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<BTreeSet<String>, StorageError> {
         let mut reachable: BTreeSet<String> = BTreeSet::new();
         let Some((root, _)) = self.shards.load_root_node(prefix, freshness).await? else {
@@ -367,7 +374,7 @@ impl Directory {
         &self,
         prefix: &str,
         key: &[u8],
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
         let Some((node, version)) = self.shards.load_root_node(prefix, freshness).await? else {
             return Ok(None);
@@ -406,7 +413,7 @@ impl Directory {
         prefix: &str,
         mut cur: Located,
         key: &[u8],
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Located, StorageError> {
         loop {
             cur = self
@@ -433,7 +440,7 @@ impl Directory {
         prefix: &str,
         mut cur: Located,
         key: &[u8],
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Located, StorageError> {
         while !cur.node.owns(key) {
             match cur.node.right_sibling() {
@@ -451,7 +458,7 @@ impl Directory {
         &self,
         prefix: &str,
         token: &str,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Located, StorageError> {
         let (node, version) = self.shards.load_node(prefix, token, freshness).await?;
         Ok(Located {
@@ -468,7 +475,7 @@ impl Directory {
         &self,
         prefix: &str,
         path: &str,
-        freshness: Freshness,
+        freshness: Requirement,
     ) -> Result<Located, StorageError> {
         if paths::is_collection_info(path) {
             let (node, version) = self
@@ -577,7 +584,7 @@ mod tests {
 
         let dir = Directory::new(s);
         let loc = dir
-            .leaf_for(COLL, b"only", Freshness::Latest)
+            .leaf_for(COLL, b"only", Requirement::AtLeast(dir.now()))
             .await
             .unwrap();
         assert_eq!(loc.path, paths::collection_info(COLL));
@@ -588,13 +595,16 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_routes_to_uncreated_root_leaf() {
         let dir = Directory::new(store());
-        let loc = dir.leaf_for(COLL, b"k", Freshness::Latest).await.unwrap();
+        let loc = dir
+            .leaf_for(COLL, b"k", Requirement::AtLeast(dir.now()))
+            .await
+            .unwrap();
         assert_eq!(loc.path, paths::collection_info(COLL));
         assert!(loc.version.is_none(), "root leaf is not created yet");
         assert!(loc.node.as_leaf().unwrap().is_empty());
         // Listing an absent collection yields no leaves.
         assert!(
-            dir.leaves(COLL, Freshness::Latest)
+            dir.leaves(COLL, Requirement::AtLeast(dir.now()))
                 .await
                 .unwrap()
                 .is_empty()
@@ -614,7 +624,10 @@ mod tests {
             (b"pear", "_n/L1"),
             (b"zebra", "_n/L1"),
         ] {
-            let loc = dir.leaf_for(COLL, key, Freshness::Latest).await.unwrap();
+            let loc = dir
+                .leaf_for(COLL, key, Requirement::AtLeast(dir.now()))
+                .await
+                .unwrap();
             assert!(
                 loc.path.ends_with(want_leaf),
                 "key {key:?} resolved to {}, want …{want_leaf}",
@@ -649,7 +662,7 @@ mod tests {
 
         let dir = Directory::new(s);
         let loc = dir
-            .leaf_for(COLL, b"pear", Freshness::Latest)
+            .leaf_for(COLL, b"pear", Requirement::AtLeast(dir.now()))
             .await
             .unwrap();
         assert!(
@@ -665,11 +678,17 @@ mod tests {
         seed_two_level(&s).await;
         let dir = Directory::new(s);
 
-        let leaves = dir.leaves(COLL, Freshness::Latest).await.unwrap();
+        let leaves = dir
+            .leaves(COLL, Requirement::AtLeast(dir.now()))
+            .await
+            .unwrap();
         let paths: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["db/coll/_n/L0", "db/coll/_n/L1"]);
 
-        let leftmost = dir.leftmost_leaf(COLL, Freshness::Latest).await.unwrap();
+        let leftmost = dir
+            .leftmost_leaf(COLL, Requirement::AtLeast(dir.now()))
+            .await
+            .unwrap();
         assert!(leftmost.unwrap().path.ends_with("_n/L0"));
     }
 
@@ -686,14 +705,24 @@ mod tests {
         let dir = Directory::new(s);
 
         // Warm the cache with a first descent, then measure only the steady state.
-        dir.leaf_for_fresh(COLL, b"apple", Freshness::AllowStale, Freshness::Latest)
-            .await
-            .unwrap();
+        dir.leaf_for_fresh(
+            COLL,
+            b"apple",
+            Requirement::Any,
+            Requirement::AtLeast(dir.now()),
+        )
+        .await
+        .unwrap();
         log.lock().unwrap().clear();
 
         for _ in 0..3 {
             let loc = dir
-                .leaf_for_fresh(COLL, b"apple", Freshness::AllowStale, Freshness::Latest)
+                .leaf_for_fresh(
+                    COLL,
+                    b"apple",
+                    Requirement::Any,
+                    Requirement::AtLeast(dir.now()),
+                )
                 .await
                 .unwrap();
             assert!(loc.path.ends_with("_n/L0"));
@@ -743,7 +772,7 @@ mod tests {
         // Process A warms its cache with the root-as-leaf (stale freshness).
         let dir_a = Directory::new(s_a.clone());
         let warm = dir_a
-            .leaf_for_fresh(COLL, b"a", Freshness::AllowStale, Freshness::AllowStale)
+            .leaf_for_fresh(COLL, b"a", Requirement::Any, Requirement::Any)
             .await
             .unwrap();
         assert!(warm.node.as_leaf().is_some(), "warm read sees a leaf");
@@ -766,7 +795,12 @@ mod tests {
         // Process A, still holding the stale root-as-leaf, resolves `a` with a
         // `Latest` leaf: it must descend into the fresh index and return leaf L.
         let loc = dir_a
-            .leaf_for_fresh(COLL, b"a", Freshness::AllowStale, Freshness::Latest)
+            .leaf_for_fresh(
+                COLL,
+                b"a",
+                Requirement::Any,
+                Requirement::AtLeast(dir_a.now()),
+            )
             .await
             .unwrap();
         let shard = loc
@@ -788,7 +822,7 @@ mod tests {
 
         // The parent of any key's leaf is the root index `_i`.
         let parent = dir
-            .parent_index_for(COLL, b"mango", Freshness::Latest)
+            .parent_index_for(COLL, b"mango", Requirement::AtLeast(dir.now()))
             .await
             .unwrap()
             .expect("a two-level tree has an index parent");
@@ -802,7 +836,7 @@ mod tests {
         single.create_root(COLL, &root).await.unwrap();
         assert!(
             Directory::new(single)
-                .parent_index_for(COLL, b"only", Freshness::Latest)
+                .parent_index_for(COLL, b"only", Requirement::AtLeast(dir.now()))
                 .await
                 .unwrap()
                 .is_none()
@@ -822,7 +856,7 @@ mod tests {
                     (paths::from_key(COLL, b"mango"), 'm'),
                     (paths::from_key(COLL, b"apple"), 'a'),
                 ],
-                Freshness::Latest,
+                Requirement::AtLeast(dir.now()),
             )
             .await
             .unwrap();

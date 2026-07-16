@@ -30,8 +30,8 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry, SplitPolicy, StorageError,
-    TxCommitStatus, TxLog, TxWrite, ValueCache, Version,
+    LockScope, LockType, NodeLocks, PathLock, Requirement, ShardEntry, SplitPolicy, StorageError,
+    TxCommitStatus, TxLog, TxWrite, ValidationTime,
 };
 
 use crate::error::TransError;
@@ -80,15 +80,6 @@ pub struct ReadAccess {
 #[derive(Debug, Clone, Default)]
 pub struct ReadVersion {
     pub last_writer: TxId,
-}
-
-impl ReadVersion {
-    /// Converts to a storage version (the writer that last committed the value).
-    pub(crate) fn to_storage_version(&self) -> Version {
-        Version {
-            writer: self.last_writer.clone(),
-        }
-    }
 }
 
 /// A single key write within a transaction.
@@ -333,9 +324,19 @@ impl ShardResolver for CommitInstallResolver {
         if staged_locks.structure().lock_type() == LockType::Write
             && !staged_locks.structure().contains(&self.id)
         {
-            return Ok(Step::Skip {
-                outcome: FoldOutcome::Moved,
-            });
+            // A concurrent structure write bars us. If a prior CAS this round was
+            // in-doubt our lock may have landed durably (sticky in-doubt), so we
+            // cannot downgrade to a definitive `Moved` — surface the ambiguity.
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            let outcome = if in_doubt {
+                FoldOutcome::InDoubt(format!(
+                    "single-rw lock for {} in-doubt: structure write barred us after uncertain CAS",
+                    self.id
+                ))
+            } else {
+                FoldOutcome::Moved
+            };
+            return Ok(Step::Skip { outcome });
         }
 
         // Re-resolve the effective writer / eligibility against the current
@@ -344,7 +345,7 @@ impl ShardResolver for CommitInstallResolver {
         let res = match cur {
             Some(e) => {
                 ctx.resolver
-                    .resolve_holders(&self.key_path, e, None)
+                    .resolve_holders(&self.key_path, e, None, Requirement::Any)
                     .await?
             }
             None => HolderResolution::default(),
@@ -395,7 +396,17 @@ impl ShardResolver for CommitInstallResolver {
         false
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        // A prior CAS this round came back in-doubt: our staged lock (the
+        // commit point) may have landed durably, so we cannot renew — that
+        // would abandon-and-rerun a committed object a peer may already read
+        // (ADR-027). Surface the ambiguity instead (sticky in-doubt).
+        if in_doubt {
+            return FoldOutcome::InDoubt(format!(
+                "single-rw lock for {} in-doubt: round abandoned after uncertain CAS",
+                self.id
+            ));
+        }
         // Pure version churn exhausted the budget: renew and re-run (the commit
         // point is a single CAS, so this absorbs contention, not conflict).
         FoldOutcome::Moved
@@ -442,7 +453,6 @@ fn eligible_writer(res: &HolderResolution, read_version: Option<&TxId>) -> Optio
 /// Coordinates transactions: read validation, locking, commit, and write-back.
 #[derive(Clone)]
 pub struct Algo {
-    values: ValueCache,
     resolver: Resolver,
     locker: Locker,
     // The single shard-mutation coordinator (ADR-028), shared with the locker:
@@ -464,7 +474,6 @@ impl Algo {
     /// priorities and lease timing share one time base.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        values: ValueCache,
         locker: Locker,
         coord: ShardCoordinator,
         mon: Monitor,
@@ -475,7 +484,6 @@ impl Algo {
         split_policy: SplitPolicy,
     ) -> Self {
         Algo {
-            values,
             resolver,
             locker,
             coord,
@@ -557,14 +565,16 @@ impl Algo {
         if tx.should_lock_reads() {
             return self.validate_locked_reads(tx).await;
         }
+        // A read-only transaction has no locks, so the bound is simply the start
+        // of validation.
+        let bound = self.resolver.now();
         if self
-            .validate(&tx.data, ValidationContext::Optimistic)
+            .validate(&tx.data, bound, ValidationContext::Optimistic)
             .await?
         {
             return Ok(());
         }
         tx.lock_reads_on_retry = true;
-        self.invalidate_reads(&tx.data);
         Err(TransError::Retry)
     }
 
@@ -626,21 +636,21 @@ impl Algo {
     /// failed validation makes the next attempt use the locked path.
     ///
     /// A failed validation does not back off before signalling [`Retry`]: the
-    /// re-run re-reads the authoritative values (the cache was just invalidated)
-    /// rather than busy-spinning on the stale ones, and an idle delay would only
-    /// add commit latency.
+    /// validation just revalidated (and so refreshed the cached copy of) every
+    /// touched shard, so the re-run reads the authoritative state rather than
+    /// busy-spinning on stale data, and an idle delay would only add latency.
     ///
     /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
+        let bound = self.resolver.now();
         if self
-            .validate(&tx.data, ValidationContext::Optimistic)
+            .validate(&tx.data, bound, ValidationContext::Optimistic)
             .await?
         {
             tx.status = Status::Committed;
             return Ok(());
         }
         tx.lock_reads_on_retry = true;
-        self.invalidate_reads(&tx.data);
         Err(TransError::Retry)
     }
 
@@ -652,6 +662,11 @@ impl Algo {
             tx.engaged = true;
         }
 
+        // Capture the validation bound *before* acquiring locks, so every lock's
+        // landing CAS advances its key's evidence past the bound. Validation of a
+        // locked key then reuses that evidence — no backend read — even if the
+        // physical leaf changed for an unrelated key (ADR-036).
+        let bound = self.resolver.now();
         let locked = match self.acquire_locks(tx).await? {
             Acquired::Locked(l) => l,
             // A higher-priority peer aborted us: renew the id and re-run.
@@ -671,7 +686,7 @@ impl Algo {
         // held. A stale dependency re-runs the body under the same id while the
         // acquired locks prevent another change in the validation-to-commit gap.
         if !self
-            .validate(&tx.data, ValidationContext::LocksHeldBy(&tx.id))
+            .validate(&tx.data, bound, ValidationContext::LocksHeldBy(&tx.id))
             .await?
         {
             return self.revalidate(tx).await;
@@ -702,13 +717,15 @@ impl Algo {
             tx.status = Status::Validating;
             tx.engaged = true;
         }
+        // See `commit_locked`: capture the bound before locks land.
+        let bound = self.resolver.now();
         let locked = match self.acquire_locks(tx).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return self.restart(tx).await,
         };
         self.mon.record_tx_locks(&tx.id, locked.locked_paths());
         if self
-            .validate(&tx.data, ValidationContext::LocksHeldBy(&tx.id))
+            .validate(&tx.data, bound, ValidationContext::LocksHeldBy(&tx.id))
             .await?
         {
             return Ok(());
@@ -769,7 +786,7 @@ impl Algo {
             }
         }
 
-        let (prefix, raw_key) = paths::split_key(&key_path)
+        let (_prefix, raw_key) = paths::split_key(&key_path)
             .map_err(|e| TransError::with_source("parsing single-rw key path", e))?;
 
         // Check dynamic eligibility before writing anything, so a create /
@@ -792,7 +809,7 @@ impl Algo {
         // (`Wounded`).
         let (holders, locator) = self
             .resolver
-            .resolve_key(&key_path, Freshness::AllowStale)
+            .resolve_key(&key_path, Requirement::Any)
             .await?;
         let Some(effective) = eligible_writer(&holders, read_version.as_ref()) else {
             return Ok(None);
@@ -805,10 +822,9 @@ impl Algo {
         // Build the committed transaction object. It records the write (and the
         // pointer it will supersede, for GC's reverse check) plus the write lock
         // it holds, so a dead-but-committed object still describes its own
-        // back-references (ADR-022). Unlike `commit_tx` this does *not* populate
-        // the value cache: the cache is written only once the commit is
-        // confirmed, so a fast path that ends up wounded or in-doubt never leaves
-        // a stale entry keyed by an uncommitted writer.
+        // back-references (ADR-022). The committed value becomes readable only
+        // once the object is durable, so a fast path that ends up wounded or
+        // in-doubt never exposes an uncommitted value.
         //
         // The recorded predecessor is the resolved effective writer, so it names
         // the true committed value even when the shard's `current_writer` pointer
@@ -853,7 +869,6 @@ impl Algo {
         match (object, install?) {
             // Committed: the object is durable and our lock is in the chain.
             (Ok(()), InstallOutcome::Landed) => {
-                self.finish_single_rw(&tx.id, &raw_key, &prefix, &value);
                 tx.status = Status::Committed;
                 self.write_back_single_rw(&tx.id, &leaf_path, &raw_key, &key_path)
                     .await;
@@ -903,7 +918,7 @@ impl Algo {
         // the version-conditional CAS + reload (ADR-030).
         match self
             .coord
-            .submit_shard(leaf_path, id, resolver, Freshness::AllowStale)
+            .submit_shard(leaf_path, id, resolver, Requirement::Any)
             .await?
         {
             Some(FoldOutcome::Landed) => Ok(InstallOutcome::Landed),
@@ -916,17 +931,6 @@ impl Algo {
                 "commit-install produced a non-install outcome",
             )),
         }
-    }
-
-    /// Records a fast-path commit by publishing the value to the cache keyed by
-    /// this writer. The superseded pointer is handed to GC later, from the
-    /// asynchronous write-back that actually overwrites `current_writer`.
-    fn finish_single_rw(&self, id: &TxId, raw_key: &[u8], prefix: &str, value: &Arc<[u8]>) {
-        self.values.write(
-            &paths::from_key(prefix, raw_key),
-            value.clone(),
-            Version { writer: id.clone() },
-        );
     }
 
     /// Converts the fast path's write lock to a published `current_writer`
@@ -973,7 +977,6 @@ impl Algo {
     /// reads, hand the now-orphaned object to GC, and signal a renewed re-run
     /// ([`TransError::Wounded`]) so the retry gets a fresh id.
     fn abandon_single_rw(&self, tx: &Handle) -> Result<Option<()>, TransError> {
-        self.invalidate_reads(&tx.data);
         self.gc.schedule_tx_cleanup(tx.id.clone());
         Err(TransError::Wounded)
     }
@@ -1011,8 +1014,7 @@ impl Algo {
     /// Does not back off: the wound already aborted us (its locks are
     /// immediately reclaimable), the locker's CAS loop backs off real lock
     /// contention, and a delay here would only slow the renewed retry.
-    async fn restart(&self, tx: &mut Handle) -> Result<(), TransError> {
-        self.invalidate_reads(&tx.data);
+    async fn restart(&self, _tx: &mut Handle) -> Result<(), TransError> {
         Err(TransError::Wounded)
     }
 
@@ -1108,8 +1110,7 @@ impl Algo {
     /// Unlike [`Algo::restart`] this does **not** back off: the transaction holds
     /// *live* locks here (its object is still pending), so sleeping would block
     /// every peer waiting on those keys and only delay our own release.
-    async fn revalidate(&self, tx: &mut Handle) -> Result<(), TransError> {
-        self.invalidate_reads(&tx.data);
+    async fn revalidate(&self, _tx: &mut Handle) -> Result<(), TransError> {
         Err(TransError::Retry)
     }
 
@@ -1117,7 +1118,7 @@ impl Algo {
     /// transaction. Best-effort: a status read error is not treated as a wound.
     async fn was_wounded(&self, tx: &Handle) -> bool {
         matches!(
-            self.mon.tx_status(&tx.id).await,
+            self.mon.tx_status(&tx.id, Requirement::Any).await,
             Ok(TxCommitStatus::Aborted)
         )
     }
@@ -1127,14 +1128,22 @@ impl Algo {
     /// membership dependencies are unchanged (ADR-032 phantom prevention).
     /// When locks are already held, scan resolution ignores this transaction's
     /// own holder ID so it is not mistaken for a concurrent membership change.
+    /// `bound` is the validation watermark captured once at the OCC boundary
+    /// (before locks were acquired, or at validation start for a read-only
+    /// transaction). Every validation read requires `AtLeast(bound)`, so a
+    /// dependency whose evidence already advanced past it — a locked key pinned
+    /// by its landing CAS, or a key revalidated earlier this attempt — is
+    /// confirmed without another backend read (ADR-036).
     async fn validate(
         &self,
         data: &Data,
+        bound: ValidationTime,
         context: ValidationContext<'_>,
     ) -> Result<bool, TransError> {
-        Ok(self.validate_reads_inner(data).await?
+        let req = Requirement::AtLeast(bound);
+        Ok(self.validate_reads_inner(data, req).await?
             && self
-                .validate_scans_inner(data, context.own_lock_holder())
+                .validate_scans_inner(data, req, context.own_lock_holder())
                 .await?)
     }
 
@@ -1142,12 +1151,16 @@ impl Algo {
     /// still match what the transaction observed (a consistent snapshot exists).
     /// The read set is resolved in one shard-batched pass (each touched shard is
     /// loaded once) rather than one shard load per key.
-    async fn validate_reads_inner(&self, data: &Data) -> Result<bool, TransError> {
+    async fn validate_reads_inner(
+        &self,
+        data: &Data,
+        req: Requirement,
+    ) -> Result<bool, TransError> {
         if data.reads.is_empty() {
             return Ok(true);
         }
         let keys: Vec<Arc<str>> = data.reads.iter().map(|r| r.path.clone()).collect();
-        let current = self.resolver.effective_writers(&keys).await?;
+        let current = self.resolver.effective_writers(&keys, req).await?;
         for r in &data.reads {
             let observed = r.version.as_ref().map(|v| v.last_writer.clone());
             if current.get(&r.path).cloned().flatten() != observed {
@@ -1166,6 +1179,7 @@ impl Algo {
     async fn validate_scans_inner(
         &self,
         data: &Data,
+        req: Requirement,
         own_lock_holder: Option<&TxId>,
     ) -> Result<bool, TransError> {
         for scan in &data.scans {
@@ -1176,6 +1190,7 @@ impl Algo {
                     &scan.range,
                     scan.frontier.as_deref(),
                     own_lock_holder,
+                    req,
                 )
                 .await?;
             let mut fast = current.len() == scan.covered.len()
@@ -1189,7 +1204,7 @@ impl Algo {
                     .iter()
                     .flat_map(|leaf| &leaf.pending_membership)
                 {
-                    if self.mon.tx_status(holder).await? == TxCommitStatus::Ok {
+                    if self.mon.tx_status(holder, req).await? == TxCommitStatus::Ok {
                         fast = false;
                         break;
                     }
@@ -1207,6 +1222,7 @@ impl Algo {
                     &scan.overlay,
                     own_lock_holder,
                     scan.frontier.as_deref(),
+                    req,
                 )
                 .await?;
             if resolved.keys != scan.keys {
@@ -1214,18 +1230,6 @@ impl Algo {
             }
         }
         Ok(true)
-    }
-
-    /// Invalidates the local cache entries for the transaction's found reads, so
-    /// a retry re-reads the authoritative value instead of re-validating the
-    /// stale cached one (which would re-conflict forever).
-    fn invalidate_reads(&self, data: &Data) {
-        for r in &data.reads {
-            if let Some(v) = &r.version {
-                self.values
-                    .mark_value_outdated(&r.path, v.to_storage_version());
-            }
-        }
     }
 
     /// Builds and writes the committed transaction object (the commit point).
@@ -1280,15 +1284,14 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_storage::{
-        CollectionRoot, Directory, MAX_STALENESS, ObjectCache, Shard, ShardEntry, ShardStore,
-        SharedCache, TLogger, TxCommitStatus, ValueCache,
+        CollectionRoot, Directory, ObjectCache, Shard, ShardEntry, ShardStore, SharedCache,
+        TLogger, TxCommitStatus,
     };
 
     const TEST_COLL: &str = "testp";
 
     struct Tctx {
         backend: Arc<dyn Backend>,
-        values: ValueCache,
         tlogger: TLogger,
         tmon: Monitor,
         shards: ShardStore,
@@ -1308,7 +1311,6 @@ mod tests {
         cache_bytes: usize,
     ) -> (Algo, Tctx) {
         let cache = SharedCache::new(cache_bytes);
-        let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(b.clone(), &cache);
         let tlogger = TLogger::new(objects.clone(), TEST_COLL);
         let bg = Arc::new(Background::new());
@@ -1316,7 +1318,7 @@ mod tests {
         // Leak the background so spawned async aborts can run for the test's
         // lifetime without us threading the owner through every helper.
         std::mem::forget(bg);
-        let tmon = Monitor::new(values.clone(), tlogger.clone(), bg_weak.clone());
+        let tmon = Monitor::new(tlogger.clone(), bg_weak.clone());
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
@@ -1346,7 +1348,6 @@ mod tests {
             .unwrap();
 
         let algo = Algo::new(
-            values.clone(),
             locker.clone(),
             coord.clone(),
             tmon.clone(),
@@ -1360,7 +1361,6 @@ mod tests {
             algo,
             Tctx {
                 backend: b,
-                values,
                 tlogger,
                 tmon,
                 shards,
@@ -1393,12 +1393,11 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(
-            tctx.values.clone(),
             tctx.shards.clone(),
             tctx.tmon.clone(),
             RetryConfig::default(),
         );
-        match reader.read(path, MAX_STALENESS).await {
+        match reader.read(path).await {
             Ok(outcome) => match outcome.value {
                 Some(rv) => ra_found(path, rv.version.writer),
                 None => ra_not_found(path),
@@ -1429,7 +1428,10 @@ mod tests {
     async fn entry(tctx: &Tctx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = tctx
             .shards
-            .load_leaf(&paths::collection_info(TEST_COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(TEST_COLL),
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap();
         loaded.entries.lookup(key).cloned()
@@ -1450,9 +1452,13 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        let status = tctx.tlogger.commit_status(&tid).await.unwrap();
+        let status = tctx
+            .tlogger
+            .commit_status(&tid, Requirement::Any)
+            .await
+            .unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
-        let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
+        let (txlog, _) = tctx.tlogger.get(&tid, Requirement::Any).await.unwrap();
         assert_eq!(txlog.writes.len(), 1);
         assert_eq!(txlog.writes[0].path, keyp);
         assert_eq!(&*txlog.writes[0].value, val);
@@ -1487,7 +1493,7 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        let (txlog, _) = tctx.tlogger.get(&tid).await.unwrap();
+        let (txlog, _) = tctx.tlogger.get(&tid, Requirement::Any).await.unwrap();
         let locked: std::collections::BTreeSet<&str> =
             txlog.locks.iter().map(|l| l.path.as_str()).collect();
         assert!(
@@ -1786,8 +1792,13 @@ mod tests {
             (backend, gate)
         }
 
-        fn arm(&self) {
-            self.skip.store(1, std::sync::atomic::Ordering::SeqCst);
+        // Arms the gate to let `skip` backend reads through, then park the next
+        // one. `skip` counts the reads a submitter issues before its
+        // coordination load: with ADR-036 cache routing, an acquire whose leaf
+        // is already cached issues none, so it parks its own coordination load
+        // (`skip = 0`).
+        fn arm(&self, skip: usize) {
+            self.skip.store(skip, std::sync::atomic::Ordering::SeqCst);
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1886,11 +1897,13 @@ mod tests {
 
         let shard_path = paths::collection_info(TEST_COLL);
         log.lock().unwrap().clear();
-        gate.arm();
+        // The acquire routes from cache (ADR-036) and issues no backend read
+        // before its coordination load, so park that load itself (`skip = 0`).
+        gate.arm(0);
 
         // The disjoint acquire is submitted first and becomes the dedup driver,
-        // parking in the gated (`Latest`) load; the single-rw install then joins
-        // that open batch. (Post-ADR-030 the install's own first attempt is
+        // parking in the gated `AtLeast(now())` load; the single-rw install then
+        // joins that open batch. (Post-ADR-030 the install's own first attempt is
         // `AllowStale` and would skip the load on a warm cache, so it merges via
         // the driver's already-loading round rather than racing a solo, cache-
         // served CAS — which is exactly the ADR-028 single-round behavior.)
@@ -1973,7 +1986,7 @@ mod tests {
 
         // Arm the merge gate and the in-doubt first CAS together.
         indoubt.arm();
-        gate.arm();
+        gate.arm(1);
 
         let (ca, cb) = (tm.clone(), tctx.locker.clone());
         let (ta, pa, ka2, kap2) = (
@@ -2169,7 +2182,11 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current_writer, Some(tid.clone()));
         assert!(e.locked_by.is_empty());
-        let status = tctx.tlogger.commit_status(&tid).await.unwrap();
+        let status = tctx
+            .tlogger
+            .commit_status(&tid, Requirement::Any)
+            .await
+            .unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.version.unwrap().last_writer, tid);
@@ -2264,7 +2281,7 @@ mod tests {
         // held by the committed H1 while the pointer lags at its predecessor H0.
         let loaded = tctx
             .shards
-            .load_leaf(&leaf_path, Freshness::Latest)
+            .load_leaf(&leaf_path, Requirement::AtLeast(tctx.shards.now()))
             .await
             .unwrap();
         let windowed = Shard::from_entries(loaded.entries.entries().cloned().map(|mut e| {
@@ -2299,7 +2316,7 @@ mod tests {
         // H1, while a read of the superseded H0 is still rejected as stale.
         let (res, _) = tm
             .resolver
-            .resolve_key(&keyp, Freshness::Latest)
+            .resolve_key(&keyp, Requirement::AtLeast(tm.resolver.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -2568,7 +2585,7 @@ mod tests {
             },
         );
         tm.commit(&mut h).await.unwrap();
-        let (log, _) = tctx.tlogger.get(h.id()).await.unwrap();
+        let (log, _) = tctx.tlogger.get(h.id(), Requirement::Any).await.unwrap();
         for path in [&ka, &kb] {
             assert!(log.locks.contains(&PathLock {
                 path: path.clone(),
@@ -2643,7 +2660,7 @@ mod tests {
         let path = paths::collection_info(TEST_COLL);
         let loaded = tctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(tctx.shards.now()))
             .await
             .unwrap();
         let mut entries: std::collections::BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -2686,7 +2703,14 @@ mod tests {
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
         let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
         let scan = resolver
-            .scan_keys(TEST_COLL, &range, &[], None, None)
+            .scan_keys(
+                TEST_COLL,
+                &range,
+                &[],
+                None,
+                None,
+                Requirement::AtLeast(resolver.now()),
+            )
             .await
             .unwrap();
         let keys = scan.keys.clone();
@@ -2746,7 +2770,11 @@ mod tests {
         tctx.locker.lock_calls_and_reset();
         tm.commit(&mut stale).await.unwrap();
         assert!(tctx.locker.lock_calls_and_reset() >= 1);
-        let (log, _) = tctx.tlogger.get(stale.id()).await.unwrap();
+        let (log, _) = tctx
+            .tlogger
+            .get(stale.id(), Requirement::Any)
+            .await
+            .unwrap();
         assert!(
             log.locks
                 .iter()
@@ -2809,7 +2837,11 @@ mod tests {
 
         let mut handle = tm.begin(data);
         tm.commit(&mut handle).await.unwrap();
-        let (log, _) = tctx.tlogger.get(handle.id()).await.unwrap();
+        let (log, _) = tctx
+            .tlogger
+            .get(handle.id(), Requirement::Any)
+            .await
+            .unwrap();
         let leaf = paths::collection_info(TEST_COLL);
         assert!(log.locks.contains(&PathLock {
             path: leaf.clone(),
@@ -2860,7 +2892,11 @@ mod tests {
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();
 
-        let (log, _) = tctx.tlogger.get(handle.id()).await.unwrap();
+        let (log, _) = tctx
+            .tlogger
+            .get(handle.id(), Requirement::Any)
+            .await
+            .unwrap();
         for token in ["S0", "S1"] {
             assert!(log.locks.contains(&PathLock {
                 path: paths::from_node(TEST_COLL, token),
@@ -2948,7 +2984,10 @@ mod tests {
         ])));
         let cur = tctx
             .shards
-            .load_leaf(&paths::collection_info(TEST_COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(TEST_COLL),
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap();
         tctx.shards
@@ -2966,7 +3005,7 @@ mod tests {
         // leaf S1, bumping its version.
         let (s1, ver) = tctx
             .shards
-            .load_node(TEST_COLL, "S1", Freshness::Latest)
+            .load_node(TEST_COLL, "S1", Requirement::AtLeast(tctx.shards.now()))
             .await
             .unwrap();
         let mut entries: Vec<ShardEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
@@ -3000,7 +3039,10 @@ mod tests {
 
         let loaded = tctx
             .shards
-            .load_leaf(&paths::collection_info(TEST_COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(TEST_COLL),
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap();
         let entries: Vec<ShardEntry> = loaded.entries.entries().cloned().collect();

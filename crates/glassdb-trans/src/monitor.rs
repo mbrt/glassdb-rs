@@ -12,8 +12,7 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    MAX_STALENESS, PathLock, StorageError, TLogger, TValue, TxCommitStatus, TxLog, ValueCache,
-    Version,
+    PathLock, Requirement, StorageError, TLogger, TValue, TxCommitStatus, TxLog,
 };
 use tokio::sync::oneshot;
 
@@ -94,7 +93,6 @@ struct State {
 }
 
 struct Inner {
-    values: ValueCache,
     tl: TLogger,
     // Weak so a `Monitor` clone captured inside a spawned task does not keep
     // the [`Background`] alive across DB shutdown. The single strong owner
@@ -125,14 +123,8 @@ pub(crate) struct KeyCommitStatus {
 
 impl Monitor {
     /// Creates a monitor using the real wall-clock and default retry timing.
-    pub fn new(values: ValueCache, tl: TLogger, background: Weak<Background>) -> Self {
-        Self::with_config(
-            values,
-            tl,
-            background,
-            Clock::real(),
-            RetryConfig::default(),
-        )
+    pub fn new(tl: TLogger, background: Weak<Background>) -> Self {
+        Self::with_config(tl, background, Clock::real(), RetryConfig::default())
     }
 
     /// Creates a monitor with a custom clock (used in tests for deterministic
@@ -140,7 +132,6 @@ impl Monitor {
     /// tunes the backoff used when polling a peer transaction's commit status
     /// and when writing a transaction's final log.
     pub fn with_config(
-        values: ValueCache,
         tl: TLogger,
         background: Weak<Background>,
         clock: Clock,
@@ -148,7 +139,6 @@ impl Monitor {
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
-                values,
                 tl,
                 background,
                 clock,
@@ -239,19 +229,6 @@ impl Monitor {
                 .map_err(|e| e.context("writing tx log"))?;
         }
 
-        let version = Version {
-            writer: tl.id.clone(),
-        };
-        for entry in &tl.writes {
-            if entry.deleted {
-                self.inner.values.mark_deleted(&entry.path, version.clone());
-            } else {
-                self.inner
-                    .values
-                    .write(&entry.path, entry.value.clone(), version.clone());
-            }
-        }
-
         let mut st = self.shard_for(&tl.id).lock().unwrap();
         st.local_tx.remove(&tl.id);
         notify_waiters(&mut st, &tl.id, TxCommitStatus::Ok);
@@ -285,9 +262,14 @@ impl Monitor {
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
     pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
-        let cs = self.inner.tl.commit_status(tid).await.map_err(|e| {
-            TransError::Storage(e.context(format!("reading status of wound target {tid}")))
-        })?;
+        let cs = self
+            .inner
+            .tl
+            .commit_status(tid, Requirement::Any)
+            .await
+            .map_err(|e| {
+                TransError::Storage(e.context(format!("reading status of wound target {tid}")))
+            })?;
         if cs.status.is_final() {
             // Already committed or aborted: nothing left to wound.
             self.mark_local_aborted(tid, cs.status);
@@ -302,14 +284,24 @@ impl Monitor {
     }
 
     /// Returns the commit status, checking locally first then remote storage.
-    pub(crate) async fn tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
+    ///
+    /// `req` bounds a remote read of a still-pending log: the commit path passes
+    /// its captured validation bound so a status already revalidated at or after
+    /// that bound is reused, while coordination and body callers pass
+    /// [`Requirement::Any`] (a stale pending is caught by the arbitrating CAS,
+    /// ADR-036). A locally-known or finalized status answers without a read.
+    pub(crate) async fn tx_status(
+        &self,
+        tid: &TxId,
+        req: Requirement,
+    ) -> Result<TxCommitStatus, TransError> {
         {
             let st = self.shard_for(tid).lock().unwrap();
             if let Some(e) = st.local_tx.get(tid) {
                 return Ok(e.status);
             }
         }
-        self.fetch_remote_tx_status(tid).await
+        self.fetch_remote_tx_status(tid, req).await
     }
 
     /// Waits asynchronously for the transaction to finalize, yielding its final
@@ -324,27 +316,16 @@ impl Monitor {
         async move { rx.await.unwrap_or_default() }
     }
 
-    /// Returns the committed value a transaction wrote for `key`, reading from
-    /// local storage or the transaction log.
+    /// Returns the committed value a transaction wrote for `key`, derived from
+    /// the transaction's decoded object (served from the shared cache when it is
+    /// terminal, ADR-036).
     pub(crate) async fn committed_value(
         &self,
         key: &str,
         tid: &TxId,
+        req: Requirement,
     ) -> Result<KeyCommitStatus, TransError> {
-        if let Some(lr) = self.inner.values.read(key, MAX_STALENESS)
-            && lr.version.writer == *tid
-        {
-            return Ok(KeyCommitStatus {
-                status: TxCommitStatus::Ok,
-                value: TValue {
-                    value: lr.value,
-                    deleted: lr.deleted,
-                    not_written: false,
-                },
-            });
-        }
-
-        let status = self.tx_status(tid).await?;
+        let status = self.tx_status(tid, req).await?;
         if status != TxCommitStatus::Ok {
             return Ok(KeyCommitStatus {
                 status,
@@ -352,10 +333,12 @@ impl Monitor {
             });
         }
 
+        // The value comes from a committed (finalized, immutable) log, so a
+        // cached copy is authoritative — no freshness bound is needed.
         let (tl, _) = self
             .inner
             .tl
-            .get(tid)
+            .get(tid, Requirement::Any)
             .await
             .map_err(|e| TransError::Storage(e.context(format!("getting TID {tid}"))))?;
         for entry in &tl.writes {
@@ -420,7 +403,7 @@ impl Monitor {
                     //     found `aborted`): a wound landed first -> surface as
                     //     `AlreadyFinalized` so the commit path treats it as a
                     //     wound.
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self.inner.tl.commit_status(tid, Requirement::Any).await?;
                     if st.status == tlog.status {
                         return Ok(());
                     }
@@ -455,7 +438,7 @@ impl Monitor {
     ) -> Result<TxCommitStatus, TransError> {
         let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         if !expected.is_unset()
-            && let Ok((current, _)) = self.inner.tl.get(tid).await
+            && let Ok((current, _)) = self.inner.tl.get(tid, Requirement::Any).await
         {
             tlog.writes = current.writes;
             tlog.locks = current.locks;
@@ -474,7 +457,7 @@ impl Monitor {
                     // The version moved under us (a commit, a pending-log
                     // refresh, or another wounder). Report whatever status is
                     // now durable.
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self.inner.tl.commit_status(tid, Requirement::Any).await?;
                     return Ok(st.status);
                 }
                 // In-doubt: the abort write may or may not have landed. Just
@@ -488,7 +471,7 @@ impl Monitor {
                 // peer's, or a commit that won the race); a still-pending
                 // status means retry the CAS over the refreshed version.
                 Err(StorageError::Unavailable(_)) => {
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self.inner.tl.commit_status(tid, Requirement::Any).await?;
                     if st.status.is_final() {
                         return Ok(st.status);
                     }
@@ -564,8 +547,12 @@ impl Monitor {
         rx
     }
 
-    async fn fetch_remote_tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let status = self.inner.tl.commit_status(tid).await?;
+    async fn fetch_remote_tx_status(
+        &self,
+        tid: &TxId,
+        req: Requirement,
+    ) -> Result<TxCommitStatus, TransError> {
+        let status = self.inner.tl.commit_status(tid, req).await?;
         match status.status {
             TxCommitStatus::Unknown => self.handle_unknown_tx(tid).await,
             TxCommitStatus::Pending => {
@@ -671,7 +658,7 @@ impl Monitor {
     async fn poll_tx_status_with_liveness(&self, tid: &TxId) -> TxCommitStatus {
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let s = match self.fetch_remote_tx_status(tid).await {
+            let s = match self.fetch_remote_tx_status(tid, Requirement::Any).await {
                 Err(_) => return TxCommitStatus::Unknown,
                 Ok(s) => s,
             };
@@ -783,7 +770,7 @@ impl Monitor {
                 // we lost) — stop and let the owner observe it; a still-pending
                 // status means we adopt its version and keep refreshing.
                 Err(StorageError::Precondition) => {
-                    match self.inner.tl.commit_status(&tid).await {
+                    match self.inner.tl.commit_status(&tid, Requirement::Any).await {
                         Ok(st) if st.status.is_final() => {
                             self.mark_local_aborted(&tid, st.status);
                             return;
@@ -817,9 +804,7 @@ mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
-    use glassdb_storage::{
-        LockScope, LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache,
-    };
+    use glassdb_storage::{LockScope, LockType, ObjectCache, PathLock, SharedCache, TxWrite};
 
     struct TestCtx {
         tl: TLogger,
@@ -839,12 +824,10 @@ mod tests {
 
     fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
         let cache = SharedCache::new(1024);
-        let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(b, &cache);
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
-            values,
             tl.clone(),
             Arc::downgrade(&bg),
             clock.clone(),
@@ -864,18 +847,32 @@ mod tests {
     #[tokio::test]
     async fn status() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (mon1, _t1) = new_test_monitor(b.clone());
-        let (mon2, _t2) = new_test_monitor(b.clone());
+        let (mon1, t1) = new_test_monitor(b.clone());
+        let (mon2, t2) = new_test_monitor(b.clone());
         let key = paths::from_key("example", b"key1");
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
 
-        assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
-        assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
+        let r1 = || Requirement::AtLeast(t1.objects.now());
+        let r2 = || Requirement::AtLeast(t2.objects.now());
+        assert_eq!(
+            mon1.tx_status(&tx, r1()).await.unwrap(),
+            TxCommitStatus::Pending
+        );
+        assert_eq!(
+            mon2.tx_status(&tx, r2()).await.unwrap(),
+            TxCommitStatus::Pending
+        );
 
         mon1.abort_tx(&tx).await.unwrap();
-        assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
-        assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
+        assert_eq!(
+            mon1.tx_status(&tx, r1()).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
+        assert_eq!(
+            mon2.tx_status(&tx, r2()).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
 
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);
@@ -886,15 +883,15 @@ mod tests {
             scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
-        assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
-        assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
+        assert_eq!(mon1.tx_status(&tx, r1()).await.unwrap(), TxCommitStatus::Ok);
+        assert_eq!(mon2.tx_status(&tx, r2()).await.unwrap(), TxCommitStatus::Ok);
     }
 
     #[tokio::test]
     async fn committed_value() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, t1) = new_test_monitor(b.clone());
-        let (mon2, _t2) = new_test_monitor(b.clone());
+        let (mon2, t2) = new_test_monitor(b.clone());
         let key = paths::from_key("example", b"key");
 
         t1.objects.write(&key, Arc::from(&b"x"[..])).await.unwrap();
@@ -910,17 +907,26 @@ mod tests {
         }];
         mon1.commit_tx(tl).await.unwrap();
 
-        let cs = mon1.committed_value(&key, &tx).await.unwrap();
+        let cs = mon1
+            .committed_value(&key, &tx, Requirement::AtLeast(t1.objects.now()))
+            .await
+            .unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
         assert_eq!(&*cs.value.value, b"val1");
         // From a remote monitor.
-        let cs = mon2.committed_value(&key, &tx).await.unwrap();
+        let cs = mon2
+            .committed_value(&key, &tx, Requirement::AtLeast(t2.objects.now()))
+            .await
+            .unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
         assert_eq!(&*cs.value.value, b"val1");
 
         // A key the transaction didn't write.
         let key2 = paths::from_key("example", b"key2");
-        let cs = mon2.committed_value(&key2, &tx).await.unwrap();
+        let cs = mon2
+            .committed_value(&key2, &tx, Requirement::AtLeast(t2.objects.now()))
+            .await
+            .unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
         assert!(cs.value.not_written);
     }
@@ -969,12 +975,20 @@ mod tests {
         // Advance well past the pending timeout. Refresh keeps it alive.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let st = t.tl.commit_status(&tx).await.unwrap();
+        let st =
+            t.tl.commit_status(&tx, Requirement::AtLeast(t.objects.now()))
+                .await
+                .unwrap();
         assert_eq!(st.status, TxCommitStatus::Pending);
 
         // A separate monitor should still see it as pending (not expired).
-        let (mon2, _t2) = new_test_monitor_clock(b, Clock::anchored());
-        assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
+        let (mon2, t2) = new_test_monitor_clock(b, Clock::anchored());
+        assert_eq!(
+            mon2.tx_status(&tx, Requirement::AtLeast(t2.objects.now()))
+                .await
+                .unwrap(),
+            TxCommitStatus::Pending
+        );
 
         mon.abort_tx(&tx).await.unwrap();
     }
@@ -1001,7 +1015,10 @@ mod tests {
         // pending object.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let (tl, _) = t.tl.get(&tx).await.unwrap();
+        let (tl, _) =
+            t.tl.get(&tx, Requirement::AtLeast(t.objects.now()))
+                .await
+                .unwrap();
         assert_eq!(tl.status, TxCommitStatus::Pending);
         assert_eq!(tl.locks, locks);
 
@@ -1017,7 +1034,7 @@ mod tests {
     async fn live_holder_not_reclaimed_across_long_wait() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor_clock(b.clone(), Clock::anchored());
-        let (observer, _o) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let (observer, o) = new_test_monitor_clock(b.clone(), Clock::anchored());
         let tx = TxId::from_bytes(b"live".to_vec());
         mon.begin_tx(&tx);
         mon.start_refresh_tx(&tx);
@@ -1026,14 +1043,20 @@ mod tests {
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_secs(5)).await;
             assert_eq!(
-                observer.tx_status(&tx).await.unwrap(),
+                observer
+                    .tx_status(&tx, Requirement::AtLeast(o.objects.now()))
+                    .await
+                    .unwrap(),
                 TxCommitStatus::Pending
             );
         }
 
         mon.abort_tx(&tx).await.unwrap();
         assert_eq!(
-            observer.tx_status(&tx).await.unwrap(),
+            observer
+                .tx_status(&tx, Requirement::AtLeast(o.objects.now()))
+                .await
+                .unwrap(),
             TxCommitStatus::Aborted
         );
     }
@@ -1056,14 +1079,24 @@ mod tests {
         t.tl.set(&tl).await.unwrap();
 
         // First sight records the progress baseline; still pending.
-        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
+        assert_eq!(
+            mon.tx_status(&tx, Requirement::AtLeast(t.objects.now()))
+                .await
+                .unwrap(),
+            TxCommitStatus::Pending
+        );
 
         // No progress for longer than the timeout on the observer's own clock.
         tokio::time::sleep(PENDING_TX_TIMEOUT + Duration::from_secs(1)).await;
 
         // The stalled holder is reclaimed (aborted), well before its absolute
         // lease would have expired.
-        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
+        assert_eq!(
+            mon.tx_status(&tx, Requirement::AtLeast(t.objects.now()))
+                .await
+                .unwrap(),
+            TxCommitStatus::Aborted
+        );
     }
 
     // Tiny helper to build a TxWrite in tests.

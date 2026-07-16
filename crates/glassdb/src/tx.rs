@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::RetryConfig;
 use glassdb_data::paths;
-use glassdb_storage::{MAX_STALENESS, ShardStore, ValueCache};
+use glassdb_storage::{Requirement, ShardStore};
 use glassdb_trans::{
     Data, ReadAccess, ReadVersion, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess,
 };
@@ -85,7 +85,7 @@ impl Transaction {
             }
         }
 
-        match self.reader.read(&p, MAX_STALENESS).await {
+        match self.reader.read(&p).await {
             Ok(outcome) => match outcome.value {
                 None => {
                     let mut inner = self.inner.lock().unwrap();
@@ -151,7 +151,7 @@ impl Transaction {
 
         let result = self
             .resolver
-            .scan_keys(c.prefix(), &range, &overlay, None, None)
+            .scan_keys(c.prefix(), &range, &overlay, None, None, Requirement::Any)
             .await
             .map_err(Error::from_read)?;
         let keys = result.keys;
@@ -196,12 +196,11 @@ impl Transaction {
 
     pub(crate) fn new(
         shards: ShardStore,
-        values: ValueCache,
         tmon: glassdb_trans::Monitor,
         retry: RetryConfig,
     ) -> Self {
         Transaction {
-            reader: Reader::new(values, shards.clone(), tmon.clone(), retry),
+            reader: Reader::new(shards.clone(), tmon.clone(), retry),
             resolver: Resolver::new(shards, tmon),
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }

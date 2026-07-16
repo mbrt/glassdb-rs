@@ -11,8 +11,11 @@ the reduced trait is unchanged.
 
 > Naming note: the caches were later renamed for clarity — `Global` →
 > `ObjectCache` (backend-version-keyed) and `Local` → `ValueCache`
-> (writer-keyed), both now built from a shared LRU. The names below use the
-> current ones; the decision is unchanged.
+> (writer-keyed), both then built from a shared LRU. The two-cache split was
+> later superseded by [ADR-036](036-decoded-object-cache-with-bounded-freshness.md):
+> `ValueCache` was removed and key values are derived from the single decoded
+> object cache. The names below describe the design at the time; the backend-trait
+> decision is unchanged.
 
 ## Context
 

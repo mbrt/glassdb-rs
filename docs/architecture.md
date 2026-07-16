@@ -83,7 +83,7 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
 | `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: commit algorithm, distributed locker, shard-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
-| `glassdb-storage`     | `object_cache.rs`, `value_cache.rs`, `shardstore.rs`, `shard.rs`, `root.rs`, `txobject.rs`, `entry.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Object cache (read/write-through, version-keyed), value cache (writer-keyed, staleness), shard/root CAS store, shard & collection-root codecs, unified transaction-object codec, per-key entry, lock-state value type, transaction-log persistence, version tracking, generic LRU |
+| `glassdb-storage`     | `cached_store.rs`, `object_cache.rs`, `shardstore.rs`, `shard.rs`, `root.rs`, `txobject.rs`, `entry.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Decoded object cache with a per-entry validation watermark (ADR-036), object-body facade over it, shard/root CAS store, shard & collection-root codecs, unified transaction-object codec, per-key entry, lock-state value type, transaction-log persistence, version tracking, generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
@@ -153,7 +153,7 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
       ▼                       ▼            ▼ (tx logs)          ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
   ShardStore (_s shards · _i roots) · TLogger (_t logs)
-  ObjectCache (read/write-through) · ValueCache (staleness LRU)
+  ObjectCache facade · CachedStore (decoded, watermark-validated LRU)
                                 │
                                 ▼
             glassdb-backend  (content-CAS object store: GCS / S3)
@@ -643,7 +643,8 @@ drives this:
 
 ## Storage & Caching
 
-GlassDB uses a three-layer caching architecture to minimize backend calls:
+GlassDB caches decoded coordination objects in a single store to minimize
+backend calls (ADR-036):
 
 ```
 ┌───────────────────────────────────────┐
@@ -652,16 +653,17 @@ GlassDB uses a three-layer caching architecture to minimize backend calls:
                   │ tx.read / tx.write
                   ▼
 ┌───────────────────────────────────────┐
-│           ValueCache (per-DB)         │
-│  Staleness tracking, outdated flags   │
-│  Caches values keyed by their writer  │
+│   Reader / Resolver / Monitor         │
+│  Derive a key value from the cached    │
+│  node + decoded transaction object     │
 └─────────────────┬─────────────────────┘
-                  │ cache miss or stale
+                  │ read (Requirement::Any) / validate (AtLeast)
                   ▼
 ┌───────────────────────────────────────┐
-│      ObjectCache (read-through)       │
-│  Uses read_if_modified to avoid full  │
-│  downloads if the version is unchanged│
+│    CachedStore (decoded, path-keyed)   │
+│  Per-entry validation watermark;       │
+│  version-conditional revalidation      │
+│  avoids re-downloading unchanged bodies│
 └─────────────────┬─────────────────────┘
                   │ version changed or absent
                   ▼
@@ -670,36 +672,38 @@ GlassDB uses a three-layer caching architecture to minimize backend calls:
 └───────────────────────────────────────┘
 ```
 
-Two facades share **one** byte-weighted LRU (a single `cache_size` budget),
-keyed by two disjoint identities (ADR-023): user values by their **writer**, and
-coordination objects by their **backend version**. Both are built from a
-`SharedCache` handle rather than one depending on the other.
+A single decoded cache replaces the earlier two-facade (`ObjectCache` /
+`ValueCache`) split (ADR-036). Key values are no longer cached separately: a
+value lives in the transaction object of whichever transaction last committed it,
+so the read path *derives* it from the cached node (resolving the effective
+writer) plus that writer's decoded transaction object — both served from the one
+store.
 
 **LRU Cache** (`glassdb-storage/src/cache.rs`). A thread-safe, byte-weighted LRU
 cache (default 512 MiB, configurable via `DatabaseBuilder::cache_size`). Entries
 are evicted least-recently-used first when the total size exceeds the limit. A
-`SharedCache` wraps one instance and hands it to both facades below.
+`SharedCache` handle carries the byte budget the decoded store is sized to.
 
-**ValueCache** (`glassdb-storage/src/value_cache.rs`). The writer-keyed facade
-for user values, with staleness awareness. A value lives in the transaction
-object of whichever transaction last committed it, so it is identified by that
-**writer**, not a backend object version. Each entry tracks when it was last
-updated and whether it has been marked outdated (e.g., because a concurrent
-transaction invalidated it). Relative staleness uses `tokio::time::Instant` so
-it stays deterministic under paused time (see
-[porting-go.md](archive/porting-go.md), "Time and determinism").
+**CachedStore** (`glassdb-storage/src/cached_store.rs`). The single decoded
+object cache (ADR-036), keyed by physical path. Each entry is `Present` (decoded
+value + `Revision` + a validation watermark), `Absent`, or `Missing`, and a read
+carries a `Requirement`: `Any` serves any usable copy, `AtLeast(t)` requires a
+copy validated no earlier than `t` (else a version-conditional revalidation that
+advances the watermark on an unchanged body). Concurrent validations of the same
+path are coalesced.
 
-**ObjectCache** (`glassdb-storage/src/object_cache.rs`). The backend-version-keyed,
-read-through / write-through facade for coordination objects (shards, roots,
-transaction logs). On reads it uses the version-conditional `read_if_modified` to
-avoid re-downloading objects whose backend version hasn't changed; on writes it
-updates the cache with the new bytes and version immediately. `ShardStore` and
-`TLogger` read and compare-and-swap through it, so a hot unchanged shard/root/log
-revalidates without re-transferring its body.
+**ObjectCache** (`glassdb-storage/src/object_cache.rs`). A thin body facade over
+`CachedStore` (an identity codec) whose reads take a `Requirement` directly:
+`Any` serves any usable copy, `AtLeast(now())` revalidates against current
+coordination state (each layer exposes `now()` for a "latest" read).
+`ShardStore` and `TLogger` read and compare-and-swap through it, so a hot
+unchanged shard/root/log revalidates without re-transferring its body, and a
+terminal (finalized) transaction object is served straight from cache.
 
-After a transaction commits, its written values are cached in the `ValueCache`.
-Subsequent transactions on the same client can read them without hitting the
-backend, unless another client modifies the same keys.
+Reads serve any usable cached copy (`Any`); serializability is enforced by the
+commit path revalidating every read against current coordination state
+(`AtLeast(now)`), so a stale read that mattered forces a retry rather than a
+wrong commit.
 
 ## Data Model
 
@@ -749,12 +753,13 @@ Two version identities are kept separate (ADR-023):
 - **Writer** — the storage-layer `Version` in `glassdb-storage/src/version.rs` is
   writer-only (`data::TxId`): the transaction that last committed the value. A
   value lives in that transaction object's body (ADR-019), so the writer *is* the
-  value's identity. This is what the `ValueCache` keys on.
+  value's identity, and the read path derives the value from that writer's decoded
+  transaction object.
 - **Backend version** (`backend::Version`): the opaque CAS token assigned by
   object storage, used for conditional writes and for cache revalidation via the
   version-conditional `read_if_modified`. It identifies a coordination object's
-  content, so it is tracked in the `ObjectCache` entries (not in the storage
-  `Version`).
+  content, so it is wrapped as the `Revision` tracked in each `CachedStore` entry
+  (not in the storage `Version`).
 
 During validation, the algorithm detects concurrent modifications by comparing
 the observed writer against the current state; the backend version is the CAS

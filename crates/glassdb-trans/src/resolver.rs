@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Directory, Freshness, LeafLocator, LockType, ShardEntry, ShardStore, StorageError,
+    Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore, StorageError,
     TxCommitStatus,
 };
 
@@ -104,6 +104,17 @@ impl Resolver {
         }
     }
 
+    /// Captures the current validation bound at the OCC boundary (ADR-036). The
+    /// commit path samples this **once** per attempt — before acquiring locks
+    /// for a read-write transaction, at validation start for a read-only one —
+    /// and threads `Requirement::AtLeast(bound)` through every validation read so
+    /// evidence already advanced past the bound (e.g. by a lock's landing CAS)
+    /// is reused without a backend round-trip. It must not be resampled per read
+    /// (that reproduces the obsolete "always latest" behavior and defeats reuse).
+    pub(crate) fn now(&self) -> glassdb_storage::ValidationTime {
+        self.dir.now()
+    }
+
     /// Scans `prefix` left-to-right and returns both the raw keys that currently
     /// exist (committed and not tombstoned, in key order) and the membership
     /// dependencies of every leaf the scan covered (ADR-032 phantom prevention).
@@ -116,7 +127,8 @@ impl Resolver {
     /// holders detect creates/deletes without conflicting with value overwrites;
     /// a changed covered-leaf set falls back to logical page validation.
     pub async fn live_keys_scan(&self, prefix: &str) -> Result<ScanResult, StorageError> {
-        self.scan_keys(prefix, &ScanRange::all(), &[], None, None)
+        // A body scan reads from cache; commit validation enforces freshness.
+        self.scan_keys(prefix, &ScanRange::all(), &[], None, None, Requirement::Any)
             .await
     }
 
@@ -130,12 +142,9 @@ impl Resolver {
         overlay: &[ScanMutation],
         own_lock_holder: Option<&TxId>,
         cap: Option<&[u8]>,
+        req: Requirement,
     ) -> Result<ScanResult, StorageError> {
-        let Some(mut loc) = self
-            .dir
-            .first_leaf_at(prefix, &range.start, Freshness::Latest)
-            .await?
-        else {
+        let Some(mut loc) = self.dir.first_leaf_at(prefix, &range.start, req).await? else {
             return Err(StorageError::NotFound);
         };
 
@@ -156,7 +165,7 @@ impl Resolver {
         let mut covered = Vec::new();
 
         loop {
-            covered.push(self.leaf_coverage(&loc, own_lock_holder).await?);
+            covered.push(self.leaf_coverage(&loc, own_lock_holder, req).await?);
             let leaf = loc
                 .node
                 .as_leaf()
@@ -187,7 +196,7 @@ impl Resolver {
                     Some(present) => *present,
                     None => {
                         let key_path = paths::from_key(prefix, &key);
-                        self.resolve_entry(&key_path, leaf.lookup(&key), own_lock_holder)
+                        self.resolve_entry(&key_path, leaf.lookup(&key), own_lock_holder, req)
                             .await
                             .map_err(trans_to_storage)?
                             .token()
@@ -211,7 +220,7 @@ impl Resolver {
             if target.is_some_and(|target| loc.node.owns(target)) {
                 break;
             }
-            let Some(next) = self.dir.next_leaf(prefix, &loc, Freshness::Latest).await? else {
+            let Some(next) = self.dir.next_leaf(prefix, &loc, req).await? else {
                 break;
             };
             loc = next;
@@ -232,11 +241,12 @@ impl Resolver {
         range: &ScanRange,
         frontier: Option<&[u8]>,
         own_lock_holder: Option<&TxId>,
+        req: Requirement,
     ) -> Result<Vec<LeafCoverage>, StorageError> {
         if range.is_empty() {
             if self
                 .dir
-                .first_leaf_at(prefix, &range.start, Freshness::Latest)
+                .first_leaf_at(prefix, &range.start, req)
                 .await?
                 .is_none()
             {
@@ -247,11 +257,11 @@ impl Resolver {
 
         let leaves = self
             .dir
-            .leaves_through(prefix, &range.start, frontier, Freshness::Latest)
+            .leaves_through(prefix, &range.start, frontier, req)
             .await?;
         let mut covered = Vec::with_capacity(leaves.len());
         for leaf in leaves {
-            covered.push(self.leaf_coverage(&leaf, own_lock_holder).await?);
+            covered.push(self.leaf_coverage(&leaf, own_lock_holder, req).await?);
         }
         Ok(covered)
     }
@@ -260,6 +270,7 @@ impl Resolver {
         &self,
         loc: &LeafLocator,
         own_lock_holder: Option<&TxId>,
+        req: Requirement,
     ) -> Result<LeafCoverage, StorageError> {
         let mut pending_membership = Vec::new();
         if loc.node.membership_lock().lock_type() == LockType::Write {
@@ -269,7 +280,7 @@ impl Resolver {
                 }
                 if self
                     .tmon
-                    .tx_status(holder)
+                    .tx_status(holder, req)
                     .await
                     .map_err(trans_to_storage)?
                     == TxCommitStatus::Pending
@@ -295,6 +306,7 @@ impl Resolver {
     pub(crate) async fn effective_writers(
         &self,
         keys: &[Arc<str>],
+        req: Requirement,
     ) -> Result<HashMap<Arc<str>, Option<TxId>>, StorageError> {
         // Route the keys to their leaves and load each once; the key→leaf
         // grouping (and its deterministic order) lives in `group_keys_by_leaf`.
@@ -304,10 +316,7 @@ impl Resolver {
         // path spawns this resolution).
         let items: Vec<(Arc<str>, Arc<str>)> =
             keys.iter().map(|k| (k.clone(), k.clone())).collect();
-        let groups = self
-            .dir
-            .group_keys_by_leaf(items, Freshness::Latest)
-            .await?;
+        let groups = self.dir.group_keys_by_leaf(items, req).await?;
 
         let mut out = HashMap::with_capacity(keys.len());
         for group in &groups {
@@ -317,7 +326,7 @@ impl Resolver {
                 .ok_or_else(|| StorageError::other("descent grouped keys under a non-leaf node"))?;
             for (raw_key, key) in &group.keys {
                 let resolved = self
-                    .resolve_entry(key, leaf.lookup(raw_key), None)
+                    .resolve_entry(key, leaf.lookup(raw_key), None, req)
                     .await
                     .map_err(trans_to_storage)?;
                 out.insert(key.clone(), resolved.token());
@@ -329,19 +338,25 @@ impl Resolver {
     /// Returns the effective committed writer of a single `key`: `Some(writer)`
     /// if the key currently exists, `None` if it is absent or tombstoned. The
     /// singular form the read path uses before materializing the value.
-    pub(crate) async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
+    ///
+    /// `req` governs the shard descent: the read path passes [`Requirement::Any`]
+    /// to resolve from cache (freshness is enforced at commit validation), while
+    /// a caller needing the authoritative pointer passes
+    /// `Requirement::AtLeast(now)`.
+    pub(crate) async fn effective_writer(
+        &self,
+        key: &str,
+        req: Requirement,
+    ) -> Result<Option<TxId>, StorageError> {
         let (prefix, raw_key) =
             paths::split_key(key).map_err(|e| StorageError::with_source("parsing key path", e))?;
-        let loc = self
-            .dir
-            .leaf_for(&prefix, &raw_key, Freshness::Latest)
-            .await?;
+        let loc = self.dir.leaf_for(&prefix, &raw_key, req).await?;
         let leaf = loc
             .node
             .as_leaf()
             .ok_or_else(|| StorageError::other("descent resolved a non-leaf node"))?;
         let resolved = self
-            .resolve_entry(key, leaf.lookup(&raw_key), None)
+            .resolve_entry(key, leaf.lookup(&raw_key), None, req)
             .await
             .map_err(trans_to_storage)?;
         Ok(resolved.token())
@@ -355,31 +370,31 @@ impl Resolver {
     /// path can decide eligibility for itself without the resolver embedding that
     /// policy. An absent key resolves to an empty view.
     ///
-    /// `freshness` is forwarded to the descent: the single read-write commit
-    /// passes [`Freshness::AllowStale`] so its eligibility check reuses the leaf
-    /// the read already cached, without a revalidation round-trip; a stale copy is
-    /// caught by the commit-install's version-conditional CAS (ADR-030).
+    /// `req` is forwarded to the descent: the single read-write commit passes
+    /// [`Requirement::Any`] so its eligibility check reuses the leaf the read
+    /// already cached, without a revalidation round-trip; a stale copy is caught
+    /// by the commit-install's version-conditional CAS (ADR-030).
     pub(crate) async fn resolve_key(
         &self,
         key_path: &str,
-        freshness: Freshness,
+        req: Requirement,
     ) -> Result<(HolderResolution, LeafLocator), TransError> {
         let (prefix, raw_key) = paths::split_key(key_path)
             .map_err(|e| TransError::with_source("parsing key path", e))?;
         // Interior index nodes are served from cache (ADR-031 hot-path
-        // invariant); only the terminal leaf honors the caller's `freshness`
-        // (the fast path's `AllowStale` reuse, else `Latest`), so the root `_i`
-        // is not revalidated on every commit.
+        // invariant); only the terminal leaf honors the caller's `req` (the fast
+        // path's `Any` reuse, else `AtLeast(now)`), so the root `_i` is not
+        // revalidated on every commit.
         let loc = self
             .dir
-            .leaf_for_fresh(&prefix, &raw_key, Freshness::AllowStale, freshness)
+            .leaf_for_fresh(&prefix, &raw_key, Requirement::Any, req)
             .await?;
         let leaf = loc
             .node
             .as_leaf()
             .ok_or_else(|| TransError::other("descent resolved a non-leaf node"))?;
         let holders = match leaf.lookup(&raw_key) {
-            Some(entry) => self.resolve_holders(key_path, entry, None).await?,
+            Some(entry) => self.resolve_holders(key_path, entry, None, req).await?,
             None => HolderResolution::default(),
         };
         Ok((holders, loc))
@@ -401,6 +416,7 @@ impl Resolver {
         key_path: &str,
         entry: &ShardEntry,
         own_lock_holder: Option<&TxId>,
+        req: Requirement,
     ) -> Result<HolderResolution, TransError> {
         let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
         let mut writer = entry.current_writer.clone();
@@ -410,10 +426,10 @@ impl Resolver {
             if Some(holder) == own_lock_holder {
                 continue;
             }
-            match self.tmon.tx_status(holder).await? {
+            match self.tmon.tx_status(holder, req).await? {
                 TxCommitStatus::Ok => {
                     if exclusive {
-                        let cv = self.tmon.committed_value(key_path, holder).await?;
+                        let cv = self.tmon.committed_value(key_path, holder, req).await?;
                         if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
                             writer = Some(holder.clone());
                             deleted = cv.value.deleted;
@@ -442,6 +458,7 @@ impl Resolver {
         key_path: &str,
         entry: Option<&ShardEntry>,
         own_lock_holder: Option<&TxId>,
+        req: Requirement,
     ) -> Result<Resolved, TransError> {
         let Some(e) = entry else {
             return Ok(Resolved::default());
@@ -457,7 +474,9 @@ impl Resolver {
             });
         }
 
-        let r = self.resolve_holders(key_path, e, own_lock_holder).await?;
+        let r = self
+            .resolve_holders(key_path, e, own_lock_holder, req)
+            .await?;
         Ok(Resolved {
             writer: r.writer,
             deleted: r.deleted,
@@ -479,7 +498,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::Background;
-    use glassdb_storage::{ObjectCache, Shard, SharedCache, TLogger, ValueCache};
+    use glassdb_storage::{ObjectCache, Shard, SharedCache, TLogger};
 
     const COLL: &str = "coll";
 
@@ -489,11 +508,10 @@ mod tests {
     // `Background` must be kept alive for the monitor's lifetime.
     fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Monitor, Arc<Background>) {
         let cache = SharedCache::new(1 << 20);
-        let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(backend, &cache);
         let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(values, tl, Arc::downgrade(&bg));
+        let mon = Monitor::new(tl, Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
         (Resolver::new(shards, mon.clone()), mon, bg)
     }
@@ -503,7 +521,10 @@ mod tests {
     // when it is a tombstone.
     async fn seed_writer(store: &ShardStore, key: &[u8], writer: &TxId, deleted: bool) {
         let path = paths::collection_info(COLL);
-        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
             .entries
             .entries()
@@ -556,7 +577,10 @@ mod tests {
     // not the (stale, empty) pointer.
     async fn seed_locked(store: &ShardStore, key: &[u8], holder: &TxId) {
         let path = paths::collection_info(COLL);
-        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
             .entries
             .entries()
@@ -627,7 +651,10 @@ mod tests {
         let pb: Arc<str> = paths::from_key(COLL, &b).into();
         let pc: Arc<str> = paths::from_key(COLL, &c).into();
         let out = resolver
-            .effective_writers(&[pa.clone(), pb.clone(), pc.clone()])
+            .effective_writers(
+                &[pa.clone(), pb.clone(), pc.clone()],
+                Requirement::AtLeast(resolver.now()),
+            )
             .await
             .unwrap();
 
@@ -669,14 +696,14 @@ mod tests {
 
         // Warm the resolver's own cache with one cold load.
         resolver
-            .resolve_key(&key_path, Freshness::Latest)
+            .resolve_key(&key_path, Requirement::AtLeast(resolver.now()))
             .await
             .unwrap();
         log.lock().unwrap().clear();
 
         // AllowStale serves the cached shard: no backend read at all.
         let (holders, _) = resolver
-            .resolve_key(&key_path, Freshness::AllowStale)
+            .resolve_key(&key_path, Requirement::Any)
             .await
             .unwrap();
         assert_eq!(holders.writer, Some(writer.clone()), "still resolves");
@@ -689,7 +716,7 @@ mod tests {
         // Latest revalidates the cached shard with one conditional read.
         log.lock().unwrap().clear();
         resolver
-            .resolve_key(&key_path, Freshness::Latest)
+            .resolve_key(&key_path, Requirement::AtLeast(resolver.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -721,21 +748,30 @@ mod tests {
         let (resolver, _mon, _bg) = resolver_over(backend);
         assert_eq!(
             resolver
-                .effective_writer(&paths::from_key(COLL, b"live-key"))
+                .effective_writer(
+                    &paths::from_key(COLL, b"live-key"),
+                    Requirement::AtLeast(resolver.now())
+                )
                 .await
                 .unwrap(),
             Some(live)
         );
         assert_eq!(
             resolver
-                .effective_writer(&paths::from_key(COLL, b"dead-key"))
+                .effective_writer(
+                    &paths::from_key(COLL, b"dead-key"),
+                    Requirement::AtLeast(resolver.now())
+                )
                 .await
                 .unwrap(),
             None
         );
         assert_eq!(
             resolver
-                .effective_writer(&paths::from_key(COLL, b"missing"))
+                .effective_writer(
+                    &paths::from_key(COLL, b"missing"),
+                    Requirement::AtLeast(resolver.now())
+                )
                 .await
                 .unwrap(),
             None
@@ -766,7 +802,10 @@ mod tests {
 
         assert_eq!(
             resolver
-                .effective_writer(&paths::from_key(COLL, b"live-key"))
+                .effective_writer(
+                    &paths::from_key(COLL, b"live-key"),
+                    Requirement::AtLeast(resolver.now())
+                )
                 .await
                 .unwrap(),
             Some(live),
@@ -774,7 +813,10 @@ mod tests {
         );
         assert_eq!(
             resolver
-                .effective_writer(&paths::from_key(COLL, b"dead-key"))
+                .effective_writer(
+                    &paths::from_key(COLL, b"dead-key"),
+                    Requirement::AtLeast(resolver.now())
+                )
                 .await
                 .unwrap(),
             None,

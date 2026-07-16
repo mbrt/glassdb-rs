@@ -28,21 +28,18 @@ impl Collection {
             .await
     }
 
-    /// Reads the value for `key` allowing stale results up to `max_staleness`,
-    /// returning `None` when the key is absent.
+    /// Reads the value for `key` outside a transaction, accepting cached
+    /// coordination state without serializable validation, and returning `None`
+    /// when the key is absent. `_max_staleness` is retained for API
+    /// compatibility; the decoded cache serves any usable copy (ADR-036).
     pub async fn read_stale(
         &self,
         key: &[u8],
-        max_staleness: Duration,
+        _max_staleness: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
         let p = paths::from_key(&self.prefix, key);
-        let r = Reader::new(
-            self.db.values.clone(),
-            self.db.shards.clone(),
-            self.db.tmon.clone(),
-            self.db.retry,
-        );
-        match r.read(&p, max_staleness).await {
+        let r = Reader::new(self.db.shards.clone(), self.db.tmon.clone(), self.db.retry);
+        match r.read(&p).await {
             Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),
             Err(e) => Err(Error::from_read(e)),
         }

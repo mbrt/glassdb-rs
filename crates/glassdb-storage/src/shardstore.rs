@@ -16,9 +16,10 @@ use std::sync::Arc;
 use glassdb_backend as backend;
 use glassdb_data::paths;
 
+use crate::cached_store::{Requirement, ValidationTime};
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
-use crate::object_cache::{Freshness, ObjectCache};
+use crate::object_cache::ObjectCache;
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
@@ -99,6 +100,12 @@ impl ShardStore {
         self.objects.clone()
     }
 
+    /// The current logical time; pass `Requirement::AtLeast(store.now())` for a
+    /// "latest" (revalidating) load.
+    pub fn now(&self) -> ValidationTime {
+        self.objects.now()
+    }
+
     /// Loads the B-link root node from the collection root `_i` under `prefix`,
     /// or `None` if the collection does not exist yet (ADR-031). The root object
     /// carries both the node and the collection metadata; this returns just the
@@ -106,11 +113,11 @@ impl ShardStore {
     pub async fn load_root_node(
         &self,
         prefix: &str,
-        freshness: Freshness,
+        req: Requirement,
     ) -> Result<Option<(Node, backend::Version)>, StorageError> {
         match self
             .objects
-            .read(&paths::collection_info(prefix), freshness)
+            .read(&paths::collection_info(prefix), req)
             .await
         {
             Ok(r) => Ok(Some((
@@ -130,11 +137,11 @@ impl ShardStore {
         &self,
         prefix: &str,
         token: &str,
-        freshness: Freshness,
+        req: Requirement,
     ) -> Result<(Node, backend::Version), StorageError> {
         let r = self
             .objects
-            .read(&paths::from_node(prefix, token), freshness)
+            .read(&paths::from_node(prefix, token), req)
             .await?;
         Ok((Node::decode(&r.value)?, r.version))
     }
@@ -201,7 +208,7 @@ impl ShardStore {
             for path in page.objects {
                 let record_id = paths::structural_log_id_of(&path)
                     .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
-                match self.objects.read(&path, Freshness::Latest).await {
+                match self.objects.read(&path, Requirement::Any).await {
                     Ok(read) => records.push((record_id, StructuralLog::decode(&read.value)?)),
                     Err(StorageError::NotFound) => {}
                     Err(e) => return Err(e),
@@ -239,10 +246,10 @@ impl ShardStore {
     pub async fn load_leaf(
         &self,
         path: &str,
-        freshness: Freshness,
+        req: Requirement,
     ) -> Result<LoadedLeaf, StorageError> {
         if paths::is_collection_info(path) {
-            match self.objects.read(path, freshness).await {
+            match self.objects.read(path, req).await {
                 Ok(r) => {
                     let root = CollectionRoot::decode(&r.value)?;
                     let entries = root
@@ -266,7 +273,7 @@ impl ShardStore {
                 Err(e) => Err(e),
             }
         } else {
-            match self.objects.read(path, freshness).await {
+            match self.objects.read(path, req).await {
                 Ok(r) => {
                     let node = Node::decode(&r.value)?;
                     let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
@@ -333,7 +340,7 @@ impl ShardStore {
     ) -> Result<(CollectionRoot, backend::Version), StorageError> {
         let r = self
             .objects
-            .read(&paths::collection_info(prefix), Freshness::Latest)
+            .read(&paths::collection_info(prefix), Requirement::Any)
             .await?;
         Ok((CollectionRoot::decode(&r.value)?, r.version))
     }
@@ -426,7 +433,7 @@ mod tests {
 
         let reader = store_over(backend.clone());
         let v1 = reader
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(reader.now()))
             .await
             .unwrap()
             .version;
@@ -434,7 +441,7 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         let v2 = reader
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(reader.now()))
             .await
             .unwrap()
             .version;
@@ -460,14 +467,14 @@ mod tests {
 
         let reader = store_over(backend.clone());
         // Warm the cache with one cold full read.
-        reader.load_leaf(&path, Freshness::Latest).await.unwrap();
+        reader
+            .load_leaf(&path, Requirement::AtLeast(reader.now()))
+            .await
+            .unwrap();
         assert_eq!(count(&log, "read"), 1);
 
         // A cached AllowStale load touches the backend for nothing.
-        reader
-            .load_leaf(&path, Freshness::AllowStale)
-            .await
-            .unwrap();
+        reader.load_leaf(&path, Requirement::Any).await.unwrap();
         assert_eq!(count(&log, "read"), 1, "cached AllowStale must not read");
         assert_eq!(
             count(&log, "read_if_modified"),
@@ -477,10 +484,7 @@ mod tests {
 
         // An uncached node has nothing to serve, so it falls through to a read.
         let other = paths::from_node(COLL, "tok2");
-        reader
-            .load_leaf(&other, Freshness::AllowStale)
-            .await
-            .unwrap();
+        reader.load_leaf(&other, Requirement::Any).await.unwrap();
         assert_eq!(count(&log, "read"), 2, "uncached AllowStale falls through");
     }
 
@@ -491,14 +495,20 @@ mod tests {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = paths::from_node(COLL, "tok");
 
-        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
         assert!(
             store
                 .store_leaf(&path, &Shard::new(), &loaded.locks, loaded.kind(), None,)
                 .await
                 .unwrap()
         );
-        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
         let v1 = loaded.version.clone().expect("node exists after create");
 
         // CAS a new generation over the loaded version, then confirm the next
@@ -516,7 +526,7 @@ mod tests {
                 .unwrap()
         );
         let v2 = store
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
             .await
             .unwrap()
             .version;

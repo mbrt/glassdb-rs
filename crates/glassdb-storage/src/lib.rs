@@ -1,10 +1,11 @@
-//! Storage and caching layers: a byte-weighted LRU cache shared by two facades
-//! — a writer-keyed [`ValueCache`] for user values and a backend-version-keyed,
-//! read/write-through [`ObjectCache`] for coordination objects — plus the shard
-//! / root coordination store, transaction-log persistence, and structural
-//! split recovery records.
+//! Storage and caching layers: a decoded, path-keyed object cache
+//! ([`CachedStore`]) with bounded-freshness validation (ADR-036), fronted by
+//! the backend-version-keyed, read/write-through [`ObjectCache`] facade for
+//! coordination objects — plus the shard / root coordination store,
+//! transaction-log persistence, and structural split recovery records.
 
 pub mod cache;
+mod cached_store;
 mod directory;
 mod entry;
 mod error;
@@ -17,16 +18,18 @@ mod shardstore;
 mod structlog;
 mod tlogger;
 pub mod txobject;
-mod value_cache;
 mod version;
 
 pub use cache::{Cache, Weighable};
+pub use cached_store::{
+    CachedStore, CasResult, Codec, Observation, Requirement, Revision, Validated, ValidationTime,
+};
 pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use entry::SharedCache;
 pub use error::StorageError;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};
-pub use object_cache::{Freshness, ObjectCache, ObjectRead};
+pub use object_cache::{ObjectCache, ObjectRead};
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LeafKind, LoadedLeaf, ShardStore};
@@ -34,5 +37,4 @@ pub use structlog::StructuralLog;
 pub use tlogger::{
     LockScope, PathLock, TLogger, TValue, TxCommitStatus, TxListPage, TxLog, TxStatus, TxWrite,
 };
-pub use value_cache::{MAX_STALENESS, ValueCache, ValueRead};
 pub use version::Version;

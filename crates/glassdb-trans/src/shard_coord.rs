@@ -35,8 +35,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    Freshness, LeafKind, LockType, NodeLocks, Shard, ShardEntry, ShardStore, SplitPolicy,
-    StorageError,
+    LeafKind, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError, ValidationTime,
 };
 
 use crate::error::TransError;
@@ -168,10 +168,18 @@ pub(crate) trait ShardResolver: Send + Sync {
     /// never contend, so they always reorder (ADR-026). A scheduling hint only.
     fn reorderable(&self) -> bool;
 
-    /// The outcome delivered when the bounded CAS budget is exhausted under
-    /// churn: acquirers must release and re-lock (`Conflict`); releases and
+    /// The outcome delivered when this round cannot deliver a definitive result
+    /// (the bounded CAS budget is exhausted under churn, or a reroute abandons
+    /// the leaf): acquirers must release and re-lock (`Conflict`); releases and
     /// write-backs are best-effort (`Released`).
-    fn exhausted_outcome(&self) -> FoldOutcome;
+    ///
+    /// `in_doubt` is set when some CAS this round came back in-doubt, so its
+    /// write may have landed durably. Commit-install must not downgrade that
+    /// ambiguity to a definitive `Moved` (which would abandon-and-rerun a
+    /// possibly-committed object); it surfaces `InDoubt` instead. Idempotent
+    /// resolvers (acquire/release/write-back) ignore it: a re-fold recovers
+    /// their landed-but-unacked CAS on the next submission.
+    fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome;
 
     /// The raw keys this member may **create or update**, so the coordinator can
     /// verify the loaded leaf still owns them before folding (ADR-031). A split
@@ -201,15 +209,32 @@ struct ShardMember {
 /// The leaf is identified by its object `path` — the collection root `_i` for a
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
-/// resolver and outcome slot. `first_freshness` is the cache freshness for the
-/// round's first fold attempt: `AllowStale` lets a lone round reuse a leaf the
-/// submitter just cached (the single read-write fast path) without a
-/// revalidation round-trip; any reload uses `Latest`.
+/// resolver and outcome slot. `first_req` is the freshness the round's first
+/// fold attempt requires of the cached leaf. Batch-intended coordination
+/// (acquire / release / write-back) submits [`Requirement::AtLeast`] so the
+/// driver's shared load is a backend revalidation that opens the dedup merge
+/// window — the one read amortized across every contender that joins (the
+/// N->1 primitive, ADR-025/028/036). The single read-write install fast path
+/// submits [`Requirement::Any`]: the round's CAS arbitrates, so a stale cached
+/// leaf only costs a precondition miss (which invalidates the entry so the
+/// retry reloads fresh) and it skips the revalidation round-trip.
 #[derive(Clone)]
 struct CasReq {
     path: String,
     members: BTreeMap<TxId, ShardMember>,
-    first_freshness: Freshness,
+    first_req: Requirement,
+}
+
+/// The stronger of two freshness requirements: the later bound wins, and any
+/// bound outranks [`Requirement::Any`]. Used to merge co-scheduled submissions
+/// so the round's first load satisfies every member.
+fn stronger_req(a: Requirement, b: Requirement) -> Requirement {
+    match (a, b) {
+        (Requirement::AtLeast(x), Requirement::AtLeast(y)) => Requirement::AtLeast(x.max(y)),
+        (Requirement::AtLeast(_), _) => a,
+        (_, Requirement::AtLeast(_)) => b,
+        _ => Requirement::Any,
+    }
 }
 
 impl MergeRequest for CasReq {
@@ -226,10 +251,7 @@ impl MergeRequest for CasReq {
         Some(CasReq {
             path: self.path.clone(),
             members,
-            // A merged round has more than one member, so it loads the leaf
-            // fresh; `AllowStale` is only a lone-round fast-path optimization
-            // and is dropped once contenders join.
-            first_freshness: Freshness::Latest,
+            first_req: stronger_req(self.first_req, other.first_req),
         })
     }
 
@@ -319,11 +341,12 @@ impl CasWorker {
         // committed object a peer already observed.
         let mut saw_in_doubt = false;
         // The first fold attempt may reuse a cached shard the submitter just
-        // loaded (a lone single read-write round; `AllowStale` serves it without
-        // a revalidation round-trip, ADR-030). Any later attempt reloads
-        // `Latest`. A stale cached shard only costs a CAS miss and a reload,
-        // never correctness.
-        let first_freshness = batch.merged().first_freshness;
+        // loaded (a lone single read-write round; `Requirement::Any` serves it
+        // without a revalidation round-trip, ADR-030). A later attempt only runs
+        // after a CAS miss, which invalidated the stale entry, so `Any` reloads
+        // fresh from the backend. A stale cached shard only costs a CAS miss and
+        // a reload, never correctness (ADR-036).
+        let first_req = batch.merged().first_req;
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
@@ -334,12 +357,12 @@ impl CasWorker {
                 tmon: &self.core.tmon,
                 cause,
             };
-            let freshness = if attempt == 0 {
-                first_freshness
+            let req = if attempt == 0 {
+                first_req
             } else {
-                Freshness::Latest
+                Requirement::Any
             };
-            let loaded = match self.core.shards.load_leaf(path, freshness).await {
+            let loaded = match self.core.shards.load_leaf(path, req).await {
                 Ok(loaded) => loaded,
                 // A root split can turn the routed root leaf into an index
                 // between grouping and this load. Deliver each resolver's
@@ -347,7 +370,8 @@ impl CasWorker {
                 Err(StorageError::Precondition) => {
                     let members = shard_members(batch);
                     for member in members.values() {
-                        *member.slot.lock().unwrap() = Some(member.resolver.exhausted_outcome());
+                        *member.slot.lock().unwrap() =
+                            Some(member.resolver.exhausted_outcome(saw_in_doubt));
                     }
                     return Ok(());
                 }
@@ -388,7 +412,7 @@ impl CasWorker {
                 // and fold nothing for it. Its caller re-resolves through the
                 // directory and re-submits on the leaf that now owns the key.
                 if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
-                    results.push((tx.clone(), m.resolver.exhausted_outcome()));
+                    results.push((tx.clone(), m.resolver.exhausted_outcome(saw_in_doubt)));
                     continue;
                 }
                 match m.resolver.resolve(&ctx, &entries, &locks).await? {
@@ -516,7 +540,7 @@ impl CasWorker {
         // resolver's exhaustion outcome (acquirers `Conflict` and release/re-lock,
         // best-effort releases / write-backs `Released`, ADR-024/026).
         for m in shard_members(batch).values() {
-            *m.slot.lock().unwrap() = Some(m.resolver.exhausted_outcome());
+            *m.slot.lock().unwrap() = Some(m.resolver.exhausted_outcome(saw_in_doubt));
         }
         Ok(())
     }
@@ -605,6 +629,23 @@ impl ShardCoordinator {
         self.inner.dedup.snapshot()
     }
 
+    /// Captures the current logical time as a per-round coordination barrier.
+    ///
+    /// Batch-intended coordination (lock acquire, release, write-back)
+    /// submits with `Requirement::AtLeast(coord.now())`: the driver's shared
+    /// leaf load is a single backend revalidation that (1) folds current state
+    /// and (2) opens the dedup merge window during which co-scheduled
+    /// contenders join the round, so N contenders collapse to one load + one
+    /// CAS (ADR-025/028/036). That one read is amortized across the whole
+    /// batch — it is the N->1 primitive, not the per-read `now()` anti-pattern
+    /// the ADR warns against for validation. The single read-write install
+    /// fast path submits `Requirement::Any` instead: it expects to be solo (or
+    /// to merge into an acquire's already-open round) and reuses its cached
+    /// leaf without a revalidation round-trip.
+    pub(crate) fn now(&self) -> ValidationTime {
+        self.inner.core.shards.now()
+    }
+
     /// Submits one shard member (any resolver installed by a caller — the
     /// [`Locker`](crate::Locker)'s acquire / write-back / release or the
     /// [`Algo`](crate::Algo)'s commit-install) through the [`Dedup`] and awaits
@@ -614,11 +655,16 @@ impl ShardCoordinator {
     /// the coordinator was shut down before the round ran, so acquires can error
     /// while best-effort releases / write-backs treat it as a no-op.
     ///
-    /// `first_freshness` chooses the cache freshness for the round's first fold
-    /// attempt: a submitter that just read this leaf (the single read-write fast
-    /// path, for its eligibility check) passes `AllowStale` so the round reuses
-    /// the cached copy instead of revalidating it (ADR-030); callers with no
-    /// fresh cached snapshot pass `Latest`.
+    /// `first_req` chooses the freshness the round's first fold attempt requires
+    /// of the cached leaf. Batch-intended callers (acquire / release /
+    /// write-back) pass [`Requirement::AtLeast(now())`](Self::now) so the
+    /// driver's shared load revalidates against the backend, folding current
+    /// state and opening the dedup merge window that lets co-scheduled
+    /// contenders collapse into one load + one CAS (ADR-025/028/036). The
+    /// single read-write install fast path passes [`Requirement::Any`]: the
+    /// round's CAS arbitrates, so a stale cached leaf only costs a precondition
+    /// miss (which invalidates it) and a fresh reload, never correctness — and
+    /// it reuses its warm cache without a revalidation round-trip (ADR-030).
     ///
     /// `path` is the leaf's object path — the collection root `_i` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
@@ -628,7 +674,7 @@ impl ShardCoordinator {
         path: &str,
         id: &TxId,
         resolver: Arc<dyn ShardResolver>,
-        first_freshness: Freshness,
+        first_req: Requirement,
     ) -> Result<Option<FoldOutcome>, TransError> {
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
@@ -642,7 +688,7 @@ impl ShardCoordinator {
         let req = CasReq {
             path: path.to_string(),
             members,
-            first_freshness,
+            first_req,
         };
         match self.inner.dedup.run(path, req).await {
             // The worker deposits an outcome for every member before it returns
@@ -687,7 +733,7 @@ mod tests {
     };
     use glassdb_concurr::Background;
     use glassdb_data::paths;
-    use glassdb_storage::{LockType, Node, ObjectCache, Shard, SharedCache, TLogger, ValueCache};
+    use glassdb_storage::{LockType, Node, ObjectCache, Shard, SharedCache, TLogger};
 
     const COLL: &str = "coordp";
 
@@ -711,22 +757,41 @@ mod tests {
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
     ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+        coord_over_retry(backend, policy, hinter, RetryConfig::default())
+    }
+
+    // A coordinator with a near-zero CAS backoff, so a test that deliberately
+    // exhausts the CAS budget does not pay the default exponential sleep.
+    fn coord_over_fast(
+        backend: Arc<dyn Backend>,
+    ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+        let retry = RetryConfig {
+            initial_interval: Duration::from_nanos(1),
+            max_interval: Duration::from_nanos(1),
+        };
+        coord_over_retry(
+            backend,
+            SplitPolicy::default(),
+            Arc::new(NoSplitHints),
+            retry,
+        )
+    }
+
+    fn coord_over_retry(
+        backend: Arc<dyn Backend>,
+        policy: SplitPolicy,
+        hinter: Arc<dyn SplitHinter>,
+        retry: RetryConfig,
+    ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
         let cache = SharedCache::new(1 << 20);
-        let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(backend, &cache);
         let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(values, tl, Arc::downgrade(&bg));
+        let mon = Monitor::new(tl, Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord = ShardCoordinator::with_hinter(
-            shards.clone(),
-            resolver,
-            mon,
-            RetryConfig::default(),
-            policy,
-            hinter,
-        );
+        let coord =
+            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
         (coord, shards, bg)
     }
 
@@ -754,7 +819,10 @@ mod tests {
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
     async fn store_shard_entries(store: &ShardStore, path: &str, entries: Vec<ShardEntry>) {
-        let loaded = store.load_leaf(path, Freshness::Latest).await.unwrap();
+        let loaded = store
+            .load_leaf(path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
         let shard = Shard::from_entries(entries);
         assert!(
             store
@@ -791,7 +859,7 @@ mod tests {
     // Loads the leaf's entries from a cold store, for asserting what landed.
     async fn cold_entries(store: &ShardStore, path: &str) -> Shard {
         store
-            .load_leaf(path, Freshness::Latest)
+            .load_leaf(path, Requirement::AtLeast(store.now()))
             .await
             .unwrap()
             .entries
@@ -837,7 +905,7 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self) -> FoldOutcome {
+        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
             FoldOutcome::Conflict
         }
 
@@ -868,7 +936,7 @@ mod tests {
             true
         }
 
-        fn exhausted_outcome(&self) -> FoldOutcome {
+        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
             FoldOutcome::Released {
                 superseded: Vec::new(),
             }
@@ -913,7 +981,7 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self) -> FoldOutcome {
+        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
             FoldOutcome::Conflict
         }
     }
@@ -988,7 +1056,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(coord.now()),
             )
             .await
             .unwrap();
@@ -1032,7 +1100,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(coord.now()),
             )
             .await
             .unwrap();
@@ -1071,7 +1139,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(coord.now()),
             )
             .await
             .unwrap();
@@ -1096,7 +1164,12 @@ mod tests {
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(SkipRelease),
+                Requirement::AtLeast(coord.now()),
+            )
             .await
             .unwrap();
         assert!(matches!(out, Some(FoldOutcome::Released { .. })));
@@ -1132,7 +1205,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(coord.now()),
             )
             .await
             .unwrap();
@@ -1169,12 +1242,15 @@ mod tests {
         )
         .await;
         let (coord, shards, _bg) = coord_over(backend.clone());
-        shards.load_leaf(&leaf(), Freshness::Latest).await.unwrap();
+        shards
+            .load_leaf(&leaf(), Requirement::AtLeast(shards.now()))
+            .await
+            .unwrap();
 
         let tx = TxId::with_priority(2, b"t");
         log.lock().unwrap().clear();
         coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::AllowStale)
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
             .await
             .unwrap();
         assert_eq!(
@@ -1185,7 +1261,12 @@ mod tests {
 
         log.lock().unwrap().clear();
         coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(SkipRelease),
+                Requirement::AtLeast(coord.now()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1224,7 +1305,7 @@ mod tests {
                     tx: t1.clone(),
                     trace: tr1,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(c1.now()),
             )
             .await
         });
@@ -1240,7 +1321,7 @@ mod tests {
                     tx: t2.clone(),
                     trace: tr2,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(c2.now()),
             )
             .await
         });
@@ -1322,7 +1403,7 @@ mod tests {
                     tx: t1.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(c1.now()),
             )
             .await
         });
@@ -1338,7 +1419,7 @@ mod tests {
                     tx: t2.clone(),
                     admission: StageAdmission::AddsKey,
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(c2.now()),
             )
             .await
         });
@@ -1379,7 +1460,12 @@ mod tests {
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Freshness::Latest)
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(SkipRelease),
+                Requirement::AtLeast(coord.now()),
+            )
             .await
             .unwrap();
         assert!(
@@ -1458,8 +1544,12 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self) -> FoldOutcome {
-            FoldOutcome::Moved
+        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt {
+                FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into())
+            } else {
+                FoldOutcome::Moved
+            }
         }
 
         fn owned_keys(&self) -> Vec<&[u8]> {
@@ -1513,7 +1603,7 @@ mod tests {
                     folds: std::sync::atomic::AtomicUsize::new(0),
                     seen_in_doubt: seen_in_doubt.clone(),
                 }),
-                Freshness::Latest,
+                Requirement::AtLeast(coord.now()),
             )
             .await
             .unwrap();
@@ -1528,6 +1618,120 @@ mod tests {
             matches!(out, Some(FoldOutcome::InDoubt(_))),
             "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
              not Moved (else the fast path abandons and double-applies)"
+        );
+    }
+
+    // A commit-install-shaped resolver that stages its write lock on *every*
+    // fold, so the round keeps issuing CASes until the coordinator's budget is
+    // exhausted. Used to drive the exhaustion path (which bypasses `resolve`'s
+    // classification and delivers `exhausted_outcome`).
+    struct AlwaysStageProbe {
+        key: Vec<u8>,
+        tx: TxId,
+    }
+
+    #[async_trait::async_trait]
+    impl ShardResolver for AlwaysStageProbe {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            Ok(Step::Stage {
+                entries: vec![(
+                    self.key.clone(),
+                    entry(&self.key, LockType::Write, Some(&self.tx), None),
+                )],
+                locks: staged_locks.clone(),
+                admission: StageAdmission::ExistingKeys,
+                outcome: FoldOutcome::Landed,
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt {
+                FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into())
+            } else {
+                FoldOutcome::Moved
+            }
+        }
+
+        fn owned_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+    }
+
+    // In-doubt on the first leaf CAS, then a precondition-miss on every
+    // subsequent one — the churn that exhausts the CAS budget without ever
+    // acking.
+    fn in_doubt_then_miss_forever(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
+        let backend = HookBackend::new(inner);
+        let leaf_cas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        backend.set_before(move |op| {
+            let result = match op {
+                BackendOp::WriteIf { path, .. }
+                    if path.contains("/_n/") || path.ends_with("/_i") =>
+                {
+                    match leaf_cas.fetch_add(1, Ordering::SeqCst) {
+                        0 => Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt leaf CAS".into(),
+                        )),
+                        _ => Err(glassdb_backend::BackendError::Precondition),
+                    }
+                }
+                _ => Ok(()),
+            };
+            let future: HookFuture = Box::pin(async move { result });
+            future
+        });
+        backend
+    }
+
+    // Regression (single read-write fast path double-apply): the sticky in-doubt
+    // flag must also survive the *exhaustion* path, not just the in-round
+    // `resolve` classification. When an in-doubt CAS (whose lock may have landed
+    // durably) is followed by enough precondition-miss churn to exhaust the CAS
+    // budget, the coordinator delivers `exhausted_outcome`, which must surface
+    // `InDoubt` for commit-install — otherwise the fast path is handed `Moved`
+    // and abandons-and-reruns a possibly-committed object.
+    #[tokio::test]
+    async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(mem);
+        let (coord, shards, _bg) = coord_over_fast(backend);
+
+        let seed = TxId::with_priority(1, b"seed");
+        store_shard_entries(
+            &shards,
+            &leaf(),
+            vec![entry(b"seed", LockType::None, None, Some(&seed))],
+        )
+        .await;
+
+        let tx = TxId::with_priority(2, b"install");
+        let out = coord
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(AlwaysStageProbe {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                }),
+                Requirement::AtLeast(coord.now()),
+            )
+            .await
+            .unwrap();
+        coord.close().await;
+
+        assert!(
+            matches!(out, Some(FoldOutcome::InDoubt(_))),
+            "an exhausted budget after an in-doubt CAS must classify InDoubt, not \
+             Moved (else the fast path abandons and double-applies)"
         );
     }
 }

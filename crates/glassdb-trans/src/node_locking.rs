@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{LockType, NodeLocks, ShardEntry, TxCommitStatus};
+use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -31,7 +31,7 @@ pub(crate) async fn try_reclaim(
         return Ok(Reclaim::Wait);
     }
     monitor.wound_tx(holder).await?;
-    if monitor.tx_status(holder).await? == TxCommitStatus::Aborted {
+    if monitor.tx_status(holder, Requirement::Any).await? == TxCommitStatus::Aborted {
         Ok(Reclaim::Wounded)
     } else {
         Ok(Reclaim::Wait)
@@ -53,7 +53,8 @@ impl<'a> NodeLockReconciler<'a> {
     async fn prune_finalized(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
         for holder in locks.structure().holders().to_vec() {
             if &holder != self.id
-                && self.monitor.tx_status(&holder).await? != TxCommitStatus::Pending
+                && self.monitor.tx_status(&holder, Requirement::Any).await?
+                    != TxCommitStatus::Pending
             {
                 locks.remove_structure_holder(&holder);
             }
@@ -65,7 +66,8 @@ impl<'a> NodeLockReconciler<'a> {
     async fn prune_finalized_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
         for holder in locks.membership().holders().to_vec() {
             if &holder != self.id
-                && self.monitor.tx_status(&holder).await? != TxCommitStatus::Pending
+                && self.monitor.tx_status(&holder, Requirement::Any).await?
+                    != TxCommitStatus::Pending
             {
                 locks.remove_membership_holder(&holder);
             }
@@ -84,7 +86,8 @@ impl<'a> NodeLockReconciler<'a> {
                 if &holder == self.id {
                     continue;
                 }
-                if self.monitor.tx_status(&holder).await? == TxCommitStatus::Pending
+                if self.monitor.tx_status(&holder, Requirement::Any).await?
+                    == TxCommitStatus::Pending
                     && matches!(
                         try_reclaim(self.monitor, self.id, &holder).await?,
                         Reclaim::Wait
@@ -116,7 +119,7 @@ impl<'a> NodeLockReconciler<'a> {
             if &holder == self.id {
                 continue;
             }
-            if self.monitor.tx_status(&holder).await? == TxCommitStatus::Pending
+            if self.monitor.tx_status(&holder, Requirement::Any).await? == TxCommitStatus::Pending
                 && matches!(
                     try_reclaim(self.monitor, self.id, &holder).await?,
                     Reclaim::Wait
@@ -153,7 +156,8 @@ impl<'a> NodeLockReconciler<'a> {
                 if &holder == self.id {
                     continue;
                 }
-                if self.monitor.tx_status(&holder).await? == TxCommitStatus::Pending
+                if self.monitor.tx_status(&holder, Requirement::Any).await?
+                    == TxCommitStatus::Pending
                     && matches!(
                         try_reclaim(self.monitor, self.id, &holder).await?,
                         Reclaim::Wait
@@ -308,7 +312,7 @@ impl ShardResolver for StructureWriteResolver {
         false
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Conflict
     }
 }
@@ -326,7 +330,12 @@ async fn resolve_entries(
     for (key, entry) in entries {
         let resolved = ctx
             .resolver
-            .resolve_holders(&paths::from_key(&prefix, key), entry, Some(id))
+            .resolve_holders(
+                &paths::from_key(&prefix, key),
+                entry,
+                Some(id),
+                Requirement::Any,
+            )
             .await?;
         let mut entry = entry.clone();
         entry.current_writer = resolved.writer;

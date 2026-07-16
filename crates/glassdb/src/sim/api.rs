@@ -143,6 +143,29 @@ fn possible_values(models: &BTreeSet<ApiModel>, key: usize) -> BTreeSet<Option<u
     models.iter().map(|model| model[key]).collect()
 }
 
+/// Marks the error a transaction body returns when a read observes a value
+/// outside its begin-snapshot model. A stale read is expected under ADR-036
+/// (execution accepts any cached state), so the body cannot assert on it
+/// directly: it returns this marker instead, and the engine validates the read
+/// set. A read that was merely stale fails validation and the transaction
+/// retries with fresh state; a read that validates as *current* yet lies
+/// outside the model is a genuine serializability violation, which surfaces as
+/// this marker on the committed run and fails the test.
+const OUT_OF_MODEL_MARKER: &str = "api-out-of-model";
+
+fn out_of_model_error(key: usize, actual: Option<u8>, allowed: &BTreeSet<Option<u8>>) -> Error {
+    Error::internal(format!(
+        "{OUT_OF_MODEL_MARKER}: API key k{key} read {actual:?} outside modeled states {allowed:?}"
+    ))
+}
+
+fn out_of_model_message(err: &Error) -> Option<&str> {
+    match err {
+        Error::Internal { msg, .. } if msg.starts_with(OUT_OF_MODEL_MARKER) => Some(msg),
+        _ => None,
+    }
+}
+
 async fn run_api_program(
     db: &Database,
     program: &ApiTransaction,
@@ -191,12 +214,12 @@ async fn run_api_program(
                                 actual, expected,
                                 "API key k{key} violated repeatable reads"
                             );
+                        } else if !allowed[*key].contains(&actual) {
+                            // Stale reads are legal (ADR-036); let commit
+                            // validation decide whether this attempt must retry
+                            // rather than asserting on a possibly-stale value.
+                            return Err(out_of_model_error(*key, actual, &allowed[*key]));
                         } else {
-                            assert!(
-                                allowed[*key].contains(&actual),
-                                "API key k{key} read {actual:?} outside modeled states {:?}",
-                                allowed[*key]
-                            );
                             observed[*key] = Some(actual);
                         }
                     }
@@ -213,6 +236,16 @@ async fn run_api_program(
             if should_abort { tx.abort() } else { Ok(()) }
         })
         .await;
+
+    // A surfaced out-of-model marker means the engine validated the read set as
+    // current yet it lies outside the begin-snapshot model: a real
+    // serializability violation (a merely-stale read would have retried inside
+    // the engine and never reached here).
+    if let Err(error) = &result
+        && let Some(message) = out_of_model_message(error)
+    {
+        panic!("{message}");
+    }
 
     if program.abort {
         return match result {

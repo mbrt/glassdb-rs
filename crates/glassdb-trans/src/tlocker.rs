@@ -35,7 +35,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Directory, Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry};
+use glassdb_storage::{
+    Directory, LockScope, LockType, NodeLocks, PathLock, Requirement, ShardEntry,
+};
 
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
@@ -181,13 +183,13 @@ async fn build_groups(
     // borrowing iterator (which would not be higher-ranked / `Send` when a
     // caller spawns the lock).
     let items: Vec<(String, Desired)> = by_path.into_iter().collect();
-    // Route with interior nodes served from cache (ADR-031 hot-path invariant):
-    // a stale index misroute self-corrects via right-links, and the leaf's own
-    // coordination CAS revalidates at the version, so the root `_i` is not
-    // revalidated on every lock. The terminal leaf is read `Latest` to keep
-    // routing accurate and avoid needless re-routes.
+    // Route from cache (ADR-031 hot-path invariant, ADR-036): a stale index
+    // misroute self-corrects via right-links, and the leaf's own coordination
+    // CAS revalidates at the version, so neither the interior nodes nor the
+    // terminal leaf are revalidated on every lock — the arbitrating CAS catches
+    // a stale routing.
     let grouped = dir
-        .group_keys_by_leaf_fresh(items, Freshness::AllowStale, Freshness::Latest)
+        .group_keys_by_leaf(items, Requirement::Any)
         .await
         .map_err(|e| TransError::with_source("grouping keys by leaf", e))?;
 
@@ -227,7 +229,7 @@ async fn build_groups(
                 &scan.prefix,
                 &scan.range.start,
                 scan.frontier.as_deref(),
-                Freshness::Latest,
+                Requirement::Any,
             )
             .await?
         {
@@ -317,7 +319,7 @@ impl ShardResolver for AcquireResolver {
             .all(|i| matches!(i.desired, Desired::Read))
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Conflict
     }
 
@@ -377,7 +379,7 @@ impl ShardResolver for WriteBackResolver {
         true
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Released {
             superseded: Vec::new(),
         }
@@ -420,7 +422,7 @@ impl ShardResolver for ReleaseResolver {
         true
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Released {
             superseded: Vec::new(),
         }
@@ -473,7 +475,7 @@ async fn resolve_and_lock(
     // as `Pending` here is genuinely live (ADR-021).
     let resolved = ctx
         .resolver
-        .resolve_holders(&intent.key_path, &e, Some(id))
+        .resolve_holders(&intent.key_path, &e, Some(id), Requirement::Any)
         .await?;
     e.current_writer = resolved.writer;
     e.deleted = resolved.deleted;
@@ -892,7 +894,7 @@ impl Locker {
         });
         match self
             .coord
-            .submit_shard(path, id, resolver, Freshness::Latest)
+            .submit_shard(path, id, resolver, Requirement::AtLeast(self.coord.now()))
             .await?
         {
             // The lock landed: record the leaf hold so the serial-fallback
@@ -925,7 +927,7 @@ impl Locker {
         });
         match self
             .coord
-            .submit_shard(path, id, resolver, Freshness::Latest)
+            .submit_shard(path, id, resolver, Requirement::AtLeast(self.coord.now()))
             .await?
         {
             Some(FoldOutcome::Released { superseded }) => Ok(superseded),
@@ -941,7 +943,7 @@ impl Locker {
     pub(crate) async fn release_leaf(&self, id: &TxId, path: &str) -> Result<(), TransError> {
         let resolver = Arc::new(ReleaseResolver { id: id.clone() });
         self.coord
-            .submit_shard(path, id, resolver, Freshness::Latest)
+            .submit_shard(path, id, resolver, Requirement::AtLeast(self.coord.now()))
             .await
             .map(|_| ())
     }
@@ -1056,8 +1058,8 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_storage::{
-        CollectionRoot, Directory, Freshness, Node, ObjectCache, Shard, ShardEntry, ShardStore,
-        SharedCache, SplitPolicy, TLogger, TxCommitStatus, ValueCache,
+        CollectionRoot, Directory, Node, ObjectCache, Requirement, Shard, ShardEntry, ShardStore,
+        SharedCache, SplitPolicy, TLogger, TxCommitStatus,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1077,11 +1079,10 @@ mod tests {
 
     fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
         let cache = SharedCache::new(1024);
-        let values = ValueCache::new(&cache);
         let objects = ObjectCache::new(b.clone(), &cache);
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(values.clone(), tl, Arc::downgrade(&bg));
+        let mon = Monitor::new(tl, Arc::downgrade(&bg));
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
@@ -1153,7 +1154,10 @@ mod tests {
     async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         loaded.entries.lookup(key).cloned()
@@ -1185,7 +1189,10 @@ mod tests {
         assert_eq!(e.locked_by, vec![tx.clone()]);
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert_eq!(loaded.node().structure_lock().lock_type(), LockType::Read);
@@ -1238,7 +1245,10 @@ mod tests {
         assert!(entry_of(&ctx, b"z").await.is_none());
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert!(!loaded.node().structure_lock().contains(&tx));
@@ -1256,7 +1266,10 @@ mod tests {
         lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structure_lock().contains(&tx));
@@ -1282,7 +1295,7 @@ mod tests {
         let path = paths::collection_info(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
@@ -1292,7 +1305,7 @@ mod tests {
         locker.release_leaf(&tx, &path).await.unwrap();
         let loaded = ctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
@@ -1340,7 +1353,10 @@ mod tests {
         let e = entry_of(&ctx, key).await.unwrap();
         assert_eq!(e.locked_by, vec![old.clone()]);
         assert_eq!(
-            ctx.monitor.tx_status(&young).await.unwrap(),
+            ctx.monitor
+                .tx_status(&young, Requirement::Any)
+                .await
+                .unwrap(),
             TxCommitStatus::Aborted
         );
     }
@@ -1461,7 +1477,10 @@ mod tests {
         assert_eq!(e.current_writer, Some(tx.clone()));
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structure_lock().holders().is_empty());
@@ -1572,7 +1591,7 @@ mod tests {
         let path = paths::collection_info(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -1982,7 +2001,10 @@ mod tests {
             vec![old.clone()]
         );
         assert_eq!(
-            ctx.monitor.tx_status(&young).await.unwrap(),
+            ctx.monitor
+                .tx_status(&young, Requirement::Any)
+                .await
+                .unwrap(),
             TxCommitStatus::Pending,
             "the younger is not wounded, only waiting"
         );
@@ -2065,7 +2087,7 @@ mod tests {
             vec![a.clone()]
         );
         assert_eq!(
-            ctx.monitor.tx_status(&b).await.unwrap(),
+            ctx.monitor.tx_status(&b, Requirement::Any).await.unwrap(),
             TxCommitStatus::Pending
         );
 

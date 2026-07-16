@@ -12,9 +12,10 @@ use glassdb_data::{TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
+use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::lock::LockType;
-use crate::object_cache::{Freshness, ObjectCache};
+use crate::object_cache::ObjectCache;
 
 /// The commit state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,7 +135,17 @@ impl TLogger {
     /// Returns the commit status of transaction `id`, using the cache when
     /// possible. The status and timestamp are read from the transaction object
     /// body (ADR-019); an absent object means the transaction is unknown.
-    pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
+    ///
+    /// `req` bounds a non-final read: pass the caller's validation bound so a
+    /// pending log already revalidated at or after that bound reuses its
+    /// evidence, or [`Requirement::Any`] when a cached copy is acceptable
+    /// (ADR-036). A finalized log is immutable and answers without a read
+    /// regardless of `req`.
+    pub async fn commit_status(
+        &self,
+        id: &TxId,
+        req: Requirement,
+    ) -> Result<TxStatus, StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
         // A finalized (committed/aborted) log is immutable, so a cached copy can
         // answer without a backend revalidation round-trip.
@@ -144,7 +155,7 @@ impl TLogger {
         {
             return Ok(ts);
         }
-        match self.objects.read(&p, Freshness::Latest).await {
+        match self.objects.read(&p, self.non_final_req(req)).await {
             Ok(gr) => decode_status(&gr.value, gr.version),
             Err(StorageError::NotFound) => Ok(TxStatus {
                 status: TxCommitStatus::Unknown,
@@ -164,8 +175,13 @@ impl TLogger {
     /// its version — is authoritative and answers without a backend round-trip.
     /// A pending log can still change, so it is read through, revalidating via
     /// the version-conditional GET (the backend version changes on every content
-    /// write — refresh or finalization — ADR-023).
-    pub async fn get(&self, id: &TxId) -> Result<(TxLog, backend::Version), StorageError> {
+    /// write — refresh or finalization — ADR-023). `req` bounds that read the
+    /// same way it does for [`commit_status`](Self::commit_status).
+    pub async fn get(
+        &self,
+        id: &TxId,
+        req: Requirement,
+    ) -> Result<(TxLog, backend::Version), StorageError> {
         let p = paths::from_transaction(&self.prefix, id);
         if let Some(o) = self.objects.peek(&p) {
             let log = decode_tx_log(id, &o.value)?;
@@ -173,8 +189,25 @@ impl TLogger {
                 return Ok((log, o.version));
             }
         }
-        let gr = self.objects.read(&p, Freshness::Latest).await?;
+        let gr = self.objects.read(&p, self.non_final_req(req)).await?;
         Ok((decode_tx_log(id, &gr.value)?, gr.version))
+    }
+
+    /// Strengthens the freshness of a read whose cached copy — if any — is not
+    /// terminal. A pending transaction log is mutable: once a reader has
+    /// observed the writer's published `current_writer` pointer (proof the
+    /// writer committed), a cached `Pending` copy of that writer's log is
+    /// already obsolete, so serving it under [`Requirement::Any`] would spin the
+    /// reader forever against a status that has moved on. The peek short-circuit
+    /// above keeps a finalized (immutable) log free; here `Any` is upgraded to a
+    /// current revalidation so a still-cached non-final log is confirmed against
+    /// the backend. An explicit validation bound already forces the appropriate
+    /// revalidation, so it is honored unchanged.
+    fn non_final_req(&self, req: Requirement) -> Requirement {
+        match req {
+            Requirement::Any => Requirement::AtLeast(self.objects.now()),
+            r => r,
+        }
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
@@ -536,7 +569,7 @@ mod tests {
         };
         t.set(&log).await.unwrap();
 
-        let (got, _) = t.get(&id).await.unwrap();
+        let (got, _) = t.get(&id, Requirement::Any).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         // Locks include the collection lock and the key lock.
@@ -551,14 +584,17 @@ mod tests {
             scope: LockScope::Entry,
         }));
 
-        let status = t.commit_status(&id).await.unwrap();
+        let status = t.commit_status(&id, Requirement::Any).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
     }
 
     #[tokio::test]
     async fn commit_status_unknown_when_absent() {
         let t = new_tlogger();
-        let status = t.commit_status(&TxId::from_bytes(vec![7])).await.unwrap();
+        let status = t
+            .commit_status(&TxId::from_bytes(vec![7]), Requirement::Any)
+            .await
+            .unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
     }
 
@@ -577,7 +613,7 @@ mod tests {
         }];
         let stored_v = t.set(&log).await.unwrap();
 
-        let (got, version) = t.get(&id).await.unwrap();
+        let (got, version) = t.get(&id, Requirement::Any).await.unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         assert_eq!(got.timestamp, log.timestamp);

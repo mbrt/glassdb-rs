@@ -9,6 +9,13 @@ duplicate. An earlier draft proposed threading an already-loaded `(shard,
 version)` _seed_ through the coordinator; that never landed — the cache already
 holds the snapshot, so the flag reuses it without any new plumbing.
 
+[ADR-036](036-decoded-object-cache-with-bounded-freshness.md) later removed this
+freshness flag in favor of a per-entry validation watermark: call sites now pass
+a `Requirement` directly (`AllowStale` → `Requirement::Any`, `Latest` →
+`Requirement::AtLeast(now)`). The reuse optimization is unchanged — the first
+fold attempt of a lone read-write round is an `Any` read — only the flag type and
+the cache underneath it changed.
+
 Refines the `ShardCoordinator` mechanism of
 [ADR-028](028-shard-mutation-coordinator.md) (a round may reuse a cached shard
 for its first fold attempt; the fold, CAS, and reload-recover loop are unchanged)
