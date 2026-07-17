@@ -272,7 +272,7 @@ impl CacheEntry {
 }
 
 impl Weighable for CacheEntry {
-    fn size_b(&self) -> usize {
+    fn size(&self) -> usize {
         // A present entry weighs its decoded size plus the revision token; an
         // absent entry costs a small fixed bookkeeping amount.
         const OVERHEAD: usize = std::mem::size_of::<CacheEntry>();
@@ -445,19 +445,19 @@ impl Drop for FlightLeader {
 
 impl CachedStore {
     /// Creates a cached store over `backend`, sharing the single byte-bounded
-    /// LRU sized by `max_size_b`.
-    pub fn new(backend: Arc<dyn Backend>, max_size_b: usize) -> Self {
-        Self::with_clock(backend, max_size_b, Arc::new(RuntimeClock::new()))
+    /// LRU sized by `max_size`.
+    pub fn new(backend: Arc<dyn Backend>, max_size: usize) -> Self {
+        Self::with_clock(backend, max_size, Arc::new(RuntimeClock::new()))
     }
 
     fn with_clock(
         backend: Arc<dyn Backend>,
-        max_size_b: usize,
+        max_size: usize,
         clock: Arc<dyn MonotonicClock>,
     ) -> Self {
         CachedStore {
             backend,
-            cache: Arc::new(Cache::new(max_size_b)),
+            cache: Arc::new(Cache::new(max_size)),
             clock: Arc::new(StoreClock::new(clock)),
             body_reads: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Mutex::new(HashMap::new())),

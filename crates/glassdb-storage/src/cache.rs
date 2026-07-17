@@ -11,12 +11,12 @@ use hashlink::LinkedHashMap;
 
 /// Implemented by cached values to report their size in bytes.
 pub trait Weighable {
-    fn size_b(&self) -> usize;
+    fn size(&self) -> usize;
 }
 
 struct Inner<V> {
-    max_size_b: usize,
-    curr_size_b: usize,
+    max_size: usize,
+    curr_size: usize,
     /// Entries in LRU order: the front is least-recently-used, the back is
     /// most-recently-used. The linked list gives O(1) recency refresh and
     /// eviction, and eviction follows that list order (not the hash buckets),
@@ -27,15 +27,15 @@ struct Inner<V> {
 impl<V: Weighable + Clone> Inner<V> {
     fn delete_entry(&mut self, key: &str) {
         if let Some(v) = self.map.remove(key) {
-            self.curr_size_b = self.curr_size_b.saturating_sub(v.size_b());
+            self.curr_size = self.curr_size.saturating_sub(v.size());
         }
     }
 
     fn remove_oldest(&mut self) {
-        while self.curr_size_b > self.max_size_b {
+        while self.curr_size > self.max_size {
             // Never evict the most-recently-used entry, even if it alone
             // exceeds the shard budget. Otherwise a freshly written value
-            // (e.g. one larger than max_size_b/shards) would be dropped
+            // (e.g. one larger than max_size/shards) would be dropped
             // immediately, defeating the write and breaking callers that read
             // back their own writes. Overshoot is bounded to one entry per
             // shard.
@@ -45,7 +45,7 @@ impl<V: Weighable + Clone> Inner<V> {
             let Some((_, v)) = self.map.pop_front() else {
                 return;
             };
-            self.curr_size_b = self.curr_size_b.saturating_sub(v.size_b());
+            self.curr_size = self.curr_size.saturating_sub(v.size());
         }
     }
 }
@@ -58,11 +58,11 @@ pub struct CacheShard<V> {
 
 impl<V: Weighable + Clone> CacheShard<V> {
     /// Creates a cache shard with the given maximum size in bytes.
-    pub fn new(max_size_b: usize) -> Self {
+    pub fn new(max_size: usize) -> Self {
         CacheShard {
             inner: Mutex::new(Inner {
-                max_size_b,
-                curr_size_b: 0,
+                max_size,
+                curr_size: 0,
                 map: LinkedHashMap::new(),
             }),
         }
@@ -85,16 +85,16 @@ impl<V: Weighable + Clone> CacheShard<V> {
     {
         let mut inner = self.inner.lock().unwrap();
         let old = inner.map.get(key).cloned();
-        let old_size = old.as_ref().map_or(0, Weighable::size_b);
+        let old_size = old.as_ref().map_or(0, Weighable::size);
         match f(old) {
             None => {
                 // Remove an existing entry, or leave an absent one absent.
                 inner.delete_entry(key);
             }
             Some(newv) => {
-                let new_size = newv.size_b();
-                inner.curr_size_b =
-                    (inner.curr_size_b as i64 + new_size as i64 - old_size as i64) as usize;
+                let new_size = newv.size();
+                inner.curr_size =
+                    (inner.curr_size as i64 + new_size as i64 - old_size as i64) as usize;
                 // `insert` appends at the back (most-recently-used) and, for an
                 // existing key, moves it there while replacing the value.
                 inner.map.insert(key.to_string(), newv);
@@ -108,8 +108,8 @@ impl<V: Weighable + Clone> CacheShard<V> {
         inner.delete_entry(key);
     }
 
-    fn size_b(&self) -> usize {
-        self.inner.lock().unwrap().curr_size_b
+    fn size(&self) -> usize {
+        self.inner.lock().unwrap().curr_size
     }
 }
 
@@ -123,8 +123,8 @@ pub struct Cache<V> {
 impl<V: Weighable + Clone> Cache<V> {
     /// Creates a cache with the given maximum size in bytes. The budget is split
     /// evenly across shards to reduce lock contention.
-    pub fn new(max_size_b: usize) -> Self {
-        let per = max_size_b / shard::count();
+    pub fn new(max_size: usize) -> Self {
+        let per = max_size / shard::count();
         Cache {
             sh: Sharded::new(move |_| CacheShard::new(per)),
         }
@@ -156,9 +156,9 @@ impl<V: Weighable + Clone> Cache<V> {
     }
 
     /// Returns the current total size of the cache in bytes across all shards.
-    pub fn size_b(&self) -> usize {
+    pub fn size(&self) -> usize {
         let mut total = 0;
-        self.sh.each(|s| total += s.size_b());
+        self.sh.each(|s| total += s.size());
         total
     }
 }
@@ -171,7 +171,7 @@ mod tests {
     struct TestEntry(String);
 
     impl Weighable for TestEntry {
-        fn size_b(&self) -> usize {
+        fn size(&self) -> usize {
             self.0.len()
         }
     }
@@ -185,13 +185,13 @@ mod tests {
     #[test]
     fn get_set() {
         let c = CacheShard::new(100);
-        assert_eq!(c.size_b(), 0);
+        assert_eq!(c.size(), 0);
         c.set("a", e("foo"));
         assert_eq!(c.get("a"), Some(e("foo")));
-        assert_eq!(c.size_b(), 3);
+        assert_eq!(c.size(), 3);
         c.set("a", e("barbaz"));
         assert_eq!(c.get("a"), Some(e("barbaz")));
-        assert_eq!(c.size_b(), 6);
+        assert_eq!(c.size(), 6);
     }
 
     #[test]
@@ -199,21 +199,21 @@ mod tests {
         let c = CacheShard::new(100);
         c.set("k1", e("k1"));
         c.set("k2", e("k2"));
-        assert_eq!(c.size_b(), 4);
+        assert_eq!(c.size(), 4);
         c.delete("k1");
         assert_eq!(c.get("k1"), None);
         assert!(c.get("k2").is_some());
-        assert_eq!(c.size_b(), 2);
+        assert_eq!(c.size(), 2);
     }
 
     #[test]
     fn update_existing() {
         let c = CacheShard::new(100);
         c.set("a", e("foo"));
-        assert_eq!(c.size_b(), 3);
+        assert_eq!(c.size(), 3);
         c.update("a", |_| Some(e("barbaz")));
         assert_eq!(c.get("a"), Some(e("barbaz")));
-        assert_eq!(c.size_b(), 6);
+        assert_eq!(c.size(), 6);
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod tests {
             Some(e("bar"))
         });
         assert_eq!(c.get("a"), Some(e("bar")));
-        assert_eq!(c.size_b(), 3);
+        assert_eq!(c.size(), 3);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         c.set("a", e("foo"));
         c.update("a", |_| None);
         assert_eq!(c.get("a"), None);
-        assert_eq!(c.size_b(), 0);
+        assert_eq!(c.size(), 0);
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
             assert!(old.is_none());
             None
         });
-        assert_eq!(c.size_b(), 0);
+        assert_eq!(c.size(), 0);
     }
 
     #[test]
@@ -252,13 +252,13 @@ mod tests {
         let c = CacheShard::new(6);
         c.set("a", e("aaa"));
         c.set("b", e("bbb"));
-        assert_eq!(c.size_b(), 6);
+        assert_eq!(c.size(), 6);
         // Adding a third entry evicts the least recently used ("a").
         c.set("c", e("ccc"));
         assert_eq!(c.get("a"), None);
         assert!(c.get("b").is_some());
         assert!(c.get("c").is_some());
-        assert_eq!(c.size_b(), 6);
+        assert_eq!(c.size(), 6);
     }
 
     #[test]
@@ -267,7 +267,7 @@ mod tests {
         let c = CacheShard::new(2);
         c.set("a", e("aaaa"));
         assert_eq!(c.get("a"), Some(e("aaaa")));
-        assert_eq!(c.size_b(), 4);
+        assert_eq!(c.size(), 4);
     }
 
     // Returns `count` distinct keys that hash to the given shard.
@@ -297,10 +297,10 @@ mod tests {
         let s0 = keys_for_shard(0, n, 2);
         let s1 = keys_for_shard(1, n, 1);
 
-        // Routing across shards and size_b summation.
+        // Routing across shards and size summation.
         c.set(&s0[0], e("aaa")); // 3 bytes in shard 0
         c.set(&s1[0], e("bbb")); // 3 bytes in shard 1
-        assert_eq!(c.size_b(), 6);
+        assert_eq!(c.size(), 6);
 
         // Overflowing shard 0 only evicts within shard 0; shard 1 is untouched.
         c.set(&s0[1], e("cccc")); // 4 bytes pushes shard 0 to 7 > 6
