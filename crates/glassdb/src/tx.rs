@@ -90,9 +90,9 @@ impl Transaction {
                     inner.record_read(
                         p,
                         ReadState::NotFound {
+                            last_writer: outcome.last_writer,
                             cache_hit: outcome.cache_hit,
                             leaf: outcome.leaf,
-                            pending_writer: outcome.pending_writer,
                         },
                     );
                     Ok(None)
@@ -108,7 +108,6 @@ impl Transaction {
                             last_writer: rv.version.writer,
                             cache_hit: outcome.cache_hit,
                             leaf: outcome.leaf,
-                            pending_writer: outcome.pending_writer,
                         },
                     );
                     Ok(Some(rv.value.to_vec()))
@@ -243,28 +242,18 @@ impl Transaction {
         }
         let mut reads = Vec::new();
         for (k, v) in &inner.reads {
-            let (last_writer, leaf, pending_writer) = match v {
+            let (last_writer, leaf) = match v {
                 ReadState::Found {
-                    last_writer,
-                    leaf,
-                    pending_writer,
-                    ..
-                } => (
-                    Some(last_writer.clone()),
-                    leaf.clone(),
-                    pending_writer.clone(),
-                ),
+                    last_writer, leaf, ..
+                } => (Some(last_writer.clone()), leaf.clone()),
                 ReadState::NotFound {
-                    leaf,
-                    pending_writer,
-                    ..
-                } => (None, leaf.clone(), pending_writer.clone()),
+                    last_writer, leaf, ..
+                } => (last_writer.clone(), leaf.clone()),
             };
             reads.push(ReadAccess {
                 path: k.as_str().into(),
                 last_writer,
                 leaf,
-                pending_writer,
             });
         }
         // Emit accesses in a stable path order so the commit path (transaction
@@ -312,12 +301,11 @@ enum ReadState {
         last_writer: TxId,
         cache_hit: bool,
         leaf: LeafObservation,
-        pending_writer: Option<TxId>,
     },
     NotFound {
+        last_writer: Option<TxId>,
         cache_hit: bool,
         leaf: LeafObservation,
-        pending_writer: Option<TxId>,
     },
 }
 

@@ -41,13 +41,12 @@ pub struct ReadValue {
 pub struct ReadOutcome {
     /// The resolved value, or `None` when the key is absent or deleted.
     pub value: Option<ReadValue>,
+    /// Effective writer resolved for the key, including a tombstone writer.
+    pub last_writer: Option<TxId>,
     /// Whether every physical dependency was served locally.
     pub cache_hit: bool,
     /// Exact leaf state used to derive this logical value.
     pub leaf: LeafObservation,
-    /// Exclusive holder whose commit could supersede `value` without first
-    /// changing `leaf`.
-    pub pending_writer: Option<TxId>,
 }
 
 /// Reads values by resolving a key's shard entry to its effective committed
@@ -109,15 +108,15 @@ impl Reader {
         let mut cache_hit = leaf.cache_hit;
         cache_hit &= resolved.cache_hit;
         let leaf = leaf.observation;
-        let pending_writer = resolved.pending_writer.clone();
-        let Some(writer) = resolved.writer.filter(|_| !resolved.deleted) else {
+        let Some(writer) = resolved.writer else {
             return Ok(ReadOutcome {
                 value: None,
+                last_writer: None,
                 cache_hit,
                 leaf,
-                pending_writer,
             });
         };
+        let last_writer = Some(writer.clone());
         let cv = self
             .resolver
             .committed_value(key, &writer)
@@ -129,9 +128,9 @@ impl Reader {
             // retry rather than trusting an empty placeholder.
             return Ok(ReadOutcome {
                 value: None,
+                last_writer,
                 cache_hit: false,
                 leaf,
-                pending_writer,
             });
         }
         cache_hit &= cv.cache_hit;
@@ -142,9 +141,9 @@ impl Reader {
         });
         Ok(ReadOutcome {
             value,
+            last_writer,
             cache_hit,
             leaf,
-            pending_writer,
         })
     }
 }

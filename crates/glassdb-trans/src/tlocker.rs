@@ -42,7 +42,7 @@ use glassdb_storage::{
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{Reclaim, ReconciledLeaf, try_reclaim};
+use crate::node_locking::{Reclaim, ReconciledLeaf, resolve_entry_locks, try_reclaim};
 use crate::shard_coord::{
     FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
 };
@@ -483,10 +483,7 @@ async fn resolve_and_lock(
     // ones come back as conflicts to wound-wait. The monitor folds lease expiry
     // and the unknown-tx grace period into `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
-    let resolved = ctx
-        .resolver
-        .resolve_holders(&intent.key_path, &e, Some(id))
-        .await?;
+    let resolved = resolve_entry_locks(ctx, &intent.key_path, Some(&e), Some(id)).await?;
     e.current_writer = resolved.writer;
     e.deleted = resolved.deleted;
     let mut pending = resolved.pending;

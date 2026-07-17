@@ -37,7 +37,8 @@ use glassdb_storage::{
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
-use crate::resolver::{HolderResolution, Resolver};
+use crate::node_locking::{LockResolution, resolve_entry_locks, resolve_entry_locks_at};
+use crate::resolver::Resolver;
 use crate::shard_coord::{
     FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
 };
@@ -74,12 +75,10 @@ enum Status {
 pub struct ReadAccess {
     /// Full storage path of the key.
     pub path: Arc<str>,
-    /// Existence-aware effective writer observed by the read.
+    /// Effective writer observed by the read, including a tombstone writer.
     pub last_writer: Option<TxId>,
     /// Exact leaf state from which the writer was resolved.
     pub leaf: LeafObservation,
-    /// Exclusive holder that was still pending when the value was resolved.
-    pub pending_writer: Option<TxId>,
 }
 
 /// A single key write within a transaction.
@@ -353,14 +352,7 @@ impl ShardResolver for CommitInstallResolver {
         // Re-resolve the effective writer / eligibility against the current
         // entry: a live pending holder, a moved pointer, or a superseded read
         // means we lost the race.
-        let res = match cur {
-            Some(e) => {
-                ctx.resolver
-                    .resolve_holders(&self.key_path, e, None)
-                    .await?
-            }
-            None => HolderResolution::default(),
-        };
+        let res = resolve_entry_locks(ctx, &self.key_path, cur, None).await?;
         let Some(effective) = eligible_writer(&res, self.read_version.as_ref()) else {
             // After an in-doubt CAS we cannot tell whether our lock landed first
             // and was then help-forwarded away, so surface in-doubt; otherwise
@@ -425,16 +417,13 @@ impl ShardResolver for CommitInstallResolver {
 }
 
 /// Decides the effective committed writer the single read-write fast path must
-/// build on from an already-resolved holder view, or `None` when the key cannot
+/// build on from lock-domain entry state, or `None` when the key cannot
 /// take the fast path's commit CAS.
 ///
-/// The [`Resolver`] supplies the raw view (help-forwarding committed holders so
-/// a lock held by an already-committed writer whose write-back is still pending
-/// is not treated as a conflict); this predicate decides eligibility from it:
-/// only a *live pending* holder blocks the fast path, and a create / put over a
-/// tombstone or a read-modify-write whose read was superseded is rejected
-/// (ADR-027).
-fn eligible_writer(res: &HolderResolution, read_version: Option<&TxId>) -> Option<TxId> {
+/// Writer resolution help-forwards a committed holder while lock coordination
+/// separately classifies live conflicts. A create / put over a tombstone or a
+/// read-modify-write whose read was superseded is rejected (ADR-027).
+fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Option<TxId> {
     // A live holder is a genuine conflict: defer to the full locked path so it
     // can wound-wait. Committed/aborted holders never reach `pending`.
     if !res.pending.is_empty() {
@@ -452,6 +441,22 @@ fn eligible_writer(res: &HolderResolution, read_version: Option<&TxId>) -> Optio
         // A blind put (no read) is last-writer-wins and always serializable.
         _ => Some(writer),
     }
+}
+
+/// Reports whether the observed leaf contains an exclusive holder whose final
+/// state can change the effective writer without rewriting the leaf.
+fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
+    let (_, raw_key) = paths::split_key(&read.path)
+        .map_err(|e| TransError::with_source("parsing read key path", e))?;
+    let Some(node) = read.leaf.node() else {
+        return Ok(false);
+    };
+    let leaf = node
+        .as_leaf()
+        .ok_or_else(|| TransError::other("read observation contains a non-leaf node"))?;
+    Ok(leaf.lookup(&raw_key).is_some_and(|entry| {
+        matches!(entry.lock_type, LockType::Write | LockType::Create) && !entry.locked_by.is_empty()
+    }))
 }
 
 /// Coordinates transactions: read validation, locking, commit, and write-back.
@@ -821,11 +826,24 @@ impl Algo {
         // version-conditional CAS misses, invalidates that seed, and re-folds
         // over the winner — finding the read superseded, the fast path renews
         // (`Wounded`).
-        let (holders, locator) = self
+        let (_, locator) = self
             .resolver
             .resolve_key(&key_path, Requirement::Any)
             .await?;
-        let Some(effective) = eligible_writer(&holders, read_version.as_ref()) else {
+        let entry = locator
+            .node()
+            .and_then(|node| node.as_leaf())
+            .and_then(|leaf| leaf.lookup(&raw_key));
+        let lock_state = resolve_entry_locks_at(
+            &self.resolver,
+            &self.mon,
+            &key_path,
+            entry,
+            None,
+            Requirement::Any,
+        )
+        .await?;
+        let Some(effective) = eligible_writer(&lock_state, read_version.as_ref()) else {
             return Ok(None);
         };
         // The leaf that owns this key, resolved by descent (ADR-031). Both the
@@ -1194,9 +1212,7 @@ impl Algo {
             if !leaf_unchanged {
                 return Ok(false);
             }
-            if let Some(writer) = &read.pending_writer
-                && self.mon.committed_at(writer, validation_start).await?
-            {
+            if read_observation_has_exclusive_holder(read)? {
                 return Ok(false);
             }
         }
@@ -1474,9 +1490,8 @@ mod tests {
         match reader.read(path, Duration::MAX).await {
             Ok(outcome) => ReadAccess {
                 path: path.into(),
-                last_writer: outcome.value.map(|value| value.version.writer),
+                last_writer: outcome.last_writer,
                 leaf: outcome.leaf,
-                pending_writer: outcome.pending_writer,
             },
             Err(e) => panic!("reading {path}: {e:?}"),
         }
@@ -2376,14 +2391,22 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.last_writer.clone().unwrap(), h1);
 
-        // Eligibility mirrors that resolution: given the one resolved holder view,
+        // Eligibility mirrors that resolution: given the reconciled lock state,
         // an RMW that read H1 and a blind put are both committable and build on
         // H1, while a read of the superseded H0 is still rejected as stale.
-        let (res, _) = tm
-            .resolver
-            .resolve_key(&keyp, Requirement::AtLeast(tm.resolver.now()))
-            .await
-            .unwrap();
+        let requirement = Requirement::AtLeast(tm.resolver.now());
+        let (_, locator) = tm.resolver.resolve_key(&keyp, requirement).await.unwrap();
+        let resolved_entry = locator.node().unwrap().as_leaf().unwrap().lookup(&raw);
+        let res = resolve_entry_locks_at(
+            &tm.resolver,
+            &tm.mon,
+            &keyp,
+            resolved_entry,
+            None,
+            requirement,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             eligible_writer(&res, Some(&h1)),
             Some(h1.clone()),
@@ -2610,7 +2633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_read_rechecks_pending_writer_through_monitor() {
+    async fn point_read_re_resolves_writer_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
@@ -2637,7 +2660,6 @@ mod tests {
 
         let read = do_read(&tctx, &keyp).await;
         assert_eq!(read.last_writer.as_ref(), Some(&previous));
-        assert_eq!(read.pending_writer.as_ref(), Some(&holder));
         let data = Data {
             reads: vec![read],
             writes: Vec::new(),
@@ -2662,12 +2684,18 @@ mod tests {
             !tm.validate_read_observations(&data, validation_start, None)
                 .await
                 .unwrap(),
-            "Monitor reports that the retained pending writer committed at the validation bound"
+            "an exclusive holder prevents the leaf-only shortcut"
+        );
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "writer resolution at the validation watermark observes the committed holder"
         );
     }
 
     #[tokio::test]
-    async fn point_read_accepts_aborted_pending_writer() {
+    async fn point_read_accepts_aborted_holder_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
         let keyp = paths::from_key(TEST_COLL, b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
@@ -2694,7 +2722,6 @@ mod tests {
 
         let read = do_read(&tctx, &keyp).await;
         assert_eq!(read.last_writer.as_ref(), Some(&previous));
-        assert_eq!(read.pending_writer.as_ref(), Some(&holder));
         let data = Data {
             reads: vec![read],
             writes: Vec::new(),
@@ -2703,11 +2730,16 @@ mod tests {
         let validation_start = tctx.shards.now();
 
         // Aborting the holder leaves the previously observed writer effective.
-        // The transaction object changes, but Monitor answers the semantic
-        // committed-at question rather than exposing that physical change.
+        // The exclusive holder prevents a physical shortcut, then writer
+        // resolution at the validation watermark accepts the unchanged value.
         tctx.tmon.abort_tx(&holder).await.unwrap();
         assert!(
-            tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, validation_start, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            tm.validate(&data, ValidationContext::Optimistic, validation_start)
                 .await
                 .unwrap()
         );
@@ -2909,11 +2941,11 @@ mod tests {
         let keyp = paths::from_key(TEST_COLL, b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
-        commit_writes(&tm, vec![wdel(&keyp)]).await;
+        let deleted_by = commit_writes(&tm, vec![wdel(&keyp)]).await.id().clone();
 
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
-        assert!(r.last_writer.is_none());
+        assert_eq!(r.last_writer.as_ref(), Some(&deleted_by));
         let mut h = tm.begin(Data {
             reads: vec![r],
             writes: Vec::new(),
@@ -2940,7 +2972,7 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert!(e.deleted);
         let r = do_read(&tctx, &keyp).await;
-        assert!(r.last_writer.is_none());
+        assert_eq!(r.last_writer.as_ref(), Some(h.id()));
     }
 
     #[tokio::test]

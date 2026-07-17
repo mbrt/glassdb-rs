@@ -49,7 +49,7 @@ use tokio::sync::Notify;
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, PENDING_TX_TIMEOUT};
-use crate::node_locking::{NodeLockReconciler, StructureWriteResolver};
+use crate::node_locking::{NodeLockReconciler, StructureWriteResolver, resolve_entry_locks_at};
 use crate::resolver::Resolver;
 use crate::shard_coord::{FoldOutcome, ShardCoordinator, SplitHinter};
 
@@ -624,10 +624,15 @@ impl Splitter {
         };
         let mut entries = Vec::with_capacity(shard.len());
         for entry in shard.entries() {
-            let resolved = self
-                .resolver
-                .resolve_holders(&paths::from_key(prefix, &entry.key), entry, Some(id))
-                .await?;
+            let resolved = resolve_entry_locks_at(
+                &self.resolver,
+                &self.mon,
+                &paths::from_key(prefix, &entry.key),
+                Some(entry),
+                Some(id),
+                Requirement::AtLeast(self.resolver.now()),
+            )
+            .await?;
             let mut entry = entry.clone();
             entry.current_writer = resolved.writer;
             entry.deleted = resolved.deleted;

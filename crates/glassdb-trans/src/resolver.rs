@@ -4,21 +4,19 @@
 //! A key's value lives in the transaction object of whichever transaction last
 //! committed it, so a shard entry only points at the *effective writer*: the
 //! `current_writer` pointer, plus any committed-but-not-yet-written-back
-//! exclusive holder that must be help-forwarded (aborted/expired holders are
-//! dropped). Resolving that pointer is a coordination concern shared by three
+//! exclusive holder that must be help-forwarded. Resolving that pointer is a
+//! coordination concern shared by three
 //! consumers with different needs:
 //!
 //! - the [`Reader`](crate::Reader) materializes the value the writer holds,
 //! - the commit algorithm ([`Algo`](crate::Algo)) validates reads by comparing
 //!   the observed writer against the current one (ADR-024), and
-//! - the locker acquires a shard's locks, which first resolves the same holders
-//!   (and additionally wound-waits the live pending ones) via
-//!   [`resolve_holders`](Resolver::resolve_holders).
+//! - the locker acquires shard locks after separately classifying live holders.
 //!
 //! This module owns that single resolution routine so all three go through one
-//! place and none re-implement help-forwarding. Callers supply one requirement
-//! requirement, which is propagated through the leaf and transaction-object
-//! dependencies used by that resolve.
+//! place and none re-implement help-forwarding. The caller's requirement is
+//! propagated through the leaf and transaction-state dependencies of the
+//! resolution.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -44,55 +42,20 @@ pub struct ScanResult {
     pub frontier: Option<Vec<u8>>,
 }
 
-/// A read key grouped for batched resolution: its full storage path (the map
-/// key of the returned effective-writer set) paired with its decoded raw key
-/// (the shard-entry lookup key).
-/// The resolved view of a shard entry, after help-forwarding committed holders.
-#[derive(Debug, Clone, Default)]
-struct Resolved {
+/// The effective writer resolved using transaction-state evidence satisfying a
+/// requested freshness requirement.
+#[derive(Debug, Clone)]
+pub(crate) struct WriterResolution {
     /// The effective committed writer holding the key's value (the MVCC
     /// pointer), or `None` if the key has no committed value.
-    writer: Option<TxId>,
-    /// Whether that writer's value for the key is a tombstone.
-    deleted: bool,
-}
-
-impl Resolved {
-    /// The existence-aware validation token: the effective writer iff the key
-    /// currently exists (committed and not tombstoned), else `None`. This is the
-    /// value a read observes, so it is what optimistic validation compares.
-    fn token(self) -> Option<TxId> {
-        match self.writer {
-            Some(w) if !self.deleted => Some(w),
-            _ => None,
-        }
-    }
-}
-
-/// The outcome of interpreting a shard entry's holder set against transaction
-/// status: the effective committed writer (after help-forwarding), whether that
-/// writer's value is a tombstone, and the foreign holders still live-pending.
-/// The read path uses `writer`/`deleted`; the lock path also wound-waits the
-/// `pending` holders. The single read-write fast path consumes the whole view
-/// to decide eligibility (a live `pending` holder is a conflict it cannot
-/// take). `pending_writer` is set only for the single exclusive holder whose
-/// commit can supersede the resolved value without first changing the leaf.
-#[derive(Debug, Clone)]
-pub(crate) struct HolderResolution {
     pub writer: Option<TxId>,
-    pub deleted: bool,
-    pub pending: Vec<TxId>,
-    pub pending_writer: Option<TxId>,
     pub cache_hit: bool,
 }
 
-impl Default for HolderResolution {
+impl Default for WriterResolution {
     fn default() -> Self {
         Self {
             writer: None,
-            deleted: false,
-            pending: Vec::new(),
-            pending_writer: None,
             cache_hit: true,
         }
     }
@@ -249,36 +212,10 @@ impl Resolver {
                         let key_path = paths::from_key(prefix, &key);
                         match leaf.lookup(&key) {
                             None => false,
-                            Some(entry)
-                                if !matches!(
-                                    entry.lock_type,
-                                    LockType::Write | LockType::Create
-                                ) =>
-                            {
-                                Resolved {
-                                    writer: entry.current_writer.clone(),
-                                    deleted: entry.deleted,
-                                }
-                                .token()
-                                .is_some()
-                            }
-                            Some(entry) => {
-                                let resolved = self
-                                    .resolve_holders_at(
-                                        &key_path,
-                                        entry,
-                                        own_lock_holder,
-                                        requirement,
-                                    )
-                                    .await
-                                    .map_err(trans_to_storage)?;
-                                Resolved {
-                                    writer: resolved.writer,
-                                    deleted: resolved.deleted,
-                                }
-                                .token()
-                                .is_some()
-                            }
+                            Some(entry) => self
+                                .entry_exists_at(&key_path, entry, own_lock_holder, requirement)
+                                .await
+                                .map_err(trans_to_storage)?,
                         }
                     }
                 };
@@ -384,12 +321,9 @@ impl Resolver {
         })
     }
 
-    /// Returns the effective committed writer of every `key` (the validation
-    /// tokens): `Some(writer)` if the key currently exists, `None` if it is
-    /// absent or tombstoned. Keys are routed to their owning leaves by descent
-    /// so each touched leaf is loaded once, then every key in it is resolved
-    /// against the one loaded copy — this is the batched form the commit path
-    /// validates against.
+    /// Returns the effective committed writer of every `key`. Keys are routed
+    /// to their owning leaves by descent so each touched leaf is loaded once,
+    /// then every key in it is resolved against the one loaded copy.
     #[cfg(test)]
     pub(crate) async fn effective_writers(
         &self,
@@ -427,23 +361,16 @@ impl Resolver {
                 .transpose()?;
             for (raw_key, key) in &group.keys {
                 let resolved = self
-                    .resolve_entry_at(
-                        key,
-                        leaf.and_then(|leaf| leaf.lookup(raw_key)),
-                        None,
-                        requirement,
-                    )
+                    .resolve_writer_at(key, leaf.and_then(|leaf| leaf.lookup(raw_key)), requirement)
                     .await
                     .map_err(trans_to_storage)?;
-                out.insert(key.clone(), resolved.token());
+                out.insert(key.clone(), resolved.writer);
             }
         }
         Ok(out)
     }
 
-    /// Returns the effective committed writer of a single `key`: `Some(writer)`
-    /// if the key currently exists, `None` if it is absent or tombstoned. The
-    /// singular form the read path uses before materializing the value.
+    /// Returns the effective committed writer of a single `key`.
     #[cfg(test)]
     async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
         let (prefix, raw_key) =
@@ -460,24 +387,18 @@ impl Resolver {
             })
             .transpose()?;
         let resolved = self
-            .resolve_entry_at(
+            .resolve_writer_at(
                 key,
                 leaf.and_then(|leaf| leaf.lookup(&raw_key)),
-                None,
                 Requirement::AtLeast(self.dir.now()),
             )
             .await
             .map_err(trans_to_storage)?;
-        Ok(resolved.token())
+        Ok(resolved.writer)
     }
 
-    /// Resolves `key_path` to its owning leaf and interprets that entry's
-    /// holders (help-forwarding committed ones, collecting the live pending
-    /// ones) into a [`HolderResolution`], returning the located leaf alongside.
-    /// Unlike [`effective_writer`](Self::effective_writer) it exposes the full
-    /// view — including the `pending` conflicts — so the single read-write fast
-    /// path can decide eligibility for itself without the resolver embedding that
-    /// policy. An absent key resolves to an empty view.
+    /// Resolves `key_path` to its owning leaf and effective writer, returning
+    /// the located leaf alongside. An absent key resolves to no writer.
     ///
     /// `requirement` is forwarded to the descent: the single read-write commit
     /// passes [`Requirement::Any`] so its eligibility check reuses the leaf
@@ -487,7 +408,7 @@ impl Resolver {
         &self,
         key_path: &str,
         requirement: Requirement,
-    ) -> Result<(HolderResolution, LeafLocator), TransError> {
+    ) -> Result<(WriterResolution, LeafLocator), TransError> {
         let (prefix, raw_key) = paths::split_key(key_path)
             .map_err(|e| TransError::with_source("parsing key path", e))?;
         // Interior index nodes are served from cache (ADR-031 hot-path
@@ -505,135 +426,84 @@ impl Resolver {
                     .ok_or_else(|| TransError::other("descent resolved a non-leaf node"))
             })
             .transpose()?;
-        let holders = match leaf.and_then(|leaf| leaf.lookup(&raw_key)) {
-            Some(entry) => {
-                self.resolve_holders_at(key_path, entry, None, requirement)
-                    .await?
-            }
-            None => HolderResolution::default(),
-        };
-        Ok((holders, loc))
+        let writer = self
+            .resolve_writer_at(
+                key_path,
+                leaf.and_then(|leaf| leaf.lookup(&raw_key)),
+                requirement,
+            )
+            .await?;
+        Ok((writer, loc))
     }
 
-    /// Interprets `entry`'s holders against transaction status — the step shared
-    /// by read resolution and lock acquisition (the locker): help-forward a
-    /// committed exclusive holder's value (one that committed but has not yet
-    /// published its `current_writer` pointer), drop aborted/unknown holders,
-    /// and collect the live pending ones. `own_lock_holder` identifies the
-    /// caller's own lock, which is never treated as a foreign holder. Only an
-    /// exclusive (write/create) entry
-    /// help-forwards; a read-locked entry's holders never change the value but
-    /// are still classified so a writer can wound-wait them. `key_path` is the
-    /// full storage path of the key, used to fetch a help-forwarded writer's
-    /// value.
-    pub(crate) async fn resolve_holders(
+    /// Resolves the effective writer named by `entry`, using Monitor evidence
+    /// satisfying `requirement` to help-forward a committed exclusive holder.
+    pub(crate) async fn resolve_writer_at(
         &self,
         key_path: &str,
-        entry: &ShardEntry,
-        own_lock_holder: Option<&TxId>,
-    ) -> Result<HolderResolution, TransError> {
-        self.resolve_holders_at(
-            key_path,
-            entry,
-            own_lock_holder,
-            Requirement::AtLeast(self.dir.now()),
-        )
-        .await
-    }
-
-    /// Interprets holders against one shared freshness requirement.
-    pub(crate) async fn resolve_holders_at(
-        &self,
-        key_path: &str,
-        entry: &ShardEntry,
-        own_lock_holder: Option<&TxId>,
+        entry: Option<&ShardEntry>,
         requirement: Requirement,
-    ) -> Result<HolderResolution, TransError> {
+    ) -> Result<WriterResolution, TransError> {
+        let Some(entry) = entry else {
+            return Ok(WriterResolution::default());
+        };
         let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
         let mut writer = entry.current_writer.clone();
-        let mut deleted = entry.deleted;
-        let mut pending = Vec::new();
-        let mut pending_writer = None;
         let mut cache_hit = true;
         if exclusive && entry.locked_by.len() > 1 {
             return Err(TransError::other(
                 "exclusive shard entry has more than one holder",
             ));
         }
-        for holder in &entry.locked_by {
-            if Some(holder) == own_lock_holder {
-                continue;
-            }
+        if exclusive && let Some(holder) = entry.locked_by.first() {
             let (status, status_cache_hit) = self
                 .tmon
                 .tx_status_at_with_cache(holder, requirement)
                 .await?;
             cache_hit &= status_cache_hit;
-            match status {
-                TxCommitStatus::Ok => {
-                    if exclusive {
-                        let cv = self
-                            .tmon
-                            .committed_value_at(key_path, holder, requirement)
-                            .await?;
-                        if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
-                            writer = Some(holder.clone());
-                            deleted = cv.value.deleted;
-                        }
-                    }
+            if status == TxCommitStatus::Ok {
+                let cv = self
+                    .tmon
+                    .committed_value_at(key_path, holder, requirement)
+                    .await?;
+                cache_hit &= cv.cache_hit;
+                if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
+                    writer = Some(holder.clone());
                 }
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                    pending.push(holder.clone());
-                    if exclusive {
-                        pending_writer = Some(holder.clone());
-                    }
-                }
-                // An aborted lock is dead; drop it.
-                _ => {}
             }
         }
-        Ok(HolderResolution {
-            writer,
-            deleted,
-            pending,
-            pending_writer,
-            cache_hit,
-        })
+        Ok(WriterResolution { writer, cache_hit })
     }
 
-    /// Resolves `entry` against the transaction monitor: help-forward a committed
-    /// exclusive holder (one that committed but has not yet published its
-    /// `current_writer` pointer) and drop aborted/absent holders. `key_path` is
-    /// the full storage path of the key, used to fetch the help-forwarded
-    /// writer's value. A `None` entry resolves to "no value".
-    async fn resolve_entry_at(
+    /// Reports whether `entry` names a live key at `requirement`.
+    async fn entry_exists_at(
         &self,
         key_path: &str,
-        entry: Option<&ShardEntry>,
+        entry: &ShardEntry,
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
-    ) -> Result<Resolved, TransError> {
-        let Some(e) = entry else {
-            return Ok(Resolved::default());
+    ) -> Result<bool, TransError> {
+        let writer = if own_lock_holder.is_some_and(|id| {
+            matches!(entry.lock_type, LockType::Write | LockType::Create)
+                && entry.locked_by.iter().any(|holder| holder == id)
+        }) {
+            entry.current_writer.clone()
+        } else {
+            self.resolve_writer_at(key_path, Some(entry), requirement)
+                .await?
+                .writer
         };
-
-        // A read-locked (non-exclusive) entry's holders never change the value,
-        // so skip the holder scan entirely — no monitor lookups for a key that
-        // only has shared readers.
-        if !matches!(e.lock_type, LockType::Write | LockType::Create) {
-            return Ok(Resolved {
-                writer: e.current_writer.clone(),
-                deleted: e.deleted,
-            });
+        let Some(writer) = writer else {
+            return Ok(false);
+        };
+        if entry.current_writer.as_ref() == Some(&writer) {
+            return Ok(!entry.deleted);
         }
-
-        let r = self
-            .resolve_holders_at(key_path, e, own_lock_holder, requirement)
+        let value = self
+            .tmon
+            .committed_value_at(key_path, &writer, requirement)
             .await?;
-        Ok(Resolved {
-            writer: r.writer,
-            deleted: r.deleted,
-        })
+        Ok(value.status == TxCommitStatus::Ok && !value.value.not_written && !value.value.deleted)
     }
 }
 
@@ -777,7 +647,7 @@ mod tests {
 
     // With split deferred every key lives in the collection's single leaf `_i`
     // (ADR-031), so a batch of keys resolves against that one leaf: a live
-    // pointer, a tombstone, and an absent key each resolve to the right token.
+    // pointer, a tombstone, and an absent key each resolve to the right writer.
     #[tokio::test]
     async fn effective_writers_resolve_against_the_single_leaf() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -807,8 +677,8 @@ mod tests {
         assert_eq!(out.get(&pa).cloned(), Some(Some(live)));
         assert_eq!(
             out.get(&pb).cloned(),
-            Some(None),
-            "a tombstone resolves to no writer"
+            Some(Some(tomb)),
+            "a tombstone still has a writer"
         );
         assert_eq!(
             out.get(&pc).cloned(),
@@ -845,11 +715,11 @@ mod tests {
         log.lock().unwrap().clear();
 
         // `Any` serves the cached shard: no backend read at all.
-        let (holders, _) = resolver
+        let (resolved, _) = resolver
             .resolve_key(&key_path, Requirement::Any)
             .await
             .unwrap();
-        assert_eq!(holders.writer, Some(writer.clone()), "still resolves");
+        assert_eq!(resolved.writer, Some(writer.clone()), "still resolves");
         assert_eq!(
             count_shard_reads(&log),
             0,
@@ -869,21 +739,16 @@ mod tests {
         );
     }
 
-    // The singular resolve mirrors the batched one for one key: a live pointer
-    // yields its writer, a tombstone and an absent key yield none.
+    // The singular resolve mirrors the batched one for one key: live and
+    // tombstone pointers yield their writer, while an absent key yields none.
     #[tokio::test]
     async fn effective_writer_resolves_single_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed_store = ShardStore::new(CachedStore::new(backend.clone(), 1 << 20));
         let live = TxId::with_priority(1, b"live");
+        let dead = TxId::with_priority(2, b"dead");
         seed_writer(&seed_store, b"live-key", &live, false).await;
-        seed_writer(
-            &seed_store,
-            b"dead-key",
-            &TxId::with_priority(2, b"dead"),
-            true,
-        )
-        .await;
+        seed_writer(&seed_store, b"dead-key", &dead, true).await;
 
         let (resolver, _mon, _bg) = resolver_over(backend);
         assert_eq!(
@@ -898,7 +763,7 @@ mod tests {
                 .effective_writer(&paths::from_key(COLL, b"dead-key"))
                 .await
                 .unwrap(),
-            None
+            Some(dead)
         );
         assert_eq!(
             resolver
@@ -910,10 +775,8 @@ mod tests {
     }
 
     // A committed exclusive holder that has not yet published its `current_writer`
-    // pointer is help-forwarded: the read path discovers the effective writer
-    // (and its tombstone flag) from the holder's committed value, not the stale
-    // pointer. This is the branch now shared with the locker via
-    // `resolve_holders`.
+    // pointer is help-forwarded: writer identity is resolved independently of
+    // whether the committed value is live or a tombstone.
     #[tokio::test]
     async fn effective_writer_help_forwards_committed_holder() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -941,8 +804,8 @@ mod tests {
                 .effective_writer(&paths::from_key(COLL, b"dead-key"))
                 .await
                 .unwrap(),
-            None,
-            "a help-forwarded tombstone resolves to no writer"
+            Some(tomb),
+            "a help-forwarded tombstone still resolves its writer"
         );
     }
 }

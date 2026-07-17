@@ -9,16 +9,105 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{LockType, NodeLocks, ShardEntry, TxCommitStatus};
+use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
+use crate::resolver::Resolver;
 use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
 
 /// Result of applying wound-wait to one live holder.
 pub(crate) enum Reclaim {
     Wounded,
     Wait,
+}
+
+/// Entry state needed by lock coordination after writer resolution and holder
+/// liveness classification.
+pub(crate) struct LockResolution {
+    pub(crate) writer: Option<TxId>,
+    pub(crate) deleted: bool,
+    pub(crate) pending: Vec<TxId>,
+}
+
+/// Resolves an entry's writer and classifies the foreign holders that remain
+/// live for lock coordination.
+pub(crate) async fn resolve_entry_locks_at(
+    resolver: &Resolver,
+    monitor: &Monitor,
+    key_path: &str,
+    entry: Option<&ShardEntry>,
+    own_lock_holder: Option<&TxId>,
+    requirement: Requirement,
+) -> Result<LockResolution, TransError> {
+    let Some(entry) = entry else {
+        return Ok(LockResolution {
+            writer: None,
+            deleted: false,
+            pending: Vec::new(),
+        });
+    };
+    let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
+    if exclusive && entry.locked_by.len() > 1 {
+        return Err(TransError::other(
+            "exclusive shard entry has more than one holder",
+        ));
+    }
+    let own_exclusive = exclusive
+        && own_lock_holder.is_some_and(|id| entry.locked_by.iter().any(|holder| holder == id));
+    let writer = if own_exclusive {
+        entry.current_writer.clone()
+    } else {
+        resolver
+            .resolve_writer_at(key_path, Some(entry), requirement)
+            .await?
+            .writer
+    };
+    let deleted = match &writer {
+        None => false,
+        Some(writer) if entry.current_writer.as_ref() == Some(writer) => entry.deleted,
+        Some(writer) => {
+            let value = monitor
+                .committed_value_at(key_path, writer, requirement)
+                .await?;
+            value.status == TxCommitStatus::Ok && !value.value.not_written && value.value.deleted
+        }
+    };
+    let mut pending = Vec::new();
+    for holder in &entry.locked_by {
+        if Some(holder) == own_lock_holder {
+            continue;
+        }
+        if matches!(
+            monitor.tx_status_at(holder, requirement).await?,
+            TxCommitStatus::Pending | TxCommitStatus::Unknown
+        ) {
+            pending.push(holder.clone());
+        }
+    }
+    Ok(LockResolution {
+        writer,
+        deleted,
+        pending,
+    })
+}
+
+/// Resolves entry lock state using current Monitor evidence.
+pub(crate) async fn resolve_entry_locks(
+    ctx: &ResolveCtx<'_>,
+    key_path: &str,
+    entry: Option<&ShardEntry>,
+    own_lock_holder: Option<&TxId>,
+) -> Result<LockResolution, TransError> {
+    resolve_entry_locks_at(
+        ctx.resolver,
+        ctx.tmon,
+        key_path,
+        entry,
+        own_lock_holder,
+        Requirement::AtLeast(ctx.resolver.now()),
+    )
+    .await
 }
 
 /// Applies the transaction priority rule to one pending lock holder.
@@ -325,10 +414,8 @@ async fn resolve_entries(
         .prefix;
     let mut resolved_entries = BTreeMap::new();
     for (key, entry) in entries {
-        let resolved = ctx
-            .resolver
-            .resolve_holders(&paths::from_key(&prefix, key), entry, Some(id))
-            .await?;
+        let resolved =
+            resolve_entry_locks(ctx, &paths::from_key(&prefix, key), Some(entry), Some(id)).await?;
         let mut entry = entry.clone();
         entry.current_writer = resolved.writer;
         entry.deleted = resolved.deleted;
