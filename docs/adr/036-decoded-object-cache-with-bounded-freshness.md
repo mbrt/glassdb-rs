@@ -2,15 +2,14 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
-When implemented, this supersedes
+This supersedes
 [ADR-030](030-seed-shard-loads.md)'s `Latest` / `AllowStale` cache-freshness API
 while preserving its reuse optimization as an `Any` read followed by CAS.
 It refines only the caching part of
 [ADR-023](023-slimmed-backend-trait.md): the slim `Backend` trait, opaque content
-versions, and version-conditional read remain unchanged. ADR-030 remains
-authoritative while this proposal is unimplemented.
+versions, and version-conditional read remain unchanged.
 
 ## Context
 

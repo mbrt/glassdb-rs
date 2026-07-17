@@ -13,8 +13,7 @@ mod split;
 mod tlocker;
 
 pub use algo::{
-    Algo, Data, Handle, LeafCoverage, ReadAccess, ReadVersion, ScanAccess, ScanMutation, ScanRange,
-    WriteAccess,
+    Algo, Data, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
 pub use error::TransError;
 pub use gc::Gc;

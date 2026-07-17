@@ -2,7 +2,7 @@
 //! in the transaction object of whichever transaction last committed it, so a
 //! value is identified by its **writer**, not by a per-key backend object
 //! version. Coordination objects are revalidated by their backend version in
-//! the [`crate::ObjectCache`]; that version is tracked there, not here
+//! the decoded object store; that revision is tracked there, not here
 //! (ADR-023).
 
 use glassdb_data::TxId;

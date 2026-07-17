@@ -300,6 +300,7 @@ impl ShardResolver for StructureWriteResolver {
             outcome: FoldOutcome::Locked {
                 typ: LockType::Write,
                 membership: LockType::None,
+                validated: None,
             },
         })
     }
@@ -308,7 +309,7 @@ impl ShardResolver for StructureWriteResolver {
         false
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Conflict
     }
 }

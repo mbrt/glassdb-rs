@@ -35,7 +35,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{Directory, Freshness, LockScope, LockType, NodeLocks, PathLock, ShardEntry};
+use glassdb_storage::{
+    Directory, LeafObservation, LockScope, LockType, NodeLocks, PathLock, Requirement, ShardEntry,
+};
 
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
@@ -103,9 +105,18 @@ struct ShardGroup {
 /// groups this transaction holds.
 pub(crate) struct LockedTx {
     groups: BTreeMap<String, ShardGroup>,
+    validations: Vec<LeafObservation>,
 }
 
 impl LockedTx {
+    /// Reports whether this transaction's successful lock CAS validated the
+    /// exact leaf state that was observed earlier.
+    pub(crate) fn validated(&self, observed: &LeafObservation) -> bool {
+        self.validations
+            .iter()
+            .any(|validated| validated.same_state(observed))
+    }
+
     /// The per-key paths this transaction holds, as the `PathLock` set GC records
     /// on the transaction object for its reverse liveness check and lock pruning
     /// (ADR-022). Keys map to their `_k/` path; GC ignores the lock type, so it
@@ -162,6 +173,7 @@ fn lock_scope_order(scope: LockScope) -> u8 {
 async fn build_groups(
     dir: &Directory,
     data: &Data,
+    scan_requirement: Requirement,
 ) -> Result<BTreeMap<String, ShardGroup>, TransError> {
     let mut by_path: BTreeMap<String, Desired> = BTreeMap::new();
     for w in &data.writes {
@@ -183,11 +195,10 @@ async fn build_groups(
     let items: Vec<(String, Desired)> = by_path.into_iter().collect();
     // Route with interior nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
-    // coordination CAS revalidates at the version, so the root `_i` is not
-    // revalidated on every lock. The terminal leaf is read `Latest` to keep
-    // routing accurate and avoid needless re-routes.
+    // coordination CAS revalidates at the version, so neither the root `_i` nor
+    // the terminal leaf needs a separate validation read.
     let grouped = dir
-        .group_keys_by_leaf_fresh(items, Freshness::AllowStale, Freshness::Latest)
+        .group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any)
         .await
         .map_err(|e| TransError::with_source("grouping keys by leaf", e))?;
 
@@ -227,7 +238,7 @@ async fn build_groups(
                 &scan.prefix,
                 &scan.range.start,
                 scan.frontier.as_deref(),
-                Freshness::Latest,
+                scan_requirement,
             )
             .await?
         {
@@ -307,6 +318,7 @@ impl ShardResolver for AcquireResolver {
             outcome: FoldOutcome::Locked {
                 typ: shard_lock_type(&self.intents),
                 membership,
+                validated: None,
             },
         })
     }
@@ -317,7 +329,7 @@ impl ShardResolver for AcquireResolver {
             .all(|i| matches!(i.desired, Desired::Read))
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Conflict
     }
 
@@ -377,7 +389,7 @@ impl ShardResolver for WriteBackResolver {
         true
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Released {
             superseded: Vec::new(),
         }
@@ -420,7 +432,7 @@ impl ShardResolver for ReleaseResolver {
         true
     }
 
-    fn exhausted_outcome(&self) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Released {
             superseded: Vec::new(),
         }
@@ -610,14 +622,14 @@ pub(crate) enum LockOutcome {
 
 /// Outcome of acquiring locks across all touched shards.
 enum ShardsOutcome {
-    Locked,
+    Locked(Vec<LeafObservation>),
     Conflict,
     LeafFull,
 }
 
 /// Outcome of acquiring locks on a single shard (after any hold-and-wait).
 enum ShardOutcome {
-    Locked,
+    Locked(LeafObservation),
     Conflict,
     LeafFull,
 }
@@ -730,22 +742,42 @@ impl Locker {
     ///
     /// `serial` selects the sorted sequential fallback over the default parallel
     /// path (ADR-020).
+    #[cfg(test)]
     pub(crate) async fn lock(
         &self,
         id: &TxId,
         data: &Data,
         serial: bool,
     ) -> Result<LockOutcome, TransError> {
-        let mut groups = build_groups(&self.dir, data).await?;
-        match self.lock_shards(id, &groups, serial).await? {
-            ShardsOutcome::Locked => {}
+        self.lock_at(id, data, serial, Requirement::AtLeast(self.dir.now()))
+            .await
+    }
+
+    /// Acquires a transaction's locks while resolving predicate-lock coverage
+    /// against the supplied pre-lock requirement barrier.
+    pub(crate) async fn lock_at(
+        &self,
+        id: &TxId,
+        data: &Data,
+        serial: bool,
+        scan_requirement: Requirement,
+    ) -> Result<LockOutcome, TransError> {
+        let mut groups = build_groups(&self.dir, data, scan_requirement).await?;
+        let validations = match self
+            .lock_shards_at(id, &groups, serial, scan_requirement)
+            .await?
+        {
+            ShardsOutcome::Locked(validations) => validations,
             ShardsOutcome::Conflict => return Ok(LockOutcome::Conflict),
             ShardsOutcome::LeafFull => return Ok(LockOutcome::LeafFull),
-        }
+        };
         for group in groups.values_mut() {
             group.membership = self.held_membership(id, &group.path);
         }
-        Ok(LockOutcome::Locked(LockedTx { groups }))
+        Ok(LockOutcome::Locked(LockedTx {
+            groups,
+            validations,
+        }))
     }
 
     /// Releases every lock `id` holds across the leaves it has acquired,
@@ -764,6 +796,7 @@ impl Locker {
     /// first. The held set is read from the coordinator's per-tx bookkeeping.
     /// Idempotent and best-effort.
     pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
+        let requirement = Requirement::AtLeast(self.coord.now());
         for path in self.held_paths(id) {
             let pr = paths::parse(&path).map_err(|e| {
                 TransError::with_source(format!("parsing held lock path {path:?}"), e)
@@ -773,7 +806,7 @@ impl Locker {
                 // (ADR-031); a standalone `_n` node is a leaf too. Both carry
                 // only key entries, so releasing the leaf clears every hold.
                 paths::Type::CollectionInfo | paths::Type::Node => {
-                    self.release_leaf(id, &path).await?
+                    self.release_leaf_at(id, &path, requirement).await?
                 }
                 // Only leaves carry transaction locks.
                 _ => {}
@@ -794,9 +827,15 @@ impl Locker {
     /// reference and are GC write-back hint candidates (ADR-022).
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
         let mut superseded = Vec::new();
+        let requirement = Requirement::AtLeast(self.coord.now());
         for group in locked.groups.values() {
             if let Ok(mut s) = self
-                .write_back_shard(id, &group.path, Arc::new(group.intents.clone()))
+                .write_back_shard(
+                    id,
+                    &group.path,
+                    Arc::new(group.intents.clone()),
+                    requirement,
+                )
                 .await
             {
                 superseded.append(&mut s);
@@ -826,20 +865,37 @@ impl Locker {
             key_path: key_path.to_string(),
             desired: Desired::Put,
         }]);
-        self.write_back_shard(id, leaf_path, intents)
-            .await
-            .unwrap_or_default()
+        self.write_back_shard(
+            id,
+            leaf_path,
+            intents,
+            Requirement::AtLeast(self.coord.now()),
+        )
+        .await
+        .unwrap_or_default()
     }
 
     /// Acquires this transaction's locks across every touched shard. A
     /// retryable shard outcome asks the transaction to release and re-lock
     /// under the same id; the first such outcome wins in deterministic
     /// shard-path order.
+    #[cfg(test)]
     async fn lock_shards(
         &self,
         id: &TxId,
         groups: &BTreeMap<String, ShardGroup>,
         serial: bool,
+    ) -> Result<ShardsOutcome, TransError> {
+        self.lock_shards_at(id, groups, serial, Requirement::AtLeast(self.coord.now()))
+            .await
+    }
+
+    async fn lock_shards_at(
+        &self,
+        id: &TxId,
+        groups: &BTreeMap<String, ShardGroup>,
+        serial: bool,
+        requirement: Requirement,
     ) -> Result<ShardsOutcome, TransError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         // The first lock for this transaction starts the background refresh so a
@@ -849,27 +905,33 @@ impl Locker {
             self.tmon.start_refresh_tx(id);
         }
 
+        let mut validations = Vec::with_capacity(groups.len());
         if serial {
             // Ascending leaf-path order is the global lock order: the BTreeMap
             // already iterates sorted by leaf path.
             for group in groups.values() {
-                match self.lock_shard(id, group).await? {
-                    ShardOutcome::Locked => {}
+                match self.lock_shard(id, group, requirement).await? {
+                    ShardOutcome::Locked(validated) => validations.push(validated),
                     ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
                     ShardOutcome::LeafFull => return Ok(ShardsOutcome::LeafFull),
                 }
             }
         } else {
-            let outcomes = join_all(groups.values().map(|group| self.lock_shard(id, group))).await;
+            let outcomes = join_all(
+                groups
+                    .values()
+                    .map(|group| self.lock_shard(id, group, requirement)),
+            )
+            .await;
             for outcome in outcomes {
                 match outcome? {
-                    ShardOutcome::Locked => {}
+                    ShardOutcome::Locked(validated) => validations.push(validated),
                     ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
                     ShardOutcome::LeafFull => return Ok(ShardsOutcome::LeafFull),
                 }
             }
         }
-        Ok(ShardsOutcome::Locked)
+        Ok(ShardsOutcome::Locked(validations))
     }
 
     /// Installs this transaction's [`AcquireResolver`] on a shard through the
@@ -883,6 +945,7 @@ impl Locker {
         path: &str,
         intents: Arc<Vec<KeyIntent>>,
         membership: LockType,
+        requirement: Requirement,
     ) -> Result<FoldOutcome, TransError> {
         let resolver = Arc::new(AcquireResolver {
             id: id.clone(),
@@ -892,14 +955,18 @@ impl Locker {
         });
         match self
             .coord
-            .submit_shard(path, id, resolver, Freshness::Latest)
+            .submit_shard(path, id, resolver, requirement)
             .await?
         {
             // The lock landed: record the leaf hold so the serial-fallback
             // release and diagnostics can find it (the engine no longer tracks
             // this, ADR-028). The outcome carries the acquired strength, so the
             // caller records it without re-deriving from the intents.
-            Some(outcome @ FoldOutcome::Locked { typ, membership }) => {
+            Some(
+                outcome @ FoldOutcome::Locked {
+                    typ, membership, ..
+                },
+            ) => {
                 self.record_leaf_lock(id, path, typ, membership);
                 Ok(outcome)
             }
@@ -918,6 +985,7 @@ impl Locker {
         id: &TxId,
         path: &str,
         intents: Arc<Vec<KeyIntent>>,
+        requirement: Requirement,
     ) -> Result<Vec<TxId>, TransError> {
         let resolver = Arc::new(WriteBackResolver {
             id: id.clone(),
@@ -925,7 +993,7 @@ impl Locker {
         });
         match self
             .coord
-            .submit_shard(path, id, resolver, Freshness::Latest)
+            .submit_shard(path, id, resolver, requirement)
             .await?
         {
             Some(FoldOutcome::Released { superseded }) => Ok(superseded),
@@ -939,9 +1007,19 @@ impl Locker {
     /// dead transaction's leaf holds (ADR-029) without corrupting live
     /// tracking.
     pub(crate) async fn release_leaf(&self, id: &TxId, path: &str) -> Result<(), TransError> {
+        self.release_leaf_at(id, path, Requirement::AtLeast(self.coord.now()))
+            .await
+    }
+
+    async fn release_leaf_at(
+        &self,
+        id: &TxId,
+        path: &str,
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
         let resolver = Arc::new(ReleaseResolver { id: id.clone() });
         self.coord
-            .submit_shard(path, id, resolver, Freshness::Latest)
+            .submit_shard(path, id, resolver, requirement)
             .await
             .map(|_| ())
     }
@@ -951,7 +1029,12 @@ impl Locker {
     /// merges with other transactions contending the same shard whenever they
     /// do not exclusively conflict, so one owner-driven load + CAS serves the
     /// whole batch.
-    async fn lock_shard(&self, id: &TxId, group: &ShardGroup) -> Result<ShardOutcome, TransError> {
+    async fn lock_shard(
+        &self,
+        id: &TxId,
+        group: &ShardGroup,
+        requirement: Requirement,
+    ) -> Result<ShardOutcome, TransError> {
         let intents = Arc::new(group.intents.clone());
         // Paces the hold-and-wait re-poll. It advances across successive blind
         // polls of a holder that will not budge, and resets whenever a holder
@@ -959,11 +1042,19 @@ impl Locker {
         let mut backoff = self.retry.backoff();
         loop {
             match self
-                .acquire(id, &group.path, intents.clone(), group.membership)
+                .acquire(
+                    id,
+                    &group.path,
+                    intents.clone(),
+                    group.membership,
+                    requirement,
+                )
                 .await?
             {
-                FoldOutcome::Locked { .. } => {
-                    return Ok(ShardOutcome::Locked);
+                FoldOutcome::Locked { validated, .. } => {
+                    return validated.map(ShardOutcome::Locked).ok_or_else(|| {
+                        TransError::other("lock CAS returned no validation receipt")
+                    });
                 }
                 // Hold-and-wait (ADR-024): if the coordinator reports
                 // [`FoldOutcome::Wait`] — a key is held by a live holder this
@@ -1056,8 +1147,8 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::paths;
     use glassdb_storage::{
-        CollectionRoot, Directory, Freshness, Node, ObjectCache, Shard, ShardEntry, ShardStore,
-        SharedCache, SplitPolicy, TLogger, TxCommitStatus, ValueCache,
+        CachedStore, CollectionRoot, Directory, Node, Shard, ShardEntry, ShardStore, SplitPolicy,
+        TLogger, TxCommitStatus,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1076,12 +1167,10 @@ mod tests {
     }
 
     fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
-        let cache = SharedCache::new(1024);
-        let values = ValueCache::new(&cache);
-        let objects = ObjectCache::new(b.clone(), &cache);
+        let objects = CachedStore::new(b.clone(), 1024);
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(values.clone(), tl, Arc::downgrade(&bg));
+        let mon = Monitor::new(tl, Arc::downgrade(&bg));
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
@@ -1153,7 +1242,10 @@ mod tests {
     async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         loaded.entries.lookup(key).cloned()
@@ -1162,7 +1254,7 @@ mod tests {
     // Acquires shard locks in parallel mode, asserting success.
     async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
         match locker.lock_shards(id, groups, false).await.unwrap() {
-            ShardsOutcome::Locked => {}
+            ShardsOutcome::Locked(_) => {}
             ShardsOutcome::Conflict => panic!("expected lock acquisition to succeed"),
             ShardsOutcome::LeafFull => panic!("expected leaf to have capacity"),
         }
@@ -1185,7 +1277,10 @@ mod tests {
         assert_eq!(e.locked_by, vec![tx.clone()]);
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert_eq!(loaded.node().structure_lock().lock_type(), LockType::Read);
@@ -1238,7 +1333,10 @@ mod tests {
         assert!(entry_of(&ctx, b"z").await.is_none());
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert!(!loaded.node().structure_lock().contains(&tx));
@@ -1256,7 +1354,10 @@ mod tests {
         lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structure_lock().contains(&tx));
@@ -1282,7 +1383,7 @@ mod tests {
         let path = paths::collection_info(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
@@ -1292,7 +1393,7 @@ mod tests {
         locker.release_leaf(&tx, &path).await.unwrap();
         let loaded = ctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
@@ -1379,7 +1480,7 @@ mod tests {
         ctx.monitor.abort_tx(&old).await.unwrap();
         let outcome = waiting.await.unwrap().unwrap();
         assert!(
-            matches!(outcome, ShardsOutcome::Locked),
+            matches!(outcome, ShardsOutcome::Locked(_)),
             "younger proceeds once the holder finalizes"
         );
 
@@ -1427,12 +1528,18 @@ mod tests {
         }];
         ctx.monitor.commit_tx(tl).await.unwrap();
         locker
-            .write_back(&old, &LockedTx { groups: old_groups })
+            .write_back(
+                &old,
+                &LockedTx {
+                    groups: old_groups,
+                    validations: Vec::new(),
+                },
+            )
             .await;
 
         let outcome = waiting.await.unwrap().unwrap();
         assert!(
-            matches!(outcome, ShardsOutcome::Locked),
+            matches!(outcome, ShardsOutcome::Locked(_)),
             "younger proceeds once the holder commits"
         );
 
@@ -1452,7 +1559,15 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         lock_ok(&locker, &tx, &groups).await;
         // First writer of a fresh key overwrites no pointer: no GC hint.
-        let superseded = locker.write_back(&tx, &LockedTx { groups }).await;
+        let superseded = locker
+            .write_back(
+                &tx,
+                &LockedTx {
+                    groups,
+                    validations: Vec::new(),
+                },
+            )
+            .await;
         assert!(superseded.is_empty());
 
         let e = entry_of(&ctx, key).await.unwrap();
@@ -1461,7 +1576,10 @@ mod tests {
         assert_eq!(e.current_writer, Some(tx.clone()));
         let loaded = ctx
             .shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.shards.now()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structure_lock().holders().is_empty());
@@ -1572,7 +1690,7 @@ mod tests {
         let path = paths::collection_info(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -1599,7 +1717,7 @@ mod tests {
                     &new_shard,
                     &loaded.locks,
                     loaded.kind(),
-                    loaded.version.as_ref(),
+                    &loaded.observation,
                 )
                 .await
                 .unwrap()
@@ -1713,8 +1831,14 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
 
-        assert!(matches!(h1.await.unwrap().unwrap(), ShardsOutcome::Locked));
-        assert!(matches!(h2.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            h1.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+        assert!(matches!(
+            h2.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
 
         let shard_path = paths::collection_info(COLL);
         assert_eq!(
@@ -1753,8 +1877,14 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
 
-        assert!(matches!(h1.await.unwrap().unwrap(), ShardsOutcome::Locked));
-        assert!(matches!(h2.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            h1.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+        assert!(matches!(
+            h2.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
 
         let shard_path = paths::collection_info(COLL);
         assert_eq!(
@@ -1791,7 +1921,7 @@ mod tests {
         ctx.monitor.abort_tx(&old).await.unwrap();
         assert!(matches!(
             waiting.await.unwrap().unwrap(),
-            ShardsOutcome::Locked
+            ShardsOutcome::Locked(_)
         ));
         assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![young]);
     }
@@ -1811,7 +1941,10 @@ mod tests {
             prev_writer: TxId::default(),
         }];
         ctx.monitor.commit_tx(tl).await.unwrap();
-        LockedTx { groups }
+        LockedTx {
+            groups,
+            validations: Vec::new(),
+        }
     }
 
     // Two committed transactions writing *disjoint* keys of one shard write back
@@ -1884,7 +2017,10 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         hw.await.unwrap();
-        assert!(matches!(ha.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            ha.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
 
         assert_eq!(
             count_stores(&log, &shard_path) - before,
@@ -1967,7 +2103,10 @@ mod tests {
         gate.release();
 
         // The older locks; the younger is left waiting on it, not wounded.
-        assert!(matches!(ho.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            ho.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!hy.is_finished(), "the younger waits for the older holder");
 
@@ -2013,11 +2152,17 @@ mod tests {
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
-        assert!(matches!(ho.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            ho.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
 
         // The older releases; the younger's hold-and-wait loop then re-acquires.
         locker.release_locks(&old).await.unwrap();
-        assert!(matches!(hy.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            hy.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
         assert_eq!(entry_of(&ctx, key).await.unwrap().locked_by, vec![young]);
 
         // A load per poll, but only three CAS stores: the older's acquire, the
@@ -2057,7 +2202,10 @@ mod tests {
         gate.release();
 
         // The tiebreak winner locks; the loser waits (not wounded).
-        assert!(matches!(ha.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            ha.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!hb.is_finished(), "the loser waits without being wounded");
         assert_eq!(
@@ -2071,7 +2219,10 @@ mod tests {
 
         // After the winner releases, the loser proceeds: progress, no livelock.
         locker.release_locks(&a).await.unwrap();
-        assert!(matches!(hb.await.unwrap().unwrap(), ShardsOutcome::Locked));
+        assert!(matches!(
+            hb.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
         assert_eq!(entry_of(&ctx, key).await.unwrap().locked_by, vec![b]);
 
         // Three CAS stores: the winner's acquire, its release, then the loser's
@@ -2108,7 +2259,10 @@ mod tests {
             rt::sleep(Duration::from_millis(50)).await;
             gate.release();
             hw.await.unwrap();
-            assert!(matches!(ha.await.unwrap().unwrap(), ShardsOutcome::Locked));
+            assert!(matches!(
+                ha.await.unwrap().unwrap(),
+                ShardsOutcome::Locked(_)
+            ));
 
             assert_eq!(
                 count_stores(&log, &shard_path) - before,

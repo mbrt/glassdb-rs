@@ -12,9 +12,9 @@ use glassdb_data::{TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
+use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
 use crate::lock::LockType;
-use crate::object_cache::{Freshness, ObjectCache};
 
 /// The commit state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,7 +82,7 @@ pub struct TValue {
 pub struct TxStatus {
     pub status: TxCommitStatus,
     pub last_update: SystemTime,
-    pub version: backend::Version,
+    pub observation: Observation<TxLog>,
 }
 
 /// One backend page of transaction IDs from a deterministic log shard.
@@ -119,15 +119,53 @@ impl std::fmt::Display for LockScope {
 #[derive(Clone)]
 pub struct TLogger {
     prefix: String,
-    objects: ObjectCache,
+    logs: crate::cached_store::TypedCachedStore<TxLog>,
+}
+
+impl Codec for TxLog {
+    type Value = TxLog;
+
+    fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+        let id = paths::transaction_id_of(path)
+            .map_err(|error| StorageError::with_source("parsing transaction path", error))?;
+        decode_tx_log(&id, body)
+    }
+
+    fn encode(log: &Self::Value) -> Result<Vec<u8>, StorageError> {
+        let timestamp = log
+            .timestamp
+            .ok_or_else(|| StorageError::other("transaction log has no persisted timestamp"))?;
+        marshal_log(log, timestamp)
+    }
+
+    fn size(log: &Self::Value) -> usize {
+        log.writes
+            .iter()
+            .map(|write| write.path.len() + write.value.len() + write.prev_writer.as_bytes().len())
+            .sum::<usize>()
+            + log
+                .locks
+                .iter()
+                .map(|lock| lock.path.len() + std::mem::size_of::<PathLock>())
+                .sum::<usize>()
+            + std::mem::size_of::<TxLog>()
+    }
+
+    fn valid_path(path: &str) -> bool {
+        paths::transaction_id_of(path).is_ok()
+    }
+
+    fn name() -> &'static str {
+        "transaction log"
+    }
 }
 
 impl TLogger {
     /// Creates a logger storing logs under `prefix`.
-    pub fn new(objects: ObjectCache, prefix: impl Into<String>) -> Self {
+    pub fn new(objects: CachedStore, prefix: impl Into<String>) -> Self {
         TLogger {
             prefix: prefix.into(),
-            objects,
+            logs: objects.typed(),
         }
     }
 
@@ -135,24 +173,30 @@ impl TLogger {
     /// possible. The status and timestamp are read from the transaction object
     /// body (ADR-019); an absent object means the transaction is unknown.
     pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
-        let p = paths::from_transaction(&self.prefix, id);
-        // A finalized (committed/aborted) log is immutable, so a cached copy can
-        // answer without a backend revalidation round-trip.
-        if let Some(o) = self.objects.peek(&p)
-            && let Ok(ts) = decode_status(&o.value, o.version)
-            && ts.status.is_final()
-        {
-            return Ok(ts);
-        }
-        match self.objects.read(&p, Freshness::Latest).await {
-            Ok(gr) => decode_status(&gr.value, gr.version),
-            Err(StorageError::NotFound) => Ok(TxStatus {
-                status: TxCommitStatus::Unknown,
-                last_update: UNIX_EPOCH,
-                version: backend::Version::default(),
-            }),
-            Err(e) => Err(e),
-        }
+        self.commit_status_at(id, Requirement::AtLeast(self.logs.now()))
+            .await
+    }
+
+    /// Returns transaction status with an explicit generic requirement bound.
+    pub async fn commit_status_at(
+        &self,
+        id: &TxId,
+        requirement: Requirement,
+    ) -> Result<TxStatus, StorageError> {
+        let path = paths::from_transaction(&self.prefix, id);
+        let observation = match self.cached_final(&path)? {
+            Some(observation) => observation,
+            None => self.logs.read(&path, requirement).await?,
+        };
+        let (status, last_update) = match observation.value() {
+            Some(log) => (log.status, log.timestamp.unwrap_or(UNIX_EPOCH)),
+            None => (TxCommitStatus::Unknown, UNIX_EPOCH),
+        };
+        Ok(TxStatus {
+            status,
+            last_update,
+            observation,
+        })
     }
 
     /// Reads and parses the full transaction log for `id`, together with its
@@ -160,50 +204,67 @@ impl TLogger {
     /// dead pending object and to prune its locks (ADR-022); callers that only
     /// need the log body ignore it.
     ///
-    /// A finalized (committed/aborted) log is immutable, so a cached copy — and
-    /// its version — is authoritative and answers without a backend round-trip.
-    /// A pending log can still change, so it is read through, revalidating via
-    /// the version-conditional GET (the backend version changes on every content
-    /// write — refresh or finalization — ADR-023).
-    pub async fn get(&self, id: &TxId) -> Result<(TxLog, backend::Version), StorageError> {
-        let p = paths::from_transaction(&self.prefix, id);
-        if let Some(o) = self.objects.peek(&p) {
-            let log = decode_tx_log(id, &o.value)?;
-            if log.status.is_final() {
-                return Ok((log, o.version));
-            }
+    /// A cached finalized object is authoritative because transaction objects
+    /// cannot change after commit or abort. Pending objects still honor the
+    /// requested generic requirement bound.
+    pub async fn get(&self, id: &TxId) -> Result<Observation<TxLog>, StorageError> {
+        self.get_at(id, Requirement::AtLeast(self.logs.now())).await
+    }
+
+    /// Reads the full transaction object with an explicit requirement bound.
+    pub async fn get_at(
+        &self,
+        id: &TxId,
+        requirement: Requirement,
+    ) -> Result<Observation<TxLog>, StorageError> {
+        let path = paths::from_transaction(&self.prefix, id);
+        let observation = match self.cached_final(&path)? {
+            Some(observation) => observation,
+            None => self.logs.read(&path, requirement).await?,
+        };
+        if observation.is_absent() {
+            Err(StorageError::NotFound)
+        } else {
+            Ok(observation)
         }
-        let gr = self.objects.read(&p, Freshness::Latest).await?;
-        Ok((decode_tx_log(id, &gr.value)?, gr.version))
     }
 
     /// Creates a new transaction log entry, failing if one already exists.
-    pub async fn set(&self, l: &TxLog) -> Result<backend::Version, StorageError> {
+    pub async fn set(&self, l: &TxLog) -> Result<Observation<TxLog>, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
-        let buf = marshal_log(l, ts)?;
-        self.objects
-            .write_if_not_exists(
+        let mut persisted = l.clone();
+        persisted.timestamp = Some(ts);
+        match self
+            .logs
+            .create(
                 &paths::from_transaction(&self.prefix, &l.id),
-                Arc::from(buf),
+                None,
+                Arc::new(persisted),
             )
-            .await
+            .await?
+        {
+            CasResult::Committed(observed) => Ok(observed),
+            CasResult::Conflict => Err(StorageError::Precondition),
+        }
     }
 
     /// Updates the log only if its current version matches `expected`.
     pub async fn set_if(
         &self,
         l: &TxLog,
-        expected: &backend::Version,
-    ) -> Result<backend::Version, StorageError> {
+        expected: &Observation<TxLog>,
+    ) -> Result<Observation<TxLog>, StorageError> {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
-        let buf = marshal_log(l, ts)?;
-        self.objects
-            .write_if(
-                &paths::from_transaction(&self.prefix, &l.id),
-                Arc::from(buf),
-                expected,
-            )
-            .await
+        let mut persisted = l.clone();
+        persisted.timestamp = Some(ts);
+        match self
+            .logs
+            .compare_and_swap(expected, Arc::new(persisted))
+            .await?
+        {
+            CasResult::Committed(observed) => Ok(observed),
+            CasResult::Conflict => Err(StorageError::Precondition),
+        }
     }
 
     /// Lists one page of transaction IDs from `shard`.
@@ -214,7 +275,7 @@ impl TLogger {
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
         let prefix = paths::transaction_shard_prefix(&self.prefix, shard);
-        let page = self.objects.list(&prefix, cursor, limit).await?;
+        let page = self.logs.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
             .iter()
@@ -228,15 +289,17 @@ impl TLogger {
 
     /// Removes the log for `id`, ignoring not-found errors.
     pub async fn delete(&self, id: &TxId) -> Result<(), StorageError> {
-        match self
-            .objects
+        self.logs
             .delete(&paths::from_transaction(&self.prefix, id))
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(StorageError::NotFound) => Ok(()),
-            Err(e) => Err(e),
-        }
+            .await?;
+        Ok(())
+    }
+
+    fn cached_final(&self, path: &str) -> Result<Option<Observation<TxLog>>, StorageError> {
+        Ok(self
+            .logs
+            .peek(path)?
+            .filter(|observation| observation.value().is_some_and(|log| log.status.is_final())))
     }
 }
 
@@ -447,28 +510,6 @@ fn parse_lock_type(t: i32) -> LockType {
     }
 }
 
-/// Decodes a transaction object body into its commit status and timestamp,
-/// pairing them with the object's backend `version`. The status and timestamp
-/// live in the proto body itself (ADR-019), so this is the v2 replacement for
-/// the v1 tag read.
-fn decode_status(buf: &[u8], version: backend::Version) -> Result<TxStatus, StorageError> {
-    let tr = parse_log(buf)?;
-    let status = match tr.status() {
-        pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
-        pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
-        pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
-        pb::transaction_log::Status::Default => {
-            return Err(StorageError::other("unknown commit status in tx log"));
-        }
-    };
-    let last_update = tr.timestamp.map(proto_ts_to_system).unwrap_or(UNIX_EPOCH);
-    Ok(TxStatus {
-        status,
-        last_update,
-        version,
-    })
-}
-
 fn system_to_proto_ts(t: SystemTime) -> prost_types::Timestamp {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => prost_types::Timestamp {
@@ -496,13 +537,12 @@ fn proto_ts_to_system(ts: prost_types::Timestamp) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::SharedCache;
     use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::RecordingBackend;
 
     fn new_tlogger() -> TLogger {
-        let cache = SharedCache::new(1 << 20);
         let backend = Arc::new(MemoryBackend::new());
-        let objects = ObjectCache::new(backend, &cache);
+        let objects = CachedStore::new(backend, 1 << 20);
         TLogger::new(objects, "db")
     }
 
@@ -536,7 +576,8 @@ mod tests {
         };
         t.set(&log).await.unwrap();
 
-        let (got, _) = t.get(&id).await.unwrap();
+        let got = t.get(&id).await.unwrap();
+        let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         // Locks include the collection lock and the key lock.
@@ -577,11 +618,63 @@ mod tests {
         }];
         let stored_v = t.set(&log).await.unwrap();
 
-        let (got, version) = t.get(&id).await.unwrap();
+        let got = t.get(&id).await.unwrap();
+        let version = got.revision().cloned();
+        let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         assert_eq!(got.timestamp, log.timestamp);
-        assert_eq!(version, stored_v);
+        assert_eq!(version.as_ref(), stored_v.revision());
+    }
+
+    #[tokio::test]
+    async fn finalized_logs_are_served_from_the_typed_cache() {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20);
+        let logger = TLogger::new(objects, "db");
+        let id = TxId::from_bytes(vec![4, 3, 2, 1]);
+        logger
+            .set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
+            .await
+            .unwrap();
+        operations.lock().unwrap().clear();
+
+        logger.get(&id).await.unwrap();
+        logger.get(&id).await.unwrap();
+
+        let conditional_reads = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.op == "read_if_modified")
+            .count();
+        assert_eq!(conditional_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn pending_logs_still_obey_generic_freshness() {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20);
+        let logger = TLogger::new(objects, "db");
+        let id = TxId::from_bytes(vec![4, 3, 2, 2]);
+        logger
+            .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        operations.lock().unwrap().clear();
+
+        logger.get(&id).await.unwrap();
+        logger.get(&id).await.unwrap();
+
+        let conditional_reads = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.op == "read_if_modified")
+            .count();
+        assert_eq!(conditional_reads, 2);
     }
 
     #[tokio::test]

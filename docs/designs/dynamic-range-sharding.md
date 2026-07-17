@@ -254,8 +254,8 @@ split-point policy, and node fan-out/sizing.
   subcollection directory are permanent invalid-input errors. Future tuning may
   still adjust those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
-  index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
-  `AllowStale` seeding).
+  index nodes (reuse of ADR-036's decoded object store and `Requirement::Any` CAS
+  seeding).
 - **Fast paths.** How the single read-write fast path (ADR-027) and read-only
   fast path interact with a stale cached descent.
 - **Subcollection directory.** It lives in the root object `_i`; whether it should

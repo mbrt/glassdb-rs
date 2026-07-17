@@ -5,45 +5,99 @@
 //! or a version-conditional compare-and-swap — the only coordination primitive
 //! v2 needs (ADR-023).
 //!
-//! Reads and writes go through the [`ObjectCache`], so a hot node/root
-//! revalidates with a version-conditional `read_if_modified` and serves its
-//! cached body without a re-transfer. The backend version changes on every
-//! content write — exactly when a cached copy must be invalidated — so this is
-//! safe.
+//! Reads and writes go through the decoded [`CachedStore`].
 
 use std::sync::Arc;
 
 use glassdb_backend as backend;
 use glassdb_data::paths;
 
+use crate::cached_store::{
+    CachedStore, CasResult, Codec, Instant, Observation, Requirement, Validated,
+};
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
-use crate::object_cache::{Freshness, ObjectCache};
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
 
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 
-/// Reads and compare-and-swaps B-link node and collection-root objects through
-/// the [`ObjectCache`], the v2 coordination substrate.
+/// Reads and compare-and-swaps B-link node and collection-root objects.
 #[derive(Clone)]
 pub struct ShardStore {
-    objects: ObjectCache,
+    roots: crate::cached_store::TypedCachedStore<CollectionRoot>,
+    nodes: crate::cached_store::TypedCachedStore<Node>,
+    structural_logs: crate::cached_store::TypedCachedStore<StructuralLog>,
 }
 
 /// A B-link leaf loaded for one coordination round (ADR-031): its per-key
-/// `entries`, the backing object's `version` (`None` if the object does not
-/// exist yet), and the private [`LeafKind`] context needed to write the entries
-/// back into the right object kind. The leaf is the CAS unit for its keys; it
+/// `entries`, the backing object's observation, and the private [`LeafKind`]
+/// context needed to write the entries back into the right object kind. The leaf is the CAS unit for its keys; it
 /// lives either in the collection root `_i` (a small collection's single leaf)
 /// or in a standalone node `_n`.
 pub struct LoadedLeaf {
     pub entries: Shard,
     /// Node-level coordination staged independently from topology.
     pub locks: NodeLocks,
-    pub version: Option<backend::Version>,
+    pub observation: LeafObservation,
     kind: LeafKind,
+}
+
+/// The exact root or node state from which a loaded leaf was decoded.
+#[derive(Clone, Debug)]
+pub enum LeafObservation {
+    Root(Observation<CollectionRoot>),
+    Node(Observation<Node>),
+}
+
+/// Result of validating an exact retained leaf state.
+pub enum LeafValidation {
+    Unchanged,
+    Changed(LeafObservation),
+}
+
+impl LeafObservation {
+    /// Returns the decoded node when the backing object exists.
+    pub fn node(&self) -> Option<&Node> {
+        match self {
+            LeafObservation::Root(observed) => observed.value().map(|root| root.node()),
+            LeafObservation::Node(observed) => observed.value().map(Arc::as_ref),
+        }
+    }
+
+    /// Reports whether the backing object was absent.
+    pub fn is_absent(&self) -> bool {
+        match self {
+            LeafObservation::Root(observed) => observed.is_absent(),
+            LeafObservation::Node(observed) => observed.is_absent(),
+        }
+    }
+
+    /// Returns the backing object's portable revision token when present.
+    pub fn revision(&self) -> Option<&crate::cached_store::Revision> {
+        match self {
+            LeafObservation::Root(observed) => observed.revision(),
+            LeafObservation::Node(observed) => observed.revision(),
+        }
+    }
+
+    /// Reports whether all physical state for this leaf came from cache.
+    pub fn cache_hit(&self) -> bool {
+        match self {
+            LeafObservation::Root(observed) => observed.cache_hit(),
+            LeafObservation::Node(observed) => observed.cache_hit(),
+        }
+    }
+
+    /// Reports whether two observations describe the same exact leaf state.
+    pub fn same_state(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LeafObservation::Root(left), LeafObservation::Root(right)) => left.same_state(right),
+            (LeafObservation::Node(left), LeafObservation::Node(right)) => left.same_state(right),
+            _ => false,
+        }
+    }
 }
 
 impl LoadedLeaf {
@@ -88,38 +142,162 @@ pub enum LeafKind {
     Node(Node),
 }
 
-impl ShardStore {
-    /// Creates a shard store that reads and compare-and-swaps through `objects`.
-    pub fn new(objects: ObjectCache) -> Self {
-        ShardStore { objects }
+impl Codec for CollectionRoot {
+    type Value = CollectionRoot;
+
+    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+        CollectionRoot::decode(body)
     }
 
-    /// Returns the shared coordination-object cache backing this store.
-    pub fn object_cache(&self) -> ObjectCache {
-        self.objects.clone()
+    fn encode(root: &Self::Value) -> Result<Vec<u8>, StorageError> {
+        Ok(root.encode())
+    }
+
+    fn size(root: &Self::Value) -> usize {
+        root.encode().len()
+    }
+
+    fn valid_path(path: &str) -> bool {
+        paths::is_collection_info(path)
+    }
+
+    fn name() -> &'static str {
+        "collection root"
+    }
+}
+
+impl Codec for Node {
+    type Value = Node;
+
+    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+        Node::decode(body)
+    }
+
+    fn encode(node: &Self::Value) -> Result<Vec<u8>, StorageError> {
+        Ok(node.encode())
+    }
+
+    fn size(node: &Self::Value) -> usize {
+        node.encode().len()
+    }
+
+    fn valid_path(path: &str) -> bool {
+        paths::parse(path).is_ok_and(|parsed| parsed.typ == paths::Type::Node)
+    }
+
+    fn name() -> &'static str {
+        "node"
+    }
+}
+
+impl Codec for StructuralLog {
+    type Value = StructuralLog;
+
+    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+        StructuralLog::decode(body)
+    }
+
+    fn encode(record: &Self::Value) -> Result<Vec<u8>, StorageError> {
+        Ok(record.encode())
+    }
+
+    fn size(record: &Self::Value) -> usize {
+        record.encode().len()
+    }
+
+    fn valid_path(path: &str) -> bool {
+        paths::structural_log_id_of(path).is_ok()
+    }
+
+    fn name() -> &'static str {
+        "structural log"
+    }
+}
+
+impl ShardStore {
+    /// Creates a shard store that reads and compare-and-swaps through `objects`.
+    pub fn new(objects: CachedStore) -> Self {
+        ShardStore {
+            roots: objects.typed(),
+            nodes: objects.typed(),
+            structural_logs: objects.typed(),
+        }
+    }
+
+    /// Returns the current instant on the shared object store's clock.
+    pub fn now(&self) -> Instant {
+        self.roots.now()
+    }
+
+    /// Builds a freshness requirement for a duration-bounded stale read.
+    pub fn requirement_within(&self, max_staleness: std::time::Duration) -> Requirement {
+        self.roots.requirement_within(max_staleness)
+    }
+
+    /// Validates a retained leaf observation after `bound`.
+    pub async fn validate_leaf(
+        &self,
+        observed: &LeafObservation,
+        bound: Instant,
+    ) -> Result<LeafValidation, StorageError> {
+        match observed {
+            LeafObservation::Root(root) => match self.roots.validate(root, bound).await? {
+                Validated::Unchanged => Ok(LeafValidation::Unchanged),
+                Validated::Changed(changed) => {
+                    Ok(LeafValidation::Changed(LeafObservation::Root(changed)))
+                }
+            },
+            LeafObservation::Node(node) => match self.nodes.validate(node, bound).await? {
+                Validated::Unchanged => Ok(LeafValidation::Unchanged),
+                Validated::Changed(changed) => {
+                    Ok(LeafValidation::Changed(LeafObservation::Node(changed)))
+                }
+            },
+        }
     }
 
     /// Loads the B-link root node from the collection root `_i` under `prefix`,
     /// or `None` if the collection does not exist yet (ADR-031). The root object
     /// carries both the node and the collection metadata; this returns just the
-    /// node (a leaf while small, an index once grown) with the root's version.
+    /// node (a leaf while small, an index once grown) and its exact observation.
     pub async fn load_root_node(
         &self,
         prefix: &str,
-        freshness: Freshness,
-    ) -> Result<Option<(Node, backend::Version)>, StorageError> {
-        match self
-            .objects
-            .read(&paths::collection_info(prefix), freshness)
-            .await
-        {
-            Ok(r) => Ok(Some((
-                CollectionRoot::decode(&r.value)?.node().clone(),
-                r.version,
-            ))),
-            Err(StorageError::NotFound) => Ok(None),
-            Err(e) => Err(e),
+        requirement: Requirement,
+    ) -> Result<Option<(Node, LeafObservation)>, StorageError> {
+        let observation = self.load_root_state(prefix, requirement).await?;
+        let node = observation.node().cloned();
+        Ok(node.map(|node| (node, observation)))
+    }
+
+    /// Loads the root object's exact observation, including observed absence.
+    pub async fn load_root_state(
+        &self,
+        prefix: &str,
+        requirement: Requirement,
+    ) -> Result<LeafObservation, StorageError> {
+        let observed = self
+            .roots
+            .read(&paths::collection_info(prefix), requirement)
+            .await?;
+        Ok(LeafObservation::Root(observed))
+    }
+
+    /// Loads the non-root node's exact observation.
+    pub async fn load_node_state(
+        &self,
+        prefix: &str,
+        token: &str,
+        requirement: Requirement,
+    ) -> Result<LeafObservation, StorageError> {
+        let observed = self
+            .nodes
+            .read(&paths::from_node(prefix, token), requirement)
+            .await?;
+        if observed.is_absent() {
+            return Err(StorageError::NotFound);
         }
+        Ok(LeafObservation::Node(observed))
     }
 
     /// Loads the non-root node named `token` (`{prefix}/_n/<token>`, ADR-031). A
@@ -130,13 +308,14 @@ impl ShardStore {
         &self,
         prefix: &str,
         token: &str,
-        freshness: Freshness,
-    ) -> Result<(Node, backend::Version), StorageError> {
-        let r = self
-            .objects
-            .read(&paths::from_node(prefix, token), freshness)
-            .await?;
-        Ok((Node::decode(&r.value)?, r.version))
+        requirement: Requirement,
+    ) -> Result<(Node, LeafObservation), StorageError> {
+        let observation = self.load_node_state(prefix, token, requirement).await?;
+        let node = observation
+            .node()
+            .expect("load_node_state rejects absence")
+            .clone();
+        Ok((node, observation))
     }
 
     /// Compare-and-swaps the non-root node named `token`. `expected = None` means
@@ -147,27 +326,33 @@ impl ShardStore {
         prefix: &str,
         token: &str,
         node: &Node,
-        expected: Option<&backend::Version>,
+        expected: Option<&LeafObservation>,
     ) -> Result<bool, StorageError> {
         let path = paths::from_node(prefix, token);
-        let body: Arc<[u8]> = Arc::from(node.encode());
         let res = match expected {
-            Some(v) => self.objects.write_if(&path, body, v).await,
-            None => self.objects.write_if_not_exists(&path, body).await,
+            Some(LeafObservation::Node(observed)) => {
+                self.nodes
+                    .compare_and_swap(observed, Arc::new(node.clone()))
+                    .await
+            }
+            Some(LeafObservation::Root(_)) => {
+                return Err(StorageError::other(
+                    "node write received a root observation",
+                ));
+            }
+            None => self.nodes.create(&path, None, Arc::new(node.clone())).await,
         };
         match res {
-            Ok(_) => Ok(true),
-            Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
+            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
     }
 
     /// Deletes the standalone node `_n/<token>`, ignoring a missing object.
     pub async fn delete_node(&self, prefix: &str, token: &str) -> Result<(), StorageError> {
-        match self.objects.delete(&paths::from_node(prefix, token)).await {
-            Ok(()) | Err(StorageError::NotFound) => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.nodes.delete(&paths::from_node(prefix, token)).await?;
+        Ok(())
     }
 
     /// Creates a split write-ahead record before any node is created.
@@ -178,11 +363,11 @@ impl ShardStore {
     ) -> Result<(), StorageError> {
         let path = paths::structural_log_record(paths::db_root_of(&record.prefix), record_id);
         match self
-            .objects
-            .write_if_not_exists(&path, Arc::from(record.encode()))
+            .structural_logs
+            .create(&path, None, Arc::new(record.clone()))
             .await
         {
-            Ok(_) | Err(StorageError::Precondition) => Ok(()),
+            Ok(CasResult::Committed(_) | CasResult::Conflict) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -197,14 +382,19 @@ impl ShardStore {
         let mut cursor = None;
         let mut records = Vec::new();
         loop {
-            let page = self.objects.list(&prefix, cursor.as_ref(), limit).await?;
+            let page = self
+                .structural_logs
+                .list(&prefix, cursor.as_ref(), limit)
+                .await?;
             for path in page.objects {
                 let record_id = paths::structural_log_id_of(&path)
                     .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
-                match self.objects.read(&path, Freshness::Latest).await {
-                    Ok(read) => records.push((record_id, StructuralLog::decode(&read.value)?)),
-                    Err(StorageError::NotFound) => {}
-                    Err(e) => return Err(e),
+                let observed = self
+                    .structural_logs
+                    .read(&path, Requirement::AtLeast(self.now()))
+                    .await?;
+                if let Some(record) = observed.value() {
+                    records.push((record_id, record.as_ref().clone()));
                 }
             }
             match page.next {
@@ -220,14 +410,10 @@ impl ShardStore {
         db_root: &str,
         record_id: &str,
     ) -> Result<(), StorageError> {
-        match self
-            .objects
+        self.structural_logs
             .delete(&paths::structural_log_record(db_root, record_id))
-            .await
-        {
-            Ok(()) | Err(StorageError::NotFound) => Ok(()),
-            Err(e) => Err(e),
-        }
+            .await?;
+        Ok(())
     }
 
     /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
@@ -239,12 +425,13 @@ impl ShardStore {
     pub async fn load_leaf(
         &self,
         path: &str,
-        freshness: Freshness,
+        requirement: Requirement,
     ) -> Result<LoadedLeaf, StorageError> {
         if paths::is_collection_info(path) {
-            match self.objects.read(path, freshness).await {
-                Ok(r) => {
-                    let root = CollectionRoot::decode(&r.value)?;
+            let observed = self.roots.read(path, requirement).await?;
+            match observed.value() {
+                Some(root) => {
+                    let root = root.as_ref().clone();
                     let entries = root
                         .node()
                         .as_leaf()
@@ -253,37 +440,36 @@ impl ShardStore {
                     Ok(LoadedLeaf {
                         entries,
                         locks: root.node().locks().clone(),
-                        version: Some(r.version),
+                        observation: LeafObservation::Root(observed),
                         kind: LeafKind::Root(root),
                     })
                 }
-                Err(StorageError::NotFound) => Ok(LoadedLeaf {
+                None => Ok(LoadedLeaf {
                     entries: Shard::new(),
                     locks: NodeLocks::default(),
-                    version: None,
+                    observation: LeafObservation::Root(observed),
                     kind: LeafKind::Root(CollectionRoot::new()),
                 }),
-                Err(e) => Err(e),
             }
         } else {
-            match self.objects.read(path, freshness).await {
-                Ok(r) => {
-                    let node = Node::decode(&r.value)?;
+            let observed = self.nodes.read(path, requirement).await?;
+            match observed.value() {
+                Some(node) => {
+                    let node = node.as_ref().clone();
                     let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
                     Ok(LoadedLeaf {
                         entries,
                         locks: node.locks().clone(),
-                        version: Some(r.version),
+                        observation: LeafObservation::Node(observed),
                         kind: LeafKind::Node(node),
                     })
                 }
-                Err(StorageError::NotFound) => Ok(LoadedLeaf {
+                None => Ok(LoadedLeaf {
                     entries: Shard::new(),
                     locks: NodeLocks::default(),
-                    version: None,
+                    observation: LeafObservation::Node(observed),
                     kind: LeafKind::Node(Node::leaf(Shard::new())),
                 }),
-                Err(e) => Err(e),
             }
         }
     }
@@ -296,31 +482,52 @@ impl ShardStore {
         entries: &Shard,
         locks: &NodeLocks,
         kind: &LeafKind,
-        expected: Option<&backend::Version>,
+        expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
-        let body: Arc<[u8]> = match kind {
-            LeafKind::Root(root) => {
+        let res = match (kind, expected) {
+            (LeafKind::Root(root), LeafObservation::Root(observed)) => {
                 let mut root = root.clone();
                 let mut node = root.node().clone();
                 node.set_leaf(entries.clone())?;
                 node.set_locks(locks.clone());
                 root.set_node(node);
-                Arc::from(root.encode())
+                if observed.is_absent() {
+                    self.roots
+                        .create(observed.path(), Some(observed), Arc::new(root))
+                        .await
+                        .map(|result| result.committed())
+                } else {
+                    self.roots
+                        .compare_and_swap(observed, Arc::new(root))
+                        .await
+                        .map(|result| result.committed())
+                }
             }
-            LeafKind::Node(node) => {
+            (LeafKind::Node(node), LeafObservation::Node(observed)) => {
                 let mut node = node.clone();
                 node.set_leaf(entries.clone())?;
                 node.set_locks(locks.clone());
-                Arc::from(node.encode())
+                if observed.is_absent() {
+                    self.nodes
+                        .create(observed.path(), Some(observed), Arc::new(node))
+                        .await
+                        .map(|result| result.committed())
+                } else {
+                    self.nodes
+                        .compare_and_swap(observed, Arc::new(node))
+                        .await
+                        .map(|result| result.committed())
+                }
+            }
+            _ => {
+                return Err(StorageError::other(format!(
+                    "leaf kind does not match observation for {path:?}"
+                )));
             }
         };
-        let res = match expected {
-            Some(v) => self.objects.write_if(path, body, v).await,
-            None => self.objects.write_if_not_exists(path, body).await,
-        };
         match res {
-            Ok(_) => Ok(true),
-            Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
+            Ok(committed) => Ok(committed),
+            Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -330,33 +537,41 @@ impl ShardStore {
     pub async fn load_root(
         &self,
         prefix: &str,
-    ) -> Result<(CollectionRoot, backend::Version), StorageError> {
-        let r = self
-            .objects
-            .read(&paths::collection_info(prefix), Freshness::Latest)
+    ) -> Result<(CollectionRoot, LeafObservation), StorageError> {
+        let observed = self
+            .roots
+            .read(
+                &paths::collection_info(prefix),
+                Requirement::AtLeast(self.now()),
+            )
             .await?;
-        Ok((CollectionRoot::decode(&r.value)?, r.version))
+        let root = observed
+            .value()
+            .map(|root| root.as_ref().clone())
+            .ok_or(StorageError::NotFound)?;
+        Ok((root, LeafObservation::Root(observed)))
     }
 
     /// Compare-and-swaps the collection root. Returns `false` on a precondition
     /// miss, `true` on success.
     pub async fn store_root(
         &self,
-        prefix: &str,
+        _prefix: &str,
         root: &CollectionRoot,
-        expected: &backend::Version,
+        expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
+        let LeafObservation::Root(expected) = expected else {
+            return Err(StorageError::other(
+                "root write received a node observation",
+            ));
+        };
         match self
-            .objects
-            .write_if(
-                &paths::collection_info(prefix),
-                Arc::from(root.encode()),
-                expected,
-            )
+            .roots
+            .compare_and_swap(expected, Arc::new(root.clone()))
             .await
         {
-            Ok(_) => Ok(true),
-            Err(StorageError::Precondition | StorageError::NotFound) => Ok(false),
+            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -369,12 +584,16 @@ impl ShardStore {
         root: &CollectionRoot,
     ) -> Result<bool, StorageError> {
         match self
-            .objects
-            .write_if_not_exists(&paths::collection_info(prefix), Arc::from(root.encode()))
+            .roots
+            .create(
+                &paths::collection_info(prefix),
+                None,
+                Arc::new(root.clone()),
+            )
             .await
         {
-            Ok(_) => Ok(true),
-            Err(StorageError::Precondition) => Ok(false),
+            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Conflict) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -388,12 +607,10 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
 
-    use crate::entry::SharedCache;
-
     const COLL: &str = "coll";
 
     fn store_over(backend: Arc<dyn Backend>) -> ShardStore {
-        ShardStore::new(ObjectCache::new(backend, &SharedCache::new(1 << 20)))
+        ShardStore::new(CachedStore::new(backend, 1 << 20))
     }
 
     fn count(log: &OpLog, op: &str) -> usize {
@@ -404,10 +621,11 @@ mod tests {
     // reader starts with a cold cache. Creates it with a bare `write_if_not_exists`
     // (no seeding read) so the shared op log reflects only the reader's traffic.
     async fn seed_empty_leaf(backend: &Arc<dyn Backend>, path: &str) {
-        let kind = LeafKind::Node(Node::leaf(Shard::new()));
+        let store = store_over(backend.clone());
+        let token = paths::node_token_of(path).unwrap();
         assert!(
-            store_over(backend.clone())
-                .store_leaf(path, &Shard::new(), &NodeLocks::default(), &kind, None)
+            store
+                .store_node(COLL, &token, &Node::leaf(Shard::new()), None)
                 .await
                 .unwrap()
         );
@@ -426,32 +644,36 @@ mod tests {
 
         let reader = store_over(backend.clone());
         let v1 = reader
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(reader.now()))
             .await
             .unwrap()
-            .version;
+            .observation;
         assert_eq!(count(&log, "read"), 1, "cold load full-reads");
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         let v2 = reader
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(reader.now()))
             .await
             .unwrap()
-            .version;
+            .observation;
         assert_eq!(count(&log, "read"), 1, "hot load must not full-read");
         assert_eq!(
             count(&log, "read_if_modified"),
             1,
             "hot load revalidates conditionally"
         );
-        assert_eq!(v1, v2, "unchanged node keeps its version");
+        assert_eq!(
+            v1.revision(),
+            v2.revision(),
+            "unchanged node keeps its revision"
+        );
     }
 
-    // A cached node loaded with `AllowStale` is served without any backend op
+    // A cached node loaded with `Any` is served without any backend op
     // (neither a full read nor a revalidation), while an uncached node still
     // does one full read (ADR-030).
     #[tokio::test]
-    async fn allow_stale_serves_cached_without_backend_op() {
+    async fn any_serves_cached_without_backend_op() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
@@ -460,28 +682,25 @@ mod tests {
 
         let reader = store_over(backend.clone());
         // Warm the cache with one cold full read.
-        reader.load_leaf(&path, Freshness::Latest).await.unwrap();
-        assert_eq!(count(&log, "read"), 1);
-
-        // A cached AllowStale load touches the backend for nothing.
         reader
-            .load_leaf(&path, Freshness::AllowStale)
+            .load_leaf(&path, Requirement::AtLeast(reader.now()))
             .await
             .unwrap();
-        assert_eq!(count(&log, "read"), 1, "cached AllowStale must not read");
+        assert_eq!(count(&log, "read"), 1);
+
+        // A cached `Any` load touches the backend for nothing.
+        reader.load_leaf(&path, Requirement::Any).await.unwrap();
+        assert_eq!(count(&log, "read"), 1, "cached Any must not read");
         assert_eq!(
             count(&log, "read_if_modified"),
             0,
-            "cached AllowStale must not revalidate"
+            "cached Any must not revalidate"
         );
 
         // An uncached node has nothing to serve, so it falls through to a read.
         let other = paths::from_node(COLL, "tok2");
-        reader
-            .load_leaf(&other, Freshness::AllowStale)
-            .await
-            .unwrap();
-        assert_eq!(count(&log, "read"), 2, "uncached AllowStale falls through");
+        reader.load_leaf(&other, Requirement::Any).await.unwrap();
+        assert_eq!(count(&log, "read"), 2, "uncached Any falls through");
     }
 
     // A write-through store updates the cache, so a load after a CAS observes the
@@ -491,18 +710,10 @@ mod tests {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = paths::from_node(COLL, "tok");
 
-        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
-        assert!(
-            store
-                .store_leaf(&path, &Shard::new(), &loaded.locks, loaded.kind(), None,)
-                .await
-                .unwrap()
-        );
-        let loaded = store.load_leaf(&path, Freshness::Latest).await.unwrap();
-        let v1 = loaded.version.clone().expect("node exists after create");
-
-        // CAS a new generation over the loaded version, then confirm the next
-        // load reflects it.
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
         assert!(
             store
                 .store_leaf(
@@ -510,17 +721,35 @@ mod tests {
                     &Shard::new(),
                     &loaded.locks,
                     loaded.kind(),
-                    Some(&v1),
+                    &loaded.observation,
                 )
                 .await
                 .unwrap()
         );
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .await
+            .unwrap();
+        let v1 = loaded.observation.clone();
+
+        // CAS a new generation over the loaded version, then confirm the next
+        // load reflects it.
+        assert!(
+            store
+                .store_leaf(&path, &Shard::new(), &loaded.locks, loaded.kind(), &v1,)
+                .await
+                .unwrap()
+        );
         let v2 = store
-            .load_leaf(&path, Freshness::Latest)
+            .load_leaf(&path, Requirement::AtLeast(store.now()))
             .await
             .unwrap()
-            .version;
-        assert_ne!(Some(v1), v2, "a CAS store advances the version");
+            .observation;
+        assert_ne!(
+            v1.revision(),
+            v2.revision(),
+            "a CAS store advances the revision"
+        );
     }
 
     #[tokio::test]

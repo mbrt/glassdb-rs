@@ -42,7 +42,7 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
 use glassdb_data::{TxId, paths, shuffle};
 use glassdb_storage::{
-    Directory, Freshness, LockScope, PathLock, ShardStore, StorageError, TLogger, TxCommitStatus,
+    Directory, LockScope, PathLock, Requirement, ShardStore, StorageError, TLogger, TxCommitStatus,
     TxLog,
 };
 
@@ -238,12 +238,15 @@ impl Gc {
     /// The reverse liveness check for one candidate (ADR-022): read it, keep it
     /// if within the safety horizon, else resolve by status.
     async fn check_candidate(&self, tid: &TxId) -> Result<(), TransError> {
-        let (log, version) = match self.tl.get(tid).await {
+        let observed = match self.tl.get(tid).await {
             Ok(v) => v,
             // Already reclaimed (or never existed): nothing to do.
             Err(StorageError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        let log = observed
+            .value()
+            .ok_or_else(|| StorageError::other("transaction disappeared after a present read"))?;
 
         // Within the horizon: keep. A recent pending object may be a live
         // transaction whose lock this non-atomic check has not observed yet
@@ -255,9 +258,9 @@ impl Gc {
         }
 
         match log.status {
-            TxCommitStatus::Ok => self.reclaim_committed(tid, &log).await,
+            TxCommitStatus::Ok => self.reclaim_committed(tid, log).await,
             TxCommitStatus::Aborted => self.reclaim_aborted(tid, &log.locks).await,
-            TxCommitStatus::Pending => self.reclaim_dead_pending(tid, &log, &version).await,
+            TxCommitStatus::Pending => self.reclaim_dead_pending(tid, log, &observed).await,
             TxCommitStatus::Unknown => Ok(()),
         }
     }
@@ -298,9 +301,9 @@ impl Gc {
         &self,
         tid: &TxId,
         log: &TxLog,
-        version: &backend::Version,
+        observation: &glassdb_storage::Observation<TxLog>,
     ) -> Result<(), TransError> {
-        match self.mon.force_abort(tid, version).await? {
+        match self.mon.force_abort(tid, observation).await? {
             TxCommitStatus::Aborted => self.release_locks(tid, &log.locks).await,
             // Committed or refreshed first: it was alive. Leave it.
             _ => Ok(()),
@@ -335,10 +338,10 @@ impl Gc {
 
         for group in self
             .dir
-            .group_keys_by_leaf(items, Freshness::Latest)
+            .group_keys_by_leaf(items, Requirement::AtLeast(self.dir.now()))
             .await?
         {
-            let Some(leaf) = group.node.as_leaf() else {
+            let Some(leaf) = group.node().and_then(|node| node.as_leaf()) else {
                 continue;
             };
             for (raw_key, kind) in &group.keys {
@@ -382,7 +385,7 @@ impl Gc {
         }
         for group in self
             .dir
-            .group_keys_by_leaf(key_locks, Freshness::Latest)
+            .group_keys_by_leaf(key_locks, Requirement::AtLeast(self.dir.now()))
             .await?
         {
             leaf_paths.insert(group.path);
@@ -413,8 +416,7 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_storage::{
-        Directory, Freshness, LockScope, LockType, ObjectCache, Shard, ShardEntry, SharedCache,
-        TxWrite, ValueCache,
+        CachedStore, Directory, LockScope, LockType, Shard, ShardEntry, TxWrite,
     };
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
@@ -443,15 +445,12 @@ mod tests {
     }
 
     fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
-        let cache = SharedCache::new(1 << 20);
-        let values = ValueCache::new(&cache);
-        let objects = ObjectCache::new(backend, &cache);
+        let objects = CachedStore::new(backend, 1 << 20);
         let tl = TLogger::new(objects.clone(), "db");
         let shards = ShardStore::new(objects);
         let bg = Arc::new(Background::new());
         let clock = Clock::anchored_at(base());
         let mon = Monitor::with_config(
-            values,
             tl.clone(),
             Arc::downgrade(&bg),
             clock.clone(),
@@ -501,7 +500,10 @@ mod tests {
 
     async fn store_entry(shards: &ShardStore, _key: &[u8], entry: ShardEntry) {
         let path = paths::collection_info(COLL);
-        let loaded = shards.load_leaf(&path, Freshness::Latest).await.unwrap();
+        let loaded = shards
+            .load_leaf(&path, Requirement::AtLeast(shards.now()))
+            .await
+            .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
             .entries
             .entries()
@@ -517,7 +519,7 @@ mod tests {
                     &shard,
                     &loaded.locks,
                     loaded.kind(),
-                    loaded.version.as_ref(),
+                    &loaded.observation,
                 )
                 .await
                 .unwrap()
@@ -526,7 +528,10 @@ mod tests {
 
     async fn lookup_entry(shards: &ShardStore, key: &[u8]) -> Option<ShardEntry> {
         let loaded = shards
-            .load_leaf(&paths::collection_info(COLL), Freshness::Latest)
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(shards.now()),
+            )
             .await
             .unwrap();
         loaded.entries.lookup(key).cloned()
@@ -622,7 +627,8 @@ mod tests {
 
         run_once(&ctx.gc).await;
 
-        let (log, _) = ctx.tl.get(&t).await.unwrap();
+        let log = ctx.tl.get(&t).await.unwrap();
+        let log = log.value().unwrap();
         assert_eq!(log.status, TxCommitStatus::Ok);
     }
 
@@ -641,7 +647,8 @@ mod tests {
 
         run_once(&ctx.gc).await;
 
-        let (got, _) = ctx.tl.get(&t).await.unwrap();
+        let got = ctx.tl.get(&t).await.unwrap();
+        let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Pending);
         // Its lock is untouched.
         let e = lookup_entry(&ctx.shards, b"k").await.unwrap();
@@ -666,7 +673,8 @@ mod tests {
         run_once(&ctx.gc).await;
 
         // Death is durable...
-        let (got, _) = ctx.tl.get(&t).await.unwrap();
+        let got = ctx.tl.get(&t).await.unwrap();
+        let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Aborted);
         // ...its lock is released (the now-vestigial entry pruned)...
         assert!(lookup_entry(&ctx.shards, b"k").await.is_none());
@@ -791,7 +799,7 @@ mod tests {
         let shard = Shard::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
         let loaded = ctx
             .shards
-            .load_leaf(&shard_path, Freshness::Latest)
+            .load_leaf(&shard_path, Requirement::AtLeast(ctx.shards.now()))
             .await
             .unwrap();
         assert!(
@@ -801,7 +809,7 @@ mod tests {
                     &shard,
                     &loaded.locks,
                     loaded.kind(),
-                    loaded.version.as_ref(),
+                    &loaded.observation,
                 )
                 .await
                 .unwrap()

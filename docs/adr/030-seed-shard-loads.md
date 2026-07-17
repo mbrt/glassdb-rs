@@ -2,12 +2,8 @@
 
 ## Status
 
-Accepted (implemented). Realized as a **cache-freshness flag** on the object-cache
-read path (`ObjectCache::read` / `ShardStore::load_shard` / `Resolver::resolve_key`),
-reused by both shard loads a single read-write transaction would otherwise
-duplicate. An earlier draft proposed threading an already-loaded `(shard,
-version)` _seed_ through the coordinator; that never landed — the cache already
-holds the snapshot, so the flag reuses it without any new plumbing.
+Superseded by
+[ADR-036](036-decoded-object-cache-with-bounded-freshness.md).
 
 Refines the `ShardCoordinator` mechanism of
 [ADR-028](028-shard-mutation-coordinator.md) (a round may reuse a cached shard

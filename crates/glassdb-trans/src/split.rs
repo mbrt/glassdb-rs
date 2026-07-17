@@ -39,12 +39,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Directory, Freshness, IndexNode, LockType, Node, Shard, ShardStore, SplitPolicy, StorageError,
-    StructuralLog, TxCommitStatus, TxLog,
+    Directory, IndexNode, LeafObservation, LockType, Node, Requirement, Shard, ShardStore,
+    SplitPolicy, StorageError, StructuralLog, TxCommitStatus, TxLog,
 };
 use tokio::sync::Notify;
 
@@ -441,11 +440,11 @@ impl Splitter {
         prefix: &str,
         token: Option<&str>,
         id: &TxId,
-    ) -> Result<Option<(Node, backend::Version)>, TransError> {
+    ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         if let Some(token) = token {
             let (node, _) = self
                 .shards
-                .load_node(prefix, token, Freshness::Latest)
+                .load_node(prefix, token, Requirement::AtLeast(self.shards.now()))
                 .await?;
             if node.as_leaf().is_some() {
                 return self
@@ -464,14 +463,14 @@ impl Splitter {
         prefix: &str,
         token: &str,
         id: &TxId,
-    ) -> Result<Option<(Node, backend::Version)>, TransError> {
+    ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         let path = paths::from_node(prefix, token);
         let outcome = coord
             .submit_shard(
                 &path,
                 id,
                 Arc::new(StructureWriteResolver::new(id.clone(), path.clone())),
-                Freshness::Latest,
+                Requirement::AtLeast(self.shards.now()),
             )
             .await?;
         if !matches!(
@@ -486,7 +485,7 @@ impl Splitter {
 
         let (node, version) = self
             .shards
-            .load_node(prefix, token, Freshness::Latest)
+            .load_node(prefix, token, Requirement::AtLeast(self.shards.now()))
             .await?;
         if node.structure_lock().lock_type() == LockType::Write
             && node.structure_lock().contains(id)
@@ -503,12 +502,12 @@ impl Splitter {
         prefix: &str,
         token: Option<&str>,
         id: &TxId,
-    ) -> Result<Option<(Node, backend::Version)>, TransError> {
+    ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         for _ in 0..PARENT_RETRIES {
             let (mut node, version) = match token {
                 Some(token) => {
                     self.shards
-                        .load_node(prefix, token, Freshness::Latest)
+                        .load_node(prefix, token, Requirement::AtLeast(self.shards.now()))
                         .await?
                 }
                 None => match self.shards.load_root(prefix).await {
@@ -542,7 +541,7 @@ impl Splitter {
                 let (_, locked_version) = match token {
                     Some(token) => {
                         self.shards
-                            .load_node(prefix, token, Freshness::Latest)
+                            .load_node(prefix, token, Requirement::AtLeast(self.shards.now()))
                             .await?
                     }
                     None => {
@@ -567,7 +566,7 @@ impl Splitter {
             let (mut node, version) = match token {
                 Some(token) => {
                     self.shards
-                        .load_node(prefix, token, Freshness::Latest)
+                        .load_node(prefix, token, Requirement::AtLeast(self.shards.now()))
                         .await?
                 }
                 None => {
@@ -594,20 +593,20 @@ impl Splitter {
         prefix: &str,
         token: Option<&str>,
         node: &Node,
-        version: &backend::Version,
+        observation: &LeafObservation,
     ) -> Result<bool, TransError> {
         match token {
             Some(token) => Ok(self
                 .shards
-                .store_node(prefix, token, node, Some(version))
+                .store_node(prefix, token, node, Some(observation))
                 .await?),
             None => {
                 let (mut root, current) = self.shards.load_root(prefix).await?;
-                if current != *version {
+                if current.revision() != observation.revision() {
                     return Ok(false);
                 }
                 root.set_node(node.clone());
-                Ok(self.shards.store_root(prefix, &root, version).await?)
+                Ok(self.shards.store_root(prefix, &root, observation).await?)
             }
         }
     }
@@ -654,7 +653,7 @@ impl Splitter {
             let node = match token {
                 Some(token) => match self
                     .shards
-                    .load_node(prefix, token, Freshness::Latest)
+                    .load_node(prefix, token, Requirement::AtLeast(self.shards.now()))
                     .await
                 {
                     Ok((node, _)) => node,
@@ -663,7 +662,7 @@ impl Splitter {
                 },
                 None => match self
                     .shards
-                    .load_root_node(prefix, Freshness::Latest)
+                    .load_root_node(prefix, Requirement::AtLeast(self.shards.now()))
                     .await?
                 {
                     Some((node, _)) => node,
@@ -728,7 +727,11 @@ impl Splitter {
                 &StructuralLog {
                     prefix: prefix.to_string(),
                     source_token: token.to_string(),
-                    source_version: version.token.to_string(),
+                    source_version: version
+                        .revision()
+                        .ok_or_else(|| TransError::other("split source is absent"))?
+                        .serialize()
+                        .to_string(),
                     created_tokens: vec![right_token.clone()],
                     split_key: split_key.clone(),
                     is_root: false,
@@ -807,7 +810,11 @@ impl Splitter {
                 &StructuralLog {
                     prefix: prefix.to_string(),
                     source_token: String::new(),
-                    source_version: version.token.to_string(),
+                    source_version: version
+                        .revision()
+                        .ok_or_else(|| TransError::other("split source is absent"))?
+                        .serialize()
+                        .to_string(),
                     created_tokens: vec![l_token.clone(), r_token.clone()],
                     split_key: Vec::new(),
                     is_root: true,
@@ -898,7 +905,7 @@ impl Splitter {
 
         let reachable = self
             .dir
-            .reachable_tokens(&record.prefix, Freshness::Latest)
+            .reachable_tokens(&record.prefix, Requirement::AtLeast(self.shards.now()))
             .await?;
         let applied = !record.created_tokens.is_empty()
             && record
@@ -946,7 +953,7 @@ impl Splitter {
         for _ in 0..PARENT_RETRIES {
             let Some(parent) = self
                 .dir
-                .parent_index_for(prefix, split_key, Freshness::Latest)
+                .parent_index_for(prefix, split_key, Requirement::AtLeast(self.shards.now()))
                 .await?
             else {
                 // No index level (a single-leaf collection): nothing to publish.
@@ -1084,7 +1091,7 @@ impl Splitter {
         let mut missing = Vec::new();
         let (mut cur, _) = self
             .shards
-            .load_node(prefix, start, Freshness::Latest)
+            .load_node(prefix, start, Requirement::AtLeast(self.shards.now()))
             .await?;
         for _ in 0..MAX_RECONCILE_HOPS {
             let (Some(right), Some(boundary)) = (cur.right_sibling(), cur.high_key()) else {
@@ -1101,7 +1108,7 @@ impl Splitter {
             let reached_target = boundary.as_slice() == split_key;
             let (next, _) = self
                 .shards
-                .load_node(prefix, &right, Freshness::Latest)
+                .load_node(prefix, &right, Requirement::AtLeast(self.shards.now()))
                 .await?;
             cur = next;
             if reached_target {
@@ -1136,10 +1143,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
     use glassdb_data::TxId;
-    use glassdb_storage::{
-        CollectionRoot, LockType, ObjectCache, ShardEntry, SharedCache, TLogger, TxWrite,
-        ValueCache,
-    };
+    use glassdb_storage::{CachedStore, CollectionRoot, LockType, ShardEntry, TLogger, TxWrite};
 
     const COLL: &str = "db/coll";
 
@@ -1155,12 +1159,30 @@ mod tests {
         }
     }
 
-    fn store() -> ShardStore {
+    #[derive(Clone)]
+    struct TestStore {
+        shards: ShardStore,
+        objects: CachedStore,
+    }
+
+    impl std::ops::Deref for TestStore {
+        type Target = ShardStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.shards
+        }
+    }
+
+    fn store() -> TestStore {
         store_with_backend(Arc::new(MemoryBackend::new()))
     }
 
-    fn store_with_backend(backend: Arc<dyn Backend>) -> ShardStore {
-        ShardStore::new(ObjectCache::new(backend, &SharedCache::new(1 << 20)))
+    fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
+        let objects = CachedStore::new(backend, 1 << 20);
+        TestStore {
+            shards: ShardStore::new(objects.clone()),
+            objects,
+        }
     }
 
     // A committed live key, so it counts as existing under a descent lookup.
@@ -1180,7 +1202,7 @@ mod tests {
             .with_right_sibling(right.map(str::to_string))
     }
 
-    fn splitter(shards: &ShardStore, bg: &Arc<Background>, policy: SplitPolicy) -> Splitter {
+    fn splitter(shards: &TestStore, bg: &Arc<Background>, policy: SplitPolicy) -> Splitter {
         splitter_with_candidates(
             shards,
             bg,
@@ -1189,14 +1211,13 @@ mod tests {
     }
 
     fn splitter_with_candidates(
-        shards: &ShardStore,
+        shards: &TestStore,
         bg: &Arc<Background>,
         candidates: SplitCandidates,
     ) -> Splitter {
-        let tl = TLogger::new(shards.object_cache(), "db");
-        let values = ValueCache::new(&SharedCache::new(1 << 20));
-        let mon = Monitor::new(values, tl.clone(), Arc::downgrade(bg));
-        splitter_with_monitor(shards, bg, mon, candidates)
+        let tl = TLogger::new(shards.objects.clone(), "db");
+        let mon = Monitor::new(tl.clone(), Arc::downgrade(bg));
+        splitter_with_monitor(&shards.shards, bg, mon, candidates)
     }
 
     fn splitter_with_monitor(
@@ -1226,17 +1247,16 @@ mod tests {
     }
 
     fn splitter_at(
-        shards: &ShardStore,
+        shards: &TestStore,
         bg: &Arc<Background>,
         policy: SplitPolicy,
         base_secs: u64,
     ) -> (Splitter, Monitor, u64) {
-        let tl = TLogger::new(shards.object_cache(), "db");
-        let values = ValueCache::new(&SharedCache::new(1 << 20));
-        let mon = Monitor::new(values, tl.clone(), Arc::downgrade(bg));
+        let tl = TLogger::new(shards.objects.clone(), "db");
+        let mon = Monitor::new(tl.clone(), Arc::downgrade(bg));
         let clock = Clock::anchored_at(std::time::UNIX_EPOCH + Duration::from_secs(base_secs));
         let candidates = SplitCandidates::with_clock(policy, clock);
-        let splitter = splitter_with_monitor(shards, bg, mon.clone(), candidates);
+        let splitter = splitter_with_monitor(&shards.shards, bg, mon.clone(), candidates);
         (splitter, mon, base_secs * 1_000_000_000)
     }
 
@@ -1286,22 +1306,26 @@ mod tests {
 
         // The root is now an index (height grew from 1 to 2).
         let (node, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
         assert!(node.as_index().is_some(), "root became an index");
 
-        let dir = Directory::new(s.clone());
-        let leaves = dir.leaves(COLL, Freshness::Latest).await.unwrap();
+        let dir = Directory::new(s.shards.clone());
+        let leaves = dir
+            .leaves(COLL, Requirement::AtLeast(s.now()))
+            .await
+            .unwrap();
         assert_eq!(leaves.len(), 2, "one leaf became two");
         // The lower leaf is bounded by the split key and links to the upper one.
-        assert!(leaves[0].node.right_sibling().is_some());
+        assert!(leaves[0].node().unwrap().right_sibling().is_some());
         assert_eq!(
-            leaves[0].node.high_key(),
+            leaves[0].node().unwrap().high_key(),
             Some(
                 leaves[1]
-                    .node
+                    .node()
+                    .unwrap()
                     .as_leaf()
                     .unwrap()
                     .entries()
@@ -1313,16 +1337,22 @@ mod tests {
         );
         // Every key remains reachable by descent, in order.
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
-            let loc = dir.leaf_for(COLL, k, Freshness::Latest).await.unwrap();
-            assert!(loc.node.as_leaf().unwrap().exists(k), "key {k:?} lost");
+            let loc = dir
+                .leaf_for(COLL, k, Requirement::AtLeast(s.now()))
+                .await
+                .unwrap();
+            assert!(
+                loc.node().unwrap().as_leaf().unwrap().exists(k),
+                "key {k:?} lost"
+            );
         }
         assert!(s.list_structural_logs("db").await.unwrap().is_empty());
         assert!(
-            s.object_cache()
+            s.objects
                 .list(
                     &paths::transactions_prefix("db"),
                     None,
-                    backend::ListLimit::new(1).unwrap(),
+                    glassdb_backend::ListLimit::new(1).unwrap(),
                 )
                 .await
                 .unwrap()
@@ -1359,21 +1389,30 @@ mod tests {
             .await
             .unwrap();
 
-        let dir = Directory::new(s.clone());
-        let leaves = dir.leaves(COLL, Freshness::Latest).await.unwrap();
+        let dir = Directory::new(s.shards.clone());
+        let leaves = dir
+            .leaves(COLL, Requirement::AtLeast(s.now()))
+            .await
+            .unwrap();
         assert_eq!(leaves.len(), 2, "leaf L split into two");
         // The parent index now routes the moved keys directly to the sibling, not
         // via a right-link walk: its child for the split key differs from L.
         let (root_node, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
         let index = root_node.as_index().unwrap();
         assert_eq!(index.len(), 2, "parent gained the separator");
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
-            let loc = dir.leaf_for(COLL, k, Freshness::Latest).await.unwrap();
-            assert!(loc.node.as_leaf().unwrap().exists(k), "key {k:?} lost");
+            let loc = dir
+                .leaf_for(COLL, k, Requirement::AtLeast(s.now()))
+                .await
+                .unwrap();
+            assert!(
+                loc.node().unwrap().as_leaf().unwrap().exists(k),
+                "key {k:?} lost"
+            );
         }
         assert!(s.list_structural_logs("db").await.unwrap().is_empty());
     }
@@ -1419,7 +1458,7 @@ mod tests {
             .unwrap();
 
         let (node, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
@@ -1429,10 +1468,16 @@ mod tests {
             "root now has two index children"
         );
         // Every original leaf is still reached in order (now via one more hop).
-        let dir = Directory::new(s.clone());
+        let dir = Directory::new(s.shards.clone());
         for k in [b"a".as_slice(), b"m", b"t"] {
-            let loc = dir.leaf_for(COLL, k, Freshness::Latest).await.unwrap();
-            assert!(loc.node.as_leaf().unwrap().exists(k), "key {k:?} lost");
+            let loc = dir
+                .leaf_for(COLL, k, Requirement::AtLeast(s.now()))
+                .await
+                .unwrap();
+            assert!(
+                loc.node().unwrap().as_leaf().unwrap().exists(k),
+                "key {k:?} lost"
+            );
         }
     }
 
@@ -1450,8 +1495,8 @@ mod tests {
         let sp = splitter(&s, &bg, tiny());
 
         sp.split_path(&paths::collection_info(COLL)).await.unwrap();
-        let after_first = Directory::new(s.clone())
-            .leaves(COLL, Freshness::Latest)
+        let after_first = Directory::new(s.shards.clone())
+            .leaves(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap();
         // Re-run: each resulting leaf holds two keys, which is at (not over) the
@@ -1461,8 +1506,8 @@ mod tests {
         }
         sp.split_path(&paths::collection_info(COLL)).await.unwrap();
 
-        let after_second = Directory::new(s.clone())
-            .leaves(COLL, Freshness::Latest)
+        let after_second = Directory::new(s.shards.clone())
+            .leaves(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -1502,8 +1547,8 @@ mod tests {
         let sp = splitter_with_candidates(&s, &bg, candidates);
         sp.run_once().await;
 
-        let leaves = Directory::new(s.clone())
-            .leaves(COLL, Freshness::Latest)
+        let leaves = Directory::new(s.shards.clone())
+            .leaves(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "the fed candidate was split");
@@ -1530,7 +1575,7 @@ mod tests {
 
         sp.run_once().await;
         assert!(
-            s.load_root_node(COLL, Freshness::Latest)
+            s.load_root_node(COLL, Requirement::AtLeast(s.now()))
                 .await
                 .unwrap()
                 .unwrap()
@@ -1546,7 +1591,7 @@ mod tests {
 
         sp.run_once().await;
         assert!(
-            s.load_root_node(COLL, Freshness::Latest)
+            s.load_root_node(COLL, Requirement::AtLeast(s.now()))
                 .await
                 .unwrap()
                 .unwrap()
@@ -1585,13 +1630,13 @@ mod tests {
             mon.tx_status(&younger).await.unwrap(),
             TxCommitStatus::Aborted
         );
-        let leaves = Directory::new(s.clone())
-            .leaves(COLL, Freshness::Latest)
+        let leaves = Directory::new(s.shards.clone())
+            .leaves(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2);
         for leaf in leaves {
-            let node = leaf.node;
+            let node = leaf.node().unwrap();
             assert!(node.structure_lock().holders().is_empty());
             assert!(
                 node.as_leaf()
@@ -1637,13 +1682,14 @@ mod tests {
 
         sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
 
-        let leaf = Directory::new(s.clone())
-            .leaf_for(COLL, b"d", Freshness::Latest)
+        let leaf = Directory::new(s.shards.clone())
+            .leaf_for(COLL, b"d", Requirement::AtLeast(s.now()))
             .await
             .unwrap();
-        assert!(leaf.node.structure_lock().holders().is_empty());
+        assert!(leaf.node().unwrap().structure_lock().holders().is_empty());
         let entry = leaf
-            .node
+            .node()
+            .unwrap()
             .as_leaf()
             .unwrap()
             .entries()
@@ -1682,8 +1728,8 @@ mod tests {
         );
         sp.run_once().await;
         assert_eq!(
-            Directory::new(s.clone())
-                .leaves(COLL, Freshness::Latest)
+            Directory::new(s.shards.clone())
+                .leaves(COLL, Requirement::AtLeast(s.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -1693,8 +1739,8 @@ mod tests {
         mon.abort_tx(&older).await.unwrap();
         sp.run_once().await;
         assert_eq!(
-            Directory::new(s.clone())
-                .leaves(COLL, Freshness::Latest)
+            Directory::new(s.shards.clone())
+                .leaves(COLL, Requirement::AtLeast(s.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -1734,8 +1780,8 @@ mod tests {
 
         // The only cap crossed is the byte cap, so a split here proves the byte
         // cap now has a producer.
-        let leaves = Directory::new(s.clone())
-            .leaves(COLL, Freshness::Latest)
+        let leaves = Directory::new(s.shards.clone())
+            .leaves(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "byte-cap overflow triggered a split");
@@ -1786,7 +1832,7 @@ mod tests {
         // The parent index now records the previously-missing `m -> S` separator
         // and the new one produced by S's split (`n`).
         let (root_node, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
@@ -1803,10 +1849,16 @@ mod tests {
         );
 
         // Every key is still reachable in order.
-        let dir = Directory::new(s.clone());
+        let dir = Directory::new(s.shards.clone());
         for k in [b"a".as_slice(), b"b", b"m", b"n", b"o"] {
-            let loc = dir.leaf_for(COLL, k, Freshness::Latest).await.unwrap();
-            assert!(loc.node.as_leaf().unwrap().exists(k), "key {k:?} lost");
+            let loc = dir
+                .leaf_for(COLL, k, Requirement::AtLeast(s.now()))
+                .await
+                .unwrap();
+            assert!(
+                loc.node().unwrap().as_leaf().unwrap().exists(k),
+                "key {k:?} lost"
+            );
         }
     }
 
@@ -1817,10 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn lost_parent_cas_is_republished_by_a_later_sweep() {
         let (backend, blocker) = RootWriteBlocker::wrap(Arc::new(MemoryBackend::new()));
-        let s = ShardStore::new(ObjectCache::new(
-            backend.clone() as Arc<dyn Backend>,
-            &SharedCache::new(1 << 20),
-        ));
+        let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
 
         // A root index over a single leaf L[a,b,c] (over the cap).
         s.store_node(COLL, "L", &leaf_node(&[b"a", b"b", b"c"], None, None), None)
@@ -1843,7 +1892,7 @@ mod tests {
             Err(TransError::Retry)
         ));
         let (blocked_root, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
@@ -1853,8 +1902,8 @@ mod tests {
             "separator is not published while the parent CAS is blocked"
         );
         assert_eq!(
-            Directory::new(s.clone())
-                .leaves(COLL, Freshness::Latest)
+            Directory::new(s.shards.clone())
+                .leaves(COLL, Requirement::AtLeast(s.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -1866,7 +1915,7 @@ mod tests {
         blocker.block(false);
         sp.run_once().await;
         let (healed_root, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
@@ -1909,7 +1958,9 @@ mod tests {
         splitter.start();
         for _ in 0..20 {
             if matches!(
-                second.load_node(COLL, "R", Freshness::Latest).await,
+                second
+                    .load_node(COLL, "R", Requirement::AtLeast(second.now()))
+                    .await,
                 Err(StorageError::NotFound)
             ) {
                 break;
@@ -1918,10 +1969,17 @@ mod tests {
         }
 
         assert!(matches!(
-            second.load_node(COLL, "R", Freshness::Latest).await,
+            second
+                .load_node(COLL, "R", Requirement::AtLeast(second.now()))
+                .await,
             Err(StorageError::NotFound)
         ));
-        assert!(second.load_node(COLL, "L", Freshness::Latest).await.is_ok());
+        assert!(
+            second
+                .load_node(COLL, "L", Requirement::AtLeast(second.now()))
+                .await
+                .is_ok()
+        );
         assert!(second.list_structural_logs("db").await.unwrap().is_empty());
     }
 
@@ -1952,13 +2010,17 @@ mod tests {
             sp.recover_record("R", &record).await,
             Err(TransError::Retry)
         ));
-        assert!(s.load_node(COLL, "R", Freshness::Latest).await.is_ok());
+        assert!(
+            s.load_node(COLL, "R", Requirement::AtLeast(s.now()))
+                .await
+                .is_ok()
+        );
         assert_eq!(s.list_structural_logs("db").await.unwrap().len(), 1);
 
         sp.mon.abort_tx(&id).await.unwrap();
         sp.recover_record("R", &record).await.unwrap();
         assert!(matches!(
-            s.load_node(COLL, "R", Freshness::Latest).await,
+            s.load_node(COLL, "R", Requirement::AtLeast(s.now())).await,
             Err(StorageError::NotFound)
         ));
         assert!(s.list_structural_logs("db").await.unwrap().is_empty());
@@ -2000,7 +2062,7 @@ mod tests {
         sp.recover_record("R", &record).await.unwrap();
 
         let (root_node, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
@@ -2103,10 +2165,7 @@ mod tests {
         let source_path = paths::from_node(COLL, "L");
         let (backend, gate) =
             FirstSourceWriteGate::wrap(Arc::new(MemoryBackend::new()), source_path.clone());
-        let s = ShardStore::new(ObjectCache::new(
-            backend as Arc<dyn Backend>,
-            &SharedCache::new(1 << 20),
-        ));
+        let s = store_with_backend(backend as Arc<dyn Backend>);
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
         let id = TxId::with_priority(1, b"racing-split");
@@ -2114,7 +2173,10 @@ mod tests {
         let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
         original.set_structure_writer(id.clone());
         s.store_node(COLL, "L", &original, None).await.unwrap();
-        let (mut shrunk, source_version) = s.load_node(COLL, "L", Freshness::Latest).await.unwrap();
+        let (mut shrunk, source_version) = s
+            .load_node(COLL, "L", Requirement::AtLeast(s.now()))
+            .await
+            .unwrap();
         let (right, split_key) = shrunk.split("R").unwrap();
         shrunk.remove_structure_holder(&id);
         s.store_node(COLL, "R", &right, None).await.unwrap();
@@ -2128,7 +2190,7 @@ mod tests {
         let record = StructuralLog {
             prefix: COLL.to_string(),
             source_token: "L".to_string(),
-            source_version: source_version.token.to_string(),
+            source_version: source_version.revision().unwrap().serialize().to_string(),
             created_tokens: vec!["R".to_string()],
             split_key,
             is_root: false,
@@ -2152,9 +2214,13 @@ mod tests {
         gate.release();
         recovering.await.unwrap().unwrap();
 
-        assert!(s.load_node(COLL, "R", Freshness::Latest).await.is_ok());
+        assert!(
+            s.load_node(COLL, "R", Requirement::AtLeast(s.now()))
+                .await
+                .is_ok()
+        );
         let (root_node, _) = s
-            .load_root_node(COLL, Freshness::Latest)
+            .load_root_node(COLL, Requirement::AtLeast(s.now()))
             .await
             .unwrap()
             .unwrap();
