@@ -481,7 +481,8 @@ impl Splitter {
                 Arc::new(StructureWriteResolver::new(id.clone(), path.clone())),
                 Requirement::AtLeast(self.timeline.now()),
             )
-            .await?;
+            .await?
+            .map(|coordinated| coordinated.outcome);
         if !matches!(
             outcome,
             Some(FoldOutcome::Locked {

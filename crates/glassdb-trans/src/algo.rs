@@ -956,6 +956,7 @@ impl Algo {
             .coord
             .submit_shard(leaf_path, id, resolver, Requirement::Any)
             .await?
+            .map(|coordinated| coordinated.outcome)
         {
             Some(FoldOutcome::Landed) => Ok(InstallOutcome::Landed),
             Some(FoldOutcome::InDoubt(msg)) => Ok(InstallOutcome::InDoubt(msg)),

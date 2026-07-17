@@ -45,7 +45,8 @@ use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::node_locking::{Reclaim, ReconciledLeaf, resolve_entry_locks, try_reclaim};
 use crate::shard_coord::{
-    FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
+    CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
+    Step,
 };
 
 /// One independent partition of the per-transaction held-lock bookkeeping: the
@@ -319,7 +320,6 @@ impl ShardResolver for AcquireResolver {
             outcome: FoldOutcome::Locked {
                 typ: shard_lock_type(&self.intents),
                 membership,
-                validated: None,
             },
         })
     }
@@ -907,8 +907,8 @@ impl Locker {
     }
 
     /// Installs this transaction's [`AcquireResolver`] on a shard through the
-    /// shared [`ShardCoordinator`] and returns its single-round [`FoldOutcome`].
-    /// The hold-and-wait loop (on [`FoldOutcome::Wait`]) lives in
+    /// shared [`ShardCoordinator`] and returns its single-round coordinated
+    /// outcome. The hold-and-wait loop (on [`FoldOutcome::Wait`]) lives in
     /// [`lock_shard`](Self::lock_shard) above. A shutdown mid-flight surfaces as
     /// an error so the caller aborts the lock rather than silently proceeding.
     async fn acquire(
@@ -918,7 +918,7 @@ impl Locker {
         intents: Arc<Vec<KeyIntent>>,
         membership: LockType,
         requirement: Requirement,
-    ) -> Result<FoldOutcome, TransError> {
+    ) -> Result<CoordinatedOutcome, TransError> {
         let resolver = Arc::new(AcquireResolver {
             id: id.clone(),
             path: path.to_string(),
@@ -934,15 +934,12 @@ impl Locker {
             // release and diagnostics can find it (the engine no longer tracks
             // this, ADR-028). The outcome carries the acquired strength, so the
             // caller records it without re-deriving from the intents.
-            Some(
-                outcome @ FoldOutcome::Locked {
-                    typ, membership, ..
-                },
-            ) => {
-                self.record_leaf_lock(id, path, typ, membership);
-                Ok(outcome)
+            Some(coordinated) => {
+                if let FoldOutcome::Locked { typ, membership } = &coordinated.outcome {
+                    self.record_leaf_lock(id, path, *typ, *membership);
+                }
+                Ok(coordinated)
             }
-            Some(outcome) => Ok(outcome),
             None => Err(TransError::other(
                 "coordinator shut down while locking leaf",
             )),
@@ -968,7 +965,10 @@ impl Locker {
             .submit_shard(path, id, resolver, requirement)
             .await?
         {
-            Some(FoldOutcome::Released { superseded }) => Ok(superseded),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Released { superseded },
+                ..
+            }) => Ok(superseded),
             _ => Ok(Vec::new()),
         }
     }
@@ -1013,7 +1013,7 @@ impl Locker {
         // finalizes — real progress.
         let mut backoff = self.retry.backoff();
         loop {
-            match self
+            let coordinated = self
                 .acquire(
                     id,
                     &group.path,
@@ -1021,12 +1021,15 @@ impl Locker {
                     group.membership,
                     requirement,
                 )
-                .await?
-            {
-                FoldOutcome::Locked { validated, .. } => {
-                    return validated.map(ShardOutcome::Locked).ok_or_else(|| {
-                        TransError::other("lock CAS returned no validation receipt")
-                    });
+                .await?;
+            match coordinated.outcome {
+                FoldOutcome::Locked { .. } => {
+                    return coordinated
+                        .cas_precondition
+                        .map(ShardOutcome::Locked)
+                        .ok_or_else(|| {
+                            TransError::other("lock CAS returned no precondition receipt")
+                        });
                 }
                 // Hold-and-wait (ADR-024): if the coordinator reports
                 // [`FoldOutcome::Wait`] — a key is held by a live holder this

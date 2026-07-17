@@ -62,12 +62,7 @@ struct Stats {
 pub(crate) enum FoldOutcome {
     /// A lock was installed (Acquire), carrying the strongest entry intention
     /// and the membership scope held on the leaf.
-    Locked {
-        typ: LockType,
-        membership: LockType,
-        /// The exact pre-CAS state validated by this round's successful CAS.
-        validated: Option<LeafObservation>,
-    },
+    Locked { typ: LockType, membership: LockType },
     /// A touched key is held by a live holder this transaction does not
     /// outrank: wait for `holder` to finalize, then re-submit (hold-and-wait,
     /// ADR-024). Nothing was staged for this transaction in the round's CAS.
@@ -98,6 +93,15 @@ pub(crate) enum FoldOutcome {
     InDoubt(String),
 }
 
+/// One member's policy outcome and the physical precondition certified by the
+/// coordinator's successful CAS. Only a staged member receives a
+/// `cas_precondition`; higher layers decide whether that receipt proves their
+/// own logical validation condition.
+pub(crate) struct CoordinatedOutcome {
+    pub(crate) outcome: FoldOutcome,
+    pub(crate) cas_precondition: Option<LeafObservation>,
+}
+
 /// Why the fold engine is (re-)running the resolvers this attempt: a `Fresh`
 /// first pass, or a re-fold after a CAS that failed precondition
 /// (`Reloaded { in_doubt: false }`) or came back in-doubt
@@ -110,11 +114,11 @@ pub(crate) enum ReloadCause {
     Reloaded { in_doubt: bool },
 }
 
-/// Per-submission mailbox carrying one transaction's [`FoldOutcome`] back from
-/// the dedup worker. Owned by the caller and cloned into the merged request, so
-/// it lives exactly as long as either side needs it and never leaks when a
-/// caller's future is dropped mid-round.
-type OutcomeSlot = Arc<Mutex<Option<FoldOutcome>>>;
+/// Per-submission mailbox carrying one transaction's [`CoordinatedOutcome`]
+/// back from the dedup worker. Owned by the caller and cloned into the merged
+/// request, so it lives exactly as long as either side needs it and never leaks
+/// when a caller's future is dropped mid-round.
+type OutcomeSlot = Arc<Mutex<Option<CoordinatedOutcome>>>;
 
 /// How a staged mutation participates in leaf-capacity admission.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -363,8 +367,10 @@ impl CasWorker {
                 Err(StorageError::Precondition) => {
                     let members = shard_members(batch);
                     for member in members.values() {
-                        *member.slot.lock().unwrap() =
-                            Some(member.resolver.exhausted_outcome(saw_in_doubt));
+                        *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
+                            outcome: member.resolver.exhausted_outcome(saw_in_doubt),
+                            cas_precondition: None,
+                        });
                     }
                     return Ok(());
                 }
@@ -393,7 +399,7 @@ impl CasWorker {
             // `Wait` — never backtracking (ADR-028 contract 1).
             let mut ordered: Vec<(&TxId, &ShardMember)> = members.iter().collect();
             ordered.sort_by(|(a, _), (b, _)| fold_order(a, b));
-            let mut results: Vec<(TxId, FoldOutcome)> = Vec::with_capacity(members.len());
+            let mut results: Vec<(TxId, FoldOutcome, bool)> = Vec::with_capacity(members.len());
             let mut staged = false;
             for (tx, m) in ordered {
                 // Ownership re-check (ADR-031): a split may have moved one of this
@@ -405,7 +411,11 @@ impl CasWorker {
                 // and fold nothing for it. Its caller re-resolves through the
                 // directory and re-submits on the leaf that now owns the key.
                 if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
-                    results.push((tx.clone(), m.resolver.exhausted_outcome(saw_in_doubt)));
+                    results.push((
+                        tx.clone(),
+                        m.resolver.exhausted_outcome(saw_in_doubt),
+                        false,
+                    ));
                     continue;
                 }
                 match m.resolver.resolve(&ctx, &entries, &locks).await? {
@@ -454,7 +464,7 @@ impl CasWorker {
                             } else {
                                 FoldOutcome::Conflict
                             };
-                            results.push((tx.clone(), outcome));
+                            results.push((tx.clone(), outcome, false));
                             continue;
                         }
                         for (k, e) in changes {
@@ -462,9 +472,9 @@ impl CasWorker {
                         }
                         locks = changed_locks;
                         staged = true;
-                        results.push((tx.clone(), outcome));
+                        results.push((tx.clone(), outcome, true));
                     }
-                    Step::Skip { outcome } => results.push((tx.clone(), outcome)),
+                    Step::Skip { outcome } => results.push((tx.clone(), outcome, false)),
                 }
             }
 
@@ -511,22 +521,17 @@ impl CasWorker {
                 }
             }
 
-            let validated = staged.then(|| loaded.observation.clone());
-
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
             // happens-before the dedup delivers to the caller. Recording the held
             // lock is the caller's job (the [`Locker`](crate::Locker)), done when
             // it observes its own `Locked` outcome.
-            for (tx, mut outcome) in results {
-                if let FoldOutcome::Locked {
-                    validated: receipt, ..
-                } = &mut outcome
-                {
-                    *receipt = validated.clone();
-                }
+            for (tx, outcome, member_staged) in results {
                 if let Some(m) = members.get(&tx) {
-                    *m.slot.lock().unwrap() = Some(outcome);
+                    *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
+                        outcome,
+                        cas_precondition: member_staged.then(|| loaded.observation.clone()),
+                    });
                 }
             }
             return Ok(());
@@ -535,7 +540,10 @@ impl CasWorker {
         // resolver's exhaustion outcome (acquirers `Conflict` and release/re-lock,
         // best-effort releases / write-backs `Released`, ADR-024/026).
         for m in shard_members(batch).values() {
-            *m.slot.lock().unwrap() = Some(m.resolver.exhausted_outcome(saw_in_doubt));
+            *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
+                outcome: m.resolver.exhausted_outcome(saw_in_doubt),
+                cas_precondition: None,
+            });
         }
         Ok(())
     }
@@ -637,11 +645,12 @@ impl ShardCoordinator {
     /// Submits one shard member (any resolver installed by a caller — the
     /// [`Locker`](crate::Locker)'s acquire / write-back / release or the
     /// [`Algo`](crate::Algo)'s commit-install) through the [`Dedup`] and awaits
-    /// its single-round [`FoldOutcome`]. The worker merges it into any in-flight
-    /// round for the shard, folds it, retries CAS contention / in-doubt
-    /// internally, and deposits the outcome into the slot. Returns `Ok(None)` if
-    /// the coordinator was shut down before the round ran, so acquires can error
-    /// while best-effort releases / write-backs treat it as a no-op.
+    /// its single-round [`CoordinatedOutcome`]. The worker merges it into any
+    /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
+    /// internally, and deposits the policy outcome plus any successful-CAS
+    /// precondition receipt into the slot. Returns `Ok(None)` if the coordinator
+    /// was shut down before the round ran, so acquires can error while best-effort
+    /// releases / write-backs treat it as a no-op.
     ///
     /// `first_requirement` chooses the cache requirement for the round's first fold
     /// attempt: a submitter that just read this leaf (the single read-write fast
@@ -659,7 +668,7 @@ impl ShardCoordinator {
         id: &TxId,
         resolver: Arc<dyn ShardResolver>,
         first_requirement: Requirement,
-    ) -> Result<Option<FoldOutcome>, TransError> {
+    ) -> Result<Option<CoordinatedOutcome>, TransError> {
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
         members.insert(
@@ -888,7 +897,6 @@ mod tests {
                 outcome: FoldOutcome::Locked {
                     typ: LockType::Write,
                     membership: LockType::None,
-                    validated: None,
                 },
             })
         }
@@ -1031,8 +1039,8 @@ mod tests {
         }
     }
 
-    // A resolver that stages entries drives one CAS, and the staged entry is
-    // durable — the coordinator loads, folds, and CASes the returned state.
+    // A resolver that stages entries drives one CAS, receives its exact
+    // precondition observation, and persists the staged entry.
     #[tokio::test]
     async fn shard_stage_is_cas_persisted() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -1052,7 +1060,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Locked { .. })));
+        assert!(matches!(
+            out,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Locked { .. },
+                cas_precondition: Some(_),
+            })
+        ));
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -1098,7 +1112,13 @@ mod tests {
             .unwrap();
         // Re-route: the acquire-shaped resolver's exhausted/re-route outcome is a
         // `Conflict`, which its caller turns into release-and-relock.
-        assert!(matches!(out, Some(FoldOutcome::Conflict)));
+        assert!(matches!(
+            out,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Conflict,
+                cas_precondition: None,
+            })
+        ));
         coord.close().await;
 
         // The wrong leaf was never mutated: "z" was not stranded here, and the
@@ -1135,7 +1155,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Locked { .. })));
+        assert!(matches!(
+            out,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Locked { .. },
+                cas_precondition: Some(_),
+            })
+        ));
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -1146,7 +1172,7 @@ mod tests {
     }
 
     // A resolver that stages nothing (`Skip`) still gets its outcome delivered,
-    // and the round issues no CAS.
+    // but receives no CAS precondition and the round issues no CAS.
     #[tokio::test]
     async fn shard_skip_delivers_outcome_without_cas() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
@@ -1164,7 +1190,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(FoldOutcome::Released { .. })));
+        assert!(matches!(
+            out,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Released { .. },
+                cas_precondition: None,
+            })
+        ));
         assert_eq!(shard_stores(&log), 0, "a skip stages nothing, so no CAS");
         coord.close().await;
     }
@@ -1325,11 +1357,17 @@ mod tests {
 
         assert!(matches!(
             driver.await.unwrap().unwrap(),
-            Some(FoldOutcome::Landed)
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            })
         ));
         assert!(matches!(
             joiner.await.unwrap().unwrap(),
-            Some(FoldOutcome::Landed)
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            })
         ));
 
         assert_eq!(shard_reads(&log), 1, "both members share one shard load");
@@ -1423,11 +1461,17 @@ mod tests {
 
         assert!(matches!(
             overwrite.await.unwrap().unwrap(),
-            Some(FoldOutcome::Locked { .. })
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Locked { .. },
+                cas_precondition: Some(_),
+            })
         ));
         assert!(matches!(
             create.await.unwrap().unwrap(),
-            Some(FoldOutcome::LeafFull)
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::LeafFull,
+                cas_precondition: None,
+            })
         ));
         assert_eq!(shard_stores(&log), 1, "the admitted member still lands");
         assert_eq!(
@@ -1610,7 +1654,13 @@ mod tests {
             "the precondition-miss after an in-doubt CAS must keep the cause in-doubt"
         );
         assert!(
-            matches!(out, Some(FoldOutcome::InDoubt(_))),
+            matches!(
+                out,
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::InDoubt(_),
+                    ..
+                })
+            ),
             "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
              not Moved (else the fast path abandons and double-applies)"
         );
@@ -1716,7 +1766,13 @@ mod tests {
         coord.close().await;
 
         assert!(
-            matches!(out, Some(FoldOutcome::InDoubt(_))),
+            matches!(
+                out,
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::InDoubt(_),
+                    ..
+                })
+            ),
             "exhaustion after an in-doubt CAS must preserve uncertainty"
         );
     }

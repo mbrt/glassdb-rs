@@ -389,7 +389,6 @@ impl ShardResolver for StructureWriteResolver {
             outcome: FoldOutcome::Locked {
                 typ: LockType::Write,
                 membership: LockType::None,
-                validated: None,
             },
         })
     }
