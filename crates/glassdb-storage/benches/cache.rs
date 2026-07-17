@@ -36,7 +36,7 @@ impl Payload {
 }
 
 impl Weighable for Payload {
-    fn size_b(&self) -> usize {
+    fn size(&self) -> usize {
         self.bytes.len()
     }
 }
@@ -63,8 +63,8 @@ fn filled_cache(keys: &[String]) -> Cache<Payload> {
     let n_shards = shard::count();
     // `Cache::new` divides the budget evenly across shards, so size the total so
     // the single shard under test has ~2x headroom over the working set.
-    let max_size_b = n * ENTRY_BYTES * n_shards * 2 + n_shards * 1024;
-    let cache = Cache::new(max_size_b);
+    let max_size = n * ENTRY_BYTES * n_shards * 2 + n_shards * 1024;
+    let cache = Cache::new(max_size);
     for k in keys {
         cache.set(k, Payload::new());
     }

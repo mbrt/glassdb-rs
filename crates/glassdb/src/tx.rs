@@ -14,11 +14,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::RetryConfig;
-use glassdb_data::paths;
-use glassdb_storage::{MAX_STALENESS, ShardStore, ValueCache};
-use glassdb_trans::{
-    Data, ReadAccess, ReadVersion, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess,
-};
+use glassdb_data::{TxId, paths};
+use glassdb_storage::{LeafObservation, ShardStore, Timeline};
+use glassdb_trans::{Data, ReadAccess, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess};
 
 use crate::collection::Collection;
 use crate::error::Error;
@@ -85,14 +83,16 @@ impl Transaction {
             }
         }
 
-        match self.reader.read(&p, MAX_STALENESS).await {
+        match self.reader.read(&p, std::time::Duration::MAX).await {
             Ok(outcome) => match outcome.value {
                 None => {
                     let mut inner = self.inner.lock().unwrap();
                     inner.record_read(
                         p,
                         ReadState::NotFound {
+                            last_writer: outcome.last_writer,
                             cache_hit: outcome.cache_hit,
+                            leaf: outcome.leaf,
                         },
                     );
                     Ok(None)
@@ -105,10 +105,9 @@ impl Transaction {
                     inner.record_read(
                         p,
                         ReadState::Found {
-                            version: ReadVersion {
-                                last_writer: rv.version.writer,
-                            },
+                            last_writer: rv.version.writer,
                             cache_hit: outcome.cache_hit,
+                            leaf: outcome.leaf,
                         },
                     );
                     Ok(Some(rv.value.to_vec()))
@@ -196,13 +195,14 @@ impl Transaction {
 
     pub(crate) fn new(
         shards: ShardStore,
-        values: ValueCache,
+        timeline: Timeline,
         tmon: glassdb_trans::Monitor,
         retry: RetryConfig,
     ) -> Self {
+        let resolver = Resolver::new(shards, tmon);
         Transaction {
-            reader: Reader::new(values, shards.clone(), tmon.clone(), retry),
-            resolver: Resolver::new(shards, tmon),
+            reader: Reader::new(resolver.clone(), timeline, retry),
+            resolver,
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }
     }
@@ -243,13 +243,18 @@ impl Transaction {
         }
         let mut reads = Vec::new();
         for (k, v) in &inner.reads {
-            let version = match v {
-                ReadState::Found { version, .. } => Some(version.clone()),
-                ReadState::NotFound { .. } => None,
+            let (last_writer, leaf) = match v {
+                ReadState::Found {
+                    last_writer, leaf, ..
+                } => (Some(last_writer.clone()), leaf.clone()),
+                ReadState::NotFound {
+                    last_writer, leaf, ..
+                } => (last_writer.clone(), leaf.clone()),
             };
             reads.push(ReadAccess {
                 path: k.as_str().into(),
-                version,
+                last_writer,
+                leaf,
             });
         }
         // Emit accesses in a stable path order so the commit path (transaction
@@ -294,24 +299,29 @@ impl StagedValue {
 
 enum ReadState {
     Found {
-        version: ReadVersion,
+        last_writer: TxId,
         cache_hit: bool,
+        leaf: LeafObservation,
     },
     NotFound {
+        last_writer: Option<TxId>,
         cache_hit: bool,
+        leaf: LeafObservation,
     },
 }
 
 impl ReadState {
     fn cache_hit(&self) -> bool {
         match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit } => *cache_hit,
+            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
+                *cache_hit
+            }
         }
     }
 
     fn set_cache_hit(&mut self) {
         match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit } => {
+            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
                 *cache_hit = true;
             }
         }

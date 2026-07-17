@@ -1,6 +1,7 @@
 //! Non-commuting ring workload and concurrent snapshot isolation oracle.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
@@ -172,13 +173,15 @@ async fn read_ring_snapshot(
 
 impl SimWorkload for CycleWorkload {
     type Op = usize;
-    type State = ();
+    type State = AtomicUsize;
 
     fn clients(&self) -> &[Vec<usize>] {
         &self.clients
     }
 
-    fn new_state(&self) {}
+    fn new_state(&self) -> AtomicUsize {
+        AtomicUsize::new(0)
+    }
 
     async fn seed(&self, db: &Database) {
         let coll = db.collection(CYCLE_COLLECTION);
@@ -196,11 +199,17 @@ impl SimWorkload for CycleWorkload {
         .expect("seed ring");
     }
 
-    async fn run_op(db: &Database, op: &usize, _state: &()) -> Result<(), Error> {
+    async fn run_op(db: &Database, op: &usize, _state: &AtomicUsize) -> Result<(), Error> {
         cycle_swap(db, &db.collection(CYCLE_COLLECTION), *op).await
     }
 
-    async fn verify(&self, db: &Database, _state: &(), _faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &AtomicUsize, _faults_enabled: bool) {
+        if self.snapshot_reads != 0 {
+            assert!(
+                state.load(Ordering::SeqCst) != 0,
+                "configured snapshot observer did not run"
+            );
+        }
         // Read every node's final next-pointer and assert the ring is still a
         // single N-cycle. The invariant holds whether or not faults occurred,
         // since each swap is atomic.
@@ -222,7 +231,7 @@ impl SimWorkload for CycleWorkload {
     fn spawn_observer(
         &self,
         backbone: &Arc<dyn Backend>,
-        _state: &Arc<()>,
+        state: &Arc<AtomicUsize>,
     ) -> Option<rt::JoinHandle<()>> {
         // A concurrent read-only observer: while the swaps mutate the ring it
         // snapshots all N pointers in one transaction (concurrent reads, unlike
@@ -239,6 +248,7 @@ impl SimWorkload for CycleWorkload {
         let node_count = self.node_count;
         let snapshot_reads = self.snapshot_reads;
         let backbone = backbone.clone();
+        let state = state.clone();
         Some(rt::spawn(async move {
             let Ok(db) = Self::open_db(&backbone).await else {
                 return;
@@ -246,6 +256,7 @@ impl SimWorkload for CycleWorkload {
             let coll = db.collection(CYCLE_COLLECTION);
             for _ in 0..snapshot_reads {
                 rt::yield_now().await;
+                state.fetch_add(1, Ordering::SeqCst);
                 match read_ring_snapshot(&db, &coll, node_count).await {
                     Ok(snap) => assert_ring(&snap),
                     Err(_) => break,

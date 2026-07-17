@@ -9,6 +9,10 @@ the opaque-cursor recursive-prefix contract in
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md). The rest of
 the reduced trait is unchanged.
 
+Its cache architecture is superseded by
+[ADR-036](036-decoded-object-cache-with-bounded-freshness.md); the reduced
+backend trait and opaque version-conditional read remain authoritative.
+
 > Naming note: the caches were later renamed for clarity — `Global` →
 > `ObjectCache` (backend-version-keyed) and `Local` → `ValueCache`
 > (writer-keyed), both now built from a shared LRU. The names below use the

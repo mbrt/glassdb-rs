@@ -261,19 +261,14 @@ split-point policy, and node fan-out/sizing.
   Proposed ADR-041 removes the latter from `_i`. Future tuning may still adjust
   those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
-  index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
-  `AllowStale` seeding).
-- **Cached-descent fast paths.** How ADR-027's single read-write path and the
-  existing strict read-only fast path recover when their cached descent is
-  stale.
-- **Snapshot and fast paths.** The proposed
-  [snapshot-read design](snapshot-reads.md) routes historical logical versions
-  through the latest B-link topology. Its correctness baseline replaces
-  ADR-027's parallel first-intent path. A specialized replacement is optional
-  and would require its own proof.
-- **Subcollection directory.** ADR-031 keeps it in `_i`; proposed ADR-041 moves
-  logical authority to an epoch-versioned catalog. If that proposal is not
-  accepted, unbounded growth and root-rewrite coupling remain open here.
+  index nodes (reuse of ADR-036's decoded object store and `Requirement::Any` CAS
+  seeding).
+- **Fast paths.** How the single read-write fast path (ADR-027) and read-only
+  fast path interact with a stale cached descent.
+- **Subcollection directory.** It lives in the root object `_i`; whether it should
+  be split out or itself range-sharded when subcollections grow unbounded
+  (ADR-018's deferred item), and how much its churn coupling with root-level
+  index rewrites matters in practice.
 - **Node fan-out / sizing.** Interior fan-out and leaf soft cap vs tree height,
   CAS cost, and cache footprint — to be pinned by a benchmark plan.
 

@@ -143,6 +143,24 @@ fn possible_values(models: &BTreeSet<ApiModel>, key: usize) -> BTreeSet<Option<u
     models.iter().map(|model| model[key]).collect()
 }
 
+/// Marks a body error caused by a value outside the begin-snapshot model.
+/// Execution may observe a stale cached value, so OCC validation—not the body—
+/// decides whether the attempt can commit.
+const OUT_OF_MODEL_MARKER: &str = "api-out-of-model";
+
+fn out_of_model_error(key: usize, actual: Option<u8>, allowed: &BTreeSet<Option<u8>>) -> Error {
+    Error::internal(format!(
+        "{OUT_OF_MODEL_MARKER}: API key k{key} read {actual:?} outside modeled states {allowed:?}"
+    ))
+}
+
+fn out_of_model_message(error: &Error) -> Option<&str> {
+    match error {
+        Error::Internal { msg, .. } if msg.starts_with(OUT_OF_MODEL_MARKER) => Some(msg),
+        _ => None,
+    }
+}
+
 async fn run_api_program(
     db: &Database,
     program: &ApiTransaction,
@@ -191,12 +209,9 @@ async fn run_api_program(
                                 actual, expected,
                                 "API key k{key} violated repeatable reads"
                             );
+                        } else if !allowed[*key].contains(&actual) {
+                            return Err(out_of_model_error(*key, actual, &allowed[*key]));
                         } else {
-                            assert!(
-                                allowed[*key].contains(&actual),
-                                "API key k{key} read {actual:?} outside modeled states {:?}",
-                                allowed[*key]
-                            );
                             observed[*key] = Some(actual);
                         }
                     }
@@ -213,6 +228,14 @@ async fn run_api_program(
             if should_abort { tx.abort() } else { Ok(()) }
         })
         .await;
+
+    // A merely stale value causes the engine to retry the body. If this marker
+    // escapes, OCC accepted an out-of-model snapshot as current.
+    if let Err(error) = &result
+        && let Some(message) = out_of_model_message(error)
+    {
+        panic!("{message}");
+    }
 
     if program.abort {
         return match result {

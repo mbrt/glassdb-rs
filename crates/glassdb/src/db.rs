@@ -9,9 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{
-    Directory, ObjectCache, ShardStore, SharedCache, SplitPolicy, TLogger, ValueCache,
-};
+use glassdb_storage::{CachedStore, Directory, ShardStore, SplitPolicy, TLogger, Timeline};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, Splitter, TransError};
 use tokio::sync::Notify;
 
@@ -108,11 +106,8 @@ impl DatabaseBuilder {
 
         let backend = Arc::new(StatsBackend::new(b));
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        // One shared LRU sized by `cache_size` backs both cache facades: the
-        // writer-keyed value cache and the backend-version-keyed object cache.
-        let cache = SharedCache::new(cache_size);
-        let values = ValueCache::new(&cache);
-        let objects = ObjectCache::new(dyn_backend, &cache);
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone());
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
@@ -127,8 +122,8 @@ impl DatabaseBuilder {
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
         let tmon = Monitor::with_config(
-            values.clone(),
             tl.clone(),
+            timeline.clone(),
             bg_weak.clone(),
             clock.clone(),
             retry,
@@ -141,6 +136,7 @@ impl DatabaseBuilder {
         let (coord, splitter) = Splitter::with_coordinator(
             bg_weak.clone(),
             shards.clone(),
+            timeline.clone(),
             tmon.clone(),
             clock.clone(),
             retry,
@@ -152,6 +148,7 @@ impl DatabaseBuilder {
             bg_weak.clone(),
             tl,
             shards.clone(),
+            timeline.clone(),
             locker.clone(),
             tmon.clone(),
             clock.clone(),
@@ -159,7 +156,8 @@ impl DatabaseBuilder {
         gc.start();
         splitter.start();
         let algo = Algo::new(
-            values.clone(),
+            shards.clone(),
+            timeline.clone(),
             locker.clone(),
             coord.clone(),
             tmon.clone(),
@@ -174,7 +172,7 @@ impl DatabaseBuilder {
             name,
             backend,
             shards,
-            values,
+            timeline,
             tmon,
             algo,
             coord,
@@ -206,7 +204,7 @@ pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) backend: Arc<StatsBackend>,
     pub(crate) shards: ShardStore,
-    pub(crate) values: ValueCache,
+    pub(crate) timeline: Timeline,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
     pub(crate) coord: ShardCoordinator,
@@ -418,7 +416,7 @@ impl DbInner {
     {
         let tx = Transaction::new(
             self.shards.clone(),
-            self.values.clone(),
+            self.timeline.clone(),
             self.tmon.clone(),
             self.retry,
         );

@@ -4,19 +4,19 @@
 //! transaction object of whichever transaction last committed it. Reading a key
 //! therefore resolves its shard entry to an *effective writer* — delegated to
 //! the [`Resolver`], the shared home for that coordination step — and then
-//! materializes the value from that writer's transaction object through the
-//! [`Monitor`]. Resolved values are cached in the [`ValueCache`], keyed by
-//! writer, so a hot key does not re-resolve its shard on every read; the cache
-//! is invalidated by the commit path when validation detects a stale read.
+//! materializes the value from that writer's decoded transaction object through
+//! the [`Monitor`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_storage::{ShardStore, StorageError, TxCommitStatus, ValueCache, Version};
+use glassdb_data::TxId;
+use glassdb_storage::{
+    LeafObservation, Requirement, StorageError, Timeline, TxCommitStatus, Version,
+};
 
 use crate::error::trans_to_storage;
-use crate::monitor::Monitor;
 use crate::resolver::Resolver;
 
 /// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
@@ -37,15 +37,18 @@ pub struct ReadValue {
     pub version: Version,
 }
 
-/// The outcome of reading a key, including whether the value cache supplied
-/// the result. An absent value may still be a cache hit when it is a cached
-/// deletion.
-#[derive(Debug, Clone, Default)]
+/// The outcome of reading a key, including whether every physical object used
+/// to derive it was served locally. An absent value may still be a cache hit.
+#[derive(Debug, Clone)]
 pub struct ReadOutcome {
     /// The resolved value, or `None` when the key is absent or deleted.
     pub value: Option<ReadValue>,
-    /// Whether the value cache supplied the outcome.
+    /// Effective writer resolved for the key, including a tombstone writer.
+    pub last_writer: Option<TxId>,
+    /// Whether every physical dependency was served locally.
     pub cache_hit: bool,
+    /// Exact leaf state used to derive this logical value.
+    pub leaf: LeafObservation,
 }
 
 /// Reads values by resolving a key's shard entry to its effective committed
@@ -54,23 +57,17 @@ pub struct ReadOutcome {
 #[derive(Clone)]
 pub struct Reader {
     resolver: Resolver,
-    values: ValueCache,
-    tmon: Monitor,
+    timeline: Timeline,
     retry: RetryConfig,
 }
 
 impl Reader {
-    /// Creates a reader over the value cache, the shard coordination store, and
-    /// a monitor. Effective-writer resolution is delegated to a [`Resolver`]
-    /// built over the same `shards`/`tmon`; the shard store revalidates shard
-    /// objects by their backend version (ADR-023), so a read always observes the
-    /// current coordination state without re-transferring an unchanged shard's
-    /// body.
-    pub fn new(values: ValueCache, shards: ShardStore, tmon: Monitor, retry: RetryConfig) -> Self {
+    /// Creates a reader that resolves and materializes values through
+    /// `resolver` using `retry` for transient read failures.
+    pub fn new(resolver: Resolver, timeline: Timeline, retry: RetryConfig) -> Self {
         Reader {
-            resolver: Resolver::new(shards, tmon.clone()),
-            values,
-            tmon,
+            resolver,
+            timeline,
             retry,
         }
     }
@@ -99,40 +96,38 @@ impl Reader {
     /// A single read attempt: local cache then shard resolution. Wrapped by
     /// [`Reader::read`] for in-place retries.
     async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadOutcome, StorageError> {
-        if let Some(lr) = self.values.read(key, max_stale)
-            && !lr.outdated
-        {
-            if lr.deleted {
-                return Ok(ReadOutcome {
-                    value: None,
-                    cache_hit: true,
-                });
-            }
-            return Ok(ReadOutcome {
-                value: Some(ReadValue {
-                    value: lr.value,
-                    version: lr.version,
-                }),
-                cache_hit: true,
-            });
-        }
-        Ok(ReadOutcome {
-            value: self.resolve_value(key).await?,
-            cache_hit: false,
-        })
+        // Bounded-staleness reads are the one foreground operation that owns a
+        // freshness policy rather than inheriting a transaction/CAS watermark.
+        self.resolve_value(key, Requirement::within(&self.timeline, max_stale))
+            .await
     }
 
     /// Resolves `key` to its effective writer (via the [`Resolver`]), then
     /// materializes the value from that writer's transaction object.
-    async fn resolve_value(&self, key: &str) -> Result<Option<ReadValue>, StorageError> {
-        let Some(writer) = self.resolver.effective_writer(key).await? else {
-            // Absent or tombstoned: not found. (A tombstone could be cached, but
-            // the next validation re-resolves the shard anyway, so we keep the
-            // read path simple and only cache materialized live values.)
-            return Ok(None);
+    async fn resolve_value(
+        &self,
+        key: &str,
+        requirement: glassdb_storage::Requirement,
+    ) -> Result<ReadOutcome, StorageError> {
+        let (resolved, leaf) = self
+            .resolver
+            .resolve_key(key, requirement)
+            .await
+            .map_err(trans_to_storage)?;
+        let mut cache_hit = leaf.cache_hit;
+        cache_hit &= resolved.cache_hit;
+        let leaf = leaf.observation;
+        let Some(writer) = resolved.writer else {
+            return Ok(ReadOutcome {
+                value: None,
+                last_writer: None,
+                cache_hit,
+                leaf,
+            });
         };
+        let last_writer = Some(writer.clone());
         let cv = self
-            .tmon
+            .resolver
             .committed_value(key, &writer)
             .await
             .map_err(trans_to_storage)?;
@@ -140,27 +135,24 @@ impl Reader {
             // The writer's value is not authoritatively resolvable yet (e.g. its
             // object is in-doubt). Report absence so transaction validation can
             // retry rather than trusting an empty placeholder.
-            return Ok(None);
+            return Ok(ReadOutcome {
+                value: None,
+                last_writer,
+                cache_hit: false,
+                leaf,
+            });
         }
-        Ok(self.materialize(key, writer, cv.value))
-    }
-
-    /// Caches and returns a resolved committed value, or `None` for a tombstone.
-    fn materialize(
-        &self,
-        key: &str,
-        writer: glassdb_data::TxId,
-        value: glassdb_storage::TValue,
-    ) -> Option<ReadValue> {
+        cache_hit &= cv.cache_hit;
         let version = Version { writer };
-        if value.deleted {
-            self.values.mark_deleted(key, version);
-            return None;
-        }
-        self.values.write(key, value.value.clone(), version.clone());
-        Some(ReadValue {
-            value: value.value,
+        let value = (!cv.value.deleted).then_some(ReadValue {
+            value: cv.value.value,
             version,
+        });
+        Ok(ReadOutcome {
+            value,
+            last_writer,
+            cache_hit,
+            leaf,
         })
     }
 }

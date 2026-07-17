@@ -159,28 +159,16 @@ fn pct_schedule_is_byte_identical_per_seed() {
 
 #[test]
 fn concurrent_snapshot_reader_runs_and_stays_deterministic() {
-    // The read-only observer must (a) actually run — adding backend reads on top
-    // of the swap-only stream — and (b) keep the run byte-for-byte deterministic
-    // even though it issues all N pointer reads concurrently within one
-    // transaction. (b) is the real test of the concurrent-read path: if joining
-    // the reads introduced any nondeterminism, the two streams would diverge.
+    // The workload verifies directly that the configured read-only observer ran;
+    // backend-op counts are not evidence of execution because a snapshot can be
+    // satisfied by retained decoded-object evidence. The two runs must still be
+    // byte-for-byte deterministic even though the observer issues all N pointer
+    // reads concurrently within one transaction.
     let with_reader = contended_cycle(); // snapshot_reads = 3
-    let without = CycleWorkload {
-        snapshot_reads: 0,
-        ..contended_cycle()
-    };
     for seed in [0u64, 1, 42, 1234] {
         let first = record_once(seed, &with_reader);
         let second = record_once(seed, &with_reader);
         assert_no_divergence(&format!("seed {seed}: snapshot-reader"), &first, &second);
-        let baseline = record_once(seed, &without);
-        assert!(
-            first.len() > baseline.len(),
-            "seed {seed}: enabling the snapshot reader added no backend ops \
-             ({} with reader vs {} without) — the observer did not run",
-            first.len(),
-            baseline.len(),
-        );
     }
 }
 

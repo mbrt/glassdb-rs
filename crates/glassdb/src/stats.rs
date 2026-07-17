@@ -19,7 +19,7 @@ pub struct Stats {
     pub tx_time: Duration,
     /// Number of reads.
     pub tx_reads: u64,
-    /// Number of distinct transactional reads served from the value cache.
+    /// Number of distinct transactional reads derived entirely from local objects.
     /// Counted once per key per transaction attempt, including cached
     /// not-found results.
     pub tx_cache_hits: u64,

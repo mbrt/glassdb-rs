@@ -8,19 +8,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    MAX_STALENESS, PathLock, StorageError, TLogger, TValue, TxCommitStatus, TxLog, ValueCache,
-    Version,
+    LogicalTime, Observation, PathLock, Requirement, StorageError, TLogger, TValue, Timeline,
+    TxCommitStatus, TxLog, TxStatus,
 };
+use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
 
 use crate::error::TransError;
 
 pub(crate) const PENDING_TX_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
+const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 
 fn refresh_timeout() -> Duration {
     // refreshMultiplier = 0.5
@@ -63,11 +64,42 @@ enum RefreshState {
 
 struct TxStatusEntry {
     status: TxCommitStatus,
-    last_version: backend::Version,
+    last_observation: Option<Observation<TxLog>>,
     refresh_state: RefreshState,
     // The lock set this transaction holds, recorded by the engine once it has
     // acquired its locks.
     locks: Vec<PathLock>,
+}
+
+#[derive(Clone, Copy)]
+struct FinalStatus {
+    status: TxCommitStatus,
+    watermark: LogicalTime,
+}
+
+struct FinalStatusCache {
+    capacity: usize,
+    entries: LinkedHashMap<TxId, FinalStatus>,
+}
+
+impl FinalStatusCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: LinkedHashMap::new(),
+        }
+    }
+
+    fn get(&mut self, tid: &TxId) -> Option<FinalStatus> {
+        self.entries.to_back(tid).copied()
+    }
+
+    fn insert(&mut self, tid: TxId, status: FinalStatus) {
+        self.entries.insert(tid, status);
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+    }
 }
 
 struct WaitRequest {
@@ -94,8 +126,9 @@ struct State {
 }
 
 struct Inner {
-    values: ValueCache,
     tl: TLogger,
+    timeline: Timeline,
+    final_status: Mutex<FinalStatusCache>,
     // Weak so a `Monitor` clone captured inside a spawned task does not keep
     // the [`Background`] alive across DB shutdown. The single strong owner
     // is `DbInner::background`.
@@ -121,14 +154,15 @@ pub struct Monitor {
 pub(crate) struct KeyCommitStatus {
     pub status: TxCommitStatus,
     pub value: TValue,
+    pub cache_hit: bool,
 }
 
 impl Monitor {
     /// Creates a monitor using the real wall-clock and default retry timing.
-    pub fn new(values: ValueCache, tl: TLogger, background: Weak<Background>) -> Self {
+    pub fn new(tl: TLogger, timeline: Timeline, background: Weak<Background>) -> Self {
         Self::with_config(
-            values,
             tl,
+            timeline,
             background,
             Clock::real(),
             RetryConfig::default(),
@@ -140,16 +174,17 @@ impl Monitor {
     /// tunes the backoff used when polling a peer transaction's commit status
     /// and when writing a transaction's final log.
     pub fn with_config(
-        values: ValueCache,
         tl: TLogger,
+        timeline: Timeline,
         background: Weak<Background>,
         clock: Clock,
         retry: RetryConfig,
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
-                values,
                 tl,
+                timeline,
+                final_status: Mutex::new(FinalStatusCache::new(FINAL_STATUS_CACHE_SIZE)),
                 background,
                 clock,
                 retry,
@@ -165,7 +200,7 @@ impl Monitor {
             tid.clone(),
             TxStatusEntry {
                 status: TxCommitStatus::Pending,
-                last_version: backend::Version::default(),
+                last_observation: None,
                 refresh_state: RefreshState::NotStarted,
                 locks: Vec::new(),
             },
@@ -239,19 +274,6 @@ impl Monitor {
                 .map_err(|e| e.context("writing tx log"))?;
         }
 
-        let version = Version {
-            writer: tl.id.clone(),
-        };
-        for entry in &tl.writes {
-            if entry.deleted {
-                self.inner.values.mark_deleted(&entry.path, version.clone());
-            } else {
-                self.inner
-                    .values
-                    .write(&entry.path, entry.value.clone(), version.clone());
-            }
-        }
-
         let mut st = self.shard_for(&tl.id).lock().unwrap();
         st.local_tx.remove(&tl.id);
         notify_waiters(&mut st, &tl.id, TxCommitStatus::Ok);
@@ -285,9 +307,15 @@ impl Monitor {
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
     pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
-        let cs = self.inner.tl.commit_status(tid).await.map_err(|e| {
-            TransError::Storage(e.context(format!("reading status of wound target {tid}")))
-        })?;
+        // TODO: this smells of TOCTOU
+        let cs = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await
+            .map_err(|e| {
+                TransError::Storage(e.context(format!("reading status of wound target {tid}")))
+            })?;
         if cs.status.is_final() {
             // Already committed or aborted: nothing left to wound.
             self.mark_local_aborted(tid, cs.status);
@@ -296,7 +324,7 @@ impl Monitor {
 
         // Force the transaction to aborted, CAS-ing over its current log version
         // (or creating an aborted log if it has none yet).
-        let status = self.force_abort(tid, &cs.version).await?;
+        let status = self.force_abort(tid, &cs.observation).await?;
         self.mark_local_aborted(tid, status);
         Ok(())
     }
@@ -309,7 +337,50 @@ impl Monitor {
                 return Ok(e.status);
             }
         }
+        if let Some(status) = self.cached_final_status(tid) {
+            return Ok(status);
+        }
         self.fetch_remote_tx_status(tid).await
+    }
+
+    /// Returns the commit status using a caller-provided observation bound.
+    pub(crate) async fn tx_status_at(
+        &self,
+        tid: &TxId,
+        requirement: Requirement,
+    ) -> Result<TxCommitStatus, TransError> {
+        Ok(self.tx_status_at_with_cache(tid, requirement).await?.0)
+    }
+
+    /// Returns whether `tid` is committed using transaction-state evidence no
+    /// older than `at`.
+    pub(crate) async fn committed_at(
+        &self,
+        tid: &TxId,
+        at: LogicalTime,
+    ) -> Result<bool, TransError> {
+        Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
+    }
+
+    /// Returns status at the requested bound and whether resolving it reused
+    /// cached transaction state.
+    pub(crate) async fn tx_status_at_with_cache(
+        &self,
+        tid: &TxId,
+        requirement: Requirement,
+    ) -> Result<(TxCommitStatus, bool), TransError> {
+        {
+            let st = self.shard_for(tid).lock().unwrap();
+            if let Some(e) = st.local_tx.get(tid) {
+                return Ok((e.status, true));
+            }
+        }
+        if let Some(status) = self.cached_final_status(tid) {
+            return Ok((status, true));
+        }
+        let status = self.inner.tl.commit_status_at(tid, requirement).await?;
+        let cache_hit = status.observation.cache_hit();
+        Ok((self.resolve_remote_tx_status(tid, status).await?, cache_hit))
     }
 
     /// Waits asynchronously for the transaction to finalize, yielding its final
@@ -331,52 +402,18 @@ impl Monitor {
         key: &str,
         tid: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
-        if let Some(lr) = self.inner.values.read(key, MAX_STALENESS)
-            && lr.version.writer == *tid
-        {
-            return Ok(KeyCommitStatus {
-                status: TxCommitStatus::Ok,
-                value: TValue {
-                    value: lr.value,
-                    deleted: lr.deleted,
-                    not_written: false,
-                },
-            });
-        }
+        self.committed_value_with_requirement(key, tid, None).await
+    }
 
-        let status = self.tx_status(tid).await?;
-        if status != TxCommitStatus::Ok {
-            return Ok(KeyCommitStatus {
-                status,
-                value: TValue::default(),
-            });
-        }
-
-        let (tl, _) = self
-            .inner
-            .tl
-            .get(tid)
+    /// Returns a committed value using a caller-provided observation bound.
+    pub(crate) async fn committed_value_at(
+        &self,
+        key: &str,
+        tid: &TxId,
+        requirement: Requirement,
+    ) -> Result<KeyCommitStatus, TransError> {
+        self.committed_value_with_requirement(key, tid, Some(requirement))
             .await
-            .map_err(|e| TransError::Storage(e.context(format!("getting TID {tid}"))))?;
-        for entry in &tl.writes {
-            if entry.path == key {
-                return Ok(KeyCommitStatus {
-                    status: TxCommitStatus::Ok,
-                    value: TValue {
-                        value: entry.value.clone(),
-                        deleted: entry.deleted,
-                        not_written: false,
-                    },
-                });
-            }
-        }
-        Ok(KeyCommitStatus {
-            status: TxCommitStatus::Ok,
-            value: TValue {
-                not_written: true,
-                ..Default::default()
-            },
-        })
     }
 
     /// Writes a transaction's final (committed or aborted) log object with
@@ -386,23 +423,24 @@ impl Monitor {
         if tid.is_unset() {
             return Err(TransError::other("missing required tlog ID"));
         }
-        let mut last_v = {
+        let mut last_observation = {
             let st = self.shard_for(tid).lock().unwrap();
             st.local_tx
                 .get(tid)
-                .map(|e| e.last_version.clone())
-                .unwrap_or_default()
+                .and_then(|entry| entry.last_observation.clone())
         };
 
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let r = if last_v.is_unset() {
-                self.inner.tl.set(tlog).await
-            } else {
-                self.inner.tl.set_if(tlog, &last_v).await
+            let r = match &last_observation {
+                Some(observed) => self.inner.tl.set_if(tlog, observed).await,
+                None => self.inner.tl.set(tlog).await,
             };
             match r {
-                Ok(_) => return Ok(()),
+                Ok(observed) => {
+                    self.remember_final(tid, &observed);
+                    return Ok(());
+                }
                 Err(StorageError::Precondition) => {
                     // The version moved under us. Possible races: our own
                     // `refresh_pending` advancing the pending log, a wound
@@ -420,14 +458,19 @@ impl Monitor {
                     //     found `aborted`): a wound landed first -> surface as
                     //     `AlreadyFinalized` so the commit path treats it as a
                     //     wound.
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
                     if st.status == tlog.status {
+                        self.remember_final(tid, &st.observation);
                         return Ok(());
                     }
                     if st.status.is_final() {
                         return Err(TransError::AlreadyFinalized);
                     }
-                    last_v = st.version;
+                    last_observation = Some(st.observation);
                 }
                 // In-doubt outcome: the log write may or may not have landed.
                 // It is always safe to retry as long as the log status was not
@@ -451,30 +494,36 @@ impl Monitor {
     pub(crate) async fn force_abort(
         &self,
         tid: &TxId,
-        expected: &backend::Version,
+        expected: &Observation<TxLog>,
     ) -> Result<TxCommitStatus, TransError> {
         let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
-        if !expected.is_unset()
-            && let Ok((current, _)) = self.inner.tl.get(tid).await
-        {
-            tlog.writes = current.writes;
-            tlog.locks = current.locks;
+        if let Some(current) = expected.value() {
+            tlog.writes = current.writes.clone();
+            tlog.locks = current.locks.clone();
         }
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let r = if expected.is_unset() {
+            let r = if expected.is_absent() {
                 self.inner.tl.set(&tlog).await
             } else {
                 self.inner.tl.set_if(&tlog, &expected).await
             };
             match r {
-                Ok(_) => return Ok(TxCommitStatus::Aborted),
+                Ok(observed) => {
+                    self.remember_final(tid, &observed);
+                    return Ok(TxCommitStatus::Aborted);
+                }
                 Err(StorageError::Precondition) => {
                     // The version moved under us (a commit, a pending-log
                     // refresh, or another wounder). Report whatever status is
                     // now durable.
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
+                    self.remember_final(tid, &st.observation);
                     return Ok(st.status);
                 }
                 // In-doubt: the abort write may or may not have landed. Just
@@ -488,16 +537,158 @@ impl Monitor {
                 // peer's, or a commit that won the race); a still-pending
                 // status means retry the CAS over the refreshed version.
                 Err(StorageError::Unavailable(_)) => {
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
                     if st.status.is_final() {
+                        self.remember_final(tid, &st.observation);
                         return Ok(st.status);
                     }
-                    expected = st.version;
+                    expected = st.observation;
                 }
                 Err(e) => return Err(e.into()),
             }
             rt::sleep(backoff.next_delay()).await;
         }
+    }
+
+    async fn committed_value_with_requirement(
+        &self,
+        key: &str,
+        tid: &TxId,
+        requirement: Option<Requirement>,
+    ) -> Result<KeyCommitStatus, TransError> {
+        let status_cache_hit = {
+            let local = self
+                .shard_for(tid)
+                .lock()
+                .unwrap()
+                .local_tx
+                .contains_key(tid);
+            local
+                || self
+                    .inner
+                    .final_status
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key(tid)
+        };
+        let status = match requirement {
+            Some(requirement) => self.tx_status_at(tid, requirement).await?,
+            None => self.tx_status(tid).await?,
+        };
+        if status != TxCommitStatus::Ok {
+            return Ok(KeyCommitStatus {
+                status,
+                value: TValue::default(),
+                cache_hit: false,
+            });
+        }
+
+        let tl = self.final_log(tid, status, requirement).await?;
+        let cache_hit = status_cache_hit && tl.cache_hit();
+        let tl = tl
+            .value()
+            .ok_or_else(|| TransError::other(format!("missing final log for {tid}")))?;
+        for entry in &tl.writes {
+            if entry.path == key {
+                return Ok(KeyCommitStatus {
+                    status: TxCommitStatus::Ok,
+                    value: TValue {
+                        value: entry.value.clone(),
+                        deleted: entry.deleted,
+                        not_written: false,
+                    },
+                    cache_hit,
+                });
+            }
+        }
+        Ok(KeyCommitStatus {
+            status: TxCommitStatus::Ok,
+            value: TValue {
+                not_written: true,
+                ..Default::default()
+            },
+            cache_hit,
+        })
+    }
+
+    async fn final_log(
+        &self,
+        tid: &TxId,
+        expected_status: TxCommitStatus,
+        requirement: Option<Requirement>,
+    ) -> Result<Observation<TxLog>, TransError> {
+        let cached = self.inner.final_status.lock().unwrap().get(tid);
+        let mut observed = match requirement {
+            Some(requirement) => {
+                let requirement = match cached {
+                    Some(status) => requirement.stricter(Requirement::AtLeast(status.watermark)),
+                    None => requirement,
+                };
+                self.inner.tl.get_at(tid, requirement).await
+            }
+            None => self.inner.tl.get_at(tid, self.current_requirement()).await,
+        }
+        .map_err(|error| TransError::Storage(error.context(format!("getting TID {tid}"))))?;
+        if observed
+            .value()
+            .is_some_and(|log| log.status != expected_status)
+        {
+            observed = self
+                .inner
+                .tl
+                .get_at(tid, self.current_requirement())
+                .await
+                .map_err(|error| {
+                    TransError::Storage(error.context(format!("refreshing TID {tid}")))
+                })?;
+        }
+        if !observed
+            .value()
+            .is_some_and(|log| log.status == expected_status)
+        {
+            return Err(TransError::other(format!(
+                "terminal status and transaction object disagree for {tid}"
+            )));
+        }
+        Ok(observed)
+    }
+
+    /// Starts a transaction-log poll after all status evidence already seen by
+    /// this monitor. Unlike transaction validation, a remote-holder poll has no
+    /// preceding CAS or validation barrier to reuse, so the monitor must create
+    /// the lower bound itself.
+    fn current_requirement(&self) -> Requirement {
+        Requirement::AtLeast(self.inner.timeline.now())
+    }
+
+    fn cached_final_status(&self, tid: &TxId) -> Option<TxCommitStatus> {
+        self.inner
+            .final_status
+            .lock()
+            .unwrap()
+            .get(tid)
+            .map(|entry| entry.status)
+    }
+
+    fn remember_final(&self, tid: &TxId, observed: &Observation<TxLog>) {
+        let Some(log) = observed.value() else {
+            return;
+        };
+        if !log.status.is_final() {
+            return;
+        }
+        self.inner.final_status.lock().unwrap().insert(
+            tid.clone(),
+            FinalStatus {
+                status: log.status,
+                watermark: observed.current_after(),
+            },
+        );
     }
 
     /// Returns the shard lock responsible for `tid`.
@@ -565,7 +756,19 @@ impl Monitor {
     }
 
     async fn fetch_remote_tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let status = self.inner.tl.commit_status(tid).await?;
+        let status = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
+        self.resolve_remote_tx_status(tid, status).await
+    }
+
+    async fn resolve_remote_tx_status(
+        &self,
+        tid: &TxId,
+        status: TxStatus,
+    ) -> Result<TxCommitStatus, TransError> {
         match status.status {
             TxCommitStatus::Unknown => self.handle_unknown_tx(tid).await,
             TxCommitStatus::Pending => {
@@ -579,7 +782,7 @@ impl Monitor {
                     || self.pending_no_progress(tid, status.last_update, now)
                 {
                     self.clear_pending_progress(tid);
-                    self.force_abort(tid, &status.version).await
+                    self.force_abort(tid, &status.observation).await
                 } else {
                     Ok(TxCommitStatus::Pending)
                 }
@@ -587,6 +790,7 @@ impl Monitor {
             s => {
                 // Finalized: drop the observer-relative progress tracking.
                 self.clear_pending_progress(tid);
+                self.remember_final(tid, &status.observation);
                 Ok(s)
             }
         }
@@ -649,7 +853,12 @@ impl Monitor {
         // own clock, so this owes no `MAX_CLOCK_SKEW` (ADR-024 refines ADR-021,
         // which over-granted this window by reusing the skew-padded check).
         if is_expired_no_skew(first_check, now) {
-            let res = self.force_abort(tid, &backend::Version::default()).await;
+            let status = self
+                .inner
+                .tl
+                .commit_status_at(tid, self.current_requirement())
+                .await?;
+            let res = self.force_abort(tid, &status.observation).await;
             if res.is_ok() {
                 self.shard_for(tid).lock().unwrap().unknown_tx.remove(tid);
             }
@@ -741,7 +950,7 @@ impl Monitor {
         if !self.should_refresh(&tid) {
             return;
         }
-        let mut last_version = backend::Version::default();
+        let mut last_observation: Option<Observation<TxLog>> = None;
 
         loop {
             rt::sleep(refresh_timeout()).await;
@@ -763,19 +972,19 @@ impl Monitor {
                 .get(&tid)
                 .map(|e| e.locks.clone())
                 .unwrap_or_default();
-            let r = if last_version.is_unset() {
+            let r = if let Some(observed) = &last_observation {
+                self.inner.tl.set_if(&tl, observed).await
+            } else {
                 // First materialization: create-if-absent so a pre-existing
                 // `aborted` object (an older peer's wound) wins.
                 self.inner.tl.set(&tl).await
-            } else {
-                self.inner.tl.set_if(&tl, &last_version).await
             };
             match r {
-                Ok(v) => {
-                    last_version = v;
+                Ok(observed) => {
+                    last_observation = Some(observed);
                     let mut st = self.shard_for(&tid).lock().unwrap();
                     if let Some(e) = st.local_tx.get_mut(&tid) {
-                        e.last_version = last_version.clone();
+                        e.last_observation = last_observation.clone();
                     }
                 }
                 // The create lost (object already exists) or the CAS version
@@ -783,12 +992,17 @@ impl Monitor {
                 // we lost) — stop and let the owner observe it; a still-pending
                 // status means we adopt its version and keep refreshing.
                 Err(StorageError::Precondition) => {
-                    match self.inner.tl.commit_status(&tid).await {
+                    match self
+                        .inner
+                        .tl
+                        .commit_status_at(&tid, self.current_requirement())
+                        .await
+                    {
                         Ok(st) if st.status.is_final() => {
                             self.mark_local_aborted(&tid, st.status);
                             return;
                         }
-                        Ok(st) => last_version = st.version,
+                        Ok(st) => last_observation = Some(st.observation),
                         // Couldn't read it back; retry on the next cycle.
                         Err(_) => {}
                     }
@@ -817,13 +1031,10 @@ mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
-    use glassdb_storage::{
-        LockScope, LockType, ObjectCache, PathLock, SharedCache, TxWrite, ValueCache,
-    };
+    use glassdb_storage::{CachedStore, LockScope, LockType, PathLock, Timeline, TxWrite};
 
     struct TestCtx {
         tl: TLogger,
-        objects: ObjectCache,
         // The clock the monitor was built with, so tests can stamp tx logs with
         // the monitor's own notion of "now".
         clock: Clock,
@@ -838,27 +1049,41 @@ mod tests {
     }
 
     fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
-        let cache = SharedCache::new(1024);
-        let values = ValueCache::new(&cache);
-        let objects = ObjectCache::new(b, &cache);
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(b, 1024, timeline.clone());
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
-            values,
             tl.clone(),
+            timeline,
             Arc::downgrade(&bg),
             clock.clone(),
             RetryConfig::default(),
         );
-        (
-            mon,
-            TestCtx {
-                tl,
-                objects,
-                clock,
-                _bg: bg,
-            },
-        )
+        (mon, TestCtx { tl, clock, _bg: bg })
+    }
+
+    #[test]
+    fn final_status_cache_is_count_bounded_and_lru() {
+        let timeline = Timeline::new();
+        let watermark = timeline.now();
+        let mut cache = FinalStatusCache::new(2);
+        let first = TxId::from_bytes(b"first".to_vec());
+        let second = TxId::from_bytes(b"second".to_vec());
+        let third = TxId::from_bytes(b"third".to_vec());
+        let status = FinalStatus {
+            status: TxCommitStatus::Ok,
+            watermark,
+        };
+
+        cache.insert(first.clone(), status);
+        cache.insert(second.clone(), status);
+        assert!(cache.get(&first).is_some());
+        cache.insert(third.clone(), status);
+
+        assert!(cache.get(&second).is_none());
+        assert!(cache.get(&first).is_some());
+        assert!(cache.get(&third).is_some());
     }
 
     #[tokio::test]
@@ -893,11 +1118,9 @@ mod tests {
     #[tokio::test]
     async fn committed_value() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (mon1, t1) = new_test_monitor(b.clone());
+        let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
         let key = paths::from_key("example", b"key");
-
-        t1.objects.write(&key, Arc::from(&b"x"[..])).await.unwrap();
 
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);
@@ -969,7 +1192,7 @@ mod tests {
         // Advance well past the pending timeout. Refresh keeps it alive.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let st = t.tl.commit_status(&tx).await.unwrap();
+        let st = t.tl.commit_status_at(&tx, Requirement::Any).await.unwrap();
         assert_eq!(st.status, TxCommitStatus::Pending);
 
         // A separate monitor should still see it as pending (not expired).
@@ -1001,7 +1224,8 @@ mod tests {
         // pending object.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let (tl, _) = t.tl.get(&tx).await.unwrap();
+        let tl = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let tl = tl.value().unwrap();
         assert_eq!(tl.status, TxCommitStatus::Pending);
         assert_eq!(tl.locks, locks);
 

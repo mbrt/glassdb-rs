@@ -125,7 +125,7 @@ async fn stats_report_locker_activity() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stats_report_transactional_value_cache_hits() {
+async fn stats_report_transactional_decoded_cache_hits() {
     let backend = mem();
     let writer_db = init_db(backend.clone()).await;
     let reader_db = init_db(backend).await;
