@@ -505,8 +505,11 @@ rather than a follow-on version:
   order-preserving, range-partitioned directory (B-link tree) that also adds
   sorted/range listing and per-range membership; supersedes the fixed hash
   mapping of ADR-016/017/018.
-- **Compaction.** A cold key can pin a fat transaction blob of otherwise-dead
-  values; there is no compaction of fragmented blobs.
+- **Compaction / bounded history.** A cold key can pin a fat transaction blob of
+  otherwise-dead values; there is no compaction of fragmented blobs. If the
+  proposed [snapshot-read design](snapshot-reads.md) is accepted, it replaces
+  this value placement with independently reclaimable per-key values, indexed
+  epoch history, and history-aware GC.
 - **Explicit liveness counter.** GC is full reverse mark-sweep of whole objects;
   an explicit per-object liveness counter could make reclamation cheaper.
 - **Benchmark the false-sharing knee.** Locate the throughput knee vs `C` and
@@ -514,5 +517,8 @@ rather than a follow-on version:
 - **Hot-shard S3 PUT ceiling.** Decide whether a hot shard hitting S3's
   per-prefix PUT rate limit is an accepted, documented limit or whether shard
   paths should be spread to mitigate it.
-- **Atomic root + shard creation.** Decide whether the collection root and its
-  shards should share a fate (created atomically on `collection.create`).
+- **Root creation and catalog visibility.** Proposed
+  [ADR-041](../adr/041-epoch-versioned-collection-catalog.md) precreates a
+  physical root bound to an incarnation, then atomically publishes collection
+  existence and parent membership; an aborted reusable root is CAS-compacted to
+  a tombstone rather than unconditionally deleted.
