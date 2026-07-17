@@ -241,7 +241,12 @@ impl Gc {
     /// The reverse liveness check for one candidate (ADR-022): read it, keep it
     /// if within the safety horizon, else resolve by status.
     async fn check_candidate(&self, tid: &TxId) -> Result<(), TransError> {
-        let observed = match self.tl.get(tid).await {
+        // GC has no preceding transaction barrier or CAS receipt: it must
+        // establish one candidate-check epoch before deciding that no durable
+        // leaf still references the transaction. The same epoch is propagated
+        // through routing and release so the decision is one coherent sweep.
+        let candidate_check = Requirement::AtLeast(self.timeline.now());
+        let observed = match self.tl.get_at(tid, Requirement::Any).await {
             Ok(v) => v,
             // Already reclaimed (or never existed): nothing to do.
             Err(StorageError::NotFound) => return Ok(()),
@@ -261,9 +266,12 @@ impl Gc {
         }
 
         match log.status {
-            TxCommitStatus::Ok => self.reclaim_committed(tid, log).await,
-            TxCommitStatus::Aborted => self.reclaim_aborted(tid, &log.locks).await,
-            TxCommitStatus::Pending => self.reclaim_dead_pending(tid, log, &observed).await,
+            TxCommitStatus::Ok => self.reclaim_committed(tid, log, candidate_check).await,
+            TxCommitStatus::Aborted => self.reclaim_aborted(tid, &log.locks, candidate_check).await,
+            TxCommitStatus::Pending => {
+                self.reclaim_dead_pending(tid, log, &observed, candidate_check)
+                    .await
+            }
             TxCommitStatus::Unknown => Ok(()),
         }
     }
@@ -273,11 +281,16 @@ impl Gc {
     /// `current_writer`, or any recorded lock still held (the commit→write-back
     /// gap), keeps it. A committed object is never pruned or force-aborted — its
     /// locks become `current_writer` through write-back, never through GC.
-    async fn reclaim_committed(&self, tid: &TxId, log: &TxLog) -> Result<(), TransError> {
-        if self.still_referenced(tid, log).await? {
+    async fn reclaim_committed(
+        &self,
+        tid: &TxId,
+        log: &TxLog,
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
+        if self.still_referenced(tid, log, requirement).await? {
             return Ok(());
         }
-        self.release_locks(tid, &log.locks).await?;
+        self.release_locks(tid, &log.locks, requirement).await?;
         self.tl.delete(tid).await?;
         Ok(())
     }
@@ -287,8 +300,13 @@ impl Gc {
     /// could still act under its txid. Release its recorded locks (pruning any
     /// entry left vestigial) and delete it. A minimal abort with no recorded
     /// locks simply has nothing to release.
-    async fn reclaim_aborted(&self, tid: &TxId, locks: &[PathLock]) -> Result<(), TransError> {
-        self.release_locks(tid, locks).await?;
+    async fn reclaim_aborted(
+        &self,
+        tid: &TxId,
+        locks: &[PathLock],
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
+        self.release_locks(tid, locks, requirement).await?;
         self.tl.delete(tid).await?;
         Ok(())
     }
@@ -305,9 +323,10 @@ impl Gc {
         tid: &TxId,
         log: &TxLog,
         observation: &glassdb_storage::Observation<TxLog>,
+        requirement: Requirement,
     ) -> Result<(), TransError> {
         match self.mon.force_abort(tid, observation).await? {
-            TxCommitStatus::Aborted => self.release_locks(tid, &log.locks).await,
+            TxCommitStatus::Aborted => self.release_locks(tid, &log.locks, requirement).await,
             // Committed or refreshed first: it was alive. Leave it.
             _ => Ok(()),
         }
@@ -324,7 +343,12 @@ impl Gc {
     /// leaf, so a per-key load would re-read the same leaf several times per
     /// candidate. Each key carries the [`CheckKind`] that says which field to
     /// inspect.
-    async fn still_referenced(&self, tid: &TxId, log: &TxLog) -> Result<bool, TransError> {
+    async fn still_referenced(
+        &self,
+        tid: &TxId,
+        log: &TxLog,
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
         let mut items: Vec<(&str, CheckKind)> = log
             .writes
             .iter()
@@ -339,11 +363,7 @@ impl Gc {
             }
         }
 
-        for group in self
-            .dir
-            .group_keys_by_leaf(items, Requirement::AtLeast(self.timeline.now()))
-            .await?
-        {
+        for group in self.dir.group_keys_by_leaf(items, requirement).await? {
             let Some(leaf) = group.node().and_then(|node| node.as_leaf()) else {
                 continue;
             };
@@ -371,7 +391,12 @@ impl Gc {
     /// per object that clears `tid` and drops any entry it thereby leaves
     /// vestigial — so GC issues no leaf CAS of its own. `current_writer` is
     /// never touched.
-    async fn release_locks(&self, tid: &TxId, locks: &[PathLock]) -> Result<(), TransError> {
+    async fn release_locks(
+        &self,
+        tid: &TxId,
+        locks: &[PathLock],
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
         let mut key_locks: Vec<(&str, ())> = Vec::new();
         let mut leaf_paths = BTreeSet::new();
         for l in locks {
@@ -386,11 +411,7 @@ impl Gc {
                 leaf_paths.insert(l.path.clone());
             }
         }
-        for group in self
-            .dir
-            .group_keys_by_leaf(key_locks, Requirement::AtLeast(self.timeline.now()))
-            .await?
-        {
+        for group in self.dir.group_keys_by_leaf(key_locks, requirement).await? {
             leaf_paths.insert(group.path);
         }
         for path in leaf_paths {
@@ -451,32 +472,26 @@ mod tests {
     fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
-        let tl = TLogger::new(objects.clone(), "db", timeline.clone());
-        let shards = ShardStore::new(objects, timeline.clone());
+        let tl = TLogger::new(objects.clone(), "db");
+        let shards = ShardStore::new(objects);
         let bg = Arc::new(Background::new());
         let clock = Clock::anchored_at(base());
         let mon = Monitor::with_config(
             tl.clone(),
+            timeline.clone(),
             Arc::downgrade(&bg),
             clock.clone(),
             RetryConfig::default(),
         );
-        let resolver = Resolver::new(shards.clone(), timeline.clone(), mon.clone());
+        let resolver = Resolver::new(shards.clone(), mon.clone());
         let coord = ShardCoordinator::new(
             shards.clone(),
-            timeline.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
         );
         let dir = Directory::new(shards.clone());
-        let locker = Locker::new(
-            coord.clone(),
-            dir,
-            timeline.clone(),
-            mon.clone(),
-            RetryConfig::default(),
-        );
+        let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
         let gc = Gc::new(
             Arc::downgrade(&bg),
             tl.clone(),
@@ -592,7 +607,10 @@ mod tests {
     }
 
     async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
-        matches!(tl.get(id).await, Err(StorageError::NotFound))
+        matches!(
+            tl.get_at(id, Requirement::Any).await,
+            Err(StorageError::NotFound)
+        )
     }
 
     fn test_scan(shards: Vec<usize>, cursor: Option<backend::ListCursor>) -> TxScan {
@@ -643,7 +661,7 @@ mod tests {
 
         run_once(&ctx.gc).await;
 
-        let log = ctx.tl.get(&t).await.unwrap();
+        let log = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
         let log = log.value().unwrap();
         assert_eq!(log.status, TxCommitStatus::Ok);
     }
@@ -663,7 +681,7 @@ mod tests {
 
         run_once(&ctx.gc).await;
 
-        let got = ctx.tl.get(&t).await.unwrap();
+        let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Pending);
         // Its lock is untouched.
@@ -689,7 +707,7 @@ mod tests {
         run_once(&ctx.gc).await;
 
         // Death is durable...
-        let got = ctx.tl.get(&t).await.unwrap();
+        let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Aborted);
         // ...its lock is released (the now-vestigial entry pruned)...
@@ -843,7 +861,10 @@ mod tests {
         let gc = ctx.gc.clone();
         let dead2 = dead.clone();
         let dead_locks = vec![write_lock(&ka)];
-        let release = tokio::spawn(async move { gc.release_locks(&dead2, &dead_locks).await });
+        let release = tokio::spawn(async move {
+            gc.release_locks(&dead2, &dead_locks, Requirement::Any)
+                .await
+        });
         let locker = ctx.locker.clone();
         let data = crate::algo::Data {
             reads: Vec::new(),

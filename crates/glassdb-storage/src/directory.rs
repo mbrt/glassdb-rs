@@ -585,10 +585,7 @@ mod tests {
 
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = ShardStore::new(
-            CachedStore::new(backend, 1 << 20, timeline.clone()),
-            timeline.clone(),
-        );
+        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone()));
         TestStore { shards, timeline }
     }
 
@@ -841,7 +838,10 @@ mod tests {
         s_b.store_node(COLL, "R", &leaf(&[b"b"], None, None), None)
             .await
             .unwrap();
-        let (mut root2, ver) = s_b.load_root(COLL).await.unwrap();
+        let (mut root2, ver) = s_b
+            .load_root(COLL, Requirement::AtLeast(s_b.timeline.now()))
+            .await
+            .unwrap();
         root2.set_node(Node::index(IndexNode::from_children([
             (b"".to_vec(), "L".to_string()),
             (b"b".to_vec(), "R".to_string()),

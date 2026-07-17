@@ -20,14 +20,13 @@ use crate::node::{Node, NodeLocks};
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
-use crate::timeline::{LogicalTime, Timeline};
+use crate::timeline::LogicalTime;
 
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 
 /// Reads and compare-and-swaps B-link node and collection-root objects.
 #[derive(Clone)]
 pub struct ShardStore {
-    timeline: Timeline,
     roots: crate::cached_store::TypedCachedStore<CollectionRoot>,
     nodes: crate::cached_store::TypedCachedStore<Node>,
     structural_logs: crate::cached_store::TypedCachedStore<StructuralLog>,
@@ -100,6 +99,14 @@ impl LeafObservation {
             (LeafObservation::Root(left), LeafObservation::Root(right)) => left.same_state(right),
             (LeafObservation::Node(left), LeafObservation::Node(right)) => left.same_state(right),
             _ => false,
+        }
+    }
+
+    /// The watermark after which this exact leaf state was known to be current.
+    pub fn current_after(&self) -> LogicalTime {
+        match self {
+            LeafObservation::Root(observed) => observed.current_after(),
+            LeafObservation::Node(observed) => observed.current_after(),
         }
     }
 }
@@ -219,11 +226,9 @@ impl Codec for StructuralLog {
 }
 
 impl ShardStore {
-    /// Creates a shard store that reads and compare-and-swaps through `objects`,
-    /// using `timeline` for its freshness requirements.
-    pub fn new(objects: CachedStore, timeline: Timeline) -> Self {
+    /// Creates a shard store that reads and compare-and-swaps through `objects`.
+    pub fn new(objects: CachedStore) -> Self {
         ShardStore {
-            timeline,
             roots: objects.typed(),
             nodes: objects.typed(),
             structural_logs: objects.typed(),
@@ -372,6 +377,7 @@ impl ShardStore {
     pub async fn list_structural_logs(
         &self,
         db_root: &str,
+        requirement: Requirement,
     ) -> Result<Vec<(String, StructuralLog)>, StorageError> {
         let prefix = paths::structural_log_dir(db_root);
         let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
@@ -385,10 +391,7 @@ impl ShardStore {
             for path in page.objects {
                 let record_id = paths::structural_log_id_of(&path)
                     .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
-                let observed = self
-                    .structural_logs
-                    .read(&path, Requirement::AtLeast(self.timeline.now()))
-                    .await?;
+                let observed = self.structural_logs.read(&path, requirement).await?;
                 if let Some(record) = observed.value() {
                     records.push((record_id, record.as_ref().clone()));
                 }
@@ -533,13 +536,11 @@ impl ShardStore {
     pub async fn load_root(
         &self,
         prefix: &str,
+        requirement: Requirement,
     ) -> Result<(CollectionRoot, LeafObservation), StorageError> {
         let observed = self
             .roots
-            .read(
-                &paths::collection_info(prefix),
-                Requirement::AtLeast(self.timeline.now()),
-            )
+            .read(&paths::collection_info(prefix), requirement)
             .await?;
         let root = observed
             .value()
@@ -598,6 +599,7 @@ impl ShardStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Timeline;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -605,12 +607,23 @@ mod tests {
 
     const COLL: &str = "coll";
 
-    fn store_over(backend: Arc<dyn Backend>) -> ShardStore {
+    struct TestStore {
+        shards: ShardStore,
+        timeline: Timeline,
+    }
+
+    impl std::ops::Deref for TestStore {
+        type Target = ShardStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.shards
+        }
+    }
+
+    fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        ShardStore::new(
-            CachedStore::new(backend, 1 << 20, timeline.clone()),
-            timeline,
-        )
+        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone()));
+        TestStore { shards, timeline }
     }
 
     fn count(log: &OpLog, op: &str) -> usize {
@@ -772,7 +785,10 @@ mod tests {
                 .unwrap();
         }
 
-        let records = store.list_structural_logs("db").await.unwrap();
+        let records = store
+            .list_structural_logs("db", Requirement::AtLeast(store.timeline.now()))
+            .await
+            .unwrap();
         assert_eq!(records.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
     }
 }

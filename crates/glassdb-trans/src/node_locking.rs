@@ -92,7 +92,7 @@ pub(crate) async fn resolve_entry_locks_at(
     })
 }
 
-/// Resolves entry lock state using current Monitor evidence.
+/// Resolves entry lock state using the coordination round's evidence bound.
 pub(crate) async fn resolve_entry_locks(
     ctx: &ResolveCtx<'_>,
     key_path: &str,
@@ -105,7 +105,7 @@ pub(crate) async fn resolve_entry_locks(
         key_path,
         entry,
         own_lock_holder,
-        Requirement::AtLeast(ctx.timeline.now()),
+        ctx.requirement,
     )
     .await
 }

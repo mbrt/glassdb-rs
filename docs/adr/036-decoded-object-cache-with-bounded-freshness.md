@@ -72,14 +72,14 @@ database may continue to use `Backend` directly.
 Each cache entry is one of:
 
 ```text
-Present(decoded value, revision, validated-after)
-Absent(validated-after)
+Present(decoded value, revision, current-after)
+Absent(current-after)
 Missing
 ```
 
 The current cache entry and evidence retained by an existing reader have
 different lifetimes. A successful read returns an `Observation` of an exact
-state and references its monotonic validation evidence. Validating that exact
+state and references its monotonic currentness evidence. Checking that exact
 state may advance the evidence shared by its observations. An observation may
 remain useful after that state is evicted or invalidated as the current cache
 entry: invalidation changes what a new read may use, but does not revoke the
@@ -89,12 +89,12 @@ historical fact that the observed state was current after its watermark.
 retain, compare, pass, and where recovery requires it serialize a revision, but
 do not interpret or manufacture one.
 
-`ValidationTime` is monotonic, opaque, and meaningful only within one open
+`LogicalTime` is monotonic, opaque, and meaningful only within one open
 `Database`. Reads accept one of two requirements:
 
 - `Any` accepts any usable cached entry without backend validation and reads the
   backend on a miss.
-- `AtLeast(T)` accepts an entry only when `validated-after >= T`; otherwise it
+- `AtLeast(T)` accepts an entry only when `current-after >= T`; otherwise it
   validates through the backend.
 
 These requirements apply to reads of the current state. A new read never
@@ -115,7 +115,7 @@ obsolete values discoverable through `Any`.
 Each backend call has a local uncertainty interval from invocation to response.
 The store records `started-at` immediately before invoking the backend. A
 successful read or mutation linearized at some point after `started-at`, so that
-is the result's `validated-after` watermark. An operation that started before
+is the result's `current-after` watermark. An operation that started before
 `T` cannot satisfy `AtLeast(T)`, even if it completes after `T`.
 
 The response time has a different role: after a successful mutation, the store
@@ -152,7 +152,7 @@ transaction states or other dependency semantics.
 Transaction execution may use `Any`: a stale execution is safe because the body
 is retryable and commit validates what it observed.
 
-Unlocked validation captures a `ValidationTime` after the transaction body and
+Unlocked validation captures a `LogicalTime` after the transaction body and
 requires `AtLeast(validation_start)` for every retained physical observation.
 The same bound is propagated when node interpretation requires a pending
 transaction's status. If another operation has already advanced that
@@ -176,6 +176,41 @@ did not write after the cached leaf was last validated. Removing that floor
 would require a stronger primitive such as a freshness lease, exclusive-client
 mode, or change stream.
 
+### Watermark ownership and propagation
+
+Sampling the timeline is a policy decision, not a storage convenience. A
+component creates a new lower bound only when the operation has no earlier
+barrier or successful CAS from which to inherit one:
+
+- the cache advances the timeline immediately before backend calls to stamp
+  evidence, while an explicit bounded-staleness read derives its bound from the
+  requested duration;
+- the transaction algorithm samples once after execution and before validation
+  or lock acquisition, then propagates that bound through every physical and
+  transaction-status dependency;
+- the transaction monitor samples when it actively polls a remote transaction,
+  because polling is itself the observation whose progress must be current;
+- garbage collection samples once per candidate before proving it unreferenced,
+  and structural recovery or separator publication samples once per maintenance
+  operation before making a decision from independently routed objects; and
+- a non-transactional metadata read samples once when its API promises a current
+  snapshot and has no later validation step.
+
+Typed storage, transaction-log persistence, writer resolution, shard
+coordination, and locking do not own time. They accept a caller-supplied
+`Requirement`. Transaction execution reads and scans may use `Any` because their
+retained observations are checked after the transaction's validation barrier.
+Idempotent CAS loops may also seed from `Any`: stale state can only lose its
+precondition and reload the winner.
+
+A successful CAS advances the retained precondition observation to the CAS
+start watermark. That receipt is propagated to later phases: lock acquisition
+uses it as physical read-validation evidence, and write-back uses it instead of
+sampling time or revalidating the just-installed leaf. Structural code likewise
+uses a successful lock or mutation receipt for post-CAS reloads and related
+tree walks. A receipt must not be replaced with a later `now()`: the later time
+would claim freshness the CAS did not establish.
+
 ### Mutation outcomes update knowledge conservatively
 
 Every successful write or CAS installs the submitted decoded value with its new
@@ -190,7 +225,7 @@ cached absence is obsolete. The cache invalidates that exact starting entry only
 if it is still current locally; it must not discard a different value or a later
 validation installed concurrently. Conflict does not automatically fetch the
 winner. A caller that needs it follows with an explicit `Any` or `AtLeast`
-read. The conflict does not revoke or advance validation evidence previously
+read. The conflict does not revoke or advance currentness evidence previously
 issued for the starting observation.
 
 An in-doubt mutation likewise invalidates its exact starting knowledge but
@@ -222,7 +257,7 @@ entries; opaque revisions; validation watermarks; and read, create, CAS, delete,
 conflict, and in-doubt outcomes. Model-based tests vary invocation, backend
 linearization, and response order independently and assert that:
 
-- `ValidationTime` and installed watermarks never regress;
+- `LogicalTime` and installed watermarks never regress;
 - a result is stamped with its operation start even when the clock advances
   before completion, and a mutation is not published before backend success;
 - `AtLeast(T)` never uses an operation started before `T`;
@@ -272,7 +307,7 @@ requires no extra validation read for the object it covers.
   automatic read, while exact conditional invalidation prevents response races
   from regressing the cache.
 - Invalidation may remove a state from the current cache without wasting the
-  validation evidence held by transactions that already observed it. This
+  currentness evidence held by transactions that already observed it. This
   recovers the older-bound reuse opportunity without exposing obsolete values
   to new reads or retaining general history.
 - Negative caching avoids repeated reads for missing objects, but refreshing

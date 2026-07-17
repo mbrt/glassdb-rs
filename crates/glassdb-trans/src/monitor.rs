@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    LogicalTime, Observation, PathLock, Requirement, StorageError, TLogger, TValue, TxCommitStatus,
-    TxLog, TxStatus,
+    LogicalTime, Observation, PathLock, Requirement, StorageError, TLogger, TValue, Timeline,
+    TxCommitStatus, TxLog, TxStatus,
 };
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
@@ -127,6 +127,7 @@ struct State {
 
 struct Inner {
     tl: TLogger,
+    timeline: Timeline,
     final_status: Mutex<FinalStatusCache>,
     // Weak so a `Monitor` clone captured inside a spawned task does not keep
     // the [`Background`] alive across DB shutdown. The single strong owner
@@ -158,8 +159,14 @@ pub(crate) struct KeyCommitStatus {
 
 impl Monitor {
     /// Creates a monitor using the real wall-clock and default retry timing.
-    pub fn new(tl: TLogger, background: Weak<Background>) -> Self {
-        Self::with_config(tl, background, Clock::real(), RetryConfig::default())
+    pub fn new(tl: TLogger, timeline: Timeline, background: Weak<Background>) -> Self {
+        Self::with_config(
+            tl,
+            timeline,
+            background,
+            Clock::real(),
+            RetryConfig::default(),
+        )
     }
 
     /// Creates a monitor with a custom clock (used in tests for deterministic
@@ -168,6 +175,7 @@ impl Monitor {
     /// and when writing a transaction's final log.
     pub fn with_config(
         tl: TLogger,
+        timeline: Timeline,
         background: Weak<Background>,
         clock: Clock,
         retry: RetryConfig,
@@ -175,6 +183,7 @@ impl Monitor {
         Monitor {
             inner: Arc::new(Inner {
                 tl,
+                timeline,
                 final_status: Mutex::new(FinalStatusCache::new(FINAL_STATUS_CACHE_SIZE)),
                 background,
                 clock,
@@ -298,9 +307,15 @@ impl Monitor {
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
     pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
-        let cs = self.inner.tl.commit_status(tid).await.map_err(|e| {
-            TransError::Storage(e.context(format!("reading status of wound target {tid}")))
-        })?;
+        // TODO: this smells of TOCTOU
+        let cs = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await
+            .map_err(|e| {
+                TransError::Storage(e.context(format!("reading status of wound target {tid}")))
+            })?;
         if cs.status.is_final() {
             // Already committed or aborted: nothing left to wound.
             self.mark_local_aborted(tid, cs.status);
@@ -443,7 +458,11 @@ impl Monitor {
                     //     found `aborted`): a wound landed first -> surface as
                     //     `AlreadyFinalized` so the commit path treats it as a
                     //     wound.
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
                     if st.status == tlog.status {
                         self.remember_final(tid, &st.observation);
                         return Ok(());
@@ -499,7 +518,11 @@ impl Monitor {
                     // The version moved under us (a commit, a pending-log
                     // refresh, or another wounder). Report whatever status is
                     // now durable.
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
                     self.remember_final(tid, &st.observation);
                     return Ok(st.status);
                 }
@@ -514,7 +537,11 @@ impl Monitor {
                 // peer's, or a commit that won the race); a still-pending
                 // status means retry the CAS over the refreshed version.
                 Err(StorageError::Unavailable(_)) => {
-                    let st = self.inner.tl.commit_status(tid).await?;
+                    let st = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
                     if st.status.is_final() {
                         self.remember_final(tid, &st.observation);
                         return Ok(st.status);
@@ -604,16 +631,21 @@ impl Monitor {
                 };
                 self.inner.tl.get_at(tid, requirement).await
             }
-            None => self.inner.tl.get(tid).await,
+            None => self.inner.tl.get_at(tid, self.current_requirement()).await,
         }
         .map_err(|error| TransError::Storage(error.context(format!("getting TID {tid}"))))?;
         if observed
             .value()
             .is_some_and(|log| log.status != expected_status)
         {
-            observed = self.inner.tl.get(tid).await.map_err(|error| {
-                TransError::Storage(error.context(format!("refreshing TID {tid}")))
-            })?;
+            observed = self
+                .inner
+                .tl
+                .get_at(tid, self.current_requirement())
+                .await
+                .map_err(|error| {
+                    TransError::Storage(error.context(format!("refreshing TID {tid}")))
+                })?;
         }
         if !observed
             .value()
@@ -624,6 +656,14 @@ impl Monitor {
             )));
         }
         Ok(observed)
+    }
+
+    /// Starts a transaction-log poll after all status evidence already seen by
+    /// this monitor. Unlike transaction validation, a remote-holder poll has no
+    /// preceding CAS or validation barrier to reuse, so the monitor must create
+    /// the lower bound itself.
+    fn current_requirement(&self) -> Requirement {
+        Requirement::AtLeast(self.inner.timeline.now())
     }
 
     fn cached_final_status(&self, tid: &TxId) -> Option<TxCommitStatus> {
@@ -716,7 +756,11 @@ impl Monitor {
     }
 
     async fn fetch_remote_tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let status = self.inner.tl.commit_status(tid).await?;
+        let status = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
         self.resolve_remote_tx_status(tid, status).await
     }
 
@@ -809,7 +853,11 @@ impl Monitor {
         // own clock, so this owes no `MAX_CLOCK_SKEW` (ADR-024 refines ADR-021,
         // which over-granted this window by reusing the skew-padded check).
         if is_expired_no_skew(first_check, now) {
-            let status = self.inner.tl.commit_status(tid).await?;
+            let status = self
+                .inner
+                .tl
+                .commit_status_at(tid, self.current_requirement())
+                .await?;
             let res = self.force_abort(tid, &status.observation).await;
             if res.is_ok() {
                 self.shard_for(tid).lock().unwrap().unknown_tx.remove(tid);
@@ -944,7 +992,12 @@ impl Monitor {
                 // we lost) — stop and let the owner observe it; a still-pending
                 // status means we adopt its version and keep refreshing.
                 Err(StorageError::Precondition) => {
-                    match self.inner.tl.commit_status(&tid).await {
+                    match self
+                        .inner
+                        .tl
+                        .commit_status_at(&tid, self.current_requirement())
+                        .await
+                    {
                         Ok(st) if st.status.is_final() => {
                             self.mark_local_aborted(&tid, st.status);
                             return;
@@ -998,10 +1051,11 @@ mod tests {
     fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b, 1024, timeline.clone());
-        let tl = TLogger::new(objects.clone(), "test", timeline);
+        let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl.clone(),
+            timeline,
             Arc::downgrade(&bg),
             clock.clone(),
             RetryConfig::default(),
@@ -1138,7 +1192,7 @@ mod tests {
         // Advance well past the pending timeout. Refresh keeps it alive.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let st = t.tl.commit_status(&tx).await.unwrap();
+        let st = t.tl.commit_status_at(&tx, Requirement::Any).await.unwrap();
         assert_eq!(st.status, TxCommitStatus::Pending);
 
         // A separate monitor should still see it as pending (not expired).
@@ -1170,7 +1224,7 @@ mod tests {
         // pending object.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let tl = t.tl.get(&tx).await.unwrap();
+        let tl = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
         let tl = tl.value().unwrap();
         assert_eq!(tl.status, TxCommitStatus::Pending);
         assert_eq!(tl.locks, locks);

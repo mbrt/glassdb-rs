@@ -20,11 +20,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
 
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore, StorageError, Timeline,
+    Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore, StorageError,
     TxCommitStatus,
 };
 
@@ -68,19 +67,16 @@ impl Default for WriterResolution {
 pub struct Resolver {
     dir: Directory,
     tmon: Monitor,
-    timeline: Timeline,
 }
 
 impl Resolver {
-    /// Creates a resolver over the shard coordination store and monitor, using
-    /// `timeline` for freshness requirements. Key routing descends the
-    /// collection's B-link directory through the shared decoded object store,
-    /// so unchanged nodes need no body transfer.
-    pub fn new(shards: ShardStore, timeline: Timeline, tmon: Monitor) -> Self {
+    /// Creates a resolver over the shard coordination store and monitor. Key
+    /// routing descends the collection's B-link directory through the shared
+    /// decoded object store, so unchanged nodes need no body transfer.
+    pub fn new(shards: ShardStore, tmon: Monitor) -> Self {
         Resolver {
             dir: Directory::new(shards),
             tmon,
-            timeline,
         }
     }
 
@@ -111,20 +107,18 @@ impl Resolver {
         own_lock_holder: Option<&TxId>,
         cap: Option<&[u8]>,
     ) -> Result<ScanResult, StorageError> {
+        // A transaction scan retains every covered leaf and validates those
+        // observations after its validation barrier. Requiring "now" here
+        // would only duplicate work; stale execution is safe and retryable.
         self.scan_keys_at(
             prefix,
             range,
             overlay,
             own_lock_holder,
             cap,
-            Requirement::AtLeast(self.timeline.now()),
+            Requirement::Any,
         )
         .await
-    }
-
-    /// Builds a freshness requirement against the resolver's timeline.
-    pub(crate) fn requirement_within(&self, max_staleness: Duration) -> Requirement {
-        Requirement::within(&self.timeline, max_staleness)
     }
 
     /// Returns the committed value a resolved writer recorded for `key`.
@@ -318,20 +312,8 @@ impl Resolver {
         })
     }
 
-    /// Returns the effective committed writer of every `key`. Keys are routed
-    /// to their owning leaves by descent so each touched leaf is loaded once,
-    /// then every key in it is resolved against the one loaded copy.
-    #[cfg(test)]
-    pub(crate) async fn effective_writers(
-        &self,
-        keys: &[Arc<str>],
-    ) -> Result<HashMap<Arc<str>, Option<TxId>>, StorageError> {
-        self.effective_writers_at(keys, Requirement::AtLeast(self.timeline.now()))
-            .await
-    }
-
     /// Resolves effective writers against one shared freshness requirement.
-    pub(crate) async fn effective_writers_at(
+    pub(crate) async fn effective_writers(
         &self,
         keys: &[Arc<str>],
         requirement: Requirement,
@@ -499,14 +481,14 @@ mod tests {
     // paired with the monitor backing it (a clone, sharing its caches) so a test
     // can commit holder values the resolver then help-forwards. The returned
     // `Background` must be kept alive for the monitor's lifetime.
-    fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Monitor, Arc<Background>) {
+    fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
-        let tl = TLogger::new(objects.clone(), COLL, timeline.clone());
+        let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(objects, timeline.clone());
-        (Resolver::new(shards, timeline, mon.clone()), mon, bg)
+        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let shards = ShardStore::new(objects);
+        (Resolver::new(shards, mon.clone()), mon, timeline, bg)
     }
 
     struct TestStore {
@@ -524,16 +506,13 @@ mod tests {
 
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = ShardStore::new(
-            CachedStore::new(backend, 1 << 20, timeline.clone()),
-            timeline.clone(),
-        );
+        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone()));
         TestStore { shards, timeline }
     }
 
     async fn effective_writer(resolver: &Resolver, key: &str) -> Option<TxId> {
         resolver
-            .resolve_key(key, Requirement::AtLeast(resolver.timeline.now()))
+            .resolve_key(key, Requirement::Any)
             .await
             .unwrap()
             .0
@@ -666,13 +645,13 @@ mod tests {
         seed_writer(&seed_store, &b, &tomb, true).await;
         // `c` is deliberately left absent.
 
-        let (resolver, _mon, _bg) = resolver_over(backend.clone());
+        let (resolver, _mon, _timeline, _bg) = resolver_over(backend.clone());
 
         let pa: Arc<str> = paths::from_key(COLL, &a).into();
         let pb: Arc<str> = paths::from_key(COLL, &b).into();
         let pc: Arc<str> = paths::from_key(COLL, &c).into();
         let out = resolver
-            .effective_writers(&[pa.clone(), pb.clone(), pc.clone()])
+            .effective_writers(&[pa.clone(), pb.clone(), pc.clone()], Requirement::Any)
             .await
             .unwrap();
 
@@ -706,12 +685,12 @@ mod tests {
         let writer = TxId::with_priority(1, b"w");
         seed_writer(&seed_store, key, &writer, false).await;
 
-        let (resolver, _mon, _bg) = resolver_over(backend.clone());
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone());
         let key_path = paths::from_key(COLL, key);
 
         // Warm the resolver's own cache with one cold load.
         resolver
-            .resolve_key(&key_path, Requirement::AtLeast(resolver.timeline.now()))
+            .resolve_key(&key_path, Requirement::Any)
             .await
             .unwrap();
         log.lock().unwrap().clear();
@@ -731,7 +710,7 @@ mod tests {
         // A current bound revalidates the cached shard with one conditional read.
         log.lock().unwrap().clear();
         resolver
-            .resolve_key(&key_path, Requirement::AtLeast(resolver.timeline.now()))
+            .resolve_key(&key_path, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -752,7 +731,7 @@ mod tests {
         seed_writer(&seed_store, b"live-key", &live, false).await;
         seed_writer(&seed_store, b"dead-key", &dead, true).await;
 
-        let (resolver, _mon, _bg) = resolver_over(backend);
+        let (resolver, _mon, _timeline, _bg) = resolver_over(backend);
         assert_eq!(
             effective_writer(&resolver, &paths::from_key(COLL, b"live-key")).await,
             Some(live)
@@ -774,7 +753,7 @@ mod tests {
     async fn effective_writer_help_forwards_committed_holder() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed_store = store_over(backend.clone());
-        let (resolver, mon, _bg) = resolver_over(backend);
+        let (resolver, mon, _timeline, _bg) = resolver_over(backend);
 
         let live = TxId::with_priority(1, b"live");
         commit_value(&mon, b"live-key", &live, false).await;

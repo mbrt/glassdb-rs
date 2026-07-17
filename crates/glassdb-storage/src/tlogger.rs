@@ -12,7 +12,6 @@ use glassdb_data::{TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
-use crate::Timeline;
 use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
 use crate::lock::LockType;
@@ -120,7 +119,6 @@ impl std::fmt::Display for LockScope {
 #[derive(Clone)]
 pub struct TLogger {
     prefix: String,
-    timeline: Timeline,
     logs: crate::cached_store::TypedCachedStore<TxLog>,
 }
 
@@ -164,20 +162,11 @@ impl Codec for TxLog {
 
 impl TLogger {
     /// Creates a logger storing logs under `prefix`.
-    pub fn new(objects: CachedStore, prefix: impl Into<String>, timeline: Timeline) -> Self {
+    pub fn new(objects: CachedStore, prefix: impl Into<String>) -> Self {
         TLogger {
             prefix: prefix.into(),
-            timeline,
             logs: objects.typed(),
         }
-    }
-
-    /// Returns the commit status of transaction `id`, using the cache when
-    /// possible. The status and timestamp are read from the transaction object
-    /// body (ADR-019); an absent object means the transaction is unknown.
-    pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
-        self.commit_status_at(id, Requirement::AtLeast(self.timeline.now()))
-            .await
     }
 
     /// Returns transaction status with an explicit generic requirement bound.
@@ -200,19 +189,6 @@ impl TLogger {
             last_update,
             observation,
         })
-    }
-
-    /// Reads and parses the full transaction log for `id`, together with its
-    /// backend version. The version is the CAS token GC needs to force-abort a
-    /// dead pending object and to prune its locks (ADR-022); callers that only
-    /// need the log body ignore it.
-    ///
-    /// A cached finalized object is authoritative because transaction objects
-    /// cannot change after commit or abort. Pending objects still honor the
-    /// requested generic requirement bound.
-    pub async fn get(&self, id: &TxId) -> Result<Observation<TxLog>, StorageError> {
-        self.get_at(id, Requirement::AtLeast(self.timeline.now()))
-            .await
     }
 
     /// Reads the full transaction object with an explicit requirement bound.
@@ -541,6 +517,7 @@ fn proto_ts_to_system(ts: prost_types::Timestamp) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Timeline;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::RecordingBackend;
 
@@ -548,7 +525,7 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
-        TLogger::new(objects, "db", timeline)
+        TLogger::new(objects, "db")
     }
 
     #[tokio::test]
@@ -581,7 +558,7 @@ mod tests {
         };
         t.set(&log).await.unwrap();
 
-        let got = t.get(&id).await.unwrap();
+        let got = t.get_at(&id, Requirement::Any).await.unwrap();
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
@@ -597,14 +574,17 @@ mod tests {
             scope: LockScope::Entry,
         }));
 
-        let status = t.commit_status(&id).await.unwrap();
+        let status = t.commit_status_at(&id, Requirement::Any).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
     }
 
     #[tokio::test]
     async fn commit_status_unknown_when_absent() {
         let t = new_tlogger();
-        let status = t.commit_status(&TxId::from_bytes(vec![7])).await.unwrap();
+        let status = t
+            .commit_status_at(&TxId::from_bytes(vec![7]), Requirement::Any)
+            .await
+            .unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
     }
 
@@ -623,7 +603,7 @@ mod tests {
         }];
         let stored_v = t.set(&log).await.unwrap();
 
-        let got = t.get(&id).await.unwrap();
+        let got = t.get_at(&id, Requirement::Any).await.unwrap();
         let version = got.revision().cloned();
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
@@ -638,7 +618,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone());
-        let logger = TLogger::new(objects, "db", timeline);
+        let logger = TLogger::new(objects, "db");
         let id = TxId::from_bytes(vec![4, 3, 2, 1]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
@@ -646,8 +626,8 @@ mod tests {
             .unwrap();
         operations.lock().unwrap().clear();
 
-        logger.get(&id).await.unwrap();
-        logger.get(&id).await.unwrap();
+        logger.get_at(&id, Requirement::Any).await.unwrap();
+        logger.get_at(&id, Requirement::Any).await.unwrap();
 
         let conditional_reads = operations
             .lock()
@@ -664,7 +644,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone());
-        let logger = TLogger::new(objects, "db", timeline);
+        let logger = TLogger::new(objects, "db");
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))
@@ -672,8 +652,14 @@ mod tests {
             .unwrap();
         operations.lock().unwrap().clear();
 
-        logger.get(&id).await.unwrap();
-        logger.get(&id).await.unwrap();
+        logger
+            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .await
+            .unwrap();
+        logger
+            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .await
+            .unwrap();
 
         let conditional_reads = operations
             .lock()

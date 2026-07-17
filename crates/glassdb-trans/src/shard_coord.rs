@@ -36,7 +36,7 @@ use glassdb_concurr::{
 use glassdb_data::TxId;
 use glassdb_storage::{
     LeafKind, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
-    SplitPolicy, StorageError, Timeline,
+    SplitPolicy, StorageError,
 };
 
 use crate::error::TransError;
@@ -153,7 +153,7 @@ pub(crate) enum Step {
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) resolver: &'a Resolver,
     pub(crate) tmon: &'a Monitor,
-    pub(crate) timeline: &'a Timeline,
+    pub(crate) requirement: Requirement,
     pub(crate) cause: ReloadCause,
 }
 
@@ -279,7 +279,6 @@ struct CoordCore {
     tmon: Monitor,
     shards: ShardStore,
     resolver: Resolver,
-    timeline: Timeline,
     retry: RetryConfig,
     stats: Stats,
     // Where over-cap leaf writes are reported (ADR-031): the background
@@ -348,16 +347,19 @@ impl CasWorker {
                 rt::sleep(backoff.next_delay()).await;
                 self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
             }
-            let ctx = ResolveCtx {
-                resolver: &self.core.resolver,
-                tmon: &self.core.tmon,
-                timeline: &self.core.timeline,
-                cause,
-            };
             let requirement = if attempt == 0 {
                 first_requirement
             } else {
                 Requirement::Any
+            };
+            let ctx = ResolveCtx {
+                resolver: &self.core.resolver,
+                tmon: &self.core.tmon,
+                // Resolver dependencies belong to the logical round, not the
+                // cache seed used after a failed CAS. Preserve the submitters'
+                // bound even when the leaf reload itself may use `Any`.
+                requirement: first_requirement,
+                cause,
             };
             let loaded = match self.core.shards.load_leaf(path, requirement).await {
                 Ok(loaded) => loaded,
@@ -572,20 +574,13 @@ pub struct ShardCoordinator {
 }
 
 impl ShardCoordinator {
-    /// Creates a coordinator over the shared shard store, timeline, resolver,
-    /// and monitor. `retry` configures the exponential backoff applied between CAS
+    /// Creates a coordinator over the shared shard store, resolver, and monitor.
+    /// `retry` configures the exponential backoff applied between CAS
     /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
     /// between hold-and-wait re-polls of a conflicting holder.
-    pub fn new(
-        shards: ShardStore,
-        timeline: Timeline,
-        resolver: Resolver,
-        tmon: Monitor,
-        retry: RetryConfig,
-    ) -> Self {
+    pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
         Self::with_hinter(
             shards,
-            timeline,
             resolver,
             tmon,
             retry,
@@ -595,13 +590,11 @@ impl ShardCoordinator {
     }
 
     /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
-    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `timeline`
-    /// supplies validation barriers, while `policy`
+    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `policy`
     /// governs the coordinator's hard node-size limit; the hinting seam carries
     /// only leaf-write observations and never exposes splitter configuration.
     pub fn with_hinter(
         shards: ShardStore,
-        timeline: Timeline,
         resolver: Resolver,
         tmon: Monitor,
         retry: RetryConfig,
@@ -612,7 +605,6 @@ impl ShardCoordinator {
             tmon,
             shards,
             resolver,
-            timeline,
             retry,
             stats: Stats::default(),
             policy,
@@ -741,7 +733,9 @@ mod tests {
     // the shard store backing it (a clone sharing the cache, so a test can warm or
     // seed the cache the coordinator reads). The returned `Background` must be
     // kept alive for the monitor's lifetime.
-    fn coord_over(backend: Arc<dyn Backend>) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+    fn coord_over(
+        backend: Arc<dyn Backend>,
+    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
         coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints))
     }
 
@@ -749,7 +743,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
-    ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
         coord_over_retry(backend, policy, hinter, RetryConfig::default())
     }
 
@@ -757,7 +751,7 @@ mod tests {
     // does not pay the production retry delay.
     fn coord_over_fast(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
         coord_over_retry(
             backend,
             SplitPolicy::default(),
@@ -774,34 +768,24 @@ mod tests {
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
         retry: RetryConfig,
-    ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
+    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
-        let tl = TLogger::new(objects.clone(), COLL, timeline.clone());
+        let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(objects, timeline.clone());
-        let resolver = Resolver::new(shards.clone(), timeline.clone(), mon.clone());
-        let coord = ShardCoordinator::with_hinter(
-            shards.clone(),
-            timeline,
-            resolver,
-            mon,
-            retry,
-            policy,
-            hinter,
-        );
-        (coord, shards, bg)
+        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let shards = ShardStore::new(objects);
+        let resolver = Resolver::new(shards.clone(), mon.clone());
+        let coord =
+            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
+        (coord, shards, timeline, bg)
     }
 
     // A cold shard store over `backend` (its own empty cache), for asserting what
     // actually landed in storage without touching the coordinator's cache.
     fn cold_store(backend: Arc<dyn Backend>) -> ShardStore {
         let timeline = Timeline::new();
-        ShardStore::new(
-            CachedStore::new(backend, 1 << 20, timeline.clone()),
-            timeline,
-        )
+        ShardStore::new(CachedStore::new(backend, 1 << 20, timeline))
     }
 
     fn entry(
@@ -1044,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn shard_stage_is_cas_persisted() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _bg) = coord_over(backend.clone());
+        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone());
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
@@ -1056,7 +1040,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();
@@ -1082,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn reroutes_when_a_split_moved_the_key_out_of_the_leaf() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, store, _bg) = coord_over(backend.clone());
+        let (coord, store, _timeline, _bg) = coord_over(backend.clone());
 
         // Seed the leaf as a shrunk left half: it owns keys < "m" and links to a
         // right sibling. "z" now lives in that sibling, not here.
@@ -1106,7 +1090,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();
@@ -1136,7 +1120,7 @@ mod tests {
     #[tokio::test]
     async fn owned_key_folds_normally_despite_a_high_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, store, _bg) = coord_over(backend.clone());
+        let (coord, store, _timeline, _bg) = coord_over(backend.clone());
 
         let node = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
         assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
@@ -1151,7 +1135,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();
@@ -1178,16 +1162,11 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let (coord, _shards, _bg) = coord_over(backend);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend);
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(SkipRelease),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
-            )
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
             .await
             .unwrap();
         assert!(matches!(
@@ -1207,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn shard_prunes_vestigial_entries_on_cas() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, shards, _bg) = coord_over(backend.clone());
+        let (coord, shards, _timeline, _bg) = coord_over(backend.clone());
         let writer = TxId::with_priority(1, b"w");
         store_shard_entries(
             &shards,
@@ -1229,7 +1208,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();
@@ -1265,14 +1244,8 @@ mod tests {
             vec![entry(b"seed", LockType::None, None, Some(&writer))],
         )
         .await;
-        let (coord, shards, _bg) = coord_over(backend.clone());
-        shards
-            .load_leaf(
-                &leaf(),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
-            )
-            .await
-            .unwrap();
+        let (coord, shards, timeline, _bg) = coord_over(backend.clone());
+        shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
 
         let tx = TxId::with_priority(2, b"t");
         log.lock().unwrap().clear();
@@ -1292,7 +1265,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(SkipRelease),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::AtLeast(timeline.now()),
             )
             .await
             .unwrap();
@@ -1313,7 +1286,7 @@ mod tests {
         let (backend, gate) = Gate::wrap(mem);
         let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
-        let (coord, _shards, _bg) = coord_over(recorder as Arc<dyn Backend>);
+        let (coord, _shards, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>);
 
         let trace: FoldTrace = Arc::new(Mutex::new(Vec::new()));
         let old = TxId::with_priority(1, b"old");
@@ -1332,7 +1305,7 @@ mod tests {
                     tx: t1.clone(),
                     trace: tr1,
                 }),
-                Requirement::AtLeast(c1.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
         });
@@ -1348,7 +1321,7 @@ mod tests {
                     tx: t2.clone(),
                     trace: tr2,
                 }),
-                Requirement::AtLeast(c2.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
         });
@@ -1421,7 +1394,8 @@ mod tests {
             ..SplitPolicy::default()
         };
         let hints = Arc::new(HintCounter::default());
-        let (coord, shards, _bg) = coord_over_with(backend.clone(), policy, hints.clone());
+        let (coord, shards, _timeline, _bg) =
+            coord_over_with(backend.clone(), policy, hints.clone());
         store_shard_entries(&shards, &leaf(), vec![seed]).await;
         log.lock().unwrap().clear();
 
@@ -1436,7 +1410,7 @@ mod tests {
                     tx: t1.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(c1.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
         });
@@ -1452,7 +1426,7 @@ mod tests {
                     tx: t2.clone(),
                     admission: StageAdmission::AddsKey,
                 }),
-                Requirement::AtLeast(c2.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
         });
@@ -1494,17 +1468,12 @@ mod tests {
     #[tokio::test]
     async fn submit_after_close_is_cancelled() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _bg) = coord_over(backend);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend);
         coord.close().await;
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(SkipRelease),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
-            )
+            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
             .await
             .unwrap();
         assert!(
@@ -1618,7 +1587,7 @@ mod tests {
     async fn in_doubt_cas_stays_in_doubt_across_a_later_precondition_miss() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let backend: Arc<dyn Backend> = in_doubt_then_miss(mem);
-        let (coord, shards, _bg) = coord_over(backend);
+        let (coord, shards, _timeline, _bg) = coord_over(backend);
 
         // The leaf must exist so the round's CAS is a `write_if` (the faulted op),
         // not a create.
@@ -1642,7 +1611,7 @@ mod tests {
                     folds: std::sync::atomic::AtomicUsize::new(0),
                     seen_in_doubt: seen_in_doubt.clone(),
                 }),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();
@@ -1740,7 +1709,7 @@ mod tests {
     async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(mem);
-        let (coord, shards, _bg) = coord_over_fast(backend);
+        let (coord, shards, _timeline, _bg) = coord_over_fast(backend);
 
         let seed = TxId::with_priority(1, b"seed");
         store_shard_entries(
@@ -1759,7 +1728,7 @@ mod tests {
                     key: b"k".to_vec(),
                     tx: tx.clone(),
                 }),
-                Requirement::AtLeast(coord.inner.core.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();

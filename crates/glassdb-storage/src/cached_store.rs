@@ -112,6 +112,9 @@ impl Requirement {
         if max_staleness == Duration::MAX {
             Requirement::Any
         } else {
+            // An explicit bounded-staleness read has no transaction validation
+            // barrier or mutation receipt to inherit, so its policy must sample
+            // the database timeline here.
             Requirement::AtLeast(timeline.now().saturating_sub(max_staleness))
         }
     }

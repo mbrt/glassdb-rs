@@ -37,7 +37,6 @@ use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
     Directory, LeafObservation, LockScope, LockType, NodeLocks, PathLock, Requirement, ShardEntry,
-    Timeline,
 };
 
 use crate::algo::{Data, WriteOp};
@@ -107,7 +106,7 @@ struct ShardGroup {
 /// groups this transaction holds.
 pub(crate) struct LockedTx {
     groups: BTreeMap<String, ShardGroup>,
-    validations: Vec<LeafObservation>,
+    validations: BTreeMap<String, LeafObservation>,
 }
 
 impl LockedTx {
@@ -115,7 +114,7 @@ impl LockedTx {
     /// exact leaf state that was observed earlier.
     pub(crate) fn validated(&self, observed: &LeafObservation) -> bool {
         self.validations
-            .iter()
+            .values()
             .any(|validated| validated.same_state(observed))
     }
 
@@ -620,7 +619,7 @@ pub(crate) enum LockOutcome {
 
 /// Outcome of acquiring locks across all touched shards.
 enum ShardsOutcome {
-    Locked(Vec<LeafObservation>),
+    Locked(BTreeMap<String, LeafObservation>),
     Conflict,
     LeafFull,
 }
@@ -652,8 +651,6 @@ pub struct Locker {
     coord: ShardCoordinator,
     /// Routes a transaction's keys to their owning leaves by descent (ADR-031).
     dir: Directory,
-    /// Database-local logical time used to capture validation barriers.
-    timeline: Timeline,
     /// Used to park on a conflicting holder during hold-and-wait.
     tmon: Monitor,
     /// Backoff config for the hold-and-wait re-poll cadence.
@@ -675,17 +672,10 @@ impl Locker {
     /// configures the exponential backoff applied between hold-and-wait re-polls
     /// of a conflicting holder, so a wait is never busy-retried (its
     /// `max_interval` caps the re-poll cadence).
-    pub fn new(
-        coord: ShardCoordinator,
-        dir: Directory,
-        timeline: Timeline,
-        tmon: Monitor,
-        retry: RetryConfig,
-    ) -> Self {
+    pub fn new(coord: ShardCoordinator, dir: Directory, tmon: Monitor, retry: RetryConfig) -> Self {
         Locker {
             coord,
             dir,
-            timeline,
             tmon,
             retry,
             tlocks: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
@@ -783,7 +773,6 @@ impl Locker {
     /// first. The held set is read from the coordinator's per-tx bookkeeping.
     /// Idempotent and best-effort.
     pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
-        let requirement = Requirement::AtLeast(self.timeline.now());
         for path in self.held_paths(id) {
             let pr = paths::parse(&path).map_err(|e| {
                 TransError::with_source(format!("parsing held lock path {path:?}"), e)
@@ -793,7 +782,9 @@ impl Locker {
                 // (ADR-031); a standalone `_n` node is a leaf too. Both carry
                 // only key entries, so releasing the leaf clears every hold.
                 paths::Type::CollectionInfo | paths::Type::Node => {
-                    self.release_leaf_at(id, &path, requirement).await?
+                    // Release is an idempotent CAS loop: a stale seed can only
+                    // lose its precondition and reload the winner.
+                    self.release_leaf_at(id, &path, Requirement::Any).await?
                 }
                 // Only leaves carry transaction locks.
                 _ => {}
@@ -814,8 +805,15 @@ impl Locker {
     /// reference and are GC write-back hint candidates (ADR-022).
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
         let mut superseded = Vec::new();
-        let requirement = Requirement::AtLeast(self.timeline.now());
         for group in locked.groups.values() {
+            // The lock-install CAS is the write-back's freshness barrier. Its
+            // retained precondition evidence was advanced by that successful
+            // CAS, so no new clock sample or validation read is needed.
+            let requirement = locked
+                .validations
+                .get(&group.path)
+                .map(|observation| Requirement::AtLeast(observation.current_after()))
+                .unwrap_or(Requirement::Any);
             if let Ok(mut s) = self
                 .write_back_shard(
                     id,
@@ -846,6 +844,7 @@ impl Locker {
         leaf_path: &str,
         raw_key: &[u8],
         key_path: &str,
+        installed_from: Option<&LeafObservation>,
     ) -> Vec<TxId> {
         let intents = Arc::new(vec![KeyIntent {
             raw_key: raw_key.to_vec(),
@@ -856,7 +855,11 @@ impl Locker {
             id,
             leaf_path,
             intents,
-            Requirement::AtLeast(self.timeline.now()),
+            // The commit-install CAS certified this precondition immediately
+            // before installing our holder and advanced its watermark.
+            installed_from
+                .map(|observation| Requirement::AtLeast(observation.current_after()))
+                .unwrap_or(Requirement::Any),
         )
         .await
         .unwrap_or_default()
@@ -877,13 +880,15 @@ impl Locker {
             self.tmon.start_refresh_tx(id);
         }
 
-        let mut validations = Vec::with_capacity(groups.len());
+        let mut validations = BTreeMap::new();
         if serial {
             // Ascending leaf-path order is the global lock order: the BTreeMap
             // already iterates sorted by leaf path.
             for group in groups.values() {
                 match self.lock_shard(id, group, requirement).await? {
-                    ShardOutcome::Locked(validated) => validations.push(validated),
+                    ShardOutcome::Locked(validated) => {
+                        validations.insert(group.path.clone(), validated);
+                    }
                     ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
                     ShardOutcome::LeafFull => return Ok(ShardsOutcome::LeafFull),
                 }
@@ -895,9 +900,11 @@ impl Locker {
                     .map(|group| self.lock_shard(id, group, requirement)),
             )
             .await;
-            for outcome in outcomes {
+            for (group, outcome) in groups.values().zip(outcomes) {
                 match outcome? {
-                    ShardOutcome::Locked(validated) => validations.push(validated),
+                    ShardOutcome::Locked(validated) => {
+                        validations.insert(group.path.clone(), validated);
+                    }
                     ShardOutcome::Conflict => return Ok(ShardsOutcome::Conflict),
                     ShardOutcome::LeafFull => return Ok(ShardsOutcome::LeafFull),
                 }
@@ -979,8 +986,9 @@ impl Locker {
     /// dead transaction's leaf holds (ADR-029) without corrupting live
     /// tracking.
     pub(crate) async fn release_leaf(&self, id: &TxId, path: &str) -> Result<(), TransError> {
-        self.release_leaf_at(id, path, Requirement::AtLeast(self.timeline.now()))
-            .await
+        // A release stages no decision that can become unsafe from a stale
+        // seed; its CAS arbitrates with any newer leaf and retries on conflict.
+        self.release_leaf_at(id, path, Requirement::Any).await
     }
 
     async fn release_leaf_at(
@@ -1145,28 +1153,21 @@ mod tests {
     fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), 1024, timeline.clone());
-        let tl = TLogger::new(objects.clone(), "test", timeline.clone());
+        let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(objects.clone(), timeline.clone());
-        let resolver = Resolver::new(shards.clone(), timeline.clone(), mon.clone());
+        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let shards = ShardStore::new(objects.clone());
+        let resolver = Resolver::new(shards.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
-            timeline.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
             policy,
             Arc::new(crate::shard_coord::NoSplitHints),
         );
-        let locker = Locker::new(
-            coord.clone(),
-            dir,
-            timeline.clone(),
-            mon.clone(),
-            RetryConfig::default(),
-        );
+        let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
         (
             locker,
             TlCtx {
@@ -1239,12 +1240,7 @@ mod tests {
     // Acquires shard locks in parallel mode, asserting success.
     async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
         match locker
-            .lock_shards_at(
-                id,
-                groups,
-                false,
-                Requirement::AtLeast(locker.timeline.now()),
-            )
+            .lock_shards_at(id, groups, false, Requirement::Any)
             .await
             .unwrap()
         {
@@ -1324,7 +1320,7 @@ mod tests {
                 &tx,
                 &group_of(b"z", put_intent(b"z")),
                 false,
-                Requirement::AtLeast(locker.timeline.now()),
+                Requirement::Any,
             )
             .await
             .unwrap();
@@ -1466,12 +1462,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             locker2
-                .lock_shards_at(
-                    &young2,
-                    &groups,
-                    false,
-                    Requirement::AtLeast(locker2.timeline.now()),
-                )
+                .lock_shards_at(&young2, &groups, false, Requirement::Any)
                 .await
         });
 
@@ -1518,12 +1509,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             locker2
-                .lock_shards_at(
-                    &young2,
-                    &groups,
-                    false,
-                    Requirement::AtLeast(locker2.timeline.now()),
-                )
+                .lock_shards_at(&young2, &groups, false, Requirement::Any)
                 .await
         });
 
@@ -1547,7 +1533,7 @@ mod tests {
                 &old,
                 &LockedTx {
                     groups: old_groups,
-                    validations: Vec::new(),
+                    validations: BTreeMap::new(),
                 },
             )
             .await;
@@ -1579,7 +1565,7 @@ mod tests {
                 &tx,
                 &LockedTx {
                     groups,
-                    validations: Vec::new(),
+                    validations: BTreeMap::new(),
                 },
             )
             .await;
@@ -1648,12 +1634,7 @@ mod tests {
             scans: Vec::new(),
         };
         let out = locker
-            .lock_at(
-                &tx,
-                &data,
-                false,
-                Requirement::AtLeast(locker.timeline.now()),
-            )
+            .lock_at(&tx, &data, false, Requirement::Any)
             .await
             .unwrap();
         assert!(matches!(out, LockOutcome::Locked(_)));
@@ -1846,14 +1827,10 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let g1 = group_of(key, read_intent(key));
         let g2 = group_of(key, read_intent(key));
-        let h1 = tokio::spawn(async move {
-            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.timeline.now()))
-                .await
-        });
-        let h2 = tokio::spawn(async move {
-            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.timeline.now()))
-                .await
-        });
+        let h1 =
+            tokio::spawn(async move { l1.lock_shards_at(&t1, &g1, false, Requirement::Any).await });
+        let h2 =
+            tokio::spawn(async move { l2.lock_shards_at(&t2, &g2, false, Requirement::Any).await });
 
         // Under paused time this sleep only fires once both tasks are parked (the
         // driver in the gated load, the second queued); then release the load.
@@ -1900,14 +1877,10 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let g1 = group_of(&ka, put_intent(&ka));
         let g2 = group_of(&kb, put_intent(&kb));
-        let h1 = tokio::spawn(async move {
-            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.timeline.now()))
-                .await
-        });
-        let h2 = tokio::spawn(async move {
-            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.timeline.now()))
-                .await
-        });
+        let h1 =
+            tokio::spawn(async move { l1.lock_shards_at(&t1, &g1, false, Requirement::Any).await });
+        let h2 =
+            tokio::spawn(async move { l2.lock_shards_at(&t2, &g2, false, Requirement::Any).await });
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
@@ -1947,12 +1920,7 @@ mod tests {
         let waiting_group = group_of(&kb, put_intent(&kb));
         let waiting = tokio::spawn(async move {
             waiting_locker
-                .lock_shards_at(
-                    &waiting_id,
-                    &waiting_group,
-                    false,
-                    Requirement::AtLeast(waiting_locker.timeline.now()),
-                )
+                .lock_shards_at(&waiting_id, &waiting_group, false, Requirement::Any)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -1983,7 +1951,7 @@ mod tests {
         ctx.monitor.commit_tx(tl).await.unwrap();
         LockedTx {
             groups,
-            validations: Vec::new(),
+            validations: BTreeMap::new(),
         }
     }
 
@@ -2053,10 +2021,8 @@ mod tests {
         // The write-back is the driver (parks in the gated load); the acquire
         // queues and is absorbed once the load returns.
         let hw = tokio::spawn(async move { l1.write_back(&t1, &lt1).await });
-        let ha = tokio::spawn(async move {
-            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.timeline.now()))
-                .await
-        });
+        let ha =
+            tokio::spawn(async move { l2.lock_shards_at(&t2, &g2, false, Requirement::Any).await });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         hw.await.unwrap();
@@ -2137,14 +2103,10 @@ mod tests {
         let (to, ty) = (old.clone(), young.clone());
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
-        let ho = tokio::spawn(async move {
-            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.timeline.now()))
-                .await
-        });
-        let hy = tokio::spawn(async move {
-            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.timeline.now()))
-                .await
-        });
+        let ho =
+            tokio::spawn(async move { lo.lock_shards_at(&to, &go, false, Requirement::Any).await });
+        let hy =
+            tokio::spawn(async move { ly.lock_shards_at(&ty, &gy, false, Requirement::Any).await });
 
         // Once both tasks are parked (driver in the gated load, the other queued),
         // release the load so the round folds both members.
@@ -2196,14 +2158,10 @@ mod tests {
         let (to, ty) = (old.clone(), young.clone());
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
-        let ho = tokio::spawn(async move {
-            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.timeline.now()))
-                .await
-        });
-        let hy = tokio::spawn(async move {
-            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.timeline.now()))
-                .await
-        });
+        let ho =
+            tokio::spawn(async move { lo.lock_shards_at(&to, &go, false, Requirement::Any).await });
+        let hy =
+            tokio::spawn(async move { ly.lock_shards_at(&ty, &gy, false, Requirement::Any).await });
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
@@ -2250,14 +2208,10 @@ mod tests {
         let (ta, tb) = (a.clone(), b.clone());
         let ga = group_of(key, put_intent(key));
         let gb = group_of(key, put_intent(key));
-        let ha = tokio::spawn(async move {
-            la.lock_shards_at(&ta, &ga, false, Requirement::AtLeast(la.timeline.now()))
-                .await
-        });
-        let hb = tokio::spawn(async move {
-            lb.lock_shards_at(&tb, &gb, false, Requirement::AtLeast(lb.timeline.now()))
-                .await
-        });
+        let ha =
+            tokio::spawn(async move { la.lock_shards_at(&ta, &ga, false, Requirement::Any).await });
+        let hb =
+            tokio::spawn(async move { lb.lock_shards_at(&tb, &gb, false, Requirement::Any).await });
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
@@ -2316,10 +2270,10 @@ mod tests {
             let (lw, la) = (locker.clone(), locker.clone());
             let (cw, ca) = (committer.clone(), acquirer.clone());
             let hw = tokio::spawn(async move { lw.write_back(&cw, &lt).await });
-            let ha = tokio::spawn(async move {
-                la.lock_shards_at(&ca, &g, false, Requirement::AtLeast(la.timeline.now()))
-                    .await
-            });
+            let ha =
+                tokio::spawn(
+                    async move { la.lock_shards_at(&ca, &g, false, Requirement::Any).await },
+                );
             rt::sleep(Duration::from_millis(50)).await;
             gate.release();
             hw.await.unwrap();
@@ -2371,7 +2325,7 @@ mod tests {
                 &tx,
                 &group_of(b"key2", put_intent(b"key2")),
                 false,
-                Requirement::AtLeast(locker.timeline.now()),
+                Requirement::Any,
             )
             .await;
         assert!(err.is_err(), "locking after close is cancelled");
@@ -2395,10 +2349,8 @@ mod tests {
         let l = locker.clone();
         let y = young.clone();
         let g = group_of(key, put_intent(key));
-        let waiting = tokio::spawn(async move {
-            l.lock_shards_at(&y, &g, false, Requirement::AtLeast(l.timeline.now()))
-                .await
-        });
+        let waiting =
+            tokio::spawn(async move { l.lock_shards_at(&y, &g, false, Requirement::Any).await });
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished(), "younger blocks on the older holder");
         waiting.abort();

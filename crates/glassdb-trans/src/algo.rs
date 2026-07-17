@@ -41,7 +41,8 @@ use crate::monitor::Monitor;
 use crate::node_locking::{LockResolution, resolve_entry_locks, resolve_entry_locks_at};
 use crate::resolver::Resolver;
 use crate::shard_coord::{
-    FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission, Step,
+    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
+    StageAdmission, Step,
 };
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
@@ -294,7 +295,7 @@ impl<'a> ValidationContext<'a> {
 enum InstallOutcome {
     /// The write lock is installed (or we are already in the chain): this
     /// transaction is inserted into the shard's version history.
-    Landed,
+    Landed(Option<LeafObservation>),
     /// The entry moved out from under us: the fast path lost the race and must
     /// renew (its committed object, if written, becomes an orphan for GC).
     Moved,
@@ -581,6 +582,8 @@ impl Algo {
         if tx.should_lock_reads() {
             return self.validate_locked_reads(tx).await;
         }
+        // The transaction body has finished and no CAS has yet certified its
+        // reads, so optimistic validation must establish its own lower bound.
         let validation_start = self.timeline.now();
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
@@ -656,6 +659,8 @@ impl Algo {
     ///
     /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
+        // Read-only commit has no mutation receipt; this barrier separates the
+        // completed body from the physical observations that certify it.
         let validation_start = self.timeline.now();
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
@@ -676,6 +681,8 @@ impl Algo {
             tx.engaged = true;
         }
 
+        // Capture before lock acquisition so every successful lock CAS is
+        // eligible to certify the reads it protects against this same bound.
         let validation_start = self.timeline.now();
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(l) => l,
@@ -734,6 +741,8 @@ impl Algo {
             tx.status = Status::Validating;
             tx.engaged = true;
         }
+        // The escalated read-only path uses lock CASes as validation evidence,
+        // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(locked) => locked,
@@ -904,9 +913,9 @@ impl Algo {
 
         match (object, install?) {
             // Committed: the object is durable and our lock is in the chain.
-            (Ok(()), InstallOutcome::Landed) => {
+            (Ok(()), InstallOutcome::Landed(receipt)) => {
                 tx.status = Status::Committed;
-                self.write_back_single_rw(&tx.id, &leaf_path, &raw_key, &key_path)
+                self.write_back_single_rw(&tx.id, &leaf_path, &raw_key, &key_path, receipt)
                     .await;
                 Ok(Some(()))
             }
@@ -956,13 +965,22 @@ impl Algo {
             .coord
             .submit_shard(leaf_path, id, resolver, Requirement::Any)
             .await?
-            .map(|coordinated| coordinated.outcome)
         {
-            Some(FoldOutcome::Landed) => Ok(InstallOutcome::Landed),
-            Some(FoldOutcome::InDoubt(msg)) => Ok(InstallOutcome::InDoubt(msg)),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                cas_precondition,
+            }) => Ok(InstallOutcome::Landed(cas_precondition)),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::InDoubt(msg),
+                ..
+            }) => Ok(InstallOutcome::InDoubt(msg)),
             // A shutdown mid-flight leaves the lock un-installed, so the fast
             // path renews (its committed object, if any, is an orphan for GC).
-            Some(FoldOutcome::Moved) | None => Ok(InstallOutcome::Moved),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Moved,
+                ..
+            })
+            | None => Ok(InstallOutcome::Moved),
             // Commit-install never waits, releases, or takes a generic lock.
             Some(_) => Err(TransError::other(
                 "commit-install produced a non-install outcome",
@@ -983,6 +1001,7 @@ impl Algo {
         leaf_path: &str,
         raw_key: &[u8],
         key_path: &str,
+        installed_from: Option<LeafObservation>,
     ) {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
@@ -992,9 +1011,16 @@ impl Algo {
                 let leaf_path = leaf_path.to_string();
                 let raw_key = raw_key.to_vec();
                 let key_path = key_path.to_string();
+                let installed_from = installed_from.clone();
                 bg.spawn_waited(async move {
                     let superseded = locker
-                        .write_back_single_put(&id, &leaf_path, &raw_key, &key_path)
+                        .write_back_single_put(
+                            &id,
+                            &leaf_path,
+                            &raw_key,
+                            &key_path,
+                            installed_from.as_ref(),
+                        )
                         .await;
                     feed_gc_hints(&gc, superseded);
                 });
@@ -1002,7 +1028,13 @@ impl Algo {
             None => {
                 let superseded = self
                     .locker
-                    .write_back_single_put(id, leaf_path, raw_key, key_path)
+                    .write_back_single_put(
+                        id,
+                        leaf_path,
+                        raw_key,
+                        key_path,
+                        installed_from.as_ref(),
+                    )
                     .await;
                 feed_gc_hints(&self.gc, superseded);
             }
@@ -1265,10 +1297,7 @@ impl Algo {
             return Ok(true);
         }
         let keys: Vec<Arc<str>> = data.reads.iter().map(|r| r.path.clone()).collect();
-        let current = self
-            .resolver
-            .effective_writers_at(&keys, requirement)
-            .await?;
+        let current = self.resolver.effective_writers(&keys, requirement).await?;
         for r in &data.reads {
             if current.get(&r.path).and_then(Option::as_ref) != r.last_writer.as_ref() {
                 return Ok(false);
@@ -1423,15 +1452,15 @@ mod tests {
     ) -> (Algo, Tctx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone());
-        let tlogger = TLogger::new(objects.clone(), TEST_COLL, timeline.clone());
+        let tlogger = TLogger::new(objects.clone(), TEST_COLL);
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         // Leak the background so spawned async aborts can run for the test's
         // lifetime without us threading the owner through every helper.
         std::mem::forget(bg);
-        let tmon = Monitor::new(tlogger.clone(), bg_weak.clone());
-        let shards = ShardStore::new(objects.clone(), timeline.clone());
-        let resolver = Resolver::new(shards.clone(), timeline.clone(), tmon.clone());
+        let tmon = Monitor::new(tlogger.clone(), timeline.clone(), bg_weak.clone());
+        let shards = ShardStore::new(objects.clone());
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         let (coord, _splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
@@ -1443,13 +1472,7 @@ mod tests {
             TEST_COLL,
             glassdb_storage::SplitPolicy::default(),
         );
-        let locker = Locker::new(
-            coord.clone(),
-            dir,
-            timeline.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-        );
+        let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
@@ -1501,11 +1524,8 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(
-            Resolver::new(
-                tctx.shards.clone(),
-                tctx.timeline.clone(),
-                tctx.tmon.clone(),
-            ),
+            Resolver::new(tctx.shards.clone(), tctx.tmon.clone()),
+            tctx.timeline.clone(),
             RetryConfig::default(),
         );
         match reader.read(path, Duration::MAX).await {
@@ -1564,9 +1584,13 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        let status = tctx.tlogger.commit_status(&tid).await.unwrap();
+        let status = tctx
+            .tlogger
+            .commit_status_at(&tid, Requirement::Any)
+            .await
+            .unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
-        let txlog = tctx.tlogger.get(&tid).await.unwrap();
+        let txlog = tctx.tlogger.get_at(&tid, Requirement::Any).await.unwrap();
         let txlog = txlog.value().unwrap();
         assert_eq!(txlog.writes.len(), 1);
         assert_eq!(txlog.writes[0].path, keyp);
@@ -1602,7 +1626,7 @@ mod tests {
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        let txlog = tctx.tlogger.get(&tid).await.unwrap();
+        let txlog = tctx.tlogger.get_at(&tid, Requirement::Any).await.unwrap();
         let txlog = txlog.value().unwrap();
         let locked: std::collections::BTreeSet<&str> =
             txlog.locks.iter().map(|l| l.path.as_str()).collect();
@@ -2043,7 +2067,7 @@ mod tests {
         let install = install.await.unwrap().unwrap();
         let acquire = acquire.await.unwrap().unwrap();
         assert!(
-            matches!(install, InstallOutcome::Landed),
+            matches!(install, InstallOutcome::Landed(_)),
             "the fast-path install must land"
         );
         assert!(
@@ -2123,7 +2147,7 @@ mod tests {
         let install = install.await.unwrap().unwrap();
         let acquire = acquire.await.unwrap().unwrap();
         assert!(
-            matches!(install, InstallOutcome::Landed),
+            matches!(install, InstallOutcome::Landed(_)),
             "the install recovers as landed, not in-doubt"
         );
         assert!(
@@ -2292,7 +2316,11 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current_writer, Some(tid.clone()));
         assert!(e.locked_by.is_empty());
-        let status = tctx.tlogger.commit_status(&tid).await.unwrap();
+        let status = tctx
+            .tlogger
+            .commit_status_at(&tid, Requirement::Any)
+            .await
+            .unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.last_writer.unwrap(), tid);
@@ -2300,11 +2328,12 @@ mod tests {
 
     // ADR-030: a warm single read-write commit reuses the shard the read cached
     // for both its eligibility check and its lock-install fold (`Any`), so
-    // it issues no backend shard read for either — only the inline write-back,
-    // whose resolver may skip without a CAS, validates at its captured bound. A
-    // revalidating eligibility or install would each add a `read_if_modified`,
-    // so pinning the total to one read guards the reuse. A large cache keeps
-    // this deterministic (nothing is evicted between the read and the commit).
+    // it issues no backend shard read for either. The successful install CAS
+    // supplies the write-back's lower bound too, so write-back also reuses the
+    // installed cached state. A revalidating eligibility, install, or write-back
+    // would add a `read_if_modified`, so pinning the total to zero guards the
+    // receipt propagation. A large cache keeps this deterministic (nothing is
+    // evicted between the read and the commit).
     #[tokio::test]
     async fn single_rw_commit_reuses_cached_shard() {
         let (tm, tctx, log) = new_recording_algo_big_cache().await;
@@ -2326,8 +2355,8 @@ mod tests {
         let (full, revalidate) = shard_reads(&log);
         assert_eq!(full, 0, "no cold shard read on a warm commit");
         assert_eq!(
-            revalidate, 1,
-            "only the write-back revalidates; eligibility and install reuse cache"
+            revalidate, 0,
+            "eligibility, install, and write-back reuse cache/CAS evidence"
         );
     }
 
@@ -2788,6 +2817,23 @@ mod tests {
         let kb = paths::from_key(TEST_COLL, b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
+        // `commit_writes` publishes pointers in a background task. This test is
+        // about the next lock CAS's receipt, so first wait until that unrelated
+        // setup CAS has left the shared leaf quiescent; otherwise it can change
+        // the exact observation between `do_read` and the lock under test.
+        let mut settled = false;
+        for _ in 0..100 {
+            if entry(&tctx, b"a")
+                .await
+                .is_some_and(|entry| entry.locked_by.is_empty())
+            {
+                settled = true;
+                break;
+            }
+            rt::yield_now().await;
+        }
+        assert!(settled, "setup write-back must settle before receipt test");
+
         let read = do_read(&tctx, &ka).await;
         let observed = read.leaf.clone();
         let validation_start = tctx.timeline.now();
@@ -2865,10 +2911,11 @@ mod tests {
         // independent, so it cannot advance the retained observation of A in
         // this database.
         let external_timeline = Timeline::new();
-        let external = ShardStore::new(
-            CachedStore::new(tctx.backend.clone(), 1 << 20, external_timeline.clone()),
+        let external = ShardStore::new(CachedStore::new(
+            tctx.backend.clone(),
+            1 << 20,
             external_timeline.clone(),
-        );
+        ));
         let leaf_path = paths::collection_info(TEST_COLL);
         let loaded = external
             .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
@@ -2989,7 +3036,7 @@ mod tests {
             },
         );
         tm.commit(&mut h).await.unwrap();
-        let log = tctx.tlogger.get(h.id()).await.unwrap();
+        let log = tctx.tlogger.get_at(h.id(), Requirement::Any).await.unwrap();
         let log = log.value().unwrap();
         for path in [&ka, &kb] {
             assert!(log.locks.contains(&PathLock {
@@ -3106,11 +3153,7 @@ mod tests {
     // test collection, returning the scan's live keys alongside so a test can
     // assert on the snapshot and later re-validate the same coverage.
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
-        let resolver = Resolver::new(
-            tctx.shards.clone(),
-            tctx.timeline.clone(),
-            tctx.tmon.clone(),
-        );
+        let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
         let scan = resolver
             .scan_keys(TEST_COLL, &range, &[], None, None)
             .await
@@ -3172,7 +3215,11 @@ mod tests {
         tctx.locker.lock_calls_and_reset();
         tm.commit(&mut stale).await.unwrap();
         assert!(tctx.locker.lock_calls_and_reset() >= 1);
-        let log = tctx.tlogger.get(stale.id()).await.unwrap();
+        let log = tctx
+            .tlogger
+            .get_at(stale.id(), Requirement::Any)
+            .await
+            .unwrap();
         let log = log.value().unwrap();
         assert!(
             log.locks
@@ -3241,7 +3288,11 @@ mod tests {
 
         let mut handle = tm.begin(data);
         tm.commit(&mut handle).await.unwrap();
-        let log = tctx.tlogger.get(handle.id()).await.unwrap();
+        let log = tctx
+            .tlogger
+            .get_at(handle.id(), Requirement::Any)
+            .await
+            .unwrap();
         let log = log.value().unwrap();
         let leaf = paths::collection_info(TEST_COLL);
         assert!(log.locks.contains(&PathLock {
@@ -3293,7 +3344,11 @@ mod tests {
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();
 
-        let log = tctx.tlogger.get(handle.id()).await.unwrap();
+        let log = tctx
+            .tlogger
+            .get_at(handle.id(), Requirement::Any)
+            .await
+            .unwrap();
         let log = log.value().unwrap();
         for token in ["S0", "S1"] {
             assert!(log.locks.contains(&PathLock {

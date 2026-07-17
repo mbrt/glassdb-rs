@@ -37,11 +37,8 @@ impl Collection {
     ) -> Result<Option<Vec<u8>>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
-            Resolver::new(
-                self.db.shards.clone(),
-                self.db.timeline.clone(),
-                self.db.tmon.clone(),
-            ),
+            Resolver::new(self.db.shards.clone(), self.db.tmon.clone()),
+            self.db.timeline.clone(),
             self.db.retry,
         );
         match r.read(&p, max_staleness).await {
@@ -127,7 +124,10 @@ impl Collection {
     ///
     /// Listing a collection that does not exist returns [`Error::NotFound`].
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
-        let (root, _version) = self.db.shards.load_root(&self.prefix).await?;
+        // This non-transactional API returns one current directory snapshot and
+        // has no later OCC validation/CAS from which to inherit a watermark.
+        let requirement = glassdb_storage::Requirement::AtLeast(self.db.timeline.now());
+        let (root, _version) = self.db.shards.load_root(&self.prefix, requirement).await?;
         let names: Vec<Vec<u8>> = root.subcollections().map(<[u8]>::to_vec).collect();
         Ok(CollectionsIter::new(names))
     }

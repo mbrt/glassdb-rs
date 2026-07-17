@@ -199,9 +199,9 @@ impl Transaction {
         tmon: glassdb_trans::Monitor,
         retry: RetryConfig,
     ) -> Self {
-        let resolver = Resolver::new(shards, timeline, tmon);
+        let resolver = Resolver::new(shards, tmon);
         Transaction {
-            reader: Reader::new(resolver.clone(), retry),
+            reader: Reader::new(resolver.clone(), timeline, retry),
             resolver,
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }

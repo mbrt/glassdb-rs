@@ -108,8 +108,8 @@ impl DatabaseBuilder {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let timeline = Timeline::new();
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone());
-        let shards = ShardStore::new(objects.clone(), timeline.clone());
-        let tl = TLogger::new(objects.clone(), &name, timeline.clone());
+        let shards = ShardStore::new(objects.clone());
+        let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
         let clock = if deterministic_time {
             Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
@@ -121,8 +121,14 @@ impl DatabaseBuilder {
         // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
         // would keep `Background` alive forever.
         let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::with_config(tl.clone(), bg_weak.clone(), clock.clone(), retry);
-        let resolver = Resolver::new(shards.clone(), timeline.clone(), tmon.clone());
+        let tmon = Monitor::with_config(
+            tl.clone(),
+            timeline.clone(),
+            bg_weak.clone(),
+            clock.clone(),
+            retry,
+        );
+        let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         // Build the coordinator and splitter as a co-wired pair over one shared
         // candidate feed: leaf writes report split candidates into the feed,
@@ -137,7 +143,7 @@ impl DatabaseBuilder {
             &name,
             split_policy,
         );
-        let locker = Locker::new(coord.clone(), dir, timeline.clone(), tmon.clone(), retry);
+        let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
         let gc = Gc::new(
             bg_weak.clone(),
             tl,

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::TxId;
-use glassdb_storage::{LeafObservation, StorageError, TxCommitStatus, Version};
+use glassdb_storage::{
+    LeafObservation, Requirement, StorageError, Timeline, TxCommitStatus, Version,
+};
 
 use crate::error::trans_to_storage;
 use crate::resolver::Resolver;
@@ -55,14 +57,19 @@ pub struct ReadOutcome {
 #[derive(Clone)]
 pub struct Reader {
     resolver: Resolver,
+    timeline: Timeline,
     retry: RetryConfig,
 }
 
 impl Reader {
     /// Creates a reader that resolves and materializes values through
     /// `resolver` using `retry` for transient read failures.
-    pub fn new(resolver: Resolver, retry: RetryConfig) -> Self {
-        Reader { resolver, retry }
+    pub fn new(resolver: Resolver, timeline: Timeline, retry: RetryConfig) -> Self {
+        Reader {
+            resolver,
+            timeline,
+            retry,
+        }
     }
 
     /// Reads `key`, accepting cached outcomes up to `max_stale` and returning
@@ -89,7 +96,9 @@ impl Reader {
     /// A single read attempt: local cache then shard resolution. Wrapped by
     /// [`Reader::read`] for in-place retries.
     async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadOutcome, StorageError> {
-        self.resolve_value(key, self.resolver.requirement_within(max_stale))
+        // Bounded-staleness reads are the one foreground operation that owns a
+        // freshness policy rather than inheriting a transaction/CAS watermark.
+        self.resolve_value(key, Requirement::within(&self.timeline, max_stale))
             .await
     }
 
