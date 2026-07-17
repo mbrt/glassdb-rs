@@ -11,14 +11,13 @@ mod root;
 mod shard;
 mod shardstore;
 mod structlog;
+mod timeline;
 mod tlogger;
 pub mod txobject;
 mod version;
 
 pub use cache::{Cache, Weighable};
-pub use cached_store::{
-    CachedStore, CasResult, Instant, Observation, Requirement, Revision, Validated,
-};
+pub use cached_store::{CachedStore, CasResult, Observation, Requirement, Revision, Validated};
 pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use error::StorageError;
 pub use lock::LockType;
@@ -27,6 +26,7 @@ pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LeafKind, LeafObservation, LeafValidation, LoadedLeaf, ShardStore};
 pub use structlog::StructuralLog;
+pub use timeline::{LogicalTime, Timeline};
 pub use tlogger::{
     LockScope, PathLock, TLogger, TValue, TxCommitStatus, TxListPage, TxLog, TxStatus, TxWrite,
 };

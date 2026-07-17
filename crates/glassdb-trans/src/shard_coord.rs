@@ -36,7 +36,7 @@ use glassdb_concurr::{
 use glassdb_data::TxId;
 use glassdb_storage::{
     LeafKind, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
-    SplitPolicy, StorageError,
+    SplitPolicy, StorageError, Timeline,
 };
 
 use crate::error::TransError;
@@ -149,6 +149,7 @@ pub(crate) enum Step {
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) resolver: &'a Resolver,
     pub(crate) tmon: &'a Monitor,
+    pub(crate) timeline: &'a Timeline,
     pub(crate) cause: ReloadCause,
 }
 
@@ -274,6 +275,7 @@ struct CoordCore {
     tmon: Monitor,
     shards: ShardStore,
     resolver: Resolver,
+    timeline: Timeline,
     retry: RetryConfig,
     stats: Stats,
     // Where over-cap leaf writes are reported (ADR-031): the background
@@ -345,6 +347,7 @@ impl CasWorker {
             let ctx = ResolveCtx {
                 resolver: &self.core.resolver,
                 tmon: &self.core.tmon,
+                timeline: &self.core.timeline,
                 cause,
             };
             let requirement = if attempt == 0 {
@@ -561,18 +564,20 @@ pub struct ShardCoordinator {
 }
 
 impl ShardCoordinator {
-    /// Returns the current instant on the shared object store's clock.
-    pub fn now(&self) -> glassdb_storage::Instant {
-        self.inner.core.shards.now()
-    }
-
-    /// Creates a coordinator over the shared shard store, resolver, and monitor.
-    /// `retry` configures the exponential backoff applied both between CAS
+    /// Creates a coordinator over the shared shard store, timeline, resolver,
+    /// and monitor. `retry` configures the exponential backoff applied between CAS
     /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
     /// between hold-and-wait re-polls of a conflicting holder.
-    pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
+    pub fn new(
+        shards: ShardStore,
+        timeline: Timeline,
+        resolver: Resolver,
+        tmon: Monitor,
+        retry: RetryConfig,
+    ) -> Self {
         Self::with_hinter(
             shards,
+            timeline,
             resolver,
             tmon,
             retry,
@@ -582,11 +587,13 @@ impl ShardCoordinator {
     }
 
     /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
-    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `policy`
+    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `timeline`
+    /// supplies validation barriers, while `policy`
     /// governs the coordinator's hard node-size limit; the hinting seam carries
     /// only leaf-write observations and never exposes splitter configuration.
     pub fn with_hinter(
         shards: ShardStore,
+        timeline: Timeline,
         resolver: Resolver,
         tmon: Monitor,
         retry: RetryConfig,
@@ -597,6 +604,7 @@ impl ShardCoordinator {
             tmon,
             shards,
             resolver,
+            timeline,
             retry,
             stats: Stats::default(),
             policy,
@@ -709,7 +717,7 @@ mod tests {
     };
     use glassdb_concurr::Background;
     use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, LockType, Node, Shard, TLogger};
+    use glassdb_storage::{CachedStore, LockType, Node, Shard, TLogger, Timeline};
 
     const COLL: &str = "coordp";
 
@@ -758,21 +766,33 @@ mod tests {
         hinter: Arc<dyn SplitHinter>,
         retry: RetryConfig,
     ) -> (ShardCoordinator, ShardStore, Arc<Background>) {
-        let objects = CachedStore::new(backend, 1 << 20);
-        let tl = TLogger::new(objects.clone(), COLL);
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        let tl = TLogger::new(objects.clone(), COLL, timeline.clone());
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(objects);
-        let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord =
-            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
+        let shards = ShardStore::new(objects, timeline.clone());
+        let resolver = Resolver::new(shards.clone(), timeline.clone(), mon.clone());
+        let coord = ShardCoordinator::with_hinter(
+            shards.clone(),
+            timeline,
+            resolver,
+            mon,
+            retry,
+            policy,
+            hinter,
+        );
         (coord, shards, bg)
     }
 
     // A cold shard store over `backend` (its own empty cache), for asserting what
     // actually landed in storage without touching the coordinator's cache.
     fn cold_store(backend: Arc<dyn Backend>) -> ShardStore {
-        ShardStore::new(CachedStore::new(backend, 1 << 20))
+        let timeline = Timeline::new();
+        ShardStore::new(
+            CachedStore::new(backend, 1 << 20, timeline.clone()),
+            timeline,
+        )
     }
 
     fn entry(
@@ -793,10 +813,7 @@ mod tests {
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
     async fn store_shard_entries(store: &ShardStore, path: &str, entries: Vec<ShardEntry>) {
-        let loaded = store
-            .load_leaf(path, Requirement::AtLeast(store.now()))
-            .await
-            .unwrap();
+        let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
         let shard = Shard::from_entries(entries);
         assert!(
             store
@@ -833,7 +850,7 @@ mod tests {
     // Loads the leaf's entries from a cold store, for asserting what landed.
     async fn cold_entries(store: &ShardStore, path: &str) -> Shard {
         store
-            .load_leaf(path, Requirement::AtLeast(store.now()))
+            .load_leaf(path, Requirement::Any)
             .await
             .unwrap()
             .entries
@@ -1031,7 +1048,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1075,7 +1092,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1114,7 +1131,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1143,7 +1160,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(SkipRelease),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1180,7 +1197,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1218,7 +1235,10 @@ mod tests {
         .await;
         let (coord, shards, _bg) = coord_over(backend.clone());
         shards
-            .load_leaf(&leaf(), Requirement::AtLeast(coord.now()))
+            .load_leaf(
+                &leaf(),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
+            )
             .await
             .unwrap();
 
@@ -1240,7 +1260,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(SkipRelease),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1280,7 +1300,7 @@ mod tests {
                     tx: t1.clone(),
                     trace: tr1,
                 }),
-                Requirement::AtLeast(c1.now()),
+                Requirement::AtLeast(c1.inner.core.timeline.now()),
             )
             .await
         });
@@ -1296,7 +1316,7 @@ mod tests {
                     tx: t2.clone(),
                     trace: tr2,
                 }),
-                Requirement::AtLeast(c2.now()),
+                Requirement::AtLeast(c2.inner.core.timeline.now()),
             )
             .await
         });
@@ -1378,7 +1398,7 @@ mod tests {
                     tx: t1.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::AtLeast(c1.now()),
+                Requirement::AtLeast(c1.inner.core.timeline.now()),
             )
             .await
         });
@@ -1394,7 +1414,7 @@ mod tests {
                     tx: t2.clone(),
                     admission: StageAdmission::AddsKey,
                 }),
-                Requirement::AtLeast(c2.now()),
+                Requirement::AtLeast(c2.inner.core.timeline.now()),
             )
             .await
         });
@@ -1439,7 +1459,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(SkipRelease),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1578,7 +1598,7 @@ mod tests {
                     folds: std::sync::atomic::AtomicUsize::new(0),
                     seen_in_doubt: seen_in_doubt.clone(),
                 }),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();
@@ -1689,7 +1709,7 @@ mod tests {
                     key: b"k".to_vec(),
                     tx: tx.clone(),
                 }),
-                Requirement::AtLeast(coord.now()),
+                Requirement::AtLeast(coord.inner.core.timeline.now()),
             )
             .await
             .unwrap();

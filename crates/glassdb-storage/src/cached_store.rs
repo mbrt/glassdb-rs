@@ -9,7 +9,7 @@
 //!
 //! Requirement is a local validation watermark, not a durable guarantee. Each
 //! cache entry is `Present` (a decoded value, its [`Revision`], and a
-//! validated-after [`Instant`]), `Absent` (a validated-after watermark,
+//! validated-after [`LogicalTime`]), `Absent` (a validated-after watermark,
 //! no revision), or `Missing` (no entry: a positively known-obsolete value that
 //! a new lookup cannot rediscover). A successful read returns an [`Observation`]
 //! that references monotonic validation evidence shared with the current cache
@@ -34,11 +34,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_backend::{self as backend, Backend, BackendError};
-use glassdb_concurr::rt;
 use tokio::sync::Notify;
 
 use crate::cache::{Cache, Weighable};
 use crate::error::StorageError;
+use crate::timeline::{LogicalTime, Timeline};
 
 /// Encoding, decoding, and decoded-size accounting for one physical object type.
 ///
@@ -84,20 +84,6 @@ impl Revision {
     }
 }
 
-/// A monotonic opaque instant, meaningful only within one open store.
-///
-/// It cannot be persisted or exchanged between databases, stores, or processes.
-/// Callers must not mix instants from different stores; this contract is not
-/// dynamically checked, so the token carries no store identifier.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Instant(u64);
-
-impl Instant {
-    fn saturating_sub(self, duration: Duration) -> Self {
-        Instant(self.0.saturating_sub(duration_to_nanos(duration)))
-    }
-}
-
 /// The freshness requirement a cached entry must satisfy before it is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
@@ -106,7 +92,7 @@ pub enum Requirement {
     Any,
     /// Accept an entry only when its watermark is at least this time; otherwise
     /// validate through the backend.
-    AtLeast(Instant),
+    AtLeast(LogicalTime),
 }
 
 impl Requirement {
@@ -117,6 +103,16 @@ impl Requirement {
             (Requirement::AtLeast(left), Requirement::AtLeast(right)) => {
                 Requirement::AtLeast(left.max(right))
             }
+        }
+    }
+
+    /// Builds a requirement accepting evidence no older than `max_staleness`
+    /// on `timeline`.
+    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
+        if max_staleness == Duration::MAX {
+            Requirement::Any
+        } else {
+            Requirement::AtLeast(timeline.now().saturating_sub(max_staleness))
         }
     }
 }
@@ -164,17 +160,17 @@ pub enum Validated<V> {
 struct Evidence(Arc<AtomicU64>);
 
 impl Evidence {
-    fn new(t: Instant) -> Self {
-        Evidence(Arc::new(AtomicU64::new(t.0)))
+    fn new(t: LogicalTime) -> Self {
+        Evidence(Arc::new(AtomicU64::new(t.raw())))
     }
 
-    fn get(&self) -> Instant {
-        Instant(self.0.load(Ordering::SeqCst))
+    fn get(&self) -> LogicalTime {
+        LogicalTime::from_raw(self.0.load(Ordering::SeqCst))
     }
 
     /// Advances the watermark to at least `t`, never regressing it.
-    fn advance(&self, t: Instant) {
-        self.0.fetch_max(t.0, Ordering::SeqCst);
+    fn advance(&self, t: LogicalTime) {
+        self.0.fetch_max(t.raw(), Ordering::SeqCst);
     }
 }
 
@@ -219,7 +215,7 @@ impl<V> Observation<V> {
 
     /// The watermark: the observed state was current at some point after this
     /// time.
-    pub fn validated_after(&self) -> Instant {
+    pub fn validated_after(&self) -> LogicalTime {
         self.evidence.get()
     }
 
@@ -266,7 +262,7 @@ impl CacheEntry {
         }
     }
 
-    fn evidence_time(&self) -> Instant {
+    fn evidence_time(&self) -> LogicalTime {
         self.evidence().get()
     }
 }
@@ -302,7 +298,7 @@ enum FlightOutcome {
 
 /// One in-flight backend validation of a path, tracked for coalescing.
 struct InFlight {
-    started: Instant,
+    started: LogicalTime,
     outcome: Mutex<Option<FlightOutcome>>,
     notify: Notify,
 }
@@ -327,68 +323,6 @@ impl InFlight {
     }
 }
 
-trait MonotonicClock: Send + Sync {
-    fn elapsed(&self) -> Duration;
-}
-
-struct RuntimeClock {
-    origin: rt::Instant,
-}
-
-impl RuntimeClock {
-    fn new() -> Self {
-        Self {
-            origin: rt::Instant::now(),
-        }
-    }
-}
-
-impl MonotonicClock for RuntimeClock {
-    fn elapsed(&self) -> Duration {
-        self.origin.elapsed()
-    }
-}
-
-struct StoreClock {
-    source: Arc<dyn MonotonicClock>,
-    last: AtomicU64,
-}
-
-impl StoreClock {
-    fn new(source: Arc<dyn MonotonicClock>) -> Self {
-        Self {
-            source,
-            last: AtomicU64::new(0),
-        }
-    }
-
-    fn now(&self) -> Instant {
-        Instant(
-            duration_to_nanos(self.source.elapsed())
-                .max(self.last.load(Ordering::SeqCst).saturating_add(1)),
-        )
-    }
-
-    fn tick(&self) -> Instant {
-        let elapsed = duration_to_nanos(self.source.elapsed());
-        let mut current = self.last.load(Ordering::SeqCst);
-        loop {
-            let next = elapsed.max(current.saturating_add(1));
-            match self
-                .last
-                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => return Instant(next),
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
-
-fn duration_to_nanos(duration: Duration) -> u64 {
-    duration.as_nanos().min(u128::from(u64::MAX)) as u64
-}
-
 /// The decoded object cache over a [`Backend`] (ADR-036). Reads and mutations of
 /// every physical object class go through this boundary; listing is an uncached
 /// pass-through. Cloning is cheap (shared `Arc`s), so every typed store holds its
@@ -397,7 +331,7 @@ fn duration_to_nanos(duration: Duration) -> u64 {
 pub struct CachedStore {
     backend: Arc<dyn Backend>,
     cache: Arc<Cache<CacheEntry>>,
-    clock: Arc<StoreClock>,
+    timeline: Timeline,
     // Count of object bodies transferred from the backend (a fresh `read` or a
     // conditional read that returned a changed body). A caller samples this
     // before and after a logical read to tell whether the result reused cached
@@ -445,20 +379,12 @@ impl Drop for FlightLeader {
 
 impl CachedStore {
     /// Creates a cached store over `backend`, sharing the single byte-bounded
-    /// LRU sized by `max_size`.
-    pub fn new(backend: Arc<dyn Backend>, max_size: usize) -> Self {
-        Self::with_clock(backend, max_size, Arc::new(RuntimeClock::new()))
-    }
-
-    fn with_clock(
-        backend: Arc<dyn Backend>,
-        max_size: usize,
-        clock: Arc<dyn MonotonicClock>,
-    ) -> Self {
+    /// LRU sized by `max_size` and ordering evidence on `timeline`.
+    pub fn new(backend: Arc<dyn Backend>, max_size: usize, timeline: Timeline) -> Self {
         CachedStore {
             backend,
             cache: Arc::new(Cache::new(max_size)),
-            clock: Arc::new(StoreClock::new(clock)),
+            timeline,
             body_reads: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -470,23 +396,6 @@ impl CachedStore {
     /// conditional revalidation that returned "not modified".
     pub fn body_reads(&self) -> u64 {
         self.body_reads.load(Ordering::SeqCst)
-    }
-
-    /// Returns the current logical time: a bound such that any operation started
-    /// from now on satisfies `AtLeast(now())`, while every already-completed
-    /// operation does not. Higher layers capture this to require requirement of
-    /// later validations.
-    pub fn now(&self) -> Instant {
-        self.clock.now()
-    }
-
-    /// Builds a freshness requirement for a duration-bounded stale read.
-    pub fn requirement_within(&self, max_staleness: Duration) -> Requirement {
-        if max_staleness == Duration::MAX {
-            Requirement::Any
-        } else {
-            Requirement::AtLeast(self.now().saturating_sub(max_staleness))
-        }
     }
 
     pub(crate) fn typed<C: Codec>(&self) -> TypedCachedStore<C> {
@@ -718,8 +627,8 @@ impl CachedStore {
 
     /// Allocates a unique `started-at` watermark, ordered before the backend
     /// call it precedes.
-    fn next_tick(&self) -> Instant {
-        self.clock.tick()
+    fn next_tick(&self) -> LogicalTime {
+        self.timeline.tick()
     }
 
     /// Serves a cached entry that already satisfies `req`, or `None` when the
@@ -825,7 +734,7 @@ impl CachedStore {
     async fn do_fetch<C: Codec>(
         &self,
         path: &str,
-        started: Instant,
+        started: LogicalTime,
         expected: Option<Revision>,
     ) -> Result<FetchResult, StorageError> {
         match &expected {
@@ -856,7 +765,7 @@ impl CachedStore {
         path: &str,
         bytes: &[u8],
         version: backend::Version,
-        started: Instant,
+        started: LogicalTime,
     ) -> Result<FetchResult, StorageError> {
         self.body_reads.fetch_add(1, Ordering::SeqCst);
         let decoded = C::decode(path, bytes)?;
@@ -878,7 +787,7 @@ impl CachedStore {
         &self,
         path: &str,
         revision: Revision,
-        started: Instant,
+        started: LogicalTime,
     ) -> Result<FetchResult, StorageError> {
         if let Some(entry) = self.cache.get(path)
             && let EntryState::Present {
@@ -906,7 +815,7 @@ impl CachedStore {
     }
 
     /// Publishes a validated absence.
-    fn publish_absent(&self, path: &str, started: Instant) -> FetchResult {
+    fn publish_absent(&self, path: &str, started: LogicalTime) -> FetchResult {
         let evidence = self.install_absent(path, started);
         FetchResult {
             value: None,
@@ -923,7 +832,7 @@ impl CachedStore {
         value: Arc<C::Value>,
         size: usize,
         revision: Revision,
-        started: Instant,
+        started: LogicalTime,
     ) -> Observation<C::Value> {
         let erased: Arc<dyn Any + Send + Sync> = value.clone();
         let evidence = self.install_present(path, erased, size, revision.clone(), started);
@@ -947,7 +856,7 @@ impl CachedStore {
         value: Arc<dyn Any + Send + Sync>,
         size: usize,
         revision: Revision,
-        started: Instant,
+        started: LogicalTime,
     ) -> Evidence {
         let mut out: Option<Evidence> = None;
         self.cache.update(path, |old| {
@@ -996,7 +905,7 @@ impl CachedStore {
     }
 
     /// Installs a validated absence under the same non-regression rule.
-    fn install_absent(&self, path: &str, started: Instant) -> Evidence {
+    fn install_absent(&self, path: &str, started: LogicalTime) -> Evidence {
         let mut out: Option<Evidence> = None;
         self.cache.update(path, |old| match old {
             Some(CacheEntry {
@@ -1036,7 +945,7 @@ impl CachedStore {
 
     /// Advances the current entry's watermark iff it is still present at
     /// `expected`, proving that exact state remained current up to `started`.
-    fn advance_present(&self, path: &str, expected: &Revision, started: Instant) {
+    fn advance_present(&self, path: &str, expected: &Revision, started: LogicalTime) {
         self.cache.update(path, |old| {
             if let Some(CacheEntry {
                 state:
@@ -1078,7 +987,7 @@ impl CachedStore {
     /// Invalidates the current entry (to `Missing`) unless a newer operation has
     /// already advanced it past `started`; used for in-doubt unconditional
     /// writes and deletes, which have no exact starting revision.
-    fn invalidate_stale(&self, path: &str, started: Instant) {
+    fn invalidate_stale(&self, path: &str, started: LogicalTime) {
         self.cache.update(path, |old| match &old {
             Some(entry) if entry.evidence_time() < started => None,
             _ => old,
@@ -1121,16 +1030,6 @@ impl<C: Codec> Clone for TypedCachedStore<C> {
 }
 
 impl<C: Codec> TypedCachedStore<C> {
-    /// Returns the current instant on the shared cached store's clock.
-    pub(crate) fn now(&self) -> Instant {
-        self.store.now()
-    }
-
-    /// Builds a freshness requirement for a duration-bounded stale read.
-    pub(crate) fn requirement_within(&self, max_staleness: Duration) -> Requirement {
-        self.store.requirement_within(max_staleness)
-    }
-
     fn check_path(path: &str) -> Result<(), StorageError> {
         if C::valid_path(path) {
             Ok(())
@@ -1176,7 +1075,7 @@ impl<C: Codec> TypedCachedStore<C> {
     pub(crate) async fn validate(
         &self,
         observed: &Observation<C::Value>,
-        bound: Instant,
+        bound: LogicalTime,
     ) -> Result<Validated<C::Value>, StorageError> {
         Self::check_path(observed.path())?;
         self.store
@@ -1245,7 +1144,7 @@ impl<C: Codec> TypedCachedStore<C> {
 }
 
 /// Reports whether an entry validated at `evidence` satisfies `req`.
-fn satisfies(evidence: Instant, req: Requirement) -> bool {
+fn satisfies(evidence: LogicalTime, req: Requirement) -> bool {
     match req {
         Requirement::Any => true,
         Requirement::AtLeast(t) => evidence >= t,
@@ -1278,6 +1177,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::timeline::TimeSource;
 
     // A trivial identity codec so the concurrency layer can be exercised in
     // isolation from any real object type.
@@ -1339,7 +1239,7 @@ mod tests {
     // A store over a recording memory backend, plus the op log for counting
     // backend traffic.
     fn bytes_store(backend: Arc<dyn Backend>) -> TypedCachedStore<Bytes> {
-        CachedStore::new(backend, 1 << 20).typed()
+        CachedStore::new(backend, 1 << 20, Timeline::new()).typed()
     }
 
     fn store_rec() -> (TypedCachedStore<Bytes>, OpLog) {
@@ -1370,7 +1270,7 @@ mod tests {
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        let t = s.now();
+        let t = s.store.timeline.now();
         let o2 = s.read("p", Requirement::AtLeast(t)).await.unwrap();
         assert_eq!(
             count(&log, "read_if_modified"),
@@ -1390,7 +1290,10 @@ mod tests {
     async fn at_least_served_locally_when_watermark_sufficient() {
         let (s, log) = store_rec();
         s.write("p", v(b"a")).await.unwrap();
-        let o = s.read("p", Requirement::AtLeast(s.now())).await.unwrap();
+        let o = s
+            .read("p", Requirement::AtLeast(s.store.timeline.now()))
+            .await
+            .unwrap();
         let w = o.validated_after();
         clear(&log);
 
@@ -1473,7 +1376,7 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         // A stricter bound re-validates and observes the winner.
-        let t = s1.now();
+        let t = s1.store.timeline.now();
         match s1.validate(&obs, t).await.unwrap() {
             Validated::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
             Validated::Unchanged => panic!("a stricter bound must revalidate"),
@@ -1495,7 +1398,7 @@ mod tests {
 
         let observed = local.write("p", v(b"a")).await.unwrap();
         peer.write("p", v(b"b")).await.unwrap();
-        let bound = local.now();
+        let bound = local.store.timeline.now();
         let current = local.read("p", Requirement::AtLeast(bound)).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
 
@@ -1521,7 +1424,7 @@ mod tests {
             .into_observation()
             .unwrap();
 
-        let before = s.now();
+        let before = s.store.timeline.now();
         let nb = s
             .compare_and_swap(&obs, v(b"b"))
             .await
@@ -1556,7 +1459,7 @@ mod tests {
             .unwrap();
         s2.write("p", v(b"b")).await.unwrap();
 
-        let before = s1.now();
+        let before = s1.store.timeline.now();
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
         assert!(!r.committed());
         assert!(
@@ -1586,7 +1489,7 @@ mod tests {
             .unwrap()
             .into_observation()
             .unwrap();
-        let before = s.now();
+        let before = s.store.timeline.now();
 
         // The write lands but its acknowledgement is lost.
         hook.set_after(|op, outcome| {
@@ -1646,14 +1549,14 @@ mod tests {
         let (s, log) = store_rec();
         s.write("p", v(b"a")).await.unwrap();
 
-        let t1 = s.now();
+        let t1 = s.store.timeline.now();
         let w1 = s
             .read("p", Requirement::AtLeast(t1))
             .await
             .unwrap()
             .validated_after();
         assert!(w1 >= t1);
-        let t2 = s.now();
+        let t2 = s.store.timeline.now();
         let w2 = s
             .read("p", Requirement::AtLeast(t2))
             .await
@@ -1688,7 +1591,7 @@ mod tests {
     // A path used through a mismatched typed store is an internal error.
     #[tokio::test]
     async fn wrong_decoded_type_is_internal_error() {
-        let store = CachedStore::new(Arc::new(MemoryBackend::new()), 1 << 20);
+        let store = CachedStore::new(Arc::new(MemoryBackend::new()), 1 << 20, Timeline::new());
         let bytes = store.typed::<Bytes>();
         let ints = store.typed::<Ints>();
         bytes.write("p", v(b"abcd")).await.unwrap();
@@ -1855,14 +1758,14 @@ mod tests {
         // Reader A revalidates at AtLeast(now()); its op start is tA.
         let a = tokio::spawn({
             let s = s.clone();
-            let t = s.now();
+            let t = s.store.timeline.now();
             async move { s.read("p", Requirement::AtLeast(t)).await }
         });
         while entered.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
         }
         // A stricter bound than A's start: it cannot join A's in-flight op.
-        let strict = s.now();
+        let strict = s.store.timeline.now();
         let b = tokio::spawn({
             let s = s.clone();
             async move { s.read("p", Requirement::AtLeast(strict)).await }
@@ -1882,34 +1785,37 @@ mod tests {
 
     #[derive(Default)]
     struct TestClock {
-        nanos: AtomicU64,
+        elapsed: Mutex<Duration>,
     }
 
     impl TestClock {
         fn set(&self, duration: Duration) {
-            self.nanos
-                .store(duration_to_nanos(duration), Ordering::SeqCst);
+            *self.elapsed.lock().unwrap() = duration;
         }
     }
 
-    impl MonotonicClock for TestClock {
+    impl TimeSource for TestClock {
         fn elapsed(&self) -> Duration {
-            Duration::from_nanos(self.nanos.load(Ordering::SeqCst))
+            *self.elapsed.lock().unwrap()
         }
     }
 
     #[test]
-    fn duration_requirement_uses_the_store_clock() {
+    fn duration_requirement_uses_the_timeline() {
         let clock = Arc::new(TestClock::default());
         clock.set(Duration::from_secs(10));
-        let store: TypedCachedStore<Bytes> =
-            CachedStore::with_clock(Arc::new(MemoryBackend::new()), 1 << 20, clock).typed();
+        let timeline = Timeline::with_source(clock);
+        let _store: TypedCachedStore<Bytes> =
+            CachedStore::new(Arc::new(MemoryBackend::new()), 1 << 20, timeline.clone()).typed();
 
         assert_eq!(
-            store.requirement_within(Duration::from_secs(3)),
-            Requirement::AtLeast(Instant(7_000_000_000))
+            Requirement::within(&timeline, Duration::from_secs(3)),
+            Requirement::AtLeast(LogicalTime::from_raw(7_000_000_000))
         );
-        assert_eq!(store.requirement_within(Duration::MAX), Requirement::Any);
+        assert_eq!(
+            Requirement::within(&timeline, Duration::MAX),
+            Requirement::Any
+        );
     }
 
     #[tokio::test]
@@ -1937,15 +1843,16 @@ mod tests {
         });
         let clock = Arc::new(TestClock::default());
         clock.set(Duration::from_secs(1));
+        let timeline = Timeline::with_source(clock.clone());
         let store: TypedCachedStore<Bytes> =
-            CachedStore::with_clock(hooked, 1 << 20, clock.clone()).typed();
+            CachedStore::new(hooked, 1 << 20, timeline.clone()).typed();
         let read_store = store.clone();
         let read =
             tokio::spawn(async move { read_store.read("p", Requirement::Any).await.unwrap() });
         entered.notified().await;
 
         clock.set(Duration::from_secs(100));
-        let later = store.now();
+        let later = timeline.now();
         release.notify_one();
         let observed = read.await.unwrap();
 
@@ -1975,7 +1882,8 @@ mod tests {
                 })
             }
         });
-        let store: TypedCachedStore<Bytes> = CachedStore::new(hooked, 1 << 20).typed();
+        let store: TypedCachedStore<Bytes> =
+            CachedStore::new(hooked, 1 << 20, Timeline::new()).typed();
         let leader = tokio::spawn({
             let store = store.clone();
             async move { store.read("p", Requirement::Any).await }

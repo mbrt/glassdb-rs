@@ -37,6 +37,7 @@ use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
     Directory, LeafObservation, LockScope, LockType, NodeLocks, PathLock, Requirement, ShardEntry,
+    Timeline,
 };
 
 use crate::algo::{Data, WriteOp};
@@ -651,6 +652,8 @@ pub struct Locker {
     coord: ShardCoordinator,
     /// Routes a transaction's keys to their owning leaves by descent (ADR-031).
     dir: Directory,
+    /// Database-local logical time used to capture validation barriers.
+    timeline: Timeline,
     /// Used to park on a conflicting holder during hold-and-wait.
     tmon: Monitor,
     /// Backoff config for the hold-and-wait re-poll cadence.
@@ -672,10 +675,17 @@ impl Locker {
     /// configures the exponential backoff applied between hold-and-wait re-polls
     /// of a conflicting holder, so a wait is never busy-retried (its
     /// `max_interval` caps the re-poll cadence).
-    pub fn new(coord: ShardCoordinator, dir: Directory, tmon: Monitor, retry: RetryConfig) -> Self {
+    pub fn new(
+        coord: ShardCoordinator,
+        dir: Directory,
+        timeline: Timeline,
+        tmon: Monitor,
+        retry: RetryConfig,
+    ) -> Self {
         Locker {
             coord,
             dir,
+            timeline,
             tmon,
             retry,
             tlocks: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
@@ -773,7 +783,7 @@ impl Locker {
     /// first. The held set is read from the coordinator's per-tx bookkeeping.
     /// Idempotent and best-effort.
     pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
-        let requirement = Requirement::AtLeast(self.coord.now());
+        let requirement = Requirement::AtLeast(self.timeline.now());
         for path in self.held_paths(id) {
             let pr = paths::parse(&path).map_err(|e| {
                 TransError::with_source(format!("parsing held lock path {path:?}"), e)
@@ -804,7 +814,7 @@ impl Locker {
     /// reference and are GC write-back hint candidates (ADR-022).
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
         let mut superseded = Vec::new();
-        let requirement = Requirement::AtLeast(self.coord.now());
+        let requirement = Requirement::AtLeast(self.timeline.now());
         for group in locked.groups.values() {
             if let Ok(mut s) = self
                 .write_back_shard(
@@ -846,7 +856,7 @@ impl Locker {
             id,
             leaf_path,
             intents,
-            Requirement::AtLeast(self.coord.now()),
+            Requirement::AtLeast(self.timeline.now()),
         )
         .await
         .unwrap_or_default()
@@ -969,7 +979,7 @@ impl Locker {
     /// dead transaction's leaf holds (ADR-029) without corrupting live
     /// tracking.
     pub(crate) async fn release_leaf(&self, id: &TxId, path: &str) -> Result<(), TransError> {
-        self.release_leaf_at(id, path, Requirement::AtLeast(self.coord.now()))
+        self.release_leaf_at(id, path, Requirement::AtLeast(self.timeline.now()))
             .await
     }
 
@@ -1110,7 +1120,7 @@ mod tests {
     use glassdb_data::paths;
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Node, Shard, ShardEntry, ShardStore, SplitPolicy,
-        TLogger, TxCommitStatus,
+        TLogger, Timeline, TxCommitStatus,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1119,6 +1129,7 @@ mod tests {
 
     struct TlCtx {
         shards: ShardStore,
+        timeline: Timeline,
         monitor: Monitor,
         coord: ShardCoordinator,
         _bg: Arc<Background>,
@@ -1129,26 +1140,35 @@ mod tests {
     }
 
     fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
-        let objects = CachedStore::new(b.clone(), 1024);
-        let tl = TLogger::new(objects.clone(), "test");
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(b.clone(), 1024, timeline.clone());
+        let tl = TLogger::new(objects.clone(), "test", timeline.clone());
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(tl, Arc::downgrade(&bg));
-        let shards = ShardStore::new(objects.clone());
-        let resolver = Resolver::new(shards.clone(), mon.clone());
+        let shards = ShardStore::new(objects.clone(), timeline.clone());
+        let resolver = Resolver::new(shards.clone(), timeline.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
+            timeline.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
             policy,
             Arc::new(crate::shard_coord::NoSplitHints),
         );
-        let locker = Locker::new(coord.clone(), dir, mon.clone(), RetryConfig::default());
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
+            timeline.clone(),
+            mon.clone(),
+            RetryConfig::default(),
+        );
         (
             locker,
             TlCtx {
                 shards,
+                timeline,
                 monitor: mon,
                 coord,
                 _bg: bg,
@@ -1206,7 +1226,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(COLL),
-                Requirement::AtLeast(ctx.shards.now()),
+                Requirement::AtLeast(ctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1216,7 +1236,12 @@ mod tests {
     // Acquires shard locks in parallel mode, asserting success.
     async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
         match locker
-            .lock_shards_at(id, groups, false, Requirement::AtLeast(locker.coord.now()))
+            .lock_shards_at(
+                id,
+                groups,
+                false,
+                Requirement::AtLeast(locker.timeline.now()),
+            )
             .await
             .unwrap()
         {
@@ -1245,7 +1270,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(COLL),
-                Requirement::AtLeast(ctx.shards.now()),
+                Requirement::AtLeast(ctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1296,7 +1321,7 @@ mod tests {
                 &tx,
                 &group_of(b"z", put_intent(b"z")),
                 false,
-                Requirement::AtLeast(locker.coord.now()),
+                Requirement::AtLeast(locker.timeline.now()),
             )
             .await
             .unwrap();
@@ -1306,7 +1331,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(COLL),
-                Requirement::AtLeast(ctx.shards.now()),
+                Requirement::AtLeast(ctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1327,7 +1352,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(COLL),
-                Requirement::AtLeast(ctx.shards.now()),
+                Requirement::AtLeast(ctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1354,7 +1379,7 @@ mod tests {
         let path = paths::collection_info(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
+            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
@@ -1364,7 +1389,7 @@ mod tests {
         locker.release_leaf(&tx, &path).await.unwrap();
         let loaded = ctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
+            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
@@ -1442,7 +1467,7 @@ mod tests {
                     &young2,
                     &groups,
                     false,
-                    Requirement::AtLeast(locker2.coord.now()),
+                    Requirement::AtLeast(locker2.timeline.now()),
                 )
                 .await
         });
@@ -1494,7 +1519,7 @@ mod tests {
                     &young2,
                     &groups,
                     false,
-                    Requirement::AtLeast(locker2.coord.now()),
+                    Requirement::AtLeast(locker2.timeline.now()),
                 )
                 .await
         });
@@ -1565,7 +1590,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(COLL),
-                Requirement::AtLeast(ctx.shards.now()),
+                Requirement::AtLeast(ctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1620,7 +1645,12 @@ mod tests {
             scans: Vec::new(),
         };
         let out = locker
-            .lock_at(&tx, &data, false, Requirement::AtLeast(locker.dir.now()))
+            .lock_at(
+                &tx,
+                &data,
+                false,
+                Requirement::AtLeast(locker.timeline.now()),
+            )
             .await
             .unwrap();
         assert!(matches!(out, LockOutcome::Locked(_)));
@@ -1680,7 +1710,7 @@ mod tests {
         let path = paths::collection_info(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(ctx.shards.now()))
+            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -1814,11 +1844,11 @@ mod tests {
         let g1 = group_of(key, read_intent(key));
         let g2 = group_of(key, read_intent(key));
         let h1 = tokio::spawn(async move {
-            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.coord.now()))
+            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.timeline.now()))
                 .await
         });
         let h2 = tokio::spawn(async move {
-            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.coord.now()))
+            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.timeline.now()))
                 .await
         });
 
@@ -1868,11 +1898,11 @@ mod tests {
         let g1 = group_of(&ka, put_intent(&ka));
         let g2 = group_of(&kb, put_intent(&kb));
         let h1 = tokio::spawn(async move {
-            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.coord.now()))
+            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.timeline.now()))
                 .await
         });
         let h2 = tokio::spawn(async move {
-            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.coord.now()))
+            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.timeline.now()))
                 .await
         });
 
@@ -1918,7 +1948,7 @@ mod tests {
                     &waiting_id,
                     &waiting_group,
                     false,
-                    Requirement::AtLeast(waiting_locker.coord.now()),
+                    Requirement::AtLeast(waiting_locker.timeline.now()),
                 )
                 .await
         });
@@ -2021,7 +2051,7 @@ mod tests {
         // queues and is absorbed once the load returns.
         let hw = tokio::spawn(async move { l1.write_back(&t1, &lt1).await });
         let ha = tokio::spawn(async move {
-            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.coord.now()))
+            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.timeline.now()))
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -2105,11 +2135,11 @@ mod tests {
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
-            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.coord.now()))
+            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.timeline.now()))
                 .await
         });
         let hy = tokio::spawn(async move {
-            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.coord.now()))
+            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.timeline.now()))
                 .await
         });
 
@@ -2164,11 +2194,11 @@ mod tests {
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
-            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.coord.now()))
+            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.timeline.now()))
                 .await
         });
         let hy = tokio::spawn(async move {
-            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.coord.now()))
+            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.timeline.now()))
                 .await
         });
 
@@ -2218,11 +2248,11 @@ mod tests {
         let ga = group_of(key, put_intent(key));
         let gb = group_of(key, put_intent(key));
         let ha = tokio::spawn(async move {
-            la.lock_shards_at(&ta, &ga, false, Requirement::AtLeast(la.coord.now()))
+            la.lock_shards_at(&ta, &ga, false, Requirement::AtLeast(la.timeline.now()))
                 .await
         });
         let hb = tokio::spawn(async move {
-            lb.lock_shards_at(&tb, &gb, false, Requirement::AtLeast(lb.coord.now()))
+            lb.lock_shards_at(&tb, &gb, false, Requirement::AtLeast(lb.timeline.now()))
                 .await
         });
 
@@ -2284,7 +2314,7 @@ mod tests {
             let (cw, ca) = (committer.clone(), acquirer.clone());
             let hw = tokio::spawn(async move { lw.write_back(&cw, &lt).await });
             let ha = tokio::spawn(async move {
-                la.lock_shards_at(&ca, &g, false, Requirement::AtLeast(la.coord.now()))
+                la.lock_shards_at(&ca, &g, false, Requirement::AtLeast(la.timeline.now()))
                     .await
             });
             rt::sleep(Duration::from_millis(50)).await;
@@ -2338,7 +2368,7 @@ mod tests {
                 &tx,
                 &group_of(b"key2", put_intent(b"key2")),
                 false,
-                Requirement::AtLeast(locker.coord.now()),
+                Requirement::AtLeast(locker.timeline.now()),
             )
             .await;
         assert!(err.is_err(), "locking after close is cancelled");
@@ -2363,7 +2393,7 @@ mod tests {
         let y = young.clone();
         let g = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
-            l.lock_shards_at(&y, &g, false, Requirement::AtLeast(l.coord.now()))
+            l.lock_shards_at(&y, &g, false, Requirement::AtLeast(l.timeline.now()))
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;

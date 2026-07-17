@@ -12,20 +12,20 @@ use std::sync::Arc;
 use glassdb_backend as backend;
 use glassdb_data::paths;
 
-use crate::cached_store::{
-    CachedStore, CasResult, Codec, Instant, Observation, Requirement, Validated,
-};
+use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement, Validated};
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
+use crate::timeline::{LogicalTime, Timeline};
 
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 
 /// Reads and compare-and-swaps B-link node and collection-root objects.
 #[derive(Clone)]
 pub struct ShardStore {
+    timeline: Timeline,
     roots: crate::cached_store::TypedCachedStore<CollectionRoot>,
     nodes: crate::cached_store::TypedCachedStore<Node>,
     structural_logs: crate::cached_store::TypedCachedStore<StructuralLog>,
@@ -215,30 +215,22 @@ impl Codec for StructuralLog {
 }
 
 impl ShardStore {
-    /// Creates a shard store that reads and compare-and-swaps through `objects`.
-    pub fn new(objects: CachedStore) -> Self {
+    /// Creates a shard store that reads and compare-and-swaps through `objects`,
+    /// using `timeline` for its freshness requirements.
+    pub fn new(objects: CachedStore, timeline: Timeline) -> Self {
         ShardStore {
+            timeline,
             roots: objects.typed(),
             nodes: objects.typed(),
             structural_logs: objects.typed(),
         }
     }
 
-    /// Returns the current instant on the shared object store's clock.
-    pub fn now(&self) -> Instant {
-        self.roots.now()
-    }
-
-    /// Builds a freshness requirement for a duration-bounded stale read.
-    pub fn requirement_within(&self, max_staleness: std::time::Duration) -> Requirement {
-        self.roots.requirement_within(max_staleness)
-    }
-
     /// Validates a retained leaf observation after `bound`.
     pub async fn validate_leaf(
         &self,
         observed: &LeafObservation,
-        bound: Instant,
+        bound: LogicalTime,
     ) -> Result<LeafValidation, StorageError> {
         match observed {
             LeafObservation::Root(root) => match self.roots.validate(root, bound).await? {
@@ -391,7 +383,7 @@ impl ShardStore {
                     .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
                 let observed = self
                     .structural_logs
-                    .read(&path, Requirement::AtLeast(self.now()))
+                    .read(&path, Requirement::AtLeast(self.timeline.now()))
                     .await?;
                 if let Some(record) = observed.value() {
                     records.push((record_id, record.as_ref().clone()));
@@ -542,7 +534,7 @@ impl ShardStore {
             .roots
             .read(
                 &paths::collection_info(prefix),
-                Requirement::AtLeast(self.now()),
+                Requirement::AtLeast(self.timeline.now()),
             )
             .await?;
         let root = observed
@@ -610,7 +602,11 @@ mod tests {
     const COLL: &str = "coll";
 
     fn store_over(backend: Arc<dyn Backend>) -> ShardStore {
-        ShardStore::new(CachedStore::new(backend, 1 << 20))
+        let timeline = Timeline::new();
+        ShardStore::new(
+            CachedStore::new(backend, 1 << 20, timeline.clone()),
+            timeline,
+        )
     }
 
     fn count(log: &OpLog, op: &str) -> usize {
@@ -644,7 +640,7 @@ mod tests {
 
         let reader = store_over(backend.clone());
         let v1 = reader
-            .load_leaf(&path, Requirement::AtLeast(reader.now()))
+            .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap()
             .observation;
@@ -652,7 +648,7 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         let v2 = reader
-            .load_leaf(&path, Requirement::AtLeast(reader.now()))
+            .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap()
             .observation;
@@ -683,7 +679,7 @@ mod tests {
         let reader = store_over(backend.clone());
         // Warm the cache with one cold full read.
         reader
-            .load_leaf(&path, Requirement::AtLeast(reader.now()))
+            .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap();
         assert_eq!(count(&log, "read"), 1);
@@ -711,7 +707,7 @@ mod tests {
         let path = paths::from_node(COLL, "tok");
 
         let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
         assert!(
@@ -727,7 +723,7 @@ mod tests {
                 .unwrap()
         );
         let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
         let v1 = loaded.observation.clone();
@@ -741,7 +737,7 @@ mod tests {
                 .unwrap()
         );
         let v2 = store
-            .load_leaf(&path, Requirement::AtLeast(store.now()))
+            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap()
             .observation;

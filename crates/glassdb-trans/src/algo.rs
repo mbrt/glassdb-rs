@@ -30,8 +30,9 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    Instant, LeafObservation, LeafValidation, LockScope, LockType, NodeLocks, PathLock,
-    Requirement, ShardEntry, ShardStore, SplitPolicy, StorageError, TxCommitStatus, TxLog, TxWrite,
+    LeafObservation, LeafValidation, LockScope, LockType, LogicalTime, NodeLocks, PathLock,
+    Requirement, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus,
+    TxLog, TxWrite,
 };
 
 use crate::error::TransError;
@@ -472,6 +473,7 @@ pub struct Algo {
     mon: Monitor,
     gc: Gc,
     clock: Clock,
+    timeline: Timeline,
     split_policy: SplitPolicy,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
@@ -479,12 +481,13 @@ pub struct Algo {
 }
 
 impl Algo {
-    /// Creates an algorithm coordinator. `clock` is the wall-clock source for
-    /// transaction-id timestamps; pass the same clock the monitor uses so
-    /// priorities and lease timing share one time base.
+    /// Creates an algorithm coordinator. Validation barriers use `timeline`;
+    /// `clock` is the wall-clock source for transaction-id timestamps and must
+    /// match the monitor's clock so priorities and lease timing share one base.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shards: ShardStore,
+        timeline: Timeline,
         locker: Locker,
         coord: ShardCoordinator,
         mon: Monitor,
@@ -502,6 +505,7 @@ impl Algo {
             mon,
             gc,
             clock,
+            timeline,
             split_policy,
             background,
         }
@@ -577,7 +581,7 @@ impl Algo {
         if tx.should_lock_reads() {
             return self.validate_locked_reads(tx).await;
         }
-        let validation_start = self.shards.now();
+        let validation_start = self.timeline.now();
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
@@ -652,7 +656,7 @@ impl Algo {
     ///
     /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
-        let validation_start = self.shards.now();
+        let validation_start = self.timeline.now();
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
@@ -672,7 +676,7 @@ impl Algo {
             tx.engaged = true;
         }
 
-        let validation_start = self.shards.now();
+        let validation_start = self.timeline.now();
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(l) => l,
             // A higher-priority peer aborted us: renew the id and re-run.
@@ -730,7 +734,7 @@ impl Algo {
             tx.status = Status::Validating;
             tx.engaged = true;
         }
-        let validation_start = self.shards.now();
+        let validation_start = self.timeline.now();
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return self.restart(tx).await,
@@ -1074,7 +1078,7 @@ impl Algo {
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
-        validation_start: Instant,
+        validation_start: LogicalTime,
     ) -> Result<Acquired, TransError> {
         let mut serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
         let mut conflicts: usize = 0;
@@ -1174,7 +1178,7 @@ impl Algo {
         &self,
         data: &Data,
         context: ValidationContext<'_>,
-        validation_start: Instant,
+        validation_start: LogicalTime,
     ) -> Result<bool, TransError> {
         let lock_validation = context.lock_validation();
         let physical_reads_valid = self
@@ -1196,7 +1200,7 @@ impl Algo {
     async fn validate_read_observations(
         &self,
         data: &Data,
-        validation_start: Instant,
+        validation_start: LogicalTime,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         for read in &data.reads {
@@ -1222,7 +1226,7 @@ impl Algo {
     async fn validate_scan_observations(
         &self,
         data: &Data,
-        validation_start: Instant,
+        validation_start: LogicalTime,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         for coverage in data.scans.iter().flat_map(|scan| &scan.covered) {
@@ -1282,7 +1286,7 @@ impl Algo {
         &self,
         data: &Data,
         own_lock_holder: Option<&TxId>,
-        validation_start: Instant,
+        validation_start: LogicalTime,
     ) -> Result<bool, TransError> {
         let requirement = Requirement::AtLeast(validation_start);
         for scan in &data.scans {
@@ -1400,6 +1404,7 @@ mod tests {
         tlogger: TLogger,
         tmon: Monitor,
         shards: ShardStore,
+        timeline: Timeline,
         locker: Locker,
     }
 
@@ -1415,31 +1420,40 @@ mod tests {
         b: Arc<dyn Backend>,
         cache_bytes: usize,
     ) -> (Algo, Tctx) {
-        let objects = CachedStore::new(b.clone(), cache_bytes);
-        let tlogger = TLogger::new(objects.clone(), TEST_COLL);
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone());
+        let tlogger = TLogger::new(objects.clone(), TEST_COLL, timeline.clone());
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         // Leak the background so spawned async aborts can run for the test's
         // lifetime without us threading the owner through every helper.
         std::mem::forget(bg);
         let tmon = Monitor::new(tlogger.clone(), bg_weak.clone());
-        let shards = ShardStore::new(objects.clone());
-        let resolver = Resolver::new(shards.clone(), tmon.clone());
+        let shards = ShardStore::new(objects.clone(), timeline.clone());
+        let resolver = Resolver::new(shards.clone(), timeline.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         let (coord, _splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             shards.clone(),
+            timeline.clone(),
             tmon.clone(),
             Clock::real(),
             RetryConfig::default(),
             TEST_COLL,
             glassdb_storage::SplitPolicy::default(),
         );
-        let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
+            timeline.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+        );
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
             shards.clone(),
+            timeline.clone(),
             locker.clone(),
             tmon.clone(),
             Clock::real(),
@@ -1453,6 +1467,7 @@ mod tests {
 
         let algo = Algo::new(
             shards.clone(),
+            timeline.clone(),
             locker.clone(),
             coord.clone(),
             tmon.clone(),
@@ -1469,6 +1484,7 @@ mod tests {
                 tlogger,
                 tmon,
                 shards,
+                timeline,
                 locker,
             },
         )
@@ -1484,7 +1500,11 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
         let reader = Reader::new(
-            Resolver::new(tctx.shards.clone(), tctx.tmon.clone()),
+            Resolver::new(
+                tctx.shards.clone(),
+                tctx.timeline.clone(),
+                tctx.tmon.clone(),
+            ),
             RetryConfig::default(),
         );
         match reader.read(path, Duration::MAX).await {
@@ -1521,7 +1541,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(TEST_COLL),
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1749,7 +1769,7 @@ mod tests {
                     scans: Vec::new(),
                 },
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -1999,7 +2019,7 @@ mod tests {
             scans: Vec::new(),
         };
         let tb = txb.clone();
-        let lock_requirement = Requirement::AtLeast(tctx.shards.now());
+        let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
         let acquire =
             tokio::spawn(async move { cb.lock_at(&tb, &data_b, false, lock_requirement).await });
 
@@ -2090,7 +2110,7 @@ mod tests {
             scans: Vec::new(),
         };
         let tb = txb.clone();
-        let lock_requirement = Requirement::AtLeast(tctx.shards.now());
+        let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
         let acquire =
             tokio::spawn(async move { cb.lock_at(&tb, &data_b, false, lock_requirement).await });
 
@@ -2366,7 +2386,7 @@ mod tests {
         // held by the committed H1 while the pointer lags at its predecessor H0.
         let loaded = tctx
             .shards
-            .load_leaf(&leaf_path, Requirement::AtLeast(tctx.shards.now()))
+            .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         let windowed = Shard::from_entries(loaded.entries.entries().cloned().map(|mut e| {
@@ -2399,7 +2419,7 @@ mod tests {
         // Eligibility mirrors that resolution: given the reconciled lock state,
         // an RMW that read H1 and a blind put are both committable and build on
         // H1, while a read of the superseded H0 is still rejected as stale.
-        let requirement = Requirement::AtLeast(tm.resolver.now());
+        let requirement = Requirement::AtLeast(tm.timeline.now());
         let (_, locator) = tm.resolver.resolve_key(&keyp, requirement).await.unwrap();
         let resolved_entry = locator.node().unwrap().as_leaf().unwrap().lookup(&raw);
         let res = resolve_entry_locks_at(
@@ -2659,7 +2679,7 @@ mod tests {
                 &holder,
                 &holder_data,
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap()
@@ -2675,7 +2695,7 @@ mod tests {
             writes: Vec::new(),
             scans: Vec::new(),
         };
-        let validation_start = tctx.shards.now();
+        let validation_start = tctx.timeline.now();
 
         // Finalize only the transaction object. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
@@ -2726,7 +2746,7 @@ mod tests {
                 &holder,
                 &holder_data,
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap()
@@ -2742,7 +2762,7 @@ mod tests {
             writes: Vec::new(),
             scans: Vec::new(),
         };
-        let validation_start = tctx.shards.now();
+        let validation_start = tctx.timeline.now();
 
         // Aborting the holder leaves the previously observed writer effective.
         // The exclusive holder prevents a physical shortcut, then writer
@@ -2769,7 +2789,7 @@ mod tests {
 
         let read = do_read(&tctx, &ka).await;
         let observed = read.leaf.clone();
-        let validation_start = tctx.shards.now();
+        let validation_start = tctx.timeline.now();
 
         // Another transaction's disjoint lock CAS validates the same pre-CAS
         // leaf after our barrier and therefore advances its shared evidence.
@@ -2786,7 +2806,7 @@ mod tests {
                 &other,
                 &other_data,
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap()
@@ -2811,7 +2831,7 @@ mod tests {
                 &current,
                 &current_data,
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap()
@@ -2838,15 +2858,19 @@ mod tests {
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         let read = do_read(&tctx, &ka).await;
-        let validation_start = tctx.shards.now();
+        let validation_start = tctx.timeline.now();
 
         // A separate client rewrites the shared leaf for B. Its cache is
         // independent, so it cannot advance the retained observation of A in
         // this database.
-        let external = ShardStore::new(CachedStore::new(tctx.backend.clone(), 1 << 20));
+        let external_timeline = Timeline::new();
+        let external = ShardStore::new(
+            CachedStore::new(tctx.backend.clone(), 1 << 20, external_timeline.clone()),
+            external_timeline.clone(),
+        );
         let leaf_path = paths::collection_info(TEST_COLL);
         let loaded = external
-            .load_leaf(&leaf_path, Requirement::AtLeast(external.now()))
+            .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -2886,7 +2910,7 @@ mod tests {
                 &other,
                 &other_data,
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap()
@@ -3040,7 +3064,7 @@ mod tests {
         let path = paths::collection_info(TEST_COLL);
         let loaded = tctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(tctx.shards.now()))
+            .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         let mut entries: std::collections::BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -3081,7 +3105,11 @@ mod tests {
     // test collection, returning the scan's live keys alongside so a test can
     // assert on the snapshot and later re-validate the same coverage.
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
-        let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
+        let resolver = Resolver::new(
+            tctx.shards.clone(),
+            tctx.timeline.clone(),
+            tctx.tmon.clone(),
+        );
         let scan = resolver
             .scan_keys(TEST_COLL, &range, &[], None, None)
             .await
@@ -3170,7 +3198,7 @@ mod tests {
                 &holder,
                 &holder_data,
                 false,
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap()
@@ -3355,7 +3383,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(TEST_COLL),
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap();
@@ -3374,7 +3402,7 @@ mod tests {
         // leaf S1, bumping its version.
         let (s1, ver) = tctx
             .shards
-            .load_node(TEST_COLL, "S1", Requirement::AtLeast(tctx.shards.now()))
+            .load_node(TEST_COLL, "S1", Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         let mut entries: Vec<ShardEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
@@ -3410,7 +3438,7 @@ mod tests {
             .shards
             .load_leaf(
                 &paths::collection_info(TEST_COLL),
-                Requirement::AtLeast(tctx.shards.now()),
+                Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
             .unwrap();

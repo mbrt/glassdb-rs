@@ -105,7 +105,7 @@ pub(crate) async fn resolve_entry_locks(
         key_path,
         entry,
         own_lock_holder,
-        Requirement::AtLeast(ctx.resolver.now()),
+        Requirement::AtLeast(ctx.timeline.now()),
     )
     .await
 }

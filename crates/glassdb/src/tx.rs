@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::RetryConfig;
 use glassdb_data::{TxId, paths};
-use glassdb_storage::{LeafObservation, ShardStore};
+use glassdb_storage::{LeafObservation, ShardStore, Timeline};
 use glassdb_trans::{Data, ReadAccess, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess};
 
 use crate::collection::Collection;
@@ -195,10 +195,11 @@ impl Transaction {
 
     pub(crate) fn new(
         shards: ShardStore,
+        timeline: Timeline,
         tmon: glassdb_trans::Monitor,
         retry: RetryConfig,
     ) -> Self {
-        let resolver = Resolver::new(shards, tmon);
+        let resolver = Resolver::new(shards, timeline, tmon);
         Transaction {
             reader: Reader::new(resolver.clone(), retry),
             resolver,

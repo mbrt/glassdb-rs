@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    Instant, Observation, PathLock, Requirement, StorageError, TLogger, TValue, TxCommitStatus,
+    LogicalTime, Observation, PathLock, Requirement, StorageError, TLogger, TValue, TxCommitStatus,
     TxLog, TxStatus,
 };
 use hashlink::LinkedHashMap;
@@ -74,7 +74,7 @@ struct TxStatusEntry {
 #[derive(Clone, Copy)]
 struct FinalStatus {
     status: TxCommitStatus,
-    watermark: Instant,
+    watermark: LogicalTime,
 }
 
 struct FinalStatusCache {
@@ -339,7 +339,11 @@ impl Monitor {
 
     /// Returns whether `tid` is committed using transaction-state evidence no
     /// older than `at`.
-    pub(crate) async fn committed_at(&self, tid: &TxId, at: Instant) -> Result<bool, TransError> {
+    pub(crate) async fn committed_at(
+        &self,
+        tid: &TxId,
+        at: LogicalTime,
+    ) -> Result<bool, TransError> {
         Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
     }
 
@@ -974,7 +978,7 @@ mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, LockScope, LockType, PathLock, TxWrite};
+    use glassdb_storage::{CachedStore, LockScope, LockType, PathLock, Timeline, TxWrite};
 
     struct TestCtx {
         tl: TLogger,
@@ -992,8 +996,9 @@ mod tests {
     }
 
     fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
-        let objects = CachedStore::new(b, 1024);
-        let tl = TLogger::new(objects.clone(), "test");
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(b, 1024, timeline.clone());
+        let tl = TLogger::new(objects.clone(), "test", timeline);
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl.clone(),
@@ -1006,8 +1011,8 @@ mod tests {
 
     #[test]
     fn final_status_cache_is_count_bounded_and_lru() {
-        let objects = CachedStore::new(Arc::new(MemoryBackend::new()), 1024);
-        let watermark = objects.now();
+        let timeline = Timeline::new();
+        let watermark = timeline.now();
         let mut cache = FinalStatusCache::new(2);
         let first = TxId::from_bytes(b"first".to_vec());
         let second = TxId::from_bytes(b"second".to_vec());

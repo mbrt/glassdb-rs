@@ -13,7 +13,6 @@
 //! never mutates the tree. Splitting and locking live above it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use glassdb_data::paths;
 
@@ -93,16 +92,6 @@ impl Directory {
     /// Creates a directory that reads nodes through `shards`.
     pub fn new(shards: ShardStore) -> Self {
         Directory { shards }
-    }
-
-    /// Returns the current instant on the shared object store's clock.
-    pub fn now(&self) -> crate::Instant {
-        self.shards.now()
-    }
-
-    /// Builds a freshness requirement against the directory's shared clock.
-    pub fn requirement_within(&self, max_staleness: Duration) -> Requirement {
-        self.shards.requirement_within(max_staleness)
     }
 
     /// Resolves the leaf that owns `key`, descending from the root `_i` and
@@ -565,6 +554,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
 
+    use crate::Timeline;
     use crate::cached_store::CachedStore;
     use crate::lock::LockType;
     use crate::node::{IndexNode, Node};
@@ -575,11 +565,31 @@ mod tests {
 
     const COLL: &str = "db/coll";
 
-    fn store() -> ShardStore {
-        ShardStore::new(CachedStore::new(
-            Arc::new(MemoryBackend::new()) as Arc<dyn Backend>,
-            1 << 20,
-        ))
+    #[derive(Clone)]
+    struct TestStore {
+        shards: ShardStore,
+        timeline: Timeline,
+    }
+
+    impl std::ops::Deref for TestStore {
+        type Target = ShardStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.shards
+        }
+    }
+
+    fn store() -> TestStore {
+        store_over(Arc::new(MemoryBackend::new()))
+    }
+
+    fn store_over(backend: Arc<dyn Backend>) -> TestStore {
+        let timeline = Timeline::new();
+        let shards = ShardStore::new(
+            CachedStore::new(backend, 1 << 20, timeline.clone()),
+            timeline.clone(),
+        );
+        TestStore { shards, timeline }
     }
 
     fn live(key: &[u8]) -> ShardEntry {
@@ -627,9 +637,9 @@ mod tests {
         root.set_node(Node::leaf(Shard::from_entries([live(b"only")])));
         s.create_root(COLL, &root).await.unwrap();
 
-        let dir = Directory::new(s);
+        let dir = Directory::new(s.shards.clone());
         let loc = dir
-            .leaf_for(COLL, b"only", Requirement::AtLeast(dir.now()))
+            .leaf_for(COLL, b"only", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(loc.path, paths::collection_info(COLL));
@@ -639,9 +649,10 @@ mod tests {
 
     #[tokio::test]
     async fn absent_collection_routes_to_uncreated_root_leaf() {
-        let dir = Directory::new(store());
+        let s = store();
+        let dir = Directory::new(s.shards.clone());
         let loc = dir
-            .leaf_for(COLL, b"k", Requirement::AtLeast(dir.now()))
+            .leaf_for(COLL, b"k", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(loc.path, paths::collection_info(COLL));
@@ -649,7 +660,7 @@ mod tests {
         assert!(loc.node().is_none());
         // Listing an absent collection yields no leaves.
         assert!(
-            dir.leaves(COLL, Requirement::AtLeast(dir.now()))
+            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .is_empty()
@@ -660,7 +671,7 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s);
+        let dir = Directory::new(s.shards.clone());
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), "_n/L0"),
@@ -670,7 +681,7 @@ mod tests {
             (b"zebra", "_n/L1"),
         ] {
             let loc = dir
-                .leaf_for(COLL, key, Requirement::AtLeast(dir.now()))
+                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(
@@ -705,9 +716,9 @@ mod tests {
         )])));
         s.create_root(COLL, &root).await.unwrap();
 
-        let dir = Directory::new(s);
+        let dir = Directory::new(s.shards.clone());
         let loc = dir
-            .leaf_for(COLL, b"pear", Requirement::AtLeast(dir.now()))
+            .leaf_for(COLL, b"pear", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert!(
@@ -721,17 +732,17 @@ mod tests {
     async fn leaves_are_returned_in_key_order() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s);
+        let dir = Directory::new(s.shards.clone());
 
         let leaves = dir
-            .leaves(COLL, Requirement::AtLeast(dir.now()))
+            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         let paths: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["db/coll/_n/L0", "db/coll/_n/L1"]);
 
         let leftmost = dir
-            .leftmost_leaf(COLL, Requirement::AtLeast(dir.now()))
+            .leftmost_leaf(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert!(leftmost.unwrap().path.ends_with("_n/L0"));
@@ -745,16 +756,16 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log: OpLog = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let s = ShardStore::new(CachedStore::new(backend, 1 << 20));
+        let s = store_over(backend);
         seed_two_level(&s).await;
-        let dir = Directory::new(s);
+        let dir = Directory::new(s.shards.clone());
 
         // Warm the cache with a first descent, then measure only the steady state.
         dir.leaf_for_fresh(
             COLL,
             b"apple",
             Requirement::Any,
-            Requirement::AtLeast(dir.now()),
+            Requirement::AtLeast(s.timeline.now()),
         )
         .await
         .unwrap();
@@ -766,7 +777,7 @@ mod tests {
                     COLL,
                     b"apple",
                     Requirement::Any,
-                    Requirement::AtLeast(dir.now()),
+                    Requirement::AtLeast(s.timeline.now()),
                 )
                 .await
                 .unwrap();
@@ -803,8 +814,8 @@ mod tests {
     #[tokio::test]
     async fn stale_root_leaf_cache_still_descends_after_root_split() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let s_a = ShardStore::new(CachedStore::new(backend.clone(), 1 << 20));
-        let s_b = ShardStore::new(CachedStore::new(backend, 1 << 20));
+        let s_a = store_over(backend.clone());
+        let s_b = store_over(backend);
 
         // A single-leaf collection: the root `_i` holds the leaf directly.
         let mut root = CollectionRoot::new();
@@ -812,7 +823,7 @@ mod tests {
         s_b.create_root(COLL, &root).await.unwrap();
 
         // Process A warms its cache with the root-as-leaf (stale requirement).
-        let dir_a = Directory::new(s_a.clone());
+        let dir_a = Directory::new(s_a.shards.clone());
         let warm = dir_a
             .leaf_for_fresh(COLL, b"a", Requirement::Any, Requirement::Any)
             .await
@@ -844,7 +855,7 @@ mod tests {
                 COLL,
                 b"a",
                 Requirement::Any,
-                Requirement::AtLeast(dir_a.now()),
+                Requirement::AtLeast(s_a.timeline.now()),
             )
             .await
             .unwrap();
@@ -864,11 +875,11 @@ mod tests {
     async fn parent_index_for_finds_leaf_parent_and_none_for_single_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s.clone());
+        let dir = Directory::new(s.shards.clone());
 
         // The parent of any key's leaf is the root index `_i`.
         let parent = dir
-            .parent_index_for(COLL, b"mango", Requirement::AtLeast(dir.now()))
+            .parent_index_for(COLL, b"mango", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap()
             .expect("a two-level tree has an index parent");
@@ -880,10 +891,10 @@ mod tests {
         let mut root = CollectionRoot::new();
         root.set_node(Node::leaf(Shard::from_entries([live(b"only")])));
         single.create_root(COLL, &root).await.unwrap();
-        let single_dir = Directory::new(single);
+        let single_dir = Directory::new(single.shards.clone());
         assert!(
             single_dir
-                .parent_index_for(COLL, b"only", Requirement::AtLeast(single_dir.now()))
+                .parent_index_for(COLL, b"only", Requirement::AtLeast(single.timeline.now()))
                 .await
                 .unwrap()
                 .is_none()
@@ -894,7 +905,7 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s);
+        let dir = Directory::new(s.shards.clone());
 
         let groups = dir
             .group_keys_by_leaf(
@@ -903,7 +914,7 @@ mod tests {
                     (paths::from_key(COLL, b"mango"), 'm'),
                     (paths::from_key(COLL, b"apple"), 'a'),
                 ],
-                Requirement::AtLeast(dir.now()),
+                Requirement::AtLeast(s.timeline.now()),
             )
             .await
             .unwrap();

@@ -12,6 +12,7 @@ use glassdb_data::{TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
+use crate::Timeline;
 use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
 use crate::lock::LockType;
@@ -119,6 +120,7 @@ impl std::fmt::Display for LockScope {
 #[derive(Clone)]
 pub struct TLogger {
     prefix: String,
+    timeline: Timeline,
     logs: crate::cached_store::TypedCachedStore<TxLog>,
 }
 
@@ -162,9 +164,10 @@ impl Codec for TxLog {
 
 impl TLogger {
     /// Creates a logger storing logs under `prefix`.
-    pub fn new(objects: CachedStore, prefix: impl Into<String>) -> Self {
+    pub fn new(objects: CachedStore, prefix: impl Into<String>, timeline: Timeline) -> Self {
         TLogger {
             prefix: prefix.into(),
+            timeline,
             logs: objects.typed(),
         }
     }
@@ -173,7 +176,7 @@ impl TLogger {
     /// possible. The status and timestamp are read from the transaction object
     /// body (ADR-019); an absent object means the transaction is unknown.
     pub async fn commit_status(&self, id: &TxId) -> Result<TxStatus, StorageError> {
-        self.commit_status_at(id, Requirement::AtLeast(self.logs.now()))
+        self.commit_status_at(id, Requirement::AtLeast(self.timeline.now()))
             .await
     }
 
@@ -208,7 +211,8 @@ impl TLogger {
     /// cannot change after commit or abort. Pending objects still honor the
     /// requested generic requirement bound.
     pub async fn get(&self, id: &TxId) -> Result<Observation<TxLog>, StorageError> {
-        self.get_at(id, Requirement::AtLeast(self.logs.now())).await
+        self.get_at(id, Requirement::AtLeast(self.timeline.now()))
+            .await
     }
 
     /// Reads the full transaction object with an explicit requirement bound.
@@ -542,8 +546,9 @@ mod tests {
 
     fn new_tlogger() -> TLogger {
         let backend = Arc::new(MemoryBackend::new());
-        let objects = CachedStore::new(backend, 1 << 20);
-        TLogger::new(objects, "db")
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        TLogger::new(objects, "db", timeline)
     }
 
     #[tokio::test]
@@ -631,8 +636,9 @@ mod tests {
     async fn finalized_logs_are_served_from_the_typed_cache() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
-        let objects = CachedStore::new(Arc::new(backend), 1 << 20);
-        let logger = TLogger::new(objects, "db");
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone());
+        let logger = TLogger::new(objects, "db", timeline);
         let id = TxId::from_bytes(vec![4, 3, 2, 1]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
@@ -656,8 +662,9 @@ mod tests {
     async fn pending_logs_still_obey_generic_freshness() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
-        let objects = CachedStore::new(Arc::new(backend), 1 << 20);
-        let logger = TLogger::new(objects, "db");
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone());
+        let logger = TLogger::new(objects, "db", timeline);
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))

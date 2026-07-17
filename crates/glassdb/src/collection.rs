@@ -37,7 +37,11 @@ impl Collection {
     ) -> Result<Option<Vec<u8>>, Error> {
         let p = paths::from_key(&self.prefix, key);
         let r = Reader::new(
-            Resolver::new(self.db.shards.clone(), self.db.tmon.clone()),
+            Resolver::new(
+                self.db.shards.clone(),
+                self.db.timeline.clone(),
+                self.db.tmon.clone(),
+            ),
             self.db.retry,
         );
         match r.read(&p, max_staleness).await {
