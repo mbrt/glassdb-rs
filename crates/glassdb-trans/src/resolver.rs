@@ -370,33 +370,6 @@ impl Resolver {
         Ok(out)
     }
 
-    /// Returns the effective committed writer of a single `key`.
-    #[cfg(test)]
-    async fn effective_writer(&self, key: &str) -> Result<Option<TxId>, StorageError> {
-        let (prefix, raw_key) =
-            paths::split_key(key).map_err(|e| StorageError::with_source("parsing key path", e))?;
-        let loc = self
-            .dir
-            .leaf_for(&prefix, &raw_key, Requirement::AtLeast(self.dir.now()))
-            .await?;
-        let leaf = loc
-            .node()
-            .map(|node| {
-                node.as_leaf()
-                    .ok_or_else(|| StorageError::other("descent resolved a non-leaf node"))
-            })
-            .transpose()?;
-        let resolved = self
-            .resolve_writer_at(
-                key,
-                leaf.and_then(|leaf| leaf.lookup(&raw_key)),
-                Requirement::AtLeast(self.dir.now()),
-            )
-            .await
-            .map_err(trans_to_storage)?;
-        Ok(resolved.writer)
-    }
-
     /// Resolves `key_path` to its owning leaf and effective writer, returning
     /// the located leaf alongside. An absent key resolves to no writer.
     ///
@@ -538,9 +511,18 @@ mod tests {
         (Resolver::new(shards, mon.clone()), mon, bg)
     }
 
+    async fn effective_writer(resolver: &Resolver, key: &str) -> Option<TxId> {
+        resolver
+            .resolve_key(key, Requirement::AtLeast(resolver.now()))
+            .await
+            .unwrap()
+            .0
+            .writer
+    }
+
     // Installs a committed pointer for `key` directly in the collection's leaf
-    // `_i` (no lock holders), so the entry resolves to `writer` — or to no writer
-    // when it is a tombstone.
+    // `_i` (no lock holders), so the entry resolves to `writer` regardless of
+    // whether that writer recorded a live value or tombstone.
     async fn seed_writer(store: &ShardStore, key: &[u8], writer: &TxId, deleted: bool) {
         let path = paths::collection_info(COLL);
         let loaded = store
@@ -752,24 +734,15 @@ mod tests {
 
         let (resolver, _mon, _bg) = resolver_over(backend);
         assert_eq!(
-            resolver
-                .effective_writer(&paths::from_key(COLL, b"live-key"))
-                .await
-                .unwrap(),
+            effective_writer(&resolver, &paths::from_key(COLL, b"live-key")).await,
             Some(live)
         );
         assert_eq!(
-            resolver
-                .effective_writer(&paths::from_key(COLL, b"dead-key"))
-                .await
-                .unwrap(),
+            effective_writer(&resolver, &paths::from_key(COLL, b"dead-key")).await,
             Some(dead)
         );
         assert_eq!(
-            resolver
-                .effective_writer(&paths::from_key(COLL, b"missing"))
-                .await
-                .unwrap(),
+            effective_writer(&resolver, &paths::from_key(COLL, b"missing")).await,
             None
         );
     }
@@ -792,18 +765,12 @@ mod tests {
         seed_locked(&seed_store, b"dead-key", &tomb).await;
 
         assert_eq!(
-            resolver
-                .effective_writer(&paths::from_key(COLL, b"live-key"))
-                .await
-                .unwrap(),
+            effective_writer(&resolver, &paths::from_key(COLL, b"live-key")).await,
             Some(live),
             "a committed exclusive holder is help-forwarded as the writer"
         );
         assert_eq!(
-            resolver
-                .effective_writer(&paths::from_key(COLL, b"dead-key"))
-                .await
-                .unwrap(),
+            effective_writer(&resolver, &paths::from_key(COLL, b"dead-key")).await,
             Some(tomb),
             "a help-forwarded tombstone still resolves its writer"
         );

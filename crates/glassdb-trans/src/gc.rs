@@ -838,7 +838,11 @@ mod tests {
             scans: Vec::new(),
         };
         let live2 = live.clone();
-        let acquire = tokio::spawn(async move { locker.lock(&live2, &data, false).await });
+        let lock_requirement = Requirement::AtLeast(ctx.shards.now());
+        let acquire =
+            tokio::spawn(
+                async move { locker.lock_at(&live2, &data, false, lock_requirement).await },
+            );
 
         // Under paused time this fires only once both tasks are parked (driver in
         // the gated load, the second queued); then release the load.

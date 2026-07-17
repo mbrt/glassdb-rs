@@ -1741,7 +1741,7 @@ mod tests {
         tctx.tmon.begin_tx(&holder);
         let held = tctx
             .locker
-            .lock(
+            .lock_at(
                 &holder,
                 &Data {
                     reads: Vec::new(),
@@ -1749,6 +1749,7 @@ mod tests {
                     scans: Vec::new(),
                 },
                 false,
+                Requirement::AtLeast(tctx.shards.now()),
             )
             .await
             .unwrap();
@@ -1998,7 +1999,9 @@ mod tests {
             scans: Vec::new(),
         };
         let tb = txb.clone();
-        let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
+        let lock_requirement = Requirement::AtLeast(tctx.shards.now());
+        let acquire =
+            tokio::spawn(async move { cb.lock_at(&tb, &data_b, false, lock_requirement).await });
 
         // Let the driver park in the gated load before the install joins.
         rt::sleep(Duration::from_secs(1)).await;
@@ -2087,7 +2090,9 @@ mod tests {
             scans: Vec::new(),
         };
         let tb = txb.clone();
-        let acquire = tokio::spawn(async move { cb.lock(&tb, &data_b, false).await });
+        let lock_requirement = Requirement::AtLeast(tctx.shards.now());
+        let acquire =
+            tokio::spawn(async move { cb.lock_at(&tb, &data_b, false, lock_requirement).await });
 
         rt::sleep(Duration::from_secs(1)).await;
         gate.release();
@@ -2650,7 +2655,12 @@ mod tests {
         };
         let locked = match tctx
             .locker
-            .lock(&holder, &holder_data, false)
+            .lock_at(
+                &holder,
+                &holder_data,
+                false,
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap()
         {
@@ -2712,7 +2722,12 @@ mod tests {
         };
         match tctx
             .locker
-            .lock(&holder, &holder_data, false)
+            .lock_at(
+                &holder,
+                &holder_data,
+                false,
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap()
         {
@@ -2765,7 +2780,17 @@ mod tests {
             writes: vec![wa(&kb, b"b1")],
             scans: Vec::new(),
         };
-        let other_locked = match tctx.locker.lock(&other, &other_data, false).await.unwrap() {
+        let other_locked = match tctx
+            .locker
+            .lock_at(
+                &other,
+                &other_data,
+                false,
+                Requirement::AtLeast(tctx.shards.now()),
+            )
+            .await
+            .unwrap()
+        {
             LockOutcome::Locked(locked) => locked,
             _ => panic!("disjoint lock acquisition must succeed"),
         };
@@ -2782,7 +2807,12 @@ mod tests {
         };
         let current_locked = match tctx
             .locker
-            .lock(&current, &current_data, false)
+            .lock_at(
+                &current,
+                &current_data,
+                false,
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap()
         {
@@ -2850,7 +2880,17 @@ mod tests {
             writes: vec![wa(&kb, b"b1")],
             scans: Vec::new(),
         };
-        let other_locked = match tctx.locker.lock(&other, &other_data, false).await.unwrap() {
+        let other_locked = match tctx
+            .locker
+            .lock_at(
+                &other,
+                &other_data,
+                false,
+                Requirement::AtLeast(tctx.shards.now()),
+            )
+            .await
+            .unwrap()
+        {
             LockOutcome::Locked(locked) => locked,
             _ => panic!("disjoint lock acquisition must succeed"),
         };
@@ -3126,7 +3166,12 @@ mod tests {
         };
         let locked = match tctx
             .locker
-            .lock(&holder, &holder_data, false)
+            .lock_at(
+                &holder,
+                &holder_data,
+                false,
+                Requirement::AtLeast(tctx.shards.now()),
+            )
             .await
             .unwrap()
         {

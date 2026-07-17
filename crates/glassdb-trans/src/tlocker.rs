@@ -730,26 +730,6 @@ impl Locker {
         out
     }
 
-    /// Groups the transaction's accessed keys by shard and acquires every entry,
-    /// structure, and membership lock it needs. Returns a [`LockedTx`] handle to
-    /// drive write-back on commit. A retryable outcome asks the caller to
-    /// release and re-lock under the same id: [`LockOutcome::Conflict`] after
-    /// contention, or [`LockOutcome::LeafFull`] while a pending split relieves
-    /// capacity pressure.
-    ///
-    /// `serial` selects the sorted sequential fallback over the default parallel
-    /// path (ADR-020).
-    #[cfg(test)]
-    pub(crate) async fn lock(
-        &self,
-        id: &TxId,
-        data: &Data,
-        serial: bool,
-    ) -> Result<LockOutcome, TransError> {
-        self.lock_at(id, data, serial, Requirement::AtLeast(self.dir.now()))
-            .await
-    }
-
     /// Acquires a transaction's locks while resolving predicate-lock coverage
     /// against the supplied pre-lock requirement barrier.
     pub(crate) async fn lock_at(
@@ -870,21 +850,6 @@ impl Locker {
         )
         .await
         .unwrap_or_default()
-    }
-
-    /// Acquires this transaction's locks across every touched shard. A
-    /// retryable shard outcome asks the transaction to release and re-lock
-    /// under the same id; the first such outcome wins in deterministic
-    /// shard-path order.
-    #[cfg(test)]
-    async fn lock_shards(
-        &self,
-        id: &TxId,
-        groups: &BTreeMap<String, ShardGroup>,
-        serial: bool,
-    ) -> Result<ShardsOutcome, TransError> {
-        self.lock_shards_at(id, groups, serial, Requirement::AtLeast(self.coord.now()))
-            .await
     }
 
     async fn lock_shards_at(
@@ -1250,7 +1215,11 @@ mod tests {
 
     // Acquires shard locks in parallel mode, asserting success.
     async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
-        match locker.lock_shards(id, groups, false).await.unwrap() {
+        match locker
+            .lock_shards_at(id, groups, false, Requirement::AtLeast(locker.coord.now()))
+            .await
+            .unwrap()
+        {
             ShardsOutcome::Locked(_) => {}
             ShardsOutcome::Conflict => panic!("expected lock acquisition to succeed"),
             ShardsOutcome::LeafFull => panic!("expected leaf to have capacity"),
@@ -1323,7 +1292,12 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
 
         let outcome = locker
-            .lock_shards(&tx, &group_of(b"z", put_intent(b"z")), false)
+            .lock_shards_at(
+                &tx,
+                &group_of(b"z", put_intent(b"z")),
+                false,
+                Requirement::AtLeast(locker.coord.now()),
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, ShardsOutcome::LeafFull));
@@ -1462,8 +1436,16 @@ mod tests {
         let locker2 = locker.clone();
         let young2 = young.clone();
         let groups = group_of(key, put_intent(key));
-        let waiting =
-            tokio::spawn(async move { locker2.lock_shards(&young2, &groups, false).await });
+        let waiting = tokio::spawn(async move {
+            locker2
+                .lock_shards_at(
+                    &young2,
+                    &groups,
+                    false,
+                    Requirement::AtLeast(locker2.coord.now()),
+                )
+                .await
+        });
 
         // Under paused time the sleep only auto-advances once every task is
         // idle, so it lands with `young` parked waiting on `old`.
@@ -1506,8 +1488,16 @@ mod tests {
         let locker2 = locker.clone();
         let young2 = young.clone();
         let groups = group_of(key, put_intent(key));
-        let waiting =
-            tokio::spawn(async move { locker2.lock_shards(&young2, &groups, false).await });
+        let waiting = tokio::spawn(async move {
+            locker2
+                .lock_shards_at(
+                    &young2,
+                    &groups,
+                    false,
+                    Requirement::AtLeast(locker2.coord.now()),
+                )
+                .await
+        });
 
         rt::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -1629,7 +1619,10 @@ mod tests {
             )],
             scans: Vec::new(),
         };
-        let out = locker.lock(&tx, &data, false).await.unwrap();
+        let out = locker
+            .lock_at(&tx, &data, false, Requirement::AtLeast(locker.dir.now()))
+            .await
+            .unwrap();
         assert!(matches!(out, LockOutcome::Locked(_)));
         assert!(!locker.tx_locks_snapshot().is_empty());
 
@@ -1820,8 +1813,14 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let g1 = group_of(key, read_intent(key));
         let g2 = group_of(key, read_intent(key));
-        let h1 = tokio::spawn(async move { l1.lock_shards(&t1, &g1, false).await });
-        let h2 = tokio::spawn(async move { l2.lock_shards(&t2, &g2, false).await });
+        let h1 = tokio::spawn(async move {
+            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.coord.now()))
+                .await
+        });
+        let h2 = tokio::spawn(async move {
+            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.coord.now()))
+                .await
+        });
 
         // Under paused time this sleep only fires once both tasks are parked (the
         // driver in the gated load, the second queued); then release the load.
@@ -1868,8 +1867,14 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let g1 = group_of(&ka, put_intent(&ka));
         let g2 = group_of(&kb, put_intent(&kb));
-        let h1 = tokio::spawn(async move { l1.lock_shards(&t1, &g1, false).await });
-        let h2 = tokio::spawn(async move { l2.lock_shards(&t2, &g2, false).await });
+        let h1 = tokio::spawn(async move {
+            l1.lock_shards_at(&t1, &g1, false, Requirement::AtLeast(l1.coord.now()))
+                .await
+        });
+        let h2 = tokio::spawn(async move {
+            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.coord.now()))
+                .await
+        });
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
@@ -1909,7 +1914,12 @@ mod tests {
         let waiting_group = group_of(&kb, put_intent(&kb));
         let waiting = tokio::spawn(async move {
             waiting_locker
-                .lock_shards(&waiting_id, &waiting_group, false)
+                .lock_shards_at(
+                    &waiting_id,
+                    &waiting_group,
+                    false,
+                    Requirement::AtLeast(waiting_locker.coord.now()),
+                )
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -2010,7 +2020,10 @@ mod tests {
         // The write-back is the driver (parks in the gated load); the acquire
         // queues and is absorbed once the load returns.
         let hw = tokio::spawn(async move { l1.write_back(&t1, &lt1).await });
-        let ha = tokio::spawn(async move { l2.lock_shards(&t2, &g2, false).await });
+        let ha = tokio::spawn(async move {
+            l2.lock_shards_at(&t2, &g2, false, Requirement::AtLeast(l2.coord.now()))
+                .await
+        });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         hw.await.unwrap();
@@ -2091,8 +2104,14 @@ mod tests {
         let (to, ty) = (old.clone(), young.clone());
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
-        let ho = tokio::spawn(async move { lo.lock_shards(&to, &go, false).await });
-        let hy = tokio::spawn(async move { ly.lock_shards(&ty, &gy, false).await });
+        let ho = tokio::spawn(async move {
+            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.coord.now()))
+                .await
+        });
+        let hy = tokio::spawn(async move {
+            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.coord.now()))
+                .await
+        });
 
         // Once both tasks are parked (driver in the gated load, the other queued),
         // release the load so the round folds both members.
@@ -2144,8 +2163,14 @@ mod tests {
         let (to, ty) = (old.clone(), young.clone());
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
-        let ho = tokio::spawn(async move { lo.lock_shards(&to, &go, false).await });
-        let hy = tokio::spawn(async move { ly.lock_shards(&ty, &gy, false).await });
+        let ho = tokio::spawn(async move {
+            lo.lock_shards_at(&to, &go, false, Requirement::AtLeast(lo.coord.now()))
+                .await
+        });
+        let hy = tokio::spawn(async move {
+            ly.lock_shards_at(&ty, &gy, false, Requirement::AtLeast(ly.coord.now()))
+                .await
+        });
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
@@ -2192,8 +2217,14 @@ mod tests {
         let (ta, tb) = (a.clone(), b.clone());
         let ga = group_of(key, put_intent(key));
         let gb = group_of(key, put_intent(key));
-        let ha = tokio::spawn(async move { la.lock_shards(&ta, &ga, false).await });
-        let hb = tokio::spawn(async move { lb.lock_shards(&tb, &gb, false).await });
+        let ha = tokio::spawn(async move {
+            la.lock_shards_at(&ta, &ga, false, Requirement::AtLeast(la.coord.now()))
+                .await
+        });
+        let hb = tokio::spawn(async move {
+            lb.lock_shards_at(&tb, &gb, false, Requirement::AtLeast(lb.coord.now()))
+                .await
+        });
 
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
@@ -2252,7 +2283,10 @@ mod tests {
             let (lw, la) = (locker.clone(), locker.clone());
             let (cw, ca) = (committer.clone(), acquirer.clone());
             let hw = tokio::spawn(async move { lw.write_back(&cw, &lt).await });
-            let ha = tokio::spawn(async move { la.lock_shards(&ca, &g, false).await });
+            let ha = tokio::spawn(async move {
+                la.lock_shards_at(&ca, &g, false, Requirement::AtLeast(la.coord.now()))
+                    .await
+            });
             rt::sleep(Duration::from_millis(50)).await;
             gate.release();
             hw.await.unwrap();
@@ -2300,7 +2334,12 @@ mod tests {
 
         ctx.coord.close().await;
         let err = locker
-            .lock_shards(&tx, &group_of(b"key2", put_intent(b"key2")), false)
+            .lock_shards_at(
+                &tx,
+                &group_of(b"key2", put_intent(b"key2")),
+                false,
+                Requirement::AtLeast(locker.coord.now()),
+            )
             .await;
         assert!(err.is_err(), "locking after close is cancelled");
     }
@@ -2323,7 +2362,10 @@ mod tests {
         let l = locker.clone();
         let y = young.clone();
         let g = group_of(key, put_intent(key));
-        let waiting = tokio::spawn(async move { l.lock_shards(&y, &g, false).await });
+        let waiting = tokio::spawn(async move {
+            l.lock_shards_at(&y, &g, false, Requirement::AtLeast(l.coord.now()))
+                .await
+        });
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished(), "younger blocks on the older holder");
         waiting.abort();
