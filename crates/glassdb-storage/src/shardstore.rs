@@ -12,7 +12,9 @@ use std::sync::Arc;
 use glassdb_backend as backend;
 use glassdb_data::paths;
 
-use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement, Validated};
+use crate::cached_store::{
+    CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
+};
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
 use crate::root::CollectionRoot;
@@ -51,9 +53,11 @@ pub enum LeafObservation {
     Node(Observation<Node>),
 }
 
-/// Result of validating an exact retained leaf state.
-pub enum LeafValidation {
-    Unchanged,
+/// The outcome of checking whether a retained leaf observation is still current.
+pub enum LeafObservationCheck {
+    /// The retained leaf observation remains current after the required bound.
+    Current,
+    /// The backing root or node changed; here is its current observation.
     Changed(LeafObservation),
 }
 
@@ -226,24 +230,24 @@ impl ShardStore {
         }
     }
 
-    /// Validates a retained leaf observation after `bound`.
-    pub async fn validate_leaf(
+    /// Checks whether a retained leaf observation is still current after `bound`.
+    pub async fn check_leaf_current(
         &self,
         observed: &LeafObservation,
         bound: LogicalTime,
-    ) -> Result<LeafValidation, StorageError> {
+    ) -> Result<LeafObservationCheck, StorageError> {
         match observed {
-            LeafObservation::Root(root) => match self.roots.validate(root, bound).await? {
-                Validated::Unchanged => Ok(LeafValidation::Unchanged),
-                Validated::Changed(changed) => {
-                    Ok(LeafValidation::Changed(LeafObservation::Root(changed)))
-                }
+            LeafObservation::Root(root) => match self.roots.check_current(root, bound).await? {
+                ObservationCheck::Current => Ok(LeafObservationCheck::Current),
+                ObservationCheck::Changed(changed) => Ok(LeafObservationCheck::Changed(
+                    LeafObservation::Root(changed),
+                )),
             },
-            LeafObservation::Node(node) => match self.nodes.validate(node, bound).await? {
-                Validated::Unchanged => Ok(LeafValidation::Unchanged),
-                Validated::Changed(changed) => {
-                    Ok(LeafValidation::Changed(LeafObservation::Node(changed)))
-                }
+            LeafObservation::Node(node) => match self.nodes.check_current(node, bound).await? {
+                ObservationCheck::Current => Ok(LeafObservationCheck::Current),
+                ObservationCheck::Changed(changed) => Ok(LeafObservationCheck::Changed(
+                    LeafObservation::Node(changed),
+                )),
             },
         }
     }
@@ -628,10 +632,10 @@ mod tests {
     }
 
     // A node object exists in the backend. A cold cache full-fetches it on the
-    // first load; a subsequent hot load revalidates with `read_if_modified`
+    // first load; a subsequent hot load checks with `read_if_modified`
     // instead of re-fetching, and returns the same version (ADR-023).
     #[tokio::test]
-    async fn hot_reload_revalidates_without_full_read() {
+    async fn hot_reload_checks_current_without_full_read() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
@@ -656,7 +660,7 @@ mod tests {
         assert_eq!(
             count(&log, "read_if_modified"),
             1,
-            "hot load revalidates conditionally"
+            "hot load checks conditionally"
         );
         assert_eq!(
             v1.revision(),
@@ -666,7 +670,7 @@ mod tests {
     }
 
     // A cached node loaded with `Any` is served without any backend op
-    // (neither a full read nor a revalidation), while an uncached node still
+    // (neither a full read nor a currentness check), while an uncached node still
     // does one full read (ADR-030).
     #[tokio::test]
     async fn any_serves_cached_without_backend_op() {
@@ -690,7 +694,7 @@ mod tests {
         assert_eq!(
             count(&log, "read_if_modified"),
             0,
-            "cached Any must not revalidate"
+            "cached Any must not check the backend"
         );
 
         // An uncached node has nothing to serve, so it falls through to a read.

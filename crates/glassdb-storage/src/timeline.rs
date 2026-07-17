@@ -1,8 +1,8 @@
-//! Database-local logical time for ordering cache validation evidence.
+//! Database-local logical time for ordering cache currentness evidence.
 //!
 //! Logical time is monotonic within one open database, but it is neither wall
 //! time nor a durable timestamp. A [`Timeline`] is shared by the decoded object
-//! cache and every higher-level component that captures validation barriers.
+//! cache and every higher-level component that captures currentness barriers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

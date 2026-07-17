@@ -17,14 +17,16 @@ pub mod txobject;
 mod version;
 
 pub use cache::{Cache, Weighable};
-pub use cached_store::{CachedStore, CasResult, Observation, Requirement, Revision, Validated};
+pub use cached_store::{
+    CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
+};
 pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use error::StorageError;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
-pub use shardstore::{LeafKind, LeafObservation, LeafValidation, LoadedLeaf, ShardStore};
+pub use shardstore::{LeafKind, LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::StructuralLog;
 pub use timeline::{LogicalTime, Timeline};
 pub use tlogger::{

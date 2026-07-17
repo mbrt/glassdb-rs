@@ -7,12 +7,12 @@
 //! decoded type, so reading it back through a different typed store is an
 //! internal error.
 //!
-//! Requirement is a local validation watermark, not a durable guarantee. Each
+//! Requirement is a local currentness watermark, not a durable guarantee. Each
 //! cache entry is `Present` (a decoded value, its [`Revision`], and a
-//! validated-after [`LogicalTime`]), `Absent` (a validated-after watermark,
+//! current-after [`LogicalTime`]), `Absent` (a current-after watermark,
 //! no revision), or `Missing` (no entry: a positively known-obsolete value that
 //! a new lookup cannot rediscover). A successful read returns an [`Observation`]
-//! that references monotonic validation evidence shared with the current cache
+//! that references monotonic currentness evidence shared with the current cache
 //! entry; the observation stays usable even after that entry is evicted or
 //! invalidated, because invalidation changes what a *new* read may use but does
 //! not revoke the historical fact that the observed state was current after its
@@ -20,7 +20,7 @@
 //!
 //! Reads take a [`Requirement`]: `Any` accepts any usable cached entry and reads
 //! the backend on a miss; `AtLeast(T)` accepts an entry only when its watermark
-//! is at least `T`, otherwise it validates through the backend. The store
+//! is at least `T`, otherwise it checks through the backend. The store
 //! records `started-at` immediately before each backend call: a successful read
 //! or mutation linearized at some point after `started-at`, so that is the
 //! result's watermark. Watermarks never regress, and a mutation is published
@@ -87,11 +87,11 @@ impl Revision {
 /// The freshness requirement a cached entry must satisfy before it is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// Accept any usable cached entry without backend validation; read the
+    /// Accept any usable cached entry without a backend check; read the
     /// backend only on a miss.
     Any,
     /// Accept an entry only when its watermark is at least this time; otherwise
-    /// validate through the backend.
+    /// check through the backend.
     AtLeast(LogicalTime),
 }
 
@@ -142,19 +142,19 @@ impl<V> CasResult<V> {
     }
 }
 
-/// The outcome of validating a previously returned observation.
+/// The outcome of checking whether a retained observation is still current.
 #[derive(Debug)]
-pub enum Validated<V> {
+pub enum ObservationCheck<V> {
     /// The observed state is still current after the required bound; its
     /// watermark has been advanced if a backend round-trip confirmed it.
-    Unchanged,
+    Current,
     /// The state changed; here is the current observation.
     Changed(Observation<V>),
 }
 
-/// A shared, monotonically-advanceable validation watermark. Observations of one
+/// A shared, monotonically-advanceable currentness watermark. Observations of one
 /// state and that state's current cache entry hold clones of the same cell, so
-/// validating advances the evidence every holder sees. An `Arc` held by a caller
+/// checking advances the evidence every holder sees. An `Arc` held by a caller
 /// outlives eviction of the corresponding cache entry.
 #[derive(Debug, Clone)]
 struct Evidence(Arc<AtomicU64>);
@@ -176,7 +176,7 @@ impl Evidence {
 
 /// An exact observed state of one object, returned by a successful read or
 /// mutation. It carries the decoded value (or absence), the [`Revision`], and a
-/// reference to the shared validation evidence. It remains inspectable after the
+/// reference to the shared currentness evidence. It remains inspectable after the
 /// state is evicted or invalidated as the current cache entry.
 #[derive(Debug, Clone)]
 pub struct Observation<V> {
@@ -215,7 +215,7 @@ impl<V> Observation<V> {
 
     /// The watermark: the observed state was current at some point after this
     /// time.
-    pub fn validated_after(&self) -> LogicalTime {
+    pub fn current_after(&self) -> LogicalTime {
         self.evidence.get()
     }
 
@@ -236,7 +236,7 @@ impl<V> Observation<V> {
 }
 
 /// One entry in the shared decoded LRU: either a present decoded value or a
-/// validated absence. A missing object has no entry at all.
+/// confirmed absence. A missing object has no entry at all.
 #[derive(Clone)]
 enum EntryState {
     Present {
@@ -280,7 +280,7 @@ impl Weighable for CacheEntry {
 }
 
 /// The raw, type-erased result of a backend fetch, shared across coalesced
-/// waiters. Cheaply cloneable so one in-flight validation can serve many.
+/// waiters. Cheaply cloneable so one in-flight check can serve many.
 #[derive(Clone)]
 struct FetchResult {
     value: Option<Arc<dyn Any + Send + Sync>>,
@@ -296,7 +296,7 @@ enum FlightOutcome {
     Cancelled,
 }
 
-/// One in-flight backend validation of a path, tracked for coalescing.
+/// One in-flight backend currentness check of a path, tracked for coalescing.
 struct InFlight {
     started: LogicalTime,
     outcome: Mutex<Option<FlightOutcome>>,
@@ -335,7 +335,7 @@ pub struct CachedStore {
     // Count of object bodies transferred from the backend (a fresh `read` or a
     // conditional read that returned a changed body). A caller samples this
     // before and after a logical read to tell whether the result reused cached
-    // bodies (an unchanged count, possibly after cheap conditional revalidation)
+    // bodies (an unchanged count, possibly after a cheap conditional check)
     // or had to fetch a body — the signal behind the transaction-layer
     // cache-hit stat.
     body_reads: Arc<AtomicU64>,
@@ -393,7 +393,7 @@ impl CachedStore {
     /// The running count of object bodies this store has transferred from the
     /// backend. Sampled around a logical read to detect a body-free read (the
     /// count did not move): a hit reuses cached bodies, possibly after a cheap
-    /// conditional revalidation that returned "not modified".
+    /// conditional check that returned "not modified".
     pub fn body_reads(&self) -> u64 {
         self.body_reads.load(Ordering::SeqCst)
     }
@@ -406,7 +406,7 @@ impl CachedStore {
     }
 
     /// Reads the object at `path`, serving a cached entry that satisfies `req`
-    /// or validating through the backend otherwise. Returns an [`Observation`],
+    /// or checking through the backend otherwise. Returns an [`Observation`],
     /// whose `value()` is `None` for an object that does not exist. A new read
     /// never returns a positively known-obsolete (`Missing`) value.
     async fn read<C: Codec>(
@@ -425,32 +425,32 @@ impl CachedStore {
     /// Returns the cached observation for `path` without contacting the backend,
     /// or `None` when it is not cached. A committed/aborted object is immutable,
     /// so its cached copy is authoritative indefinitely; callers use this to
-    /// serve terminal objects without a revalidation round-trip.
+    /// serve terminal objects without a currentness-check round-trip.
     fn peek<C: Codec>(&self, path: &str) -> Result<Option<Observation<C::Value>>, StorageError> {
         let key: Arc<str> = Arc::from(path);
         self.try_hit::<C>(&key, Requirement::Any)
     }
 
-    /// Validates a previously returned observation against `req`. Succeeds
-    /// locally when the observation's watermark already satisfies the bound
-    /// (even if that state is no longer the current cache entry); otherwise uses
-    /// the observation's revision in a conditional backend read (or an ordinary
-    /// read for an absence, which has no revision).
-    async fn validate<C: Codec>(
+    /// Checks whether a previously returned observation is current under `req`.
+    /// Succeeds locally when the observation's watermark already satisfies the
+    /// bound (even if that state is no longer the current cache entry); otherwise
+    /// uses the observation's revision in a conditional backend read (or an
+    /// ordinary read for an absence, which has no revision).
+    async fn check_current<C: Codec>(
         &self,
         obs: &Observation<C::Value>,
         req: Requirement,
-    ) -> Result<Validated<C::Value>, StorageError> {
+    ) -> Result<ObservationCheck<C::Value>, StorageError> {
         if satisfies(obs.evidence.get(), req) {
-            return Ok(Validated::Unchanged);
+            return Ok(ObservationCheck::Current);
         }
         let path = Arc::clone(&obs.path);
         if let Some(current) = self.try_hit::<C>(&path, req)? {
             if current.revision == obs.revision {
-                obs.evidence.advance(current.validated_after());
-                return Ok(Validated::Unchanged);
+                obs.evidence.advance(current.current_after());
+                return Ok(ObservationCheck::Current);
             }
-            return Ok(Validated::Changed(current));
+            return Ok(ObservationCheck::Changed(current));
         }
         let started = self.next_tick();
         match &obs.revision {
@@ -464,7 +464,7 @@ impl CachedStore {
                     // current, the cache entry's) watermark without decoding.
                     obs.evidence.advance(started);
                     self.advance_present(&obs.path, rev, started);
-                    Ok(Validated::Unchanged)
+                    Ok(ObservationCheck::Current)
                 }
                 Ok(reply) => {
                     let f = self.publish_present::<C>(
@@ -473,11 +473,15 @@ impl CachedStore {
                         reply.version,
                         started,
                     )?;
-                    Ok(Validated::Changed(self.to_observation::<C>(&obs.path, f)?))
+                    Ok(ObservationCheck::Changed(
+                        self.to_observation::<C>(&obs.path, f)?,
+                    ))
                 }
                 Err(BackendError::NotFound) => {
                     let f = self.publish_absent(&obs.path, started);
-                    Ok(Validated::Changed(self.to_observation::<C>(&obs.path, f)?))
+                    Ok(ObservationCheck::Changed(
+                        self.to_observation::<C>(&obs.path, f)?,
+                    ))
                 }
                 Err(e) => Err(e.into()),
             },
@@ -485,7 +489,7 @@ impl CachedStore {
                 Err(BackendError::NotFound) => {
                     obs.evidence.advance(started);
                     self.install_absent(&obs.path, started);
-                    Ok(Validated::Unchanged)
+                    Ok(ObservationCheck::Current)
                 }
                 Ok(reply) => {
                     let f = self.publish_present::<C>(
@@ -494,7 +498,9 @@ impl CachedStore {
                         reply.version,
                         started,
                     )?;
-                    Ok(Validated::Changed(self.to_observation::<C>(&obs.path, f)?))
+                    Ok(ObservationCheck::Changed(
+                        self.to_observation::<C>(&obs.path, f)?,
+                    ))
                 }
                 Err(e) => Err(e.into()),
             },
@@ -596,7 +602,7 @@ impl CachedStore {
         }
     }
 
-    /// Deletes the object and installs freshly validated absence. A missing
+    /// Deletes the object and installs freshly confirmed absence. A missing
     /// object is treated as a successful delete; an in-doubt outcome invalidates
     /// the starting knowledge and surfaces `Unavailable`.
     pub async fn delete(&self, path: &str) -> Result<(), StorageError> {
@@ -675,8 +681,8 @@ impl CachedStore {
         }
     }
 
-    /// Fetches from the backend, coalescing with an in-flight validation of the
-    /// same path when that validation's start satisfies `req`.
+    /// Fetches from the backend, coalescing with an in-flight check of the same
+    /// path when that check's start satisfies `req`.
     async fn fetch<C: Codec>(
         &self,
         path: &Arc<str>,
@@ -729,7 +735,7 @@ impl CachedStore {
         }
     }
 
-    /// Runs one backend read for a path: a version-conditional revalidation when
+    /// Runs one backend read for a path: a version-conditional check when
     /// a present revision is known, else an ordinary read.
     async fn do_fetch<C: Codec>(
         &self,
@@ -814,7 +820,7 @@ impl CachedStore {
         }
     }
 
-    /// Publishes a validated absence.
+    /// Publishes a confirmed absence.
     fn publish_absent(&self, path: &str, started: LogicalTime) -> FetchResult {
         let evidence = self.install_absent(path, started);
         FetchResult {
@@ -846,7 +852,7 @@ impl CachedStore {
     }
 
     /// Installs a present entry under the non-regression rule: an entry already
-    /// validated at least as recently is kept (the caller still gets an
+    /// confirmed current at least as recently is kept (the caller still gets an
     /// observation of what it read); a same-revision entry only advances its
     /// watermark; otherwise the new value is installed. Returns the evidence the
     /// caller's observation should reference.
@@ -904,7 +910,7 @@ impl CachedStore {
         out.expect("update closure always sets the evidence")
     }
 
-    /// Installs a validated absence under the same non-regression rule.
+    /// Installs a confirmed absence under the same non-regression rule.
     fn install_absent(&self, path: &str, started: LogicalTime) -> Evidence {
         let mut out: Option<Evidence> = None;
         self.cache.update(path, |old| match old {
@@ -961,9 +967,9 @@ impl CachedStore {
         });
     }
 
-    /// Invalidates the exact starting present entry (to `Missing`) only if it is
-    /// still current at `expected`; never discards a different value or a later
-    /// validation.
+    /// Invalidates the exact starting present entry (to `Missing`) only if its
+    /// revision is still `expected`; never discards a different state installed
+    /// later.
     fn invalidate_present(&self, path: &str, expected: &Revision) {
         self.cache.update(path, |old| match &old {
             Some(CacheEntry {
@@ -1071,15 +1077,15 @@ impl<C: Codec> TypedCachedStore<C> {
         Ok(page)
     }
 
-    /// Validates an exact retained observation after `bound`.
-    pub(crate) async fn validate(
+    /// Checks whether an exact retained observation is current after `bound`.
+    pub(crate) async fn check_current(
         &self,
         observed: &Observation<C::Value>,
         bound: LogicalTime,
-    ) -> Result<Validated<C::Value>, StorageError> {
+    ) -> Result<ObservationCheck<C::Value>, StorageError> {
         Self::check_path(observed.path())?;
         self.store
-            .validate::<C>(observed, Requirement::AtLeast(bound))
+            .check_current::<C>(observed, Requirement::AtLeast(bound))
             .await
     }
 
@@ -1111,7 +1117,7 @@ impl<C: Codec> TypedCachedStore<C> {
         }
         let result = self.store.create::<C>(path, value).await?;
         if let (Some(expected), CasResult::Committed(installed)) = (expected_absence, &result) {
-            expected.evidence.advance(installed.validated_after());
+            expected.evidence.advance(installed.current_after());
         }
         Ok(result)
     }
@@ -1131,7 +1137,7 @@ impl<C: Codec> TypedCachedStore<C> {
             .cas::<C>(expected.path(), value, revision)
             .await?;
         if let CasResult::Committed(installed) = &result {
-            expected.evidence.advance(installed.validated_after());
+            expected.evidence.advance(installed.current_after());
         }
         Ok(result)
     }
@@ -1143,7 +1149,7 @@ impl<C: Codec> TypedCachedStore<C> {
     }
 }
 
-/// Reports whether an entry validated at `evidence` satisfies `req`.
+/// Reports whether an entry confirmed current at `evidence` satisfies `req`.
 fn satisfies(evidence: LogicalTime, req: Requirement) -> bool {
     match req {
         Requirement::Any => true,
@@ -1258,10 +1264,10 @@ mod tests {
     }
 
     // Model invariant: an `Any` hit is served from cache with no backend op,
-    // while `AtLeast(now())` on an older entry revalidates and advances (never
+    // while `AtLeast(now())` on an older entry checks and advances (never
     // regresses) its watermark.
     #[tokio::test]
-    async fn any_hit_is_local_and_at_least_revalidates_and_advances() {
+    async fn any_hit_is_local_and_at_least_checks_current_and_advances() {
         let (s, log) = store_rec();
         s.write("p", v(b"a")).await.unwrap();
 
@@ -1272,16 +1278,9 @@ mod tests {
 
         let t = s.store.timeline.now();
         let o2 = s.read("p", Requirement::AtLeast(t)).await.unwrap();
-        assert_eq!(
-            count(&log, "read_if_modified"),
-            1,
-            "stale entry revalidates"
-        );
-        assert!(o2.validated_after() >= t, "watermark advanced to the bound");
-        assert!(
-            o2.validated_after() >= o1.validated_after(),
-            "never regresses"
-        );
+        assert_eq!(count(&log, "read_if_modified"), 1, "stale entry is checked");
+        assert!(o2.current_after() >= t, "watermark advanced to the bound");
+        assert!(o2.current_after() >= o1.current_after(), "never regresses");
     }
 
     // Model invariant: `AtLeast(T)` accepts an entry whose watermark already
@@ -1294,13 +1293,13 @@ mod tests {
             .read("p", Requirement::AtLeast(s.store.timeline.now()))
             .await
             .unwrap();
-        let w = o.validated_after();
+        let w = o.current_after();
         clear(&log);
 
         let o2 = s.read("p", Requirement::AtLeast(w)).await.unwrap();
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
-        assert!(o2.validated_after() >= w);
+        assert!(o2.current_after() >= w);
     }
 
     // Model invariant: `Any` never returns an entry a conflict invalidated. A
@@ -1344,7 +1343,7 @@ mod tests {
     // Model invariant: an observation stays usable after its current entry is
     // invalidated. Its established watermark satisfies an older bound locally,
     // while a new read cannot rediscover the obsolete value and a stricter bound
-    // validates through the backend.
+    // checks through the backend.
     #[tokio::test]
     async fn observation_outlives_invalidation() {
         let mem = Arc::new(MemoryBackend::new());
@@ -1360,7 +1359,7 @@ mod tests {
             .unwrap()
             .into_observation()
             .unwrap();
-        let w = obs.validated_after();
+        let w = obs.current_after();
 
         s2.write("p", v(b"b")).await.unwrap();
         s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> Missing
@@ -1369,17 +1368,17 @@ mod tests {
 
         clear(&log);
         assert!(matches!(
-            s1.validate(&obs, w).await.unwrap(),
-            Validated::Unchanged
+            s1.check_current(&obs, w).await.unwrap(),
+            ObservationCheck::Current
         ));
         assert_eq!(count(&log, "read"), 0, "older bound needs no backend op");
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        // A stricter bound re-validates and observes the winner.
+        // A stricter bound checks again and observes the winner.
         let t = s1.store.timeline.now();
-        match s1.validate(&obs, t).await.unwrap() {
-            Validated::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
-            Validated::Unchanged => panic!("a stricter bound must revalidate"),
+        match s1.check_current(&obs, t).await.unwrap() {
+            ObservationCheck::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
+            ObservationCheck::Current => panic!("a stricter bound must observe the changed state"),
         }
 
         // A brand-new read cannot rediscover the obsolete value.
@@ -1388,7 +1387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newer_current_evidence_validates_an_observation_without_io() {
+    async fn newer_current_evidence_confirms_an_observation_without_io() {
         let memory = Arc::new(MemoryBackend::new());
         let recording = Arc::new(RecordingBackend::new(memory));
         let log = recording.log();
@@ -1403,11 +1402,11 @@ mod tests {
         assert_eq!(current.value().unwrap().as_slice(), b"b");
 
         clear(&log);
-        match local.validate(&observed, bound).await.unwrap() {
-            Validated::Changed(changed) => {
+        match local.check_current(&observed, bound).await.unwrap() {
+            ObservationCheck::Changed(changed) => {
                 assert_eq!(changed.value().unwrap().as_slice(), b"b");
             }
-            Validated::Unchanged => panic!("the retained revision changed"),
+            ObservationCheck::Current => panic!("the retained revision changed"),
         }
         assert!(log.lock().unwrap().is_empty());
     }
@@ -1432,10 +1431,10 @@ mod tests {
             .into_observation()
             .unwrap();
         assert!(
-            obs.validated_after() >= before,
+            obs.current_after() >= before,
             "expected observation advanced past the CAS start"
         );
-        assert!(nb.validated_after() >= before);
+        assert!(nb.current_after() >= before);
         assert_eq!(nb.value().unwrap().as_slice(), b"b");
 
         let got = s.read("p", Requirement::Any).await.unwrap();
@@ -1463,7 +1462,7 @@ mod tests {
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
         assert!(!r.committed());
         assert!(
-            obs.validated_after() < before,
+            obs.current_after() < before,
             "conflict must not advance the observation"
         );
         let got = s1.read("p", Requirement::Any).await.unwrap();
@@ -1506,7 +1505,7 @@ mod tests {
         hook.clear_after();
 
         assert!(
-            obs.validated_after() < before,
+            obs.current_after() < before,
             "an in-doubt outcome must not advance the observation"
         );
         // The starting entry became Missing, so Any re-reads and finds the write
@@ -1522,7 +1521,7 @@ mod tests {
         let backend: Arc<dyn Backend> = hook.clone();
         let s = bytes_store(backend);
 
-        // Cache a validated absence first.
+        // Cache a confirmed absence first.
         assert!(!s.read("p", Requirement::Any).await.unwrap().exists());
 
         hook.set_before(|op| {
@@ -1542,7 +1541,7 @@ mod tests {
         assert!(!got.exists(), "a failed create must not publish its value");
     }
 
-    // Model invariant: repeated conditional revalidations advance but never
+    // Model invariant: repeated conditional checks advance but never
     // regress the watermark.
     #[tokio::test]
     async fn unchanged_conditional_reads_only_advance() {
@@ -1554,21 +1553,21 @@ mod tests {
             .read("p", Requirement::AtLeast(t1))
             .await
             .unwrap()
-            .validated_after();
+            .current_after();
         assert!(w1 >= t1);
         let t2 = s.store.timeline.now();
         let w2 = s
             .read("p", Requirement::AtLeast(t2))
             .await
             .unwrap()
-            .validated_after();
+            .current_after();
         assert!(w2 >= w1, "watermark never regresses");
         assert_eq!(count(&log, "read_if_modified"), 2);
     }
 
     // Model invariant: negative caching. An absence is cached and re-served
     // without a backend read; a create replaces it; a delete installs a fresh
-    // validated absence.
+    // confirmed absence.
     #[tokio::test]
     async fn absence_is_cached_and_transitions() {
         let (s, log) = store_rec();
@@ -1653,7 +1652,7 @@ mod tests {
             "the read observed the old body"
         );
         assert!(
-            o.validated_after() < wb.validated_after(),
+            o.current_after() < wb.current_after(),
             "the delayed read is stamped with its own earlier start"
         );
         let got = s.read("p", Requirement::Any).await.unwrap();
@@ -1721,7 +1720,7 @@ mod tests {
     }
 
     // Gated race: a stricter waiter whose bound is not satisfied by the in-flight
-    // validation's start does not coalesce; it issues its own validation.
+    // check's start does not coalesce; it issues its own check.
     #[tokio::test]
     async fn stricter_waiter_does_not_coalesce() {
         let mem = Arc::new(MemoryBackend::new());
@@ -1755,7 +1754,7 @@ mod tests {
             }
         });
 
-        // Reader A revalidates at AtLeast(now()); its op start is tA.
+        // Reader A checks at AtLeast(now()); its op start is tA.
         let a = tokio::spawn({
             let s = s.clone();
             let t = s.store.timeline.now();
@@ -1779,7 +1778,7 @@ mod tests {
         assert_eq!(
             count(&log, "read_if_modified"),
             2,
-            "the stricter waiter issued its own validation"
+            "the stricter waiter issued its own check"
         );
     }
 
@@ -1856,7 +1855,7 @@ mod tests {
         release.notify_one();
         let observed = read.await.unwrap();
 
-        assert!(observed.validated_after() < later);
+        assert!(observed.current_after() < later);
     }
 
     #[tokio::test]

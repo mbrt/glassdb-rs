@@ -1,7 +1,7 @@
 //! Storage value versions. In the v2 object-native layout a key's value lives
 //! in the transaction object of whichever transaction last committed it, so a
 //! value is identified by its **writer**, not by a per-key backend object
-//! version. Coordination objects are revalidated by their backend version in
+//! version. Coordination objects are checked by their backend version in
 //! the decoded object store; that revision is tracked there, not here
 //! (ADR-023).
 

@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{TxId, paths};
 use glassdb_storage::{
-    LeafObservation, LeafValidation, LockScope, LockType, LogicalTime, NodeLocks, PathLock,
+    LeafObservation, LeafObservationCheck, LockScope, LockType, LogicalTime, NodeLocks, PathLock,
     Requirement, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus,
     TxLog, TxWrite,
 };
@@ -1208,9 +1208,9 @@ impl Algo {
                 Some(locked) => locked.validated(&read.leaf),
                 None => matches!(
                     self.shards
-                        .validate_leaf(&read.leaf, validation_start)
+                        .check_leaf_current(&read.leaf, validation_start)
                         .await?,
-                    LeafValidation::Unchanged
+                    LeafObservationCheck::Current
                 ),
             };
             if !leaf_unchanged {
@@ -1234,9 +1234,9 @@ impl Algo {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
                     self.shards
-                        .validate_leaf(&coverage.observation, validation_start)
+                        .check_leaf_current(&coverage.observation, validation_start)
                         .await?,
-                    LeafValidation::Unchanged
+                    LeafObservationCheck::Current
                 ),
             };
             if !leaf_unchanged {

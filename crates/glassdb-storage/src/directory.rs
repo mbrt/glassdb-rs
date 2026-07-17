@@ -197,11 +197,11 @@ impl Directory {
         }
     }
 
-    /// Resolves the owning leaf while keeping interior-node revalidation off the
-    /// hot path (ADR-031): descends the index spine at `interior` requirement
+    /// Resolves the owning leaf while keeping interior-node currentness checks
+    /// off the hot path (ADR-031): descends the index spine at `interior` requirement
     /// (served from cache — a stale misroute self-corrects via right-links) and
-    /// revalidates only the terminal leaf — the coordination/CAS unit — at `leaf`
-    /// requirement. A grown tree thus never revalidates the root `_i` on every key
+    /// checks only the terminal leaf — the coordination/CAS unit — at `leaf`
+    /// requirement. A grown tree thus never checks the root `_i` on every key
     /// coordination; a current lower bound stays where a CAS depends on it.
     ///
     /// When both freshnesses match this is exactly [`leaf_for`](Self::leaf_for).
@@ -213,11 +213,11 @@ impl Directory {
         leaf: Requirement,
     ) -> Result<LeafLocator, StorageError> {
         let loc = self.leaf_for(prefix, key, interior).await?;
-        // Same requirement, or an uncreated root leaf (nothing to revalidate).
+        // Same requirement, or an uncreated root leaf (nothing to check).
         if interior == leaf || loc.observation.is_absent() {
             return Ok(loc);
         }
-        // Revalidate the terminal node at the stricter requirement and resume the
+        // Check the terminal node at the stricter requirement and resume the
         // descent from it: the cached interior read may have routed us to `_i`
         // as a leaf while a concurrent split has since rewritten `_i` into an
         // index (or split the leaf), so we must keep descending — never hand
@@ -318,7 +318,7 @@ impl Directory {
 
     /// [`group_keys_by_leaf`] with the interior-vs-leaf requirement split of
     /// [`leaf_for_fresh`], so the coordination hot path routes keys without
-    /// revalidating the root `_i` (ADR-031).
+    /// checking the root `_i` (ADR-031).
     ///
     /// [`group_keys_by_leaf`]: Self::group_keys_by_leaf
     /// [`leaf_for_fresh`]: Self::leaf_for_fresh
@@ -429,7 +429,7 @@ impl Directory {
     /// to the owning node, then follow the index child pointer, until a leaf is
     /// reached. Self-correcting through right-links, so a stale interior read
     /// never traps the descent at the wrong node — and, crucially, a node that
-    /// turns out to be an index (e.g. a revalidated `_i` that split into one) is
+    /// turns out to be an index (e.g. a freshly checked `_i` that split into one) is
     /// resolved to its child rather than returned as a leaf.
     async fn descend_to_leaf(
         &self,
@@ -503,7 +503,7 @@ impl Directory {
     }
 
     /// Re-reads the node at `path` (the root `_i` or a standalone `_n`) at
-    /// `requirement`, for revalidating a terminal leaf reached through a cached
+    /// `requirement`, for checking a terminal leaf reached through a cached
     /// interior descent.
     async fn reload(
         &self,
@@ -750,9 +750,9 @@ mod tests {
 
     // ADR-031 hot-path invariant: with interior-vs-leaf requirement split, repeated
     // coordination on a non-root leaf serves the root index `_i` from cache
-    // (never revalidating it) while still revalidating the terminal leaf.
+    // (never checking it) while still checking the terminal leaf.
     #[tokio::test]
-    async fn interior_descent_does_not_revalidate_root() {
+    async fn interior_descent_does_not_check_root() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log: OpLog = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
@@ -796,11 +796,11 @@ mod tests {
         assert_eq!(
             reads("/_i"),
             0,
-            "root index is served from cache, never revalidated"
+            "root index is served from cache, never checked"
         );
         assert!(
             reads("_n/L0") >= 3,
-            "the terminal leaf is revalidated each time"
+            "the terminal leaf is checked each time"
         );
     }
 

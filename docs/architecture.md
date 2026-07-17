@@ -277,12 +277,13 @@ object's ETag. Consumers never interpret it — they pass it back unchanged to
 **Change detection.** All coordination state lives in object *content* and
 changes only by content CAS, so an object's version (ETag / generation) changes
 on exactly every write — precisely when a cached copy must be invalidated. To
-revalidate a cached object the cache issues a *version-conditional* read:
+check whether a cached object is current, the cache issues a
+*version-conditional* read:
 `read_if_modified` takes the expected `Version` and returns `Precondition` when
 the stored version still matches (the body is not re-transferred), or the full
 object when it changed. This maps to a native conditional GET on every backend
 (`If-None-Match` on S3, `ifGenerationNotMatch` on GCS) and lets a hot, unchanged
-shard revalidate without a body transfer
+shard check its currentness without a body transfer
 ([ADR-023](adr/023-slimmed-backend-trait.md)).
 
 **Conditional operations.** `write_if` and `write_if_not_exists` take an
@@ -656,12 +657,12 @@ GlassDB uses one decoded object store to minimize backend calls (ADR-036):
 │ Derive values from decoded leaves and │
 │       transaction objects             │
 └─────────────────┬─────────────────────┘
-                  │ Any read / AtLeast validation
+                  │ Any read / AtLeast currentness
                   ▼
 ┌───────────────────────────────────────┐
 │       CachedStore (per database)      │
 │ Decoded values, revisions, retained   │
-│ observations and validation evidence  │
+│ observations and currentness evidence │
 └─────────────────┬─────────────────────┘
                   │ miss or insufficient evidence
                   ▼
@@ -682,13 +683,13 @@ are evicted least-recently-used first when the total decoded-size estimate
 exceeds the limit.
 
 **CachedStore** (`glassdb-storage/src/cached_store.rs`). Each current entry is
-`Present` (decoded value, opaque CAS revision, and validation watermark),
+`Present` (decoded value, opaque CAS revision, and currentness watermark),
 `Absent`, or `Missing`. Typed stores provide codecs and decoded-size accounting.
 `Requirement::Any` accepts any usable current entry. `Requirement::AtLeast(t)`
 requires evidence that the state was current after a lower bound captured once
 at an OCC phase boundary; otherwise the store performs a version-conditional
 read. Unchanged responses advance evidence without transferring or decoding the
-body. Concurrent compatible validations coalesce.
+body. Concurrent compatible currentness checks coalesce.
 
 Reads retain exact `Observation`s. Their evidence can remain useful after the
 current entry changes or is evicted, but obsolete states are never discoverable
@@ -699,12 +700,12 @@ immutability is a transaction-object invariant; the generic store does not know
 what a final transaction is. The monitor separately keeps a small count-bounded
 status cache for finalized transactions.
 
-Transaction execution may use cached state. Validated captures one lower bound
-and propagates it through leaf and transaction-object dependencies. A post-bound
-lock CAS can satisfy that bound without another read. If the physical leaf has
-changed, validation compares the observed logical writer or membership with the
-newer consistent state; another operation's post-bound evidence can therefore
-save I/O without being mistaken for logical finality.
+Transaction execution may use cached state. Transaction validation captures one
+lower bound and propagates it through leaf and transaction-object dependencies.
+A post-bound lock CAS can satisfy that bound without another read. If the
+physical leaf has changed, validation compares the observed logical writer or
+membership with the newer consistent state; another operation's post-bound
+evidence can therefore save I/O without being mistaken for logical finality.
 
 ## Data Model
 
@@ -756,7 +757,7 @@ Two version identities are kept separate (ADR-023):
   value lives in that transaction object's body (ADR-019), so the writer *is* the
   value's identity; the reader uses it to locate the decoded transaction object.
 - **Backend version** (`backend::Version`): the opaque CAS token assigned by
-  object storage, used for conditional writes and for cache revalidation via the
+  object storage, used for conditional writes and cache currentness checks via the
   version-conditional `read_if_modified`. It identifies a coordination object's
   content, so the object store wraps it in an opaque `Revision` attached to each
   observation (not in the storage `Version`).

@@ -646,7 +646,7 @@ impl Monitor {
             tid.clone(),
             FinalStatus {
                 status: log.status,
-                watermark: observed.validated_after(),
+                watermark: observed.current_after(),
             },
         );
     }
