@@ -4,7 +4,7 @@
 //! locks alive, aborts expired remote transactions, and lets callers wait for a
 //! transaction to finalize.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +14,7 @@ use glassdb_storage::{
     Instant, Observation, PathLock, Requirement, StorageError, TLogger, TValue, TxCommitStatus,
     TxLog, TxStatus,
 };
+use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
 
 use crate::error::TransError;
@@ -78,34 +79,25 @@ struct FinalStatus {
 
 struct FinalStatusCache {
     capacity: usize,
-    entries: HashMap<TxId, FinalStatus>,
-    recency: VecDeque<TxId>,
+    entries: LinkedHashMap<TxId, FinalStatus>,
 }
 
 impl FinalStatusCache {
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            entries: HashMap::new(),
-            recency: VecDeque::new(),
+            entries: LinkedHashMap::new(),
         }
     }
 
     fn get(&mut self, tid: &TxId) -> Option<FinalStatus> {
-        let status = *self.entries.get(tid)?;
-        self.recency.retain(|candidate| candidate != tid);
-        self.recency.push_back(tid.clone());
-        Some(status)
+        self.entries.to_back(tid).copied()
     }
 
     fn insert(&mut self, tid: TxId, status: FinalStatus) {
-        self.recency.retain(|candidate| candidate != &tid);
-        self.entries.insert(tid.clone(), status);
-        self.recency.push_back(tid);
+        self.entries.insert(tid, status);
         while self.entries.len() > self.capacity {
-            if let Some(oldest) = self.recency.pop_front() {
-                self.entries.remove(&oldest);
-            }
+            self.entries.pop_front();
         }
     }
 }
