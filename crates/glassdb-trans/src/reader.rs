@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::TxId;
+use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::{
     LeafObservation, Requirement, StorageError, Timeline, TxCommitStatus, Version,
 };
@@ -80,7 +80,11 @@ impl Reader {
     /// [`READ_UNAVAILABLE_RETRIES`] times. A persistent outage surfaces the last
     /// `Unavailable` error for the caller to classify; the caller cancels by
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
-    pub async fn read(&self, key: &str, max_stale: Duration) -> Result<ReadOutcome, StorageError> {
+    pub async fn read(
+        &self,
+        key: &KeyRef,
+        max_stale: Duration,
+    ) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
         for _ in 0..READ_UNAVAILABLE_RETRIES {
             match self.read_once(key, max_stale).await {
@@ -95,7 +99,11 @@ impl Reader {
 
     /// A single read attempt: local cache then shard resolution. Wrapped by
     /// [`Reader::read`] for in-place retries.
-    async fn read_once(&self, key: &str, max_stale: Duration) -> Result<ReadOutcome, StorageError> {
+    async fn read_once(
+        &self,
+        key: &KeyRef,
+        max_stale: Duration,
+    ) -> Result<ReadOutcome, StorageError> {
         // Bounded-staleness reads are the one foreground operation that owns a
         // freshness policy rather than inheriting a transaction/CAS watermark.
         self.resolve_value(key, Requirement::within(&self.timeline, max_stale))
@@ -106,7 +114,7 @@ impl Reader {
     /// materializes the value from that writer's transaction object.
     async fn resolve_value(
         &self,
-        key: &str,
+        key: &KeyRef,
         requirement: glassdb_storage::Requirement,
     ) -> Result<ReadOutcome, StorageError> {
         let (resolved, leaf) = self

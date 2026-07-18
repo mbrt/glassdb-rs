@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use glassdb_data::{TxId, paths};
+use glassdb_data::{KeyRef, LeafRef, TxId};
 use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
@@ -35,7 +35,7 @@ pub(crate) struct LockResolution {
 pub(crate) async fn resolve_entry_locks_at(
     resolver: &Resolver,
     monitor: &Monitor,
-    key_path: &str,
+    key: &KeyRef,
     entry: Option<&ShardEntry>,
     own_lock_holder: Option<&TxId>,
     requirement: Requirement,
@@ -59,7 +59,7 @@ pub(crate) async fn resolve_entry_locks_at(
         entry.current_writer.clone()
     } else {
         resolver
-            .resolve_writer_at(key_path, Some(entry), requirement)
+            .resolve_writer_at(key, Some(entry), requirement)
             .await?
             .writer
     };
@@ -67,9 +67,7 @@ pub(crate) async fn resolve_entry_locks_at(
         None => false,
         Some(writer) if entry.current_writer.as_ref() == Some(writer) => entry.deleted,
         Some(writer) => {
-            let value = monitor
-                .committed_value_at(key_path, writer, requirement)
-                .await?;
+            let value = monitor.committed_value_at(key, writer, requirement).await?;
             value.status == TxCommitStatus::Ok && !value.value.not_written && value.value.deleted
         }
     };
@@ -95,14 +93,14 @@ pub(crate) async fn resolve_entry_locks_at(
 /// Resolves entry lock state using the coordination round's evidence bound.
 pub(crate) async fn resolve_entry_locks(
     ctx: &ResolveCtx<'_>,
-    key_path: &str,
+    key: &KeyRef,
     entry: Option<&ShardEntry>,
     own_lock_holder: Option<&TxId>,
 ) -> Result<LockResolution, TransError> {
     resolve_entry_locks_at(
         ctx.resolver,
         ctx.tmon,
-        key_path,
+        key,
         entry,
         own_lock_holder,
         ctx.requirement,
@@ -408,13 +406,19 @@ async fn resolve_entries(
     id: &TxId,
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
 ) -> Result<BTreeMap<Vec<u8>, ShardEntry>, TransError> {
-    let prefix = paths::parse(path)
+    let collection = LeafRef::from_physical_path(path)
         .map_err(|e| TransError::with_source("parsing leaf path", e))?
-        .prefix;
+        .collection()
+        .clone();
     let mut resolved_entries = BTreeMap::new();
     for (key, entry) in entries {
-        let resolved =
-            resolve_entry_locks(ctx, &paths::from_key(&prefix, key), Some(entry), Some(id)).await?;
+        let resolved = resolve_entry_locks(
+            ctx,
+            &KeyRef::new(collection.clone(), key),
+            Some(entry),
+            Some(id),
+        )
+        .await?;
         let mut entry = entry.clone();
         entry.current_writer = resolved.writer;
         entry.deleted = resolved.deleted;

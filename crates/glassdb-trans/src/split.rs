@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
-use glassdb_data::{TxId, paths};
+use glassdb_data::{CollectionPath, KeyRef, TxId, paths};
 use glassdb_storage::{
     Directory, IndexNode, LeafObservation, LockType, Node, Requirement, Shard, ShardStore,
     SplitPolicy, StorageError, StructuralLog, Timeline, TxCommitStatus, TxLog,
@@ -639,6 +639,8 @@ impl Splitter {
         node: &mut Node,
         id: &TxId,
     ) -> Result<(), TransError> {
+        let collection = CollectionPath::from_physical_prefix(prefix)
+            .map_err(|e| TransError::with_source("parsing collection prefix", e))?;
         let Some(shard) = node.as_leaf() else {
             return Ok(());
         };
@@ -647,7 +649,7 @@ impl Splitter {
             let resolved = resolve_entry_locks_at(
                 &self.resolver,
                 &self.mon,
-                &paths::from_key(prefix, &entry.key),
+                &KeyRef::new(collection.clone(), &entry.key),
                 Some(entry),
                 Some(id),
                 Requirement::Any,
@@ -1179,7 +1181,11 @@ mod tests {
     use glassdb_data::TxId;
     use glassdb_storage::{CachedStore, CollectionRoot, LockType, ShardEntry, TLogger, TxWrite};
 
-    const COLL: &str = "db/coll";
+    const COLL: &str = "db/_c/NqxgQ0";
+
+    fn collection() -> CollectionPath {
+        CollectionPath::new("db", b"coll")
+    }
 
     // A soft cap so tight a two-entry leaf is at the cap and a third overflows it,
     // and any three-child index overflows — so splits are driven by a handful of
@@ -1707,7 +1713,7 @@ mod tests {
         mon.begin_tx(&holder);
         let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
         log.writes.push(TxWrite {
-            path: paths::from_key(COLL, b"d"),
+            key: KeyRef::new(collection(), b"d"),
             value: Arc::from(b"new-d".as_slice()),
             deleted: false,
             prev_writer: TxId::from_bytes(vec![1]),

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{TxId, paths};
+use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::{LeafObservation, ShardStore, Timeline};
 use glassdb_trans::{Data, ReadAccess, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess};
 
@@ -39,8 +39,8 @@ pub struct Transaction {
 
 #[derive(Default)]
 struct TransactionInner {
-    staged: HashMap<String, StagedValue>,
-    reads: HashMap<String, ReadState>,
+    staged: HashMap<KeyRef, StagedValue>,
+    reads: HashMap<KeyRef, ReadState>,
     scans: Vec<ScanAccess>,
     aborted: bool,
 }
@@ -50,14 +50,14 @@ pub(crate) struct TransactionMetrics {
 }
 
 impl TransactionInner {
-    fn record_read(&mut self, path: String, mut state: ReadState) {
+    fn record_read(&mut self, key: KeyRef, mut state: ReadState) {
         // Concurrent reads of one path can both miss the transaction-local
         // state. Preserve a hit observed by either result while still counting
         // the path once, consistently with `tx_reads`.
-        if self.reads.get(&path).is_some_and(ReadState::cache_hit) {
+        if self.reads.get(&key).is_some_and(ReadState::cache_hit) {
             state.set_cache_hit();
         }
-        self.reads.insert(path, state);
+        self.reads.insert(key, state);
     }
 }
 
@@ -69,26 +69,26 @@ impl Transaction {
     /// Takes `&self`, so multiple reads can be polled concurrently (e.g. with
     /// `futures::future::join_all`) to fetch keys in parallel.
     pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        let p = paths::from_key(c.prefix(), key);
+        let key = KeyRef::new(c.path().clone(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
-            if let Some(staged) = inner.staged.get(&p) {
+            if let Some(staged) = inner.staged.get(&key) {
                 return Ok(staged.read());
             }
-            if let Some(ReadState::NotFound { .. }) = inner.reads.get(&p) {
+            if let Some(ReadState::NotFound { .. }) = inner.reads.get(&key) {
                 // Be consistent with values not found the first time.
                 return Ok(None);
             }
         }
 
-        match self.reader.read(&p, std::time::Duration::MAX).await {
+        match self.reader.read(&key, std::time::Duration::MAX).await {
             Ok(outcome) => match outcome.value {
                 None => {
                     let mut inner = self.inner.lock().unwrap();
                     inner.record_read(
-                        p,
+                        key,
                         ReadState::NotFound {
                             last_writer: outcome.last_writer,
                             cache_hit: outcome.cache_hit,
@@ -101,9 +101,9 @@ impl Transaction {
                     let mut inner = self.inner.lock().unwrap();
                     inner
                         .staged
-                        .insert(p.clone(), StagedValue::Read(rv.value.clone()));
+                        .insert(key.clone(), StagedValue::Read(rv.value.clone()));
                     inner.record_read(
-                        p,
+                        key,
                         ReadState::Found {
                             last_writer: rv.version.writer,
                             cache_hit: outcome.cache_hit,
@@ -132,9 +132,8 @@ impl Transaction {
             inner
                 .staged
                 .iter()
-                .filter_map(|(path, value)| {
-                    let (prefix, key) = paths::split_key(path).ok()?;
-                    if prefix != c.prefix() {
+                .filter_map(|(key, value)| {
+                    if key.collection() != c.path() {
                         return None;
                     }
                     let present = match value {
@@ -142,7 +141,10 @@ impl Transaction {
                         StagedValue::Put(_) => true,
                         StagedValue::Delete => false,
                     };
-                    Some(ScanMutation { key, present })
+                    Some(ScanMutation {
+                        key: key.key().to_vec(),
+                        present,
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -150,12 +152,12 @@ impl Transaction {
 
         let result = self
             .resolver
-            .scan_keys(c.prefix(), &range, &overlay, None, None)
+            .scan_keys(c.path(), &range, &overlay, None, None)
             .await
             .map_err(Error::from_read)?;
         let keys = result.keys;
         self.inner.lock().unwrap().scans.push(ScanAccess {
-            prefix: c.prefix().into(),
+            collection: c.path().clone(),
             range,
             overlay,
             keys: keys.clone(),
@@ -167,23 +169,23 @@ impl Transaction {
 
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        let p = paths::from_key(c.prefix(), key);
+        let key = KeyRef::new(c.path().clone(), key);
         self.inner
             .lock()
             .unwrap()
             .staged
-            .insert(p, StagedValue::Put(Arc::from(value)));
+            .insert(key, StagedValue::Put(Arc::from(value)));
         Ok(())
     }
 
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
-        let p = paths::from_key(c.prefix(), key);
+        let key = KeyRef::new(c.path().clone(), key);
         self.inner
             .lock()
             .unwrap()
             .staged
-            .insert(p, StagedValue::Delete);
+            .insert(key, StagedValue::Delete);
         Ok(())
     }
 
@@ -235,10 +237,8 @@ impl Transaction {
         for (k, v) in &inner.staged {
             match v {
                 StagedValue::Read(_) => {}
-                StagedValue::Put(val) => {
-                    writes.push(WriteAccess::put(k.as_str().into(), val.clone()))
-                }
-                StagedValue::Delete => writes.push(WriteAccess::delete(k.as_str().into())),
+                StagedValue::Put(val) => writes.push(WriteAccess::put(k.clone(), val.clone())),
+                StagedValue::Delete => writes.push(WriteAccess::delete(k.clone())),
             }
         }
         let mut reads = Vec::new();
@@ -252,7 +252,7 @@ impl Transaction {
                 } => (last_writer.clone(), leaf.clone()),
             };
             reads.push(ReadAccess {
-                path: k.as_str().into(),
+                key: k.clone(),
                 last_writer,
                 leaf,
             });
@@ -262,8 +262,8 @@ impl Transaction {
         // independent of `HashMap`'s randomized iteration, and of the order in
         // which concurrent reads happened to insert their entries. This makes a
         // simulation replay byte-for-byte identical and is harmless in production.
-        writes.sort_by(|a, b| a.path.cmp(&b.path));
-        reads.sort_by(|a, b| a.path.cmp(&b.path));
+        writes.sort_by(|a, b| a.key.cmp(&b.key));
+        reads.sort_by(|a, b| a.key.cmp(&b.key));
         // Scans are recorded in listing order, which is already deterministic
         // (leaves scanned left-to-right), so they need no re-sorting.
         let scans = inner.scans.clone();

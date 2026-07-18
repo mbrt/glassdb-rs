@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use glassdb_data::KeyRef;
 use glassdb_data::paths;
 
 use crate::cached_store::Requirement;
@@ -300,16 +301,16 @@ impl Directory {
         }
     }
 
-    /// Routes `(key_path, payload)` items to their owning leaves, returning one
+    /// Routes `(key, payload)` items to their owning leaves, returning one
     /// group per touched leaf with its loaded node and version. Callers hand it
-    /// key paths and never compute a location themselves; routing is by descent
+    /// logical keys and never compute a location themselves; routing is by descent
     /// from the collection root, not by any fixed hash (ADR-031).
     ///
     /// Groups are keyed by leaf object path, so keys from different collections
     /// (distinct `_i`) never collide; input order is preserved within a group.
-    pub async fn group_keys_by_leaf<P: AsRef<str>, T>(
+    pub async fn group_keys_by_leaf<T>(
         &self,
-        items: impl IntoIterator<Item = (P, T)>,
+        items: impl IntoIterator<Item = (KeyRef, T)>,
         requirement: Requirement,
     ) -> Result<Vec<LeafGroup<T>>, StorageError> {
         self.group_keys_by_leaf_fresh(items, requirement, requirement)
@@ -322,16 +323,16 @@ impl Directory {
     ///
     /// [`group_keys_by_leaf`]: Self::group_keys_by_leaf
     /// [`leaf_for_fresh`]: Self::leaf_for_fresh
-    pub async fn group_keys_by_leaf_fresh<P: AsRef<str>, T>(
+    pub async fn group_keys_by_leaf_fresh<T>(
         &self,
-        items: impl IntoIterator<Item = (P, T)>,
+        items: impl IntoIterator<Item = (KeyRef, T)>,
         interior: Requirement,
         leaf: Requirement,
     ) -> Result<Vec<LeafGroup<T>>, StorageError> {
         let mut groups: BTreeMap<String, LeafGroup<T>> = BTreeMap::new();
-        for (path, payload) in items {
-            let (prefix, raw_key) = paths::split_key(path.as_ref())
-                .map_err(|e| StorageError::with_source("parsing key path", e))?;
+        for (key, payload) in items {
+            let prefix = key.collection().physical_prefix();
+            let raw_key = key.key().to_vec();
             let loc = self
                 .leaf_for_fresh(&prefix, &raw_key, interior, leaf)
                 .await?;
@@ -553,6 +554,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_data::CollectionPath;
 
     use crate::Timeline;
     use crate::cached_store::CachedStore;
@@ -563,7 +565,7 @@ mod tests {
     use crate::shard::ShardEntry;
     use crate::shardstore::ShardStore;
 
-    const COLL: &str = "db/coll";
+    const COLL: &str = "db/_c/NqxgQ0";
 
     #[derive(Clone)]
     struct TestStore {
@@ -736,7 +738,7 @@ mod tests {
             .await
             .unwrap();
         let paths: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
-        assert_eq!(paths, vec!["db/coll/_n/L0", "db/coll/_n/L1"]);
+        assert_eq!(paths, vec!["db/_c/NqxgQ0/_n/L0", "db/_c/NqxgQ0/_n/L1"]);
 
         let leftmost = dir
             .leftmost_leaf(COLL, Requirement::AtLeast(s.timeline.now()))
@@ -906,13 +908,20 @@ mod tests {
         let s = store();
         seed_two_level(&s).await;
         let dir = Directory::new(s.shards.clone());
+        assert_eq!(CollectionPath::new("db", b"coll").physical_prefix(), COLL);
 
         let groups = dir
             .group_keys_by_leaf(
                 [
-                    (paths::from_key(COLL, b"cat"), 'c'),
-                    (paths::from_key(COLL, b"mango"), 'm'),
-                    (paths::from_key(COLL, b"apple"), 'a'),
+                    (KeyRef::new(CollectionPath::new("db", b"coll"), b"cat"), 'c'),
+                    (
+                        KeyRef::new(CollectionPath::new("db", b"coll"), b"mango"),
+                        'm',
+                    ),
+                    (
+                        KeyRef::new(CollectionPath::new("db", b"coll"), b"apple"),
+                        'a',
+                    ),
                 ],
                 Requirement::AtLeast(s.timeline.now()),
             )

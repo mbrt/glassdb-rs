@@ -711,25 +711,26 @@ evidence can therefore save I/O without being mistaken for logical finality.
 
 ### Path Encoding
 
-Storage paths follow a hierarchical scheme with type markers
-(`glassdb-data/src/paths.rs`):
+Logical collection paths are structured as a database root plus raw collection
+name segments. Logical keys pair one of those collection paths with raw key
+bytes. They are not encoded as physical object paths.
 
-```
-<db-prefix>/<type>/<base64-encoded-name>
-```
+Only backend objects have type markers (`glassdb-data/src/paths.rs`):
 
-| Type Marker | Meaning                     | Example                    |
-| ----------- | --------------------------- | -------------------------- |
-| `_k`        | Key (user data)             | `mydb/coll/_k/dXNlcl9rZXk` |
-| `_c`        | Collection (sub-collection) | `mydb/root/_c/c2V0dGluZ3M` |
-| `_t`        | Transaction log             | `mydb/root/_t/dHhfMTIz`    |
-| `_i`        | Collection info (metadata)  | `mydb/root/_i`             |
+| Type Marker | Meaning                         | Example                           |
+| ----------- | ------------------------------- | --------------------------------- |
+| `_c`        | Physical collection namespace   | `mydb/_c/RqKoS6_iOrB`             |
+| `_i`        | Collection root                  | `mydb/_c/RqKoS6_iOrB/_i`          |
+| `_n`        | Standalone B-link node           | `mydb/_c/RqKoS6_iOrB/_n/<token>`  |
+| `_t`        | Sharded transaction object       | `mydb/_t/<shard>/<transaction-id>`|
+| `_s`        | Structural recovery record       | `mydb/_s/<record-id>`             |
 
-Key names and collection names are base64-encoded in the path to avoid
-conflicts with the type markers and to support arbitrary byte sequences. The
-encoding uses a custom **order-preserving** base64 alphabet
-(`glassdb-data/src/base64.rs`), so storage keys are stable and anchored by
-golden vectors.
+Collection names are base64-encoded only when rendering a physical collection
+namespace. Keys live inside leaf objects and remain raw bytes. Transaction
+objects likewise store raw key bytes and root-relative collection-name segments;
+the database root comes from the transaction object's location, so moving a
+database does not invalidate its logs. The physical namespace encoding uses a
+custom **order-preserving** base64 alphabet (`glassdb-data/src/base64.rs`).
 
 ### Collections
 

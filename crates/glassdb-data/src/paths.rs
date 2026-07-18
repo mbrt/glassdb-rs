@@ -1,10 +1,209 @@
-//! Storage path encoding/decoding. Ported from the Go `internal/data/paths`
-//! package. Paths have the form `{prefix}/{type}/{base64(payload)}`, except
-//! collection-info objects (`{prefix}/_i`) and sharded transaction objects
-//! (`{prefix}/_t/{shard}/{base64(txid)}`).
+//! Logical collection/key references and physical backend-object paths.
+//! Collection names and keys remain structured until a collection prefix or a
+//! leaf/transaction object must be addressed in the backend.
+
+use std::sync::Arc;
 
 use crate::base64;
 use crate::txid::TxId;
+
+/// A collection's logical identity.
+///
+/// Collection names remain raw bytes here. The `_c/<base64>` representation is
+/// produced only when addressing physical objects in the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CollectionPath {
+    db_root: Arc<str>,
+    segments: Arc<[Vec<u8>]>,
+}
+
+impl CollectionPath {
+    /// Creates a top-level collection path.
+    pub fn new(db_root: impl Into<Arc<str>>, name: impl AsRef<[u8]>) -> Self {
+        Self::from_segments(db_root, [name.as_ref().to_vec()])
+    }
+
+    /// Creates a collection path from its database root and ordered name segments.
+    pub fn from_segments<I, B>(db_root: impl Into<Arc<str>>, segments: I) -> Self
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let db_root = db_root.into();
+        let segments: Vec<Vec<u8>> = segments
+            .into_iter()
+            .map(|segment| segment.as_ref().to_vec())
+            .collect();
+        assert!(!db_root.is_empty(), "database root must not be empty");
+        assert!(
+            !segments.is_empty(),
+            "collection path must contain at least one name"
+        );
+        CollectionPath {
+            db_root,
+            segments: segments.into(),
+        }
+    }
+
+    /// Returns this collection's database root.
+    pub fn db_root(&self) -> &str {
+        &self.db_root
+    }
+
+    /// Returns the raw collection-name segments from outermost to innermost.
+    pub fn segments(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.segments.iter().map(Vec::as_slice)
+    }
+
+    /// Returns a child collection path.
+    pub fn child(&self, name: impl AsRef<[u8]>) -> Self {
+        let mut segments = self.segments.to_vec();
+        segments.push(name.as_ref().to_vec());
+        CollectionPath {
+            db_root: self.db_root.clone(),
+            segments: segments.into(),
+        }
+    }
+
+    /// Returns the parent collection and this collection's name when nested.
+    pub fn parent(&self) -> Option<(Self, Vec<u8>)> {
+        if self.segments.len() <= 1 {
+            return None;
+        }
+        let mut segments = self.segments.to_vec();
+        let name = segments.pop().expect("nested collection has a final name");
+        Some((
+            CollectionPath {
+                db_root: self.db_root.clone(),
+                segments: segments.into(),
+            },
+            name,
+        ))
+    }
+
+    /// Renders the collection prefix used for physical backend objects.
+    pub fn physical_prefix(&self) -> String {
+        let mut prefix = self.db_root.to_string();
+        for segment in self.segments.iter() {
+            prefix.push_str("/_c/");
+            prefix.push_str(&base64::encode(segment));
+        }
+        prefix
+    }
+
+    /// Parses a physical `_c/<base64>` collection prefix.
+    pub fn from_physical_prefix(prefix: &str) -> Result<Self, PathError> {
+        let mut parts = prefix.split('/');
+        let db_root = parts
+            .next()
+            .filter(|part| !part.is_empty())
+            .ok_or_else(|| PathError::Parse(prefix.to_string()))?;
+        let rest: Vec<&str> = parts.collect();
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            return Err(PathError::Parse(prefix.to_string()));
+        }
+        let mut segments = Vec::with_capacity(rest.len() / 2);
+        for pair in rest.chunks_exact(2) {
+            if pair[0] != "_c" {
+                return Err(PathError::Parse(prefix.to_string()));
+            }
+            segments.push(base64::decode(pair[1])?);
+        }
+        Ok(CollectionPath::from_segments(db_root, segments))
+    }
+}
+
+/// A logical key stored inside a collection leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyRef {
+    collection: CollectionPath,
+    key: Arc<[u8]>,
+}
+
+impl KeyRef {
+    /// Creates a logical key reference.
+    pub fn new(collection: CollectionPath, key: impl AsRef<[u8]>) -> Self {
+        KeyRef {
+            collection,
+            key: Arc::from(key.as_ref()),
+        }
+    }
+
+    /// Returns the containing collection.
+    pub fn collection(&self) -> &CollectionPath {
+        &self.collection
+    }
+
+    /// Returns the raw key bytes used by the leaf entry.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+}
+
+/// A physical leaf within a collection's coordination tree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LeafRef {
+    Root(CollectionPath),
+    Node {
+        collection: CollectionPath,
+        token: Arc<str>,
+    },
+}
+
+impl LeafRef {
+    /// Creates a collection-root leaf reference.
+    pub fn root(collection: CollectionPath) -> Self {
+        LeafRef::Root(collection)
+    }
+
+    /// Creates a standalone-node leaf reference.
+    pub fn node(collection: CollectionPath, token: impl Into<Arc<str>>) -> Self {
+        LeafRef::Node {
+            collection,
+            token: token.into(),
+        }
+    }
+
+    /// Returns the collection whose tree contains this leaf.
+    pub fn collection(&self) -> &CollectionPath {
+        match self {
+            LeafRef::Root(collection) | LeafRef::Node { collection, .. } => collection,
+        }
+    }
+
+    /// Returns the standalone node token, or `None` for the collection root.
+    pub fn node_token(&self) -> Option<&str> {
+        match self {
+            LeafRef::Root(_) => None,
+            LeafRef::Node { token, .. } => Some(token),
+        }
+    }
+
+    /// Renders the exact physical backend object path of this leaf.
+    pub fn physical_path(&self) -> String {
+        match self {
+            LeafRef::Root(collection) => collection_info(&collection.physical_prefix()),
+            LeafRef::Node { collection, token } => from_node(&collection.physical_prefix(), token),
+        }
+    }
+
+    /// Parses a physical collection-root or node path.
+    pub fn from_physical_path(path: &str) -> Result<Self, PathError> {
+        if let Some(prefix) = path.strip_suffix("/_i") {
+            return Ok(LeafRef::root(CollectionPath::from_physical_prefix(prefix)?));
+        }
+        let Some((prefix, token)) = path.rsplit_once("/_n/") else {
+            return Err(PathError::Parse(path.to_string()));
+        };
+        if token.is_empty() || token.contains('/') {
+            return Err(PathError::Parse(path.to_string()));
+        }
+        Ok(LeafRef::node(
+            CollectionPath::from_physical_prefix(prefix)?,
+            token,
+        ))
+    }
+}
 
 /// Number of deterministic transaction-log shards (two base64 symbols).
 pub const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
@@ -13,8 +212,6 @@ pub const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Unknown,
-    Key,
-    Collection,
     Transaction,
     CollectionInfo,
     /// A B-link tree node object (`_n/<token>`, ADR-031).
@@ -22,13 +219,10 @@ pub enum Type {
 }
 
 impl Type {
-    /// Returns the path type marker string (`_k`, `_c`, `_t`, `_i`, `_n`, or
-    /// `""`).
+    /// Returns the physical object marker (`_t`, `_i`, `_n`, or `""`).
     pub fn as_str(self) -> &'static str {
         match self {
             Type::Unknown => "",
-            Type::Key => "_k",
-            Type::Collection => "_c",
             Type::Transaction => "_t",
             Type::CollectionInfo => "_i",
             Type::Node => "_n",
@@ -75,45 +269,6 @@ pub struct ParseResult {
     pub typ: Type,
 }
 
-/// Encodes a key into a storage path under `prefix`.
-pub fn from_key(prefix: &str, key: &[u8]) -> String {
-    prefix_encode(prefix, Type::Key, key)
-}
-
-/// Decodes a key from a storage path suffix (e.g. `_k/<b64>`).
-pub fn to_key(suffix: &str) -> Result<Vec<u8>, PathError> {
-    decode(Type::Key, suffix)
-}
-
-/// Splits a full key path (`{prefix}/_k/<b64>`) into its collection prefix and
-/// decoded raw key bytes, the inverse of [`from_key`]. Unlike [`to_key`] (which
-/// decodes a type-marked suffix), this takes a whole path.
-pub fn split_key(path: &str) -> Result<(String, Vec<u8>), PathError> {
-    let pr = parse(path)?;
-    if pr.typ != Type::Key {
-        return Err(PathError::WrongPrefix {
-            suffix: path.to_string(),
-            expected: Type::Key.as_str().to_string(),
-        });
-    }
-    Ok((pr.prefix, base64::decode(&pr.suffix)?))
-}
-
-/// Returns the listing prefix for all keys under `prefix`.
-pub fn keys_prefix(prefix: &str) -> String {
-    typed_prefix(prefix, Type::Key)
-}
-
-/// Encodes a collection name into a storage path under `prefix`.
-pub fn from_collection(prefix: &str, name: &[u8]) -> String {
-    prefix_encode(prefix, Type::Collection, name)
-}
-
-/// Decodes a collection name from a storage path suffix (e.g. `_c/<b64>`).
-pub fn to_collection(suffix: &str) -> Result<Vec<u8>, PathError> {
-    decode(Type::Collection, suffix)
-}
-
 /// Returns the storage path for the collection-info object under `prefix`.
 pub fn collection_info(prefix: &str) -> String {
     format!("{prefix}/_i")
@@ -122,29 +277,6 @@ pub fn collection_info(prefix: &str) -> String {
 /// Reports whether `p` refers to a collection-info object.
 pub fn is_collection_info(p: &str) -> bool {
     p.ends_with("/_i")
-}
-
-/// Returns the listing prefix for all collections under `prefix`.
-pub fn collections_prefix(prefix: &str) -> String {
-    typed_prefix(prefix, Type::Collection)
-}
-
-/// Splits a collection `prefix` into its parent collection prefix and this
-/// collection's decoded name, but only when the parent is *itself* a collection
-/// (and thus owns a root `_i` that holds a subcollection directory).
-///
-/// A top-level collection's parent is the database, which has no root, so this
-/// returns `None`. It also returns `None` for any non-collection path.
-pub fn parent_collection(prefix: &str) -> Option<(String, Vec<u8>)> {
-    let pr = parse(prefix).ok()?;
-    if pr.typ != Type::Collection {
-        return None;
-    }
-    if parse(&pr.prefix).map(|p| p.typ) != Ok(Type::Collection) {
-        return None;
-    }
-    let name = base64::decode(&pr.suffix).ok()?;
-    Some((pr.prefix, name))
 }
 
 /// Encodes a transaction ID into a storage path under `prefix`.
@@ -320,8 +452,6 @@ pub fn parse(p: &str) -> Result<ParseResult, PathError> {
     let typ_str = &p[prefix_idx + 1..type_idx];
     let suffix = &p[type_idx + 1..];
     let typ = match typ_str {
-        "_k" => Type::Key,
-        "_c" => Type::Collection,
         "_n" => Type::Node,
         _ => Type::Unknown,
     };
@@ -357,55 +487,43 @@ fn typed_prefix(prefix: &str, t: Type) -> String {
     format!("{}/{}/", prefix, t.as_str())
 }
 
-fn prefix_encode(prefix: &str, category: Type, a: &[u8]) -> String {
-    format!("{}/{}/{}", prefix, category.as_str(), base64::encode(a))
-}
-
-fn decode(category: Type, suffix: &str) -> Result<Vec<u8>, PathError> {
-    let pfx = format!("{}/", category.as_str());
-    match suffix.strip_prefix(&pfx) {
-        Some(rest) => Ok(base64::decode(rest)?),
-        None => Err(PathError::WrongPrefix {
-            suffix: suffix.to_string(),
-            expected: category.as_str().to_string(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn key_round_trip() {
-        let p = from_key("foo/bar", b"Hello");
-        assert!(p.starts_with("foo/bar/_k/"));
-        let suffix = p.strip_prefix("foo/bar/").unwrap();
-        assert_eq!(to_key(suffix).unwrap(), b"Hello");
+    fn logical_collection_and_key_paths_round_trip() {
+        let parent = CollectionPath::new("db", b"parent");
+        let child = parent.child(b"child");
+        assert_eq!(child.db_root(), "db");
+        assert_eq!(
+            child.segments().collect::<Vec<_>>(),
+            vec![b"parent".as_slice(), b"child".as_slice()]
+        );
+        assert_eq!(
+            CollectionPath::from_physical_prefix(&child.physical_prefix()).unwrap(),
+            child
+        );
+        assert_eq!(child.parent(), Some((parent.clone(), b"child".to_vec())));
+        assert_eq!(parent.parent(), None);
+
+        let key = KeyRef::new(child, b"Hello");
+        assert_eq!(key.key(), b"Hello");
+        assert_eq!(key.collection().db_root(), "db");
     }
 
     #[test]
-    fn parse_key() {
-        let p = from_key("foo/bar", b"Hello");
-        let r = parse(&p).unwrap();
-        assert_eq!(r.prefix, "foo/bar");
-        assert_eq!(r.typ, Type::Key);
-        // suffix is just the base64 component.
-        assert_eq!(to_key(&format!("_k/{}", r.suffix)).unwrap(), b"Hello");
-    }
-
-    #[test]
-    fn split_key_round_trip_and_errors() {
-        let (prefix, key) = split_key(&from_key("foo/bar", b"Hello")).unwrap();
-        assert_eq!(prefix, "foo/bar");
-        assert_eq!(key, b"Hello");
-        // A non-key path is rejected.
-        assert!(matches!(
-            split_key(&from_node("db/coll", "tok")),
-            Err(PathError::WrongPrefix { .. })
-        ));
-        // A malformed path (no type segment) is a parse error.
-        assert!(matches!(split_key("db"), Err(PathError::Parse(_))));
+    fn leaf_paths_round_trip() {
+        let collection = CollectionPath::new("db", b"collection");
+        for leaf in [
+            LeafRef::root(collection.clone()),
+            LeafRef::node(collection, "token"),
+        ] {
+            assert_eq!(
+                LeafRef::from_physical_path(&leaf.physical_path()).unwrap(),
+                leaf
+            );
+        }
     }
 
     #[test]
@@ -433,37 +551,10 @@ mod tests {
     }
 
     #[test]
-    fn keys_prefix_format() {
-        assert_eq!(keys_prefix("db/coll"), "db/coll/_k/");
-        assert_eq!(collections_prefix("db/coll"), "db/coll/_c/");
+    fn transaction_prefix_format() {
         assert_eq!(transactions_prefix("db"), "db/_t/");
         assert_eq!(transaction_shard(&TxId::from_bytes(vec![1, 2, 3, 4])), 16);
         assert_eq!(transaction_shard_prefix("db", 16), "db/_t/0F/");
-    }
-
-    #[test]
-    fn parent_collection_identifies_subcollection_owner() {
-        // A top-level collection's parent is the database, which owns no root.
-        assert_eq!(parent_collection(&from_collection("db", b"top")), None);
-
-        // A subcollection's parent is the collection that owns its directory.
-        let parent = from_collection("db", b"parent");
-        let child = from_collection(&parent, b"child");
-        assert_eq!(
-            parent_collection(&child),
-            Some((parent.clone(), b"child".to_vec()))
-        );
-
-        // Nesting composes: the owner is always the direct parent.
-        let grandchild = from_collection(&child, b"grandchild");
-        assert_eq!(
-            parent_collection(&grandchild),
-            Some((child, b"grandchild".to_vec()))
-        );
-
-        // Non-collection paths have no collection parent.
-        assert_eq!(parent_collection(&from_key("db/coll", b"k")), None);
-        assert_eq!(parent_collection("db"), None);
     }
 
     #[test]
@@ -476,7 +567,7 @@ mod tests {
         ));
         // A non-transaction path is rejected.
         assert!(matches!(
-            transaction_id_of(&from_key("db/coll", b"k")),
+            transaction_id_of(&from_node("db/coll", "node")),
             Err(PathError::WrongPrefix { .. })
         ));
         // A malformed path (no type segment) is a parse error.
@@ -495,7 +586,7 @@ mod tests {
         assert_eq!(nodes_prefix("db/coll"), "db/coll/_n/");
         // A non-node path is rejected.
         assert!(matches!(
-            node_token_of(&from_key("db/coll", b"k")),
+            node_token_of(&from_transaction("db", &TxId::from_bytes(vec![1]))),
             Err(PathError::WrongPrefix { .. })
         ));
         // A malformed path (no type segment) is a parse error.
@@ -528,17 +619,14 @@ mod tests {
         assert_eq!(base64::encode(b"Hello"), "H6KgQ6w");
         assert_eq!(base64::encode(&[0, 1, 2, 3, 4]), "00420kF");
         assert_eq!(base64::encode(b"ab"), "NL8");
-        assert_eq!(from_key("foo/bar", b"Hello"), "foo/bar/_k/H6KgQ6w");
-        assert_eq!(from_collection("db", b"settings"), "db/_c/RqKoS6_iOrB");
+        assert_eq!(
+            CollectionPath::new("db", b"settings").physical_prefix(),
+            "db/_c/RqKoS6_iOrB"
+        );
         assert_eq!(
             from_transaction("db", &TxId::from_bytes(vec![1, 2, 3, 4])),
             "db/_t/0F/0F8310"
         );
         assert_eq!(collection_info("db/root"), "db/root/_i");
-
-        let r = parse("foo/bar/_k/H6KgQ6w").unwrap();
-        assert_eq!(r.prefix, "foo/bar");
-        assert_eq!(r.suffix, "H6KgQ6w");
-        assert_eq!(r.typ, Type::Key);
     }
 }

@@ -47,7 +47,20 @@ impl fmt::Display for Diagnostics {
         for t in &self.transactions {
             writeln!(f, "    {} ({} locks)", t.tx_id, t.locks.len())?;
             for l in &t.locks {
-                writeln!(f, "      {} {} {}", l.scope, l.typ, l.path)?;
+                match l {
+                    glassdb_storage::TxLock::Entry { key, typ } => writeln!(
+                        f,
+                        "      Entry {typ} {}/{:?}",
+                        key.collection().physical_prefix(),
+                        key.key()
+                    )?,
+                    glassdb_storage::TxLock::Structure { leaf, typ } => {
+                        writeln!(f, "      Structure {typ} {}", leaf.physical_path())?
+                    }
+                    glassdb_storage::TxLock::Membership { leaf, typ } => {
+                        writeln!(f, "      Membership {typ} {}", leaf.physical_path())?
+                    }
+                }
             }
         }
         Ok(())

@@ -8,7 +8,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
-use glassdb_data::{TxId, paths};
+use glassdb_data::{CollectionPath, TxId};
 use glassdb_storage::{CachedStore, Directory, ShardStore, SplitPolicy, TLogger, Timeline};
 use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, Splitter, TransError};
 use tokio::sync::Notify;
@@ -288,8 +288,8 @@ impl Database {
 
     /// Returns a top-level collection with the given name.
     pub fn collection(&self, name: &[u8]) -> Collection {
-        let p = paths::from_collection(&self.inner.name, name);
-        self.inner.open_collection(p)
+        self.inner
+            .open_collection(CollectionPath::new(self.inner.name.as_str(), name))
     }
 
     /// Executes `f` within a serializable transaction, retrying on conflicts.
@@ -375,8 +375,8 @@ impl Drop for InFlightGuard<'_> {
 }
 
 impl DbInner {
-    pub(crate) fn open_collection(self: &Arc<Self>, prefix: String) -> Collection {
-        Collection::new(prefix, self.clone())
+    pub(crate) fn open_collection(self: &Arc<Self>, path: CollectionPath) -> Collection {
+        Collection::new(path, self.clone())
     }
 
     pub(crate) async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>

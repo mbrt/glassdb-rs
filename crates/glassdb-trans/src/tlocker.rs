@@ -34,9 +34,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
-use glassdb_data::{TxId, paths};
+use glassdb_data::{KeyRef, LeafRef, TxId, paths};
 use glassdb_storage::{
-    Directory, LeafObservation, LockScope, LockType, NodeLocks, PathLock, Requirement, ShardEntry,
+    Directory, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TxLock,
 };
 
 use crate::algo::{Data, WriteOp};
@@ -66,7 +66,7 @@ struct HeldLeaf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxLockSnapshot {
     pub tx_id: TxId,
-    pub locks: Vec<PathLock>,
+    pub locks: Vec<TxLock>,
 }
 
 /// The lock a transaction wants on a key's shard entry.
@@ -82,9 +82,8 @@ enum Desired {
 struct KeyIntent {
     /// Raw user key bytes (the shard-entry key).
     pub raw_key: Vec<u8>,
-    /// Full storage path of the key (`{prefix}/_k/<b64>`), used to fetch a
-    /// help-forwarded writer's value.
-    pub key_path: String,
+    /// Logical key used to fetch a help-forwarded writer's value.
+    pub key: KeyRef,
     /// The lock to install.
     pub desired: Desired,
 }
@@ -96,6 +95,7 @@ struct ShardGroup {
     /// single leaf, else a standalone node `_n`, resolved by descent. This is
     /// the coordinator submit target and the recorded held-lock path.
     path: String,
+    leaf: LeafRef,
     /// Per-key intentions, in ascending raw-key order.
     intents: Vec<KeyIntent>,
     membership: LockType,
@@ -118,30 +118,25 @@ impl LockedTx {
             .any(|validated| validated.same_state(observed))
     }
 
-    /// The per-key paths this transaction holds, as the `PathLock` set GC records
-    /// on the transaction object for its reverse liveness check and lock pruning
-    /// (ADR-022). Keys map to their `_k/` path; GC ignores the lock type, so it
-    /// is only kept faithful for diagnostics.
-    pub(crate) fn locked_paths(&self) -> Vec<PathLock> {
+    /// The typed entry and leaf locks GC records on the transaction object for
+    /// its reverse liveness check and lock pruning (ADR-022).
+    pub(crate) fn locked_paths(&self) -> Vec<TxLock> {
         let mut out = Vec::new();
         for group in self.groups.values() {
             for intent in &group.intents {
-                out.push(PathLock {
-                    path: intent.key_path.clone(),
+                out.push(TxLock::Entry {
+                    key: intent.key.clone(),
                     typ: lock_type(intent.desired),
-                    scope: LockScope::Entry,
                 });
             }
-            out.push(PathLock {
-                path: group.path.clone(),
+            out.push(TxLock::Structure {
+                leaf: group.leaf.clone(),
                 typ: LockType::Read,
-                scope: LockScope::Structure,
             });
             if group.membership != LockType::None {
-                out.push(PathLock {
-                    path: group.path.clone(),
+                out.push(TxLock::Membership {
+                    leaf: group.leaf.clone(),
                     typ: group.membership,
-                    scope: LockScope::Membership,
                 });
             }
         }
@@ -149,8 +144,7 @@ impl LockedTx {
     }
 }
 
-/// The lock type a `Desired` intention installs, for the recorded `PathLock`
-/// set (a read lock for a key only read, a write lock for any mutation).
+/// The lock type a `Desired` intention records for an entry lock.
 fn lock_type(desired: Desired) -> LockType {
     match desired {
         Desired::Read => LockType::Read,
@@ -158,11 +152,14 @@ fn lock_type(desired: Desired) -> LockType {
     }
 }
 
-fn lock_scope_order(scope: LockScope) -> u8 {
-    match scope {
-        LockScope::Entry => 0,
-        LockScope::Structure => 1,
-        LockScope::Membership => 2,
+fn lock_order(lock: &TxLock) -> (String, u8) {
+    match lock {
+        TxLock::Entry { key, .. } => (
+            format!("{}\0{:?}", key.collection().physical_prefix(), key.key()),
+            0,
+        ),
+        TxLock::Structure { leaf, .. } => (leaf.physical_path(), 1),
+        TxLock::Membership { leaf, .. } => (leaf.physical_path(), 2),
     }
 }
 
@@ -176,24 +173,27 @@ async fn build_groups(
     data: &Data,
     scan_requirement: Requirement,
 ) -> Result<BTreeMap<String, ShardGroup>, TransError> {
-    let mut by_path: BTreeMap<String, Desired> = BTreeMap::new();
+    let mut by_key: BTreeMap<KeyRef, Desired> = BTreeMap::new();
     for w in &data.writes {
         let desired = match w.op {
             WriteOp::Delete => Desired::Delete,
             WriteOp::Put(_) => Desired::Put,
         };
         // A later write to the same key wins (e.g. put-then-delete).
-        by_path.insert(w.path.to_string(), desired);
+        by_key.insert(w.key.clone(), desired);
     }
     for r in &data.reads {
         // A key that is also written keeps its exclusive intent.
-        by_path.entry(r.path.to_string()).or_insert(Desired::Read);
+        by_key.entry(r.key.clone()).or_insert(Desired::Read);
     }
 
     // Collect before descending so the returned future does not close over a
     // borrowing iterator (which would not be higher-ranked / `Send` when a
     // caller spawns the lock).
-    let items: Vec<(String, Desired)> = by_path.into_iter().collect();
+    let items: Vec<(KeyRef, (KeyRef, Desired))> = by_key
+        .into_iter()
+        .map(|(key, desired)| (key.clone(), (key, desired)))
+        .collect();
     // Route with interior nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
     // coordination CAS revalidates at the version, so neither the root `_i` nor
@@ -205,14 +205,14 @@ async fn build_groups(
 
     let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
     for group in grouped {
-        let prefix = paths::parse(&group.path)
-            .map_err(|e| TransError::with_source(format!("parsing leaf path {:?}", group.path), e))?
-            .prefix;
+        let leaf = LeafRef::from_physical_path(&group.path).map_err(|e| {
+            TransError::with_source(format!("parsing leaf path {:?}", group.path), e)
+        })?;
         let mut intents: Vec<KeyIntent> = group
             .keys
             .into_iter()
-            .map(|(raw_key, desired)| KeyIntent {
-                key_path: paths::from_key(&prefix, &raw_key),
+            .map(|(raw_key, (key, desired))| KeyIntent {
+                key,
                 raw_key,
                 desired,
             })
@@ -222,6 +222,7 @@ async fn build_groups(
             group.path.clone(),
             ShardGroup {
                 path: group.path,
+                leaf,
                 intents,
                 membership: LockType::None,
             },
@@ -236,7 +237,7 @@ async fn build_groups(
         }
         for leaf in dir
             .leaves_through(
-                &scan.prefix,
+                &scan.collection.physical_prefix(),
                 &scan.range.start,
                 scan.frontier.as_deref(),
                 scan_requirement,
@@ -246,6 +247,8 @@ async fn build_groups(
             let group = groups
                 .entry(leaf.path.clone())
                 .or_insert_with(|| ShardGroup {
+                    leaf: LeafRef::from_physical_path(&leaf.path)
+                        .expect("directory returned a physical leaf path"),
                     path: leaf.path,
                     intents: Vec::new(),
                     membership: LockType::None,
@@ -483,7 +486,7 @@ async fn resolve_and_lock(
     // ones come back as conflicts to wound-wait. The monitor folds lease expiry
     // and the unknown-tx grace period into `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
-    let resolved = resolve_entry_locks(ctx, &intent.key_path, Some(&e), Some(id)).await?;
+    let resolved = resolve_entry_locks(ctx, &intent.key, Some(&e), Some(id)).await?;
     e.current_writer = resolved.writer;
     e.deleted = resolved.deleted;
     let mut pending = resolved.pending;
@@ -702,24 +705,20 @@ impl Locker {
                 }
                 let mut paths = Vec::new();
                 for (p, held) in locks {
-                    paths.push(PathLock {
-                        path: p.clone(),
+                    let leaf = LeafRef::from_physical_path(p)
+                        .expect("locker tracks only physical leaf paths");
+                    paths.push(TxLock::Structure {
+                        leaf: leaf.clone(),
                         typ: held.typ,
-                        scope: LockScope::Structure,
                     });
                     if held.membership != LockType::None {
-                        paths.push(PathLock {
-                            path: p.clone(),
+                        paths.push(TxLock::Membership {
+                            leaf,
                             typ: held.membership,
-                            scope: LockScope::Membership,
                         });
                     }
                 }
-                paths.sort_by(|a, b| {
-                    a.path
-                        .cmp(&b.path)
-                        .then_with(|| lock_scope_order(a.scope).cmp(&lock_scope_order(b.scope)))
-                });
+                paths.sort_by_key(lock_order);
                 out.push(TxLockSnapshot {
                     tx_id: tx_id.clone(),
                     locks: paths,
@@ -843,12 +842,12 @@ impl Locker {
         id: &TxId,
         leaf_path: &str,
         raw_key: &[u8],
-        key_path: &str,
+        key: &KeyRef,
         installed_from: Option<&LeafObservation>,
     ) -> Vec<TxId> {
         let intents = Arc::new(vec![KeyIntent {
             raw_key: raw_key.to_vec(),
-            key_path: key_path.to_string(),
+            key: key.clone(),
             desired: Desired::Put,
         }]);
         self.write_back_shard(
@@ -1128,7 +1127,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::paths;
+    use glassdb_data::{CollectionPath, paths};
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Node, Shard, ShardEntry, ShardStore, SplitPolicy,
         TLogger, Timeline, TxCommitStatus,
@@ -1190,12 +1189,20 @@ mod tests {
         TxId::with_priority(order * 1_000_000_000, name.as_bytes())
     }
 
-    const COLL: &str = "example";
+    const COLL: &str = "test/_c/OMWWQM1gOF";
+
+    fn collection() -> CollectionPath {
+        CollectionPath::new("test", b"example")
+    }
+
+    fn key_ref(key: &[u8]) -> KeyRef {
+        KeyRef::new(collection(), key)
+    }
 
     fn read_intent(key: &[u8]) -> KeyIntent {
         KeyIntent {
             raw_key: key.to_vec(),
-            key_path: paths::from_key(COLL, key),
+            key: key_ref(key),
             desired: Desired::Read,
         }
     }
@@ -1203,7 +1210,7 @@ mod tests {
     fn put_intent(key: &[u8]) -> KeyIntent {
         KeyIntent {
             raw_key: key.to_vec(),
-            key_path: paths::from_key(COLL, key),
+            key: key_ref(key),
             desired: Desired::Put,
         }
     }
@@ -1218,6 +1225,7 @@ mod tests {
             path.clone(),
             ShardGroup {
                 path,
+                leaf: LeafRef::root(collection()),
                 intents: vec![intent],
                 membership: LockType::None,
             },
@@ -1522,7 +1530,7 @@ mod tests {
         // `old` commits its write, then publishes the pointer and releases.
         let mut tl = TxLog::new(old.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
-            path: paths::from_key(COLL, key),
+            key: key_ref(key),
             value: Arc::from(&b"v1"[..]),
             deleted: false,
             prev_writer: TxId::default(),
@@ -1628,7 +1636,7 @@ mod tests {
         let data = Data {
             reads: Vec::new(),
             writes: vec![crate::algo::WriteAccess::put(
-                paths::from_key(COLL, key).into(),
+                key_ref(key),
                 Arc::from(&b"v"[..]),
             )],
             scans: Vec::new(),
@@ -1667,12 +1675,11 @@ mod tests {
         // A write intention records the held leaf (the small collection's root
         // `_i`) as a write lock.
         let shard_path = paths::collection_info(COLL);
-        assert!(
-            snap[0]
-                .locks
-                .iter()
-                .any(|l| l.path == shard_path && l.typ == LockType::Write)
-        );
+        assert!(snap[0].locks.iter().any(|lock| matches!(
+            lock,
+            TxLock::Membership { leaf, typ: LockType::Write }
+                if leaf.physical_path() == shard_path
+        )));
     }
 
     // Helper: commit a value for `key` so the shard records a `current_writer`,
@@ -1683,7 +1690,7 @@ mod tests {
         ctx.monitor.begin_tx(&writer);
         let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
-            path: paths::from_key(COLL, key),
+            key: key_ref(key),
             value: Arc::from(value),
             deleted: false,
             prev_writer: TxId::default(),
@@ -1943,7 +1950,7 @@ mod tests {
         lock_ok(locker, tx, &groups).await;
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
-            path: paths::from_key(COLL, key),
+            key: key_ref(key),
             value: Arc::from(&b"v"[..]),
             deleted: false,
             prev_writer: TxId::default(),

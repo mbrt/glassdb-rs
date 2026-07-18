@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{Backend, Collection, Database, Error, SplitPolicy, Transaction};
-use glassdb_data::paths;
+use glassdb_data::{CollectionPath, paths};
 use glassdb_storage::{CollectionRoot, TxCommitStatus};
 use tokio::sync::{Barrier, oneshot};
 
@@ -909,7 +909,7 @@ async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
 async fn concurrent_subcollection_registration_survives_parent_cas_contention() {
     let mem = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem.clone());
-    let parent_prefix = paths::from_collection("example", b"parent");
+    let parent_prefix = CollectionPath::new("example", b"parent").physical_prefix();
     let parent_root = paths::collection_info(&parent_prefix);
     let barrier = Arc::new(Barrier::new(3));
     let parent_writes = Arc::new(AtomicUsize::new(0));
@@ -1140,8 +1140,8 @@ impl PauseControl {
 
 /// Reports whether `body` is a transaction object marked aborted.
 fn is_aborted_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::decode(&glassdb_data::TxId::default(), body)
-        .map(|l| l.status == TxCommitStatus::Aborted)
+    glassdb_storage::txobject::status(body)
+        .map(|status| status == TxCommitStatus::Aborted)
         .unwrap_or(false)
 }
 

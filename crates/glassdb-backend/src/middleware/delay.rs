@@ -522,8 +522,8 @@ mod tests {
     #[test]
     fn prefix_key_segments() {
         let cases = [
-            ("bench/_c/abc/_k/def", 1, "bench"),
-            ("bench/_c/abc/_k/def", 2, "bench/_c"),
+            ("bench/_c/abc/_n/def", 1, "bench"),
+            ("bench/_c/abc/_n/def", 2, "bench/_c"),
             ("bench/_t/xyz", 3, "bench/_t/xyz"),
             ("bench", 2, "bench"),
             ("a/b", 2, "a/b"),
