@@ -45,17 +45,24 @@ pub mod transaction_log {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionWrites {
-    #[prost(string, tag = "1")]
-    pub prefix: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "1")]
+    pub collection: ::core::option::Option<CollectionPath>,
     #[prost(message, repeated, tag = "2")]
     pub writes: ::prost::alloc::vec::Vec<Write>,
     #[prost(message, optional, tag = "3")]
     pub locks: ::core::option::Option<CollectionLocks>,
 }
+/// A relocatable logical collection path. The database root comes from the
+/// enclosing transaction object's physical path and is deliberately omitted.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CollectionPath {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub segments: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Write {
-    #[prost(string, tag = "1")]
-    pub suffix: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
     /// The ID of the last transaction writing to this key.
     #[prost(bytes = "vec", tag = "3")]
     pub prev_tid: ::prost::alloc::vec::Vec<u8>,
@@ -74,20 +81,41 @@ pub mod write {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionLocks {
-    #[prost(enumeration = "lock::LockType", tag = "2")]
-    pub collection_lock: i32,
-    #[prost(message, repeated, tag = "3")]
-    pub locks: ::prost::alloc::vec::Vec<Lock>,
+    #[prost(message, repeated, tag = "1")]
+    pub entry_locks: ::prost::alloc::vec::Vec<EntryLock>,
+    #[prost(message, repeated, tag = "2")]
+    pub leaf_locks: ::prost::alloc::vec::Vec<LeafLock>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Lock {
-    #[prost(string, tag = "1")]
-    pub suffix: ::prost::alloc::string::String,
+pub struct EntryLock {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(enumeration = "lock::LockType", tag = "2")]
     pub lock_type: i32,
-    #[prost(enumeration = "lock::Scope", tag = "3")]
-    pub scope: i32,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LeafLock {
+    #[prost(enumeration = "lock::LockType", tag = "3")]
+    pub lock_type: i32,
+    #[prost(enumeration = "lock::Scope", tag = "4")]
+    pub scope: i32,
+    #[prost(oneof = "leaf_lock::Target", tags = "1, 2")]
+    pub target: ::core::option::Option<leaf_lock::Target>,
+}
+/// Nested message and enum types in `LeafLock`.
+pub mod leaf_lock {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Target {
+        /// The collection root object (`_i`). Always encoded as true.
+        #[prost(bool, tag = "1")]
+        Root(bool),
+        /// The opaque token of a standalone node object (`_n/<token>`).
+        #[prost(string, tag = "2")]
+        Node(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Lock {}
 /// Nested message and enum types in `Lock`.
 pub mod lock {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -129,9 +157,8 @@ pub mod lock {
     #[repr(i32)]
     pub enum Scope {
         UnknownScope = 0,
-        Entry = 1,
-        Structure = 2,
-        Membership = 3,
+        Structure = 1,
+        Membership = 2,
     }
     impl Scope {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -141,7 +168,6 @@ pub mod lock {
         pub fn as_str_name(&self) -> &'static str {
             match self {
                 Self::UnknownScope => "UNKNOWN_SCOPE",
-                Self::Entry => "ENTRY",
                 Self::Structure => "STRUCTURE",
                 Self::Membership => "MEMBERSHIP",
             }
@@ -150,7 +176,6 @@ pub mod lock {
         pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
             match value {
                 "UNKNOWN_SCOPE" => Some(Self::UnknownScope),
-                "ENTRY" => Some(Self::Entry),
                 "STRUCTURE" => Some(Self::Structure),
                 "MEMBERSHIP" => Some(Self::Membership),
                 _ => None,

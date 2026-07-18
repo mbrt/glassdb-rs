@@ -40,10 +40,10 @@ use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
-use glassdb_data::{TxId, paths, shuffle};
+use glassdb_data::{KeyRef, TxId, paths, shuffle};
 use glassdb_storage::{
-    Directory, LockScope, PathLock, Requirement, ShardStore, StorageError, TLogger, Timeline,
-    TxCommitStatus, TxLog,
+    Directory, Requirement, ShardStore, StorageError, TLogger, Timeline, TxCommitStatus, TxLock,
+    TxLog,
 };
 
 use crate::error::TransError;
@@ -303,7 +303,7 @@ impl Gc {
     async fn reclaim_aborted(
         &self,
         tid: &TxId,
-        locks: &[PathLock],
+        locks: &[TxLock],
         requirement: Requirement,
     ) -> Result<(), TransError> {
         self.release_locks(tid, locks, requirement).await?;
@@ -349,17 +349,14 @@ impl Gc {
         log: &TxLog,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let mut items: Vec<(&str, CheckKind)> = log
+        let mut items: Vec<(KeyRef, CheckKind)> = log
             .writes
             .iter()
-            .map(|w| (w.path.as_str(), CheckKind::Writer))
+            .map(|write| (write.key.clone(), CheckKind::Writer))
             .collect();
-        for l in &log.locks {
-            let Ok(pr) = paths::parse(&l.path) else {
-                continue;
-            };
-            if pr.typ == paths::Type::Key {
-                items.push((l.path.as_str(), CheckKind::Holder));
+        for lock in &log.locks {
+            if let TxLock::Entry { key, .. } = lock {
+                items.push((key.clone(), CheckKind::Holder));
             }
         }
 
@@ -394,21 +391,17 @@ impl Gc {
     async fn release_locks(
         &self,
         tid: &TxId,
-        locks: &[PathLock],
+        locks: &[TxLock],
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        let mut key_locks: Vec<(&str, ())> = Vec::new();
+        let mut key_locks: Vec<(KeyRef, ())> = Vec::new();
         let mut leaf_paths = BTreeSet::new();
-        for l in locks {
-            let Ok(pr) = paths::parse(&l.path) else {
-                continue;
-            };
-            if pr.typ == paths::Type::Key {
-                key_locks.push((l.path.as_str(), ()));
-            } else if matches!(l.scope, LockScope::Structure | LockScope::Membership)
-                && matches!(pr.typ, paths::Type::CollectionInfo | paths::Type::Node)
-            {
-                leaf_paths.insert(l.path.clone());
+        for lock in locks {
+            match lock {
+                TxLock::Entry { key, .. } => key_locks.push((key.clone(), ())),
+                TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => {
+                    leaf_paths.insert(leaf.physical_path());
+                }
             }
         }
         for group in self.dir.group_keys_by_leaf(key_locks, requirement).await? {
@@ -439,13 +432,15 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_storage::{
-        CachedStore, Directory, LockScope, LockType, Shard, ShardEntry, Timeline, TxWrite,
-    };
+    use glassdb_storage::{CachedStore, Directory, LockType, Shard, ShardEntry, Timeline, TxWrite};
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
 
-    const COLL: &str = "db/coll";
+    const COLL: &str = "db/_c/NqxgQ0";
+
+    fn collection() -> glassdb_data::CollectionPath {
+        glassdb_data::CollectionPath::new("db", b"coll")
+    }
 
     // A fixed wall-clock anchor so the horizon is a pure function of the
     // offsets the tests choose, independent of the machine's real clock.
@@ -515,15 +510,14 @@ mod tests {
         TxId::from_bytes(vec![n])
     }
 
-    fn key_path(k: &[u8]) -> String {
-        paths::from_key(COLL, k)
+    fn key_path(k: &[u8]) -> KeyRef {
+        KeyRef::new(collection(), k)
     }
 
-    fn write_lock(k: &[u8]) -> PathLock {
-        PathLock {
-            path: key_path(k),
+    fn write_lock(k: &[u8]) -> TxLock {
+        TxLock::Entry {
+            key: key_path(k),
             typ: LockType::Write,
-            scope: LockScope::Entry,
         }
     }
 
@@ -576,7 +570,7 @@ mod tests {
             writes: writes
                 .iter()
                 .map(|k| TxWrite {
-                    path: key_path(k),
+                    key: key_path(k),
                     value: Arc::from(&b"v"[..]),
                     deleted: false,
                     prev_writer: TxId::default(),
@@ -869,7 +863,7 @@ mod tests {
         let data = crate::algo::Data {
             reads: Vec::new(),
             writes: vec![crate::algo::WriteAccess::put(
-                key_path(&kb).into(),
+                key_path(&kb),
                 Arc::from(&b"v2"[..]),
             )],
             scans: Vec::new(),

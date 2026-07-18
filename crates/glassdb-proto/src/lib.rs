@@ -21,25 +21,30 @@ mod tests {
             }),
             status: transaction_log::Status::Committed as i32,
             writes: vec![CollectionWrites {
-                prefix: "db/root".to_string(),
+                collection: Some(CollectionPath {
+                    segments: vec![b"root".to_vec()],
+                }),
                 writes: vec![
                     Write {
-                        suffix: "_k/H6KgQ6w".to_string(),
+                        key: b"Hello".to_vec(),
                         prev_tid: vec![1, 2, 3, 4],
                         val_delete: Some(write::ValDelete::Value(b"world!".to_vec())),
                     },
                     Write {
-                        suffix: "_k/other".to_string(),
+                        key: b"other".to_vec(),
                         prev_tid: vec![],
                         val_delete: Some(write::ValDelete::Deleted(true)),
                     },
                 ],
                 locks: Some(CollectionLocks {
-                    collection_lock: lock::LockType::Write as i32,
-                    locks: vec![Lock {
-                        suffix: "_k/H6KgQ6w".to_string(),
+                    entry_locks: vec![EntryLock {
+                        key: b"Hello".to_vec(),
                         lock_type: lock::LockType::Write as i32,
-                        scope: lock::Scope::Entry as i32,
+                    }],
+                    leaf_locks: vec![LeafLock {
+                        target: Some(leaf_lock::Target::Root(true)),
+                        lock_type: lock::LockType::Read as i32,
+                        scope: lock::Scope::Structure as i32,
                     }],
                 }),
             }],

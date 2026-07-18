@@ -28,11 +28,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
-use glassdb_data::{TxId, paths};
+use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId};
 use glassdb_storage::{
-    LeafObservation, LeafObservationCheck, LockScope, LockType, LogicalTime, NodeLocks, PathLock,
-    Requirement, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus,
-    TxLog, TxWrite,
+    LeafObservation, LeafObservationCheck, LockType, LogicalTime, NodeLocks, Requirement,
+    ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus, TxLock, TxLog,
+    TxWrite,
 };
 
 use crate::error::TransError;
@@ -75,8 +75,7 @@ enum Status {
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
-    /// Full storage path of the key.
-    pub path: Arc<str>,
+    pub key: KeyRef,
     /// Effective writer observed by the read, including a tombstone writer.
     pub last_writer: Option<TxId>,
     /// Exact leaf state from which the writer was resolved.
@@ -86,7 +85,7 @@ pub struct ReadAccess {
 /// A single key write within a transaction.
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
-    pub path: Arc<str>,
+    pub key: KeyRef,
     pub(crate) op: WriteOp,
 }
 
@@ -98,16 +97,16 @@ pub(crate) enum WriteOp {
 }
 
 impl WriteAccess {
-    pub fn put(path: Arc<str>, value: Arc<[u8]>) -> Self {
+    pub fn put(key: KeyRef, value: Arc<[u8]>) -> Self {
         Self {
-            path,
+            key,
             op: WriteOp::Put(value),
         }
     }
 
-    pub fn delete(path: Arc<str>) -> Self {
+    pub fn delete(key: KeyRef) -> Self {
         Self {
-            path,
+            key,
             op: WriteOp::Delete,
         }
     }
@@ -119,8 +118,8 @@ impl WriteAccess {
 /// those dependencies and falls back to the logical page after physical churn.
 #[derive(Debug, Clone)]
 pub struct ScanAccess {
-    /// Collection prefix the scan ranged over.
-    pub prefix: Arc<str>,
+    /// Collection the scan ranged over.
+    pub collection: CollectionPath,
     /// Normalized logical range and page limit.
     pub range: ScanRange,
     /// Staged membership mutations visible when the scan ran.
@@ -319,7 +318,7 @@ enum InstallOutcome {
 struct CommitInstallResolver {
     id: TxId,
     raw_key: Vec<u8>,
-    key_path: String,
+    key: KeyRef,
     read_version: Option<TxId>,
 }
 
@@ -354,7 +353,7 @@ impl ShardResolver for CommitInstallResolver {
         // Re-resolve the effective writer / eligibility against the current
         // entry: a live pending holder, a moved pointer, or a superseded read
         // means we lost the race.
-        let res = resolve_entry_locks(ctx, &self.key_path, cur, None).await?;
+        let res = resolve_entry_locks(ctx, &self.key, cur, None).await?;
         let Some(effective) = eligible_writer(&res, self.read_version.as_ref()) else {
             // After an in-doubt CAS we cannot tell whether our lock landed first
             // and was then help-forwarded away, so surface in-doubt; otherwise
@@ -448,15 +447,14 @@ fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Option<
 /// Reports whether the observed leaf contains an exclusive holder whose final
 /// state can change the effective writer without rewriting the leaf.
 fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
-    let (_, raw_key) = paths::split_key(&read.path)
-        .map_err(|e| TransError::with_source("parsing read key path", e))?;
+    let raw_key = read.key.key();
     let Some(node) = read.leaf.node() else {
         return Ok(false);
     };
     let leaf = node
         .as_leaf()
         .ok_or_else(|| TransError::other("read observation contains a non-leaf node"))?;
-    Ok(leaf.lookup(&raw_key).is_some_and(|entry| {
+    Ok(leaf.lookup(raw_key).is_some_and(|entry| {
         matches!(entry.lock_type, LockType::Write | LockType::Create) && !entry.locked_by.is_empty()
     }))
 }
@@ -631,15 +629,13 @@ impl Algo {
 
     /// Rejects keys that can never fit before the transaction has side effects.
     fn validate_coordination_keys(&self, data: &Data) -> Result<(), TransError> {
-        for path in data
+        for key in data
             .reads
             .iter()
-            .map(|read| read.path.as_ref())
-            .chain(data.writes.iter().map(|write| write.path.as_ref()))
+            .map(|read| &read.key)
+            .chain(data.writes.iter().map(|write| &write.key))
         {
-            let (_, key) = paths::split_key(path)
-                .map_err(|e| TransError::with_source("parsing transaction key path", e))?;
-            if !self.split_policy.key_fits(&key) {
+            if !self.split_policy.key_fits(key.key()) {
                 return Err(TransError::InvalidInput(
                     "key exceeds the coordination node size limit".into(),
                 ));
@@ -802,14 +798,14 @@ impl Algo {
             return Ok(None);
         };
         let value = value.clone();
-        let key_path = write.path.clone();
+        let key = write.key.clone();
 
         // Every read must be of the written key and found: a read of another key
         // needs its own shard validated, and a not-found read of the written key
         // makes this a create (no predecessor for the fast path to build on).
         let mut read_version: Option<TxId> = None;
         for r in &tx.data.reads {
-            if r.path != key_path {
+            if r.key != key {
                 return Ok(None);
             }
             match &r.last_writer {
@@ -818,8 +814,7 @@ impl Algo {
             }
         }
 
-        let (_prefix, raw_key) = paths::split_key(&key_path)
-            .map_err(|e| TransError::with_source("parsing single-rw key path", e))?;
+        let raw_key = key.key().to_vec();
 
         // Check dynamic eligibility before writing anything, so a create /
         // genuinely-conflicting entry falls back to the full path with the same
@@ -839,10 +834,7 @@ impl Algo {
         // version-conditional CAS misses, invalidates that seed, and re-folds
         // over the winner — finding the read superseded, the fast path renews
         // (`Wounded`).
-        let (_, locator) = self
-            .resolver
-            .resolve_key(&key_path, Requirement::Any)
-            .await?;
+        let (_, locator) = self.resolver.resolve_key(&key, Requirement::Any).await?;
         let entry = locator
             .node()
             .and_then(|node| node.as_leaf())
@@ -850,7 +842,7 @@ impl Algo {
         let lock_state = resolve_entry_locks_at(
             &self.resolver,
             &self.mon,
-            &key_path,
+            &key,
             entry,
             None,
             Requirement::Any,
@@ -863,6 +855,8 @@ impl Algo {
         // commit-install fold and the write-back target it directly instead of
         // recomputing a fixed-hash shard index.
         let leaf_path = locator.path;
+        let leaf = LeafRef::from_physical_path(&leaf_path)
+            .map_err(|e| TransError::with_source("parsing single-rw leaf path", e))?;
 
         // Build the committed transaction object. It records the write (and the
         // pointer it will supersede, for GC's reverse check) plus the write lock
@@ -877,19 +871,17 @@ impl Algo {
         let recorded_prev = effective;
         let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
         tl.locks = vec![
-            PathLock {
-                path: key_path.to_string(),
+            TxLock::Entry {
+                key: key.clone(),
                 typ: LockType::Write,
-                scope: LockScope::Entry,
             },
-            PathLock {
-                path: leaf_path.clone(),
+            TxLock::Structure {
+                leaf,
                 typ: LockType::Read,
-                scope: LockScope::Structure,
             },
         ];
         tl.writes.push(TxWrite {
-            path: key_path.to_string(),
+            key: key.clone(),
             value: value.clone(),
             deleted: false,
             prev_writer: recorded_prev,
@@ -906,7 +898,7 @@ impl Algo {
             &tx.id,
             &leaf_path,
             raw_key.clone(),
-            key_path.to_string(),
+            key.clone(),
             read_version.clone(),
         );
         let (object, install) = tokio::join!(object, install);
@@ -915,7 +907,7 @@ impl Algo {
             // Committed: the object is durable and our lock is in the chain.
             (Ok(()), InstallOutcome::Landed(receipt)) => {
                 tx.status = Status::Committed;
-                self.write_back_single_rw(&tx.id, &leaf_path, &raw_key, &key_path, receipt)
+                self.write_back_single_rw(&tx.id, &leaf_path, &raw_key, &key, receipt)
                     .await;
                 Ok(Some(()))
             }
@@ -948,13 +940,13 @@ impl Algo {
         id: &TxId,
         leaf_path: &str,
         raw_key: Vec<u8>,
-        key_path: String,
+        key: KeyRef,
         read_version: Option<TxId>,
     ) -> Result<InstallOutcome, TransError> {
         let resolver = Arc::new(CommitInstallResolver {
             id: id.clone(),
             raw_key,
-            key_path,
+            key,
             read_version,
         });
         // The commit's eligibility check just resolved this leaf through the
@@ -1000,7 +992,7 @@ impl Algo {
         id: &TxId,
         leaf_path: &str,
         raw_key: &[u8],
-        key_path: &str,
+        key: &KeyRef,
         installed_from: Option<LeafObservation>,
     ) {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
@@ -1010,7 +1002,7 @@ impl Algo {
                 let id = id.clone();
                 let leaf_path = leaf_path.to_string();
                 let raw_key = raw_key.to_vec();
-                let key_path = key_path.to_string();
+                let key = key.clone();
                 let installed_from = installed_from.clone();
                 bg.spawn_waited(async move {
                     let superseded = locker
@@ -1018,7 +1010,7 @@ impl Algo {
                             &id,
                             &leaf_path,
                             &raw_key,
-                            &key_path,
+                            &key,
                             installed_from.as_ref(),
                         )
                         .await;
@@ -1028,13 +1020,7 @@ impl Algo {
             None => {
                 let superseded = self
                     .locker
-                    .write_back_single_put(
-                        id,
-                        leaf_path,
-                        raw_key,
-                        key_path,
-                        installed_from.as_ref(),
-                    )
+                    .write_back_single_put(id, leaf_path, raw_key, key, installed_from.as_ref())
                     .await;
                 feed_gc_hints(&self.gc, superseded);
             }
@@ -1296,10 +1282,10 @@ impl Algo {
         if data.reads.is_empty() {
             return Ok(true);
         }
-        let keys: Vec<Arc<str>> = data.reads.iter().map(|r| r.path.clone()).collect();
+        let keys: Vec<KeyRef> = data.reads.iter().map(|read| read.key.clone()).collect();
         let current = self.resolver.effective_writers(&keys, requirement).await?;
         for r in &data.reads {
-            if current.get(&r.path).and_then(Option::as_ref) != r.last_writer.as_ref() {
+            if current.get(&r.key).and_then(Option::as_ref) != r.last_writer.as_ref() {
                 return Ok(false);
             }
         }
@@ -1323,7 +1309,7 @@ impl Algo {
             let current = self
                 .resolver
                 .scan_coverage(
-                    &scan.prefix,
+                    &scan.collection,
                     &scan.range,
                     scan.frontier.as_deref(),
                     own_lock_holder,
@@ -1354,7 +1340,7 @@ impl Algo {
             let resolved = self
                 .resolver
                 .scan_keys_at(
-                    &scan.prefix,
+                    &scan.collection,
                     &scan.range,
                     &scan.overlay,
                     own_lock_holder,
@@ -1375,7 +1361,7 @@ impl Algo {
     async fn commit_writes(
         &self,
         writes: &[WriteAccess],
-        locks: Vec<PathLock>,
+        locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
         let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
@@ -1386,7 +1372,7 @@ impl Algo {
                 WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
             };
             tl.writes.push(TxWrite {
-                path: w.path.to_string(),
+                key: w.key.clone(),
                 value,
                 deleted,
                 prev_writer: TxId::default(),
@@ -1427,7 +1413,16 @@ mod tests {
         TxCommitStatus,
     };
 
-    const TEST_COLL: &str = "testp";
+    const TEST_DB: &str = "testp";
+    const TEST_COLL: &str = "testp/_c/Nk";
+
+    fn test_collection() -> CollectionPath {
+        CollectionPath::new(TEST_DB, b"c")
+    }
+
+    fn key_ref(key: &[u8]) -> KeyRef {
+        KeyRef::new(test_collection(), key)
+    }
 
     struct Tctx {
         backend: Arc<dyn Backend>,
@@ -1452,7 +1447,7 @@ mod tests {
     ) -> (Algo, Tctx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone());
-        let tlogger = TLogger::new(objects.clone(), TEST_COLL);
+        let tlogger = TLogger::new(objects.clone(), TEST_DB);
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         // Leak the background so spawned async aborts can run for the test's
@@ -1514,27 +1509,27 @@ mod tests {
         )
     }
 
-    fn wa(path: &str, val: &[u8]) -> WriteAccess {
-        WriteAccess::put(path.into(), Arc::from(val))
+    fn wa(key: &KeyRef, val: &[u8]) -> WriteAccess {
+        WriteAccess::put(key.clone(), Arc::from(val))
     }
 
-    fn wdel(path: &str) -> WriteAccess {
-        WriteAccess::delete(path.into())
+    fn wdel(key: &KeyRef) -> WriteAccess {
+        WriteAccess::delete(key.clone())
     }
 
-    async fn do_read(tctx: &Tctx, path: &str) -> ReadAccess {
+    async fn do_read(tctx: &Tctx, key: &KeyRef) -> ReadAccess {
         let reader = Reader::new(
             Resolver::new(tctx.shards.clone(), tctx.tmon.clone()),
             tctx.timeline.clone(),
             RetryConfig::default(),
         );
-        match reader.read(path, Duration::MAX).await {
+        match reader.read(key, Duration::MAX).await {
             Ok(outcome) => ReadAccess {
-                path: path.into(),
+                key: key.clone(),
                 last_writer: outcome.last_writer,
                 leaf: outcome.leaf,
             },
-            Err(e) => panic!("reading {path}: {e:?}"),
+            Err(e) => panic!("reading {key:?}: {e:?}"),
         }
     }
 
@@ -1572,7 +1567,7 @@ mod tests {
     #[tokio::test]
     async fn write_new() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
         let val = b"v";
 
         let mut h = tm.begin(Data {
@@ -1593,7 +1588,7 @@ mod tests {
         let txlog = tctx.tlogger.get_at(&tid, Requirement::Any).await.unwrap();
         let txlog = txlog.value().unwrap();
         assert_eq!(txlog.writes.len(), 1);
-        assert_eq!(txlog.writes[0].path, keyp);
+        assert_eq!(txlog.writes[0].key, keyp);
         assert_eq!(&*txlog.writes[0].value, val);
 
         // The shard entry points at the committed writer and the lock is gone.
@@ -1610,8 +1605,8 @@ mod tests {
     #[tokio::test]
     async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
-        let readp = paths::from_key(TEST_COLL, b"r");
-        let writep = paths::from_key(TEST_COLL, b"w");
+        let readp = key_ref(b"r");
+        let writep = key_ref(b"w");
 
         // Seed the read key so it resolves to a committed value.
         commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
@@ -1628,33 +1623,29 @@ mod tests {
 
         let txlog = tctx.tlogger.get_at(&tid, Requirement::Any).await.unwrap();
         let txlog = txlog.value().unwrap();
-        let locked: std::collections::BTreeSet<&str> =
-            txlog.locks.iter().map(|l| l.path.as_str()).collect();
-        assert!(
-            locked.contains(readp.as_str()),
-            "read lock recorded: {locked:?}"
-        );
-        assert!(
-            locked.contains(writep.as_str()),
-            "write lock recorded: {locked:?}"
-        );
-        let leaf = paths::collection_info(TEST_COLL);
-        assert!(txlog.locks.contains(&PathLock {
-            path: leaf.clone(),
+        assert!(txlog.locks.contains(&TxLock::Entry {
+            key: readp,
             typ: LockType::Read,
-            scope: LockScope::Structure,
         }));
-        assert!(txlog.locks.contains(&PathLock {
-            path: leaf,
+        assert!(txlog.locks.contains(&TxLock::Entry {
+            key: writep,
             typ: LockType::Write,
-            scope: LockScope::Membership,
+        }));
+        let leaf = LeafRef::root(test_collection());
+        assert!(txlog.locks.contains(&TxLock::Structure {
+            leaf: leaf.clone(),
+            typ: LockType::Read,
+        }));
+        assert!(txlog.locks.contains(&TxLock::Membership {
+            leaf,
+            typ: LockType::Write,
         }));
     }
 
     #[tokio::test]
     async fn read_then_write_round_trips() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         let h = commit_writes(&tm, vec![wa(&keyp, b"init")]).await;
         let _ = h;
@@ -1682,8 +1673,8 @@ mod tests {
     async fn stale_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let ka = paths::from_key(TEST_COLL, b"k");
-        let kb = paths::from_key(TEST_COLL, b"k2");
+        let ka = key_ref(b"k");
+        let kb = key_ref(b"k2");
 
         // Seed both keys so the writes are overwrites (not creates), keeping the
         // transaction on the read-write path rather than a membership change.
@@ -1722,7 +1713,7 @@ mod tests {
     async fn single_rw_stale_read_renews_and_converges() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
         let ra = do_read(&tctx, &keyp).await;
@@ -1779,7 +1770,7 @@ mod tests {
         use crate::tlocker::LockOutcome;
         use std::time::Duration;
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         // An older holder takes the key's write lock and does not finalize.
         let holder = TxId::with_priority(0, b"holder");
@@ -2013,8 +2004,8 @@ mod tests {
 
         let ka = b"k".to_vec();
         let kb = same_shard_sibling(&ka);
-        let kap = paths::from_key(TEST_COLL, &ka);
-        let kbp = paths::from_key(TEST_COLL, &kb);
+        let kap = key_ref(&ka);
+        let kbp = key_ref(&kb);
 
         // Seed keys A and B committed: the fast-path install builds on A's
         // predecessor, and the disjoint acquire overwrites an existing B, so it
@@ -2102,8 +2093,8 @@ mod tests {
 
         let ka = b"k".to_vec();
         let kb = same_shard_sibling(&ka);
-        let kap = paths::from_key(TEST_COLL, &ka);
-        let kbp = paths::from_key(TEST_COLL, &kb);
+        let kap = key_ref(&ka);
+        let kbp = key_ref(&kb);
 
         // Seed keys A and B committed (un-gated, before arming): the install has
         // a predecessor and the acquire overwrites an existing B, so it takes no
@@ -2175,8 +2166,8 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, flaky) = FlakyCas::wrap(mem, 70);
         let (tm, tctx) = new_algo_from_backend(backend).await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
-        let keyp2 = paths::from_key(TEST_COLL, b"k2");
+        let keyp = key_ref(b"k");
+        let keyp2 = key_ref(b"k2");
 
         // Seed the keys over a clean connection so their shards exist (the lock
         // CAS is then a `write_if`, the thing we fault).
@@ -2289,7 +2280,7 @@ mod tests {
     #[tokio::test]
     async fn single_rw_overwrite_takes_fast_path() {
         let (tm, tctx, log) = new_recording_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
         let r = do_read(&tctx, &keyp).await;
@@ -2337,7 +2328,7 @@ mod tests {
     #[tokio::test]
     async fn single_rw_commit_reuses_cached_shard() {
         let (tm, tctx, log) = new_recording_algo_big_cache().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
         // The read warms the shard in the object cache.
@@ -2364,7 +2355,7 @@ mod tests {
     #[tokio::test]
     async fn single_rw_blind_put_takes_fast_path() {
         let (tm, tctx, log) = new_recording_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
@@ -2397,7 +2388,7 @@ mod tests {
     #[tokio::test]
     async fn single_rw_committed_holder_stays_on_fast_path() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
         let leaf_path = paths::collection_info(TEST_COLL);
         let raw = b"k".to_vec();
 
@@ -2509,7 +2500,7 @@ mod tests {
         // attempts, so the object write lands but the lock install never does.
         let (backend, flaky) = FlakyCas::wrap(mem, crate::shard_coord::CAS_RETRIES);
         let (tm, tctx) = new_algo_from_backend(backend).await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         // Seed over the (unarmed) backend so the key exists and is committable.
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
@@ -2562,7 +2553,7 @@ mod tests {
     #[tokio::test]
     async fn single_rw_create_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"new");
+        let keyp = key_ref(b"new");
 
         log.lock().unwrap().clear();
         tctx.locker.lock_calls_and_reset();
@@ -2593,7 +2584,7 @@ mod tests {
     #[tokio::test]
     async fn single_rw_delete_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
@@ -2625,8 +2616,8 @@ mod tests {
     #[tokio::test]
     async fn single_rw_multi_key_uses_full_path() {
         let (tm, _tctx, log) = new_recording_algo().await;
-        let ka = paths::from_key(TEST_COLL, b"a");
-        let kb = paths::from_key(TEST_COLL, b"b");
+        let ka = key_ref(b"a");
+        let kb = key_ref(b"b");
 
         commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
 
@@ -2648,8 +2639,8 @@ mod tests {
     #[tokio::test]
     async fn single_rw_other_key_read_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
-        let ka = paths::from_key(TEST_COLL, b"a");
-        let kb = paths::from_key(TEST_COLL, b"b");
+        let ka = key_ref(b"a");
+        let kb = key_ref(b"b");
 
         commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
         let ra = do_read(&tctx, &ka).await;
@@ -2673,7 +2664,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_validates() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
@@ -2690,7 +2681,7 @@ mod tests {
     #[tokio::test]
     async fn point_read_re_resolves_writer_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
             .await
             .id()
@@ -2733,7 +2724,7 @@ mod tests {
         let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
         log.locks = locked.locked_paths();
         log.writes.push(TxWrite {
-            path: keyp,
+            key: keyp,
             value: Arc::from(b"v2".as_slice()),
             deleted: false,
             prev_writer: previous,
@@ -2757,7 +2748,7 @@ mod tests {
     #[tokio::test]
     async fn point_read_accepts_aborted_holder_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
             .await
             .id()
@@ -2813,8 +2804,8 @@ mod tests {
     #[tokio::test]
     async fn locked_validation_requires_its_own_cas_receipt() {
         let (tm, tctx) = new_algo().await;
-        let ka = paths::from_key(TEST_COLL, b"a");
-        let kb = paths::from_key(TEST_COLL, b"b");
+        let ka = key_ref(b"a");
+        let kb = key_ref(b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         // `commit_writes` publishes pointers in a background task. This test is
@@ -2900,8 +2891,8 @@ mod tests {
     #[tokio::test]
     async fn newer_shared_evidence_runs_logical_validation_without_io() {
         let (tm, tctx, log) = new_recording_algo_big_cache().await;
-        let ka = paths::from_key(TEST_COLL, b"a");
-        let kb = paths::from_key(TEST_COLL, b"b");
+        let ka = key_ref(b"a");
+        let kb = key_ref(b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         let read = do_read(&tctx, &ka).await;
@@ -2999,8 +2990,8 @@ mod tests {
     async fn readonly_retry_locks_its_complete_point_read_set() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let ka = paths::from_key(TEST_COLL, b"a");
-        let kb = paths::from_key(TEST_COLL, b"b");
+        let ka = key_ref(b"a");
+        let kb = key_ref(b"b");
 
         commit_writes(&tm2, vec![wa(&ka, b"a1"), wa(&kb, b"b1")]).await;
         let ra = do_read(&tctx, &ka).await;
@@ -3038,11 +3029,10 @@ mod tests {
         tm.commit(&mut h).await.unwrap();
         let log = tctx.tlogger.get_at(h.id(), Requirement::Any).await.unwrap();
         let log = log.value().unwrap();
-        for path in [&ka, &kb] {
-            assert!(log.locks.contains(&PathLock {
-                path: path.clone(),
+        for key in [ka, kb] {
+            assert!(log.locks.contains(&TxLock::Entry {
+                key,
                 typ: LockType::Read,
-                scope: LockScope::Entry,
             }));
         }
     }
@@ -3050,7 +3040,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_after_delete_not_found() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let deleted_by = commit_writes(&tm, vec![wdel(&keyp)]).await.id().clone();
@@ -3069,7 +3059,7 @@ mod tests {
     #[tokio::test]
     async fn delete_round_trips() {
         let (tm, tctx) = new_algo().await;
-        let keyp = paths::from_key(TEST_COLL, b"k");
+        let keyp = key_ref(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
@@ -3090,8 +3080,8 @@ mod tests {
     #[tokio::test]
     async fn multi_key_commit() {
         let (tm, tctx) = new_algo().await;
-        let k1 = paths::from_key(TEST_COLL, b"k1");
-        let k2 = paths::from_key(TEST_COLL, b"k2");
+        let k1 = key_ref(b"k1");
+        let k2 = key_ref(b"k2");
 
         let mut h = tm.begin(Data {
             reads: Vec::new(),
@@ -3155,7 +3145,7 @@ mod tests {
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
         let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
         let scan = resolver
-            .scan_keys(TEST_COLL, &range, &[], None, None)
+            .scan_keys(&test_collection(), &range, &[], None, None)
             .await
             .unwrap();
         let keys = scan.keys.clone();
@@ -3163,7 +3153,7 @@ mod tests {
             reads: Vec::new(),
             writes: Vec::new(),
             scans: vec![ScanAccess {
-                prefix: TEST_COLL.into(),
+                collection: test_collection(),
                 range,
                 overlay: Vec::new(),
                 keys: keys.clone(),
@@ -3198,7 +3188,7 @@ mod tests {
         assert_eq!(tctx.locker.lock_calls_and_reset(), 0);
 
         // A create between the scan and (re-)validation bumps the covered leaf.
-        commit_writes(&tm, vec![wa(&paths::from_key(TEST_COLL, b"b"), b"1")]).await;
+        commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
 
         let mut stale = tm.begin(data);
         let err = tm.commit(&mut stale).await.unwrap_err();
@@ -3221,18 +3211,20 @@ mod tests {
             .await
             .unwrap();
         let log = log.value().unwrap();
-        assert!(
-            log.locks
-                .iter()
-                .any(|lock| { lock.scope == LockScope::Membership && lock.typ == LockType::Read })
-        );
+        assert!(log.locks.iter().any(|lock| matches!(
+            lock,
+            TxLock::Membership {
+                typ: LockType::Read,
+                ..
+            }
+        )));
         tm.end(&mut stale).await.unwrap();
     }
 
     #[tokio::test]
     async fn scan_rechecks_pending_membership_holder_that_commits() {
         let (tm, tctx) = new_algo().await;
-        let key_path = paths::from_key(TEST_COLL, b"new");
+        let key_path = key_ref(b"new");
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
         let holder_data = Data {
@@ -3266,7 +3258,7 @@ mod tests {
         let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
         log.locks = locked.locked_paths();
         log.writes.push(TxWrite {
-            path: key_path,
+            key: key_path,
             value: Arc::from(b"value".as_slice()),
             deleted: false,
             prev_writer: TxId::default(),
@@ -3281,7 +3273,7 @@ mod tests {
     #[tokio::test]
     async fn scan_with_write_records_predicate_locks() {
         let (tm, tctx) = new_algo().await;
-        let key_path = paths::from_key(TEST_COLL, b"a");
+        let key_path = key_ref(b"a");
         seed_live_keys(&tctx, &[b"a"]).await;
         let (mut data, _) = scan_data(&tctx).await;
         data.writes.push(wa(&key_path, b"updated"));
@@ -3294,16 +3286,14 @@ mod tests {
             .await
             .unwrap();
         let log = log.value().unwrap();
-        let leaf = paths::collection_info(TEST_COLL);
-        assert!(log.locks.contains(&PathLock {
-            path: leaf.clone(),
+        let leaf = LeafRef::root(test_collection());
+        assert!(log.locks.contains(&TxLock::Structure {
+            leaf: leaf.clone(),
             typ: LockType::Read,
-            scope: LockScope::Structure,
         }));
-        assert!(log.locks.contains(&PathLock {
-            path: leaf,
+        assert!(log.locks.contains(&TxLock::Membership {
+            leaf,
             typ: LockType::Read,
-            scope: LockScope::Membership,
         }));
     }
 
@@ -3322,13 +3312,11 @@ mod tests {
         let (mut stale, keys) = scan_data_for_range(&tctx, range.clone()).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(stale.scans[0].frontier.as_deref(), Some(b"b".as_slice()));
-        stale
-            .writes
-            .push(wa(&paths::from_key(TEST_COLL, b"a"), b"updated"));
+        stale.writes.push(wa(&key_ref(b"a"), b"updated"));
 
         // Removing the old frontier means the refreshed two-key page reaches
         // into S1. The first locked validation only owns S0 and must retry.
-        commit_writes(&tm, vec![wdel(&paths::from_key(TEST_COLL, b"b"))]).await;
+        commit_writes(&tm, vec![wdel(&key_ref(b"b"))]).await;
         let mut handle = tm.begin(stale);
         let err = tm.commit(&mut handle).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
@@ -3338,9 +3326,7 @@ mod tests {
         let (mut fresh, keys) = scan_data_for_range(&tctx, range).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"m".to_vec()]);
         assert_eq!(fresh.scans[0].frontier.as_deref(), Some(b"m".as_slice()));
-        fresh
-            .writes
-            .push(wa(&paths::from_key(TEST_COLL, b"a"), b"updated"));
+        fresh.writes.push(wa(&key_ref(b"a"), b"updated"));
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();
 
@@ -3351,10 +3337,9 @@ mod tests {
             .unwrap();
         let log = log.value().unwrap();
         for token in ["S0", "S1"] {
-            assert!(log.locks.contains(&PathLock {
-                path: paths::from_node(TEST_COLL, token),
+            assert!(log.locks.contains(&TxLock::Membership {
+                leaf: LeafRef::node(test_collection(), token),
                 typ: LockType::Read,
-                scope: LockScope::Membership,
             }));
         }
         tm.end(&mut handle).await.unwrap();
@@ -3365,7 +3350,7 @@ mod tests {
     #[tokio::test]
     async fn scan_detects_racing_delete() {
         let (tm, tctx) = new_algo().await;
-        let bp = paths::from_key(TEST_COLL, b"b");
+        let bp = key_ref(b"b");
         seed_live_keys(&tctx, &[b"a", b"b"]).await;
 
         let (data, keys) = scan_data(&tctx).await;

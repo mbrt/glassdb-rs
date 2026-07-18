@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{TxId, paths};
+use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -41,7 +41,7 @@ pub struct TxLog {
     pub timestamp: Option<SystemTime>,
     pub status: TxCommitStatus,
     pub writes: Vec<TxWrite>,
-    pub locks: Vec<PathLock>,
+    pub locks: Vec<TxLock>,
 }
 
 impl TxLog {
@@ -60,7 +60,7 @@ impl TxLog {
 /// A single write within a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxWrite {
-    pub path: String,
+    pub key: KeyRef,
     pub value: Arc<[u8]>,
     pub deleted: bool,
     pub prev_writer: TxId,
@@ -92,26 +92,22 @@ pub struct TxListPage {
     pub next: Option<backend::ListCursor>,
 }
 
-/// A storage path together with its lock type.
+/// A transaction lock backreference.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathLock {
-    pub path: String,
-    pub typ: LockType,
-    pub scope: LockScope,
+pub enum TxLock {
+    Entry { key: KeyRef, typ: LockType },
+    Structure { leaf: LeafRef, typ: LockType },
+    Membership { leaf: LeafRef, typ: LockType },
 }
 
-/// The coordination namespace a transaction-log lock backreference belongs to.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LockScope {
-    #[default]
-    Entry,
-    Structure,
-    Membership,
-}
-
-impl std::fmt::Display for LockScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+impl TxLock {
+    /// Returns the lock type recorded for this backreference.
+    pub fn typ(&self) -> LockType {
+        match self {
+            TxLock::Entry { typ, .. }
+            | TxLock::Structure { typ, .. }
+            | TxLock::Membership { typ, .. } => *typ,
+        }
     }
 }
 
@@ -128,7 +124,7 @@ impl Codec for TxLog {
     fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
         let id = paths::transaction_id_of(path)
             .map_err(|error| StorageError::with_source("parsing transaction path", error))?;
-        decode_tx_log(&id, body)
+        decode_tx_log(paths::db_root_of(path), &id, body)
     }
 
     fn encode(log: &Self::Value) -> Result<Vec<u8>, StorageError> {
@@ -141,12 +137,19 @@ impl Codec for TxLog {
     fn size(log: &Self::Value) -> usize {
         log.writes
             .iter()
-            .map(|write| write.path.len() + write.value.len() + write.prev_writer.as_bytes().len())
+            .map(|write| {
+                write.key.key().len() + write.value.len() + write.prev_writer.as_bytes().len()
+            })
             .sum::<usize>()
             + log
                 .locks
                 .iter()
-                .map(|lock| lock.path.len() + std::mem::size_of::<PathLock>())
+                .map(|lock| match lock {
+                    TxLock::Entry { key, .. } => key.key().len(),
+                    TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => {
+                        leaf.node_token().map_or(0, str::len)
+                    }
+                })
                 .sum::<usize>()
             + std::mem::size_of::<TxLog>()
     }
@@ -299,15 +302,29 @@ fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
         .map_err(|e| StorageError::with_source("unmarshalling transaction log", e))
 }
 
+pub(crate) fn decode_tx_status(buf: &[u8]) -> Result<TxCommitStatus, StorageError> {
+    let log = parse_log(buf)?;
+    match log.status() {
+        pb::transaction_log::Status::Committed => Ok(TxCommitStatus::Ok),
+        pb::transaction_log::Status::Aborted => Ok(TxCommitStatus::Aborted),
+        pb::transaction_log::Status::Pending => Ok(TxCommitStatus::Pending),
+        pb::transaction_log::Status::Default => Err(StorageError::other("unknown commit status")),
+    }
+}
+
 /// Decodes a transaction-log protobuf body into a [`TxLog`]. The status and
 /// timestamp are taken from the body (not tags), which is what the v2 unified
 /// transaction object relies on (ADR-019). Shared by [`TLogger::get`] and the
 /// v2 [`crate::txobject`] codec.
-pub(crate) fn decode_tx_log(id: &TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
-    decode_tx_log_from_proto(id, &parse_log(buf)?)
+pub(crate) fn decode_tx_log(db_root: &str, id: &TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
+    decode_tx_log_from_proto(db_root, id, &parse_log(buf)?)
 }
 
-fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog, StorageError> {
+fn decode_tx_log_from_proto(
+    db_root: &str,
+    id: &TxId,
+    tr: &pb::TransactionLog,
+) -> Result<TxLog, StorageError> {
     let status = match tr.status() {
         pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
         pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
@@ -325,33 +342,41 @@ fn decode_tx_log_from_proto(id: &TxId, tr: &pb::TransactionLog) -> Result<TxLog,
     };
 
     for cw in &tr.writes {
+        let collection = decode_collection_path(db_root, cw.collection.as_ref())?;
         for w in &cw.writes {
             res.writes.push(TxWrite {
-                path: format!("{}/{}", cw.prefix, w.suffix),
+                key: KeyRef::new(collection.clone(), &w.key),
                 value: write_value(w),
                 deleted: write_deleted(w),
                 prev_writer: TxId::from_bytes(w.prev_tid.clone()),
             });
         }
         if let Some(locks) = &cw.locks {
-            // A collection lock is present only when set to a real lock type. The
-            // proto default is UNKNOWN(0) (e.g. the empty `CollectionLocks` a
-            // key-only write group carries), which must not decode as a spurious
-            // collection lock.
-            let clt = locks.collection_lock;
-            if clt != pb::lock::LockType::None as i32 && clt != pb::lock::LockType::Unknown as i32 {
-                res.locks.push(PathLock {
-                    path: paths::collection_info(&cw.prefix),
-                    typ: parse_lock_type(clt),
-                    scope: LockScope::Entry,
+            for lock in &locks.entry_locks {
+                res.locks.push(TxLock::Entry {
+                    key: KeyRef::new(collection.clone(), &lock.key),
+                    typ: parse_lock_type(lock.lock_type),
                 });
             }
-            for l in &locks.locks {
-                res.locks.push(PathLock {
-                    path: format!("{}/{}", cw.prefix, l.suffix),
-                    typ: parse_lock_type(l.lock_type),
-                    scope: parse_lock_scope(l.scope),
-                });
+            for lock in &locks.leaf_locks {
+                let leaf = match lock.target.as_ref() {
+                    Some(pb::leaf_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
+                    Some(pb::leaf_lock::Target::Node(token)) if !token.is_empty() => {
+                        LeafRef::node(collection.clone(), token.as_str())
+                    }
+                    _ => return Err(StorageError::other("transaction log has invalid leaf lock")),
+                };
+                let typ = parse_lock_type(lock.lock_type);
+                let lock = match pb::lock::Scope::try_from(lock.scope) {
+                    Ok(pb::lock::Scope::Structure) => TxLock::Structure { leaf, typ },
+                    Ok(pb::lock::Scope::Membership) => TxLock::Membership { leaf, typ },
+                    _ => {
+                        return Err(StorageError::other(
+                            "transaction log leaf lock has invalid scope",
+                        ));
+                    }
+                };
+                res.locks.push(lock);
             }
         }
     }
@@ -362,7 +387,8 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
     if l.id.is_unset() {
         return Err(StorageError::other("empty transaction ID"));
     }
-    let mut coll_writes: BTreeMap<String, pb::CollectionWrites> = BTreeMap::new();
+    validate_single_database(l)?;
+    let mut coll_writes: BTreeMap<CollectionPath, pb::CollectionWrites> = BTreeMap::new();
 
     for e in &l.writes {
         marshal_write(&mut coll_writes, e)?;
@@ -389,31 +415,24 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
 }
 
 fn marshal_write(
-    coll_writes: &mut BTreeMap<String, pb::CollectionWrites>,
+    coll_writes: &mut BTreeMap<CollectionPath, pb::CollectionWrites>,
     e: &TxWrite,
 ) -> Result<(), StorageError> {
-    let pr = paths::parse(&e.path)
-        .map_err(|err| StorageError::with_source("parsing transaction-log write path", err))?;
-    if pr.typ != paths::Type::Key {
-        return Err(StorageError::other(format!(
-            "expected 'key' path, got path {:?}",
-            e.path
-        )));
-    }
     let val_delete = if e.deleted {
         pb::write::ValDelete::Deleted(true)
     } else {
         pb::write::ValDelete::Value(e.value.to_vec())
     };
     let write = pb::Write {
-        suffix: format!("{}/{}", pr.typ.as_str(), pr.suffix),
+        key: e.key.key().to_vec(),
         prev_tid: e.prev_writer.as_bytes().to_vec(),
         val_delete: Some(val_delete),
     };
+    let collection = e.key.collection();
     let coll = coll_writes
-        .entry(pr.prefix.clone())
+        .entry(collection.clone())
         .or_insert_with(|| pb::CollectionWrites {
-            prefix: pr.prefix.clone(),
+            collection: Some(encode_collection_path(collection)),
             writes: Vec::new(),
             locks: Some(pb::CollectionLocks::default()),
         });
@@ -422,52 +441,92 @@ fn marshal_write(
 }
 
 fn marshal_lock(
-    coll_writes: &mut BTreeMap<String, pb::CollectionWrites>,
-    e: &PathLock,
+    coll_writes: &mut BTreeMap<CollectionPath, pb::CollectionWrites>,
+    lock: &TxLock,
 ) -> Result<(), StorageError> {
-    let lt = lock_type_to_proto(e.typ);
-    let pr = paths::parse(&e.path)
-        .map_err(|err| StorageError::with_source("parsing transaction-log lock path", err))?;
-
+    let collection = match lock {
+        TxLock::Entry { key, .. } => key.collection(),
+        TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => leaf.collection(),
+    };
     let coll = coll_writes
-        .entry(pr.prefix.clone())
+        .entry(collection.clone())
         .or_insert_with(|| pb::CollectionWrites {
-            prefix: pr.prefix.clone(),
+            collection: Some(encode_collection_path(collection)),
             writes: Vec::new(),
             locks: Some(pb::CollectionLocks::default()),
         });
     let clocks = coll.locks.get_or_insert_with(pb::CollectionLocks::default);
 
-    if pr.typ == paths::Type::CollectionInfo && e.scope == LockScope::Entry {
-        clocks.collection_lock = lt as i32;
-    } else {
-        clocks.locks.push(pb::Lock {
-            suffix: if pr.suffix.is_empty() {
-                pr.typ.as_str().to_string()
-            } else {
-                format!("{}/{}", pr.typ.as_str(), pr.suffix)
-            },
-            lock_type: lt as i32,
-            scope: lock_scope_to_proto(e.scope) as i32,
-        });
+    match lock {
+        TxLock::Entry { key, typ } => clocks.entry_locks.push(pb::EntryLock {
+            key: key.key().to_vec(),
+            lock_type: lock_type_to_proto(*typ) as i32,
+        }),
+        TxLock::Structure { leaf, typ } | TxLock::Membership { leaf, typ } => {
+            let target = match leaf.node_token() {
+                Some(token) => pb::leaf_lock::Target::Node(token.to_string()),
+                None => pb::leaf_lock::Target::Root(true),
+            };
+            let scope = match lock {
+                TxLock::Structure { .. } => pb::lock::Scope::Structure,
+                TxLock::Membership { .. } => pb::lock::Scope::Membership,
+                TxLock::Entry { .. } => unreachable!(),
+            };
+            clocks.leaf_locks.push(pb::LeafLock {
+                target: Some(target),
+                lock_type: lock_type_to_proto(*typ) as i32,
+                scope: scope as i32,
+            });
+        }
     }
     Ok(())
 }
 
-fn lock_scope_to_proto(scope: LockScope) -> pb::lock::Scope {
-    match scope {
-        LockScope::Entry => pb::lock::Scope::Entry,
-        LockScope::Structure => pb::lock::Scope::Structure,
-        LockScope::Membership => pb::lock::Scope::Membership,
+fn encode_collection_path(collection: &CollectionPath) -> pb::CollectionPath {
+    pb::CollectionPath {
+        segments: collection.segments().map(<[u8]>::to_vec).collect(),
     }
 }
 
-fn parse_lock_scope(scope: i32) -> LockScope {
-    match pb::lock::Scope::try_from(scope) {
-        Ok(pb::lock::Scope::Structure) => LockScope::Structure,
-        Ok(pb::lock::Scope::Membership) => LockScope::Membership,
-        _ => LockScope::Entry,
+fn decode_collection_path(
+    db_root: &str,
+    collection: Option<&pb::CollectionPath>,
+) -> Result<CollectionPath, StorageError> {
+    let collection = collection
+        .filter(|collection| !collection.segments.is_empty())
+        .ok_or_else(|| StorageError::other("transaction log has no collection path"))?;
+    Ok(CollectionPath::from_segments(
+        db_root,
+        collection.segments.iter(),
+    ))
+}
+
+fn validate_single_database(log: &TxLog) -> Result<(), StorageError> {
+    let mut db_root: Option<String> = None;
+    let mut check = |collection: &CollectionPath| -> Result<(), StorageError> {
+        match db_root.as_deref() {
+            Some(root) if root != collection.db_root() => Err(StorageError::other(
+                "transaction log spans multiple database roots",
+            )),
+            Some(_) => Ok(()),
+            None => {
+                db_root = Some(collection.db_root().to_string());
+                Ok(())
+            }
+        }
+    };
+    for write in &log.writes {
+        check(write.key.collection())?;
     }
+    for lock in &log.locks {
+        match lock {
+            TxLock::Entry { key, .. } => check(key.collection())?,
+            TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => {
+                check(leaf.collection())?
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
@@ -532,27 +591,26 @@ mod tests {
     async fn round_trip() {
         let t = new_tlogger();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let key_path = paths::from_key("db/root", b"hello");
+        let collection = CollectionPath::new("db", b"root");
+        let key = KeyRef::new(collection.clone(), b"hello");
         let log = TxLog {
             id: id.clone(),
             timestamp: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
             status: TxCommitStatus::Ok,
             writes: vec![TxWrite {
-                path: key_path.clone(),
+                key: key.clone(),
                 value: Arc::from(&b"world"[..]),
                 deleted: false,
                 prev_writer: TxId::from_bytes(vec![9]),
             }],
             locks: vec![
-                PathLock {
-                    path: paths::collection_info("db/root"),
+                TxLock::Structure {
+                    leaf: LeafRef::root(collection),
                     typ: LockType::Read,
-                    scope: LockScope::Entry,
                 },
-                PathLock {
-                    path: key_path.clone(),
+                TxLock::Entry {
+                    key: key.clone(),
                     typ: LockType::Write,
-                    scope: LockScope::Entry,
                 },
             ],
         };
@@ -563,15 +621,13 @@ mod tests {
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         // Locks include the collection lock and the key lock.
-        assert!(got.locks.contains(&PathLock {
-            path: paths::collection_info("db/root"),
+        assert!(got.locks.contains(&TxLock::Structure {
+            leaf: LeafRef::root(CollectionPath::new("db", b"root")),
             typ: LockType::Read,
-            scope: LockScope::Entry,
         }));
-        assert!(got.locks.contains(&PathLock {
-            path: key_path,
+        assert!(got.locks.contains(&TxLock::Entry {
+            key,
             typ: LockType::Write,
-            scope: LockScope::Entry,
         }));
 
         let status = t.commit_status_at(&id, Requirement::Any).await.unwrap();
@@ -592,11 +648,11 @@ mod tests {
     async fn get_returns_log_and_version() {
         let t = new_tlogger();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let key_path = paths::from_key("db/root", b"hello");
+        let key = KeyRef::new(CollectionPath::new("db", b"root"), b"hello");
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         log.writes = vec![TxWrite {
-            path: key_path.clone(),
+            key,
             value: Arc::from(&b"world"[..]),
             deleted: false,
             prev_writer: TxId::default(),
@@ -610,6 +666,62 @@ mod tests {
         assert_eq!(got.writes, log.writes);
         assert_eq!(got.timestamp, log.timestamp);
         assert_eq!(version.as_ref(), stored_v.revision());
+    }
+
+    #[test]
+    fn encoded_collection_paths_are_relocatable() {
+        let id = TxId::from_bytes(vec![1]);
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(42));
+        log.writes.push(TxWrite {
+            key: KeyRef::new(
+                CollectionPath::new("original", b"parent").child(b"child"),
+                b"key",
+            ),
+            value: Arc::from(&b"value"[..]),
+            deleted: false,
+            prev_writer: TxId::default(),
+        });
+
+        let encoded = marshal_log(&log, log.timestamp.unwrap()).unwrap();
+        let relocated = decode_tx_log("moved", &id, &encoded).unwrap();
+
+        assert_eq!(relocated.writes[0].key.collection().db_root(), "moved");
+        assert_eq!(
+            relocated.writes[0]
+                .key
+                .collection()
+                .segments()
+                .collect::<Vec<_>>(),
+            vec![b"parent".as_slice(), b"child".as_slice()]
+        );
+        assert_eq!(
+            marshal_log(&relocated, relocated.timestamp.unwrap()).unwrap(),
+            encoded,
+            "the database root must not be encoded in the transaction body"
+        );
+    }
+
+    #[test]
+    fn one_transaction_cannot_span_database_roots() {
+        let mut log = TxLog::new(TxId::from_bytes(vec![1]), TxCommitStatus::Ok);
+        log.timestamp = Some(UNIX_EPOCH);
+        log.writes = vec![
+            TxWrite {
+                key: KeyRef::new(CollectionPath::new("first", b"c"), b"a"),
+                value: Arc::from(&b"a"[..]),
+                deleted: false,
+                prev_writer: TxId::default(),
+            },
+            TxWrite {
+                key: KeyRef::new(CollectionPath::new("second", b"c"), b"b"),
+                value: Arc::from(&b"b"[..]),
+                deleted: false,
+                prev_writer: TxId::default(),
+            },
+        ];
+
+        assert!(marshal_log(&log, UNIX_EPOCH).is_err());
     }
 
     #[tokio::test]

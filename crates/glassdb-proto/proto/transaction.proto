@@ -18,13 +18,19 @@ message TransactionLog {
 }
 
 message CollectionWrites {
-    string prefix = 1;
+    CollectionPath collection = 1;
     repeated Write writes = 2;
     CollectionLocks locks = 3;
 }
 
+// A relocatable logical collection path. The database root comes from the
+// enclosing transaction object's physical path and is deliberately omitted.
+message CollectionPath {
+    repeated bytes segments = 1;
+}
+
 message Write {
-    string suffix = 1;
+    bytes key = 1;
     // The ID of the last transaction writing to this key.
     bytes prev_tid = 3;
 
@@ -35,8 +41,24 @@ message Write {
 }
 
 message CollectionLocks {
-    Lock.LockType collection_lock = 2;
-    repeated Lock locks = 3;
+    repeated EntryLock entry_locks = 1;
+    repeated LeafLock leaf_locks = 2;
+}
+
+message EntryLock {
+    bytes key = 1;
+    Lock.LockType lock_type = 2;
+}
+
+message LeafLock {
+    oneof target {
+        // The collection root object (`_i`). Always encoded as true.
+        bool root = 1;
+        // The opaque token of a standalone node object (`_n/<token>`).
+        string node = 2;
+    }
+    Lock.LockType lock_type = 3;
+    Lock.Scope scope = 4;
 }
 
 message Lock {
@@ -50,14 +72,9 @@ message Lock {
 
     enum Scope {
         UNKNOWN_SCOPE = 0;
-        ENTRY = 1;
-        STRUCTURE = 2;
-        MEMBERSHIP = 3;
+        STRUCTURE = 1;
+        MEMBERSHIP = 2;
     }
-
-    string suffix = 1;
-    LockType lock_type = 2;
-    Scope scope = 3;
 }
 
 message NodeLock {

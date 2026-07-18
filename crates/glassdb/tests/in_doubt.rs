@@ -59,8 +59,8 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type Competitor = Box<dyn FnOnce() -> BoxFuture<()> + Send + Sync>;
 
 fn is_committed_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::decode(&glassdb_data::TxId::default(), body)
-        .map(|l| l.status == TxCommitStatus::Ok)
+    glassdb_storage::txobject::status(body)
+        .map(|status| status == TxCommitStatus::Ok)
         .unwrap_or(false)
 }
 

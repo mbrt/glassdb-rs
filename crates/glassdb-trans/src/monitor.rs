@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
-use glassdb_data::TxId;
+use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::{
-    LogicalTime, Observation, PathLock, Requirement, StorageError, TLogger, TValue, Timeline,
-    TxCommitStatus, TxLog, TxStatus,
+    LogicalTime, Observation, Requirement, StorageError, TLogger, TValue, Timeline, TxCommitStatus,
+    TxLock, TxLog, TxStatus,
 };
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
@@ -68,7 +68,7 @@ struct TxStatusEntry {
     refresh_state: RefreshState,
     // The lock set this transaction holds, recorded by the engine once it has
     // acquired its locks.
-    locks: Vec<PathLock>,
+    locks: Vec<TxLock>,
 }
 
 #[derive(Clone, Copy)]
@@ -211,7 +211,7 @@ impl Monitor {
     /// stamp it onto the pending transaction object (ADR-022). Overwrites any
     /// previously recorded set with the latest acquire; a no-op if the
     /// transaction is no longer tracked (already finalized).
-    pub(crate) fn record_tx_locks(&self, tid: &TxId, locks: Vec<PathLock>) {
+    pub(crate) fn record_tx_locks(&self, tid: &TxId, locks: Vec<TxLock>) {
         let mut st = self.shard_for(tid).lock().unwrap();
         if let Some(e) = st.local_tx.get_mut(tid) {
             e.locks = locks;
@@ -399,7 +399,7 @@ impl Monitor {
     /// local storage or the transaction log.
     pub(crate) async fn committed_value(
         &self,
-        key: &str,
+        key: &KeyRef,
         tid: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
         self.committed_value_with_requirement(key, tid, None).await
@@ -408,7 +408,7 @@ impl Monitor {
     /// Returns a committed value using a caller-provided observation bound.
     pub(crate) async fn committed_value_at(
         &self,
-        key: &str,
+        key: &KeyRef,
         tid: &TxId,
         requirement: Requirement,
     ) -> Result<KeyCommitStatus, TransError> {
@@ -556,7 +556,7 @@ impl Monitor {
 
     async fn committed_value_with_requirement(
         &self,
-        key: &str,
+        key: &KeyRef,
         tid: &TxId,
         requirement: Option<Requirement>,
     ) -> Result<KeyCommitStatus, TransError> {
@@ -594,7 +594,7 @@ impl Monitor {
             .value()
             .ok_or_else(|| TransError::other(format!("missing final log for {tid}")))?;
         for entry in &tl.writes {
-            if entry.path == key {
+            if &entry.key == key {
                 return Ok(KeyCommitStatus {
                     status: TxCommitStatus::Ok,
                     value: TValue {
@@ -1030,8 +1030,12 @@ fn notify_waiters(st: &mut State, tid: &TxId, status: TxCommitStatus) {
 mod tests {
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, LockScope, LockType, PathLock, Timeline, TxWrite};
+    use glassdb_data::CollectionPath;
+    use glassdb_storage::{CachedStore, LockType, Timeline, TxWrite};
+
+    fn key_ref(key: &[u8]) -> KeyRef {
+        KeyRef::new(CollectionPath::new("test", b"collection"), key)
+    }
 
     struct TestCtx {
         tl: TLogger,
@@ -1091,7 +1095,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
-        let key = paths::from_key("example", b"key1");
+        let key = key_ref(b"key1");
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
 
@@ -1105,10 +1109,9 @@ mod tests {
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
-        tl.locks = vec![PathLock {
-            path: key,
+        tl.locks = vec![TxLock::Entry {
+            key,
             typ: LockType::Write,
-            scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
@@ -1120,16 +1123,15 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
-        let key = paths::from_key("example", b"key");
+        let key = key_ref(b"key");
 
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWriteForTest::w(&key, b"val1")];
-        tl.locks = vec![PathLock {
-            path: key.clone(),
+        tl.locks = vec![TxLock::Entry {
+            key: key.clone(),
             typ: LockType::Write,
-            scope: LockScope::Entry,
         }];
         mon1.commit_tx(tl).await.unwrap();
 
@@ -1142,7 +1144,7 @@ mod tests {
         assert_eq!(&*cs.value.value, b"val1");
 
         // A key the transaction didn't write.
-        let key2 = paths::from_key("example", b"key2");
+        let key2 = key_ref(b"key2");
         let cs = mon2.committed_value(&key2, &tx).await.unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
         assert!(cs.value.not_written);
@@ -1211,10 +1213,9 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
         let tx = TxId::from_bytes(b"tx1".to_vec());
-        let locks = vec![PathLock {
-            path: paths::from_key("example", b"k"),
+        let locks = vec![TxLock::Entry {
+            key: key_ref(b"k"),
             typ: LockType::Write,
-            scope: LockScope::Entry,
         }];
         mon.begin_tx(&tx);
         mon.record_tx_locks(&tx, locks.clone());
@@ -1293,9 +1294,9 @@ mod tests {
     // Tiny helper to build a TxWrite in tests.
     struct TxWriteForTest;
     impl TxWriteForTest {
-        fn w(path: &str, value: &[u8]) -> TxWrite {
+        fn w(key: &KeyRef, value: &[u8]) -> TxWrite {
             TxWrite {
-                path: path.to_string(),
+                key: key.clone(),
                 value: Arc::from(value),
                 deleted: false,
                 prev_writer: TxId::default(),

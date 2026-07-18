@@ -13,7 +13,11 @@
 //! [`crate::tlogger`].
 
 use crate::error::StorageError;
-use crate::tlogger::{TxLog, TxWrite, decode_tx_log, marshal_log};
+use glassdb_data::KeyRef;
+
+use crate::tlogger::{
+    TxCommitStatus, TxLog, TxWrite, decode_tx_log, decode_tx_status, marshal_log,
+};
 
 /// Encodes a transaction object to its canonical protobuf body (the CAS unit).
 ///
@@ -29,15 +33,20 @@ pub fn encode(obj: &TxLog) -> Result<Vec<u8>, StorageError> {
 
 /// Decodes a transaction object from its protobuf body. The status and timestamp
 /// are read from the body, not tags (ADR-019).
-pub fn decode(id: &glassdb_data::TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
-    decode_tx_log(id, buf)
+pub fn decode(db_root: &str, id: &glassdb_data::TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
+    decode_tx_log(db_root, id, buf)
 }
 
-/// Returns the write the transaction recorded for the full key `path`, or `None`
+/// Decodes only the transaction status without requiring relocation context.
+pub fn status(buf: &[u8]) -> Result<TxCommitStatus, StorageError> {
+    decode_tx_status(buf)
+}
+
+/// Returns the write the transaction recorded for `key`, or `None`
 /// if it wrote nothing there. This is how a reader materializes a key's value
 /// from the committed writer's object.
-pub fn find_write<'a>(obj: &'a TxLog, path: &str) -> Option<&'a TxWrite> {
-    obj.writes.iter().find(|w| w.path == path)
+pub fn find_write<'a>(obj: &'a TxLog, key: &KeyRef) -> Option<&'a TxWrite> {
+    obj.writes.iter().find(|write| &write.key == key)
 }
 
 #[cfg(test)]
@@ -45,20 +54,23 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use glassdb_data::{TxId, paths};
+    use glassdb_data::{CollectionPath, KeyRef, TxId};
 
     use super::*;
     use crate::lock::LockType;
-    use crate::tlogger::{PathLock, TxCommitStatus, TxWrite};
+    use crate::tlogger::{TxCommitStatus, TxLock, TxWrite};
+
+    fn key(key: &[u8]) -> KeyRef {
+        KeyRef::new(CollectionPath::new("db", b"c"), key)
+    }
 
     fn committed_object() -> TxLog {
-        let key_path = paths::from_key("db/c", b"hello");
         TxLog {
             id: TxId::from_bytes(vec![1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             status: TxCommitStatus::Ok,
             writes: vec![TxWrite {
-                path: key_path,
+                key: key(b"hello"),
                 value: Arc::from(&b"world"[..]),
                 deleted: false,
                 prev_writer: TxId::default(),
@@ -70,7 +82,7 @@ mod tests {
     #[test]
     fn committed_round_trip() {
         let obj = committed_object();
-        let decoded = decode(&obj.id, &encode(&obj).unwrap()).unwrap();
+        let decoded = decode("db", &obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Ok);
         assert_eq!(decoded.writes, obj.writes);
         assert_eq!(decoded.timestamp, obj.timestamp);
@@ -78,19 +90,17 @@ mod tests {
 
     #[test]
     fn pending_round_trip_carries_lease_and_locks() {
-        let key_path = paths::from_key("db/c", b"hello");
         let obj = TxLog {
             id: TxId::from_bytes(vec![9]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
             status: TxCommitStatus::Pending,
             writes: Vec::new(),
-            locks: vec![PathLock {
-                path: key_path,
+            locks: vec![TxLock::Entry {
+                key: key(b"hello"),
                 typ: LockType::Write,
-                scope: crate::tlogger::LockScope::Entry,
             }],
         };
-        let decoded = decode(&obj.id, &encode(&obj).unwrap()).unwrap();
+        let decoded = decode("db", &obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Pending);
         // The lease (timestamp) survives the round trip with sub-second loss
         // tolerated by the body encoding (full nanos are preserved here).
@@ -107,7 +117,7 @@ mod tests {
             writes: Vec::new(),
             locks: Vec::new(),
         };
-        let decoded = decode(&obj.id, &encode(&obj).unwrap()).unwrap();
+        let decoded = decode("db", &obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Aborted);
     }
 
@@ -121,12 +131,11 @@ mod tests {
     #[test]
     fn find_write_locates_key() {
         let obj = committed_object();
-        let key_path = paths::from_key("db/c", b"hello");
         assert_eq!(
-            find_write(&obj, &key_path).unwrap().value.as_ref(),
+            find_write(&obj, &key(b"hello")).unwrap().value.as_ref(),
             b"world"
         );
-        assert!(find_write(&obj, "db/c/_k/missing").is_none());
+        assert!(find_write(&obj, &key(b"missing")).is_none());
     }
 
     // Golden vector: a fixed committed object must always encode to these exact
@@ -135,9 +144,9 @@ mod tests {
     fn golden_encoding() {
         let got = encode(&committed_object()).unwrap();
         let want = [
-            0x0a, 0x06, 0x08, 0x80, 0xe2, 0xcf, 0xaa, 0x06, 0x10, 0x01, 0x1a, 0x1d, 0x0a, 0x04,
-            0x64, 0x62, 0x2f, 0x63, 0x12, 0x13, 0x0a, 0x0a, 0x5f, 0x6b, 0x2f, 0x50, 0x36, 0x4b,
-            0x67, 0x51, 0x36, 0x77, 0x12, 0x05, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x1a, 0x00,
+            0x0a, 0x06, 0x08, 0x80, 0xe2, 0xcf, 0xaa, 0x06, 0x10, 0x01, 0x1a, 0x17, 0x0a, 0x03,
+            0x0a, 0x01, 0x63, 0x12, 0x0e, 0x0a, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x12, 0x05,
+            0x77, 0x6f, 0x72, 0x6c, 0x64, 0x1a, 0x00,
         ];
         assert_eq!(got, want, "tx-object encoding drifted: {got:02x?}");
     }
