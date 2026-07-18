@@ -62,21 +62,6 @@ ephemeral — they can scale to zero and back without any coordination. The only
 shared state is the object storage bucket, which provides strong consistency for
 single-object operations and conditional writes for atomic state transitions.
 
-## Snapshot reads (proposed)
-
-Strict serializability remains the default. The proposed
-[bounded-staleness snapshot design](designs/snapshot-reads.md) adds an explicit
-snapshot-preferred read-only transaction. A snapshot execution binds one sealed
-global epoch and reads historical data at that cut without locks or commit
-validation. Epoch sealing is cooperative and activity-driven; long readers use
-a fixed retention window rather than durable reader pins.
-
-Read-write transactions keep the lock-and-revalidate protocol below and admit
-their terminal writes into the global epoch frontier only after their
-serialization dependencies and immutable payload manifest are fixed. Snapshot
-acquisition may fall back before execution to a strict OCC implementation of the
-same read facade; the closure is side-effect-free and may be replayed.
-
 ## Crate Structure
 
 The port is a Cargo workspace whose crates mirror the original Go `internal/`
@@ -152,7 +137,7 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
  │ Reader  │   │ Locker — lock POLICY  │   │ Monitor  │   │   Gc    │
  │ effctv. │   │ owns the SHARD model: │   │ tx-log   │   │ tx-log  │
  │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ reverse │
- │ snapshot│   │ · parallel/serial     │   │ wound /  │   │ liveness│
+ │ validate│   │ · parallel/serial     │   │ wound /  │   │ liveness│
  │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ release │
  │ validate│   │ · installs resolvers  │   │ refresh  │   │ →Locker │
  └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
@@ -197,7 +182,7 @@ wound-wait; the fold visits members oldest-first so it never has to backtrack.
 | `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall` | **shards**, CAS details, caching    |
 | `Locker`              | lock **policy** | `Data`, `TxId`, shard objects | key→shard grouping, parallel & serial acquisition strategy, hold-and-wait, installs acquire / write-back / release resolvers | retry *policy*, **read validation** (reports `Conflict` only) |
 | `ShardCoordinator`    | shard/root **mechanism** | object path, resolvers | one round per object: single-flight, load-once, monotonic fold, single CAS, reload-recover, vestigial-entry pruning | locks, `TxId`, wound-wait, commit |
-| `Reader`              | read mechanism   | paths                        | effective-writer resolution, snapshot reads                                                                           | commit / lock policy                |
+| `Reader`              | read mechanism   | paths                        | effective-writer resolution                                                                                            | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
 | `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
 
