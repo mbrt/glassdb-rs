@@ -233,8 +233,19 @@ impl<V> Observation<V> {
     }
 
     /// Reports whether two observations refer to the same exact state.
+    ///
+    /// Observations of one state normally share the same evidence cell, so
+    /// pointer identity is the fast path. But a cache eviction and reload mint a
+    /// fresh evidence cell for the very same committed version, so two
+    /// observations of the same path and revision are still the same state.
     pub fn same_state(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.evidence.0, &other.evidence.0)
+        if Arc::ptr_eq(&self.evidence.0, &other.evidence.0) {
+            return true;
+        }
+        match (&self.revision, &other.revision) {
+            (Some(mine), Some(theirs)) => self.path == other.path && mine == theirs,
+            _ => false,
+        }
     }
 }
 
@@ -1340,6 +1351,32 @@ mod tests {
             count(&log, "read"),
             1,
             "the invalidated entry forces a read"
+        );
+    }
+
+    // Regression: two observations of one committed revision are the same state
+    // even when they hold distinct evidence cells. A cache eviction and reload
+    // (modeled here by two independent caches over one backend) mints a fresh
+    // cell for the unchanged version; `same_state` must still hold, otherwise a
+    // lock CAS fails to certify a read taken before the reload.
+    #[tokio::test]
+    async fn same_state_holds_across_independent_evidence_for_one_revision() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let a = bytes_store(backend.clone());
+        let b = bytes_store(backend);
+
+        a.write("p", v(b"x")).await.unwrap();
+        let obs_a = a.read("p", Requirement::Any).await.unwrap();
+        let obs_b = b.read("p", Requirement::Any).await.unwrap();
+
+        assert_eq!(
+            obs_a.revision(),
+            obs_b.revision(),
+            "both observed the same committed version"
+        );
+        assert!(
+            obs_a.same_state(&obs_b),
+            "same revision is the same state despite distinct evidence cells"
         );
     }
 
