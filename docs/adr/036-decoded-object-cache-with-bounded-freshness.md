@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+The operation-order and cache-publication rules are partially superseded by
+[ADR-043](043-causally-coordinated-backend-operations.md). Its decoded-cache,
+observation, and bounded-validation decisions remain authoritative.
+
 This supersedes
 [ADR-030](030-seed-shard-loads.md)'s `Latest` / `AllowStale` cache-freshness API
 while preserving its reuse optimization as an `Any` read followed by CAS.
