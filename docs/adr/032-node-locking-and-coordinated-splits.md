@@ -6,6 +6,9 @@ Accepted — implemented.
 
 The placement and lifecycle of structural records are refined by
 [ADR-034](034-separate-structural-log-namespace.md).
+The post-cancellation exception to structural-record coverage, including the
+accepted possibility of an unreachable late-created node, is defined by
+[ADR-043](043-causally-coordinated-backend-operations.md).
 
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —

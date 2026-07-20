@@ -7,8 +7,9 @@ Accepted.
 This depends on
 [ADR-042](042-conditional-only-backend-mutations.md), partially supersedes
 [ADR-036](036-decoded-object-cache-with-bounded-freshness.md)'s operation-order
-and publication rules, and refines ADR-009's treatment of cancellation after a
-mutation is dispatched.
+and publication rules, refines ADR-009's treatment of cancellation after a
+mutation is dispatched, and defines ADR-032's exception for structural objects
+created after their operation was abandoned.
 
 ## Context
 
@@ -37,47 +38,71 @@ it.
 including read-after-definitive-completion consistency. Eventually consistent
 implementations are not supported.
 
-Replace `LogicalTime` with two deliberately distinct concepts:
+Replace `LogicalTime` with `SequencePoint`, a strictly ordered event on one open
+`Database`. It is not persisted, exchanged, or shared by separately opened
+database instances. Its allocator remains internally coupled to a monotonic
+elapsed-time floor so `read_stale` can derive an approximate cutoff; numeric
+distance between sequence points otherwise has no meaning, and no
+`MonotonicInstant` becomes part of the cache interface.
 
-- `SequencePoint` is a strictly ordered event on one open `Database`. It is not
-  persisted, exchanged, or shared by separately opened database instances.
-- `MonotonicInstant` is elapsed local time and is not causal evidence.
+For reasoning, every backend call has a conceptual interval from invocation to
+local completion. An invoked call is pending until it settles definitively or in
+doubt. These are specification labels, not an `Operation` struct or a
+`Completion` enum.
 
-Every backend call has an internal span with explicit completion certainty:
+The invocation point is allocated immediately before dispatch. Local completion
+occurs after the result has been reconciled with local knowledge and before the
+operation's future becomes ready. A pending or in-doubt operation establishes no
+definitive backend edge. A definitive completion before another operation's
+invocation establishes the backend's real-time edge. Invocation order alone
+cannot distinguish disjoint operations from overlapping ones; the per-path lane
+below supplies that distinction.
 
-```text
-OperationSpan { invoked: SequencePoint, completion: Completion }
-Completion = Definitive(SequencePoint) | InDoubt(SequencePoint)
-```
+The interval is specification notation, not a persisted `OperationSpan`, and
+no completion sequence point is stored. One interval covers the complete
+backend method, including provider retry attempts; ADR-009 determines when an
+ambiguous retry sequence must remain in doubt. For an abandoned call, local
+completion means that GlassDB stopped driving the future, not that the remote
+request completed.
 
-`invoked` is allocated immediately before dispatch. The completion point is
-allocated after the result has been reconciled with local knowledge and before
-the operation's future becomes ready. For definitive outcomes:
+Cache entries remain `Present` or `Absent`. Removing an entry represents no
+usable current knowledge, including a definitive changed read whose body cannot
+be decoded. This is ADR-036's `Missing` condition, renamed in this ADR to
+"uncertain" to avoid confusing it with observed absence; it is not a third
+stored entry variant.
 
-```text
-point(A.completion) < B.invoked  =>  A happens before B
-```
+### Required types and ownership
 
-Overlapping spans are incomparable. Invocation order, completion order, and
-acknowledgement order alone do not order them. An in-doubt operation has a local
-completion point but establishes no definitive backend happens-before edge.
-One span covers the complete backend method, including provider retry attempts;
-ADR-009 determines when an ambiguous retry sequence must remain in doubt.
+The implementation introduces these named types:
 
-Completion certainty and cache knowledge are separate:
+- `SequencePoint`, replacing `LogicalTime`;
+- a private `PathCoordinator`, owned and shared by `CachedStore`, for per-path
+  admission and compatible-read joining;
+- a private `PathPermit`, representing ownership of one path lane;
+- a private `ReadAdmission` enum, distinguishing joining the existing read
+  flight from leading it with a `PathPermit`;
+- a private `ExpectedState` enum, distinguishing expected absence from an
+  expected present revision; and
+- a private `MutationGuard`, holding the expected state and path permit so a
+  dropped invoked mutation invalidates knowledge before releasing the lane.
 
-```text
-CacheKnowledge   = Present | Absent | Uncertain
-```
+`PathCoordinator` is an internal helper, not another storage layer. It does not
+own the cache or drive backend futures: `CachedStore` performs the cache recheck,
+backend call, and reconciliation while holding its permit. The existing read
+flight and its shared outcome remain the coalescing mechanism and move under
+this coordinator.
 
-A definitive read whose changed body cannot be decoded, for example, has a
-definitive backend outcome but leaves cache knowledge uncertain.
+No `Operation`, `OperationSpan`, `Completion`, `CacheKnowledge`, `Uncertain`, or
+monotonic-instant type is introduced. `Requirement`, the present/absent cache
+entry state, mutation results, and observation checks retain their existing
+roles.
 
 ### Serialize point operations per path
 
-One database-local coordinator serializes actual point-object backend calls per
-physical path. Calls on different paths remain concurrent. The initial design
-uses an exclusive lane for reads and mutations alike:
+The `PathCoordinator` serializes point-object backend calls per physical path
+while this `Database` owns them. Calls on different paths remain concurrent. The
+initial design uses an exclusive lane for reads and mutations alike. The
+required ordering is:
 
 ```text
 check cache
@@ -85,30 +110,35 @@ check cache
 -> check cache again
 -> allocate invoked
 -> call backend
--> reconcile knowledge
--> allocate completed
--> release path lane
--> return
+-> definitive: reconcile knowledge, release path lane, return
+   in-doubt: remove usable knowledge, release path lane, return `Unavailable`
+   abandoned: remove usable knowledge, release path lane, no return
 ```
 
-Reconciliation happens before completion while the lane is still held. No
-operation holds two path lanes, and cache reconciliation invokes no
-higher-level protocol, avoiding lock-order cycles.
+Reconciliation happens before definitive completion while the lane is still
+held. In-doubt completion and abandonment make knowledge uncertain before
+releasing the lane; abandonment is the same state transition without an error
+being returned to the cancelled caller. No operation holds two path lanes, and
+cache reconciliation invokes no higher-level protocol, avoiding lock-order
+cycles.
 
 An `Any` cache hit does not acquire the lane and may return an older state while
-a mutation is active. A read requiring newer evidence waits, rechecks after it
-acquires the lane, and avoids a backend call if the preceding operation already
-satisfied it.
+a mutation is active. Compatible read callers may also coalesce onto one lane
+owner and share its single backend operation and invocation point. A caller
+requiring newer evidence cannot join an operation invoked before its bound: it
+queues, rechecks after acquiring the lane, and avoids another backend call when
+the preceding result already satisfies it.
 
-Concurrent same-path backend reads are a permitted later optimization internal
-to the coordinator. They may share or merge identical states; incompatible
-overlapping results make the discoverable cache state uncertain. This
+Multiple concurrent same-path backend reads are a permitted later optimization
+internal to the coordinator; coalesced callers are not concurrent backend
+operations. Distinct overlapping reads may merge identical states, while
+incompatible results make discoverable cache knowledge uncertain. This
 optimization is enabled only after a qualitative benchmark shows that exclusive
-reads materially regress slow-read or hot-object workloads.
+backend calls materially regress slow-read or hot-object workloads.
 
 ### Evidence and publication
 
-An observation retains `observed_after`, set to the definitive backend
+An observation retains ADR-036's `current_after`, set to the definitive backend
 operation's `invoked` point. Completion is a causal boundary, not a freshness
 watermark, and is not exposed by `Observation`.
 
@@ -119,52 +149,94 @@ validation merges evidence. A later serialized operation may replace earlier
 discoverable knowledge; a result that proves the cached state obsolete but
 cannot supply a usable replacement invalidates it.
 
-`Uncertain` initially needs no LRU-resident tombstone: exclusive point
+Uncertain knowledge initially needs no LRU-resident tombstone: exclusive point
 operations eliminate delayed local publishers, so removing the usable cache
-entry is sufficient. Retained observations preserve their historical evidence
-but are not discoverable by new cache reads. A future concurrent-read
-optimization may add provenance-bearing tombstones internally.
+entry is sufficient. An abandoned mutation may still apply remotely, but it can
+never publish a delayed result locally and is treated like a writer from another
+database instance. Retained observations preserve their historical evidence but
+are not discoverable by new cache reads. A future concurrent-read optimization
+may add provenance-bearing tombstones internally.
+
+Any later definitive read or successful mutation may install usable knowledge
+again. A clean mutation precondition failure only proves the expected
+observation obsolete; because it does not identify the current state, knowledge
+remains uncertain until another operation does.
+
+Every conditional mutation must remain semantically safe if it executes
+arbitrarily later when its original predicate is true again. CAS and conditional
+delete deliberately use ADR-042's state-based revision semantics, including
+revision ABA. Create-if-absent is restricted to either a permanent path whose
+initial state is idempotent and is never deleted, or a fresh identity path whose
+mere existence cannot publish newer user-visible state. An identity object
+becomes live only through a separately revision-fenced reference or through
+idempotent recovery of that identity.
+
+Transaction objects use fresh transaction IDs and
+[ADR-022](022-garbage-collection-mark-sweep.md)'s reference-checked GC;
+structural nodes and records use fresh random tokens and
+[ADR-032](032-node-locking-and-coordinated-splits.md)'s version-fenced
+reachability. A late object therefore belongs to its original lifecycle rather
+than replacing a newer one. In particular, a structural node created after its
+write-ahead record was resolved cannot become reachable without the
+already-fenced tree update. It may remain as an unreachable object, because no
+node-directory orphan sweep is required by this decision. The resulting
+object-store space leak is accepted for now; it is not permission for late
+creation to affect the live tree or transaction state.
 
 ADR-036's `read_stale` remains an approximate cache policy only. It may use a
-`MonotonicInstant` to derive an explicitly approximate `SequencePoint` cutoff,
-but duration-to-sequence conversion is confined to that API. Causal validation,
-mutation receipts, and recovery never perform time arithmetic. Snapshot reads
-are expected to supersede `read_stale` for real bounded-staleness guarantees.
+monotonic elapsed-time sample to derive an explicitly approximate
+`SequencePoint` cutoff, but duration-to-sequence conversion is confined to that
+API. Causal validation, mutation receipts, and recovery never perform time
+arithmetic. Snapshot reads are expected to supersede `read_stale` for real
+bounded-staleness guarantees.
 
 ### Cancellation and lifecycle
 
-Waiting for a path lane is cancellable. At backend invocation, ownership of a
-mutation transfers to the database: dropping the caller stops waiting but does
-not cancel the dispatched mutation. The owned worker runs through definitive
-publication or uncertainty and is included in graceful-shutdown draining.
-Reads remain cancellable because they cannot change backend state.
+Waiting for a path lane is cancellable. Cancellation before backend invocation
+ends the operation without changing cache knowledge and releases the lane if it
+was acquired. Cancellation after a mutation is invoked abandons the operation:
+while still holding the lane, GlassDB removes usable cache knowledge, then drops
+the backend future and releases the lane. It does not move the future to a
+background worker and never publishes a result from that call.
 
-Any panic, task failure, or lost result after mutation dispatch and before
-definitive publication is treated like `InDoubt`: invalidate usable knowledge,
-notify the waiter of uncertainty when possible, and release the lane. Encoding
-or validation failures before dispatch do not invalidate cache state.
+Dropping the future cannot prove that the provider cancelled the request. The
+mutation may still apply remotely, so abandonment is treated exactly like
+`InDoubt` and like an in-flight mutation from a crashed or different `Database`
+instance. It establishes no local completion edge, and later local operations
+may overlap it remotely. Their conditional operations and freshness
+requirements, rather than the path lane, reconcile any effect that becomes
+observable. Reads remain cancellable without invalidation because they cannot
+change backend state.
 
-Graceful shutdown rejects new public asynchronous operations, drains already
-admitted public operations and protocol/background producers, then closes and
-drains the backend-operation coordinator. A caller may independently bound
-shutdown with a timeout. A slow dispatched backend mutation can block its path
-and graceful drain; per-operation timeouts are a follow-up operational policy,
-not part of this decision.
+Any panic, task failure, or lost result after mutation invocation and before
+definitive publication follows the same abandonment transition. Encoding or
+validation failures before invocation do not invalidate cache state.
 
-Database metadata initialization uses the same spans and conditional
-primitives, but occurs before an open database owns background work. Cancelling
-`Database::open` is treated as crashing an opener; create-if-absent metadata is
-safe under that exception.
+The coordinator admits operations, cancels queued work before dispatch, and
+serializes live calls. It owns no continuation task or drain registry for an
+abandoned mutation.
+
+Graceful shutdown rejects new public asynchronous operations and drains
+still-live admitted operations and protocol/background producers. It does not
+wait for abandoned mutations and cannot promise that none will apply after
+shutdown returns; this is the same boundary as a crashed database instance. A
+caller may independently bound shutdown with a timeout.
+
+Database metadata initialization uses the same invocation/completion lifecycle
+and conditional primitives. Cancelling `Database::open` abandons an invoked
+create-if-absent and is treated as crashing an opener; metadata creation is
+idempotent under that exception.
 
 ### Complete backend boundary
 
 Production engine code performs every backend operation through this boundary.
-Database metadata and cached point objects receive operation spans; point
-objects additionally use path lanes and cache reconciliation. Backend tests and
-standalone backend benchmarks may call a raw backend directly.
+Database metadata and cached point objects use the same invocation/completion
+lifecycle; point objects additionally use path lanes and cache reconciliation.
+Backend tests and standalone backend benchmarks may call a raw backend directly.
 
 Listing is not a point operation and takes no path lane. Each page has its own
-`OperationSpan`. S3 documents a continuation token only as an opaque way to
+conceptual operation interval and invocation point. S3 documents a continuation
+token only as an opaque way to
 [continue a later request](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html),
 not as a snapshot token. A paginated traversal therefore makes no cross-page
 consistency claim. Protocols needing a consistent traversal retain their
@@ -174,8 +246,12 @@ membership/version validation or recovery logic.
 
 Deterministic state-machine and gated tests cover disjoint and overlapping
 operations, the false-absence race, path parallelism, cache hits during
-mutation, both cancellation boundaries, every certainty/knowledge combination,
-conditional deletion, retained observations, and shutdown draining.
+mutation, both cancellation boundaries, definitive and in-doubt outcomes,
+present, absent, and uncertain knowledge, conditional deletion, retained
+observations, shutdown with abandoned mutations, and absence/revision ABA.
+One backend test separates request dispatch from remote application, abandons
+the local mutation, completes shutdown, then applies the request and verifies
+that subsequent read/CAS or recovery safely reconciles it.
 Transaction simulation remains the end-to-end check under reordered responses,
 lost acknowledgements, outages, and client crashes. Hot-object, slow-read, and
 ordinary multi-path benchmarks gate any relaxation of the exclusive read lane.
@@ -190,7 +266,7 @@ which is the false-`NotFound` failure that motivated this ADR. Completion order
 also cannot order overlapping operations: object stores do not promise that
 acknowledgements arrive in linearization order.
 
-Stamping a result with completion as `observed_after` is stronger than either
+Stamping a result with completion as `current_after` is stronger than either
 ordering mistake. Another client may replace the state after this operation
 linearizes but before its response arrives, so completion would claim freshness
 the result never established.
@@ -220,11 +296,13 @@ later publisher cannot close uncertainty generically.
 Per-path serialization collapses definitive local operations into a chain.
 After a lane is released there is no delayed local publisher, so the current
 entry or its invalidation is sufficient; no long-lived provenance registry is
-needed. It preserves concurrency across paths, where GlassDB obtains most of
-its parallelism, while existing read coalescing and shard mutation coordination
-already reduce useful same-path overlap. Shared reads remain a measured,
-internal follow-up rather than making the initial correctness state machine
-substantially larger.
+needed. An abandoned mutation can remain active remotely, but has left the
+instance's causal domain and is indistinguishable from an external writer. The
+lane preserves concurrency across paths, where GlassDB obtains most of its
+parallelism, while existing read coalescing and shard mutation coordination
+already reduce useful same-path overlap. Multiple concurrent backend reads
+remain a measured, internal follow-up rather than making the initial correctness
+state machine substantially larger.
 
 ### Serialize mutations but not reads
 
@@ -248,24 +326,47 @@ requirement algebra solely for an approximate API expected to be superseded by
 snapshot reads. The chosen approximate conversion is quarantined from causal
 validation instead.
 
-### Expose completion through `Observation`
+### Store or expose completion sequence points
 
-Callers need the invocation evidence established by an exact state. Completion
-is consumed by the coordinator to order later operations; once publication has
-happened and the future is ready, retaining it in every observation adds no
-proof a caller currently needs.
+The lane and coordinator lifecycle establish that a definitive operation
+completed before the next same-path invocation. A numeric completion point has
+no consumer in the serialized design, and an in-doubt completion cannot create
+a backend edge. Callers need only the invocation evidence established by an
+exact state. Completion points would become necessary if serialization were
+removed and overlapping intervals had to be compared explicitly.
+
+### Continue cancelled mutations in the background
+
+Transferring an invoked mutation to a database-owned worker would preserve its
+place in the local path order and often recover a definitive result. That edge
+is not observable by the caller that abandoned the operation, however, and
+GlassDB must already tolerate the same mutation arriving from another database
+instance or a crashed client. Continuing it would require a task registry,
+ownership handoff, panic containment, and shutdown draining, while a slow call
+would retain the path lane after its caller no longer needs it. Invalidating
+knowledge and applying the existing external-writer model gives the required
+correctness with a smaller lifecycle.
 
 ## Consequences
 
 - Local cache publication follows the same real-time order guaranteed by the
   backend instead of inventing an order for overlapping operations.
-- The false-absence class is removed without weakening `Any` cache reuse or
-  serializing operations on different objects.
+- The false-absence class is removed among definitively completed operations in
+  one database instance, without weakening `Any` cache reuse or serializing
+  operations on different objects. An abandoned mutation can still make a
+  cached result stale as an external writer because it has no successful local
+  completion and creates no causal promise.
 - Same-path backend latency can cause head-of-line blocking. Existing read
   coalescing and higher-level shard mutation coordination reduce the common
-  cost; safe shared reads remain available as a measured optimization.
-- Dispatched mutations may outlive their callers, so the database owns and
-  drains them.
+  cost; multiple concurrent backend reads remain available as a measured
+  optimization.
+- A dispatched mutation may outlive its caller remotely. The database abandons
+  it, invalidates local knowledge, and neither owns nor drains it.
+- Graceful shutdown does not guarantee that an abandoned provider request will
+  never apply afterward.
+- A late create at a fresh identity can leave an unreachable object after its
+  recovery record has been removed. This is an accepted space leak until a
+  node-directory orphan sweep is justified and implemented.
 - Separate `Database` openings have independent causality domains. A cache hit
   in one instance does not inherit completion in another.
 - `SequencePoint` remains exact for causality while `read_stale` is explicitly

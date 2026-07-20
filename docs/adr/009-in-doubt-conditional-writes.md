@@ -6,7 +6,7 @@ Accepted
 
 The conditional mutation surface is refined by
 [ADR-042](042-conditional-only-backend-mutations.md), and post-dispatch
-cancellation ownership and cache reconciliation are refined by
+cancellation and cache reconciliation are refined by
 [ADR-043](043-causally-coordinated-backend-operations.md).
 
 ## Context
