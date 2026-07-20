@@ -1,9 +1,10 @@
-//! Amazon S3 backend for GlassDB (ADR-016, ADR-023).
+//! Amazon S3 backend for GlassDB (ADR-016, ADR-023, ADR-042).
 //!
 //! Each logical key maps to a single S3 object whose body holds the value.
 //! Coordination is content CAS only: conditional writes use `If-Match` /
-//! `If-None-Match` on the object ETag, and the opaque [`Version`] token is that
-//! ETag (kept verbatim, quotes included). Conditional reads use `If-None-Match`.
+//! `If-None-Match` and conditional deletion uses `If-Match` on the object ETag.
+//! The opaque [`Version`] token is that ETag (kept verbatim, quotes included).
+//! Conditional reads use `If-None-Match`.
 
 use std::future::Future;
 use std::time::Duration;
@@ -44,8 +45,8 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 /// it reactively splits a partition, a window that can outlast a few attempts.
 const DEFAULT_MAX_ATTEMPTS: u32 = 10;
 
-/// Builds an [`S3Backend`], allowing the per-operation retry strategy to be
-/// tuned independently of how the injected client was configured.
+/// Builds an [`S3Backend`], allowing the idempotent-operation retry strategy to
+/// be tuned independently of how the injected client was configured.
 pub struct Builder {
     client: Client,
     bucket: String,
@@ -63,20 +64,22 @@ impl Builder {
         }
     }
 
-    /// Sets the maximum number of attempts per S3 operation (including the
-    /// first), keeping the adaptive strategy.
+    /// Sets the maximum number of attempts for idempotent S3 operations
+    /// (including the first), keeping the adaptive strategy. Conditional
+    /// mutations own their retry and in-doubt classification.
     pub fn max_retry_attempts(mut self, n: u32) -> Self {
         self.retry = self.retry.with_max_attempts(n);
         self
     }
 
-    /// Overrides the entire retry strategy applied to every S3 operation.
+    /// Overrides the retry strategy applied to idempotent S3 operations.
     pub fn retry_config(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
         self
     }
 
-    /// Disables backend-level retries (the `aws.NopRetryer{}` equivalent).
+    /// Disables retries for idempotent operations (the `aws.NopRetryer{}`
+    /// equivalent). Conditional mutations retain their outcome-aware policy.
     pub fn disable_retries(mut self) -> Self {
         self.retry = RetryConfig::disabled();
         self
@@ -96,7 +99,7 @@ impl Builder {
 pub struct S3Backend {
     client: Client,
     bucket: String,
-    // Shared across all operations via per-call config override, so the
+    // Applied to idempotent operations via per-call config override, so their
     // retryer is independent of how the client was constructed.
     retry: RetryConfig,
 }
@@ -113,16 +116,16 @@ impl S3Backend {
         Builder::new(client, bucket)
     }
 
-    /// A config override carrying this backend's retryer, applied to every
-    /// operation so it is independent of the client's own config.
+    /// A config override carrying this backend's retryer for idempotent
+    /// operations, independent of the client's own config.
     fn overrides(&self) -> aws_sdk_s3::config::Builder {
         aws_sdk_s3::config::Builder::default().retry_config(self.retry.clone())
     }
 
     /// Awaits an idempotent S3 operation and maps SDK errors. Used for reads
-    /// and the conditional GET behind `read_if_modified` — never for the
-    /// conditional-write loop, which classifies its own outcomes (see
-    /// [`S3Backend::put`]). Because the request is idempotent, transient
+    /// and the conditional GET behind `read_if_modified` — never for
+    /// conditional mutations, which classify their own outcomes. Because the
+    /// request is idempotent, transient
     /// failures are surfaced as `Unavailable` (retryable) via [`annotate_read`].
     /// Cancellation is by dropping the surrounding future.
     async fn run<F, T, E>(op: &'static str, path: &str, fut: F) -> Result<T, BackendError>
@@ -156,7 +159,10 @@ impl S3Backend {
         }
         let cfg = aws_sdk_s3::config::Builder::default().retry_config(retry);
         match op.customize().config_override(cfg).send().await {
-            Ok(out) => PutAttempt::Ok(version_from_etag(out.e_tag())),
+            Ok(out) => match out.e_tag().filter(|etag| !etag.is_empty()) {
+                Some(etag) => PutAttempt::Ok(Version::new(etag)),
+                None => PutAttempt::AppliedWithoutVersion,
+            },
             Err(e) => PutAttempt::Err(Box::new(e)),
         }
     }
@@ -175,20 +181,7 @@ impl S3Backend {
             // than risk an unconditional overwrite.
             return Err(BackendError::Precondition);
         }
-        let conditional = conds.if_match.is_some() || conds.if_none_match;
-
-        if !conditional {
-            // An unconditional overwrite is idempotent (re-applying the same
-            // body is harmless), so the SDK's adaptive retryer may ride out
-            // throttling/transient failures transparently.
-            return match self
-                .send_put(path, &value, &conds, self.retry.clone())
-                .await
-            {
-                PutAttempt::Ok(version) => Ok(version),
-                PutAttempt::Err(e) => Err(annotate("Write", path, *e)),
-            };
-        }
+        debug_assert!(conds.if_match.is_some() || conds.if_none_match);
 
         // A conditional write is NOT idempotent under retry: if an attempt lands
         // but its acknowledgement is lost, a re-send sees its own write and
@@ -207,6 +200,7 @@ impl S3Backend {
                 PutAttempt::Ok(version) => {
                     return Ok(version);
                 }
+                PutAttempt::AppliedWithoutVersion => return Err(in_doubt("Write", path)),
                 PutAttempt::Err(e) => *e,
             };
 
@@ -250,11 +244,11 @@ impl S3Backend {
 /// The outcome of a single PutObject attempt.
 enum PutAttempt {
     Ok(Version),
+    AppliedWithoutVersion,
     Err(Box<SdkError<PutObjectError>>),
 }
 
 /// The optional conditional headers for a PutObject.
-#[derive(Default)]
 struct PutConds {
     if_match: Option<String>,
     if_none_match: bool,
@@ -298,7 +292,7 @@ impl Backend for S3Backend {
         if expected.is_unset() {
             return self.read(path).await;
         }
-        // The ETag changes on every content write, so a conditional GET with
+        // The ETag identifies the content state, so a conditional GET with
         // `If-None-Match` revalidates without transferring the body: an
         // unchanged object answers `304 Not Modified`, mapped to `Precondition`
         // by `annotate` (see the 304 arm).
@@ -328,10 +322,6 @@ impl Backend for S3Backend {
             contents: stored,
             version,
         })
-    }
-
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.put(path, value, PutConds::default()).await
     }
 
     async fn write_if(
@@ -367,20 +357,28 @@ impl Backend for S3Backend {
         .await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        Self::run(
-            "Delete",
-            path,
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(path)
-                .customize()
-                .config_override(self.overrides())
-                .send(),
-        )
-        .await
-        .map(|_| ())
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        if expected.is_unset() {
+            return Err(BackendError::Precondition);
+        }
+        let retry = aws_sdk_s3::config::Builder::default().retry_config(RetryConfig::disabled());
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(path)
+            .if_match(expected.token.to_string())
+            .customize()
+            .config_override(retry)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_ambiguous(&error) || is_throttle(&error) => {
+                Err(in_doubt("DeleteIf", path))
+            }
+            Err(error) => Err(annotate("DeleteIf", path, error)),
+        }
     }
 
     async fn list(
@@ -584,23 +582,25 @@ where
 
 /// Reports whether `e`'s outcome is ambiguous: the request may have reached S3
 /// and been applied before the failure. Covers transport timeouts, dispatch
-/// failures, and server errors that are not a throttle (`500`/`502`/`504`).
+/// failures, undecodable responses, and server errors that are not a throttle.
 fn is_ambiguous<E>(e: &SdkError<E>) -> bool {
-    if matches!(e, SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)) {
+    if matches!(
+        e,
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
+    ) {
         return true;
     }
-    matches!(
-        e.raw_response().map(|r| r.status().as_u16()),
-        Some(500) | Some(502) | Some(504)
-    )
+    e.raw_response()
+        .map(|response| response.status().as_u16())
+        .is_some_and(|status| (500..=599).contains(&status) && status != 503)
 }
 
-/// Builds the in-doubt error returned when a conditional write's outcome cannot
-/// be confirmed (a possibly-applied attempt followed by a precondition, or an
-/// exhausted retry budget).
+/// Builds the in-doubt error returned when a conditional mutation's outcome
+/// cannot be confirmed (a possibly-applied attempt followed by a precondition,
+/// or an exhausted retry budget).
 fn in_doubt(op: &str, path: &str) -> BackendError {
     BackendError::Unavailable(format!(
-        "{op}({path}): conditional write outcome unknown after a lost or ambiguous attempt"
+        "{op}({path}): conditional mutation outcome unknown after a lost or ambiguous attempt"
     ))
 }
 

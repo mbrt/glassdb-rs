@@ -43,7 +43,7 @@ async fn read_returns_value_and_version() {
         ("empty", Vec::new()),
         ("binary", vec![0x00, 0x01, 0x02, 0xff]),
     ] {
-        let version = b.write(name, value.clone()).await.unwrap();
+        let version = b.write_if_not_exists(name, value.clone()).await.unwrap();
         assert!(!version.is_unset());
 
         let r = b.read(name).await.unwrap();
@@ -58,12 +58,12 @@ async fn identical_content_keeps_version() {
     let b = backend(&fake);
     // With ADR-023 the body itself drives the ETag (no nonce), so re-uploading
     // identical bytes yields the same version, exactly as real S3 behaves.
-    let v1 = b.write("k", b"same".to_vec()).await.unwrap();
-    let v2 = b.write("k", b"same".to_vec()).await.unwrap();
+    let v1 = b.write_if_not_exists("k", b"same".to_vec()).await.unwrap();
+    let v2 = b.write_if("k", b"same".to_vec(), &v1).await.unwrap();
     assert_eq!(v1, v2);
 
     // Distinct content yields a distinct version.
-    let v3 = b.write("k", b"other".to_vec()).await.unwrap();
+    let v3 = b.write_if("k", b"other".to_vec(), &v2).await.unwrap();
     assert_ne!(v1, v3);
 }
 
@@ -82,7 +82,7 @@ async fn write_if_not_exists() {
 async fn write_if_cas() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
 
     let err = b
         .write_if("k", b"b".to_vec(), &Version::new("\"stale\""))
@@ -100,7 +100,7 @@ async fn write_if_cas() {
 async fn write_if_null_version_fails_precondition() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
 
     // A null expected version has an empty token; it must fail rather than
     // overwrite unconditionally.
@@ -119,7 +119,7 @@ async fn write_if_null_version_fails_precondition() {
 async fn read_if_modified() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"x".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
 
     // The cached version still matches: revalidation reports Precondition (the
     // 304 Not Modified path) instead of transferring the body.
@@ -136,7 +136,7 @@ async fn read_if_modified() {
 
     // After a content change the cached version no longer matches, so the new
     // value is returned.
-    let v1 = b.write("k", b"y".to_vec()).await.unwrap();
+    let v1 = b.write_if("k", b"y".to_vec(), &v0).await.unwrap();
     let r = b.read_if_modified("k", &v0).await.unwrap();
     assert_eq!(r.contents, b"y");
     assert_eq!(r.version, v1);
@@ -146,7 +146,7 @@ async fn read_if_modified() {
 async fn read_if_modified_unset_version_reads() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"x".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
 
     // An unset expected version has nothing to revalidate against, so it behaves
     // like a plain read.
@@ -156,13 +156,40 @@ async fn read_if_modified_unset_version_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_removes_object() {
+async fn delete_if_matching_etag() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    b.write("k", b"x".to_vec()).await.unwrap();
-    b.delete("k").await.unwrap();
+    let version = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
+    b.delete_if("k", &version).await.unwrap();
     let err = b.read("k").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_if_missing_is_not_found() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+
+    let error = b
+        .delete_if("missing", &Version::new("\"old\""))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, BackendError::NotFound));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_delete_if_preserves_current_object() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+    let old = b.write_if_not_exists("k", b"old".to_vec()).await.unwrap();
+    let current = b.write_if("k", b"current".to_vec(), &old).await.unwrap();
+
+    let err = b.delete_if("k", &old).await.unwrap_err();
+    assert!(matches!(err, BackendError::Precondition));
+    let read = b.read("k").await.unwrap();
+    assert_eq!(read.contents, b"current");
+    assert_eq!(read.version, current);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -178,7 +205,9 @@ async fn list_is_recursive_and_paginated() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write(name, name.as_bytes().to_vec()).await.unwrap();
+        b.write_if_not_exists(name, name.as_bytes().to_vec())
+            .await
+            .unwrap();
     }
     let limit = ListLimit::new(2).unwrap();
     let first = b.list("d/", None, limit).await.unwrap();
@@ -197,12 +226,12 @@ async fn list_is_recursive_and_paginated() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_retries_through_slow_down() {
+async fn conditional_write_retries_through_slow_down() {
     let fake = FakeS3::start().await;
     let b = builder(&fake).retry_config(fast_retry()).build();
     fake.set_slowdown(2, Some(Method::PUT));
 
-    b.write("k", b"v".to_vec()).await.unwrap();
+    b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
     assert_eq!(fake.slowdown_remaining(), 0);
 
     let r = b.read("k").await.unwrap();
@@ -215,34 +244,12 @@ async fn read_retries_through_slow_down() {
     let b = builder(&fake).retry_config(fast_retry()).build();
 
     // The write is a PUT, so it is not throttled here.
-    b.write("k", b"v".to_vec()).await.unwrap();
+    b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
 
     fake.set_slowdown(2, Some(Method::GET));
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"v");
     assert_eq!(fake.slowdown_remaining(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nop_retryer_surfaces_slow_down() {
-    let fake = FakeS3::start().await;
-    let b = builder(&fake).disable_retries().build();
-    fake.set_slowdown(1, Some(Method::PUT));
-
-    let err = b.write("k", b"v".to_vec()).await.unwrap_err();
-    // An unclassified S3 failure is rendered through the structured request
-    // error, so the request coordinates surface as typed fields under `{:?}`
-    // (op/path/code/status), and the SDK error is kept as the underlying cause.
-    let dbg = format!("{err:?}");
-    assert!(dbg.contains(r#"op: "Write""#), "got: {dbg}");
-    assert!(dbg.contains(r#"code: Some("SlowDown")"#), "got: {dbg}");
-    assert!(dbg.contains("status: Some(503)"), "got: {dbg}");
-
-    use std::error::Error as _;
-    assert!(
-        err.source().is_some(),
-        "SDK error should be kept as the cause"
-    );
 }
 
 // Transient read unavailability (ADR-009): a read is idempotent, so a transient
@@ -256,7 +263,7 @@ async fn read_transient_failure_surfaces_unavailable() {
     let b = builder(&fake).disable_retries().build();
 
     // Seed via PUT (not throttled), then throttle the next GET.
-    b.write("k", b"v".to_vec()).await.unwrap();
+    b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
     fake.set_slowdown(1, Some(Method::GET));
 
     let err = b.read("k").await.unwrap_err();
@@ -303,7 +310,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
 async fn write_if_lost_ack_is_in_doubt() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
 
     // The CAS write lands (changing the ETag), but its ack is lost; the re-send's
     // If-Match no longer matches and gets 412.
@@ -316,6 +323,18 @@ async fn write_if_lost_ack_is_in_doubt() {
 
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_if_lost_ack_is_in_doubt() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+    let version = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
+
+    fake.set_lost_ack(1);
+    let err = b.delete_if("k", &version).await.unwrap_err();
+    assert!(matches!(err, BackendError::Unavailable(_)));
+    assert!(matches!(b.read("k").await, Err(BackendError::NotFound)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

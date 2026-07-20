@@ -84,9 +84,9 @@ struct SlowDown {
     method: Option<Method>,
 }
 
-/// Models a lost acknowledgement: the next `remaining` PUTs are *applied*
+/// Models a lost acknowledgement: the next `remaining` mutations are *applied*
 /// normally but then answered with a `500 InternalError` instead of success, so
-/// the client cannot tell whether the write landed.
+/// the client cannot tell whether the mutation landed.
 #[derive(Default)]
 struct LostAck {
     remaining: i64,
@@ -172,7 +172,7 @@ impl FakeS3 {
         self.state.slow.lock().unwrap().remaining
     }
 
-    /// Apply the next `n` PUTs but answer them with `500` (a lost ack).
+    /// Apply the next `n` mutations but answer them with `500` (a lost ack).
     pub fn set_lost_ack(&self, n: i64) {
         self.state.lost_ack.lock().unwrap().remaining = n;
     }
@@ -297,7 +297,7 @@ async fn handle(
             Method::GET => get_object(&state, &key, &parts.headers),
             Method::HEAD => head_object(&state, &key),
             Method::PUT => put_object(&state, &key, &parts.headers, body.to_vec()),
-            Method::DELETE => delete_object(&state, &key),
+            Method::DELETE => delete_object(&state, &key, &parts.headers),
             _ => xml_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "nope"),
         }
     };
@@ -416,8 +416,41 @@ fn put_object(
         .unwrap()
 }
 
-fn delete_object(state: &FakeState, key: &str) -> Response<Full<Bytes>> {
-    state.objects.lock().unwrap().remove(key);
+fn delete_object(
+    state: &FakeState,
+    key: &str,
+    headers: &hyper::HeaderMap,
+) -> Response<Full<Bytes>> {
+    let if_match = header_str(headers, "if-match");
+    let mut objects = state.objects.lock().unwrap();
+    if let Some(expected) = &if_match {
+        let Some(object) = objects.get(key) else {
+            return xml_error(StatusCode::NOT_FOUND, "NoSuchKey", "object not found");
+        };
+        if &object.etag != expected {
+            return xml_error(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                "etag mismatch",
+            );
+        }
+    }
+    objects.remove(key);
+    drop(objects);
+
+    {
+        let mut lost_ack = state.lost_ack.lock().unwrap();
+        if lost_ack.remaining > 0 {
+            lost_ack.remaining -= 1;
+            drop(lost_ack);
+            return xml_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "we encountered an internal error",
+            );
+        }
+    }
+
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Full::new(Bytes::new()))

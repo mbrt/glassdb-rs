@@ -270,11 +270,9 @@ impl TLogger {
         })
     }
 
-    /// Removes the log for `id`, ignoring not-found errors.
-    pub async fn delete(&self, id: &TxId) -> Result<(), StorageError> {
-        self.logs
-            .delete(&paths::from_transaction(&self.prefix, id))
-            .await?;
+    /// Removes the exact observed transaction log, converging if it is missing.
+    pub async fn delete(&self, expected: &Observation<TxLog>) -> Result<(), StorageError> {
+        self.logs.delete(expected).await?;
         Ok(())
     }
 

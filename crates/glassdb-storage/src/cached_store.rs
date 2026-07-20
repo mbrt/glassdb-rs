@@ -521,27 +521,6 @@ impl CachedStore {
         }
     }
 
-    /// Unconditionally writes `value` and publishes it in the cache after the
-    /// backend confirms. An in-doubt outcome invalidates the starting knowledge
-    /// (it may or may not have landed) and surfaces `Unavailable`.
-    async fn write<C: Codec>(
-        &self,
-        path: &str,
-        value: Arc<C::Value>,
-    ) -> Result<Observation<C::Value>, StorageError> {
-        let bytes = C::encode(&value)?;
-        let size = C::size(&value);
-        let started = self.next_tick();
-        match self.backend.write(path, bytes).await {
-            Ok(v) => Ok(self.commit_write::<C>(path, value, size, Revision(v), started)),
-            Err(BackendError::Unavailable(msg)) => {
-                self.invalidate_stale(path, started);
-                Err(StorageError::Unavailable(msg))
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Creates the object only if absent. On success publishes the value; on a
     /// conflict (it already exists) invalidates the cached absence and reports
     /// [`CasResult::Conflict`]; an in-doubt outcome invalidates the absence and
@@ -616,18 +595,54 @@ impl CachedStore {
         }
     }
 
-    /// Deletes the object and installs freshly confirmed absence. A missing
-    /// object is treated as a successful delete; an in-doubt outcome invalidates
-    /// the starting knowledge and surfaces `Unavailable`.
-    pub async fn delete(&self, path: &str) -> Result<(), StorageError> {
+    /// Deletes the exact present observation and returns the installed absence.
+    /// A missing object is successful convergence; a conflict or in-doubt
+    /// outcome invalidates only the expected revision.
+    async fn delete<C: Codec>(
+        &self,
+        expected: &Observation<C::Value>,
+    ) -> Result<Observation<C::Value>, StorageError> {
+        let revision = expected
+            .revision
+            .as_ref()
+            .ok_or_else(|| StorageError::other("delete requires a present observation"))?;
+        let path = expected.path.as_ref();
         let started = self.next_tick();
-        match self.backend.delete(path).await {
-            Ok(()) | Err(BackendError::NotFound) => {
-                self.install_absent(path, started);
-                Ok(())
+        match self.backend.delete_if(path, revision.version()).await {
+            Ok(()) => {
+                let evidence = self.install_absent(path, started);
+                // Publish absence before advancing the old state's evidence so
+                // the non-regression rule cannot retain that old state at the
+                // same watermark.
+                expected.evidence.advance(started);
+                Ok(Observation {
+                    path: expected.path.clone(),
+                    value: None,
+                    revision: None,
+                    evidence,
+                    cache_hit: false,
+                })
+            }
+            Err(BackendError::NotFound) => {
+                // Let the non-regression rule retain knowledge from an
+                // operation started later. This matters when a path is
+                // concurrently recreated with equivalent contents and hence
+                // the same content-derived revision.
+                let evidence = self.install_absent(path, started);
+                Ok(Observation {
+                    path: expected.path.clone(),
+                    value: None,
+                    revision: None,
+                    evidence,
+                    cache_hit: false,
+                })
+            }
+            Err(BackendError::Precondition) => {
+                self.invalidate_present(path, revision);
+                Err(StorageError::Precondition)
             }
             Err(BackendError::Unavailable(msg)) => {
-                self.invalidate_stale(path, started);
+                self.invalidate_present(path, revision);
                 Err(StorageError::Unavailable(msg))
             }
             Err(e) => Err(e.into()),
@@ -1004,16 +1019,6 @@ impl CachedStore {
         });
     }
 
-    /// Invalidates the current entry (to `Missing`) unless a newer operation has
-    /// already advanced it past `started`; used for in-doubt unconditional
-    /// writes and deletes, which have no exact starting revision.
-    fn invalidate_stale(&self, path: &str, started: LogicalTime) {
-        self.cache.update(path, |old| match &old {
-            Some(entry) if entry.evidence_time() < started => None,
-            _ => old,
-        });
-    }
-
     /// Converts a type-erased fetch result into a typed observation.
     fn to_observation<C: Codec>(
         &self,
@@ -1103,17 +1108,6 @@ impl<C: Codec> TypedCachedStore<C> {
             .await
     }
 
-    /// Unconditionally writes a decoded object.
-    #[allow(dead_code)]
-    pub(crate) async fn write(
-        &self,
-        path: &str,
-        value: Arc<C::Value>,
-    ) -> Result<Observation<C::Value>, StorageError> {
-        Self::check_path(path)?;
-        self.store.write::<C>(path, value).await
-    }
-
     /// Creates a decoded object if it is absent.
     pub(crate) async fn create(
         &self,
@@ -1156,10 +1150,16 @@ impl<C: Codec> TypedCachedStore<C> {
         Ok(result)
     }
 
-    /// Deletes an object and caches the resulting absence.
-    pub(crate) async fn delete(&self, path: &str) -> Result<(), StorageError> {
-        Self::check_path(path)?;
-        self.store.delete(path).await
+    /// Deletes an exact present observation and caches the resulting absence.
+    pub(crate) async fn delete(
+        &self,
+        expected: &Observation<C::Value>,
+    ) -> Result<Observation<C::Value>, StorageError> {
+        Self::check_path(expected.path())?;
+        if expected.is_absent() {
+            return Err(StorageError::other("delete requires a present observation"));
+        }
+        self.store.delete::<C>(expected).await
     }
 }
 
@@ -1222,6 +1222,97 @@ mod tests {
         }
     }
 
+    // Models a provider such as S3 whose revision identifies contents rather
+    // than a unique mutation. Recreating equivalent bytes deliberately reuses
+    // the same token.
+    #[derive(Default)]
+    struct ContentVersionBackend {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl ContentVersionBackend {
+        fn version(value: &[u8]) -> backend::Version {
+            backend::Version::new(format!("{value:?}"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for ContentVersionBackend {
+        async fn read(&self, path: &str) -> Result<backend::ReadReply, BackendError> {
+            let objects = self.objects.lock().unwrap();
+            let contents = objects.get(path).cloned().ok_or(BackendError::NotFound)?;
+            Ok(backend::ReadReply {
+                version: Self::version(&contents),
+                contents,
+            })
+        }
+
+        async fn read_if_modified(
+            &self,
+            path: &str,
+            expected: &backend::Version,
+        ) -> Result<backend::ReadReply, BackendError> {
+            let reply = self.read(path).await?;
+            if &reply.version == expected {
+                Err(BackendError::Precondition)
+            } else {
+                Ok(reply)
+            }
+        }
+
+        async fn write_if(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+            expected: &backend::Version,
+        ) -> Result<backend::Version, BackendError> {
+            let mut objects = self.objects.lock().unwrap();
+            let current = objects.get_mut(path).ok_or(BackendError::NotFound)?;
+            if &Self::version(current) != expected {
+                return Err(BackendError::Precondition);
+            }
+            *current = value;
+            Ok(Self::version(current))
+        }
+
+        async fn write_if_not_exists(
+            &self,
+            path: &str,
+            value: Vec<u8>,
+        ) -> Result<backend::Version, BackendError> {
+            let mut objects = self.objects.lock().unwrap();
+            if objects.contains_key(path) {
+                return Err(BackendError::Precondition);
+            }
+            let version = Self::version(&value);
+            objects.insert(path.to_string(), value);
+            Ok(version)
+        }
+
+        async fn delete_if(
+            &self,
+            path: &str,
+            expected: &backend::Version,
+        ) -> Result<(), BackendError> {
+            let mut objects = self.objects.lock().unwrap();
+            let current = objects.get(path).ok_or(BackendError::NotFound)?;
+            if &Self::version(current) != expected {
+                return Err(BackendError::Precondition);
+            }
+            objects.remove(path);
+            Ok(())
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&backend::ListCursor>,
+            _limit: backend::ListLimit,
+        ) -> Result<backend::ListPage, BackendError> {
+            Ok(backend::ListPage::default())
+        }
+    }
+
     // A second codec over a different decoded type, to prove a path used through
     // the wrong typed store is an internal error.
     struct Ints;
@@ -1277,13 +1368,39 @@ mod tests {
         log.lock().unwrap().clear();
     }
 
+    async fn create_value(
+        store: &TypedCachedStore<Bytes>,
+        path: &str,
+        value: Arc<Vec<u8>>,
+    ) -> Observation<Vec<u8>> {
+        store
+            .create(path, None, value)
+            .await
+            .unwrap()
+            .into_observation()
+            .unwrap()
+    }
+
+    async fn replace_value(
+        store: &TypedCachedStore<Bytes>,
+        expected: &Observation<Vec<u8>>,
+        value: Arc<Vec<u8>>,
+    ) -> Observation<Vec<u8>> {
+        store
+            .compare_and_swap(expected, value)
+            .await
+            .unwrap()
+            .into_observation()
+            .unwrap()
+    }
+
     // Model invariant: an `Any` hit is served from cache with no backend op,
     // while `AtLeast(now())` on an older entry checks and advances (never
     // regresses) its watermark.
     #[tokio::test]
     async fn any_hit_is_local_and_at_least_checks_current_and_advances() {
         let (s, log) = store_rec();
-        s.write("p", v(b"a")).await.unwrap();
+        create_value(&s, "p", v(b"a")).await;
 
         let o1 = s.read("p", Requirement::Any).await.unwrap();
         assert_eq!(o1.value().unwrap().as_slice(), b"a");
@@ -1302,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn at_least_served_locally_when_watermark_sufficient() {
         let (s, log) = store_rec();
-        s.write("p", v(b"a")).await.unwrap();
+        create_value(&s, "p", v(b"a")).await;
         let o = s
             .read("p", Requirement::AtLeast(s.store.timeline.now()))
             .await
@@ -1335,7 +1452,7 @@ mod tests {
             .into_observation()
             .unwrap();
         // A peer overwrites the object; s1's cache is unaware.
-        s2.write("p", v(b"b")).await.unwrap();
+        replace_value(&s2, &obs, v(b"b")).await;
 
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
         assert!(!r.committed(), "the stale CAS conflicts");
@@ -1365,7 +1482,7 @@ mod tests {
         let a = bytes_store(backend.clone());
         let b = bytes_store(backend);
 
-        a.write("p", v(b"x")).await.unwrap();
+        create_value(&a, "p", v(b"x")).await;
         let obs_a = a.read("p", Requirement::Any).await.unwrap();
         let obs_b = b.read("p", Requirement::Any).await.unwrap();
 
@@ -1401,7 +1518,7 @@ mod tests {
             .unwrap();
         let w = obs.current_after();
 
-        s2.write("p", v(b"b")).await.unwrap();
+        replace_value(&s2, &obs, v(b"b")).await;
         s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> Missing
 
         assert_eq!(obs.value().unwrap().as_slice(), b"a", "still inspectable");
@@ -1435,8 +1552,8 @@ mod tests {
         let local = bytes_store(backend.clone());
         let peer = bytes_store(backend);
 
-        let observed = local.write("p", v(b"a")).await.unwrap();
-        peer.write("p", v(b"b")).await.unwrap();
+        let observed = create_value(&local, "p", v(b"a")).await;
+        replace_value(&peer, &observed, v(b"b")).await;
         let bound = local.store.timeline.now();
         let current = local.read("p", Requirement::AtLeast(bound)).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
@@ -1496,7 +1613,7 @@ mod tests {
             .unwrap()
             .into_observation()
             .unwrap();
-        s2.write("p", v(b"b")).await.unwrap();
+        replace_value(&s2, &obs, v(b"b")).await;
 
         let before = s1.store.timeline.now();
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
@@ -1586,7 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn unchanged_conditional_reads_only_advance() {
         let (s, log) = store_rec();
-        s.write("p", v(b"a")).await.unwrap();
+        create_value(&s, "p", v(b"a")).await;
 
         let t1 = s.store.timeline.now();
         let w1 = s
@@ -1617,14 +1734,228 @@ mod tests {
         assert!(!s.read("m", Requirement::Any).await.unwrap().exists());
         assert_eq!(count(&log, "read"), 0, "absence is cached");
 
-        assert!(s.create("m", None, v(b"x")).await.unwrap().committed());
+        let present = create_value(&s, "m", v(b"x")).await;
         let got = s.read("m", Requirement::Any).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"x");
 
-        s.delete("m").await.unwrap();
+        let deleted = s.delete(&present).await.unwrap();
+        assert!(deleted.is_absent());
         clear(&log);
         assert!(!s.read("m", Requirement::Any).await.unwrap().exists());
         assert_eq!(count(&log, "read"), 0, "delete leaves cached absence");
+    }
+
+    // Model invariant: a successful conditional delete advances the exact
+    // expected state's evidence and publishes absence from the operation's
+    // invocation.
+    #[tokio::test]
+    async fn successful_delete_advances_expected_and_installs_absence() {
+        let (s, log) = store_rec();
+        let expected = create_value(&s, "p", v(b"a")).await;
+        let before = s.store.timeline.now();
+
+        let absent = s.delete(&expected).await.unwrap();
+
+        assert!(absent.is_absent());
+        assert!(absent.current_after() >= before);
+        assert!(expected.current_after() >= before);
+        assert_eq!(count(&log, "delete_if"), 1);
+        clear(&log);
+        assert!(s.read("p", Requirement::Any).await.unwrap().is_absent());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    // Model invariant: NotFound is successful convergence on absence, but it
+    // does not claim the retained present observation survived until this
+    // delete's invocation.
+    #[tokio::test]
+    async fn delete_not_found_converges_without_advancing_expected() {
+        let memory = Arc::new(MemoryBackend::new());
+        let recording = Arc::new(RecordingBackend::new(memory));
+        let log = recording.log();
+        let backend: Arc<dyn Backend> = recording;
+        let local = bytes_store(backend.clone());
+        let peer = bytes_store(backend);
+
+        let expected = create_value(&local, "p", v(b"a")).await;
+        let peer_observation = peer.read("p", Requirement::Any).await.unwrap();
+        peer.delete(&peer_observation).await.unwrap();
+        let before = local.store.timeline.now();
+        clear(&log);
+
+        let absent = local.delete(&expected).await.unwrap();
+
+        assert!(absent.is_absent());
+        assert!(absent.current_after() >= before);
+        assert!(expected.current_after() < before);
+        assert_eq!(count(&log, "delete_if"), 1);
+        clear(&log);
+        assert!(local.read("p", Requirement::Any).await.unwrap().is_absent());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    // Regression: a NotFound delete that finishes after an equivalent state is
+    // recreated must not overwrite that later present evidence with absence.
+    #[tokio::test]
+    async fn delete_not_found_preserves_later_equivalent_recreation() {
+        let content = Arc::new(ContentVersionBackend::default());
+        let inner: Arc<dyn Backend> = content.clone();
+        let hook = HookBackend::new(inner);
+        let backend: Arc<dyn Backend> = hook.clone();
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+        content
+            .delete_if("p", expected.revision().unwrap().version())
+            .await
+            .unwrap();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        hook.set_after({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |operation, outcome| {
+                let gate = matches!(operation, BackendOp::DeleteIf { path, .. } if *path == "p")
+                    && !outcome.is_success();
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if gate {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+
+        let deleting = tokio::spawn({
+            let store = store.clone();
+            async move { store.delete(&expected).await }
+        });
+        entered.notified().await;
+        let recreated = create_value(&store, "p", v(b"a")).await;
+        release.notify_one();
+
+        assert!(deleting.await.unwrap().unwrap().is_absent());
+        let current = store.read("p", Requirement::Any).await.unwrap();
+        assert!(current.exists());
+        assert!(current.same_state(&recreated));
+        assert!(current.cache_hit());
+    }
+
+    // Model invariant: a stale conditional delete invalidates only its exact
+    // cached starting revision, forcing the next unbounded read to discover the
+    // winner without deleting it.
+    #[tokio::test]
+    async fn delete_conflict_invalidates_expected_and_preserves_winner() {
+        let memory = Arc::new(MemoryBackend::new());
+        let recording = Arc::new(RecordingBackend::new(memory));
+        let log = recording.log();
+        let backend: Arc<dyn Backend> = recording;
+        let local = bytes_store(backend.clone());
+        let peer = bytes_store(backend);
+
+        let expected = create_value(&local, "p", v(b"a")).await;
+        let peer_observation = peer.read("p", Requirement::Any).await.unwrap();
+        replace_value(&peer, &peer_observation, v(b"b")).await;
+        let before = local.store.timeline.now();
+
+        assert!(matches!(
+            local.delete(&expected).await,
+            Err(StorageError::Precondition)
+        ));
+        assert!(expected.current_after() < before);
+        clear(&log);
+
+        let current = local.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(current.value().unwrap().as_slice(), b"b");
+        assert_eq!(count(&log, "read"), 1);
+    }
+
+    // Model invariant: a lost delete acknowledgement makes the path uncertain.
+    // The expected cache entry is invalidated and its evidence is not advanced,
+    // even when the underlying deletion actually landed.
+    #[tokio::test]
+    async fn delete_in_doubt_invalidates_expected_without_advancing_it() {
+        let memory = Arc::new(MemoryBackend::new());
+        let recording = Arc::new(RecordingBackend::new(memory));
+        let log = recording.log();
+        let inner: Arc<dyn Backend> = recording;
+        let hook = HookBackend::new(inner);
+        let backend: Arc<dyn Backend> = hook.clone();
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+        let before = store.store.timeline.now();
+
+        hook.set_after(|operation, outcome| {
+            ready(
+                if matches!(operation, BackendOp::DeleteIf { .. }) && outcome.is_success() {
+                    Err(BackendError::Unavailable("lost ack".into()))
+                } else {
+                    Ok(())
+                },
+            )
+        });
+        assert!(matches!(
+            store.delete(&expected).await,
+            Err(StorageError::Unavailable(_))
+        ));
+        hook.clear_after();
+
+        assert!(expected.current_after() < before);
+        clear(&log);
+        assert!(store.read("p", Requirement::Any).await.unwrap().is_absent());
+        assert_eq!(count(&log, "read"), 1);
+    }
+
+    // Model invariant: a definitive error raised before dispatch leaves the
+    // retained present entry usable because the backend knows deletion did not
+    // apply.
+    #[tokio::test]
+    async fn definitive_delete_error_keeps_expected_cached() {
+        let memory = Arc::new(MemoryBackend::new());
+        let recording = Arc::new(RecordingBackend::new(memory));
+        let log = recording.log();
+        let inner: Arc<dyn Backend> = recording;
+        let hook = HookBackend::new(inner);
+        let backend: Arc<dyn Backend> = hook.clone();
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+        let before = store.store.timeline.now();
+
+        hook.set_before(|operation| {
+            ready(if matches!(operation, BackendOp::DeleteIf { .. }) {
+                Err(BackendError::other("rejected before dispatch"))
+            } else {
+                Ok(())
+            })
+        });
+        assert!(matches!(
+            store.delete(&expected).await,
+            Err(StorageError::Other { .. })
+        ));
+        hook.clear_before();
+
+        assert!(expected.current_after() < before);
+        clear(&log);
+        let current = store.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(current.value().unwrap().as_slice(), b"a");
+        assert!(current.cache_hit());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_an_absence_observation_without_backend_io() {
+        let (store, log) = store_rec();
+        let absent = store.read("p", Requirement::Any).await.unwrap();
+        clear(&log);
+
+        assert!(matches!(
+            store.delete(&absent).await,
+            Err(StorageError::Other { .. })
+        ));
+        assert!(log.lock().unwrap().is_empty());
     }
 
     // A path used through a mismatched typed store is an internal error.
@@ -1633,7 +1964,7 @@ mod tests {
         let store = CachedStore::new(Arc::new(MemoryBackend::new()), 1 << 20, Timeline::new());
         let bytes = store.typed::<Bytes>();
         let ints = store.typed::<Ints>();
-        bytes.write("p", v(b"abcd")).await.unwrap();
+        create_value(&bytes, "p", v(b"abcd")).await;
         assert!(matches!(
             ints.read("p", Requirement::Any).await,
             Err(StorageError::Other { .. })
@@ -1649,7 +1980,7 @@ mod tests {
         // Seed the backend through a separate store so the store under test
         // starts with a cold cache and must read the backend.
         let seeder = bytes_store(backend.clone());
-        seeder.write("p", v(b"a")).await.unwrap();
+        let seeded = create_value(&seeder, "p", v(b"a")).await;
         let s = bytes_store(backend);
 
         let entered = Arc::new(AtomicBool::new(false));
@@ -1682,7 +2013,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // A newer write lands while the read is parked before publishing.
-        let wb = s.write("p", v(b"b")).await.unwrap();
+        let wb = replace_value(&s, &seeded, v(b"b")).await;
         released.store(true, Ordering::SeqCst);
 
         let o = read.await.unwrap().unwrap();
@@ -1714,7 +2045,7 @@ mod tests {
         let hook = HookBackend::new(inner);
         let backend: Arc<dyn Backend> = hook.clone();
         let seeder = bytes_store(backend.clone());
-        seeder.write("p", v(b"a")).await.unwrap();
+        create_value(&seeder, "p", v(b"a")).await;
         let s = bytes_store(backend);
         clear(&log);
 
@@ -1771,7 +2102,7 @@ mod tests {
         let backend: Arc<dyn Backend> = hook.clone();
         let s = bytes_store(backend);
         // Seed a present-but-stale entry.
-        s.write("p", v(b"a")).await.unwrap();
+        create_value(&s, "p", v(b"a")).await;
         clear(&log);
 
         let entered = Arc::new(AtomicUsize::new(0));
@@ -1860,7 +2191,10 @@ mod tests {
     #[tokio::test]
     async fn response_time_does_not_overstate_freshness() {
         let inner = Arc::new(MemoryBackend::new());
-        inner.write("p", b"one".to_vec()).await.unwrap();
+        inner
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
         let hooked = HookBackend::new(inner);
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -1901,7 +2235,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_read_leader_releases_its_waiters() {
         let inner = Arc::new(MemoryBackend::new());
-        inner.write("p", b"one".to_vec()).await.unwrap();
+        inner
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
         let hooked = HookBackend::new(inner);
         let entered = Arc::new(Notify::new());
         let first = Arc::new(AtomicBool::new(true));

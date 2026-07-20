@@ -10,8 +10,9 @@ use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, V
 
 /// Snapshot of backend operation counters.
 ///
-/// The content-CAS-only trait (ADR-023) has no metadata-only operations, so the
-/// counters track object reads, writes, and lists only.
+/// The conditional-only trait (ADR-042) has no metadata-only operations, so the
+/// counters track object reads, mutations, and lists only. Deletes remain part
+/// of `obj_writes` for metric compatibility.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackendStats {
     pub obj_reads: u64,
@@ -64,11 +65,6 @@ impl Backend for StatsBackend {
         self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.obj_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.write(path, value).await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -88,9 +84,9 @@ impl Backend for StatsBackend {
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
-        self.inner.delete(path).await
+        self.inner.delete_if(path, expected).await
     }
 
     async fn list(

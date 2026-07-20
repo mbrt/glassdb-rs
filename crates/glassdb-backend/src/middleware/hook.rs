@@ -18,8 +18,6 @@ pub enum BackendOp<'a> {
         path: &'a str,
         expected: &'a Version,
     },
-    /// An unconditional object write.
-    Write { path: &'a str, value: &'a [u8] },
     /// A compare-and-swap object write.
     WriteIf {
         path: &'a str,
@@ -28,8 +26,11 @@ pub enum BackendOp<'a> {
     },
     /// A create-if-absent object write.
     WriteIfNotExists { path: &'a str, value: &'a [u8] },
-    /// An unconditional object deletion.
-    Delete { path: &'a str },
+    /// A revision-conditional object deletion.
+    DeleteIf {
+        path: &'a str,
+        expected: &'a Version,
+    },
     /// One page of a prefix listing.
     List {
         path: &'a str,
@@ -44,10 +45,9 @@ impl BackendOp<'_> {
         match self {
             BackendOp::Read { path }
             | BackendOp::ReadIfModified { path, .. }
-            | BackendOp::Write { path, .. }
             | BackendOp::WriteIf { path, .. }
             | BackendOp::WriteIfNotExists { path, .. }
-            | BackendOp::Delete { path }
+            | BackendOp::DeleteIf { path, .. }
             | BackendOp::List { path, .. } => path,
         }
     }
@@ -167,17 +167,6 @@ impl Backend for HookBackend {
         .await
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.hooked(
-            BackendOp::Write {
-                path,
-                value: &value,
-            },
-            || self.inner.write(path, value.clone()),
-        )
-        .await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -210,9 +199,11 @@ impl Backend for HookBackend {
         .await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        self.hooked(BackendOp::Delete { path }, || self.inner.delete(path))
-            .await
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        self.hooked(BackendOp::DeleteIf { path, expected }, || {
+            self.inner.delete_if(path, expected)
+        })
+        .await
     }
 
     async fn list(
@@ -254,18 +245,20 @@ mod tests {
                 let bit = match op {
                     BackendOp::Read { .. } => 1 << 0,
                     BackendOp::ReadIfModified { .. } => 1 << 1,
-                    BackendOp::Write { .. } => 1 << 2,
-                    BackendOp::WriteIf { .. } => 1 << 3,
-                    BackendOp::WriteIfNotExists { .. } => 1 << 4,
-                    BackendOp::Delete { .. } => 1 << 5,
-                    BackendOp::List { .. } => 1 << 6,
+                    BackendOp::WriteIf { .. } => 1 << 2,
+                    BackendOp::WriteIfNotExists { .. } => 1 << 3,
+                    BackendOp::DeleteIf { .. } => 1 << 4,
+                    BackendOp::List { .. } => 1 << 5,
                 };
                 seen.fetch_or(bit, Ordering::SeqCst);
                 ready(Ok(()))
             }
         });
 
-        let version = backend.write("p", b"one".to_vec()).await.unwrap();
+        let version = backend
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
         backend.read("p").await.unwrap();
         assert!(matches!(
             backend.read_if_modified("p", &version).await,
@@ -279,27 +272,27 @@ mod tests {
             .write_if_not_exists("q", b"three".to_vec())
             .await
             .unwrap();
-        backend.delete("p").await.unwrap();
+        backend.delete_if("p", &version).await.unwrap();
         backend
             .list("", None, ListLimit::new(1).unwrap())
             .await
             .unwrap();
         assert!(!version.is_unset());
-        assert_eq!(seen.load(Ordering::SeqCst), (1 << 7) - 1);
+        assert_eq!(seen.load(Ordering::SeqCst), (1 << 6) - 1);
     }
 
     #[tokio::test]
     async fn before_error_prevents_the_operation_from_landing() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         backend.set_before(|op| {
-            ready(if matches!(op, BackendOp::Write { .. }) {
+            ready(if matches!(op, BackendOp::WriteIfNotExists { .. }) {
                 Err(BackendError::Precondition)
             } else {
                 Ok(())
             })
         });
         assert!(matches!(
-            backend.write("p", b"value".to_vec()).await,
+            backend.write_if_not_exists("p", b"value".to_vec()).await,
             Err(BackendError::Precondition)
         ));
         assert!(matches!(
@@ -311,7 +304,10 @@ mod tests {
     #[tokio::test]
     async fn async_before_hook_gates_then_forwards() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
-        backend.write("p", b"value".to_vec()).await.unwrap();
+        backend
+            .write_if_not_exists("p", b"value".to_vec())
+            .await
+            .unwrap();
         let entered = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
         backend.set_before({
@@ -370,10 +366,13 @@ mod tests {
     #[tokio::test]
     async fn hooks_can_reenter_without_holding_configuration_locks() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
-        backend.write("seed", b"value".to_vec()).await.unwrap();
+        backend
+            .write_if_not_exists("seed", b"value".to_vec())
+            .await
+            .unwrap();
         let weak = Arc::downgrade(&backend);
         backend.set_after(move |op, _| {
-            if !matches!(op, BackendOp::Write { path, .. } if *path == "outer") {
+            if !matches!(op, BackendOp::WriteIfNotExists { path, .. } if *path == "outer") {
                 return ready(Ok(()));
             }
             let backend = weak.upgrade().unwrap();
@@ -382,6 +381,9 @@ mod tests {
                 Ok(())
             })
         });
-        backend.write("outer", b"value".to_vec()).await.unwrap();
+        backend
+            .write_if_not_exists("outer", b"value".to_vec())
+            .await
+            .unwrap();
     }
 }

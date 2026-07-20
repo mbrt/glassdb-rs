@@ -62,19 +62,6 @@ impl Backend for BackendLogger {
         r
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        let size = value.len();
-        let r = self.inner.write(path, value).await;
-        tracing::debug!(
-            backend_id = %self.id,
-            path,
-            args = %format!("val[size]:{size}"),
-            res = %version_summary(&r),
-            "Write"
-        );
-        r
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -110,9 +97,15 @@ impl Backend for BackendLogger {
         r
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        let r = self.inner.delete(path).await;
-        tracing::debug!(backend_id = %self.id, path, err = ?r.as_ref().err(), "Delete");
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        let r = self.inner.delete_if(path, expected).await;
+        tracing::debug!(
+            backend_id = %self.id,
+            path,
+            expv = %format!("{expected:?}"),
+            err = ?r.as_ref().err(),
+            "DeleteIf"
+        );
         r
     }
 

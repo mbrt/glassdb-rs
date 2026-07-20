@@ -211,10 +211,6 @@ impl Backend for FaultBackend {
             .await
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.transport(|| self.inner.write(path, value)).await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -234,8 +230,9 @@ impl Backend for FaultBackend {
             .await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        self.transport(|| self.inner.delete(path)).await
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        self.transport(|| self.inner.delete_if(path, expected))
+            .await
     }
 
     async fn list(
@@ -258,8 +255,8 @@ mod tests {
     async fn inactive_passes_through() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let fb = FaultBackend::new(mem, 1, FaultOptions::from_intensity(255));
-        // While inactive, an unconditional write/read round-trips cleanly.
-        fb.write("p", b"v".to_vec()).await.unwrap();
+        // While inactive, a conditional create/read round-trips cleanly.
+        fb.write_if_not_exists("p", b"v".to_vec()).await.unwrap();
         let r = fb.read("p").await.unwrap();
         assert_eq!(r.contents, b"v");
     }
@@ -353,6 +350,28 @@ mod tests {
 
         assert!(matches!(err, BackendError::Unavailable(msg) if msg.contains("lost ack")));
         assert_eq!(landed.contents, b"v");
+    }
+
+    #[tokio::test]
+    async fn delete_lost_ack_reports_unavailable_after_landing() {
+        let mem = Arc::new(MemoryBackend::new());
+        let version = mem.write_if_not_exists("p", b"v".to_vec()).await.unwrap();
+        let backend: Arc<dyn Backend> = mem.clone();
+        let opts = FaultOptions {
+            delay_prob: 0,
+            fault_prob: 255,
+            lost_ack_prob: 255,
+            max_delay: Duration::from_millis(0),
+        };
+        let fault = FaultBackend::with_tape(backend, vec![0, 0], 1, opts);
+        fault.set_active(true);
+
+        let error = fault.delete_if("p", &version).await.unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::Unavailable(message) if message.contains("lost ack"))
+        );
+        assert!(matches!(mem.read("p").await, Err(BackendError::NotFound)));
     }
 
     #[tokio::test]

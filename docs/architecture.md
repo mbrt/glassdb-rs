@@ -24,7 +24,7 @@ GlassDB is designed around a specific set of constraints:
 - **Throughput over latency.** Object storage is slow (50–150 ms per
   operation), but highly scalable. GlassDB leverages that parallelism.
 - **Object storage as the only dependency.** Requires strong consistency and
-  conditional writes (available in GCS and S3).
+  conditional mutations (available in GCS and S3).
 
 The explicit tradeoffs are:
 
@@ -60,7 +60,7 @@ The explicit tradeoffs are:
 Each client embeds GlassDB as a library. Clients are completely independent and
 ephemeral — they can scale to zero and back without any coordination. The only
 shared state is the object storage bucket, which provides strong consistency for
-single-object operations and conditional writes for atomic state transitions.
+single-object operations and conditional mutations for atomic state transitions.
 
 ## Crate Structure
 
@@ -236,14 +236,15 @@ pub trait Backend: Send + Sync {
     async fn read_if_modified(
         &self, path: &str, expected: &Version,
     ) -> Result<ReadReply, BackendError>;
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError>;
     async fn write_if(
         &self, path: &str, value: Vec<u8>, expected: &Version,
     ) -> Result<Version, BackendError>;
     async fn write_if_not_exists(
         &self, path: &str, value: Vec<u8>,
     ) -> Result<Version, BackendError>;
-    async fn delete(&self, path: &str) -> Result<(), BackendError>;
+    async fn delete_if(
+        &self, path: &str, expected: &Version,
+    ) -> Result<(), BackendError>;
     async fn list(
         &self,
         prefix: &str,
@@ -253,11 +254,12 @@ pub trait Backend: Send + Sync {
 }
 ```
 
-This is the slimmed, content-CAS-only surface of
-[ADR-023](adr/023-slimmed-backend-trait.md): seven methods, each mapping to a
-primitive S3 and GCS both provide natively. All coordination state lives in
-object *content* and is mutated *only* by content CAS — there are no tags,
-metadata, or writer ids.
+This is the six-method, conditional-only surface established by
+[ADR-042](adr/042-conditional-only-backend-mutations.md), refining the slimmed
+backend of [ADR-023](adr/023-slimmed-backend-trait.md). Each method maps to a
+primitive S3 and GCS provide natively. All coordination state lives in object
+*content*, and every mutation names either absence or an exact content revision
+— there are no tags, metadata, writer ids, or unconditional mutations.
 
 `list` returns one recursive prefix page of actual object paths. Its cursor is
 an opaque provider token valid only for the same backend and prefix, and only a
@@ -272,12 +274,12 @@ contract directly to their native continuation tokens without a delimiter
 assigned by the backend and used only for conditional operations. The format is
 backend-specific: GCS encodes the object `generation`, while S3 uses the
 object's ETag. Consumers never interpret it — they pass it back unchanged to
-`write_if` / `read_if_modified`.
+`write_if`, `delete_if`, or `read_if_modified`.
 
 **Change detection.** All coordination state lives in object *content* and
-changes only by content CAS, so an object's version (ETag / generation) changes
-on exactly every write — precisely when a cached copy must be invalidated. To
-check whether a cached object is current, the cache issues a
+changes only by content CAS. The version (ETag / generation) identifies that
+content state; rewriting equivalent content may retain the same token. To check
+whether a cached object is current, the cache issues a
 *version-conditional* read:
 `read_if_modified` takes the expected `Version` and returns `Precondition` when
 the stored version still matches (the body is not re-transferred), or the full
@@ -286,26 +288,25 @@ object when it changed. This maps to a native conditional GET on every backend
 shard check its currentness without a body transfer
 ([ADR-023](adr/023-slimmed-backend-trait.md)).
 
-**Conditional operations.** `write_if` and `write_if_not_exists` take an
-expected version (or "must not exist") and fail with
-`BackendError::Precondition` if the object has been modified since. This content
-compare-and-swap (CAS) is the only coordination primitive — the fundamental
-building block for distributed coordination.
+**Conditional operations.** `write_if`, `write_if_not_exists`, and `delete_if`
+name an expected version (or "must not exist") and fail with
+`BackendError::Precondition` if that state is no longer current. A missing
+object during `delete_if` is successful convergence whether represented as
+success or `NotFound`. Content compare-and-swap (CAS) is the only coordination
+primitive — the fundamental building block for distributed coordination.
 
 **Error semantics** (`BackendError`):
 
 - `NotFound` — object does not exist.
 - `Precondition` — conditional operation failed (version mismatch).
-- `Unavailable(_)` — the operation could not be confirmed. For a *conditional
-  write* this means the outcome is _in doubt_: it may or may not have been
-  applied (e.g. an acknowledgement was lost and the retry then saw a precondition
-  failure, or an outage exhausted the retry budget), so a non-idempotent
-  operation must not be blindly retried
-  ([ADR-009](adr/009-in-doubt-conditional-writes.md)). For an *idempotent*
-  request (read, `read_if_modified`, unconditional write/delete, list) it is just
-  a transient failure (`5xx`, timeout, transport error) that is always safe to
-  retry; the engine retries reads in place and surfaces an unrecoverable one as
-  `Error::Unavailable` ([ADR-015](adr/015-read-unavailability.md)).
+- `Unavailable(_)` — the operation could not be confirmed. For a *mutation*
+  this means the outcome is _in doubt_: it may or may not have been applied
+  (e.g. an acknowledgement was lost or an outage exhausted the retry budget),
+  so it must not be blindly retried
+  ([ADR-009](adr/009-in-doubt-conditional-writes.md)). For an idempotent read or
+  list it is a transient failure (`5xx`, timeout, transport error) that is safe
+  to retry; the engine retries reads in place and surfaces an unrecoverable one
+  as `Error::Unavailable` ([ADR-015](adr/015-read-unavailability.md)).
 - `Other(_)` — any other backend error.
 
 `is_not_found`, `is_precondition`, and `is_unavailable` predicates preserve
@@ -315,8 +316,8 @@ the original sentinel-error matching semantics.
 
 | Backend                       | Purpose             | Notes                                                                                                                                              |
 | ----------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `glassdb-backend-gcs`         | Production          | GCS JSON API over `reqwest`; encodes the object `generation` in the version token; `read_if_modified` via `ifGenerationNotMatch`                    |
-| `glassdb-backend-s3`          | Production          | One object per path (`aws-sdk-s3`); stores the value verbatim as the body, ETag as the version token; `read_if_modified` via `If-None-Match`        |
+| `glassdb-backend-gcs`         | Production          | GCS JSON API over `reqwest`; generation versions; conditional read/write/delete through native generation preconditions                            |
+| `glassdb-backend-s3`          | Production          | One object per path (`aws-sdk-s3`); ETag versions; conditional read/write/delete through native HTTP preconditions                                 |
 | `glassdb-backend::memory`     | Testing             | In-process `MemoryBackend` simulating GCS semantics                                                                                                |
 | `glassdb-backend::middleware` | Debugging / testing | Wrappers for logging, latency injection, byte-driven scheduling, fault injection, and op-stream recording                                          |
 
@@ -694,11 +695,14 @@ body. Concurrent compatible currentness checks coalesce.
 Reads retain exact `Observation`s. Their evidence can remain useful after the
 current entry changes or is evicted, but obsolete states are never discoverable
 by a new `Any` read. Successful mutations publish their decoded result; conflict
-and in-doubt outcomes invalidate only the exact starting knowledge. A typed
-`TLogger` may serve cached final transaction objects indefinitely because their
-immutability is a transaction-object invariant; the generic store does not know
-what a final transaction is. The monitor separately keeps a small count-bounded
-status cache for finalized transactions.
+and in-doubt outcomes invalidate only the exact starting knowledge. Deletion
+accepts a present observation and forwards its revision: success advances that
+state's evidence and publishes absence, while `NotFound` converges on absence
+without claiming the old state survived to the delete. A typed `TLogger` may
+serve cached final transaction objects indefinitely because their immutability
+is a transaction-object invariant; the generic store does not know what a final
+transaction is. The monitor separately keeps a small count-bounded status cache
+for finalized transactions.
 
 Transaction execution may use cached state. Transaction validation captures one
 lower bound and propagates it through leaf and transaction-object dependencies.
@@ -758,10 +762,10 @@ Two version identities are kept separate (ADR-023):
   value lives in that transaction object's body (ADR-019), so the writer *is* the
   value's identity; the reader uses it to locate the decoded transaction object.
 - **Backend version** (`backend::Version`): the opaque CAS token assigned by
-  object storage, used for conditional writes and cache currentness checks via the
-  version-conditional `read_if_modified`. It identifies a coordination object's
-  content, so the object store wraps it in an opaque `Revision` attached to each
-  observation (not in the storage `Version`).
+  object storage, used for conditional mutations and cache currentness checks
+  via the version-conditional `read_if_modified`. It identifies a coordination
+  object's content, so the object store wraps it in an opaque `Revision`
+  attached to each observation (not in the storage `Version`).
 
 During validation, the algorithm detects concurrent modifications by comparing
 the observed writer against the current state; the backend version is the CAS
@@ -795,7 +799,8 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
   so the release batches through the same shard-mutation coordinator as live
   traffic (ADR-029); the entry left behind is pruned as a fold property when it
-  becomes vestigial (no holder, no `current-writer`).
+  becomes vestigial (no holder, no `current-writer`). It retains the candidate
+  log observation and conditionally deletes only that exact revision.
 - **Background execution.** Sweeps run every `GC_INTERVAL` on the `Background`
   task manager and do not block transaction processing. Background loops are torn
   down via `Drop` when the last `Database` clone is dropped.

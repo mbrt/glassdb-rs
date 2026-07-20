@@ -119,7 +119,7 @@ pub struct DelayBackend {
 impl DelayBackend {
     /// Wraps `inner`, simulating the latencies described by `opts`.
     ///
-    /// The content-CAS-only trait (ADR-023) has no metadata-only operations, so
+    /// The conditional-only trait (ADR-042) has no metadata-only operations, so
     /// `opts.meta_read` / `opts.meta_write` are unused; they remain in
     /// [`DelayOptions`] only for config-shape stability.
     pub fn new(inner: Arc<dyn Backend>, opts: DelayOptions) -> Self {
@@ -190,13 +190,6 @@ impl Backend for DelayBackend {
         self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.prefix_write_wait(path).await;
-        self.backoff(path).await;
-        self.delay(&self.obj_write).await;
-        self.inner.write(path, value).await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -220,11 +213,11 @@ impl Backend for DelayBackend {
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         self.prefix_write_wait(path).await;
         self.backoff(path).await;
         self.delay(&self.obj_write).await;
-        self.inner.delete(path).await
+        self.inner.delete_if(path, expected).await
     }
 
     async fn list(

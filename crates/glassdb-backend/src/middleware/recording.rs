@@ -122,13 +122,6 @@ impl Backend for RecordingBackend {
         self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        let mut args = Vec::new();
-        enc_bytes(&mut args, &value);
-        self.record("write", path, args);
-        self.inner.write(path, value).await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -153,9 +146,11 @@ impl Backend for RecordingBackend {
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        self.record("delete", path, Vec::new());
-        self.inner.delete(path).await
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        let mut args = Vec::new();
+        enc_version(&mut args, expected);
+        self.record("delete_if", path, args);
+        self.inner.delete_if(path, expected).await
     }
 
     async fn list(
@@ -201,22 +196,34 @@ mod tests {
         let rec = RecordingBackend::new(inner);
         let log = rec.log();
 
-        let v = rec.write("a/b", b"v".to_vec()).await.unwrap();
+        let v = rec.write_if_not_exists("a/b", b"v".to_vec()).await.unwrap();
         let _ = rec.read("a/b").await;
         let _ = rec.read_if_modified("a/b", &v).await;
+        let _ = rec.delete_if("a/b", &v).await;
         let _ = rec.list("a/", None, ListLimit::new(1).unwrap()).await;
 
         let recorded = log.lock().unwrap();
         let ops: Vec<&str> = recorded.iter().map(|r| r.op).collect();
-        assert_eq!(ops, vec!["write", "read", "read_if_modified", "list"]);
+        assert_eq!(
+            ops,
+            vec![
+                "write_if_not_exists",
+                "read",
+                "read_if_modified",
+                "delete_if",
+                "list"
+            ]
+        );
         assert_eq!(recorded[0].path, "a/b");
-        // The write encoded its value into args; a plain read carries none.
+        // The create encoded its value into args; a plain read carries none.
         assert!(!recorded[0].args.is_empty());
         assert!(recorded[1].args.is_empty());
         // read_if_modified encoded the expected version.
         assert!(!recorded[2].args.is_empty());
-        // list records the absent cursor and positive page limit.
+        // delete_if also encoded the expected version.
         assert!(!recorded[3].args.is_empty());
+        // list records the absent cursor and positive page limit.
+        assert!(!recorded[4].args.is_empty());
     }
 
     #[test]
@@ -226,11 +233,11 @@ mod tests {
             path: "p".into(),
             args: Vec::new(),
         };
-        let a = vec![mk("read"), mk("write"), mk("delete")];
-        let b = vec![mk("read"), mk("read_if_modified"), mk("delete")];
+        let a = vec![mk("read"), mk("write_if"), mk("delete_if")];
+        let b = vec![mk("read"), mk("read_if_modified"), mk("delete_if")];
         let (i, ar, br) = first_divergence(&a, &b).unwrap();
         assert_eq!(i, 1);
-        assert_eq!(ar.unwrap().op, "write");
+        assert_eq!(ar.unwrap().op, "write_if");
         assert_eq!(br.unwrap().op, "read_if_modified");
 
         assert!(first_divergence(&a, &a).is_none());
