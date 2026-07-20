@@ -1,11 +1,11 @@
 //! Compare-and-swap I/O for the v2 coordination objects (ADR-031).
 //!
 //! B-link nodes (`{prefix}/_n/<token>`) and collection roots (`{prefix}/_i`)
-//! are the coordination units. Each store is an unconditional create-if-absent
-//! or a version-conditional compare-and-swap — the only coordination primitive
-//! v2 needs (ADR-023).
+//! are the coordination units. Each mutation is a create-if-absent, a
+//! version-conditional compare-and-swap, or an exact-revision delete
+//! (ADR-023/ADR-042).
 //!
-//! Reads and writes go through the decoded [`CachedStore`].
+//! Reads and mutations go through the decoded [`CachedStore`].
 
 use std::sync::Arc;
 
@@ -350,35 +350,36 @@ impl ShardStore {
         }
     }
 
-    /// Deletes the standalone node `_n/<token>`, ignoring a missing object.
-    pub async fn delete_node(&self, prefix: &str, token: &str) -> Result<(), StorageError> {
-        self.nodes.delete(&paths::from_node(prefix, token)).await?;
+    /// Deletes the exact observed standalone node, converging if it is missing.
+    pub async fn delete_node(&self, expected: &Observation<Node>) -> Result<(), StorageError> {
+        self.nodes.delete(expected).await?;
         Ok(())
     }
 
-    /// Creates a split write-ahead record before any node is created.
+    /// Creates a split write-ahead record and returns its exact observation.
     pub async fn write_structural_log(
         &self,
         record_id: &str,
         record: &StructuralLog,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Observation<StructuralLog>, StorageError> {
         let path = paths::structural_log_record(paths::db_root_of(&record.prefix), record_id);
         match self
             .structural_logs
             .create(&path, None, Arc::new(record.clone()))
             .await
         {
-            Ok(CasResult::Committed(_) | CasResult::Conflict) => Ok(()),
+            Ok(CasResult::Committed(observed)) => Ok(observed),
+            Ok(CasResult::Conflict) => Err(StorageError::Precondition),
             Err(e) => Err(e),
         }
     }
 
-    /// Lists every unresolved structural record in a database.
+    /// Lists exact observations of every unresolved structural record.
     pub async fn list_structural_logs(
         &self,
         db_root: &str,
         requirement: Requirement,
-    ) -> Result<Vec<(String, StructuralLog)>, StorageError> {
+    ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
         let prefix = paths::structural_log_dir(db_root);
         let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
         let mut cursor = None;
@@ -392,8 +393,8 @@ impl ShardStore {
                 let record_id = paths::structural_log_id_of(&path)
                     .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
                 let observed = self.structural_logs.read(&path, requirement).await?;
-                if let Some(record) = observed.value() {
-                    records.push((record_id, record.as_ref().clone()));
+                if observed.exists() {
+                    records.push((record_id, observed));
                 }
             }
             match page.next {
@@ -403,15 +404,12 @@ impl ShardStore {
         }
     }
 
-    /// Deletes a resolved structural record, ignoring an already-missing one.
+    /// Deletes the exact observed structural record, converging if it is missing.
     pub async fn delete_structural_log(
         &self,
-        db_root: &str,
-        record_id: &str,
+        expected: &Observation<StructuralLog>,
     ) -> Result<(), StorageError> {
-        self.structural_logs
-            .delete(&paths::structural_log_record(db_root, record_id))
-            .await?;
+        self.structural_logs.delete(expected).await?;
         Ok(())
     }
 

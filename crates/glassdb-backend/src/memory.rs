@@ -1,8 +1,8 @@
-//! In-memory backend for testing and development (ADR-016, ADR-023).
+//! In-memory backend for testing and development (ADR-016, ADR-023, ADR-042).
 //!
 //! Content-CAS only: the opaque version token is the object generation, bumped
 //! on every content write. This matches the (now generation-only) GCS token,
-//! so the in-memory backend keeps modelling production conditional-write
+//! so the in-memory backend keeps modelling production conditional-mutation
 //! semantics.
 
 use std::collections::HashMap;
@@ -92,15 +92,6 @@ impl Backend for MemoryBackend {
         })
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        let mut state = self.state.lock().unwrap();
-        let mut obj = state.objects.get(path).cloned().unwrap_or_default();
-        state.update_data(&mut obj, value);
-        let version = obj.version();
-        state.objects.insert(path.to_string(), obj);
-        Ok(version)
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -138,11 +129,13 @@ impl Backend for MemoryBackend {
         Ok(version)
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
-        if state.objects.remove(path).is_none() {
-            return Err(BackendError::NotFound);
+        let object = state.objects.get(path).ok_or(BackendError::NotFound)?;
+        if &object.version() != expected {
+            return Err(BackendError::Precondition);
         }
+        state.objects.remove(path);
         Ok(())
     }
 
@@ -216,15 +209,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn write_read_delete() {
+    async fn create_read_delete_if() {
         let b = MemoryBackend::new();
         assert!(matches!(b.read("a").await, Err(BackendError::NotFound)));
-        let v = b.write("a", b"hello".to_vec()).await.unwrap();
+        let v = b.write_if_not_exists("a", b"hello".to_vec()).await.unwrap();
         assert_eq!(&*v.token, "1");
         let r = b.read("a").await.unwrap();
         assert_eq!(r.contents, b"hello");
-        b.delete("a").await.unwrap();
-        assert!(matches!(b.delete("a").await, Err(BackendError::NotFound)));
+        b.delete_if("a", &v).await.unwrap();
+        assert!(matches!(
+            b.delete_if("a", &v).await,
+            Err(BackendError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -247,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn read_if_modified_tracks_version() {
         let b = MemoryBackend::new();
-        let v = b.write("a", b"v".to_vec()).await.unwrap();
+        let v = b.write_if_not_exists("a", b"v".to_vec()).await.unwrap();
 
         // Same version => precondition (not modified).
         assert!(matches!(
@@ -260,7 +256,7 @@ mod tests {
 
         // After a content write the version changes, so the old token no longer
         // matches and the body is returned.
-        let v2 = b.write("a", b"v2".to_vec()).await.unwrap();
+        let v2 = b.write_if("a", b"v2".to_vec(), &v).await.unwrap();
         assert_ne!(v, v2);
         let r = b.read_if_modified("a", &v).await.unwrap();
         assert_eq!(r.contents, b"v2");
@@ -271,7 +267,7 @@ mod tests {
     async fn list_is_recursive_and_paginated() {
         let b = MemoryBackend::new();
         for p in ["d/b", "d/a", "d/sub/x", "d/sub/y", "other/z"] {
-            b.write(p, b"v".to_vec()).await.unwrap();
+            b.write_if_not_exists(p, b"v".to_vec()).await.unwrap();
         }
         let limit = ListLimit::new(2).unwrap();
         let first = b.list("d/", None, limit).await.unwrap();
@@ -285,5 +281,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BackendError::InvalidCursor));
+    }
+
+    #[tokio::test]
+    async fn stale_delete_cannot_remove_recreated_state() {
+        let b = MemoryBackend::new();
+        let old = b.write_if_not_exists("a", b"old".to_vec()).await.unwrap();
+        b.delete_if("a", &old).await.unwrap();
+        let current = b
+            .write_if_not_exists("a", b"current".to_vec())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            b.delete_if("a", &old).await,
+            Err(BackendError::Precondition)
+        ));
+        let read = b.read("a").await.unwrap();
+        assert_eq!(read.contents, b"current");
+        assert_eq!(read.version, current);
     }
 }

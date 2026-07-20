@@ -42,8 +42,8 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
 use glassdb_data::{KeyRef, TxId, paths, shuffle};
 use glassdb_storage::{
-    Directory, Requirement, ShardStore, StorageError, TLogger, Timeline, TxCommitStatus, TxLock,
-    TxLog,
+    Directory, Observation, Requirement, ShardStore, StorageError, TLogger, Timeline,
+    TxCommitStatus, TxLock, TxLog,
 };
 
 use crate::error::TransError;
@@ -266,8 +266,14 @@ impl Gc {
         }
 
         match log.status {
-            TxCommitStatus::Ok => self.reclaim_committed(tid, log, candidate_check).await,
-            TxCommitStatus::Aborted => self.reclaim_aborted(tid, &log.locks, candidate_check).await,
+            TxCommitStatus::Ok => {
+                self.reclaim_committed(tid, log, &observed, candidate_check)
+                    .await
+            }
+            TxCommitStatus::Aborted => {
+                self.reclaim_aborted(tid, &log.locks, &observed, candidate_check)
+                    .await
+            }
             TxCommitStatus::Pending => {
                 self.reclaim_dead_pending(tid, log, &observed, candidate_check)
                     .await
@@ -285,13 +291,14 @@ impl Gc {
         &self,
         tid: &TxId,
         log: &TxLog,
+        observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
         if self.still_referenced(tid, log, requirement).await? {
             return Ok(());
         }
         self.release_locks(tid, &log.locks, requirement).await?;
-        self.tl.delete(tid).await?;
+        self.tl.delete(observation).await?;
         Ok(())
     }
 
@@ -304,10 +311,11 @@ impl Gc {
         &self,
         tid: &TxId,
         locks: &[TxLock],
+        observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
         self.release_locks(tid, locks, requirement).await?;
-        self.tl.delete(tid).await?;
+        self.tl.delete(observation).await?;
         Ok(())
     }
 
@@ -322,7 +330,7 @@ impl Gc {
         &self,
         tid: &TxId,
         log: &TxLog,
-        observation: &glassdb_storage::Observation<TxLog>,
+        observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
         match self.mon.force_abort(tid, observation).await? {

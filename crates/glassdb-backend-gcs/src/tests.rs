@@ -36,7 +36,7 @@ struct Store {
 
 struct FakeState {
     store: Mutex<Store>,
-    /// Number of inserts to apply but answer with `500` (a lost ack).
+    /// Number of mutations to apply but answer with `500` (a lost ack).
     lost_ack: Mutex<i64>,
     /// Number of object GETs to answer with `500` (a transient read outage).
     read_fault: Mutex<i64>,
@@ -91,7 +91,7 @@ impl FakeGcs {
         self.base_url.clone()
     }
 
-    /// Apply the next `n` inserts but answer them with `500` (a lost ack).
+    /// Apply the next `n` mutations but answer them with `500` (a lost ack).
     fn set_lost_ack(&self, n: i64) {
         *self.state.lost_ack.lock().unwrap() = n;
     }
@@ -318,6 +318,13 @@ fn delete(state: &FakeState, name: &str, query: &HashMap<String, String>) -> Res
         }
     }
     store.objects.remove(name);
+    {
+        let mut la = state.lost_ack.lock().unwrap();
+        if *la > 0 {
+            *la -= 1;
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "backendError");
+        }
+    }
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Full::new(Bytes::new()))
@@ -560,7 +567,7 @@ async fn read_write_roundtrip() {
         ("empty", Vec::new()),
         ("binary", vec![0x00, 0x01, 0x02, 0xff]),
     ] {
-        let version = b.write(name, value.clone()).await.unwrap();
+        let version = b.write_if_not_exists(name, value.clone()).await.unwrap();
         assert!(!version.is_unset());
 
         let r = b.read(name).await.unwrap();
@@ -573,8 +580,8 @@ async fn read_write_roundtrip() {
 async fn write_produces_fresh_version_each_time() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let v1 = b.write("k", b"same".to_vec()).await.unwrap();
-    let v2 = b.write("k", b"same".to_vec()).await.unwrap();
+    let v1 = b.write_if_not_exists("k", b"same".to_vec()).await.unwrap();
+    let v2 = b.write_if("k", b"same".to_vec(), &v1).await.unwrap();
     assert_ne!(v1, v2);
 }
 
@@ -593,7 +600,7 @@ async fn write_if_not_exists() {
 async fn write_if_cas() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
 
     let err = b
         .write_if("k", b"b".to_vec(), &Version::new("999"))
@@ -611,7 +618,7 @@ async fn write_if_cas() {
 async fn write_if_null_version_fails_precondition() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
 
     let err = b
         .write_if("k", b"b".to_vec(), &Version::default())
@@ -628,7 +635,7 @@ async fn write_if_null_version_fails_precondition() {
 async fn read_if_modified() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"x".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
 
     // Unchanged generation => precondition (not modified).
     let err = b.read_if_modified("k", &v0).await.unwrap_err();
@@ -641,7 +648,7 @@ async fn read_if_modified() {
 
     // After a content write the generation changes, so the old token no longer
     // matches and the body is returned.
-    let v1 = b.write("k", b"y".to_vec()).await.unwrap();
+    let v1 = b.write_if("k", b"y".to_vec(), &v0).await.unwrap();
     assert_ne!(v0, v1);
     let r = b.read_if_modified("k", &v0).await.unwrap();
     assert_eq!(r.contents, b"y");
@@ -649,13 +656,27 @@ async fn read_if_modified() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_unconditional() {
+async fn delete_if_matching_generation() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write("k", b"x".to_vec()).await.unwrap();
-    b.delete("k").await.unwrap();
+    let version = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
+    b.delete_if("k", &version).await.unwrap();
     let err = b.read("k").await.unwrap_err();
     assert!(matches!(err, BackendError::NotFound));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_delete_if_preserves_current_object() {
+    let fake = FakeGcs::start().await;
+    let b = backend(&fake);
+    let old = b.write_if_not_exists("k", b"old".to_vec()).await.unwrap();
+    let current = b.write_if("k", b"current".to_vec(), &old).await.unwrap();
+
+    let err = b.delete_if("k", &old).await.unwrap_err();
+    assert!(matches!(err, BackendError::Precondition));
+    let read = b.read("k").await.unwrap();
+    assert_eq!(read.contents, b"current");
+    assert_eq!(read.version, current);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -671,7 +692,9 @@ async fn list_is_recursive_and_paginated() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
     for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write(name, name.as_bytes().to_vec()).await.unwrap();
+        b.write_if_not_exists(name, name.as_bytes().to_vec())
+            .await
+            .unwrap();
     }
     let limit = ListLimit::new(2).unwrap();
     let first = b.list("d/", None, limit).await.unwrap();
@@ -720,7 +743,7 @@ async fn write_if_not_exists_lost_ack_is_in_doubt() {
 async fn write_if_lost_ack_is_in_doubt() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    let v0 = b.write("k", b"a".to_vec()).await.unwrap();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
 
     fake.set_lost_ack(1);
     let err = b.write_if("k", b"b".to_vec(), &v0).await.unwrap_err();
@@ -731,6 +754,18 @@ async fn write_if_lost_ack_is_in_doubt() {
 
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_if_lost_ack_is_in_doubt() {
+    let fake = FakeGcs::start().await;
+    let b = backend(&fake);
+    let version = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
+
+    fake.set_lost_ack(1);
+    let err = b.delete_if("k", &version).await.unwrap_err();
+    assert!(matches!(err, BackendError::Unavailable(_)));
+    assert!(matches!(b.read("k").await, Err(BackendError::NotFound)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -752,7 +787,7 @@ async fn clean_conflict_still_precondition() {
 async fn read_server_error_surfaces_unavailable() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    b.write("k", b"v".to_vec()).await.unwrap();
+    b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
 
     // The object stays durable, but the next metadata GET answers 500.
     fake.set_read_fault(1);

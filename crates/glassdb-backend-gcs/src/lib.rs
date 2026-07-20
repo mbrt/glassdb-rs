@@ -1,9 +1,10 @@
-//! Google Cloud Storage backend for GlassDB (ADR-016, ADR-023).
+//! Google Cloud Storage backend for GlassDB (ADR-016, ADR-023, ADR-042).
 //!
 //! Each logical key maps to a single GCS object whose body holds the value.
-//! GCS provides native content compare-and-swap through the object `generation`
-//! precondition, so the opaque [`Version`] token is the object generation.
-//! Conditional reads use `ifGenerationNotMatch`.
+//! GCS provides native content compare-and-swap through object `generation`
+//! preconditions, so the opaque [`Version`] token is the object generation.
+//! Conditional reads use `ifGenerationNotMatch`; writes and deletion require an
+//! exact generation condition.
 
 use std::sync::Arc;
 
@@ -150,12 +151,11 @@ impl GcsBackend {
 
     /// Sends `rb`. Cancellation is by dropping the surrounding future.
     ///
-    /// Only idempotent operations go through `send` (reads, unconditional
-    /// write/delete, and list); conditional writes use
-    /// [`Self::send_conditional`]. A transport failure on an idempotent request
-    /// is therefore always safe to retry, so it is reported as `Unavailable`
-    /// rather than a generic `Other` (ADR-009), letting the engine recover a
-    /// transient outage in place.
+    /// Only idempotent reads and listings go through `send`; conditional
+    /// mutations use [`Self::send_conditional`]. A transport failure on an
+    /// idempotent request is therefore always safe to retry, so it is reported
+    /// as `Unavailable` rather than a generic `Other` (ADR-009), letting the
+    /// engine recover a transient outage in place.
     async fn send(&self, rb: RequestBuilder) -> Result<reqwest::Response, BackendError> {
         let rb = self.authorize(rb).await?;
         rb.send()
@@ -164,14 +164,13 @@ impl GcsBackend {
     }
 
     /// Sends a *conditional* request and maps its outcome with the in-doubt
-    /// contract (ADR-009). GCS applies conditional writes atomically and this
-    /// backend does not retry them, so a clean `412`/`409` means the write did
+    /// contract (ADR-009). GCS applies conditional mutations atomically and this
+    /// backend does not retry them, so a clean `412`/`409` means the mutation did
     /// not take effect (a genuine `Precondition`). But a transport error or a
-    /// `5xx` leaves the outcome unknown — the write may have landed before the
-    /// failure — so it is reported as `Unavailable` rather than a confident error
-    /// or a generic `Other`, ensuring the engine never retries it into a
-    /// double-apply. An authentication failure happens before the request is
-    /// sent, so it is not in-doubt.
+    /// `5xx` leaves the outcome unknown — the mutation may have landed before the
+    /// failure — so it is reported as `Unavailable` rather than a confident
+    /// error or a generic `Other`. An authentication failure happens before the
+    /// request is sent, so it is not in-doubt.
     async fn send_conditional(
         &self,
         rb: RequestBuilder,
@@ -242,20 +241,19 @@ impl GcsBackend {
         )))
     }
 
-    /// Uploads `value` as a multipart insert with the given generation
+    /// Uploads `value` as a multipart insert with the required generation
     /// precondition, returning the new version.
     async fn upload(
         &self,
         path: &str,
         value: Vec<u8>,
-        if_generation_match: Option<String>,
+        if_generation_match: String,
     ) -> Result<Version, BackendError> {
-        let conditional = if_generation_match.is_some();
         let body = multipart_body(&object_metadata_json(path), &value);
-        let mut query: Vec<(&str, String)> = vec![("uploadType", "multipart".to_string())];
-        if let Some(g) = &if_generation_match {
-            query.push(("ifGenerationMatch", g.clone()));
-        }
+        let query = [
+            ("uploadType", "multipart".to_string()),
+            ("ifGenerationMatch", if_generation_match),
+        ];
         let rb = self
             .http
             .post(self.upload_url())
@@ -265,15 +263,20 @@ impl GcsBackend {
                 format!("multipart/related; boundary={BOUNDARY}"),
             )
             .body(body);
-        let resp = if conditional {
-            self.send_conditional(rb, "Write", path).await?
-        } else {
-            let resp = self.send(rb).await?;
-            check_status(resp.status(), "Write", path)?;
-            resp
-        };
-        let obj: ObjectResource = parse_json(resp, "Write", path).await?;
-        Ok(obj.version())
+        let resp = self.send_conditional(rb, "Write", path).await?;
+        let obj: ObjectResource = parse_json(resp, "Write", path).await.map_err(|error| {
+            BackendError::Unavailable(format!(
+                "Write({path}): mutation applied but response could not be decoded: {error}"
+            ))
+        })?;
+        obj.generation
+            .filter(|generation| !generation.is_empty())
+            .map(Version::new)
+            .ok_or_else(|| {
+                BackendError::Unavailable(format!(
+                    "Write({path}): mutation applied but response omitted its generation"
+                ))
+            })
     }
 }
 
@@ -314,10 +317,6 @@ impl Backend for GcsBackend {
         })
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.upload(path, value, None).await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -325,7 +324,7 @@ impl Backend for GcsBackend {
         expected: &Version,
     ) -> Result<Version, BackendError> {
         let generation = parse_token(expected)?;
-        self.upload(path, value, Some(generation)).await
+        self.upload(path, value, generation).await
     }
 
     async fn write_if_not_exists(
@@ -333,13 +332,16 @@ impl Backend for GcsBackend {
         path: &str,
         value: Vec<u8>,
     ) -> Result<Version, BackendError> {
-        self.upload(path, value, Some("0".to_string())).await
+        self.upload(path, value, "0".to_string()).await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
-        let rb = self.http.delete(self.object_url(path));
-        let resp = self.send(rb).await?;
-        check_status(resp.status(), "Delete", path)?;
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        let generation = parse_token(expected)?;
+        let rb = self
+            .http
+            .delete(self.object_url(path))
+            .query(&[("ifGenerationMatch", generation)]);
+        self.send_conditional(rb, "DeleteIf", path).await?;
         Ok(())
     }
 
@@ -457,8 +459,8 @@ impl GcsStatusError {
 
 /// Maps a GCS HTTP status onto a [`BackendError`].
 ///
-/// Used only for idempotent requests (reads, unconditional write/delete, list);
-/// conditional writes use [`check_conditional_status`].
+/// Used only for idempotent reads and listings; conditional mutations use
+/// [`check_conditional_status`].
 /// A `5xx` on an idempotent request is a transient outage that is always safe
 /// to retry (ADR-009), so it surfaces as `Unavailable` rather than a generic
 /// `Other`.
@@ -478,15 +480,15 @@ fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), 
 }
 
 /// Maps a non-success status from a *conditional* request (ADR-009). A `412`/
-/// `409` is a genuine precondition (the atomic write did not take effect); a
-/// `5xx` leaves the write in doubt, since GCS may have applied it before
+/// `409` is a genuine precondition (the atomic mutation did not take effect); a
+/// `5xx` leaves the mutation in doubt, since GCS may have applied it before
 /// failing, so it is reported as `Unavailable`.
 fn check_conditional_status(status: StatusCode, op: &'static str, path: &str) -> BackendError {
     match status {
         StatusCode::NOT_FOUND => BackendError::NotFound,
         StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => BackendError::Precondition,
         s if s.is_server_error() => BackendError::Unavailable(format!(
-            "{op}({path}): conditional write outcome unknown (gcs status {})",
+            "{op}({path}): conditional mutation outcome unknown (gcs status {})",
             s.as_u16()
         )),
         s => GcsStatusError::new(op, path, s).into_backend_error(),

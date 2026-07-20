@@ -85,11 +85,6 @@ impl Backend for ScheduledBackend {
         self.inner.read_if_modified(path, expected).await
     }
 
-    async fn write(&self, path: &str, value: Vec<u8>) -> Result<Version, BackendError> {
-        self.wait().await;
-        self.inner.write(path, value).await
-    }
-
     async fn write_if(
         &self,
         path: &str,
@@ -109,9 +104,9 @@ impl Backend for ScheduledBackend {
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete(&self, path: &str) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         self.wait().await;
-        self.inner.delete(path).await
+        self.inner.delete_if(path, expected).await
     }
 
     async fn list(

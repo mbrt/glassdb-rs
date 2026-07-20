@@ -133,17 +133,45 @@ fn fmt_ms(d: Duration) -> String {
     }
 }
 
+async fn replace_or_create(
+    backend: &dyn Backend,
+    path: &str,
+    value: Vec<u8>,
+) -> Result<Version, BackendError> {
+    loop {
+        match backend.read(path).await {
+            Ok(current) => match backend
+                .write_if(path, value.clone(), &current.version)
+                .await
+            {
+                Ok(version) => return Ok(version),
+                Err(BackendError::Precondition | BackendError::NotFound) => continue,
+                Err(err) => return Err(err),
+            },
+            Err(BackendError::NotFound) => {
+                match backend.write_if_not_exists(path, value.clone()).await {
+                    Ok(version) => return Ok(version),
+                    Err(BackendError::Precondition) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn run_write_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let p = format!("{TEST_ROOT}/write-same");
+        let mut version = replace_or_create(b.as_ref(), &p, random_data(1024)).await?;
         let mut count = 0u64;
         while !bench.is_finished() {
-            // Vary the content so each overwrite is a genuinely new object
-            // (content-derived CAS version in v2), matching real write traffic.
+            // Vary the content so each overwrite is a genuine state change,
+            // including on providers whose CAS token is content-derived.
             let data = random_data(1024);
             bench
                 .measure(|| async {
-                    b.write(&p, data.clone()).await?;
+                    version = b.write_if(&p, data, &version).await?;
                     Ok(())
                 })
                 .await?;
@@ -158,7 +186,7 @@ fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/write-same");
-        b.write(&p, data.clone()).await?;
+        replace_or_create(b.as_ref(), &p, data.clone()).await?;
         // A clearly-bogus version so the conditional write always fails its
         // precondition; the error is ignored, the latency is what we measure.
         let expected = Version::new("0/0");
@@ -178,7 +206,7 @@ fn run_read(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/read");
-        b.write(&p, data).await?;
+        replace_or_create(b.as_ref(), &p, data).await?;
         while !bench.is_finished() {
             bench
                 .measure(|| async {
@@ -197,7 +225,7 @@ fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         let p = format!("{TEST_ROOT}/read");
         // The version returned by the write is the object's current CAS token;
         // a conditional read against it short-circuits (304 / Precondition).
-        let version = b.write(&p, data).await?;
+        let version = replace_or_create(b.as_ref(), &p, data).await?;
         while !bench.is_finished() {
             bench
                 .measure(|| async {

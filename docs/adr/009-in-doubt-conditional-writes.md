@@ -4,6 +4,11 @@
 
 Accepted
 
+The conditional mutation surface is refined by
+[ADR-042](042-conditional-only-backend-mutations.md), and post-dispatch
+cancellation and cache reconciliation are refined by
+[ADR-043](043-causally-coordinated-backend-operations.md).
+
 ## Context
 
 GlassDB builds atomic commits out of object-store compare-and-swap (CAS):

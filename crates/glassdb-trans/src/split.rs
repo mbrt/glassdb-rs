@@ -42,8 +42,8 @@ use std::time::Duration;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionPath, KeyRef, TxId, paths};
 use glassdb_storage::{
-    Directory, IndexNode, LeafObservation, LockType, Node, Requirement, Shard, ShardStore,
-    SplitPolicy, StorageError, StructuralLog, Timeline, TxCommitStatus, TxLog,
+    Directory, IndexNode, LeafObservation, LockType, Node, Observation, Requirement, Shard,
+    ShardStore, SplitPolicy, StorageError, StructuralLog, Timeline, TxCommitStatus, TxLog,
 };
 use tokio::sync::Notify;
 
@@ -741,7 +741,8 @@ impl Splitter {
         node.remove_structure_holder(id);
 
         let record_id = right_token.clone();
-        self.shards
+        let structural_record = self
+            .shards
             .write_structural_log(
                 &record_id,
                 &StructuralLog {
@@ -776,7 +777,7 @@ impl Splitter {
         self.publish_separators(prefix, &split_key, &right_token)
             .await?;
         self.shards
-            .delete_structural_log(&self.db_root, &record_id)
+            .delete_structural_log(&structural_record)
             .await?;
         Ok(())
     }
@@ -824,7 +825,8 @@ impl Splitter {
         }
 
         let record_id = r_token.clone();
-        self.shards
+        let structural_record = self
+            .shards
             .write_structural_log(
                 &record_id,
                 &StructuralLog {
@@ -860,7 +862,7 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.shards
-            .delete_structural_log(&self.db_root, &record_id)
+            .delete_structural_log(&structural_record)
             .await?;
         Ok(())
     }
@@ -910,10 +912,7 @@ impl Splitter {
         };
         let active = !records.is_empty();
         for (record_id, record) in records {
-            if let Err(e) = self
-                .recover_record(&record_id, &record, recovery_start)
-                .await
-            {
+            if let Err(e) = self.recover_record(&record, recovery_start).await {
                 tracing::debug!(record = %record_id, error = %e, "structural recovery deferred");
             }
         }
@@ -923,10 +922,12 @@ impl Splitter {
     /// Resolves one structural record from fenced tree reachability.
     async fn recover_record(
         &self,
-        record_id: &str,
-        record: &StructuralLog,
+        observed: &Observation<StructuralLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
+        let record = observed
+            .value()
+            .ok_or_else(|| TransError::other("structural record disappeared after listing"))?;
         let source_token = (!record.is_root).then_some(record.source_token.as_str());
         if !self
             .fence_source_writer_for_recovery(&record.prefix, source_token, requirement)
@@ -954,13 +955,26 @@ impl Splitter {
         } else if !applied {
             for token in &record.created_tokens {
                 if !reachable.contains(token) {
-                    self.shards.delete_node(&record.prefix, token).await?;
+                    match self
+                        .shards
+                        .load_node_state(&record.prefix, token, requirement)
+                        .await
+                    {
+                        Ok(LeafObservation::Node(node)) => {
+                            self.shards.delete_node(&node).await?;
+                        }
+                        Ok(LeafObservation::Root(_)) => {
+                            return Err(TransError::other(
+                                "orphan-node cleanup loaded a collection root",
+                            ));
+                        }
+                        Err(StorageError::NotFound) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
         }
-        self.shards
-            .delete_structural_log(&self.db_root, record_id)
-            .await?;
+        self.shards.delete_structural_log(observed).await?;
         Ok(())
     }
 
@@ -2072,10 +2086,10 @@ mod tests {
         )])));
         s.create_root(COLL, &root).await.unwrap();
         let record = nonroot_record("L", "R", b"m");
-        s.write_structural_log("R", &record).await.unwrap();
+        let observed = s.write_structural_log("R", &record).await.unwrap();
 
         assert!(matches!(
-            sp.recover_record("R", &record, Requirement::AtLeast(s.timeline.now()))
+            sp.recover_record(&observed, Requirement::AtLeast(s.timeline.now()))
                 .await,
             Err(TransError::Retry)
         ));
@@ -2093,7 +2107,7 @@ mod tests {
         );
 
         sp.mon.abort_tx(&id).await.unwrap();
-        sp.recover_record("R", &record, Requirement::AtLeast(s.timeline.now()))
+        sp.recover_record(&observed, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert!(matches!(
@@ -2140,9 +2154,9 @@ mod tests {
             split_key: b"m".to_vec(),
             is_root: false,
         };
-        s.write_structural_log("R", &record).await.unwrap();
+        let observed = s.write_structural_log("R", &record).await.unwrap();
 
-        sp.recover_record("R", &record, Requirement::AtLeast(s.timeline.now()))
+        sp.recover_record(&observed, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
 
@@ -2285,7 +2299,7 @@ mod tests {
             split_key,
             is_root: false,
         };
-        s.write_structural_log("R", &record).await.unwrap();
+        let observed = s.write_structural_log("R", &record).await.unwrap();
         sp.mon.begin_tx(&id);
         sp.mon.wound_tx(&id).await.unwrap();
 
@@ -2293,7 +2307,7 @@ mod tests {
         let recovering = {
             let sp = sp.clone();
             let requirement = Requirement::AtLeast(s.timeline.now());
-            tokio::spawn(async move { sp.recover_record("R", &record, requirement).await })
+            tokio::spawn(async move { sp.recover_record(&observed, requirement).await })
         };
         gate.wait_until_entered().await;
 

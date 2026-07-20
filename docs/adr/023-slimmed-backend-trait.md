@@ -4,6 +4,10 @@
 
 Accepted
 
+The mutation surface is superseded by
+[ADR-042](042-conditional-only-backend-mutations.md), which removes
+unconditional write and delete and restores native revision-conditional delete.
+
 The non-paginated, immediate-directory semantics of `list` are superseded by
 the opaque-cursor recursive-prefix contract in
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md). The rest of
