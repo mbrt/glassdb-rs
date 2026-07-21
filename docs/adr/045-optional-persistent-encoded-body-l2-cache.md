@@ -1,4 +1,4 @@
-# ADR-042: Optional persistent encoded-body L2 cache
+# ADR-045: Optional persistent encoded-body L2 cache
 
 ## Status
 
