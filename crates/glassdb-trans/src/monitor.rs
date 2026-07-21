@@ -490,12 +490,28 @@ impl Monitor {
     /// contended lease expiry uses ([`Monitor::force_abort`]): CAS `pending →
     /// aborted` over `expected`. If a live owner committed or refreshed first
     /// the CAS loses and the now-durable status is reported instead, so GC
-    /// never drops a lock out from under a still-live owner.
+    /// never drops a lock out from under a still-live owner. A final expected
+    /// observation is returned unchanged without issuing a mutation.
     pub(crate) async fn force_abort(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,
     ) -> Result<TxCommitStatus, TransError> {
+        if let Some(current) = expected.value() {
+            match current.status {
+                status @ (TxCommitStatus::Ok | TxCommitStatus::Aborted) => {
+                    self.remember_final(tid, expected);
+                    return Ok(status);
+                }
+                TxCommitStatus::Pending => {}
+                TxCommitStatus::Unknown => {
+                    return Err(TransError::other(format!(
+                        "transaction {tid} has an invalid persisted status"
+                    )));
+                }
+            }
+        }
+
         let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         if let Some(current) = expected.value() {
             tlog.writes = current.writes.clone();
@@ -769,8 +785,18 @@ impl Monitor {
         tid: &TxId,
         status: TxStatus,
     ) -> Result<TxCommitStatus, TransError> {
+        if status.status == TxCommitStatus::Unknown {
+            return self.handle_unknown_tx(tid).await;
+        }
+        self.resolve_present_tx_status(tid, status).await
+    }
+
+    async fn resolve_present_tx_status(
+        &self,
+        tid: &TxId,
+        status: TxStatus,
+    ) -> Result<TxCommitStatus, TransError> {
         match status.status {
-            TxCommitStatus::Unknown => self.handle_unknown_tx(tid).await,
             TxCommitStatus::Pending => {
                 let now = self.inner.clock.now();
                 // Absolute lease check (foreign clock — skew applies): a holder
@@ -787,12 +813,15 @@ impl Monitor {
                     Ok(TxCommitStatus::Pending)
                 }
             }
-            s => {
+            s @ (TxCommitStatus::Ok | TxCommitStatus::Aborted) => {
                 // Finalized: drop the observer-relative progress tracking.
                 self.clear_pending_progress(tid);
                 self.remember_final(tid, &status.observation);
                 Ok(s)
             }
+            TxCommitStatus::Unknown => Err(TransError::other(format!(
+                "transaction {tid} has an invalid persisted status"
+            ))),
         }
     }
 
@@ -858,7 +887,13 @@ impl Monitor {
                 .tl
                 .commit_status_at(tid, self.current_requirement())
                 .await?;
-            let res = self.force_abort(tid, &status.observation).await;
+            let res = match status.status {
+                TxCommitStatus::Unknown => self.force_abort(tid, &status.observation).await,
+                // Appearance is progress. Re-enter ordinary status resolution
+                // so a fresh pending lease remains live and a final object can
+                // never be used as the expected side of an abort CAS.
+                _ => self.resolve_present_tx_status(tid, status).await,
+            };
             if res.is_ok() {
                 self.shard_for(tid).lock().unwrap().unknown_tx.remove(tid);
             }
@@ -1289,6 +1324,67 @@ mod tests {
         // The stalled holder is reclaimed (aborted), well before its absolute
         // lease would have expired.
         assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_recheck_preserves_a_concurrent_commit() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (observer, _o) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let (_owner, owner) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let tx = TxId::from_bytes(b"committed-during-unknown-grace".to_vec());
+
+        assert_eq!(
+            observer.tx_status(&tx).await.unwrap(),
+            TxCommitStatus::Pending
+        );
+        tokio::time::sleep(PENDING_TX_TIMEOUT + Duration::from_secs(1)).await;
+
+        owner
+            .tl
+            .set(&TxLog::new(tx.clone(), TxCommitStatus::Ok))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            observer.handle_unknown_tx(&tx).await.unwrap(),
+            TxCommitStatus::Ok
+        );
+        let (_verify, verify) = new_test_monitor(b);
+        assert_eq!(
+            verify
+                .tl
+                .commit_status_at(&tx, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn force_abort_preserves_a_final_observation() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, t) = new_test_monitor(b.clone());
+        let tx = TxId::from_bytes(b"already-committed".to_vec());
+        let committed =
+            t.tl.set(&TxLog::new(tx.clone(), TxCommitStatus::Ok))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            mon.force_abort(&tx, &committed).await.unwrap(),
+            TxCommitStatus::Ok
+        );
+        let (_verify, verify) = new_test_monitor(b);
+        assert_eq!(
+            verify
+                .tl
+                .commit_status_at(&tx, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Ok
+        );
     }
 
     // Tiny helper to build a TxWrite in tests.
