@@ -398,6 +398,88 @@ async fn concurrent_multiple_rmw() {
     assert_eq!(read_int(&val), 60);
 }
 
+// Regression for the false-NotFound race: once a collection-root create owns
+// its path lane, a same-path read must wait instead of reaching the backend and
+// observing absence before the create linearizes. The listing requires evidence
+// newer than the create's invocation, so it validates only after the create has
+// definitively completed.
+#[tokio::test]
+async fn collection_read_waits_for_in_flight_create() {
+    let prefix = CollectionPath::new("example", b"create-race").physical_prefix();
+    let root_path = paths::collection_info(&prefix);
+    let create_started = Arc::new(Notify::new());
+    let release_create = Arc::new(Notify::new());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let backend = HookBackend::new(mem());
+    backend.set_before({
+        let root_path = root_path.clone();
+        let create_started = create_started.clone();
+        let release_create = release_create.clone();
+        let reads = reads.clone();
+        move |operation| {
+            let is_target = operation.path() == root_path;
+            let is_read = is_target
+                && matches!(
+                    operation,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                );
+            if is_read {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            let gate_create = is_target && matches!(operation, BackendOp::WriteIfNotExists { .. });
+            let create_started = create_started.clone();
+            let release_create = release_create.clone();
+            let future: HookFuture = Box::pin(async move {
+                if gate_create {
+                    create_started.notify_one();
+                    release_create.notified().await;
+                }
+                Ok(())
+            });
+            future
+        }
+    });
+
+    let db = init_db(backend).await;
+    let collection = db.collection(b"create-race");
+
+    let creating = tokio::spawn({
+        let collection = collection.clone();
+        async move { collection.create().await }
+    });
+    create_started.notified().await;
+
+    let read_started = Arc::new(Notify::new());
+    let reading = tokio::spawn({
+        let collection = collection.clone();
+        let read_started = read_started.clone();
+        async move {
+            read_started.notify_one();
+            collection
+                .collections()
+                .await?
+                .collect::<Result<Vec<_>, Error>>()
+        }
+    });
+    read_started.notified().await;
+
+    assert!(
+        !reading.is_finished(),
+        "the read must wait for the path lane"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "no backend read is issued");
+
+    release_create.notify_one();
+    creating.await.unwrap().unwrap();
+    let children = reading.await.unwrap().unwrap();
+    assert!(children.is_empty());
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the queued read must validate only after create completion"
+    );
+}
+
 // Reads many keys concurrently within a single transaction (the parallelism
 // `read_multi` used to provide), now via `join_all` over `Transaction::read`.
 #[tokio::test(start_paused = true)]
