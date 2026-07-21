@@ -248,7 +248,7 @@ impl SimWorkload for MembershipWorkload {
         }
     }
 
-    async fn verify(&self, db: &Database, state: &Mutex<MembershipAcct>, faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &Mutex<MembershipAcct>, failures_enabled: bool) {
         let coll = db.collection(MEMBERSHIP_COLLECTION);
         let keys: Vec<Vec<u8>> = coll
             .keys()
@@ -270,7 +270,7 @@ impl SimWorkload for MembershipWorkload {
                 );
             } else {
                 assert!(
-                    faults_enabled,
+                    failures_enabled,
                     "key k{k}: an op was left in-doubt with faults disabled"
                 );
                 assert!(

@@ -81,7 +81,7 @@ impl<'a> Arbitrary<'a> for RmwWorkload {
 async fn read_int_from_tx(tx: &crate::Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
         Ok(Some(v)) => Ok(read_int(&v)),
-        Ok(None) => Ok(0),
+        Ok(None) => Err(Error::NotFound),
         Err(e) => Err(e),
     }
 }
@@ -184,7 +184,7 @@ fn expected_increments(workload: &RmwWorkload) -> Vec<i64> {
 /// must be durable (`acked <= final`) and the store cannot show more than what
 /// was attempted (`final <= started`). With faults disabled, `final` must equal
 /// the workload's total increments exactly.
-fn assert_bounds(acct: &RmwAcct, finals: &[i64], expected: &[i64], faults_enabled: bool) {
+fn assert_bounds(acct: &RmwAcct, finals: &[i64], expected: &[i64], failures_enabled: bool) {
     for k in 0..RMW_KEY_COUNT {
         let a = acct.acked[k];
         let s = acct.started[k];
@@ -193,7 +193,7 @@ fn assert_bounds(acct: &RmwAcct, finals: &[i64], expected: &[i64], faults_enable
             a <= f && f <= s,
             "key k{k}: violated acked({a}) <= final({f}) <= started({s})"
         );
-        if !faults_enabled {
+        if !failures_enabled {
             assert_eq!(
                 f, expected[k],
                 "key k{k}: final {f} != expected {} (no faults)",
@@ -234,7 +234,7 @@ impl SimWorkload for RmwWorkload {
         run_one(db, &db.collection(INCREMENT_COLLECTION), op, state).await
     }
 
-    async fn verify(&self, db: &Database, state: &Mutex<RmwAcct>, faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &Mutex<RmwAcct>, failures_enabled: bool) {
         let coll = db.collection(INCREMENT_COLLECTION);
         let expected = expected_increments(self);
         let mut finals = vec![0i64; RMW_KEY_COUNT];
@@ -248,6 +248,36 @@ impl SimWorkload for RmwWorkload {
             );
         }
         let acct = state.lock().unwrap();
-        assert_bounds(&acct, &finals, &expected, faults_enabled);
+        assert_bounds(&acct, &finals, &expected, failures_enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_storage::SplitPolicy;
+
+    use super::*;
+    use crate::sim::harness::open_det_db;
+
+    #[tokio::test]
+    async fn missing_preseeded_key_is_not_treated_as_zero() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let db = open_det_db(&backend, SplitPolicy::default()).await.unwrap();
+        let collection = db.collection(INCREMENT_COLLECTION);
+        collection.create().await.unwrap();
+        let collection = &collection;
+
+        let result = db
+            .tx(|tx| async move {
+                read_int_from_tx(&tx, collection, b"missing")
+                    .await
+                    .map(|_| ())
+            })
+            .await;
+        assert!(matches!(result, Err(Error::NotFound)));
+        db.shutdown().await;
     }
 }

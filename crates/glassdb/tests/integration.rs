@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
-use glassdb::{Backend, Collection, Database, Error, SplitPolicy, Transaction};
+use glassdb::{Backend, Collection, Database, Error, ProtocolTiming, SplitPolicy, Transaction};
 use glassdb_data::{CollectionPath, paths};
 use glassdb_storage::{CollectionRoot, TxCommitStatus};
 use tokio::sync::{Barrier, Notify, oneshot};
@@ -1025,6 +1025,10 @@ async fn builder_custom_options() {
         .cache_size(8 * 1024 * 1024)
         .retry_initial_interval(Duration::from_millis(10))
         .retry_max_interval(Duration::from_millis(100))
+        .protocol_timing(ProtocolTiming::new(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ))
         .open()
         .await
         .unwrap();

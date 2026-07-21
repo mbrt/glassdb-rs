@@ -9,7 +9,9 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{CollectionPath, TxId};
 use glassdb_storage::{CachedStore, Directory, ShardStore, SplitPolicy, TLogger, Timeline};
-use glassdb_trans::{Algo, Gc, Locker, Monitor, Resolver, ShardCoordinator, Splitter, TransError};
+use glassdb_trans::{
+    Algo, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator, Splitter, TransError,
+};
 use tokio::sync::Notify;
 
 use crate::collection::Collection;
@@ -40,6 +42,7 @@ pub struct DatabaseBuilder {
     deterministic_time: bool,
     retry: RetryConfig,
     split_policy: SplitPolicy,
+    protocol_timing: ProtocolTiming,
 }
 
 impl DatabaseBuilder {
@@ -84,6 +87,14 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Overrides transaction-liveness timing, including the pending lease and
+    /// cross-client clock-skew allowance. The configured skew must bound every
+    /// client using this database so a live transaction is never reclaimed.
+    pub fn protocol_timing(mut self, timing: ProtocolTiming) -> Self {
+        self.protocol_timing = timing;
+        self
+    }
+
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
     pub async fn open(self) -> Result<Database, Error> {
@@ -94,6 +105,7 @@ impl DatabaseBuilder {
             deterministic_time,
             retry,
             split_policy,
+            protocol_timing,
         } = self;
 
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -125,6 +137,7 @@ impl DatabaseBuilder {
             bg_weak.clone(),
             clock.clone(),
             retry,
+            protocol_timing,
         );
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
@@ -192,6 +205,7 @@ impl DatabaseBuilder {
             deterministic_time: false,
             retry: RetryConfig::default(),
             split_policy: SplitPolicy::default(),
+            protocol_timing: ProtocolTiming::default(),
         }
     }
 }

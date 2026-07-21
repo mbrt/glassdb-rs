@@ -1,4 +1,4 @@
-//! Shared deterministic execution, fault injection, replay, and PCT harness.
+//! Shared deterministic execution, failure/delay injection, replay, and PCT harness.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -15,43 +15,74 @@ use glassdb_concurr::{Tape, rt};
 use glassdb_storage::SplitPolicy;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Database, Error};
+use crate::{Database, Error, ProtocolTiming};
 
 use super::MAX_CLIENTS;
+use super::slow_backend;
 
 const DB_NAME: &str = "fuzz";
-/// Controls the fault nemesis. With `enabled` false the harness injects no
-/// faults (so the exact-count invariant holds); `intensity` scales both the
-/// [`FaultBackend`] probabilities and how many clients the crash nemesis cancels.
+const SLOW_MUTATION_SEED: u64 = 0x510A_7E00_5EED_BA5E;
+
+/// Controls transport failures, client crashes, and slow backend mutations in
+/// the deterministic simulation harness.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaultConfig {
-    /// Whether the harness injects backend faults and client crashes.
-    pub enabled: bool,
-    /// How aggressive the faults are (probabilities and crash count scale with
-    /// this).
-    pub intensity: u8,
+    failures: bool,
+    slow_mutations: bool,
+    intensity: u8,
 }
 
 impl FaultConfig {
-    /// No fault injection.
+    /// Disables every injector.
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// Fault injection enabled at the given intensity.
-    pub fn enabled(intensity: u8) -> Self {
+    /// Enables transport failures and client crashes at the given intensity.
+    pub fn failures(intensity: u8) -> Self {
         FaultConfig {
-            enabled: true,
+            failures: true,
+            slow_mutations: false,
             intensity,
         }
+    }
+
+    /// Enables one slow conditional mutation and no uncertain failures.
+    pub fn slow_mutations() -> Self {
+        FaultConfig {
+            failures: false,
+            slow_mutations: true,
+            intensity: 0,
+        }
+    }
+
+    /// Enables transport failures, client crashes, and one slow mutation.
+    pub fn combined(intensity: u8) -> Self {
+        FaultConfig {
+            failures: true,
+            slow_mutations: true,
+            intensity,
+        }
+    }
+
+    fn failures_enabled(self) -> bool {
+        self.failures
+    }
+
+    fn slow_mutations_enabled(self) -> bool {
+        self.slow_mutations
     }
 }
 
 impl<'a> Arbitrary<'a> for FaultConfig {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(FaultConfig {
-            enabled: u.arbitrary()?,
-            intensity: u.arbitrary()?,
+        let mode = u.arbitrary::<u8>()? % 4;
+        let intensity = u.arbitrary()?;
+        Ok(match mode {
+            0 => FaultConfig::none(),
+            1 => FaultConfig::failures(intensity),
+            2 => FaultConfig::slow_mutations(),
+            _ => FaultConfig::combined(intensity),
         })
     }
 }
@@ -66,6 +97,7 @@ pub(crate) async fn open_det_db(
     Database::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
         .split_policy(policy)
+        .protocol_timing(ProtocolTiming::simulation())
         .open()
         .await
 }
@@ -154,10 +186,10 @@ fn make_backbone() -> (Arc<dyn Backend>, OpLog) {
     (backbone, log)
 }
 
-/// One transport per client over `backbone`. With faults enabled each is an
-/// active, tape-guided [`FaultBackend`]; otherwise each client shares the
-/// backbone directly. Returns the transports (for the outage nemesis and final
-/// healing) and the per-client backends, in client order.
+/// One transport per client over `backbone`. With transport failures enabled,
+/// each is an active, tape-guided [`FaultBackend`]; otherwise each client shares
+/// the backbone directly. Returns the transports (for the outage nemesis and
+/// final healing) and the per-client backends, in client order.
 fn build_transports(
     backbone: &Arc<dyn Backend>,
     faults: FaultConfig,
@@ -167,7 +199,7 @@ fn build_transports(
 ) -> (Vec<Arc<FaultBackend>>, Vec<Arc<dyn Backend>>) {
     let mut transports: Vec<Arc<FaultBackend>> = Vec::new();
     let mut client_backends: Vec<Arc<dyn Backend>> = Vec::with_capacity(nclients);
-    if faults.enabled {
+    if faults.failures_enabled() {
         let fopts = FaultOptions::from_intensity(faults.intensity);
         for i in 0..nclients {
             let tape = streams[CLIENT_STREAM_BASE + i % MAX_CLIENTS].clone();
@@ -184,11 +216,11 @@ fn build_transports(
     (transports, client_backends)
 }
 
-/// Spawns the crash and outage nemeses when faults are enabled, each on its own
-/// fault-tape stream and a distinct fallback seed. The caller spawns the client
-/// tasks first, so the fixed spawn order (clients, then crash, then outage)
-/// keeps task ids — and thus the schedule — deterministic. Returns their join
-/// handles (both `None` with faults off).
+/// Spawns the crash and outage nemeses when transport failures are enabled,
+/// each on its own fault-tape stream and a distinct fallback seed. The caller
+/// spawns the client tasks first, so the fixed spawn order (clients, then crash,
+/// then outage) keeps task ids — and thus the schedule — deterministic. Returns
+/// their join handles (both `None` without transport failures).
 #[allow(clippy::type_complexity)]
 fn spawn_nemeses(
     faults: FaultConfig,
@@ -197,7 +229,7 @@ fn spawn_nemeses(
     signals: &[CancellationToken],
     transports: &[Arc<FaultBackend>],
 ) -> (Option<rt::JoinHandle<()>>, Option<rt::JoinHandle<()>>) {
-    if !faults.enabled {
+    if !faults.failures_enabled() {
         return (None, None);
     }
     let crash_tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
@@ -272,13 +304,13 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Reads the final committed state and asserts the workload invariant.
-    /// Panics on any violation. `faults_enabled` selects the exact vs. relaxed
-    /// (in-doubt-tolerant) form of the invariant.
+    /// Panics on any violation. `failures_enabled` selects the exact vs. relaxed
+    /// (in-doubt-tolerant) form of the invariant; slow-only runs remain exact.
     fn verify(
         &self,
         db: &Database,
         state: &Self::State,
-        faults_enabled: bool,
+        failures_enabled: bool,
     ) -> impl Future<Output = ()> + Send;
 
     /// An optional concurrent read-only observer spawned alongside the clients
@@ -303,6 +335,7 @@ async fn run_generic_client<W: SimWorkload>(
     ops: &[W::Op],
     state: &W::State,
     consumed: &AtomicUsize,
+    faults: FaultConfig,
 ) -> usize {
     for (i, op) in ops.iter().enumerate() {
         // Bump consumed *before* attempting the op. If the outer crash future
@@ -311,12 +344,24 @@ async fn run_generic_client<W: SimWorkload>(
         // atomic because the `tokio::select!` cancel arm simply drops this future
         // and cannot read its return value.
         consumed.store(i + 1, Ordering::SeqCst);
-        if W::run_op(db, op, state).await.is_err() {
+        if let Err(error) = W::run_op(db, op, state).await {
+            assert_admissible_client_error(faults, "running client operation", error);
             return i + 1;
         }
     }
     consumed.store(ops.len(), Ordering::SeqCst);
     ops.len()
+}
+
+fn assert_admissible_client_error(faults: FaultConfig, context: &str, error: Error) {
+    if client_error_is_admissible(faults, &error) {
+        return;
+    }
+    panic!("{context} returned unexpected error: {error} ({error:?})");
+}
+
+fn client_error_is_admissible(faults: FaultConfig, error: &Error) -> bool {
+    faults.failures_enabled() && matches!(error, Error::InDoubt(_) | Error::Unavailable(_))
 }
 
 /// Core harness, generic over the workload: seed the store, run the clients as
@@ -329,9 +374,9 @@ async fn run_generic<W: SimWorkload>(
     seed: u64,
     fault_tape: Vec<u8>,
 ) -> OpLog {
-    // The fault tape guides each client's transport faults, crash timing, and
-    // outage windows; with an empty tape all fall back to the seed
-    // (PCT/seed-breadth runs).
+    // The fault tape guides each client's transport failures, crash timing,
+    // outage windows, and the independent one-shot slow mutation. With an empty
+    // tape all decisions fall back to the seed (PCT/seed-breadth runs).
     let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
 
     // The store and a shared recorder form a faultless backbone; each client gets
@@ -342,15 +387,27 @@ async fn run_generic<W: SimWorkload>(
     // backbone so setup cannot fail spuriously.
     let init_db = W::open_db(&backbone).await.expect("open init db");
     workload.seed(&init_db).await;
+    init_db.shutdown().await;
+    drop(init_db);
 
     let state = Arc::new(workload.new_state());
 
-    // One transport per client over the shared backbone. Faults are live only
-    // while the clients run.
+    // One transport per client over the shared backbone. Injectors are live
+    // only while the clients run.
     let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
     let nclients = client_ops.len();
+    let client_backbone: Arc<dyn Backend> = if faults.slow_mutations_enabled() {
+        slow_backend::with_tape(
+            backbone.clone(),
+            fault_tape,
+            seed ^ SLOW_MUTATION_SEED,
+            ProtocolTiming::simulation(),
+        )
+    } else {
+        backbone.clone()
+    };
     let (transports, client_backends) =
-        build_transports(&backbone, faults, seed, &streams, nclients);
+        build_transports(&client_backbone, faults, seed, &streams, nclients);
 
     // Each client runs as its own task over its own transport so the scheduler
     // can interleave them. A `CancellationToken` lets the crash nemesis
@@ -371,13 +428,17 @@ async fn run_generic<W: SimWorkload>(
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
             let crashed = {
-                let Ok(db) = W::open_db(&backend).await else {
-                    return;
+                let db = match W::open_db(&backend).await {
+                    Ok(db) => db,
+                    Err(error) => {
+                        assert_admissible_client_error(faults, "opening client database", error);
+                        return;
+                    }
                 };
                 let crashed = tokio::select! {
                     biased;
                     _ = signal.cancelled() => true,
-                    _ = run_generic_client::<W>(&db, &ops, &state, &consumed) => false,
+                    _ = run_generic_client::<W>(&db, &ops, &state, &consumed, faults) => false,
                 };
                 if !crashed {
                     db.shutdown().await;
@@ -391,13 +452,19 @@ async fn run_generic<W: SimWorkload>(
             // non-idempotent op). The restart is uncancellable so it runs to
             // completion.
             let n = consumed.load(Ordering::SeqCst);
-            if crashed
-                && n < ops.len()
-                && let Ok(db) = W::open_db(&backend).await
-            {
-                let dummy = AtomicUsize::new(0);
-                let _ = run_generic_client::<W>(&db, &ops[n..], &state, &dummy).await;
-                db.shutdown().await;
+            if crashed && n < ops.len() {
+                match W::open_db(&backend).await {
+                    Ok(db) => {
+                        let dummy = AtomicUsize::new(0);
+                        run_generic_client::<W>(&db, &ops[n..], &state, &dummy, faults).await;
+                        db.shutdown().await;
+                    }
+                    Err(error) => assert_admissible_client_error(
+                        faults,
+                        "reopening crashed client database",
+                        error,
+                    ),
+                }
             }
         }));
     }
@@ -410,16 +477,16 @@ async fn run_generic<W: SimWorkload>(
     let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
 
     for h in handles {
-        let _ = h.await;
+        h.await.expect("client task failed");
     }
     if let Some(h) = observer {
-        let _ = h.await;
+        h.await.expect("observer task failed");
     }
     if let Some(h) = crash {
-        let _ = h.await;
+        h.await.expect("crash nemesis task failed");
     }
     if let Some(h) = outage {
-        let _ = h.await;
+        h.await.expect("outage nemesis task failed");
     }
 
     // Heal every transport before verifying so recovery reads cannot themselves
@@ -430,8 +497,13 @@ async fn run_generic<W: SimWorkload>(
 
     // The workload reads the final committed state (driving recovery of any
     // crashed client's locks via lease expiry) and asserts its invariant.
-    workload.verify(&init_db, &state, faults.enabled).await;
-    init_db.shutdown().await;
+    let verify_db = W::open_db(&backbone)
+        .await
+        .expect("open fresh verification db");
+    workload
+        .verify(&verify_db, &state, faults.failures_enabled())
+        .await;
+    verify_db.shutdown().await;
     log
 }
 
@@ -447,9 +519,9 @@ pub async fn run_and_assert<W: SimWorkload>(workload: W) {
     run_generic(workload, FaultConfig::none(), 0, Vec::new()).await;
 }
 
-/// Like [`run_and_assert`] but injects backend faults and client crashes per
-/// `faults`. `fault_tape` guides the fault schedule (the fuzzer's secondary
-/// tape); once it is exhausted, decisions fall back to `seed`.
+/// Like [`run_and_assert`] but applies the failure and slow-mutation modes in
+/// `faults`. `fault_tape` guides their schedule (the fuzzer's secondary tape);
+/// once it is exhausted, decisions fall back to `seed`.
 pub async fn run_and_assert_with_faults<W: SimWorkload>(
     workload: W,
     faults: FaultConfig,
@@ -465,8 +537,8 @@ pub async fn run_and_record<W: SimWorkload>(workload: &W) -> OpLog {
     run_generic(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
 }
 
-/// Like [`run_and_record`] but with fault injection enabled per `faults`.
-/// `fault_tape` guides the fault schedule; it falls back to `seed` once spent.
+/// Like [`run_and_record`] but with the configured failure/slow-mutation modes.
+/// `fault_tape` guides injection; it falls back to `seed` once spent.
 pub async fn run_and_record_with_faults<W: SimWorkload>(
     workload: &W,
     faults: FaultConfig,
@@ -597,5 +669,79 @@ pub fn pct_sweep<W: SimWorkload>(
 ) {
     for seed in seeds {
         pct_assert(workload, faults, seed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fault_config_decodes_four_modes_without_shifting_the_tail() {
+        let cases = [
+            (0, false, false),
+            (1, true, false),
+            (2, false, true),
+            (3, true, true),
+        ];
+        for (mode, failures, slow_mutations) in cases {
+            let bytes = [mode, 99, 77];
+            let mut input = Unstructured::new(&bytes);
+            let decoded = FaultConfig::arbitrary(&mut input).unwrap();
+            assert_eq!(decoded.failures, failures);
+            assert_eq!(decoded.slow_mutations, slow_mutations);
+            assert_eq!(input.len(), 1, "mode {mode} consumed the wrong byte count");
+        }
+    }
+
+    #[test]
+    fn only_uncertain_errors_are_admissible_with_failures() {
+        let failures = FaultConfig::failures(1);
+        assert!(client_error_is_admissible(
+            failures,
+            &Error::InDoubt("test".into())
+        ));
+        assert!(client_error_is_admissible(
+            failures,
+            &Error::Unavailable("test".into())
+        ));
+        assert!(!client_error_is_admissible(failures, &Error::NotFound));
+        assert!(!client_error_is_admissible(
+            FaultConfig::slow_mutations(),
+            &Error::InDoubt("test".into())
+        ));
+    }
+
+    #[derive(Clone, Default)]
+    struct PanickingWorkload {
+        clients: Vec<Vec<()>>,
+    }
+
+    impl SimWorkload for PanickingWorkload {
+        type Op = ();
+        type State = ();
+
+        fn clients(&self) -> &[Vec<Self::Op>] {
+            &self.clients
+        }
+
+        fn new_state(&self) -> Self::State {}
+
+        async fn seed(&self, _db: &Database) {}
+
+        async fn run_op(_db: &Database, _op: &Self::Op, _state: &Self::State) -> Result<(), Error> {
+            panic!("intentional workload panic")
+        }
+
+        async fn verify(&self, _db: &Database, _state: &Self::State, _failures_enabled: bool) {}
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "client task failed")]
+    async fn client_task_panics_reach_the_harness() {
+        run_and_assert(PanickingWorkload {
+            clients: vec![vec![()]],
+        })
+        .await;
     }
 }

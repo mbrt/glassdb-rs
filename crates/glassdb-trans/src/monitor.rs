@@ -19,39 +19,83 @@ use tokio::sync::oneshot;
 
 use crate::error::TransError;
 
-pub(crate) const PENDING_TX_TIMEOUT: Duration = Duration::from_secs(15);
-pub(crate) const MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
 const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 
-fn refresh_timeout() -> Duration {
-    // refreshMultiplier = 0.5
-    PENDING_TX_TIMEOUT / 2
+/// Timing parameters for transaction liveness and recovery.
+///
+/// Production uses [`ProtocolTiming::default`]. Deterministic simulation uses
+/// [`ProtocolTiming::simulation`] so lease-boundary interleavings are cheap to
+/// explore while preserving the production ratios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolTiming {
+    pending_timeout: Duration,
+    max_clock_skew: Duration,
 }
 
-/// Absolute lease check (ADR-021): compares the holder's own wall-clock lease
-/// `timestamp` against the observer's `now`. The comparison crosses machines, so
-/// it is padded by `MAX_CLOCK_SKEW`. Lets a waiter immediately reclaim a holder
-/// whose last refresh is already ancient the first time it is seen.
-///
-/// This is also GC's safety horizon (ADR-022): a transaction object is
-/// collectable-by-age exactly when its lease `timestamp` is expired by this
-/// predicate, and for an aborted object (whose `timestamp` is the abort instant)
-/// it doubles as the tombstone-retention gate.
-pub(crate) fn is_expired(last_refresh: SystemTime, now: SystemTime) -> bool {
-    // Go: now.Sub(lastRefresh.Add(maxClockSkew)) > pendingTxTimeout
-    match now.duration_since(last_refresh + MAX_CLOCK_SKEW) {
-        Ok(d) => d > PENDING_TX_TIMEOUT,
-        Err(_) => false,
+impl ProtocolTiming {
+    /// Creates a timing profile with an explicit pending-transaction timeout
+    /// and maximum expected clock skew between database clients.
+    ///
+    /// `max_clock_skew` must conservatively bound the clocks of every client
+    /// using the database; underestimating it can reclaim a live transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `pending_timeout` is zero.
+    pub const fn new(pending_timeout: Duration, max_clock_skew: Duration) -> Self {
+        assert!(
+            !pending_timeout.is_zero(),
+            "pending timeout must be non-zero"
+        );
+        Self {
+            pending_timeout,
+            max_clock_skew,
+        }
+    }
+
+    /// Returns the shortened timing profile used by deterministic simulation.
+    pub const fn simulation() -> Self {
+        Self::new(Duration::from_millis(250), Duration::from_millis(500))
+    }
+
+    /// Returns the interval after which an unrefreshed transaction is stale.
+    pub const fn pending_timeout(self) -> Duration {
+        self.pending_timeout
+    }
+
+    /// Returns the allowance for timestamps written by another machine.
+    pub const fn max_clock_skew(self) -> Duration {
+        self.max_clock_skew
+    }
+
+    /// Applies the skew-padded absolute lease check used for foreign timestamps
+    /// and GC retention horizons.
+    pub(crate) fn is_expired(self, last_refresh: SystemTime, now: SystemTime) -> bool {
+        // Go: now.Sub(lastRefresh.Add(maxClockSkew)) > pendingTxTimeout
+        match now.duration_since(last_refresh + self.max_clock_skew) {
+            Ok(d) => d > self.pending_timeout,
+            Err(_) => false,
+        }
+    }
+
+    fn refresh_interval(self) -> Duration {
+        // refreshMultiplier = 0.5
+        self.pending_timeout / 2
+    }
+
+    /// Applies the observer-relative check used when both endpoints come from
+    /// the same local clock.
+    fn is_expired_no_skew(self, first_seen: SystemTime, now: SystemTime) -> bool {
+        match now.duration_since(first_seen) {
+            Ok(d) => d > self.pending_timeout,
+            Err(_) => false,
+        }
     }
 }
 
-/// Observer-relative check (ADR-024): both endpoints are the observer's *own*
-/// clock — the time it first saw a fact (a missing object, or a lease
-/// `timestamp` value) and `now` — so **no** `MAX_CLOCK_SKEW` is added.
-fn is_expired_no_skew(first_seen: SystemTime, now: SystemTime) -> bool {
-    match now.duration_since(first_seen) {
-        Ok(d) => d > PENDING_TX_TIMEOUT,
-        Err(_) => false,
+impl Default for ProtocolTiming {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(15), Duration::from_secs(30))
     }
 }
 
@@ -109,9 +153,9 @@ struct WaitRequest {
 /// Observer-relative liveness tracker for a watched remote pending transaction
 /// (ADR-024). Remembers the last lease `timestamp` seen on the holder's object
 /// and the observer-clock time it was first seen at that value; if the value
-/// does not advance within `PENDING_TX_TIMEOUT` of `observed_at` (no skew, since
-/// both endpoints are the observer's own clock) the holder has stopped making
-/// progress and is treated as dead.
+/// does not advance within the configured pending timeout of `observed_at` (no
+/// skew, since both endpoints are the observer's own clock) the holder has
+/// stopped making progress and is treated as dead.
 struct PendingProgress {
     last_seen: SystemTime,
     observed_at: SystemTime,
@@ -135,6 +179,7 @@ struct Inner {
     background: Weak<Background>,
     clock: Clock,
     retry: RetryConfig,
+    timing: ProtocolTiming,
     // The transaction-tracking maps are partitioned into independent shards
     // keyed by tid. Grouping the three maps under one lock per shard keeps
     // their cross-map updates (e.g. removing a tx and notifying its waiters)
@@ -166,19 +211,22 @@ impl Monitor {
             background,
             Clock::real(),
             RetryConfig::default(),
+            ProtocolTiming::default(),
         )
     }
 
     /// Creates a monitor with a custom clock (used in tests for deterministic
-    /// expiry/refresh timing) and retry-backoff configuration. The retry config
-    /// tunes the backoff used when polling a peer transaction's commit status
-    /// and when writing a transaction's final log.
+    /// expiry/refresh timing), retry-backoff configuration, and transaction
+    /// liveness timing. The retry config tunes the backoff used when polling a
+    /// peer transaction's commit status and when writing a transaction's final
+    /// log.
     pub fn with_config(
         tl: TLogger,
         timeline: Timeline,
         background: Weak<Background>,
         clock: Clock,
         retry: RetryConfig,
+        timing: ProtocolTiming,
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
@@ -188,9 +236,14 @@ impl Monitor {
                 background,
                 clock,
                 retry,
+                timing,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
             }),
         }
+    }
+
+    pub(crate) fn protocol_timing(&self) -> ProtocolTiming {
+        self.inner.timing
     }
 
     /// Registers a new pending local transaction.
@@ -803,8 +856,9 @@ impl Monitor {
                 // whose last refresh is already ancient is reclaimed at once.
                 // Observer-relative progress check (one clock — no skew): a
                 // holder that stops bumping its lease `timestamp` while a waiter
-                // watches it is dead within `PENDING_TX_TIMEOUT` (ADR-024).
-                if is_expired(status.last_update, now)
+                // watches it is dead within the configured pending timeout
+                // (ADR-024).
+                if self.inner.timing.is_expired(status.last_update, now)
                     || self.pending_no_progress(tid, status.last_update, now)
                 {
                     self.clear_pending_progress(tid);
@@ -828,8 +882,8 @@ impl Monitor {
     /// Observer-relative no-progress check (ADR-024). Records the lease
     /// `timestamp` seen on the holder's pending object and when (observer clock)
     /// it was first seen at that value. Returns `true` only if the value has not
-    /// advanced within `PENDING_TX_TIMEOUT` of that first sight — comparing two
-    /// values from the *same* observer clock, so no `MAX_CLOCK_SKEW` is owed.
+    /// advanced within the pending timeout of that first sight — comparing two
+    /// values from the *same* observer clock, so no clock-skew allowance is owed.
     fn pending_no_progress(&self, tid: &TxId, last_update: SystemTime, now: SystemTime) -> bool {
         let mut st = self.shard_for(tid).lock().unwrap();
         match st.pending_progress.get_mut(tid) {
@@ -850,7 +904,7 @@ impl Monitor {
                     p.observed_at = now;
                     false
                 } else {
-                    is_expired_no_skew(p.observed_at, now)
+                    self.inner.timing.is_expired_no_skew(p.observed_at, now)
                 }
             }
         }
@@ -878,10 +932,10 @@ impl Monitor {
         };
 
         // Observer-relative grace: the object must *appear* within
-        // `PENDING_TX_TIMEOUT` of first sight. Both endpoints are the observer's
-        // own clock, so this owes no `MAX_CLOCK_SKEW` (ADR-024 refines ADR-021,
+        // the pending timeout of first sight. Both endpoints are the observer's
+        // own clock, so this owes no skew allowance (ADR-024 refines ADR-021,
         // which over-granted this window by reusing the skew-padded check).
-        if is_expired_no_skew(first_check, now) {
+        if self.inner.timing.is_expired_no_skew(first_check, now) {
             let status = self
                 .inner
                 .tl
@@ -964,13 +1018,13 @@ impl Monitor {
     }
 
     /// Background lease refresher (ADR-021/ADR-024). Under hold-and-wait a live
-    /// transaction can block while holding locks for far longer than
-    /// `PENDING_TX_TIMEOUT`, so this loop keeps its lease fresh until the
+    /// transaction can block while holding locks for far longer than the
+    /// configured pending timeout, so this loop keeps its lease fresh until the
     /// transaction commits or aborts (`should_refresh` flips). It is
     /// load-bearing: its **first** write *creates* the pending transaction
     /// object with create-if-absent semantics, materializing the lazily-created
     /// object (ADR-024); thereafter it CAS-bumps the `timestamp` over the
-    /// object's version every `PENDING_TX_TIMEOUT / 2`.
+    /// object's version halfway through each pending interval.
     ///
     /// Create-if-absent is what keeps lazy materialization wound-safe: if an
     /// older peer already wounded this transaction (wrote an `aborted` object)
@@ -988,7 +1042,7 @@ impl Monitor {
         let mut last_observation: Option<Observation<TxLog>> = None;
 
         loop {
-            rt::sleep(refresh_timeout()).await;
+            rt::sleep(self.inner.timing.refresh_interval()).await;
             if !self.should_refresh(&tid) {
                 return;
             }
@@ -1069,6 +1123,24 @@ mod tests {
     use glassdb_data::CollectionPath;
     use glassdb_storage::{CachedStore, LockType, Timeline, TxWrite};
 
+    #[test]
+    fn protocol_timing_profiles_preserve_liveness_boundaries() {
+        let production = ProtocolTiming::default();
+        assert_eq!(production.pending_timeout(), Duration::from_secs(15));
+        assert_eq!(production.max_clock_skew(), Duration::from_secs(30));
+        assert_eq!(production.refresh_interval(), Duration::from_millis(7_500));
+
+        let simulation = ProtocolTiming::simulation();
+        assert_eq!(simulation.pending_timeout(), Duration::from_millis(250));
+        assert_eq!(simulation.max_clock_skew(), Duration::from_millis(500));
+        assert_eq!(simulation.refresh_interval(), Duration::from_millis(125));
+
+        let refreshed = SystemTime::UNIX_EPOCH;
+        let boundary = refreshed + simulation.pending_timeout() + simulation.max_clock_skew();
+        assert!(!simulation.is_expired(refreshed, boundary));
+        assert!(simulation.is_expired(refreshed, boundary + Duration::from_nanos(1)));
+    }
+
     fn key_ref(key: &[u8]) -> KeyRef {
         KeyRef::new(CollectionPath::new("test", b"collection"), key)
     }
@@ -1099,6 +1171,7 @@ mod tests {
             Arc::downgrade(&bg),
             clock.clone(),
             RetryConfig::default(),
+            ProtocolTiming::default(),
         );
         (mon, TestCtx { tl, clock, _bg: bg })
     }
@@ -1270,8 +1343,8 @@ mod tests {
     }
 
     // ADR-024: a peer that repeatedly polls a *live* holder over a span far
-    // beyond `PENDING_TX_TIMEOUT` never reclaims it, because the refresher bumps
-    // the lease timestamp every `PENDING_TX_TIMEOUT/2`, so the observer always
+    // beyond the pending timeout never reclaims it, because the refresher bumps
+    // the lease timestamp halfway through each interval, so the observer always
     // sees progress (neither the absolute lease nor the relative no-progress
     // check fires).
     #[tokio::test(start_paused = true)]
@@ -1300,7 +1373,7 @@ mod tests {
     }
 
     // ADR-024: a crashed holder whose pending object exists but stops being
-    // refreshed is reclaimed within `PENDING_TX_TIMEOUT` by the observer-relative
+    // refreshed is reclaimed within the pending timeout by the observer-relative
     // no-progress check — even though its absolute (skew-padded) lease is nowhere
     // near expiry — once a watcher has seen it make no progress for that long.
     #[tokio::test(start_paused = true)]
@@ -1310,8 +1383,8 @@ mod tests {
         let tx = TxId::from_bytes(b"dead".to_vec());
 
         // A pending object stamped "now" that never refreshes (a crashed
-        // holder). Its absolute lease stays valid for `PENDING_TX_TIMEOUT +
-        // MAX_CLOCK_SKEW`, so only the relative check can reclaim it sooner.
+        // holder). Its absolute lease includes both the pending timeout and
+        // skew allowance, so only the relative check can reclaim it sooner.
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Pending);
         tl.timestamp = Some(t.clock.now());
         t.tl.set(&tl).await.unwrap();
@@ -1320,7 +1393,7 @@ mod tests {
         assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
         // No progress for longer than the timeout on the observer's own clock.
-        tokio::time::sleep(PENDING_TX_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::sleep(mon.protocol_timing().pending_timeout() + Duration::from_secs(1)).await;
 
         // The stalled holder is reclaimed (aborted), well before its absolute
         // lease would have expired.
@@ -1338,7 +1411,8 @@ mod tests {
             observer.tx_status(&tx).await.unwrap(),
             TxCommitStatus::Pending
         );
-        tokio::time::sleep(PENDING_TX_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::sleep(observer.protocol_timing().pending_timeout() + Duration::from_secs(1))
+            .await;
 
         owner
             .tl

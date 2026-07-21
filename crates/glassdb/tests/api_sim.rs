@@ -7,7 +7,8 @@
 mod sim_support;
 
 use sim_support::{
-    assert_no_divergence, fault_tape, record_faults_with_tape, record_once, record_with_tapes, tape,
+    assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape,
+    record_once, record_with_tapes, tape,
 };
 
 use glassdb::rt::{TapeScheduler, block_on_with};
@@ -66,7 +67,7 @@ fn transaction_program_invariants_hold_under_contention() {
 #[test]
 fn op_stream_is_byte_identical_with_faults() {
     let workload = contended_api_workload();
-    let faults = FaultConfig::enabled(224);
+    let faults = FaultConfig::failures(224);
     let first = record_faults_with_tape(59, &workload, faults, fault_tape(59));
     let second = record_faults_with_tape(59, &workload, faults, fault_tape(59));
     assert_no_divergence("faulted API workload", &first, &second);
@@ -76,8 +77,13 @@ fn op_stream_is_byte_identical_with_faults() {
 fn model_holds_under_crash_restart_and_outages() {
     let workload = contended_api_workload();
     block_on_with(TapeScheduler::new(tape(71)), 71, async move {
-        run_and_assert_with_faults(workload, FaultConfig::enabled(255), 71, fault_tape(71)).await
+        run_and_assert_with_faults(workload, FaultConfig::failures(255), 71, fault_tape(71)).await
     });
+}
+
+#[test]
+fn api_model_holds_with_slow_mutations() {
+    assert_slow_mutation_modes("API workload", &contended_api_workload());
 }
 
 #[test]
@@ -91,14 +97,14 @@ fn boundary_tapes_replay_deterministically() {
         let first = record_with_tapes(
             83,
             &workload,
-            FaultConfig::enabled(192),
+            FaultConfig::failures(192),
             schedule.clone(),
             fault_tape.clone(),
         );
         let second = record_with_tapes(
             83,
             &workload,
-            FaultConfig::enabled(192),
+            FaultConfig::failures(192),
             schedule,
             fault_tape,
         );
@@ -109,8 +115,8 @@ fn boundary_tapes_replay_deterministically() {
 #[test]
 fn pct_schedule_is_byte_identical_per_seed() {
     let workload = contended_api_workload();
-    let first = pct_record(&workload, FaultConfig::enabled(160), 97);
-    let second = pct_record(&workload, FaultConfig::enabled(160), 97);
+    let first = pct_record(&workload, FaultConfig::failures(160), 97);
+    let second = pct_record(&workload, FaultConfig::failures(160), 97);
     assert_no_divergence(
         "PCT API workload",
         &first.lock().unwrap(),
@@ -120,5 +126,5 @@ fn pct_schedule_is_byte_identical_per_seed() {
 
 #[test]
 fn pct_seed_breadth_holds_api_model() {
-    pct_sweep(&contended_api_workload(), FaultConfig::enabled(192), 0..16);
+    pct_sweep(&contended_api_workload(), FaultConfig::failures(192), 0..16);
 }

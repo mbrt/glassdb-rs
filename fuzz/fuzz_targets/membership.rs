@@ -13,8 +13,9 @@
 //! The generic harness ([`glassdb::sim::replay_input`]) asserts that every
 //! committed listing is strictly sorted and drawn from the key universe, and
 //! that the final key set matches the per-key membership accounting (exactly
-//! with faults off; within the in-doubt bound otherwise). Any violation panics,
-//! which libFuzzer reports as a crash. `cargo fuzz` overrides the
+//! without transport failures, including slow-only runs; within the in-doubt
+//! bound otherwise). Any violation panics, which libFuzzer reports as a crash.
+//! `cargo fuzz` overrides the
 //! `fuzz/.cargo/config.toml` rustflags, so `--cfg sim --cfg tokio_unstable` must
 //! be passed through the environment:
 //!
