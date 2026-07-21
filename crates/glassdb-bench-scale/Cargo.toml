@@ -29,6 +29,7 @@ glassdb-concurr = { workspace = true }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3.32"
+async-trait = "0.1.89"
 rand = "0.10.1"
 # mixbench emits/diffs its result grid as JSON.
 serde = { version = "1", features = ["derive"] }
@@ -53,3 +54,6 @@ libc = "0.2"
 
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1.52"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -42,7 +42,7 @@ message Write {
 
 message CollectionLocks {
     repeated EntryLock entry_locks = 1;
-    repeated LeafLock leaf_locks = 2;
+    repeated MembershipLock membership_locks = 2;
 }
 
 message EntryLock {
@@ -50,7 +50,7 @@ message EntryLock {
     Lock.LockType lock_type = 2;
 }
 
-message LeafLock {
+message MembershipLock {
     oneof target {
         // The collection root object (`_i`). Always encoded as true.
         bool root = 1;
@@ -58,7 +58,6 @@ message LeafLock {
         string node = 2;
     }
     Lock.LockType lock_type = 3;
-    Lock.Scope scope = 4;
 }
 
 message Lock {
@@ -68,12 +67,6 @@ message Lock {
         READ = 2;
         WRITE = 3;
         CREATE = 4;
-    }
-
-    enum Scope {
-        UNKNOWN_SCOPE = 0;
-        STRUCTURE = 1;
-        MEMBERSHIP = 2;
     }
 }
 

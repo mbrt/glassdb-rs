@@ -6,10 +6,9 @@
 //! single read-modify-write CAS: resolve every touched key's holders
 //! (help-forward committed holders, drop aborted ones, wound-wait the live
 //! pending ones), install this transaction's locks, then CAS the shard back.
-//! Create/delete additionally take the owning leaf's membership-write lock,
-//! while every coordination-object mutation holds its structure-read lock
-//! (ADR-032). Write-back republishes `current_writer` pointers and releases all
-//! three scopes together.
+//! Create/delete additionally take the owning leaf's membership-write lock.
+//! Every node rewrite proves the exclusive structural gate absent in the state
+//! it conditionally replaces (ADR-044).
 //!
 //! The [`Locker`] owns the *policy*: how a transaction groups its keys, the
 //! parallel/serial acquisition strategy, the hold-and-wait loop, and the
@@ -42,7 +41,7 @@ use glassdb_storage::{
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{Reclaim, ReconciledLeaf, resolve_entry_locks, try_reclaim};
+use crate::node_locking::{NodeLockReconciler, Reclaim, resolve_entry_locks, try_reclaim};
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
     Step,
@@ -54,19 +53,27 @@ type LockerShard = Mutex<HashMap<TxId, HashMap<String, HeldLeaf>>>;
 
 #[derive(Clone, Copy)]
 struct HeldLeaf {
-    typ: LockType,
+    entry_lock: LockType,
     membership: LockType,
+}
+
+/// Aggregate lock strengths locally held by one transaction on one leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldLeafSnapshot {
+    pub path: String,
+    pub entry_lock: LockType,
+    pub membership_lock: LockType,
 }
 
 /// Diagnostic snapshot of one transaction's locally-tracked held locks.
 ///
 /// Returned by [`Locker::tx_locks_snapshot`] for operators investigating hangs.
-/// The locks list is sorted by path for stable display. In v2 the tracked paths
-/// are the shard and root objects the transaction holds (not per-key objects).
+/// The leaf list is sorted by path for stable display. It summarizes lock
+/// strength without cloning the transaction's individual keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxLockSnapshot {
     pub tx_id: TxId,
-    pub locks: Vec<TxLock>,
+    pub leaves: Vec<HeldLeafSnapshot>,
 }
 
 /// The lock a transaction wants on a key's shard entry.
@@ -129,10 +136,6 @@ impl LockedTx {
                     typ: lock_type(intent.desired),
                 });
             }
-            out.push(TxLock::Structure {
-                leaf: group.leaf.clone(),
-                typ: LockType::Read,
-            });
             if group.membership != LockType::None {
                 out.push(TxLock::Membership {
                     leaf: group.leaf.clone(),
@@ -149,17 +152,6 @@ fn lock_type(desired: Desired) -> LockType {
     match desired {
         Desired::Read => LockType::Read,
         Desired::Put | Desired::Delete => LockType::Write,
-    }
-}
-
-fn lock_order(lock: &TxLock) -> (String, u8) {
-    match lock {
-        TxLock::Entry { key, .. } => (
-            format!("{}\0{:?}", key.collection().physical_prefix(), key.key()),
-            0,
-        ),
-        TxLock::Structure { leaf, .. } => (leaf.physical_path(), 1),
-        TxLock::Membership { leaf, .. } => (leaf.physical_path(), 2),
     }
 }
 
@@ -268,7 +260,6 @@ async fn build_groups(
 /// transaction's lock (ADR-024).
 struct AcquireResolver {
     id: TxId,
-    path: String,
     intents: Arc<Vec<KeyIntent>>,
     membership: LockType,
 }
@@ -281,11 +272,18 @@ impl ShardResolver for AcquireResolver {
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let mut leaf = ReconciledLeaf::new(ctx, &self.path, &self.id, staged, staged_locks).await?;
+        let mut locks = staged_locks.clone();
+        let reconciler = NodeLockReconciler::new(ctx.tmon, &self.id);
+        if let Some(holder) = reconciler.admit_non_structural(&mut locks).await? {
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Wait(holder),
+            });
+        }
         let mut membership = self.membership;
         let mut admission = StageAdmission::ExistingKeys;
+        let mut entries = Vec::with_capacity(self.intents.len());
         for intent in self.intents.iter() {
-            let cur = leaf.entry(&intent.raw_key).cloned();
+            let cur = staged.get(&intent.raw_key).cloned();
             match resolve_and_lock(ctx, &self.id, intent, cur).await? {
                 EntryResolution::Locked(entry, changes_membership) => {
                     if changes_membership {
@@ -294,7 +292,7 @@ impl ShardResolver for AcquireResolver {
                             admission = StageAdmission::AddsKey;
                         }
                     }
-                    leaf.insert_entry(intent.raw_key.clone(), entry);
+                    entries.push((intent.raw_key.clone(), entry));
                 }
                 // A member stages all its keys or none (member atomicity): the
                 // moment a key must wait, stage nothing and return Wait.
@@ -306,15 +304,17 @@ impl ShardResolver for AcquireResolver {
             }
         }
 
-        if let Some(holder) = leaf.acquire_mutation_locks(ctx, membership).await? {
-            return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
-            });
-        }
         if membership != LockType::None {
-            membership = leaf.membership_lock_type();
+            if let Some(holder) = reconciler
+                .acquire_membership(&mut locks, membership)
+                .await?
+            {
+                return Ok(Step::Skip {
+                    outcome: FoldOutcome::Wait(holder),
+                });
+            }
+            membership = locks.membership().lock_type();
         }
-        let (entries, locks) = leaf.into_stage(staged);
         Ok(Step::Stage {
             entries,
             locks,
@@ -349,13 +349,16 @@ impl ShardResolver for AcquireResolver {
 fn shard_lock_type(intents: &[KeyIntent]) -> LockType {
     if intents.iter().any(|i| !matches!(i.desired, Desired::Read)) {
         LockType::Write
+    } else if intents.is_empty() {
+        LockType::None
     } else {
         LockType::Read
     }
 }
 
 /// Publishes its committed writes on its keys and drops its holds (ADR-020).
-/// Never lock-conflicts, so it always folds into any round.
+/// A gated leaf is mutated only after the current routed state proves this
+/// transaction still has a holder that needs publishing.
 struct WriteBackResolver {
     id: TxId,
     intents: Arc<Vec<KeyIntent>>,
@@ -365,17 +368,38 @@ struct WriteBackResolver {
 impl ShardResolver for WriteBackResolver {
     async fn resolve(
         &self,
-        _ctx: &ResolveCtx<'_>,
+        ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
+        let owns_entry = self.intents.iter().any(|intent| {
+            staged
+                .get(&intent.raw_key)
+                .is_some_and(|entry| entry.locked_by.contains(&self.id))
+        });
+        let owns_membership = staged_locks.membership().contains(&self.id);
+        let mut locks = staged_locks.clone();
+        if let Some(holder) = NodeLockReconciler::new(ctx.tmon, &self.id)
+            .admit_non_structural(&mut locks)
+            .await?
+        {
+            if !owns_entry && !owns_membership {
+                return Ok(Step::Skip {
+                    outcome: FoldOutcome::Released {
+                        superseded: Vec::new(),
+                    },
+                });
+            }
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Wait(holder),
+            });
+        }
         let WritebackStaged {
             changes,
             superseded,
         } = writeback_changes(&self.id, &self.intents, staged);
         let outcome = FoldOutcome::Released { superseded };
-        let mut locks = staged_locks.clone();
-        let locks_changed = locks.release(&self.id);
+        let locks_changed = locks.release_membership(&self.id);
         if changes.is_empty() && !locks_changed {
             Ok(Step::Skip { outcome })
         } else {
@@ -393,14 +417,26 @@ impl ShardResolver for WriteBackResolver {
     }
 
     fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Released {
-            superseded: Vec::new(),
-        }
+        // Exhaustion proves neither publication nor that gate acquisition
+        // removed our holder. Re-descend and keep converging from current
+        // routing state.
+        FoldOutcome::Reroute
+    }
+
+    fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+        FoldOutcome::Reroute
+    }
+
+    fn owned_keys(&self) -> Vec<&[u8]> {
+        self.intents
+            .iter()
+            .map(|intent| intent.raw_key.as_slice())
+            .collect()
     }
 }
 
 /// Drops every hold this transaction has in the shard, publishing nothing
-/// (ADR-024 serial-fallback release). Never lock-conflicts.
+/// (ADR-024 serial-fallback release).
 struct ReleaseResolver {
     id: TxId,
 }
@@ -409,16 +445,35 @@ struct ReleaseResolver {
 impl ShardResolver for ReleaseResolver {
     async fn resolve(
         &self,
-        _ctx: &ResolveCtx<'_>,
+        ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
+        let owns_entry = staged
+            .values()
+            .any(|entry| entry.locked_by.contains(&self.id));
+        let owns_membership = staged_locks.membership().contains(&self.id);
+        let mut locks = staged_locks.clone();
+        if let Some(holder) = NodeLockReconciler::new(ctx.tmon, &self.id)
+            .admit_non_structural(&mut locks)
+            .await?
+        {
+            if !owns_entry && !owns_membership {
+                return Ok(Step::Skip {
+                    outcome: FoldOutcome::Released {
+                        superseded: Vec::new(),
+                    },
+                });
+            }
+            return Ok(Step::Skip {
+                outcome: FoldOutcome::Wait(holder),
+            });
+        }
         let changes = release_changes(&self.id, staged);
         let outcome = FoldOutcome::Released {
             superseded: Vec::new(),
         };
-        let mut locks = staged_locks.clone();
-        let locks_changed = locks.release(&self.id);
+        let locks_changed = locks.release_membership(&self.id);
         if changes.is_empty() && !locks_changed {
             Ok(Step::Skip { outcome })
         } else {
@@ -456,6 +511,11 @@ enum EntryResolution {
 struct WritebackStaged {
     changes: Vec<(Vec<u8>, ShardEntry)>,
     superseded: Vec<TxId>,
+}
+
+enum WriteBackOutcome {
+    Released(Vec<TxId>),
+    Reroute,
 }
 
 /// Resolves the holders of an entry (help-forward committed, drop aborted,
@@ -703,25 +763,18 @@ impl Locker {
                 if locks.is_empty() {
                     continue;
                 }
-                let mut paths = Vec::new();
+                let mut leaves = Vec::new();
                 for (p, held) in locks {
-                    let leaf = LeafRef::from_physical_path(p)
-                        .expect("locker tracks only physical leaf paths");
-                    paths.push(TxLock::Structure {
-                        leaf: leaf.clone(),
-                        typ: held.typ,
+                    leaves.push(HeldLeafSnapshot {
+                        path: p.clone(),
+                        entry_lock: held.entry_lock,
+                        membership_lock: held.membership,
                     });
-                    if held.membership != LockType::None {
-                        paths.push(TxLock::Membership {
-                            leaf,
-                            typ: held.membership,
-                        });
-                    }
                 }
-                paths.sort_by_key(lock_order);
+                leaves.sort_by(|a, b| a.path.cmp(&b.path));
                 out.push(TxLockSnapshot {
                     tx_id: tx_id.clone(),
-                    locks: paths,
+                    leaves,
                 });
             }
         });
@@ -814,7 +867,7 @@ impl Locker {
                 .map(|observation| Requirement::AtLeast(observation.current_after()))
                 .unwrap_or(Requirement::Any);
             if let Ok(mut s) = self
-                .write_back_shard(
+                .write_back_routed(
                     id,
                     &group.path,
                     Arc::new(group.intents.clone()),
@@ -850,7 +903,7 @@ impl Locker {
             key: key.clone(),
             desired: Desired::Put,
         }]);
-        self.write_back_shard(
+        self.write_back_routed(
             id,
             leaf_path,
             intents,
@@ -927,7 +980,6 @@ impl Locker {
     ) -> Result<CoordinatedOutcome, TransError> {
         let resolver = Arc::new(AcquireResolver {
             id: id.clone(),
-            path: path.to_string(),
             intents: intents.clone(),
             membership,
         });
@@ -952,30 +1004,88 @@ impl Locker {
         }
     }
 
-    /// Installs this transaction's [`WriteBackResolver`] on a shard and returns
-    /// the `current_writer`s it superseded (GC candidates, ADR-022). Best-effort:
-    /// a shutdown mid-flight leaves the holds to lazy reclaim / lease expiry.
-    async fn write_back_shard(
+    /// Publishes a group and re-descends when a split moved any of its keys.
+    async fn write_back_routed(
         &self,
         id: &TxId,
         path: &str,
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
     ) -> Result<Vec<TxId>, TransError> {
+        let mut pending = vec![(path.to_string(), intents)];
+        let mut superseded = Vec::new();
+        while let Some((path, intents)) = pending.pop() {
+            match self
+                .write_back_shard(id, &path, intents.clone(), requirement)
+                .await?
+            {
+                WriteBackOutcome::Released(mut ids) => superseded.append(&mut ids),
+                WriteBackOutcome::Reroute => {
+                    let items: Vec<(KeyRef, KeyIntent)> = intents
+                        .iter()
+                        .cloned()
+                        .map(|intent| (intent.key.clone(), intent))
+                        .collect();
+                    let groups = self
+                        .dir
+                        .group_keys_by_leaf_fresh(items, Requirement::Any, requirement)
+                        .await
+                        .map_err(|e| TransError::from(e).context("rerouting delayed write-back"))?;
+                    pending.extend(groups.into_iter().map(|group| {
+                        let intents = group.keys.into_iter().map(|(_, intent)| intent).collect();
+                        (group.path, Arc::new(intents))
+                    }));
+                }
+            }
+        }
+        Ok(superseded)
+    }
+
+    /// Installs this transaction's [`WriteBackResolver`] on one routed shard.
+    async fn write_back_shard(
+        &self,
+        id: &TxId,
+        path: &str,
+        intents: Arc<Vec<KeyIntent>>,
+        requirement: Requirement,
+    ) -> Result<WriteBackOutcome, TransError> {
         let resolver = Arc::new(WriteBackResolver {
             id: id.clone(),
             intents,
         });
-        match self
-            .coord
-            .submit_shard(path, id, resolver, requirement)
-            .await?
-        {
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { superseded },
-                ..
-            }) => Ok(superseded),
-            _ => Ok(Vec::new()),
+        let mut backoff = self.retry.backoff();
+        loop {
+            match self
+                .coord
+                .submit_shard(path, id, resolver.clone(), requirement)
+                .await?
+            {
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Released { superseded },
+                    ..
+                }) => return Ok(WriteBackOutcome::Released(superseded)),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Reroute,
+                    ..
+                }) => return Ok(WriteBackOutcome::Reroute),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Wait(holder),
+                    ..
+                }) => {
+                    let delay = backoff.next_delay();
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                        backoff = self.retry.backoff();
+                    }
+                }
+                Some(_) => {
+                    return Err(TransError::other(
+                        "write-back produced a non-cleanup outcome",
+                    ));
+                }
+                None => {
+                    return Err(TransError::other("coordinator shut down during write-back"));
+                }
+            }
         }
     }
 
@@ -997,10 +1107,30 @@ impl Locker {
         requirement: Requirement,
     ) -> Result<(), TransError> {
         let resolver = Arc::new(ReleaseResolver { id: id.clone() });
-        self.coord
-            .submit_shard(path, id, resolver, requirement)
-            .await
-            .map(|_| ())
+        let mut backoff = self.retry.backoff();
+        loop {
+            match self
+                .coord
+                .submit_shard(path, id, resolver.clone(), requirement)
+                .await?
+            {
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Released { .. },
+                    ..
+                }) => return Ok(()),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Wait(holder),
+                    ..
+                }) => {
+                    let delay = backoff.next_delay();
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                        backoff = self.retry.backoff();
+                    }
+                }
+                Some(_) => return Err(TransError::other("release produced a non-cleanup outcome")),
+                None => return Err(TransError::other("coordinator shut down during release")),
+            }
+        }
     }
 
     /// Installs this transaction's locks on every key it touches in one shard,
@@ -1058,6 +1188,7 @@ impl Locker {
                 // takes the safe release-and-relock path.
                 FoldOutcome::Conflict
                 | FoldOutcome::Released { .. }
+                | FoldOutcome::Reroute
                 | FoldOutcome::Landed
                 | FoldOutcome::Moved
                 | FoldOutcome::InDoubt(_) => {
@@ -1078,13 +1209,16 @@ impl Locker {
         }
     }
 
-    /// Records that `id` holds the leaf at `path` at `typ`.
+    /// Records the aggregate entry and membership strengths held on one leaf.
     fn record_leaf_lock(&self, id: &TxId, path: &str, typ: LockType, membership: LockType) {
         let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        tlocks
-            .entry(id.clone())
-            .or_default()
-            .insert(path.to_string(), HeldLeaf { typ, membership });
+        tlocks.entry(id.clone()).or_default().insert(
+            path.to_string(),
+            HeldLeaf {
+                entry_lock: typ,
+                membership,
+            },
+        );
     }
 
     fn held_membership(&self, id: &TxId, path: &str) -> LockType {
@@ -1215,6 +1349,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exhausted_write_back_requires_rerouting() {
+        let resolver = WriteBackResolver {
+            id: mk_tid(1, "writer"),
+            intents: Arc::new(vec![put_intent(b"key")]),
+        };
+
+        assert!(matches!(
+            resolver.exhausted_outcome(false),
+            FoldOutcome::Reroute
+        ));
+        assert!(matches!(
+            resolver.exhausted_outcome(true),
+            FoldOutcome::Reroute
+        ));
+    }
+
     // Routes an intent to the collection's single leaf `_i` (ADR-031: with split
     // deferred, every key coordinates on the root leaf). The `key` is carried by
     // the intent itself, so it is only used for readability at call sites.
@@ -1268,8 +1419,8 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         lock_ok(&locker, &tx, &groups).await;
 
-        // A create installs the entry lock together with structure-R and
-        // membership-W in the same leaf CAS.
+        // A create installs the entry lock and membership-W while proving the
+        // structural gate open in the same leaf CAS.
         let e = entry_of(&ctx, key).await.expect("entry installed");
         assert_eq!(e.lock_type, LockType::Create);
         assert_eq!(e.locked_by, vec![tx.clone()]);
@@ -1281,11 +1432,93 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(loaded.node().structure_lock().lock_type(), LockType::Read);
-        assert!(loaded.node().structure_lock().contains(&tx));
+        assert!(loaded.node().structural_gate().holders().is_empty());
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Write);
         assert!(loaded.node().membership_lock().contains(&tx));
         assert_eq!(loaded.node().membership_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn stable_mutation_does_not_resolve_unrelated_entry_holders() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(backend));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder);
+        let unrelated = mk_tid(1, "unrelated");
+        let tx = mk_tid(2, "tx");
+        let mut root = CollectionRoot::new();
+        root.set_node(Node::leaf(Shard::from_entries([ShardEntry {
+            key: b"other".to_vec(),
+            lock_type: LockType::Write,
+            locked_by: vec![unrelated.clone()],
+            current_writer: None,
+            deleted: false,
+        }])));
+        ctx.shards.create_root(COLL, &root).await.unwrap();
+        log.lock().unwrap().clear();
+        ctx.monitor.begin_tx(&tx);
+
+        lock_ok(&locker, &tx, &group_of(b"target", put_intent(b"target"))).await;
+
+        let unrelated_path = paths::from_transaction("test", &unrelated);
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .all(|op| op.path != unrelated_path),
+            "a disjoint mutation must not inspect an unrelated holder"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutation_waits_for_a_live_structural_gate() {
+        let (locker, ctx) = init_tl_test();
+        let gate = mk_tid(1, "gate");
+        let tx = mk_tid(2, "tx");
+        ctx.monitor.begin_tx(&gate);
+        ctx.monitor.begin_tx(&tx);
+        let mut node = Node::leaf(Shard::new());
+        node.set_structural_gate(gate.clone());
+        let mut root = CollectionRoot::new();
+        root.set_node(node);
+        ctx.shards.create_root(COLL, &root).await.unwrap();
+
+        let waiting_locker = locker.clone();
+        let waiting_tx = tx.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_locker
+                .lock_shards_at(
+                    &waiting_tx,
+                    &group_of(b"target", put_intent(b"target")),
+                    false,
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+
+        ctx.monitor
+            .commit_tx(glassdb_storage::TxLog::new(gate, TxCommitStatus::Ok))
+            .await
+            .unwrap();
+        assert!(matches!(
+            waiting.await.unwrap().unwrap(),
+            ShardsOutcome::Locked(_)
+        ));
+        let loaded = ctx
+            .shards
+            .load_leaf(
+                &paths::collection_info(COLL),
+                Requirement::AtLeast(ctx.timeline.now()),
+            )
+            .await
+            .unwrap();
+        assert!(loaded.node().structural_gate().holders().is_empty());
+        assert_eq!(
+            loaded.entries.lookup(b"target").unwrap().locked_by,
+            vec![tx]
+        );
     }
 
     #[tokio::test]
@@ -1307,7 +1540,6 @@ mod tests {
             deleted: false,
         };
         let mut node = Node::leaf(Shard::from_entries([existing, created]));
-        node.add_structure_reader(tx.clone());
         node.set_membership_writer(tx.clone());
         let mut root = CollectionRoot::new();
         root.set_node(node);
@@ -1342,7 +1574,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!loaded.node().structure_lock().contains(&tx));
+        assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(!loaded.node().membership_lock().contains(&tx));
     }
 
@@ -1363,7 +1595,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(loaded.node().structure_lock().contains(&tx));
+        assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_version(), 0);
     }
@@ -1591,7 +1823,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(loaded.node().structure_lock().holders().is_empty());
+        assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_version(), 2);
         assert!(locker.tx_locks_snapshot().is_empty());
@@ -1675,11 +1907,11 @@ mod tests {
         // A write intention records the held leaf (the small collection's root
         // `_i`) as a write lock.
         let shard_path = paths::collection_info(COLL);
-        assert!(snap[0].locks.iter().any(|lock| matches!(
-            lock,
-            TxLock::Membership { leaf, typ: LockType::Write }
-                if leaf.physical_path() == shard_path
-        )));
+        assert!(snap[0].leaves.iter().any(|leaf| {
+            leaf.path == shard_path
+                && leaf.entry_lock == LockType::Write
+                && leaf.membership_lock == LockType::Write
+        }));
     }
 
     // Helper: commit a value for `key` so the shard records a `current_writer`,

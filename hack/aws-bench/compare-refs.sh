@@ -73,6 +73,8 @@
 #                           that support --drain-timeout
 #   COMMAND_TIMEOUT=15m     hard watchdog for each workload command, including
 #                           historical binaries without per-cell deadlines
+#   DIAGNOSTICS=0          set to 1 for classified backend/protocol metrics;
+#                          both refs must support --diagnostics-dir
 #   OUT=<script dir>/out-refs                output root
 #   BASE_WT, TARGET_WT      worktree paths (defaults are repo-parent siblings)
 set -euo pipefail
@@ -143,6 +145,7 @@ MIX_NUM_KEYS="${MIX_NUM_KEYS:-$NUM_KEYS}"
 MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
 MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-15m}"
+DIAGNOSTICS="${DIAGNOSTICS:-0}"
 OUT="${OUT:-$SCRIPT_DIR/out-refs}"
 BASE_WT="${BASE_WT:-$(dirname "$REPO_ROOT")/.glassdb-perf-base}"
 TARGET_WT_DEFAULT="$(dirname "$REPO_ROOT")/.glassdb-perf-target"
@@ -263,6 +266,10 @@ supports_drain_timeout() {
   "$1" --help 2>&1 | grep -q -- "--drain-timeout"
 }
 
+supports_diagnostics() {
+  "$1" --help 2>&1 | grep -q -- "--diagnostics-dir"
+}
+
 # Run every workload for one side into $OUT/<group>/<label>/.
 #   $1 = label (output subdir + report label)
 #   $2 = bin dir (… /target/release)
@@ -280,12 +287,17 @@ run_side() {
     local d="$OUT/$mix/$label"
     mkdir -p "$d"
     local mix_args=()
+    local diagnostic_args=()
     if [ "$has_mix" = "1" ]; then
       mix_args=(--rw-mix="$mix")
+    fi
+    if [ "$DIAGNOSTICS" = "1" ]; then
+      diagnostic_args=(--diagnostics-dir="$d/diagnostics")
     fi
     log "$label rw9010 mix=$mix"
     run_bounded "$bindir/rtbench" "${common[@]}" "${drain_args[@]}" \
       --test-name=rw9010 "${mix_args[@]}" \
+      "${diagnostic_args[@]}" \
       --db-list="$DB_LIST" --num-keys="$NUM_KEYS" \
       --duration="$DURATION" --num-runs="$NUM_RUNS" \
       --samples-out="$d/samples.csv" --stats-out="$d/stats.csv" \
@@ -356,6 +368,17 @@ supports_rw_mix "$BASE_BIN" && A_MIX=1
 supports_rw_mix "$TARGET_BIN" && B_MIX=1
 supports_drain_timeout "$BASE_BIN/rtbench" && A_DRAIN=1
 supports_drain_timeout "$TARGET_BIN/rtbench" && B_DRAIN=1
+if [ "$DIAGNOSTICS" != "0" ] && [ "$DIAGNOSTICS" != "1" ]; then
+  log "ERROR: DIAGNOSTICS must be 0 or 1, got $DIAGNOSTICS"
+  exit 2
+fi
+if [ "$DIAGNOSTICS" = "1" ]; then
+  if ! supports_diagnostics "$BASE_BIN/rtbench" \
+     || ! supports_diagnostics "$TARGET_BIN/rtbench"; then
+    log "ERROR: DIAGNOSTICS=1 requires --diagnostics-dir support on both refs"
+    exit 2
+  fi
+fi
 if [ "$A_MIX" = "1" ] && [ "$B_MIX" = "1" ]; then
   MIXES="$RW_MIX"
 else
@@ -366,7 +389,8 @@ fi
 MODE_DESC="full"
 [ "$SUMMARY" = "1" ] && MODE_DESC="summary (fast, no plots)"
 log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); mode: $MODE_DESC; \
-mixes: $MIXES; drain-timeout: $DRAIN_TIMEOUT; command-timeout: $COMMAND_TIMEOUT"
+mixes: $MIXES; diagnostics: $DIAGNOSTICS; drain-timeout: $DRAIN_TIMEOUT; \
+command-timeout: $COMMAND_TIMEOUT"
 rm -rf "$OUT"
 
 # --- Run both sides back-to-back -------------------------------------------

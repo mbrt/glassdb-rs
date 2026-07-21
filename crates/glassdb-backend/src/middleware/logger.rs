@@ -7,8 +7,9 @@ use async_trait::async_trait;
 
 use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
-/// A [`Backend`] decorator that emits a `tracing` debug event for every
-/// operation, tagged with the configured backend id.
+/// A [`Backend`] decorator that emits a `tracing` debug event on the
+/// `glassdb::backend` target for every operation, tagged with the configured
+/// backend id.
 pub struct BackendLogger {
     inner: Arc<dyn Backend>,
     id: String,
@@ -42,7 +43,13 @@ fn version_summary(r: &Result<Version, BackendError>) -> String {
 impl Backend for BackendLogger {
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         let r = self.inner.read(path).await;
-        tracing::debug!(backend_id = %self.id, path, res = %read_reply_summary(&r), "Read");
+        tracing::debug!(
+            target: "glassdb::backend",
+            backend_id = %self.id,
+            path,
+            res = %read_reply_summary(&r),
+            "Read"
+        );
         r
     }
 
@@ -53,6 +60,7 @@ impl Backend for BackendLogger {
     ) -> Result<ReadReply, BackendError> {
         let r = self.inner.read_if_modified(path, expected).await;
         tracing::debug!(
+            target: "glassdb::backend",
             backend_id = %self.id,
             path,
             expv = %format!("{expected:?}"),
@@ -71,6 +79,7 @@ impl Backend for BackendLogger {
         let size = value.len();
         let r = self.inner.write_if(path, value, expected).await;
         tracing::debug!(
+            target: "glassdb::backend",
             backend_id = %self.id,
             path,
             args = %format!("val[size]:{size};expv:{expected:?}"),
@@ -88,6 +97,7 @@ impl Backend for BackendLogger {
         let size = value.len();
         let r = self.inner.write_if_not_exists(path, value).await;
         tracing::debug!(
+            target: "glassdb::backend",
             backend_id = %self.id,
             path,
             args = %format!("val[size]:{size}"),
@@ -100,6 +110,7 @@ impl Backend for BackendLogger {
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         let r = self.inner.delete_if(path, expected).await;
         tracing::debug!(
+            target: "glassdb::backend",
             backend_id = %self.id,
             path,
             expv = %format!("{expected:?}"),
@@ -117,6 +128,7 @@ impl Backend for BackendLogger {
     ) -> Result<ListPage, BackendError> {
         let r = self.inner.list(prefix, cursor, limit).await;
         tracing::debug!(
+            target: "glassdb::backend",
             backend_id = %self.id,
             path = prefix,
             cursor = ?cursor,

@@ -22,6 +22,7 @@ produced by `rtbench` and (optionally) the `autoresearch` scoring harness:
 * `mixbench.json`   -> mixed-workload grid: per-shape throughput and ops/tx across
                        contention mode x Database topology (the contention /
                        in-process-dedup efficiency signal).
+* `diagnostics/metrics.csv` -> opt-in backend-role and protocol counters.
 
 Whatever files are present on both sides are compared; the rest are skipped.
 Every metric is reported as the ratio ``b / a`` (the second set over the first),
@@ -240,6 +241,55 @@ def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["ops-per-tx_b"], r["ops-per-tx_a"]), axis=1
+    )
+    return merged
+
+
+def diagnostic_metrics_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
+    """Opt-in component metrics normalized by logical benchmark operations."""
+
+    def agg(df: pd.DataFrame) -> pd.DataFrame:
+        g = (
+            df.groupby(["num-db", "component", "metric"])
+            .agg({"value": "sum", "logical-tx": "sum"})
+            .reset_index()
+        )
+        g["per-tx"] = g["value"] / g["logical-tx"].where(g["logical-tx"] > 0)
+        g["concurrent"] = g["num-db"] * conc_per_db
+        return g
+
+    merged = agg(a).merge(
+        agg(b),
+        on=["num-db", "component", "metric", "concurrent"],
+        suffixes=("_a", "_b"),
+    )
+    merged["ratio"] = merged.apply(
+        lambda r: _ratio(r["per-tx_b"], r["per-tx_a"]), axis=1
+    )
+    return merged
+
+
+def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
+    """Coordinator submissions per round, a direction-neutral batching signal."""
+
+    def agg(df: pd.DataFrame) -> pd.DataFrame:
+        d = df[
+            (df["component"] == "coordinator")
+            & (df["metric"].isin(["submissions", "rounds"]))
+        ]
+        if d.empty:
+            return pd.DataFrame(columns=["num-db", "concurrent", "batch-factor"])
+        g = d.groupby(["num-db", "metric"])["value"].sum().unstack(fill_value=0)
+        if "submissions" not in g or "rounds" not in g:
+            return pd.DataFrame(columns=["num-db", "concurrent", "batch-factor"])
+        g["batch-factor"] = g["submissions"] / g["rounds"].where(g["rounds"] > 0)
+        g = g.reset_index()
+        g["concurrent"] = g["num-db"] * conc_per_db
+        return g[["num-db", "concurrent", "batch-factor"]]
+
+    merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
+    merged["ratio"] = merged.apply(
+        lambda r: _ratio(r["batch-factor_b"], r["batch-factor_a"]), axis=1
     )
     return merged
 
@@ -683,6 +733,60 @@ def main() -> int:
         summaries.append(
             summarize("backend-ops/tx", tbl["ratio"], lower_is_better=True)
         )
+
+    a_diag = read_csv(args.a / "diagnostics", "metrics.csv")
+    b_diag = read_csv(args.b / "diagnostics", "metrics.csv")
+    if a_diag is not None and b_diag is not None:
+        tbl = diagnostic_metrics_table(a_diag, b_diag, cpd)
+        cols = [
+            "concurrent",
+            "component",
+            "metric",
+            "per-tx_a",
+            "per-tx_b",
+            "ratio",
+        ]
+        print_table(f"Diagnostic metrics per transaction ({lb}/{la})", tbl[cols])
+
+        backend = tbl[tbl["component"].str.startswith("backend.")]
+        if not backend.empty:
+            role_totals = (
+                backend.groupby(["concurrent", "component"])
+                .agg({"per-tx_a": "sum", "per-tx_b": "sum"})
+                .reset_index()
+            )
+            role_totals["ratio"] = role_totals.apply(
+                lambda r: _ratio(r["per-tx_b"], r["per-tx_a"]), axis=1
+            )
+            for component, group in role_totals.groupby("component"):
+                summaries.append(
+                    summarize(
+                        f"diag-ops/tx[{component}]",
+                        group["ratio"],
+                        lower_is_better=True,
+                    )
+                )
+
+        protocol = tbl[~tbl["component"].str.startswith("backend.")]
+        for (component, metric), group in protocol.groupby(["component", "metric"]):
+            direction = None if component == "splitter" else True
+            summaries.append(
+                summarize(
+                    f"diag-{component}/tx[{metric}]",
+                    group["ratio"],
+                    lower_is_better=direction,
+                )
+            )
+
+        batch = diagnostic_batch_table(a_diag, b_diag, cpd)
+        print_table(
+            f"Coordinator batching factor ({lb}/{la}; direction-neutral)",
+            batch,
+        )
+        if not batch.empty:
+            summaries.append(
+                summarize("diag-coordinator[batch-factor]", batch["ratio"])
+            )
 
     a_dl, b_dl = read_csv(args.a, "deadlock.csv"), read_csv(args.b, "deadlock.csv")
     if a_dl is not None and b_dl is not None:

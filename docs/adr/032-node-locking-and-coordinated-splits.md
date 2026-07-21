@@ -9,6 +9,9 @@ The placement and lifecycle of structural records are refined by
 The post-cancellation exception to structural-record coverage, including the
 accepted possibility of an unreachable late-created node, is defined by
 [ADR-043](043-causally-coordinated-backend-operations.md).
+This ADR's shared structure-R protocol is superseded by
+[ADR-044](044-cas-fenced-structural-gate.md). Its split linearization,
+right-link, membership-lock, structural recovery, and hard-cap decisions remain.
 
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —

@@ -1,14 +1,13 @@
 //! Shared node-lock policy for leaf mutations and structural operations.
 //!
 //! The shard coordinator is deliberately policy-free. This module owns the
-//! wound-wait transitions applied to the node-level structure and membership
-//! locks, including the leaf-quiescing sequence required before a split takes
-//! structure-write.
+//! wound-wait transitions applied to membership locks and the full-node
+//! quiescing sequence required before a split closes the structural gate.
 
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use glassdb_data::{KeyRef, LeafRef, TxId};
+use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId};
 use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
@@ -125,7 +124,7 @@ pub(crate) async fn try_reclaim(
     }
 }
 
-/// Wound-wait policy over one node's structure and membership locks.
+/// Wound-wait policy over one node's structural gate and membership lock.
 pub(crate) struct NodeLockReconciler<'a> {
     monitor: &'a Monitor,
     id: &'a TxId,
@@ -136,90 +135,82 @@ impl<'a> NodeLockReconciler<'a> {
         Self { monitor, id }
     }
 
-    /// Removes finalized structure and membership holders.
-    async fn prune_finalized(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
-        for holder in locks.structure().holders().to_vec() {
-            if &holder != self.id
-                && self.monitor.tx_status(&holder).await? != TxCommitStatus::Pending
-            {
-                locks.remove_structure_holder(&holder);
-            }
-        }
-        self.prune_finalized_membership(locks).await
-    }
-
-    /// Removes finalized membership holders after a structure-holder wound.
-    async fn prune_finalized_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
-        for holder in locks.membership().holders().to_vec() {
-            if &holder != self.id
-                && self.monitor.tx_status(&holder).await? != TxCommitStatus::Pending
-            {
-                locks.remove_membership_holder(&holder);
-            }
-        }
-        Ok(())
-    }
-
-    /// Acquires shared structure protection, returning the holder to wait for.
-    async fn acquire_structure_read(
+    /// Admits an ordinary node rewrite by proving the gate absent in the state
+    /// that will be conditionally replaced.
+    ///
+    /// A live gate has priority over new traffic. A finalized gate can be
+    /// removed by this same CAS: if its structural write was still in flight,
+    /// only one of the two conditional writes can land.
+    pub(crate) async fn admit_non_structural(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        if locks.structure().lock_type() == LockType::Write && !locks.structure().contains(self.id)
-        {
-            for holder in locks.structure().holders().to_vec() {
-                if &holder == self.id {
-                    continue;
-                }
-                if self.monitor.tx_status(&holder).await? == TxCommitStatus::Pending
-                    && matches!(
-                        try_reclaim(self.monitor, self.id, &holder).await?,
-                        Reclaim::Wait
-                    )
-                {
-                    return Ok(Some(holder));
-                }
-                locks.remove_structure_holder(&holder);
-            }
+        let Some(holder) = locks.structural_gate().holders().first().cloned() else {
+            return Ok(None);
+        };
+        if &holder == self.id {
+            return Ok(Some(holder));
         }
-        locks.add_structure_reader(self.id.clone());
-        Ok(None)
+        if self.monitor.tx_status(&holder).await?.is_final() {
+            locks.remove_structural_gate(&holder);
+            return Ok(None);
+        }
+        Ok(Some(holder))
     }
 
-    /// Quiesces the node under exclusive structure protection.
+    /// Closes the structural gate after quiescing membership holders.
     ///
     /// Returns the live holder to wait for, or leaves both node-lock scopes free
     /// of finalized foreign holders with structure-write installed for this
     /// operation.
-    pub(crate) async fn acquire_structure_write(
+    pub(crate) async fn acquire_structural_gate(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        if locks.structure().lock_type() == LockType::Write && locks.structure().contains(self.id) {
+        if locks.structural_gate().contains(self.id) {
             self.prune_finalized_membership(locks).await?;
             return Ok(None);
         }
-        for holder in locks.structure().holders().to_vec() {
+        for holder in locks.structural_gate().holders().to_vec() {
+            match self.monitor.tx_status(&holder).await? {
+                TxCommitStatus::Pending => {
+                    if matches!(
+                        try_reclaim(self.monitor, self.id, &holder).await?,
+                        Reclaim::Wait
+                    ) {
+                        return Ok(Some(holder));
+                    }
+                }
+                TxCommitStatus::Unknown => return Ok(Some(holder)),
+                TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
+            }
+            locks.remove_structural_gate(&holder);
+        }
+        for holder in locks.membership().holders().to_vec() {
             if &holder == self.id {
+                locks.remove_membership_holder(&holder);
                 continue;
             }
-            if self.monitor.tx_status(&holder).await? == TxCommitStatus::Pending
-                && matches!(
-                    try_reclaim(self.monitor, self.id, &holder).await?,
-                    Reclaim::Wait
-                )
-            {
-                return Ok(Some(holder));
+            match self.monitor.tx_status(&holder).await? {
+                TxCommitStatus::Pending => {
+                    if matches!(
+                        try_reclaim(self.monitor, self.id, &holder).await?,
+                        Reclaim::Wait
+                    ) {
+                        return Ok(Some(holder));
+                    }
+                }
+                TxCommitStatus::Unknown => return Ok(Some(holder)),
+                TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
             }
-            locks.remove_structure_holder(&holder);
+            locks.remove_membership_holder(&holder);
         }
-        locks.set_structure_writer(self.id.clone());
-        self.prune_finalized_membership(locks).await?;
+        locks.set_structural_gate(self.id.clone());
         Ok(None)
     }
 
     /// Acquires the requested membership lock, returning a holder to wait for.
-    async fn acquire_membership(
+    pub(crate) async fn acquire_membership(
         &self,
         locks: &mut NodeLocks,
         desired: LockType,
@@ -240,13 +231,17 @@ impl<'a> NodeLockReconciler<'a> {
                 if &holder == self.id {
                     continue;
                 }
-                if self.monitor.tx_status(&holder).await? == TxCommitStatus::Pending
-                    && matches!(
-                        try_reclaim(self.monitor, self.id, &holder).await?,
-                        Reclaim::Wait
-                    )
-                {
-                    return Ok(Some(holder));
+                match self.monitor.tx_status(&holder).await? {
+                    TxCommitStatus::Pending => {
+                        if matches!(
+                            try_reclaim(self.monitor, self.id, &holder).await?,
+                            Reclaim::Wait
+                        ) {
+                            return Ok(Some(holder));
+                        }
+                    }
+                    TxCommitStatus::Unknown => return Ok(Some(holder)),
+                    TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
                 }
                 locks.remove_membership_holder(&holder);
             }
@@ -265,121 +260,72 @@ impl<'a> NodeLockReconciler<'a> {
         }
         Ok(None)
     }
-}
 
-/// A leaf's entries and node locks after finalized holders are resolved.
-pub(crate) struct ReconciledLeaf {
-    path: String,
-    id: TxId,
-    entries: BTreeMap<Vec<u8>, ShardEntry>,
-    locks: NodeLocks,
-}
-
-impl ReconciledLeaf {
-    /// Resolves entry holders before discarding their finalized node holds.
-    pub(crate) async fn new(
-        ctx: &ResolveCtx<'_>,
-        path: &str,
-        id: &TxId,
-        entries: &BTreeMap<Vec<u8>, ShardEntry>,
-        locks: &NodeLocks,
-    ) -> Result<Self, TransError> {
-        let entries = resolve_entries(ctx, path, id, entries).await?;
-        let mut locks = locks.clone();
-        NodeLockReconciler::new(ctx.tmon, id)
-            .prune_finalized(&mut locks)
-            .await?;
-        Ok(Self {
-            path: path.to_string(),
-            id: id.clone(),
-            entries,
-            locks,
-        })
-    }
-
-    pub(crate) fn entry(&self, key: &[u8]) -> Option<&ShardEntry> {
-        self.entries.get(key)
-    }
-
-    pub(crate) fn insert_entry(&mut self, key: Vec<u8>, entry: ShardEntry) {
-        self.entries.insert(key, entry);
-    }
-
-    pub(crate) fn membership_lock_type(&self) -> LockType {
-        self.locks.membership().lock_type()
-    }
-
-    /// Acquires the node locks required by a data mutation or scan.
-    pub(crate) async fn acquire_mutation_locks(
-        &mut self,
-        ctx: &ResolveCtx<'_>,
-        membership: LockType,
-    ) -> Result<Option<TxId>, TransError> {
-        let reconciler = NodeLockReconciler::new(ctx.tmon, &self.id);
-        if let Some(holder) = reconciler.acquire_structure_read(&mut self.locks).await? {
-            return Ok(Some(holder));
+    /// Removes finalized membership holders after their entry state was
+    /// reconciled. Unknown holders remain live until the monitor classifies
+    /// them through its missing-transaction grace period.
+    async fn prune_finalized_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
+        for holder in locks.membership().holders().to_vec() {
+            if &holder != self.id && self.monitor.tx_status(&holder).await?.is_final() {
+                locks.remove_membership_holder(&holder);
+            }
         }
-        if membership != LockType::None
-            && let Some(holder) = reconciler
-                .acquire_membership(&mut self.locks, membership)
-                .await?
-        {
-            return Ok(Some(holder));
-        }
-        Ok(None)
-    }
-
-    async fn refresh_entries(&mut self, ctx: &ResolveCtx<'_>) -> Result<(), TransError> {
-        self.entries = resolve_entries(ctx, &self.path, &self.id, &self.entries).await?;
         Ok(())
     }
-
-    /// Returns the complete delta against the fold state observed on entry.
-    pub(crate) fn into_stage(
-        self,
-        original: &BTreeMap<Vec<u8>, ShardEntry>,
-    ) -> (Vec<(Vec<u8>, ShardEntry)>, NodeLocks) {
-        let changes = self
-            .entries
-            .into_iter()
-            .filter(|(key, entry)| original.get(key) != Some(entry))
-            .collect();
-        (changes, self.locks)
-    }
 }
 
-/// The leaf-coordinator resolver for a split's structure-write acquisition.
-pub(crate) struct StructureWriteResolver {
+/// The leaf-coordinator resolver for structural-gate acquisition.
+pub(crate) struct StructuralGateResolver {
     id: TxId,
     path: String,
 }
 
-impl StructureWriteResolver {
+impl StructuralGateResolver {
     pub(crate) fn new(id: TxId, path: String) -> Self {
         Self { id, path }
     }
 }
 
 #[async_trait]
-impl ShardResolver for StructureWriteResolver {
+impl ShardResolver for StructuralGateResolver {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let mut leaf = ReconciledLeaf::new(ctx, &self.path, &self.id, staged, staged_locks).await?;
+        let collection = LeafRef::from_physical_path(&self.path)
+            .map_err(|e| TransError::with_source("parsing leaf path", e))?
+            .collection()
+            .clone();
+        let entries = match quiesce_entries(
+            ctx.resolver,
+            ctx.tmon,
+            &collection,
+            &self.id,
+            staged,
+            ctx.requirement,
+        )
+        .await?
+        {
+            QuiescedEntries::Ready(entries) => entries,
+            QuiescedEntries::Wait(holder) => {
+                return Ok(Step::Skip {
+                    outcome: FoldOutcome::Wait(holder),
+                });
+            }
+        };
+        let mut locks = staged_locks.clone();
         let reconciler = NodeLockReconciler::new(ctx.tmon, &self.id);
-        if let Some(holder) = reconciler.acquire_structure_write(&mut leaf.locks).await? {
+        if let Some(holder) = reconciler.acquire_structural_gate(&mut locks).await? {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Wait(holder),
             });
         }
-
-        // Wounding structure readers changes which entry holders are live. A
-        // second pass prevents their stale locks from moving to the sibling.
-        leaf.refresh_entries(ctx).await?;
-        let (entries, locks) = leaf.into_stage(staged);
+        let entries = entries
+            .into_iter()
+            .filter(|(key, entry)| staged.get(key) != Some(entry))
+            .collect();
         Ok(Step::Stage {
             entries,
             locks,
@@ -400,35 +346,49 @@ impl ShardResolver for StructureWriteResolver {
     }
 }
 
-async fn resolve_entries(
-    ctx: &ResolveCtx<'_>,
-    path: &str,
+/// Result of reconciling all entry holders before gate installation.
+pub(crate) enum QuiescedEntries {
+    Ready(BTreeMap<Vec<u8>, ShardEntry>),
+    Wait(TxId),
+}
+
+/// Resolves every entry and removes all holders that the structural operation
+/// successfully wounds.
+pub(crate) async fn quiesce_entries(
+    resolver: &Resolver,
+    monitor: &Monitor,
+    collection: &CollectionPath,
     id: &TxId,
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
-) -> Result<BTreeMap<Vec<u8>, ShardEntry>, TransError> {
-    let collection = LeafRef::from_physical_path(path)
-        .map_err(|e| TransError::with_source("parsing leaf path", e))?
-        .collection()
-        .clone();
+    requirement: Requirement,
+) -> Result<QuiescedEntries, TransError> {
     let mut resolved_entries = BTreeMap::new();
     for (key, entry) in entries {
-        let resolved = resolve_entry_locks(
-            ctx,
+        let resolved = resolve_entry_locks_at(
+            resolver,
+            monitor,
             &KeyRef::new(collection.clone(), key),
             Some(entry),
             Some(id),
+            requirement,
         )
         .await?;
+        for holder in &resolved.pending {
+            if monitor.tx_status(holder).await? == TxCommitStatus::Unknown {
+                return Ok(QuiescedEntries::Wait(holder.clone()));
+            }
+            if matches!(try_reclaim(monitor, id, holder).await?, Reclaim::Wait) {
+                return Ok(QuiescedEntries::Wait(holder.clone()));
+            }
+        }
         let mut entry = entry.clone();
         entry.current_writer = resolved.writer;
         entry.deleted = resolved.deleted;
-        entry
-            .locked_by
-            .retain(|holder| holder == id || resolved.pending.contains(holder));
+        entry.locked_by.retain(|holder| holder == id);
         if entry.locked_by.is_empty() {
             entry.lock_type = LockType::None;
         }
         resolved_entries.insert(key.clone(), entry);
     }
-    Ok(resolved_entries)
+    Ok(QuiescedEntries::Ready(resolved_entries))
 }

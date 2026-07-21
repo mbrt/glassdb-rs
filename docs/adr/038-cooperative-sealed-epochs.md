@@ -33,7 +33,8 @@ durably aborted and fenced against delayed publication. Advance
 After the user body has produced a candidate read and write set, use the
 following correctness-first writer order:
 
-1. acquire every point, absence/membership, range, catalog, and structure lock;
+1. acquire every point, absence/membership, range, and catalog lock, while
+   proving the structural gate absent for every ordinary node rewrite;
 2. revalidate dependencies and capture predecessors while holding those locks;
 3. durably prepare an authoritative manifest, then make every named immutable
    payload or physical root durable, with an immutable initialization witness
@@ -46,13 +47,14 @@ Locks and intents precede admission, so a dependent transaction observes or
 waits for the earlier transaction before it can enter a later epoch. This makes
 every sealed epoch a downward-closed prefix of the strict-serializable order.
 Every epoch-bearing transaction must lock and revalidate all point,
-absence/membership, range, catalog, and structure predicates on which its writes
-depend; an optimization that loses one of those edges cannot use this proof.
-Concretely, ADR-033 requires any transaction containing both a scan and a write
-to take structure-read and membership-read locks through every scan's effective
-frontier and revalidate. If a limited frontier moves outward, the transaction
-retains its locks and extends the range to a fixpoint before preparation and
-epoch admission.
+absence/membership, range, and catalog predicates on which its writes depend,
+and every ordinary node rewrite must prove its structural gate absent; an
+optimization that loses one of those edges cannot use this proof. Concretely,
+ADR-033 and ADR-044 require any transaction containing both a scan and a write
+to take membership-read locks through every scan's effective frontier and
+revalidate. If a limited frontier moves outward, the transaction retains its
+locks and extends the range to a fixpoint before preparation and epoch
+admission.
 
 Implement admission with sparse per-client lanes. One logical `Database` client
 and its clones may physically batch independent admissions into one lane CAS

@@ -406,7 +406,7 @@ impl Gc {
         for lock in locks {
             match lock {
                 TxLock::Entry { key, .. } => key_locks.push((key.clone(), ())),
-                TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => {
+                TxLock::Membership { leaf, .. } => {
                     leaf_paths.insert(leaf.physical_path());
                 }
             }

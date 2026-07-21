@@ -54,6 +54,14 @@ struct Stats {
     n_retries: AtomicU64,
 }
 
+/// Cumulative coordination work since the previous stats snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardCoordinatorStats {
+    pub submissions: u64,
+    pub rounds: u64,
+    pub cas_retries: u64,
+}
+
 /// One transaction's outcome for a single deduplicated CAS round, deposited by
 /// the engine into that transaction's [`OutcomeSlot`] and read by its caller once
 /// the [`Dedup`] submission resolves. Heterogeneous across resolver kinds: the
@@ -74,11 +82,14 @@ pub(crate) enum FoldOutcome {
     /// A create would exceed the leaf's reserved content limit. Nothing was
     /// staged for this member; retry after the pending split relieves the leaf.
     LeafFull,
-    /// A release or write-back completed (ADR-026). Idempotent and best-effort:
-    /// there is nothing to wait on and nothing for the caller to retry.
+    /// A release or write-back completed (ADR-026). The current node state
+    /// proved that the holder was removed or the corresponding CAS landed.
     /// `superseded` carries the `current_writer` transaction ids a write-back
     /// overwrote — GC reverse-check candidates (ADR-022); empty for a release.
     Released { superseded: Vec<TxId> },
+    /// The submitted leaf no longer owns one of this operation's keys. The
+    /// caller must descend again and regroup before retrying.
+    Reroute,
     /// The single read-write commit-install landed: this transaction's write
     /// lock is in the shard's version chain, or it was already there (idempotent,
     /// help-forwarded). The committed object may now be published (ADR-027).
@@ -174,8 +185,9 @@ pub(crate) trait ShardResolver: Send + Sync {
     ) -> Result<Step, TransError>;
 
     /// Whether this member may join any in-flight round instead of FIFO-blocking
-    /// behind an unrelated writer: read-only acquires, releases, and write-backs
-    /// never contend, so they always reorder (ADR-026). A scheduling hint only.
+    /// behind an unrelated writer. Read-only acquires, releases, and write-backs
+    /// are safe to reorder (ADR-026), even though a structural gate can make a
+    /// cleanup member wait. A scheduling hint only.
     fn reorderable(&self) -> bool;
 
     /// The outcome delivered when this round cannot produce a definitive
@@ -183,6 +195,11 @@ pub(crate) trait ShardResolver: Send + Sync {
     /// non-idempotent resolver cannot downgrade uncertainty while abandoning
     /// the round.
     fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome;
+
+    /// The outcome delivered when a structural change invalidated routing.
+    fn reroute_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        self.exhausted_outcome(in_doubt)
+    }
 
     /// The raw keys this member may **create or update**, so the coordinator can
     /// verify the loaded leaf still owns them before folding (ADR-031). A split
@@ -370,7 +387,7 @@ impl CasWorker {
                     let members = shard_members(batch);
                     for member in members.values() {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                            outcome: member.resolver.exhausted_outcome(saw_in_doubt),
+                            outcome: member.resolver.reroute_outcome(saw_in_doubt),
                             cas_precondition: None,
                         });
                     }
@@ -413,11 +430,7 @@ impl CasWorker {
                 // and fold nothing for it. Its caller re-resolves through the
                 // directory and re-submits on the leaf that now owns the key.
                 if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
-                    results.push((
-                        tx.clone(),
-                        m.resolver.exhausted_outcome(saw_in_doubt),
-                        false,
-                    ));
+                    results.push((tx.clone(), m.resolver.reroute_outcome(saw_in_doubt), false));
                     continue;
                 }
                 match m.resolver.resolve(&ctx, &entries, &locks).await? {
@@ -539,8 +552,8 @@ impl CasWorker {
             return Ok(());
         }
         // Bounded CAS budget exhausted under churn: each member gets its
-        // resolver's exhaustion outcome (acquirers `Conflict` and release/re-lock,
-        // best-effort releases / write-backs `Released`, ADR-024/026).
+        // resolver's exhaustion outcome. Acquirers conflict and release/re-lock;
+        // write-backs re-descend because exhaustion does not prove convergence.
         for m in shard_members(batch).values() {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.resolver.exhausted_outcome(saw_in_doubt),
@@ -622,11 +635,14 @@ impl ShardCoordinator {
         self.inner.dedup.close().await;
     }
 
-    /// Returns and resets the count of inner CAS retries performed under
-    /// contention across every submitter (acquire / release / write-back /
-    /// commit-install).
-    pub fn cas_retries_and_reset(&self) -> usize {
-        self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed) as usize
+    /// Returns and resets submission, worker-round, and inner-CAS retry counts.
+    pub fn stats_and_reset(&self) -> ShardCoordinatorStats {
+        let dedup = self.inner.dedup.stats_and_reset();
+        ShardCoordinatorStats {
+            submissions: dedup.submissions,
+            rounds: dedup.rounds,
+            cas_retries: self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed),
+        }
     }
 
     /// Returns a per-object dedup coordination snapshot (ADR-025).
@@ -641,8 +657,8 @@ impl ShardCoordinator {
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus any successful-CAS
     /// precondition receipt into the slot. Returns `Ok(None)` if the coordinator
-    /// was shut down before the round ran, so acquires can error while best-effort
-    /// releases / write-backs treat it as a no-op.
+    /// was shut down before the round ran, so callers can preserve their
+    /// operation-specific best-effort behavior.
     ///
     /// `first_requirement` chooses the cache requirement for the round's first fold
     /// attempt: a submitter that just read this leaf (the single read-write fast

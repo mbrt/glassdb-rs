@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
-use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId};
+use glassdb_data::{CollectionPath, KeyRef, TxId};
 use glassdb_storage::{
     LeafObservation, LeafObservationCheck, LockType, NodeLocks, Requirement, SequencePoint,
     ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus, TxLock, TxLog,
@@ -342,9 +342,7 @@ impl ShardResolver for CommitInstallResolver {
             });
         }
 
-        if staged_locks.structure().lock_type() == LockType::Write
-            && !staged_locks.structure().contains(&self.id)
-        {
+        if staged_locks.structural_gate().lock_type() == LockType::Write {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Moved,
             });
@@ -384,11 +382,9 @@ impl ShardResolver for CommitInstallResolver {
         e.locked_by = vec![self.id.clone()];
         e.current_writer = Some(effective);
         e.deleted = false;
-        let mut locks = staged_locks.clone();
-        locks.add_structure_reader(self.id.clone());
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
-            locks,
+            locks: staged_locks.clone(),
             admission: StageAdmission::ExistingKeys,
             // The lock is installed only once the round's CAS confirms it; on a
             // precondition/in-doubt the engine re-folds and re-classifies.
@@ -835,6 +831,12 @@ impl Algo {
         // over the winner — finding the read superseded, the fast path renews
         // (`Wounded`).
         let (_, locator) = self.resolver.resolve_key(&key, Requirement::Any).await?;
+        if locator
+            .node()
+            .is_some_and(|node| node.structural_gate().lock_type() == LockType::Write)
+        {
+            return Ok(None);
+        }
         let entry = locator
             .node()
             .and_then(|node| node.as_leaf())
@@ -855,8 +857,6 @@ impl Algo {
         // commit-install fold and the write-back target it directly instead of
         // recomputing a fixed-hash shard index.
         let leaf_path = locator.path;
-        let leaf = LeafRef::from_physical_path(&leaf_path)
-            .map_err(|e| TransError::with_source("parsing single-rw leaf path", e))?;
 
         // Build the committed transaction object. It records the write (and the
         // pointer it will supersede, for GC's reverse check) plus the write lock
@@ -870,16 +870,10 @@ impl Algo {
         // still lags behind a help-forwarded holder.
         let recorded_prev = effective;
         let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
-        tl.locks = vec![
-            TxLock::Entry {
-                key: key.clone(),
-                typ: LockType::Write,
-            },
-            TxLock::Structure {
-                leaf,
-                typ: LockType::Read,
-            },
-        ];
+        tl.locks = vec![TxLock::Entry {
+            key: key.clone(),
+            typ: LockType::Write,
+        }];
         tl.writes.push(TxWrite {
             key: key.clone(),
             value: value.clone(),
@@ -1407,7 +1401,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::paths;
+    use glassdb_data::{LeafRef, paths};
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Shard, ShardEntry, ShardStore, TLogger,
         TxCommitStatus,
@@ -1632,10 +1626,6 @@ mod tests {
             typ: LockType::Write,
         }));
         let leaf = LeafRef::root(test_collection());
-        assert!(txlog.locks.contains(&TxLock::Structure {
-            leaf: leaf.clone(),
-            typ: LockType::Read,
-        }));
         assert!(txlog.locks.contains(&TxLock::Membership {
             leaf,
             typ: LockType::Write,
@@ -2315,6 +2305,59 @@ mod tests {
         assert_eq!(status.status, TxCommitStatus::Ok);
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.last_writer.unwrap(), tid);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = key_ref(b"k");
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+        let read = do_read(&tctx, &keyp).await;
+
+        let gate = TxId::with_priority(0, b"gate");
+        tctx.tmon.begin_tx(&gate);
+        let (mut root, version) = tctx
+            .shards
+            .load_root(TEST_COLL, Requirement::Any)
+            .await
+            .unwrap();
+        root.node_locks_mut().set_structural_gate(gate.clone());
+        assert!(
+            tctx.shards
+                .store_root(TEST_COLL, &root, &version)
+                .await
+                .unwrap()
+        );
+
+        tctx.locker.lock_calls_and_reset();
+        let mut handle = tm.begin(Data {
+            reads: vec![read],
+            writes: vec![wa(&keyp, b"v2")],
+            scans: Vec::new(),
+        });
+        let committing_tm = tm.clone();
+        let committing = tokio::spawn(async move {
+            let result = committing_tm.commit(&mut handle).await;
+            (handle, result)
+        });
+        rt::sleep(Duration::from_millis(50)).await;
+        assert!(!committing.is_finished());
+
+        tctx.tmon
+            .commit_tx(TxLog::new(gate, TxCommitStatus::Ok))
+            .await
+            .unwrap();
+        let (mut handle, result) = committing.await.unwrap();
+        result.unwrap();
+        tm.end(&mut handle).await.unwrap();
+        assert!(
+            tctx.locker.lock_calls_and_reset() >= 1,
+            "an observed gate bypasses commit-install"
+        );
+        assert_eq!(
+            do_read(&tctx, &keyp).await.last_writer,
+            Some(handle.id().clone())
+        );
     }
 
     // ADR-030: a warm single read-write commit reuses the shard the read cached
@@ -3287,10 +3330,6 @@ mod tests {
             .unwrap();
         let log = log.value().unwrap();
         let leaf = LeafRef::root(test_collection());
-        assert!(log.locks.contains(&TxLock::Structure {
-            leaf: leaf.clone(),
-            typ: LockType::Read,
-        }));
         assert!(log.locks.contains(&TxLock::Membership {
             leaf,
             typ: LockType::Read,

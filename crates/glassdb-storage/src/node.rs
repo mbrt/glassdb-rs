@@ -296,8 +296,8 @@ pub struct NodeLocks {
 }
 
 impl NodeLocks {
-    /// Returns the structure lock guarding the node's physical shape.
-    pub fn structure(&self) -> &NodeLock {
+    /// Returns the exclusive gate guarding changes to the node's physical shape.
+    pub fn structural_gate(&self) -> &NodeLock {
         &self.structure
     }
 
@@ -311,18 +311,13 @@ impl NodeLocks {
         self.membership_version
     }
 
-    /// Installs a shared structure holder.
-    pub fn add_structure_reader(&mut self, id: TxId) {
-        self.structure.add_reader(id);
-    }
-
-    /// Installs an exclusive structure holder.
-    pub fn set_structure_writer(&mut self, id: TxId) {
+    /// Closes the structural gate for one structural operation.
+    pub fn set_structural_gate(&mut self, id: TxId) {
         self.structure.set_writer(id);
     }
 
-    /// Removes one structure holder.
-    pub fn remove_structure_holder(&mut self, id: &TxId) -> bool {
+    /// Opens the structural gate when held by `id`.
+    pub fn remove_structural_gate(&mut self, id: &TxId) -> bool {
         self.structure.remove(id)
     }
 
@@ -353,11 +348,12 @@ impl NodeLocks {
         removed
     }
 
-    /// Removes all node-level holds belonging to `id`.
-    pub fn release(&mut self, id: &TxId) -> bool {
-        let structure_changed = self.remove_structure_holder(id);
-        let membership_changed = self.remove_membership_holder(id);
-        structure_changed || membership_changed
+    /// Removes the transaction's membership hold.
+    ///
+    /// Structural gates have a separate lifecycle and cannot be released by
+    /// ordinary transaction cleanup.
+    pub fn release_membership(&mut self, id: &TxId) -> bool {
+        self.remove_membership_holder(id)
     }
 
     /// Clears transient holders while preserving the membership version.
@@ -461,9 +457,9 @@ impl Node {
         }
     }
 
-    /// Returns the node's structure lock.
-    pub fn structure_lock(&self) -> &NodeLock {
-        self.locks.structure()
+    /// Returns the node's exclusive structural gate.
+    pub fn structural_gate(&self) -> &NodeLock {
+        self.locks.structural_gate()
     }
 
     /// Returns the complete node-level coordination state.
@@ -481,19 +477,14 @@ impl Node {
         self.locks = locks;
     }
 
-    /// Installs a structure-read holder.
-    pub fn add_structure_reader(&mut self, id: TxId) {
-        self.locks.add_structure_reader(id);
+    /// Closes the structural gate for one structural operation.
+    pub fn set_structural_gate(&mut self, id: TxId) {
+        self.locks.set_structural_gate(id);
     }
 
-    /// Installs a structure-write holder.
-    pub fn set_structure_writer(&mut self, id: TxId) {
-        self.locks.set_structure_writer(id);
-    }
-
-    /// Removes a structure-lock holder.
-    pub fn remove_structure_holder(&mut self, id: &TxId) -> bool {
-        self.locks.remove_structure_holder(id)
+    /// Opens the structural gate when held by `id`.
+    pub fn remove_structural_gate(&mut self, id: &TxId) -> bool {
+        self.locks.remove_structural_gate(id)
     }
 
     /// Returns the leaf membership lock.
@@ -639,7 +630,7 @@ impl Node {
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
         let raw = pb::Node::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling node", e))?;
-        Ok(Node::from_pb(raw))
+        Node::from_pb(raw)
     }
 
     pub(crate) fn to_pb(&self) -> pb::Node {
@@ -659,22 +650,44 @@ impl Node {
         }
     }
 
-    pub(crate) fn from_pb(raw: pb::Node) -> Self {
+    pub(crate) fn from_pb(raw: pb::Node) -> Result<Self, StorageError> {
         let body = match raw.body {
             Some(pb::node::Body::Index(index)) => NodeBody::Index(IndexNode::from_pb(index)),
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)),
             None => NodeBody::Leaf(Shard::new()),
         };
-        Node {
+        let structure = NodeLock::from_pb(raw.structure_lock);
+        validate_structural_gate(&structure)?;
+        let membership = NodeLock::from_pb(raw.membership_lock);
+        validate_membership_lock(&membership)?;
+        Ok(Node {
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
             right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
             body,
             locks: NodeLocks {
-                structure: NodeLock::from_pb(raw.structure_lock),
-                membership: NodeLock::from_pb(raw.membership_lock),
+                structure,
+                membership,
                 membership_version: raw.membership_version,
             },
-        }
+        })
+    }
+}
+
+fn validate_structural_gate(gate: &NodeLock) -> Result<(), StorageError> {
+    match (gate.lock_type(), gate.holders()) {
+        (LockType::None | LockType::Unknown, []) | (LockType::Write, [_]) => Ok(()),
+        _ => Err(StorageError::other(
+            "node structural gate must be empty or have one write holder",
+        )),
+    }
+}
+
+fn validate_membership_lock(lock: &NodeLock) -> Result<(), StorageError> {
+    match (lock.lock_type(), lock.holders()) {
+        (LockType::None | LockType::Unknown, [])
+        | (LockType::Read, [_, ..])
+        | (LockType::Write, [_]) => Ok(()),
+        _ => Err(StorageError::other("node has invalid membership lock")),
     }
 }
 
@@ -732,16 +745,36 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_node_locks_and_membership_version() {
-        let reader = TxId::from_bytes(vec![2]);
+        let gate = TxId::from_bytes(vec![2]);
         let writer = TxId::from_bytes(vec![1]);
         let mut node = Node::leaf(Shard::new());
-        node.add_structure_reader(reader.clone());
+        node.set_structural_gate(gate.clone());
         node.set_membership_writer(writer.clone());
 
         let decoded = Node::decode(&node.encode()).unwrap();
-        assert_eq!(decoded.structure_lock().holders(), &[reader]);
+        assert_eq!(decoded.structural_gate().holders(), &[gate]);
         assert_eq!(decoded.membership_lock().holders(), &[writer]);
         assert_eq!(decoded.membership_version(), 1);
+    }
+
+    #[test]
+    fn decode_rejects_shared_or_nonexclusive_structural_gate() {
+        for gate in [
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![1]],
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Write as i32,
+                locked_by: vec![vec![1], vec![2]],
+            },
+        ] {
+            let raw = pb::Node {
+                structure_lock: Some(gate),
+                ..pb::Node::default()
+            };
+            assert!(Node::decode(&raw.encode_to_vec()).is_err());
+        }
     }
 
     #[test]
@@ -930,7 +963,7 @@ mod tests {
     fn empty_body_decodes_as_empty_leaf() {
         // A Node protobuf with no body (the wire default) is a fresh empty root.
         let raw = pb::Node::default();
-        let node = Node::from_pb(raw);
+        let node = Node::from_pb(raw).unwrap();
         assert!(node.as_leaf().is_some_and(Shard::is_empty));
         assert_eq!(node.high_key(), None);
         assert_eq!(node.right_sibling(), None);
@@ -964,8 +997,8 @@ mod tests {
         let never_locked = Node::leaf(Shard::from_entries([entry(b"a", 1)]));
         let mut released = never_locked.clone();
         let holder = TxId::from_bytes(vec![0x11]);
-        released.add_structure_reader(holder.clone());
-        assert!(released.remove_structure_holder(&holder));
+        released.set_structural_gate(holder.clone());
+        assert!(released.remove_structural_gate(&holder));
         assert_eq!(released.encode(), never_locked.encode());
     }
 
@@ -981,13 +1014,13 @@ mod tests {
             current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
             deleted: false,
         }]));
-        node.add_structure_reader(TxId::from_bytes(vec![0x11]));
+        node.set_structural_gate(TxId::from_bytes(vec![0x11]));
         node.set_membership_writer(TxId::from_bytes(vec![0x22]));
 
         let got = node.encode();
         let want = [
             0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
-            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x02, 0xaa, 0xbb, 0x2a, 0x05, 0x08, 0x02, 0x12,
+            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x02, 0xaa, 0xbb, 0x2a, 0x05, 0x08, 0x03, 0x12,
             0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38, 0x01,
         ];
         assert_eq!(node.encoded_len(), got.len());

@@ -84,7 +84,7 @@ pub struct CollectionLocks {
     #[prost(message, repeated, tag = "1")]
     pub entry_locks: ::prost::alloc::vec::Vec<EntryLock>,
     #[prost(message, repeated, tag = "2")]
-    pub leaf_locks: ::prost::alloc::vec::Vec<LeafLock>,
+    pub membership_locks: ::prost::alloc::vec::Vec<MembershipLock>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EntryLock {
@@ -94,16 +94,14 @@ pub struct EntryLock {
     pub lock_type: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct LeafLock {
+pub struct MembershipLock {
     #[prost(enumeration = "lock::LockType", tag = "3")]
     pub lock_type: i32,
-    #[prost(enumeration = "lock::Scope", tag = "4")]
-    pub scope: i32,
-    #[prost(oneof = "leaf_lock::Target", tags = "1, 2")]
-    pub target: ::core::option::Option<leaf_lock::Target>,
+    #[prost(oneof = "membership_lock::Target", tags = "1, 2")]
+    pub target: ::core::option::Option<membership_lock::Target>,
 }
-/// Nested message and enum types in `LeafLock`.
-pub mod leaf_lock {
+/// Nested message and enum types in `MembershipLock`.
+pub mod membership_lock {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Target {
         /// The collection root object (`_i`). Always encoded as true.
@@ -149,35 +147,6 @@ pub mod lock {
                 "READ" => Some(Self::Read),
                 "WRITE" => Some(Self::Write),
                 "CREATE" => Some(Self::Create),
-                _ => None,
-            }
-        }
-    }
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-    #[repr(i32)]
-    pub enum Scope {
-        UnknownScope = 0,
-        Structure = 1,
-        Membership = 2,
-    }
-    impl Scope {
-        /// String value of the enum field names used in the ProtoBuf definition.
-        ///
-        /// The values are not transformed in any way and thus are considered stable
-        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-        pub fn as_str_name(&self) -> &'static str {
-            match self {
-                Self::UnknownScope => "UNKNOWN_SCOPE",
-                Self::Structure => "STRUCTURE",
-                Self::Membership => "MEMBERSHIP",
-            }
-        }
-        /// Creates an enum from field names used in the ProtoBuf definition.
-        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-            match value {
-                "UNKNOWN_SCOPE" => Some(Self::UnknownScope),
-                "STRUCTURE" => Some(Self::Structure),
-                "MEMBERSHIP" => Some(Self::Membership),
                 _ => None,
             }
         }

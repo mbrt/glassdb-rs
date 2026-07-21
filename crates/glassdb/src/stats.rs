@@ -37,8 +37,20 @@ pub struct Stats {
 
     /// Number of lock-acquisition calls made by the distributed locker.
     pub lock_calls: u64,
-    /// Number of inner CAS retries performed under contention.
+    /// Number of shard-coordinator inner CAS retries performed under contention.
     pub lock_retries: u64,
+
+    /// Number of mutation requests submitted to the shard coordinator.
+    pub coord_submissions: u64,
+    /// Number of deduplicated shard-coordinator worker rounds started.
+    pub coord_rounds: u64,
+
+    /// Number of deduplicated split candidates processed in the background.
+    pub split_candidates: u64,
+    /// Number of locally observed split source/root linearizations.
+    pub split_completed: u64,
+    /// Number of retryable split candidates requeued for a later sweep.
+    pub split_deferred: u64,
 }
 
 impl Stats {
@@ -54,6 +66,11 @@ impl Stats {
         self.obj_lists += other.obj_lists;
         self.lock_calls += other.lock_calls;
         self.lock_retries += other.lock_retries;
+        self.coord_submissions += other.coord_submissions;
+        self.coord_rounds += other.coord_rounds;
+        self.split_candidates += other.split_candidates;
+        self.split_completed += other.split_completed;
+        self.split_deferred += other.split_deferred;
     }
 
     pub(crate) fn add_backend(&mut self, b: &BackendStats) {
@@ -62,9 +79,19 @@ impl Stats {
         self.obj_lists += b.obj_lists;
     }
 
-    pub(crate) fn add_lock(&mut self, calls: u64, retries: u64) {
-        self.lock_calls += calls;
-        self.lock_retries += retries;
+    pub(crate) fn add_protocol(
+        &mut self,
+        lock_calls: u64,
+        coord: glassdb_trans::ShardCoordinatorStats,
+        split: glassdb_trans::SplitterStats,
+    ) {
+        self.lock_calls += lock_calls;
+        self.lock_retries += coord.cas_retries;
+        self.coord_submissions += coord.submissions;
+        self.coord_rounds += coord.rounds;
+        self.split_candidates += split.candidates;
+        self.split_completed += split.completed;
+        self.split_deferred += split.deferred;
     }
 }
 
@@ -84,6 +111,44 @@ impl Sub for Stats {
             obj_lists: self.obj_lists.saturating_sub(other.obj_lists),
             lock_calls: self.lock_calls.saturating_sub(other.lock_calls),
             lock_retries: self.lock_retries.saturating_sub(other.lock_retries),
+            coord_submissions: self
+                .coord_submissions
+                .saturating_sub(other.coord_submissions),
+            coord_rounds: self.coord_rounds.saturating_sub(other.coord_rounds),
+            split_candidates: self.split_candidates.saturating_sub(other.split_candidates),
+            split_completed: self.split_completed.saturating_sub(other.split_completed),
+            split_deferred: self.split_deferred.saturating_sub(other.split_deferred),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subtraction_covers_protocol_counters() {
+        let before = Stats {
+            coord_submissions: 10,
+            coord_rounds: 8,
+            split_candidates: 3,
+            split_completed: 2,
+            split_deferred: 1,
+            ..Default::default()
+        };
+        let after = Stats {
+            coord_submissions: 14,
+            coord_rounds: 10,
+            split_candidates: 5,
+            split_completed: 3,
+            split_deferred: 1,
+            ..Default::default()
+        };
+        let delta = after - before;
+        assert_eq!(delta.coord_submissions, 4);
+        assert_eq!(delta.coord_rounds, 2);
+        assert_eq!(delta.split_candidates, 2);
+        assert_eq!(delta.split_completed, 1);
+        assert_eq!(delta.split_deferred, 0);
     }
 }

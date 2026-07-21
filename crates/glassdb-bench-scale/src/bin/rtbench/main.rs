@@ -31,6 +31,7 @@
 
 mod clientmetrics;
 mod cpu;
+mod diagnostics;
 
 // musl's default allocator serializes multi-threaded allocation on a coarse
 // lock, which collapses into a futex/`sys`-CPU storm under the benchmark's
@@ -43,6 +44,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -62,6 +64,7 @@ use glassdb_bench_scale::bench::{Bench, Results};
 use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
 
 use clientmetrics::{HttpCounter, HttpMetrics, HttpSnapshot, ThreadSampler};
+use diagnostics::DiagnosticSession;
 
 const READ_WRITE_9010_CNAME: &str = "read-write-9010";
 const READ_WRITE_9010_NUM_CONCURR_TX: usize = 10;
@@ -113,6 +116,10 @@ struct Args {
     /// Output file with per-step client resource metrics.
     #[arg(long, default_value = "client-stats.csv")]
     client_stats_out: String,
+    /// Directory for opt-in backend/protocol metrics and failure-state dumps.
+    /// Initially supported by the rw9010 workload only.
+    #[arg(long)]
+    diagnostics_dir: Option<PathBuf>,
     /// Output file with deadlock latency samples.
     #[arg(long, default_value = "deadlock.csv")]
     deadlock_out: String,
@@ -158,12 +165,23 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    if args.diagnostics_dir.is_some() && args.test_name != "rw9010" {
+        return Err("--diagnostics-dir is currently supported only with --test-name=rw9010".into());
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let handle = rt.handle().clone();
 
-    let setup = rt.block_on(init_backend(&args))?;
+    let mut setup = rt.block_on(init_backend(&args))?;
+    let mut diagnostics = match args.diagnostics_dir.as_deref() {
+        Some(dir) => {
+            let (session, backend) = DiagnosticSession::new(dir, setup.backend)?;
+            setup.backend = backend;
+            Some(session)
+        }
+        None => None,
+    };
     let time_scale = report_time_scale(&args);
 
     match args.test_name.as_str() {
@@ -175,6 +193,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             setup.http,
             setup.server_conns,
             time_scale,
+            diagnostics.as_mut(),
         )?,
         "deadlock" => run_deadlock(&handle, &args, setup.backend, time_scale)?,
         other => return Err(format!("unknown test name {other:?}").into()),
@@ -426,8 +445,11 @@ impl Benchmarker {
             Some(tokio::time::Instant::now() + self.bench.expected_duration() + drain_timeout);
     }
 
-    fn end(&mut self, db: &Database) {
+    fn end(&mut self) {
         self.bench.end();
+    }
+
+    fn collect_stats(&mut self, db: &Database) {
         self.delta_stats = db.stats() - self.base_stats;
     }
 
@@ -577,6 +599,7 @@ where
     ));
     res?;
     shutdown?;
+    ben.collect_stats(&db);
     println!("{name},{}", ben.results_row());
     Ok(())
 }
@@ -619,7 +642,7 @@ fn independent_single_rmw(
         })
         .collect();
     let result = handle.block_on(join_tasks_until(handles, deadline));
-    b.end(db);
+    b.end();
     result
 }
 
@@ -674,7 +697,7 @@ fn independent_multi_rmw(
         })
         .collect();
     let result = handle.block_on(join_tasks_until(handles, deadline));
-    b.end(db);
+    b.end();
     result
 }
 
@@ -747,7 +770,7 @@ fn overlapping_multi_rmw(
         })
         .collect();
     let result = handle.block_on(join_tasks_until(handles, deadline));
-    b.end(db);
+    b.end();
     result
 }
 
@@ -875,6 +898,7 @@ fn run_read_write_9010(
     metrics: Option<Arc<HttpMetrics>>,
     server_conns: Option<Arc<AtomicU64>>,
     time_scale: f64,
+    mut diagnostics: Option<&mut DiagnosticSession>,
 ) -> Result<(), Box<dyn Error>> {
     // Parse the transaction mix up front so a bad --rw-mix fails before the
     // expensive key initialization.
@@ -937,6 +961,8 @@ fn run_read_write_9010(
                 &mut stats,
                 &mut throughput,
                 &mut client,
+                run + 1,
+                diagnostics.as_deref_mut(),
             )?;
         }
     }
@@ -960,6 +986,8 @@ fn run_read_write_9010_step(
     stats: &mut impl Write,
     throughput: &mut impl Write,
     client: &mut impl Write,
+    run: usize,
+    diagnostics: Option<&mut DiagnosticSession>,
 ) -> Result<(), Box<dyn Error>> {
     let http_before = metrics.map(|m| m.snapshot()).unwrap_or_default();
     let conns_before = server_conns.map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
@@ -967,8 +995,18 @@ fn run_read_write_9010_step(
     let sampler = ThreadSampler::start();
     let wall_start = std::time::Instant::now();
 
-    let results =
-        read_write_9010_all_dbs(handle, args, backend, keys, numdb, mix, time_scale, rnd)?;
+    let results = read_write_9010_all_dbs(
+        handle,
+        args,
+        backend,
+        keys,
+        numdb,
+        mix,
+        time_scale,
+        rnd,
+        run,
+        diagnostics,
+    )?;
 
     let wall = wall_start.elapsed();
     let (user_after, sys_after) = cpu::process_cpu_time();
@@ -1008,9 +1046,15 @@ fn read_write_9010_all_dbs(
     mix: RwMix,
     time_scale: f64,
     rnd: &mut StdRng,
+    run_number: usize,
+    mut diagnostics: Option<&mut DiagnosticSession>,
 ) -> Result<Vec<DbResults>, Box<dyn Error>> {
     // One seed per Database, derived up front from the shared source.
     let seeds: Vec<u64> = (0..numdb).map(|_| rnd.random()).collect();
+
+    let backend_before = diagnostics
+        .as_deref()
+        .map(DiagnosticSession::backend_snapshot);
 
     // Open all Databases and create their per-type benches.
     let dbs: Vec<Database> = (0..numdb)
@@ -1048,7 +1092,27 @@ fn read_write_9010_all_dbs(
         db_bench.end();
     }
 
-    // Collect results and close Databases.
+    if let Err(error) = &run
+        && let Some(diagnostics) = diagnostics.as_deref_mut()
+        && let Err(diagnostic_error) =
+            diagnostics.record_failure(run_number, numdb, "workers", error, &dbs)
+    {
+        eprintln!("writing worker failure diagnostics failed: {diagnostic_error}");
+    }
+    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
+    if let Err(error) = &shutdown
+        && let Some(diagnostics) = diagnostics.as_deref_mut()
+        && let Err(diagnostic_error) =
+            diagnostics.record_failure(run_number, numdb, "shutdown", error, &dbs)
+    {
+        eprintln!("writing shutdown failure diagnostics failed: {diagnostic_error}");
+    }
+
+    run?;
+    shutdown?;
+
+    // Shutdown drains write-back, so only now are the per-Database counters a
+    // complete account of the cell's protocol work.
     let mut results = Vec::with_capacity(numdb);
     for (di, db) in dbs.iter().enumerate() {
         results.push(DbResults {
@@ -1058,10 +1122,19 @@ fn read_write_9010_all_dbs(
             weak: benches[di].weak.results(),
         });
     }
-    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
-
-    run?;
-    shutdown?;
+    if let (Some(diagnostics), Some(backend_before)) = (diagnostics, backend_before) {
+        let cell_stats = results
+            .iter()
+            .map(|result| result.stats)
+            .collect::<Vec<_>>();
+        diagnostics.record_cell(
+            run_number,
+            numdb,
+            results.iter().map(DbResults::logical_tx).sum::<usize>() as u64,
+            &cell_stats,
+            backend_before,
+        )?;
+    }
     Ok(results)
 }
 
@@ -1235,6 +1308,7 @@ fn run_deadlock(
                 ));
                 res?;
                 shutdown?;
+                ben.collect_stats(&db);
 
                 let results = ben.bench.results();
                 let overlap_pct = 100 * overlap / k;

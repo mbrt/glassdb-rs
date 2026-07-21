@@ -101,10 +101,10 @@ impl CollectionRoot {
         let raw = pb::CollectionRoot::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling collection root", e))?;
         Ok(CollectionRoot {
-            node: raw
-                .node
-                .map(Node::from_pb)
-                .unwrap_or_else(|| Node::leaf(Shard::new())),
+            node: match raw.node {
+                Some(node) => Node::from_pb(node)?,
+                None => Node::leaf(Shard::new()),
+            },
             subcollections: raw.subcollections.into_iter().collect(),
         })
     }
