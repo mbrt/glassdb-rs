@@ -5,8 +5,8 @@
 //! deletes, and explicit aborts. The harness checks read-your-writes,
 //! repeatable-read, abort, atomicity, and final-state invariants against an exact
 //! model that retains every possible in-doubt commit outcome. Schedule and fault
-//! tapes make both interleavings and failures coverage-guidable and exactly
-//! reproducible.
+//! tapes make interleavings, failures, and slow mutations coverage-guidable and
+//! exactly reproducible.
 //!
 //! ```bash
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run api_correctness <crash-file>

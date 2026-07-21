@@ -17,6 +17,8 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use glassdb::Error;
+
 const DEFAULT_DURATION: Duration = Duration::from_secs(10);
 const MIN_SAMPLES: usize = 10;
 
@@ -99,9 +101,37 @@ impl Bench {
         }
     }
 
-    /// Times `f` and records the duration as a sample on success. The
-    /// operation's error (if any) is propagated unchanged.
-    pub async fn measure<F, Fut, E>(&self, f: F) -> Result<(), E>
+    /// Times one logical GlassDB operation and records it on success.
+    ///
+    /// An unknown transaction outcome is replayed as part of the same sample,
+    /// so the latency includes every attempt. This benchmark-only policy can
+    /// double-apply a non-idempotent mutation and must not be copied into
+    /// application code. Every definitive error is propagated unchanged.
+    pub async fn measure<F, Fut>(&self, mut f: F) -> Result<(), Error>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), Error>>,
+    {
+        let start = Instant::now();
+        loop {
+            match f().await {
+                Ok(()) => {
+                    self.record_raw(start.elapsed());
+                    return Ok(());
+                }
+                Err(Error::InDoubt(reason)) => {
+                    eprintln!(
+                        "WARNING: measured transaction outcome is in doubt; retrying: {reason}"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Times one non-transactional operation and records it on success.
+    pub async fn measure_once<F, Fut, E>(&self, f: F) -> Result<(), E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(), E>>,
@@ -117,6 +147,11 @@ impl Bench {
     /// cloning the whole sample vector.
     pub fn sample_count(&self) -> usize {
         self.inner.lock().unwrap().samples.len()
+    }
+
+    /// Returns the configured wall-clock measurement duration.
+    pub fn expected_duration(&self) -> Duration {
+        self.expected_duration
     }
 
     /// Returns a snapshot of the collected results.
@@ -314,5 +349,50 @@ mod tests {
         let ci = rate_rel_ci(0);
         assert!(ci.is_finite() && ci > 1.0);
         assert_eq!(Results::default().rate_rel_ci(), ci);
+    }
+
+    #[tokio::test]
+    async fn in_doubt_replay_is_one_logical_sample() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let bench = Bench::new(Duration::from_secs(1));
+        bench.start();
+
+        bench
+            .measure(|| {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if attempt == 0 {
+                        Err(Error::InDoubt("lost acknowledgement".into()))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(bench.sample_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn definitive_error_is_not_replayed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let bench = Bench::new(Duration::from_secs(1));
+        let err = bench
+            .measure(|| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                async { Err(Error::NotFound) }
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::NotFound));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(bench.sample_count(), 0);
     }
 }

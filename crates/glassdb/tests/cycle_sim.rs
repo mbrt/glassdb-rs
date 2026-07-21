@@ -20,7 +20,8 @@
 mod sim_support;
 
 use sim_support::{
-    assert_no_divergence, fault_tape, record_faults_with_tape, record_once, record_with_tapes, tape,
+    assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape,
+    record_once, record_with_tapes, tape,
 };
 
 use glassdb::rt::{TapeScheduler, block_on_with};
@@ -86,7 +87,7 @@ fn op_stream_is_byte_identical_with_faults() {
     // Determinism must hold even with faults active: scheduling, time,
     // randomness, and the fault schedule are all functions of the tape and seed.
     let workload = contended_cycle();
-    let faults = FaultConfig::enabled(7);
+    let faults = FaultConfig::failures(7);
     for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
         let first = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
         let second = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
@@ -104,9 +105,14 @@ fn ring_invariant_holds_under_faults() {
         let w = workload.clone();
         let ft = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(w, FaultConfig::enabled(9), seed, ft).await
+            run_and_assert_with_faults(w, FaultConfig::failures(9), seed, ft).await
         });
     }
+}
+
+#[test]
+fn ring_invariant_holds_with_slow_mutations() {
+    assert_slow_mutation_modes("Cycle workload", &contended_cycle());
 }
 
 #[test]
@@ -118,7 +124,7 @@ fn ring_holds_under_crash_restart_and_outages() {
     // exercise: lease expiry, lock-lease recovery, and a restarted client
     // reclaiming its own orphaned locks.
     let workload = contended_cycle();
-    let faults = FaultConfig::enabled(200);
+    let faults = FaultConfig::failures(200);
     for seed in [0u64, 1, 7, 42, 99, 1234] {
         let ft = fault_tape(seed);
         let first = record_faults_with_tape(seed, &workload, faults, ft.clone());
@@ -130,7 +136,7 @@ fn ring_holds_under_crash_restart_and_outages() {
 #[test]
 fn boundary_tapes_replay_deterministically() {
     let workload = max_snapshot_cycle();
-    let faults = FaultConfig::enabled(128);
+    let faults = FaultConfig::failures(128);
     for (schedule, fault_tape) in [
         (Vec::new(), Vec::new()),
         (vec![0], Vec::new()),
@@ -147,7 +153,7 @@ fn pct_schedule_is_byte_identical_per_seed() {
     // The PCT policy must be just as reproducible as the tape policy: a fixed
     // seed yields a byte-for-byte identical op stream across runs.
     let workload = contended_cycle();
-    let faults = FaultConfig::enabled(5);
+    let faults = FaultConfig::failures(5);
     for seed in [0u64, 1, 7, 42, 1234] {
         let first = pct_record(&workload, faults, seed);
         let second = pct_record(&workload, faults, seed);
@@ -177,6 +183,6 @@ fn pct_seed_breadth_holds_ring_invariant() {
     // Seed-breadth sweep: many PCT schedules over the contended ring, with and
     // without faults. Any invariant violation panics inside the sweep.
     let workload = contended_cycle();
-    pct_sweep(&workload, FaultConfig::enabled(7), 0..32);
+    pct_sweep(&workload, FaultConfig::failures(7), 0..32);
     pct_sweep(&workload, FaultConfig::none(), 0..16);
 }

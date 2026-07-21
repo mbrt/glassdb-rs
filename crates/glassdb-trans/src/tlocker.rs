@@ -201,7 +201,7 @@ async fn build_groups(
     let grouped = dir
         .group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any)
         .await
-        .map_err(|e| TransError::with_source("grouping keys by leaf", e))?;
+        .map_err(|e| TransError::from(e).context("grouping keys by leaf"))?;
 
     let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
     for group in grouped {

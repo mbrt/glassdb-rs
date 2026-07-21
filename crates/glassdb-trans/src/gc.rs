@@ -47,14 +47,12 @@ use glassdb_storage::{
 };
 
 use crate::error::TransError;
-use crate::monitor::{Monitor, PENDING_TX_TIMEOUT, is_expired};
+use crate::monitor::Monitor;
 use crate::tlocker::Locker;
 
 /// How often the collector runs a sweep cycle. Reuses the lease timeout: a
 /// candidate cannot become collectable faster than one lease anyway, so a
 /// tighter cadence would only re-GET still-referenced objects.
-const GC_INTERVAL: std::time::Duration = PENDING_TX_TIMEOUT;
-
 /// Maximum number of transaction objects returned by one listing request.
 const GC_LIST_PAGE: usize = 128;
 
@@ -143,8 +141,9 @@ impl Gc {
     }
 
     /// Starts the background sweep loop on the [`Background`] executor. It runs
-    /// one cycle every [`GC_INTERVAL`] until the executor is dropped. If the
-    /// executor is already gone (DB shut down) nothing is started.
+    /// one cycle every transaction-liveness interval until the executor is
+    /// dropped. If the executor is already gone (DB shut down) nothing is
+    /// started.
     pub fn start(&self) {
         let Some(bg) = self.bg.upgrade() else {
             return;
@@ -153,7 +152,7 @@ impl Gc {
         let mut scan = TxScan::shuffled();
         bg.spawn(async move {
             loop {
-                rt::sleep(GC_INTERVAL).await;
+                rt::sleep(gc.mon.protocol_timing().pending_timeout()).await;
                 gc.run_once(&mut scan).await;
             }
         });
@@ -261,7 +260,7 @@ impl Gc {
         // (ADR-024 materializes the object lazily, after the locks are taken);
         // a recent committed/aborted one is left for a later cycle.
         let ts = log.timestamp.unwrap_or(UNIX_EPOCH);
-        if !is_expired(ts, self.clock.now()) {
+        if !self.mon.protocol_timing().is_expired(ts, self.clock.now()) {
             return Ok(());
         }
 
@@ -485,6 +484,7 @@ mod tests {
             Arc::downgrade(&bg),
             clock.clone(),
             RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
         );
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let coord = ShardCoordinator::new(

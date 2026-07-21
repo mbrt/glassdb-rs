@@ -266,8 +266,8 @@ hack/aws-bench/compare-refs.sh
 DELAY_SCALE=0.02 DB_LIST=1,5 NUM_KEYS=500 DURATION=5s NUM_RUNS=1 \
   DEADLOCK_DURATION=3s COUNT=2 RW_MIX=balanced hack/aws-bench/compare-refs.sh
 
-# only the deterministic autoresearch efficiency score (no rtbench sweeps):
-hack/aws-bench/compare-refs.sh --autoresearch-only
+# fast run of every summary section (smaller windows, no plots):
+hack/aws-bench/compare-refs.sh --summary
 
 # pick the two refs explicitly:
 BASE=main TARGET=s3-redesign hack/aws-bench/compare-refs.sh
@@ -283,13 +283,22 @@ artifact that is **not** gitignored, so it can be committed to track the numbers
 (the autoresearch score is deterministic) across changes.
 
 How it works: each ref compiles its own engine (the `Backend` trait differs
-across versions), so the script builds `rtbench` + `autoresearch` (+ `mixbench`,
-best-effort) from the baseline ref in a **reused detached git worktree** and from
-the target tree, runs `rw9010` (the `--rw-mix` presets
+across versions), so the script builds `rtbench` + `autoresearch` and, when
+present, `mixbench` from the baseline ref in a **reused detached git worktree**
+and from the target tree, runs `rw9010` (the `--rw-mix` presets
 `balanced`/`readheavy`/`writeheavy`), `deadlock`, the `autoresearch` score, and
 the `mixbench` grid on both into `out-refs/`, then diffs them with `compare.py`
 (`ratio = target / base`: throughput > 1 is a win; latency / retries /
 backend-ops / cost < 1 is a win).
+
+Modern benchmark binaries bound each cell's in-flight drain with
+`--drain-timeout`; the full comparison allows 90 seconds so it retains the
+current high-concurrency write tail, while `--summary` allows 30 seconds. Every
+workload command also runs under a 15-minute watchdog for historical refs that
+predate that flag. Missing cells and terminal transaction failures abort the
+comparison. An `InDoubt` returned by a measured mutation is different: the
+benchmark replays it as part of the same logical operation and includes every
+attempt in the sample's latency and backend-op cost.
 
 `mixbench` runs all four transaction shapes (`rwSingle`, `rwMany`, `roSingle`,
 `roMulti`) together over a contention **mode** (`lo`/`hi`) x Database
@@ -319,8 +328,10 @@ the per-class op columns, so the run still works.
 
 Tunables (env): `BASE`, `TARGET`, `LABEL_A`/`LABEL_B`, `DELAY_SCALE`, `DB_LIST`,
 `NUM_KEYS`, `DURATION`, `NUM_RUNS`, `DEADLOCK_DURATION`, `COUNT`, `RW_MIX`,
-`MIX_DURATION`, `MIX_MODES`, `MIX_TOPOLOGIES`, `MIX_WORKERS`, `MIX_CLIENTS`,
-`MIX_NUM_KEYS`, `MIX_HOT_KEYS`, `MIX_MULTI_KEYS`, `OUT`, `BASE_WT`/`TARGET_WT`.
+`MIX_DURATION`, `MIX_MAX_DURATION`, `MIX_TARGET_CI`, `MIX_MODES`,
+`MIX_TOPOLOGIES`, `MIX_WORKERS`, `MIX_CLIENTS`, `MIX_NUM_KEYS`, `MIX_HOT_KEYS`,
+`MIX_MULTI_KEYS`, `DRAIN_TIMEOUT`, `COMMAND_TIMEOUT`, `OUT`,
+`BASE_WT`/`TARGET_WT`.
 
 > **Criterion is secondary here.** `cargo bench -p glassdb` (`make bench`)
 > measures one transaction at a time at compressed delays; it is good for

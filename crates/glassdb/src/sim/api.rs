@@ -283,7 +283,7 @@ impl SimWorkload for ApiWorkload {
         run_api_program(db, op, state).await
     }
 
-    async fn verify(&self, db: &Database, state: &Mutex<ApiAcct>, _faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &Mutex<ApiAcct>, _failures_enabled: bool) {
         let collection = db.collection(API_COLLECTION);
         let listed: Vec<Vec<u8>> = collection
             .keys()

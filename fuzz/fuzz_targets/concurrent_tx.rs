@@ -5,11 +5,11 @@
 //! tape* and a *fault tape*. The harness runs every client as its own task over
 //! a shared in-process backend on the in-repo deterministic executor
 //! ([`glassdb::rt`], `--cfg sim`); a [`TapeScheduler`] consumes the schedule
-//! tape to choose task interleavings, while the fault tape guides the fault
-//! schedule (backend faults and crash timing). Both dimensions are therefore
-//! part of the libFuzzer input and become coverage-guidable. Scheduling, time,
-//! randomness, and faults are all a deterministic function of the input, so a
-//! crashing input replays the exact interleaving.
+//! tape to choose task interleavings, while the fault tape guides transport
+//! failures, crash timing, and one-shot slow mutations. Both dimensions are
+//! therefore part of the libFuzzer input and become coverage-guidable.
+//! Scheduling, time, randomness, failures, and delays are all deterministic
+//! functions of the input, so a crashing input replays the exact interleaving.
 //!
 //! [`run_and_assert_with_faults`] panics on any invariant violation
 //! (`acked <= final <= started`, plus non-negativity and serializability),

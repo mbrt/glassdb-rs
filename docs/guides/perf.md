@@ -7,6 +7,134 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+Open follow-up work is tracked in [Performance TODOs](perf-todos.md).
+
+## ADR-031–ADR-043 and transaction-log refactoring
+
+This cumulative comparison covers dynamic range sharding
+([ADR-031](../adr/031-dynamic-range-sharding.md)), node-level locking and
+coordinated splits ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)),
+the subsequent listing and transaction changes, the decoded object cache
+([ADR-036](../adr/036-decoded-object-cache-with-bounded-freshness.md)), and the
+causally coordinated backend operations of
+[ADR-043](../adr/043-causally-coordinated-backend-operations.md). The target also
+includes the transaction-log refactor in `f9625778` (PR #21).
+
+### compare-refs full summary
+
+- command: `BASE=7a1e05b1 LABEL_A=adr030 LABEL_B=head compare-refs.sh`
+- base: `7a1e05b1f27737169872b6162f6dc98d8c91fe46` (adr030)
+- target: current worktree based on `122e229c` (head)
+- ratio = head / adr030 (throughput >1 good; latency/ops/cost <1 good)
+- full parameters: 5,000 keys, 15-second rw9010 cells at 1/10/20/40
+  Databases, 8-second deadlock cells, five deterministic efficiency repeats,
+  and adaptive mixbench cells capped at 60 seconds
+- every rw9010 cell completed with zero transaction failures; deadlock and all
+  four mixbench cells also completed. The high-contention per-shape mixbench
+  cell reached its time cap and is marked `[unconverged]`
+- at 40 Databases, the target's nominal 15-second cells took 36.5 seconds
+  (balanced), 42.4 seconds (read-heavy), and 49.7 seconds (write-heavy) to
+  finish in-flight work, versus 17.8–20.0 seconds for adr030. These successful
+  drains are included rather than discarded
+- weak-read ratios magnify adr030's 0.04–0.07 ms p50 baseline; the target's
+  40-Database weak-read p50 is 45–49 ms
+
+### rw9010/balanced
+
+- throughput[strong-read]: ratio b/a min=0.03 median=0.05 max=0.62 (geomean=0.08, n=4) => WORSE
+- throughput[weak-read]: ratio b/a min=0.03 median=0.05 max=0.62 (geomean=0.08, n=4) => WORSE
+- throughput[write]: ratio b/a min=0.03 median=0.05 max=0.62 (geomean=0.08, n=4) => WORSE
+- latency-p50[strong-read]: ratio b/a min=0.91 median=0.97 max=1.99 (geomean=1.14, n=4) => better
+- latency-p50[weak-read]: ratio b/a min=5.00 median=620.35 max=894.40 (geomean=199.88, n=4) => WORSE
+- latency-p50[write]: ratio b/a min=1.03 median=6.90 max=30.69 (geomean=5.06, n=4) => WORSE
+- retries: ratio b/a min=0.03 median=0.06 max=1.64 (geomean=0.11, n=4) => better
+- backend-ops/tx: ratio b/a min=0.42 median=0.75 max=1.53 (geomean=0.77, n=4) => better
+
+### rw9010/readheavy
+
+- throughput[strong-read]: ratio b/a min=0.03 median=0.07 max=0.61 (geomean=0.10, n=4) => WORSE
+- throughput[weak-read]: ratio b/a min=0.03 median=0.07 max=0.61 (geomean=0.10, n=4) => WORSE
+- throughput[write]: ratio b/a min=0.03 median=0.07 max=0.61 (geomean=0.10, n=4) => WORSE
+- latency-p50[strong-read]: ratio b/a min=0.53 median=0.95 max=1.92 (geomean=0.98, n=4) => better
+- latency-p50[weak-read]: ratio b/a min=6.25 median=280.20 max=909.30 (geomean=69.90, n=4) => WORSE
+- latency-p50[write]: ratio b/a min=1.06 median=6.19 max=21.40 (geomean=4.47, n=4) => WORSE
+- retries: ratio b/a min=0.01 median=0.03 max=1.38 (geomean=0.07, n=4) => better
+- backend-ops/tx: ratio b/a min=0.48 median=0.67 max=1.20 (geomean=0.71, n=4) => better
+
+### rw9010/writeheavy
+
+- throughput[strong-read]: ratio b/a min=0.02 median=0.04 max=0.58 (geomean=0.06, n=4) => WORSE
+- throughput[weak-read]: ratio b/a min=0.02 median=0.04 max=0.58 (geomean=0.06, n=4) => WORSE
+- throughput[write]: ratio b/a min=0.02 median=0.04 max=0.58 (geomean=0.06, n=4) => WORSE
+- latency-p50[strong-read]: ratio b/a min=0.93 median=1.12 max=2.20 (geomean=1.27, n=4) => WORSE
+- latency-p50[weak-read]: ratio b/a min=0.62 median=0.76 max=4.43 (geomean=1.12, n=4) => better
+- latency-p50[write]: ratio b/a min=1.35 median=5.51 max=19.67 (geomean=4.38, n=4) => WORSE
+- retries: ratio b/a min=0.20 median=0.37 max=1.09 (geomean=0.40, n=4) => better
+- backend-ops/tx: ratio b/a min=0.33 median=1.42 max=3.36 (geomean=1.19, n=4) => WORSE
+
+### deadlock
+
+- deadlock-p50 [noisy]: ratio b/a min=0.34 median=0.83 max=0.86 (geomean=0.72, n=6) => better
+- deadlock-p90 [noisy]: ratio b/a min=0.45 median=1.14 max=1.26 (geomean=1.00, n=6) => WORSE
+
+### mixbench
+
+- mix-tps[roMulti] [unconverged]: ratio b/a min=0.00 median=0.26 max=0.67 (geomean=0.07, n=4) n_min=96 => WORSE
+- mix-tps[roSingle] [unconverged]: ratio b/a min=0.00 median=0.42 max=1.43 (geomean=0.09, n=4) n_min=55 => WORSE
+- mix-tps[rwMany] [unconverged]: ratio b/a min=0.09 median=0.41 max=0.66 (geomean=0.30, n=4) n_min=77 => WORSE
+- mix-tps[rwSingle]: ratio b/a min=0.07 median=0.67 max=6.95 (geomean=0.52, n=4) n_min=790 => WORSE
+- mix-ops/tx[hi/roMulti] [unconverged]: ratio b/a=0.63 (1 point) n_min=96 => better
+- mix-ops/tx[hi/roSingle] [unconverged]: ratio b/a=8.26 (1 point) n_min=55 => WORSE
+- mix-ops/tx[hi/rwMany] [unconverged]: ratio b/a=0.03 (1 point) n_min=77 => better
+- mix-ops/tx[hi/rwSingle]: ratio b/a=0.18 (1 point) n_min=14954 => better
+- mix-ops/tx[lo/roMulti]: ratio b/a=0.23 (1 point) n_min=12416 => better
+- mix-ops/tx[lo/roSingle]: ratio b/a=0.56 (1 point) n_min=96356 => better
+- mix-ops/tx[lo/rwMany]: ratio b/a=1.03 (1 point) n_min=394 => WORSE
+- mix-ops/tx[lo/rwSingle]: ratio b/a=3.33 (1 point) n_min=1201 => WORSE
+- mix-retries/tx[hi] [unconverged]: ratio b/a min=0.09 median=0.82 max=4.99 (geomean=0.51, n=4) => better
+- mix-retries/tx[lo]: ratio b/a min=0.03 median=0.93 max=462.57 (geomean=0.96, n=4) => better
+- mix-agg-ops/tx[hi]: ratio b/a=0.12 (1 point) => better
+- mix-agg-ops/tx[lo]: ratio b/a=0.04 (1 point) => better
+
+### efficiency
+
+- autoresearch-score (cost/tx geomean, lower=better) [deterministic]: adr030=863.53 head=122.66 ratio b/a=0.142 => better
+- autoresearch-cost/tx: ratio b/a min=0.01 median=0.10 max=1.11 (geomean=0.14, n=5) => better
+- autoresearch-cost/tx[batchWrite100]: ratio b/a=0.01 => better
+- autoresearch-cost/tx[multiRMW10]: ratio b/a=0.08 => better
+- autoresearch-cost/tx[batchRead10]: ratio b/a=0.10 => better
+- autoresearch-cost/tx[readRepeat]: ratio b/a=0.98 => ~same
+- autoresearch-cost/tx[singleRMW]: ratio b/a=1.11 => WORSE
+
+### Attribution
+
+The largest throughput change remains the ADR-031/ADR-032 transition. Comparing
+ADR-030 with `118c0224` (PR #15, the first standard-workload-compatible commit
+after PR #14) gives throughput geomeans of 0.16 for balanced, 0.18 for
+read-heavy, and 0.15 for write-heavy. PR #14 (`996d5078`, ADR-031) cannot run
+the standard 5,000-key workload by itself: it fails at the first root split with
+`collection root node is not a leaf`. That prevents a clean separation of
+ADR-031 from ADR-032, but locates most of the cumulative throughput regression
+to their dynamic-sharding and node-locking transition.
+
+The largest efficiency improvement remains PR #20 (`b11eeb39`, ADR-036). In a
+direct comparison with its parent, the deterministic efficiency score falls
+from 598.98 to 127.13 (ratio 0.212), while backend operations/transaction fall
+to 0.45–0.58 across the rw9010 mixes. The same comparison has throughput ratios
+of 0.83 for balanced, 0.36 for read-heavy, and 0.58 for write-heavy: fewer
+backend operations and better median reads, but long write tails reduce
+completed throughput.
+
+The earlier deadlock `NotFound` started with ADR-036's cache and is addressed by
+ADR-043's completion-before-invocation ordering. This full target run completes
+the deadlock matrix. During the full rw9010 validation, a second false
+`NotFound` exposed a transaction-lifecycle invariant violation: missing-object
+expiry could re-read a concurrently committed object and pass that final
+observation to `force_abort`, allowing `committed → aborted`. Status appearance
+now re-enters ordinary resolution, and `force_abort` independently refuses to
+overwrite a final observation. The remaining 36–50 second cells are therefore
+performance tails rather than failed or corrupted transactions.
+
 ## ADR-030: Seed shard loads
 
 Reducing the number of strong shard loads and replacing them with caching in

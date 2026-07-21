@@ -203,7 +203,7 @@ impl SimWorkload for CycleWorkload {
         cycle_swap(db, &db.collection(CYCLE_COLLECTION), *op).await
     }
 
-    async fn verify(&self, db: &Database, state: &AtomicUsize, _faults_enabled: bool) {
+    async fn verify(&self, db: &Database, state: &AtomicUsize, _failures_enabled: bool) {
         if self.snapshot_reads != 0 {
             assert!(
                 state.load(Ordering::SeqCst) != 0,
@@ -250,16 +250,16 @@ impl SimWorkload for CycleWorkload {
         let backbone = backbone.clone();
         let state = state.clone();
         Some(rt::spawn(async move {
-            let Ok(db) = Self::open_db(&backbone).await else {
-                return;
-            };
+            let db = Self::open_db(&backbone)
+                .await
+                .expect("open cycle observer database");
             let coll = db.collection(CYCLE_COLLECTION);
             for _ in 0..snapshot_reads {
                 rt::yield_now().await;
                 state.fetch_add(1, Ordering::SeqCst);
                 match read_ring_snapshot(&db, &coll, node_count).await {
                     Ok(snap) => assert_ring(&snap),
-                    Err(_) => break,
+                    Err(error) => panic!("cycle observer read failed: {error}"),
                 }
             }
             db.shutdown().await;

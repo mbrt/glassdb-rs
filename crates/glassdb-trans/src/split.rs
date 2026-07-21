@@ -48,7 +48,7 @@ use glassdb_storage::{
 use tokio::sync::Notify;
 
 use crate::error::TransError;
-use crate::monitor::{Monitor, PENDING_TX_TIMEOUT};
+use crate::monitor::Monitor;
 use crate::node_locking::{NodeLockReconciler, StructureWriteResolver, resolve_entry_locks_at};
 use crate::resolver::Resolver;
 use crate::shard_coord::{FoldOutcome, ShardCoordinator, SplitHinter};
@@ -56,9 +56,6 @@ use crate::shard_coord::{FoldOutcome, ShardCoordinator, SplitHinter};
 /// How often the splitter drains its candidate queue. A split is a handful of
 /// CAS round-trips, so a tight cadence keeps overflowing leaves short-lived.
 const SPLIT_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Retry unresolved structural records at the transaction-liveness horizon.
-const STRUCTURAL_RECOVERY_ACTIVE_INTERVAL: Duration = PENDING_TX_TIMEOUT;
 
 /// Back off empty structural-log listings independently of split candidates.
 const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(60);
@@ -390,7 +387,7 @@ impl Splitter {
             loop {
                 let active = recovery.recover_structural_logs().await;
                 let delay = if active {
-                    STRUCTURAL_RECOVERY_ACTIVE_INTERVAL
+                    recovery.mon.protocol_timing().pending_timeout()
                 } else {
                     STRUCTURAL_RECOVERY_IDLE_INTERVAL
                 };

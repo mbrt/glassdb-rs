@@ -3,7 +3,7 @@
 # Compare GlassDB transaction performance between two engine versions (git
 # refs) under the in-memory backend with simulated S3 latency and throttling.
 #
-# It builds `rtbench` + `autoresearch` (+ `mixbench`, best-effort) from a base
+# It builds `rtbench` + `autoresearch` (+ `mixbench`, when present) from a base
 # ref (default `main`, built in a reused detached git worktree) and from the
 # target tree (the current worktree by default), runs the same workloads on both
 # into `out-refs/`, and diffs them with `compare.py`. Throughput and latency are
@@ -19,8 +19,8 @@
 # apples-to-apples once both refs carry the enhanced `rtbench` (e.g. after `main`
 # is merged into the v2 branch); against an older target the driver falls back
 # to the `balanced` mix only and `compare.py` degrades gracefully. Likewise
-# `mixbench` runs only on refs that carry it; a ref that predates it just skips
-# that section.
+# `mixbench` runs only on refs that carry it; a ref that predates it skips that
+# section, while a present binary must complete successfully.
 #
 # Each run leaves a small, trackable digest at $OUT/summary.md (the per-section
 # ratio summaries plus the deterministic autoresearch score). It is the only
@@ -69,6 +69,10 @@
 #   MIX_NUM_KEYS=<NUM_KEYS> mixbench lo-mode key pool
 #   MIX_HOT_KEYS=8          mixbench hi-mode hot-key pool
 #   MIX_MULTI_KEYS=10       mixbench keys per multi-key shape
+#   DRAIN_TIMEOUT=90s / 30s per-cell completion grace for benchmark binaries
+#                           that support --drain-timeout
+#   COMMAND_TIMEOUT=15m     hard watchdog for each workload command, including
+#                           historical binaries without per-cell deadlines
 #   OUT=<script dir>/out-refs                output root
 #   BASE_WT, TARGET_WT      worktree paths (defaults are repo-parent siblings)
 set -euo pipefail
@@ -112,6 +116,7 @@ if [ "$SUMMARY" = "1" ]; then
   MIX_DURATION="${MIX_DURATION:-1s}"
   MIX_MAX_DURATION="${MIX_MAX_DURATION:-20s}"
   MIX_TARGET_CI="${MIX_TARGET_CI:-0.2}"
+  DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30s}"
 else
   DELAY_SCALE="${DELAY_SCALE:-0.05}"
   DB_LIST="${DB_LIST:-1,10,20,40}"
@@ -122,6 +127,9 @@ else
   MIX_DURATION="${MIX_DURATION:-2s}"
   MIX_MAX_DURATION="${MIX_MAX_DURATION:-60s}"
   MIX_TARGET_CI="${MIX_TARGET_CI:-0.1}"
+  # The current 40-Database workload has a measured 40+ second transaction
+  # tail. Keep the run bounded without rejecting that valid slow sample.
+  DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-90s}"
 fi
 NUM_KEYS="${NUM_KEYS:-5000}"
 RW_MIX="${RW_MIX:-balanced readheavy writeheavy}"
@@ -134,6 +142,7 @@ MIX_CLIENTS="${MIX_CLIENTS:-4}"
 MIX_NUM_KEYS="${MIX_NUM_KEYS:-$NUM_KEYS}"
 MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
 MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-15m}"
 OUT="${OUT:-$SCRIPT_DIR/out-refs}"
 BASE_WT="${BASE_WT:-$(dirname "$REPO_ROOT")/.glassdb-perf-base}"
 TARGET_WT_DEFAULT="$(dirname "$REPO_ROOT")/.glassdb-perf-target"
@@ -145,6 +154,55 @@ PLOT_ARGS=()
 [ "$SUMMARY" = "1" ] && PLOT_ARGS=(--no-plots)
 
 log() { echo "[compare-refs] $*" >&2; }
+
+run_bounded() {
+  timeout --foreground --kill-after=10s "$COMMAND_TIMEOUT" "$@"
+}
+
+csv_items() {
+  local value="$1" items
+  IFS=',' read -r -a items <<<"$value"
+  echo "${#items[@]}"
+}
+
+validate_rw_results() {
+  local path="$1" expected="$2"
+  awk -F, -v expected="$expected" '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) if ($i == "tx-failures") failures_col = i
+      next
+    }
+    { rows++ }
+    failures_col && $failures_col + 0 != 0 {
+      printf("%s: transaction failures in row %d: %s\n", FILENAME, NR, $failures_col) > "/dev/stderr"
+      bad = 1
+    }
+    END {
+      if (!failures_col) {
+        printf("%s: missing tx-failures column\n", FILENAME) > "/dev/stderr"
+        bad = 1
+      }
+      if (rows != expected) {
+        printf("%s: expected %d cells, found %d\n", FILENAME, expected, rows) > "/dev/stderr"
+        bad = 1
+      }
+      exit bad
+    }
+  ' "$path"
+}
+
+validate_mix_results() {
+  local path="$1" expected="$2" cells
+  cells="$(grep -c '"mode"' "$path" || true)"
+  if [ "$cells" -ne "$expected" ]; then
+    log "ERROR: $path expected $expected cells, found $cells"
+    return 1
+  fi
+  if grep -Eq '"failures"[[:space:]]*:[[:space:]]*[1-9]' "$path"; then
+    log "ERROR: $path contains transaction failures"
+    return 1
+  fi
+}
 
 # Add or refresh a detached worktree at $1 pinned to ref $2.
 ensure_worktree() {
@@ -177,6 +235,11 @@ if [ "$DO_CLEAN" = "1" ]; then
   exit 0
 fi
 
+if ! command -v timeout >/dev/null 2>&1; then
+  log "ERROR: GNU timeout is required for bounded benchmark runs"
+  exit 2
+fi
+
 build_bins() {
   local dir="$1"
   log "building rtbench + autoresearch in $dir (release)"
@@ -196,13 +259,22 @@ supports_rw_mix() {
   "$1/rtbench" --help 2>&1 | grep -q -- "--rw-mix"
 }
 
+supports_drain_timeout() {
+  "$1" --help 2>&1 | grep -q -- "--drain-timeout"
+}
+
 # Run every workload for one side into $OUT/<group>/<label>/.
 #   $1 = label (output subdir + report label)
 #   $2 = bin dir (… /target/release)
 #   $3 = whether this side supports --rw-mix (0/1)
+#   $4 = whether this side's rtbench supports --drain-timeout (0/1)
 run_side() {
-  local label="$1" bindir="$2" has_mix="$3"
+  local label="$1" bindir="$2" has_mix="$3" has_drain="$4"
   local common=(--backend=memory --delays=s3 --delay-scale="$DELAY_SCALE")
+  local drain_args=()
+  [ "$has_drain" = "1" ] && drain_args=(--drain-timeout="$DRAIN_TIMEOUT")
+  local expected_rw
+  expected_rw=$(( $(csv_items "$DB_LIST") * NUM_RUNS ))
 
   for mix in $MIXES; do
     local d="$OUT/$mix/$label"
@@ -212,39 +284,44 @@ run_side() {
       mix_args=(--rw-mix="$mix")
     fi
     log "$label rw9010 mix=$mix"
-    "$bindir/rtbench" "${common[@]}" \
+    run_bounded "$bindir/rtbench" "${common[@]}" "${drain_args[@]}" \
       --test-name=rw9010 "${mix_args[@]}" \
       --db-list="$DB_LIST" --num-keys="$NUM_KEYS" \
       --duration="$DURATION" --num-runs="$NUM_RUNS" \
       --samples-out="$d/samples.csv" --stats-out="$d/stats.csv" \
       --throughput-out="$d/throughput.csv" --client-stats-out="$d/client-stats.csv" >&2
+    validate_rw_results "$d/client-stats.csv" "$expected_rw"
   done
 
   local dd="$OUT/contention/$label"
   mkdir -p "$dd"
   log "$label deadlock"
-  "$bindir/rtbench" "${common[@]}" \
+  run_bounded "$bindir/rtbench" "${common[@]}" "${drain_args[@]}" \
     --test-name=deadlock --duration="$DEADLOCK_DURATION" --num-runs="$NUM_RUNS" \
     --deadlock-out="$dd/deadlock.csv" >&2
 
   # mixbench: all shapes together over the contention x topology grid. Only
   # when this side actually built the binary (older refs skip it); progress
-  # goes to stderr, the JSON grid to the compared artifact. Run best-effort: a
-  # ref whose mixbench predates the sequential-sampling flags rejects them, and
-  # that must skip its section rather than abort the whole sweep (set -e).
+  # goes to stderr, the JSON grid to the compared artifact. An available binary
+  # is strict: command errors, missing cells, and transaction failures abort the
+  # comparison rather than silently dropping its section.
   if [ -x "$bindir/mixbench" ]; then
     local dm="$OUT/mixbench/$label"
     mkdir -p "$dm"
     log "$label mixbench"
-    if ! "$bindir/mixbench" --delays=s3 --delay-scale="$DELAY_SCALE" \
+    local mix_drain_args=()
+    supports_drain_timeout "$bindir/mixbench" \
+      && mix_drain_args=(--drain-timeout="$DRAIN_TIMEOUT")
+    run_bounded "$bindir/mixbench" --delays=s3 --delay-scale="$DELAY_SCALE" \
+      "${mix_drain_args[@]}" \
       --duration="$MIX_DURATION" --max-duration="$MIX_MAX_DURATION" \
       --target-ci="$MIX_TARGET_CI" --modes="$MIX_MODES" --topologies="$MIX_TOPOLOGIES" \
       --workers-per-shape="$MIX_WORKERS" --clients-per-shape="$MIX_CLIENTS" \
       --num-keys="$MIX_NUM_KEYS" --hot-keys="$MIX_HOT_KEYS" --multi-keys="$MIX_MULTI_KEYS" \
-      --json >"$dm/mixbench.json"; then
-      log "NOTE: $label mixbench failed (likely an older ref without --target-ci); skipping"
-      rm -f "$dm/mixbench.json"
-    fi
+      --json >"$dm/mixbench.json"
+    local expected_mix
+    expected_mix=$(( $(csv_items "$MIX_MODES") * $(csv_items "$MIX_TOPOLOGIES") ))
+    validate_mix_results "$dm/mixbench.json" "$expected_mix"
   else
     log "$label has no mixbench binary; skipping mixbench"
   fi
@@ -252,7 +329,7 @@ run_side() {
   local de="$OUT/efficiency/$label"
   mkdir -p "$de"
   log "$label autoresearch (--count $COUNT)"
-  "$bindir/autoresearch" --json --count "$COUNT" >"$de/score.json"
+  run_bounded "$bindir/autoresearch" --json --count "$COUNT" >"$de/score.json"
 }
 
 # --- Build both sides ------------------------------------------------------
@@ -274,9 +351,11 @@ fi
 
 # Determine the mix set: every requested mix only when both binaries support
 # --rw-mix, else fall back to the default balanced mix (run flagless).
-A_MIX=0; B_MIX=0
+A_MIX=0; B_MIX=0; A_DRAIN=0; B_DRAIN=0
 supports_rw_mix "$BASE_BIN" && A_MIX=1
 supports_rw_mix "$TARGET_BIN" && B_MIX=1
+supports_drain_timeout "$BASE_BIN/rtbench" && A_DRAIN=1
+supports_drain_timeout "$TARGET_BIN/rtbench" && B_DRAIN=1
 if [ "$A_MIX" = "1" ] && [ "$B_MIX" = "1" ]; then
   MIXES="$RW_MIX"
 else
@@ -286,13 +365,14 @@ fi
 
 MODE_DESC="full"
 [ "$SUMMARY" = "1" ] && MODE_DESC="summary (fast, no plots)"
-log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); mode: $MODE_DESC; mixes: $MIXES"
+log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); mode: $MODE_DESC; \
+mixes: $MIXES; drain-timeout: $DRAIN_TIMEOUT; command-timeout: $COMMAND_TIMEOUT"
 rm -rf "$OUT"
 
 # --- Run both sides back-to-back -------------------------------------------
 
-run_side "$LABEL_A" "$BASE_BIN" "$A_MIX"
-run_side "$LABEL_B" "$TARGET_BIN" "$B_MIX"
+run_side "$LABEL_A" "$BASE_BIN" "$A_MIX" "$A_DRAIN"
+run_side "$LABEL_B" "$TARGET_BIN" "$B_MIX" "$B_DRAIN"
 
 # --- Compare ---------------------------------------------------------------
 # Every comparison appends a section to $SUMMARY, leaving one small, trackable

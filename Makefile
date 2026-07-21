@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score bench-mix flamegraph profile
+.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -36,17 +36,11 @@ bench:
 bench-score:
 	@cargo run --release -p glassdb-bench-score --bin autoresearch -- --count 3
 
-# Run the mixed-workload contention gridA fast dev tool for seeing where an
-# algorithm change lands. Pass extra flags after `--`, e.g. `make bench-mix
-# ARGS="--modes hi --json"`.
-bench-mix:
-	@cargo run --release -p glassdb-bench-scale --bin mixbench -- $(ARGS)
-
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
 # excluded from `test`, `bench-score`, and the autoresearch gate; it changes no
 # source and is not part of any metric). Tunable via TARGET/COUNT/OUT; see
 # hack/perf/README.md.
-flamegraph profile:
+flamegraph:
 	hack/perf/profile.sh
 
 # Run the test suite under the in-repo deterministic simulation executor

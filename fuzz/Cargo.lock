@@ -304,7 +304,6 @@ name = "glassdb-storage"
 version = "0.1.0"
 dependencies = [
  "base64",
- "futures",
  "glassdb-backend",
  "glassdb-concurr",
  "glassdb-data",
@@ -326,6 +325,7 @@ dependencies = [
  "glassdb-concurr",
  "glassdb-data",
  "glassdb-storage",
+ "hashlink",
  "thiserror",
  "tokio",
  "tracing",

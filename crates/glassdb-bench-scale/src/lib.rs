@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 pub mod bench;
+pub mod run;
 
 /// Parses a duration like `20s`, `500ms`, `2m`, or `1h` (a small subset of
 /// Go's `time.Duration` syntax) for the CLI flags. A bare number is seconds.

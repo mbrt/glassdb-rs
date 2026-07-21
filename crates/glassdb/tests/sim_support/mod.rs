@@ -63,3 +63,17 @@ pub fn record_with_tapes<W: SimWorkload>(
     let recorded = log.lock().unwrap();
     recorded.clone()
 }
+
+pub fn assert_slow_mutation_modes<W: SimWorkload>(label: &str, workload: &W) {
+    for (mode, faults) in [
+        ("slow-only", FaultConfig::slow_mutations()),
+        ("combined", FaultConfig::combined(64)),
+    ] {
+        for seed in [17, 29] {
+            let fault_tape = fault_tape(seed);
+            let first = record_faults_with_tape(seed, workload, faults, fault_tape.clone());
+            let second = record_faults_with_tape(seed, workload, faults, fault_tape);
+            assert_no_divergence(&format!("{label}: {mode}, seed {seed}"), &first, &second);
+        }
+    }
+}

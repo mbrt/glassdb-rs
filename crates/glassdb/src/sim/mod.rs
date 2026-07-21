@@ -14,6 +14,7 @@ mod cycle;
 mod harness;
 mod membership;
 mod rmw;
+mod slow_backend;
 
 pub use api::{ApiAcct, ApiAction, ApiTransaction, ApiWorkload};
 pub use cycle::CycleWorkload;

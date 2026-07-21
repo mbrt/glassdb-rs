@@ -17,7 +17,7 @@ pub use algo::{
 };
 pub use error::TransError;
 pub use gc::Gc;
-pub use monitor::Monitor;
+pub use monitor::{Monitor, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue, Reader};
 pub use resolver::{Resolver, ScanResult};
 pub use shard_coord::{ShardCoordinator, SplitHinter};

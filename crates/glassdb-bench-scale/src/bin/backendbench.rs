@@ -170,7 +170,7 @@ fn run_write_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
             // including on providers whose CAS token is content-derived.
             let data = random_data(1024);
             bench
-                .measure(|| async {
+                .measure_once(|| async {
                     version = b.write_if(&p, data, &version).await?;
                     Ok(())
                 })
@@ -192,7 +192,7 @@ fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         let expected = Version::new("0/0");
         while !bench.is_finished() {
             bench
-                .measure(|| async {
+                .measure_once(|| async {
                     let _ = b.write_if(&p, data.clone(), &expected).await;
                     Ok(())
                 })
@@ -209,7 +209,7 @@ fn run_read(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         replace_or_create(b.as_ref(), &p, data).await?;
         while !bench.is_finished() {
             bench
-                .measure(|| async {
+                .measure_once(|| async {
                     b.read(&p).await?;
                     Ok(())
                 })
@@ -228,7 +228,7 @@ fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         let version = replace_or_create(b.as_ref(), &p, data).await?;
         while !bench.is_finished() {
             bench
-                .measure(|| async {
+                .measure_once(|| async {
                     // The object is unchanged, so the backend returns a
                     // precondition error; that is the fast path we are timing,
                     // not a failure.

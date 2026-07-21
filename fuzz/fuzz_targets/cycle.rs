@@ -11,10 +11,10 @@
 //!
 //! The harness reads back every node's next-pointer and asserts the ring is
 //! still a single cycle of length `N`; any violation panics, which
-//! libFuzzer reports as a crash. The invariant holds even with faults active,
-//! since each swap is atomic. `cargo fuzz` overrides the `fuzz/.cargo/config.toml`
-//! rustflags, so `--cfg sim --cfg tokio_unstable` must be passed through the
-//! environment:
+//! libFuzzer reports as a crash. The invariant holds with transport failures,
+//! crashes, and slow mutations since each swap is atomic. `cargo fuzz` overrides
+//! the `fuzz/.cargo/config.toml` rustflags, so `--cfg sim --cfg tokio_unstable`
+//! must be passed through the environment:
 //!
 //! ```bash
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run cycle <crash-file>

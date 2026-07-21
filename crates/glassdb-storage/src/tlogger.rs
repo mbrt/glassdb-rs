@@ -212,8 +212,9 @@ impl TLogger {
         }
     }
 
-    /// Creates a new transaction log entry, failing if one already exists.
+    /// Creates a transaction's initial log, failing if one already exists.
     pub async fn set(&self, l: &TxLog) -> Result<Observation<TxLog>, StorageError> {
+        validate_lifecycle_transition(None, Some(l.status))?;
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
@@ -231,12 +232,19 @@ impl TLogger {
         }
     }
 
-    /// Updates the log only if its current version matches `expected`.
+    /// Transitions a pending log if its current version matches `expected`.
+    ///
+    /// Final logs are immutable: attempting to replace one fails locally with
+    /// [`StorageError::Precondition`] and issues no backend operation.
     pub async fn set_if(
         &self,
         l: &TxLog,
         expected: &Observation<TxLog>,
     ) -> Result<Observation<TxLog>, StorageError> {
+        let current = expected
+            .value()
+            .ok_or_else(|| StorageError::other("transaction log CAS requires a present value"))?;
+        validate_lifecycle_transition(Some(current.status), Some(l.status))?;
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
@@ -270,8 +278,15 @@ impl TLogger {
         })
     }
 
-    /// Removes the exact observed transaction log, converging if it is missing.
+    /// Removes an exact final log during GC, converging if it is missing.
+    ///
+    /// Pending logs must first transition to aborted; deleting one directly
+    /// fails locally with [`StorageError::Precondition`].
     pub async fn delete(&self, expected: &Observation<TxLog>) -> Result<(), StorageError> {
+        let current = expected.value().ok_or_else(|| {
+            StorageError::other("transaction log deletion requires a present value")
+        })?;
+        validate_lifecycle_transition(Some(current.status), None)?;
         self.logs.delete(expected).await?;
         Ok(())
     }
@@ -281,6 +296,43 @@ impl TLogger {
             .logs
             .peek(path)?
             .filter(|observation| observation.value().is_some_and(|log| log.status.is_final())))
+    }
+}
+
+/// Validates the durable transaction lifecycle before any backend operation.
+///
+/// Final objects are cached indefinitely, so replacing one would invalidate
+/// knowledge held by every database instance that has observed it. GC deletion
+/// is different: after its safety horizon, removing the physical object does
+/// not change the transaction's semantic final state.
+fn validate_lifecycle_transition(
+    current: Option<TxCommitStatus>,
+    next: Option<TxCommitStatus>,
+) -> Result<(), StorageError> {
+    if current == Some(TxCommitStatus::Unknown) || next == Some(TxCommitStatus::Unknown) {
+        return Err(StorageError::other(
+            "unknown is not a persisted transaction status",
+        ));
+    }
+
+    match (current, next) {
+        (
+            None | Some(TxCommitStatus::Pending),
+            Some(TxCommitStatus::Pending | TxCommitStatus::Ok | TxCommitStatus::Aborted),
+        ) => Ok(()),
+        (Some(TxCommitStatus::Ok | TxCommitStatus::Aborted), None) => Ok(()),
+        (Some(TxCommitStatus::Pending), None)
+        | (Some(TxCommitStatus::Ok | TxCommitStatus::Aborted), Some(_)) => {
+            Err(StorageError::Precondition)
+        }
+        (None, None) => Err(StorageError::other(
+            "transaction lifecycle transition has no source or destination",
+        )),
+        // Unknown statuses are rejected above, but keep this match exhaustive
+        // if the status enum gains another non-persisted variant.
+        _ => Err(StorageError::other(
+            "invalid transaction lifecycle transition",
+        )),
     }
 }
 
@@ -578,7 +630,9 @@ mod tests {
 
     use crate::Timeline;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+    use glassdb_backend::middleware::{
+        BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
+    };
     use tokio::sync::Notify;
 
     fn new_tlogger() -> TLogger {
@@ -586,6 +640,146 @@ mod tests {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
         TLogger::new(objects, "db")
+    }
+
+    fn new_recording_tlogger() -> (TLogger, OpLog) {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new());
+        (TLogger::new(objects, "db"), operations)
+    }
+
+    fn assert_operations(operations: &OpLog, expected: &[&str]) {
+        let mut operations = operations.lock().unwrap();
+        let actual: Vec<_> = operations.iter().map(|operation| operation.op).collect();
+        assert_eq!(actual, expected);
+        operations.clear();
+    }
+
+    #[tokio::test]
+    async fn allowed_lifecycle_transitions_add_no_backend_reads() {
+        let (logger, operations) = new_recording_tlogger();
+
+        for (suffix, status) in [
+            (1, TxCommitStatus::Pending),
+            (2, TxCommitStatus::Ok),
+            (3, TxCommitStatus::Aborted),
+        ] {
+            let id = TxId::from_bytes(vec![9, suffix]);
+            let observed = logger.set(&TxLog::new(id, status)).await.unwrap();
+            assert_operations(&operations, &["write_if_not_exists"]);
+            if status.is_final() {
+                logger.delete(&observed).await.unwrap();
+                assert_operations(&operations, &["delete_if"]);
+            }
+        }
+
+        let committed_id = TxId::from_bytes(vec![9, 4]);
+        let pending = logger
+            .set(&TxLog::new(committed_id.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+        let refreshed = logger
+            .set_if(
+                &TxLog::new(committed_id.clone(), TxCommitStatus::Pending),
+                &pending,
+            )
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if"]);
+        let committed = logger
+            .set_if(&TxLog::new(committed_id, TxCommitStatus::Ok), &refreshed)
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if"]);
+        logger.delete(&committed).await.unwrap();
+        assert_operations(&operations, &["delete_if"]);
+
+        let aborted_id = TxId::from_bytes(vec![9, 5]);
+        let pending = logger
+            .set(&TxLog::new(aborted_id.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+        logger
+            .set_if(&TxLog::new(aborted_id, TxCommitStatus::Aborted), &pending)
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if"]);
+    }
+
+    #[tokio::test]
+    async fn rejected_lifecycle_transitions_issue_no_backend_operations() {
+        let (logger, operations) = new_recording_tlogger();
+
+        for (suffix, current) in [(1, TxCommitStatus::Ok), (2, TxCommitStatus::Aborted)] {
+            let id = TxId::from_bytes(vec![10, suffix]);
+            let observed = logger.set(&TxLog::new(id.clone(), current)).await.unwrap();
+            assert_operations(&operations, &["write_if_not_exists"]);
+            for next in [
+                TxCommitStatus::Pending,
+                TxCommitStatus::Ok,
+                TxCommitStatus::Aborted,
+            ] {
+                assert!(matches!(
+                    logger
+                        .set_if(&TxLog::new(id.clone(), next), &observed)
+                        .await,
+                    Err(StorageError::Precondition)
+                ));
+                assert_operations(&operations, &[]);
+            }
+            assert_eq!(
+                logger
+                    .commit_status_at(&id, Requirement::Any)
+                    .await
+                    .unwrap()
+                    .status,
+                current
+            );
+            assert_operations(&operations, &[]);
+        }
+
+        let pending_id = TxId::from_bytes(vec![10, 3]);
+        let pending = logger
+            .set(&TxLog::new(pending_id.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+        assert!(matches!(
+            logger.delete(&pending).await,
+            Err(StorageError::Precondition)
+        ));
+        assert_operations(&operations, &[]);
+        assert_eq!(
+            logger
+                .commit_status_at(&pending_id, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Pending
+        );
+        assert_operations(&operations, &[]);
+
+        assert!(matches!(
+            logger
+                .set_if(&TxLog::new(pending_id, TxCommitStatus::Unknown), &pending,)
+                .await,
+            Err(StorageError::Other { .. })
+        ));
+        assert_operations(&operations, &[]);
+
+        assert!(matches!(
+            logger
+                .set(&TxLog::new(
+                    TxId::from_bytes(vec![10, 4]),
+                    TxCommitStatus::Unknown,
+                ))
+                .await,
+            Err(StorageError::Other { .. })
+        ));
+        assert_operations(&operations, &[]);
     }
 
     #[tokio::test]
