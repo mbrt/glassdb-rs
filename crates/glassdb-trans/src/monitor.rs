@@ -1064,6 +1064,7 @@ fn notify_waiters(st: &mut State, tid: &TxId, status: TxCommitStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glassdb_backend::middleware::RecordingBackend;
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_data::CollectionPath;
     use glassdb_storage::{CachedStore, LockType, Timeline, TxWrite};
@@ -1363,17 +1364,24 @@ mod tests {
 
     #[tokio::test]
     async fn force_abort_preserves_a_final_observation() {
-        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let b: Arc<dyn Backend> = Arc::new(backend);
         let (mon, t) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"already-committed".to_vec());
         let committed =
             t.tl.set(&TxLog::new(tx.clone(), TxCommitStatus::Ok))
                 .await
                 .unwrap();
+        operations.lock().unwrap().clear();
 
         assert_eq!(
             mon.force_abort(&tx, &committed).await.unwrap(),
             TxCommitStatus::Ok
+        );
+        assert!(
+            operations.lock().unwrap().is_empty(),
+            "the final-observation fast path must issue no backend operation"
         );
         let (_verify, verify) = new_test_monitor(b);
         assert_eq!(
