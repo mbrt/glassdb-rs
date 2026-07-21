@@ -227,6 +227,9 @@ pub struct Splitter {
     // Only leaf structure-write acquisition uses it; root and interior nodes
     // remain direct structural CASes.
     coord: ShardCoordinator,
+    // Paces root-metadata CAS retries. Transaction-status polling remains
+    // entirely owned by Monitor.
+    retry: RetryConfig,
     stats: Arc<Stats>,
 }
 
@@ -263,6 +266,7 @@ impl Splitter {
             db_root,
             coord.clone(),
             candidates,
+            retry,
         );
         (coord, splitter)
     }
@@ -287,6 +291,7 @@ impl Splitter {
         db_root: &str,
         coord: ShardCoordinator,
         candidates: SplitCandidates,
+        retry: RetryConfig,
     ) -> Self {
         let dir = Directory::new(shards.clone());
         Splitter {
@@ -301,6 +306,7 @@ impl Splitter {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             recovery_wake: Arc::new(Notify::new()),
             coord,
+            retry,
             stats: Arc::new(Stats::default()),
         }
     }
@@ -311,20 +317,24 @@ impl Splitter {
         parent_prefix: &str,
         name: &[u8],
     ) -> Result<(), TransError> {
+        let mut backoff = self.retry.backoff();
         for _ in 0..50 {
             let (mut root, version) = self
                 .shards
                 .load_root(parent_prefix, Requirement::Any)
                 .await?;
             if let Some(holder) = root.node().structural_gate().holders().first().cloned() {
-                if self.mon.tx_status(&holder).await?.is_final() {
+                // Monitor owns status polling and coalesces every waiter for the
+                // same transaction. Re-enter only after it observes finality;
+                // abandoning that wait would defeat its backoff.
+                if self.mon.wait_for_tx(&holder).await.is_final() {
                     self.release_structural_gate(parent_prefix, None, &holder)
                         .await?;
                 } else {
-                    tokio::select! {
-                        _ = self.mon.wait_for_tx(&holder) => {}
-                        _ = rt::sleep(Duration::from_millis(5)) => {}
-                    }
+                    // A status read error wakes waiters as Unknown. Pace the
+                    // fresh attempt instead of turning that error into a tight
+                    // root/status loop.
+                    rt::sleep(backoff.next_delay()).await;
                 }
                 continue;
             }
@@ -355,6 +365,7 @@ impl Splitter {
             {
                 return Ok(());
             }
+            rt::sleep(backoff.next_delay()).await;
         }
         Err(TransError::Retry)
     }
@@ -1317,6 +1328,7 @@ mod tests {
             "db",
             coord,
             candidates,
+            RetryConfig::default(),
         )
     }
 
@@ -1356,6 +1368,45 @@ mod tests {
             split_key: split_key.to_vec(),
             is_root: false,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subcollection_registration_waits_for_the_gate_holder() {
+        let s = store();
+        let bg = Arc::new(Background::new());
+        let (splitter, mon, _) = splitter_at(&s, &bg, tiny(), 1_000_000);
+        let holder = TxId::with_priority(1_000_000_000, b"gate");
+        mon.begin_tx(&holder);
+
+        let mut root = CollectionRoot::new();
+        root.node_locks_mut().set_structural_gate(holder.clone());
+        assert!(s.create_root(COLL, &root).await.unwrap());
+
+        let registering = tokio::spawn({
+            let splitter = splitter.clone();
+            async move { splitter.register_subcollection(COLL, b"child").await }
+        });
+        tokio::task::yield_now().await;
+        rt::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !registering.is_finished(),
+            "a live gate parks registration instead of exhausting a short poll loop"
+        );
+
+        mon.commit_tx(TxLog::new(holder, TxCommitStatus::Ok))
+            .await
+            .unwrap();
+        registering.await.unwrap().unwrap();
+
+        let (root, _) = s
+            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(
+            root.subcollections().collect::<Vec<_>>(),
+            vec![b"child".as_slice()]
+        );
+        assert!(root.node().structural_gate().holders().is_empty());
     }
 
     // A small collection whose single leaf lives in the root `_i`; when it grows

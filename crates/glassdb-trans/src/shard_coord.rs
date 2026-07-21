@@ -82,8 +82,8 @@ pub(crate) enum FoldOutcome {
     /// A create would exceed the leaf's reserved content limit. Nothing was
     /// staged for this member; retry after the pending split relieves the leaf.
     LeafFull,
-    /// A release or write-back completed (ADR-026). Idempotent and best-effort:
-    /// there is nothing to wait on and nothing for the caller to retry.
+    /// A release or write-back completed (ADR-026). The current node state
+    /// proved that the holder was removed or the corresponding CAS landed.
     /// `superseded` carries the `current_writer` transaction ids a write-back
     /// overwrote — GC reverse-check candidates (ADR-022); empty for a release.
     Released { superseded: Vec<TxId> },
@@ -185,8 +185,9 @@ pub(crate) trait ShardResolver: Send + Sync {
     ) -> Result<Step, TransError>;
 
     /// Whether this member may join any in-flight round instead of FIFO-blocking
-    /// behind an unrelated writer: read-only acquires, releases, and write-backs
-    /// never contend, so they always reorder (ADR-026). A scheduling hint only.
+    /// behind an unrelated writer. Read-only acquires, releases, and write-backs
+    /// are safe to reorder (ADR-026), even though a structural gate can make a
+    /// cleanup member wait. A scheduling hint only.
     fn reorderable(&self) -> bool;
 
     /// The outcome delivered when this round cannot produce a definitive
@@ -551,8 +552,8 @@ impl CasWorker {
             return Ok(());
         }
         // Bounded CAS budget exhausted under churn: each member gets its
-        // resolver's exhaustion outcome (acquirers `Conflict` and release/re-lock,
-        // best-effort releases / write-backs `Released`, ADR-024/026).
+        // resolver's exhaustion outcome. Acquirers conflict and release/re-lock;
+        // write-backs re-descend because exhaustion does not prove convergence.
         for m in shard_members(batch).values() {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.resolver.exhausted_outcome(saw_in_doubt),
@@ -656,8 +657,8 @@ impl ShardCoordinator {
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus any successful-CAS
     /// precondition receipt into the slot. Returns `Ok(None)` if the coordinator
-    /// was shut down before the round ran, so acquires can error while best-effort
-    /// releases / write-backs treat it as a no-op.
+    /// was shut down before the round ran, so callers can preserve their
+    /// operation-specific best-effort behavior.
     ///
     /// `first_requirement` chooses the cache requirement for the round's first fold
     /// attempt: a submitter that just read this leaf (the single read-write fast

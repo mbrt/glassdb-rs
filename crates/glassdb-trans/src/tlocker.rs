@@ -417,9 +417,10 @@ impl ShardResolver for WriteBackResolver {
     }
 
     fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Released {
-            superseded: Vec::new(),
-        }
+        // Exhaustion proves neither publication nor that gate acquisition
+        // removed our holder. Re-descend and keep converging from current
+        // routing state.
+        FoldOutcome::Reroute
     }
 
     fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
@@ -1346,6 +1347,23 @@ mod tests {
             key: key_ref(key),
             desired: Desired::Put,
         }
+    }
+
+    #[test]
+    fn exhausted_write_back_requires_rerouting() {
+        let resolver = WriteBackResolver {
+            id: mk_tid(1, "writer"),
+            intents: Arc::new(vec![put_intent(b"key")]),
+        };
+
+        assert!(matches!(
+            resolver.exhausted_outcome(false),
+            FoldOutcome::Reroute
+        ));
+        assert!(matches!(
+            resolver.exhausted_outcome(true),
+            FoldOutcome::Reroute
+        ));
     }
 
     // Routes an intent to the collection's single leaf `_i` (ADR-031: with split
