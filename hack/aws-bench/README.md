@@ -258,6 +258,30 @@ the next optimization. Throughput and latency are the primary axes; transaction
 retries and **backend round-trips per transaction** (object-storage efficiency)
 are secondary.
 
+For a deeper, opt-in attribution run, set `DIAGNOSTICS=1`. Both refs must
+support the diagnostic interface; the script then asks `rtbench` to write a
+`diagnostics/metrics.csv` beside each rw9010 result set:
+
+```bash
+DIAGNOSTICS=1 hack/aws-bench/compare-refs.sh --summary
+```
+
+The tidy CSV attributes reads, writes, and lists to database metadata,
+collection roots, tree nodes, transaction logs, structural logs, or unknown
+objects. It also records locker calls, coordinator submissions/rounds/CAS
+retries, and split activity. `compare.py` reports these per logical transaction
+and derives submissions per coordinator round as a direction-neutral batching
+factor. The diagnostic backend decorator is absent when the flag is omitted,
+so headline runs keep it disabled.
+
+The same diagnostic directory contains `failure-state.txt`. If a measured
+worker or shutdown fails, `rtbench` snapshots the coordinator queues and held
+transaction locks before teardown erases that state. This failure snapshot is
+pull-only; the protocol counts come from the same cheap cumulative counters as
+`Database::stats`. Detailed event history remains the separate `tracing`
+mechanism selected by an application's subscriber. Runs with verbose event
+tracing are forensic runs, not comparable performance samples.
+
 ```bash
 # main (baseline) vs the current worktree:
 hack/aws-bench/compare-refs.sh

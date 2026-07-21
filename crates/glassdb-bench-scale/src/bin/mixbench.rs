@@ -481,14 +481,16 @@ fn run_cell(
     for p in &plans {
         p.bench.end();
     }
+    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
+    run?;
+    shutdown?;
+    // Shutdown drains write-back, so collect counters only after all protocol
+    // work belonging to the measured cell has finished.
     let deltas: Vec<Stats> = dbs
         .iter()
         .enumerate()
         .map(|(i, d)| d.stats() - base[i])
         .collect();
-    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
-    run?;
-    shutdown?;
     let cell_converged = match drive {
         DriveOutcome::Converged => true,
         DriveOutcome::Capped => false,

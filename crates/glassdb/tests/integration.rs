@@ -113,6 +113,22 @@ async fn stats_report_locker_activity() {
         before.lock_calls,
         after_write.lock_calls
     );
+    assert!(
+        after_write.coord_submissions > before.coord_submissions,
+        "a committed write must submit coordinator work: {} -> {}",
+        before.coord_submissions,
+        after_write.coord_submissions
+    );
+    assert!(
+        after_write.coord_rounds > before.coord_rounds,
+        "a committed write must start coordinator rounds: {} -> {}",
+        before.coord_rounds,
+        after_write.coord_rounds
+    );
+    assert!(
+        after_write.coord_submissions >= after_write.coord_rounds,
+        "one round cannot serve more work than was submitted"
+    );
 
     // A read-only transaction commits via the lock-free fast path, so the
     // counter is unchanged across it.
@@ -122,6 +138,11 @@ async fn stats_report_locker_activity() {
         after_read.lock_calls, after_write.lock_calls,
         "a read-only commit takes no locks"
     );
+
+    db.shutdown().await;
+    let drained = db.stats();
+    assert!(drained.coord_submissions >= after_write.coord_submissions);
+    assert_eq!(db.stats(), drained, "stats snapshots remain cumulative");
 }
 
 #[tokio::test(start_paused = true)]
@@ -495,7 +516,7 @@ async fn diagnostics_returns_typed_snapshot() {
 
     // A fresh Database has no coordination state.
     let idle = db.diagnostics();
-    assert!(idle.locker_dedup.is_empty(), "fresh dedup: {idle:?}");
+    assert!(idle.coordinator_dedup.is_empty(), "fresh dedup: {idle:?}");
     assert!(idle.transactions.is_empty(), "fresh tx locks: {idle:?}");
 
     // After running a transaction, the snapshot is still callable and renders

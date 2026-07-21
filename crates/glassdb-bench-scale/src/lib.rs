@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+pub mod backend_breakdown;
 pub mod bench;
 pub mod run;
 

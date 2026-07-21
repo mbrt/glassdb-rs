@@ -315,20 +315,23 @@ impl Database {
         self.inner.tx(f).await
     }
 
-    /// Retrieves ongoing performance stats. Only updated when transactions
-    /// close. Counters only increase; subtract snapshots for intervals.
+    /// Retrieves cumulative foreground and background performance stats.
+    ///
+    /// Counters only increase; subtract snapshots for intervals. Collection is
+    /// not an atomic cut across concurrently active engine components.
     pub fn stats(&self) -> Stats {
         let bstats = self.inner.backend.stats_and_reset();
         let lock_calls = self.inner.locker.lock_calls_and_reset() as u64;
-        let cas_retries = self.inner.coord.cas_retries_and_reset() as u64;
+        let coord = self.inner.coord.stats_and_reset();
+        let split = self.inner.splitter.stats_and_reset();
         let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
-        s.add_lock(lock_calls, cas_retries);
+        s.add_protocol(lock_calls, coord, split);
         *s
     }
 
-    /// Returns a snapshot of the lock coordinator's live state, intended for
-    /// operators investigating hangs or unexpected contention. See
+    /// Returns a snapshot of the shard coordinator's and locker's live state,
+    /// intended for operators investigating hangs or unexpected contention. See
     /// [`crate::diagnostics`] for the data shape and how to enable the
     /// complementary `tracing` events.
     ///
@@ -336,7 +339,7 @@ impl Database {
     /// briefly while collecting counts, then released.
     pub fn diagnostics(&self) -> Diagnostics {
         Diagnostics {
-            locker_dedup: self.inner.coord.dedup_snapshot(),
+            coordinator_dedup: self.inner.coord.dedup_snapshot(),
             transactions: self.inner.locker.tx_locks_snapshot(),
         }
     }

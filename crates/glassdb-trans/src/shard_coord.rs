@@ -54,6 +54,14 @@ struct Stats {
     n_retries: AtomicU64,
 }
 
+/// Cumulative coordination work since the previous stats snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardCoordinatorStats {
+    pub submissions: u64,
+    pub rounds: u64,
+    pub cas_retries: u64,
+}
+
 /// One transaction's outcome for a single deduplicated CAS round, deposited by
 /// the engine into that transaction's [`OutcomeSlot`] and read by its caller once
 /// the [`Dedup`] submission resolves. Heterogeneous across resolver kinds: the
@@ -622,11 +630,14 @@ impl ShardCoordinator {
         self.inner.dedup.close().await;
     }
 
-    /// Returns and resets the count of inner CAS retries performed under
-    /// contention across every submitter (acquire / release / write-back /
-    /// commit-install).
-    pub fn cas_retries_and_reset(&self) -> usize {
-        self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed) as usize
+    /// Returns and resets submission, worker-round, and inner-CAS retry counts.
+    pub fn stats_and_reset(&self) -> ShardCoordinatorStats {
+        let dedup = self.inner.dedup.stats_and_reset();
+        ShardCoordinatorStats {
+            submissions: dedup.submissions,
+            rounds: dedup.rounds,
+            cas_retries: self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed),
+        }
     }
 
     /// Returns a per-object dedup coordination snapshot (ADR-025).

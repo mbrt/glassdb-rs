@@ -24,7 +24,7 @@
 //! lost handoffs are impossible.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -259,12 +259,16 @@ where
 /// One key-space partition guarded by a single lock.
 struct Shard<R, E> {
     map: Mutex<HashMap<String, KeyState<R, E>>>,
+    submissions: AtomicU64,
+    rounds: AtomicU64,
 }
 
 impl<R, E> Shard<R, E> {
     fn new() -> Self {
         Shard {
             map: Mutex::new(HashMap::new()),
+            submissions: AtomicU64::new(0),
+            rounds: AtomicU64::new(0),
         }
     }
 }
@@ -343,6 +347,17 @@ pub struct DedupKeySnapshot {
     pub has_active_op: bool,
 }
 
+/// Cumulative work accepted and rounds started by a [`Dedup`].
+///
+/// The ratio of `submissions` to `rounds` describes how much compatible work
+/// was coalesced. Cancelled submissions remain submissions: they consumed
+/// coordination work even if their caller stopped waiting for the result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DedupStats {
+    pub submissions: u64,
+    pub rounds: u64,
+}
+
 struct Inner<R, E, W> {
     worker: Arc<W>,
     shards: Sharded<Arc<Shard<R, E>>>,
@@ -403,6 +418,7 @@ where
                 tracing::trace!(target: "glassdb::dedup", key, "key_removed");
                 return Round::Exit;
             }
+            shard.rounds.fetch_add(1, Ordering::Relaxed);
             let signal = CancellationToken::new();
             st.op_signal = Some(signal.clone());
             tracing::trace!(
@@ -680,6 +696,7 @@ where
     /// spawned owner, so neither orphans the key nor strands other callers.
     pub async fn run(&self, key: &str, r: R) -> Result<(), DedupError<E>> {
         let shard = self.inner.shards.for_key(key.as_bytes()).clone();
+        shard.submissions.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let reorder = r.can_reorder();
         let member = Member {
@@ -756,6 +773,16 @@ where
             }
         });
         out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
+    }
+
+    /// Returns and resets cumulative submission and worker-round counts.
+    pub fn stats_and_reset(&self) -> DedupStats {
+        let mut out = DedupStats::default();
+        self.inner.shards.each(|shard| {
+            out.submissions += shard.submissions.swap(0, Ordering::Relaxed);
+            out.rounds += shard.rounds.swap(0, Ordering::Relaxed);
+        });
         out
     }
 
@@ -940,6 +967,14 @@ mod tests {
         assert!(b.await.is_ok());
         assert_eq!(*d.inner.worker.res.lock().unwrap(), vec![2]);
         assert_eq!(d.active_owners(), 0);
+        assert_eq!(
+            d.stats_and_reset(),
+            DedupStats {
+                submissions: 2,
+                rounds: 1,
+            }
+        );
+        assert_eq!(d.stats_and_reset(), DedupStats::default());
     }
 
     #[tokio::test]

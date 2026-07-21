@@ -1,7 +1,7 @@
 //! Operator diagnostics for hang-prone coordination paths.
 //!
-//! [`Database::diagnostics`] returns a [`Diagnostics`] snapshot capturing the lock
-//! coordinator's live state: per-key dedup state and per-transaction held
+//! [`Database::diagnostics`] returns a [`Diagnostics`] snapshot capturing the
+//! shard coordinator's live dedup state and each transaction's locally held
 //! locks. The snapshot is pull-only and zero cost unless called.
 //!
 //! The signals are tuned to the orphan-key (dedup) and partial-lock-set
@@ -9,10 +9,10 @@
 //! non-empty queue but no active op, or a transaction whose held set does not
 //! cover its needed paths, is the visible signature of those bug classes.
 //!
-//! For event-style breadcrumbs (e.g. `parallel_lock_timeout_fallback_to_serial`,
-//! `inline_driver_dropped_handoff`), register a [`tracing`] subscriber on the
-//! `glassdb::dedup`, `glassdb::locker`, and `glassdb::algo` targets, e.g. via
-//! `tracing-subscriber` and `RUST_LOG=glassdb=debug`.
+//! For event-style deduplication breadcrumbs such as
+//! `inline_driver_dropped_handoff`, register a [`tracing`] subscriber on the
+//! `glassdb::dedup` target. Splitter and explicit backend-logging middleware
+//! events use the stable `glassdb::splitter` and `glassdb::backend` targets.
 //!
 //! [`Database::diagnostics`]: crate::Database::diagnostics
 //! [`tracing`]: https://docs.rs/tracing
@@ -21,13 +21,14 @@ use std::fmt;
 
 pub use glassdb_trans::{DedupKeySnapshot, TxLockSnapshot};
 
-/// A snapshot of the lock coordinator's live state. Returned by
+/// A snapshot of the shard coordinator's and locker's live state. Returned by
 /// [`crate::Database::diagnostics`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
-    /// Per-key dedup state inside the locker (one entry per key with live
-    /// coordination state). Sorted by key.
-    pub locker_dedup: Vec<DedupKeySnapshot>,
+    /// Per-object dedup state inside the shard coordinator.
+    ///
+    /// Contains one entry per path with live coordination state, sorted by key.
+    pub coordinator_dedup: Vec<DedupKeySnapshot>,
     /// One entry per transaction holding any local-cache lock. Sorted by tx id.
     pub transactions: Vec<TxLockSnapshot>,
 }
@@ -35,8 +36,12 @@ pub struct Diagnostics {
 impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Diagnostics:")?;
-        writeln!(f, "  locker dedup ({} keys):", self.locker_dedup.len())?;
-        for k in &self.locker_dedup {
+        writeln!(
+            f,
+            "  coordinator dedup ({} paths):",
+            self.coordinator_dedup.len()
+        )?;
+        for k in &self.coordinator_dedup {
             writeln!(
                 f,
                 "    {} active_op={} batch={} pending={} queue={}",

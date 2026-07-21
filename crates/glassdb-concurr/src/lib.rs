@@ -17,7 +17,9 @@ mod tape;
 
 pub use background::Background;
 pub use clock::Clock;
-pub use dedup::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker};
+pub use dedup::{
+    BatchHandle, Dedup, DedupError, DedupKeySnapshot, DedupStats, MergeRequest, Worker,
+};
 pub use retry::{Backoff, RetryConfig, RetryErr, retry, retry_with_backoff};
 pub use rng::Rng;
 pub use shard::Sharded;

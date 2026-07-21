@@ -36,6 +36,7 @@
 //! preserving the collection metadata.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -102,6 +103,25 @@ pub(crate) struct SplitCandidates {
 struct SplitCandidate {
     path: String,
     priority: TxId,
+}
+
+#[derive(Default)]
+struct Stats {
+    candidates: AtomicU64,
+    completed: AtomicU64,
+    deferred: AtomicU64,
+}
+
+/// Cumulative background split activity since the previous stats snapshot.
+///
+/// `completed` counts locally observed source/root linearizations. A split may
+/// also be `deferred` if a later publication or cleanup step needs another
+/// sweep, so the fields are not mutually exclusive outcomes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SplitterStats {
+    pub candidates: u64,
+    pub completed: u64,
+    pub deferred: u64,
 }
 
 impl SplitCandidates {
@@ -205,6 +225,7 @@ pub struct Splitter {
     // Only leaf structure-write acquisition uses it; root and interior nodes
     // remain direct structural CASes.
     coord: ShardCoordinator,
+    stats: Arc<Stats>,
 }
 
 impl Splitter {
@@ -244,6 +265,15 @@ impl Splitter {
         (coord, splitter)
     }
 
+    /// Returns and resets background split activity counters.
+    pub fn stats_and_reset(&self) -> SplitterStats {
+        SplitterStats {
+            candidates: self.stats.candidates.swap(0, Ordering::Relaxed),
+            completed: self.stats.completed.swap(0, Ordering::Relaxed),
+            deferred: self.stats.deferred.swap(0, Ordering::Relaxed),
+        }
+    }
+
     /// Creates a splitter over an explicitly co-wired coordinator and feed.
     #[allow(clippy::too_many_arguments)]
     fn with_candidates(
@@ -269,6 +299,7 @@ impl Splitter {
             pending: Arc::new(Mutex::new(VecDeque::new())),
             recovery_wake: Arc::new(Notify::new()),
             coord,
+            stats: Arc::new(Stats::default()),
         }
     }
 
@@ -404,12 +435,19 @@ impl Splitter {
     /// logged and the sweep continues.
     async fn run_once(&self) {
         for candidate in self.candidates.drain() {
+            self.stats.candidates.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = self
                 .split_path_with_id(&candidate.path, candidate.priority.renew())
                 .await
             {
-                tracing::debug!(path = %candidate.path, error = %e, "split candidate deferred");
+                tracing::debug!(
+                    target: "glassdb::splitter",
+                    path = %candidate.path,
+                    error = %e,
+                    "split candidate deferred"
+                );
                 if !matches!(e, TransError::InvalidInput(_)) {
+                    self.stats.deferred.fetch_add(1, Ordering::Relaxed);
                     self.candidates.requeue(candidate);
                 }
             }
@@ -421,7 +459,11 @@ impl Splitter {
                 .publish_separators(&sep.prefix, &sep.split_key, &sep.new_token)
                 .await
             {
-                tracing::debug!(error = %e, "separator publication deferred");
+                tracing::debug!(
+                    target: "glassdb::splitter",
+                    error = %e,
+                    "separator publication deferred"
+                );
             }
         }
     }
@@ -771,6 +813,7 @@ impl Splitter {
         {
             return Err(TransError::Retry);
         }
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
         self.publish_separators(prefix, &split_key, &right_token)
             .await?;
         self.shards
@@ -858,6 +901,7 @@ impl Splitter {
         {
             return Err(TransError::Retry);
         }
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
         self.shards
             .delete_structural_log(&structural_record)
             .await?;
@@ -873,7 +917,11 @@ impl Splitter {
             .commit_tx(TxLog::new(id.clone(), TxCommitStatus::Ok))
             .await
         {
-            tracing::debug!(error = %e, "finalizing split transaction failed");
+            tracing::debug!(
+                target: "glassdb::splitter",
+                error = %e,
+                "finalizing split transaction failed"
+            );
         }
     }
 
@@ -903,14 +951,23 @@ impl Splitter {
         {
             Ok(records) => records,
             Err(e) => {
-                tracing::debug!(error = %e, "listing structural records failed");
+                tracing::debug!(
+                    target: "glassdb::splitter",
+                    error = %e,
+                    "listing structural records failed"
+                );
                 return true;
             }
         };
         let active = !records.is_empty();
         for (record_id, record) in records {
             if let Err(e) = self.recover_record(&record, recovery_start).await {
-                tracing::debug!(record = %record_id, error = %e, "structural recovery deferred");
+                tracing::debug!(
+                    target: "glassdb::splitter",
+                    record = %record_id,
+                    error = %e,
+                    "structural recovery deferred"
+                );
             }
         }
         active
@@ -1617,6 +1674,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "the fed candidate was split");
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                completed: 1,
+                deferred: 0,
+            }
+        );
+        assert_eq!(sp.stats_and_reset(), SplitterStats::default());
     }
 
     #[tokio::test]
@@ -1639,6 +1705,14 @@ mod tests {
         let sp = splitter_with_candidates(&s, &bg, candidates);
 
         sp.run_once().await;
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                completed: 0,
+                deferred: 1,
+            }
+        );
         assert!(
             s.load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
@@ -1658,6 +1732,14 @@ mod tests {
         assert!(s.store_root(COLL, &root, &version).await.unwrap());
 
         sp.run_once().await;
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                completed: 1,
+                deferred: 0,
+            }
+        );
         assert!(
             s.load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
