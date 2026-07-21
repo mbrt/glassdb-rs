@@ -45,7 +45,9 @@ can be eyeballed together.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import lzma
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +75,19 @@ def read_csv(input_dir: Path, name: str) -> pd.DataFrame | None:
     """Load a result CSV, accepting an optional ``.xz`` compression."""
     for path in (input_dir / name, input_dir / f"{name}.xz"):
         if path.exists():
+            # ADR-030-era rtbench wrote eight stats fields under a six-field
+            # header. pandas otherwise consumes the leading fields as an index
+            # and silently shifts every metric, including the concurrency key.
+            # Repair only that exact historical shape.
+            if name == "stats.csv":
+                opener = lzma.open if path.suffix == ".xz" else open
+                with opener(path, "rt", newline="") as f:
+                    rows = csv.reader(f)
+                    header = next(rows, [])
+                    first = next(rows, [])
+                if len(header) == 6 and len(first) == 8:
+                    names = header + ["obj-list", "backend-ops"]
+                    return pd.read_csv(path, skiprows=1, names=names)
             return pd.read_csv(path)
     return None
 
@@ -132,6 +147,14 @@ def backend_ops_series(df: pd.DataFrame) -> pd.Series:
     return df[present].sum(axis=1) if present else pd.Series(0, index=df.index)
 
 
+def logical_tx_series(df: pd.DataFrame) -> pd.Series:
+    """Logical benchmark operations, falling back to physical transaction calls
+    for result files that predate benchmark-level in-doubt replay."""
+    if "logical-tx" in df.columns:
+        return df["logical-tx"]
+    return df["num-tx"]
+
+
 # ---------------------------------------------------------------------------
 # Tables (each returns a merged frame with a `ratio` / `*-ratio` column)
 # ---------------------------------------------------------------------------
@@ -183,7 +206,8 @@ def latency_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
 def retries_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
         d = df.copy()
-        d["retries-per-tx"] = d["num-retries"] / d["num-tx"].where(d["num-tx"] > 0)
+        logical = logical_tx_series(d)
+        d["retries-per-tx"] = d["num-retries"] / logical.where(logical > 0)
         g = d.groupby("num-db")["retries-per-tx"].median().reset_index()
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
@@ -201,12 +225,15 @@ def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
         d = df.copy()
         d["backend-ops"] = backend_ops_series(d)
+        d["logical-tx"] = logical_tx_series(d)
         g = (
             d.groupby("num-db")
-            .agg({"backend-ops": "sum", "num-tx": "sum"})
+            .agg({"backend-ops": "sum", "logical-tx": "sum"})
             .reset_index()
         )
-        g["ops-per-tx"] = g["backend-ops"] / g["num-tx"].where(g["num-tx"] > 0)
+        g["ops-per-tx"] = g["backend-ops"] / g["logical-tx"].where(
+            g["logical-tx"] > 0
+        )
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
@@ -479,7 +506,8 @@ def _tidy_retries(a, b, la, lb, conc_per_db):
     for src, df in ((la, a), (lb, b)):
         d = df.copy()
         d["concurrent"] = d["num-db"] * conc_per_db
-        d["retries-per-tx"] = d["num-retries"] / d["num-tx"].where(d["num-tx"] > 0)
+        logical = logical_tx_series(d)
+        d["retries-per-tx"] = d["num-retries"] / logical.where(logical > 0)
         d["source"] = src
         frames.append(d)
     return pd.concat(frames, ignore_index=True)

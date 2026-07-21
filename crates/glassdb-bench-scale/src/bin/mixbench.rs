@@ -38,7 +38,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -54,6 +54,7 @@ use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
 use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
+use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
 
 /// The shared collection every shape reads and writes, so all shapes contend on
 /// the same key pool.
@@ -87,6 +88,10 @@ struct Args {
     /// `--target-ci`; such a shape's result is flagged not-converged.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     max_duration: Duration,
+    /// Time allowed after a cell stops launching transactions for in-flight
+    /// logical transactions and graceful Database shutdown to finish.
+    #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
+    drain_timeout: Duration,
     /// Target relative half-width of each shape's throughput 95% confidence
     /// interval (`0.1` = +/-10%). The cell runs until every shape reaches it or
     /// `--max-duration`. `0` disables adaptivity: run exactly `--duration`.
@@ -231,7 +236,10 @@ fn parse_topologies(v: &[String]) -> Result<Vec<Topology>, Box<dyn Error>> {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OpsPerTx {
+    /// Successfully completed logical operations used as the denominator.
     txn: u64,
+    /// Physical `Database::tx` calls, including unknown-outcome replays.
+    attempted_txn: u64,
     obj_reads_per_tx: f64,
     obj_writes_per_tx: f64,
     obj_lists_per_tx: f64,
@@ -270,10 +278,11 @@ impl RawOps {
         }
     }
 
-    fn per_tx(self) -> OpsPerTx {
-        let d = self.txn.max(1) as f64;
+    fn per_tx(self, logical_txn: u64) -> OpsPerTx {
+        let d = logical_txn.max(1) as f64;
         OpsPerTx {
-            txn: self.txn,
+            txn: logical_txn,
+            attempted_txn: self.txn,
             obj_reads_per_tx: self.reads as f64 / d,
             obj_writes_per_tx: self.writes as f64 / d,
             obj_lists_per_tx: self.lists as f64 / d,
@@ -408,7 +417,7 @@ fn run_cell(
 
     // Seed the shared pool once on the shared backend (unmeasured), via a
     // throwaway Database whose stats do not touch the measurement DBs.
-    seed_pool(handle, backend.clone(), pool_size)?;
+    seed_pool(handle, backend.clone(), pool_size, args.drain_timeout)?;
 
     // Open the cell's Databases and build each shape's worker plan.
     // The DelayBackend compresses wall-clock by `delay_scale`; report latency
@@ -453,20 +462,20 @@ fn run_cell(
         p.bench.start();
     }
 
-    let failures = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let target = samples_for_rel_ci(args.target_ci);
     let ctx = WorkerCtx {
         stop: stop.clone(),
         pool_size,
         multi_keys: args.multi_keys,
-        failures: failures.clone(),
     };
-    let outcome = handle.block_on(async {
+    let (drive, run, deadline) = handle.block_on(async {
         let handles = spawn_workers(&dbs, &plans, &ctx);
-        let converged =
+        let drive =
             drive_to_significance(&plans, &stop, target, args.duration, args.max_duration).await;
-        join_tasks(handles).await.map(|()| converged)
+        let deadline = tokio::time::Instant::now() + args.drain_timeout;
+        let run = join_tasks_until(handles, deadline).await;
+        (drive, run, deadline)
     });
 
     for p in &plans {
@@ -477,10 +486,16 @@ fn run_cell(
         .enumerate()
         .map(|(i, d)| d.stats() - base[i])
         .collect();
-    for d in &dbs {
-        handle.block_on(d.shutdown());
-    }
-    let cell_converged = outcome?;
+    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
+    run?;
+    shutdown?;
+    let cell_converged = match drive {
+        DriveOutcome::Converged => true,
+        DriveOutcome::Capped => false,
+        DriveOutcome::WorkerStopped => {
+            return Err("benchmark worker stopped without reporting its error".into());
+        }
+    };
     if !cell_converged {
         eprintln!(
             "  note: mode={} topology={} hit --max-duration before every shape reached \
@@ -510,7 +525,7 @@ fn run_cell(
                 let raw = p.slots.iter().fold(RawOps::default(), |acc, &(idx, _)| {
                     acc.add(RawOps::of(deltas[idx]))
                 });
-                Some(raw.per_tx())
+                Some(raw.per_tx(count as u64))
             }
             Topology::Shared => None,
         };
@@ -527,29 +542,28 @@ fn run_cell(
     }
 
     let aggregate_ops = match topo {
-        Topology::Shared => Some(RawOps::of(deltas[0]).per_tx()),
+        Topology::Shared => {
+            Some(RawOps::of(deltas[0]).per_tx(shapes.iter().map(|s| s.committed as u64).sum()))
+        }
         Topology::PerShape => None,
     };
-
     Ok(CellResult {
         mode: mode.label().to_string(),
         topology: topo.label().to_string(),
         databases: dbs.len(),
-        failures: failures.load(Ordering::Relaxed),
+        failures: 0,
         shapes,
         aggregate_ops,
     })
 }
 
-/// Cell-wide context shared by every worker (cheap to clone: two `Arc`s and two
-/// counts).
+/// Cell-wide context shared by every worker.
 #[derive(Clone)]
 struct WorkerCtx {
     /// Set by [`drive_to_significance`] to stop all shapes at once.
     stop: Arc<AtomicBool>,
     pool_size: usize,
     multi_keys: usize,
-    failures: Arc<AtomicU64>,
 }
 
 /// Spawns every shape's workers across the cell's Databases, returning their
@@ -583,23 +597,31 @@ fn spawn_workers(
 /// once once each has reached `target` (so its throughput 95% CI is within
 /// `--target-ci`) — but never before `min_dur` and never past `max_dur`. Keeping
 /// every shape running until the last one is precise avoids skewing contention by
-/// letting readers drop out early. Returns whether every shape converged (`false`
-/// = the `max_dur` cap fired first).
+/// letting readers drop out early.
 ///
 /// `target == 0` disables adaptivity: the cell runs exactly `min_dur` and reports
 /// as converged (the caller asked for a fixed window, not a significance target).
+enum DriveOutcome {
+    Converged,
+    Capped,
+    WorkerStopped,
+}
+
 async fn drive_to_significance(
     plans: &[ShapePlan],
     stop: &Arc<AtomicBool>,
     target: u64,
     min_dur: Duration,
     max_dur: Duration,
-) -> bool {
+) -> DriveOutcome {
     let started = Instant::now();
     // Poll often enough to react promptly, coarsely enough to stay negligible.
     let step = (max_dur / 40).clamp(Duration::from_millis(20), Duration::from_millis(250));
     loop {
         tokio::time::sleep(step).await;
+        if stop.load(Ordering::Relaxed) {
+            return DriveOutcome::WorkerStopped;
+        }
         let elapsed = started.elapsed();
         let ready = elapsed >= min_dur
             && (target == 0
@@ -608,19 +630,19 @@ async fn drive_to_significance(
                     .all(|p| p.bench.sample_count() as u64 >= target));
         if ready {
             stop.store(true, Ordering::Relaxed);
-            return true;
+            return DriveOutcome::Converged;
         }
         if elapsed >= max_dur {
             stop.store(true, Ordering::Relaxed);
-            return false;
+            return DriveOutcome::Capped;
         }
     }
 }
 
 /// One worker: loops its shape's transaction until the cell's `stop` flag is set
 /// (the significance controller) or the shape's `Bench` deadline elapses, keying
-/// from the shared pool. Errors are counted, not fatal (a single contention
-/// timeout must not derail the run).
+/// from the shared pool. [`Bench::measure`] absorbs unknown outcomes into the
+/// logical sample; every definitive error stops and fails the cell.
 async fn worker(
     db: Database,
     shape: Shape,
@@ -642,8 +664,8 @@ async fn worker(
         let keys = &keys;
         let coll = &coll;
         let db = &db;
-        let res = bench
-            .measure(|| async move {
+        let result = bench
+            .measure(|| async {
                 if shape.is_write() {
                     rmw_tx(db, coll, keys).await
                 } else {
@@ -651,8 +673,9 @@ async fn worker(
                 }
             })
             .await;
-        if res.is_err() {
-            ctx.failures.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = result {
+            ctx.stop.store(true, Ordering::Relaxed);
+            return Err(err);
         }
     }
     Ok(())
@@ -707,6 +730,7 @@ fn seed_pool(
     handle: &Handle,
     backend: Arc<dyn Backend>,
     pool_size: usize,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let db = open_db(handle, backend);
     handle.block_on(async {
@@ -729,23 +753,11 @@ fn seed_pool(
         }
         Ok::<(), GError>(())
     })?;
-    handle.block_on(db.shutdown());
+    handle.block_on(shutdown_databases_until(
+        std::slice::from_ref(&db),
+        tokio::time::Instant::now() + drain_timeout,
+    ))?;
     Ok(())
-}
-
-/// Awaits spawned worker tasks, returning the first error encountered.
-async fn join_tasks(handles: Vec<JoinHandle<Result<(), GError>>>) -> Result<(), GError> {
-    let mut result = Ok(());
-    for h in handles {
-        match h.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) if result.is_ok() => result = Err(e),
-            Ok(Err(_)) => {}
-            Err(_) if result.is_ok() => result = Err(GError::internal("worker task panicked")),
-            Err(_) => {}
-        }
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -836,18 +848,41 @@ fn emit_text(args: &Args, cells: &[CellResult]) {
             if let Some(o) = c.aggregate_ops {
                 println!(
                     "aggregate ops/tx: reads={:.2} writes={:.2} lists={:.2} total={:.2} \
-                     retries/tx={:.3} (txn={})",
+                     retries/tx={:.3} (logical-txn={} attempted-txn={})",
                     o.obj_reads_per_tx,
                     o.obj_writes_per_tx,
                     o.obj_lists_per_tx,
                     o.total_ops_per_tx,
                     o.retries_per_tx,
                     o.txn,
+                    o.attempted_txn,
                 );
             }
         }
         if c.failures > 0 {
             println!("WARNING: {} transaction failures in this cell", c.failures);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ops_are_normalized_by_logical_transactions() {
+        let ops = RawOps {
+            reads: 8,
+            writes: 4,
+            lists: 0,
+            txn: 3,
+            retries: 2,
+        }
+        .per_tx(2);
+
+        assert_eq!(ops.txn, 2);
+        assert_eq!(ops.attempted_txn, 3);
+        assert_eq!(ops.total_ops_per_tx, 6.0);
+        assert_eq!(ops.retries_per_tx, 1.0);
     }
 }

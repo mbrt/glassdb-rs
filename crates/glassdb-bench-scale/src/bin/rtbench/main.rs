@@ -59,6 +59,7 @@ use glassdb::s3::{FakeS3, FakeS3Options, tuned_http_client};
 use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
+use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
 
 use clientmetrics::{HttpCounter, HttpMetrics, HttpSnapshot, ThreadSampler};
 
@@ -124,6 +125,10 @@ struct Args {
     /// Duration of each rw9010 / deadlock step.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
+    /// Time allowed after a cell's measurement window for in-flight logical
+    /// transactions and graceful Database shutdown to finish.
+    #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
+    drain_timeout: Duration,
     /// Repeat the parameter sweep this many times. The expensive setup (e.g.
     /// rw9010's 50k-key init) happens once and is shared across runs; only
     /// the measured sweeps are repeated. All runs append to the same CSV
@@ -162,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let time_scale = report_time_scale(&args);
 
     match args.test_name.as_str() {
-        "simple" => run_simple(&handle, setup.backend, time_scale)?,
+        "simple" => run_simple(&handle, setup.backend, time_scale, args.drain_timeout)?,
         "rw9010" => run_read_write_9010(
             &handle,
             &args,
@@ -388,6 +393,7 @@ struct Benchmarker {
     num_keys_per_worker: usize,
     base_stats: Stats,
     delta_stats: Stats,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Benchmarker {
@@ -399,6 +405,7 @@ impl Benchmarker {
             num_keys_per_worker: 0,
             base_stats: Stats::default(),
             delta_stats: Stats::default(),
+            deadline: None,
         }
     }
 
@@ -408,17 +415,25 @@ impl Benchmarker {
         num_keys: usize,
         num_workers: usize,
         num_keys_per_worker: usize,
+        drain_timeout: Duration,
     ) {
         self.num_keys = num_keys;
         self.num_workers = num_workers;
         self.num_keys_per_worker = num_keys_per_worker;
         self.base_stats = db.stats();
         self.bench.start();
+        self.deadline =
+            Some(tokio::time::Instant::now() + self.bench.expected_duration() + drain_timeout);
     }
 
     fn end(&mut self, db: &Database) {
         self.bench.end();
         self.delta_stats = db.stats() - self.base_stats;
+    }
+
+    fn deadline(&self, fallback: Duration) -> tokio::time::Instant {
+        self.deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + fallback)
     }
 
     fn results_row(&self) -> String {
@@ -434,6 +449,7 @@ impl Benchmarker {
             self.num_workers.to_string(),
             self.num_keys_per_worker.to_string(),
             self.delta_stats.tx_n.to_string(),
+            res.samples.len().to_string(),
             self.delta_stats.tx_retries.to_string(),
             fmt_float(txs),
             fmt_ms(res.avg()),
@@ -454,6 +470,7 @@ fn run_simple(
     handle: &Handle,
     backend: Arc<dyn Backend>,
     time_scale: f64,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     println!(
         "{}",
@@ -464,6 +481,7 @@ fn run_simple(
             "num workers",
             "num keys/worker",
             "num tx",
+            "logical tx",
             "num retries",
             "tx/sec",
             "avg tx time",
@@ -485,7 +503,8 @@ fn run_simple(
             backend.clone(),
             Duration::ZERO,
             time_scale,
-            |b, db, h| independent_single_rmw(b, db, h, numw),
+            drain_timeout,
+            |b, db, h| independent_single_rmw(b, db, h, numw, drain_timeout),
         )?;
         i += 5;
     }
@@ -503,7 +522,8 @@ fn run_simple(
                 backend.clone(),
                 Duration::ZERO,
                 time_scale,
-                |b, db, h| independent_multi_rmw(b, db, h, numw, numk),
+                drain_timeout,
+                |b, db, h| independent_multi_rmw(b, db, h, numw, numk, drain_timeout),
             )?;
             j += 5;
         }
@@ -524,7 +544,8 @@ fn run_simple(
                     backend.clone(),
                     Duration::ZERO,
                     time_scale,
-                    |b, db, h| overlapping_multi_rmw(b, db, h, numw, numkpw, nover),
+                    drain_timeout,
+                    |b, db, h| overlapping_multi_rmw(b, db, h, numw, numkpw, nover, drain_timeout),
                 )?;
                 j += 2;
             }
@@ -541,6 +562,7 @@ fn run_test<F>(
     backend: Arc<dyn Backend>,
     duration: Duration,
     time_scale: f64,
+    drain_timeout: Duration,
     f: F,
 ) -> Result<(), Box<dyn Error>>
 where
@@ -549,8 +571,12 @@ where
     let db = open_db(handle, backend);
     let mut ben = Benchmarker::new(duration, time_scale);
     let res = f(&mut ben, &db, handle);
-    handle.block_on(db.shutdown());
+    let shutdown = handle.block_on(shutdown_databases_until(
+        std::slice::from_ref(&db),
+        ben.deadline(drain_timeout),
+    ));
     res?;
+    shutdown?;
     println!("{name},{}", ben.results_row());
     Ok(())
 }
@@ -560,8 +586,10 @@ fn independent_single_rmw(
     db: &Database,
     handle: &Handle,
     nwriters: usize,
+    drain_timeout: Duration,
 ) -> Result<(), GError> {
-    b.start(db, nwriters, nwriters, 1);
+    b.start(db, nwriters, nwriters, 1, drain_timeout);
+    let deadline = b.deadline(drain_timeout);
     let handles: Vec<_> = (0..nwriters)
         .map(|i| {
             let db = db.clone();
@@ -590,7 +618,7 @@ fn independent_single_rmw(
             })
         })
         .collect();
-    let result = handle.block_on(join_tasks(handles));
+    let result = handle.block_on(join_tasks_until(handles, deadline));
     b.end(db);
     result
 }
@@ -601,8 +629,10 @@ fn independent_multi_rmw(
     handle: &Handle,
     nwriters: usize,
     numkeys: usize,
+    drain_timeout: Duration,
 ) -> Result<(), GError> {
-    b.start(db, numkeys * nwriters, nwriters, numkeys);
+    b.start(db, numkeys * nwriters, nwriters, numkeys, drain_timeout);
+    let deadline = b.deadline(drain_timeout);
     let handles: Vec<_> = (0..nwriters)
         .map(|i| {
             let db = db.clone();
@@ -643,7 +673,7 @@ fn independent_multi_rmw(
             })
         })
         .collect();
-    let result = handle.block_on(join_tasks(handles));
+    let result = handle.block_on(join_tasks_until(handles, deadline));
     b.end(db);
     result
 }
@@ -655,11 +685,10 @@ fn overlapping_multi_rmw(
     n_writers: usize,
     n_keys_per_writer: usize,
     n_overlap: usize,
+    drain_timeout: Duration,
 ) -> Result<(), GError> {
     let coll = db.collection(b"omrmw");
-    handle.block_on(async {
-        let _ = coll.create().await;
-    });
+    handle.block_on(coll.create())?;
 
     let n_keys = n_writers * n_keys_per_writer - n_overlap;
     let all_keys: Vec<Vec<u8>> = (0..n_keys)
@@ -678,7 +707,8 @@ fn overlapping_multi_rmw(
         .await
     })?;
 
-    b.start(db, n_keys, n_writers, n_keys_per_writer);
+    b.start(db, n_keys, n_writers, n_keys_per_writer, drain_timeout);
+    let deadline = b.deadline(drain_timeout);
     let n_unique = n_keys_per_writer - n_overlap;
     let handles: Vec<_> = (0..n_writers)
         .map(|i| {
@@ -716,27 +746,8 @@ fn overlapping_multi_rmw(
             })
         })
         .collect();
-    let result = handle.block_on(join_tasks(handles));
+    let result = handle.block_on(join_tasks_until(handles, deadline));
     b.end(db);
-    result
-}
-
-/// Awaits spawned worker tasks, returning the first error encountered.
-async fn join_tasks(
-    handles: Vec<tokio::task::JoinHandle<Result<(), GError>>>,
-) -> Result<(), GError> {
-    let mut result = Ok(());
-    for h in handles {
-        match h.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) if result.is_ok() => result = Err(e),
-            Ok(Err(_)) => {}
-            Err(_) if result.is_ok() => {
-                result = Err(GError::internal("worker task panicked"));
-            }
-            Err(_) => {}
-        }
-    }
     result
 }
 
@@ -835,6 +846,12 @@ struct DbResults {
     weak: Results,
 }
 
+impl DbResults {
+    fn logical_tx(&self) -> usize {
+        self.write.samples.len() + self.strong.samples.len() + self.weak.samples.len()
+    }
+}
+
 /// The concurrency points (number of Databases) the rw9010 sweep visits:
 /// the explicit `--db-list` when given, otherwise the default
 /// `1,5,10,..,max-dbs` ramp.
@@ -868,13 +885,14 @@ fn run_read_write_9010(
     );
 
     eprintln!("Initialize keys");
-    let keys = init_keys(handle, backend.clone(), args.num_keys)?;
+    let keys = init_keys(handle, backend.clone(), args.num_keys, args.drain_timeout)?;
     eprintln!("End of keys initialization");
 
     let mut samples = create_csv(&args.samples_out, "num-db,db,tx-type,ops,latency\n")?;
     let mut stats = create_csv(
         &args.stats_out,
-        "num-db,db,num-tx,num-retries,obj-write,obj-read\n",
+        "num-db,db,num-tx,logical-tx,num-retries,\
+         obj-write,obj-read,obj-list,backend-ops\n",
     )?;
     let mut throughput = create_csv(
         &args.throughput_out,
@@ -883,7 +901,8 @@ fn run_read_write_9010(
     let mut client = create_csv(
         &args.client_stats_out,
         "num-db,wall-ms,num-cpu,cpu-user-ms,cpu-sys-ms,cpu-util-pct,\
-         http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-threads,tx-failures\n",
+         http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-threads,\
+         tx-failures\n",
     )?;
 
     // Deterministic random source, for reproducibility. Re-seeded from the
@@ -948,19 +967,8 @@ fn run_read_write_9010_step(
     let sampler = ThreadSampler::start();
     let wall_start = std::time::Instant::now();
 
-    let (results, failures) =
-        match read_write_9010_all_dbs(handle, args, backend, keys, numdb, mix, time_scale, rnd) {
-            Ok(r) => r,
-            Err(e) => {
-                // Individual failed transactions are counted and dropped, not
-                // propagated. Reaching here means an unexpected fatal error (e.g. a
-                // worker panic): warn and skip just this concurrency point rather
-                // than discarding the whole sweep.
-                let _ = sampler.stop_and_peak();
-                eprintln!("WARNING: step num-db={numdb} failed, skipping: {e}");
-                return Ok(());
-            }
-        };
+    let results =
+        read_write_9010_all_dbs(handle, args, backend, keys, numdb, mix, time_scale, rnd)?;
 
     let wall = wall_start.elapsed();
     let (user_after, sys_after) = cpu::process_cpu_time();
@@ -985,7 +993,7 @@ fn run_read_write_9010_step(
         sys_after - sys_before,
         http_delta,
         peak_threads,
-        failures,
+        0,
     )?;
     Ok(())
 }
@@ -1000,7 +1008,7 @@ fn read_write_9010_all_dbs(
     mix: RwMix,
     time_scale: f64,
     rnd: &mut StdRng,
-) -> Result<(Vec<DbResults>, u64), Box<dyn Error>> {
+) -> Result<Vec<DbResults>, Box<dyn Error>> {
     // One seed per Database, derived up front from the shared source.
     let seeds: Vec<u64> = (0..numdb).map(|_| rnd.random()).collect();
 
@@ -1014,11 +1022,9 @@ fn read_write_9010_all_dbs(
     for db_bench in &benches {
         db_bench.start();
     }
+    let deadline =
+        tokio::time::Instant::now() + benches[0].write.expected_duration() + args.drain_timeout;
     let keys: Arc<[Vec<u8>]> = Arc::from(keys);
-    // Counts transactions that errored out during the step (shared across all
-    // workers). Such transactions are dropped from the latency samples but
-    // tracked here so the failure noise is reported per step.
-    let failures = Arc::new(AtomicU64::new(0));
 
     // Run every worker of every Database concurrently as spawned tasks, so the shared
     // runtime multiplexes them over its worker threads.
@@ -1032,17 +1038,11 @@ fn read_write_9010_all_dbs(
             let db = db.clone();
             let db_bench = benches[di].clone();
             let keys = keys.clone();
-            worker_handles.push(handle.spawn(read_write_9010_worker(
-                db,
-                db_bench,
-                keys,
-                failures.clone(),
-                mix,
-                wseed,
-            )));
+            worker_handles
+                .push(handle.spawn(read_write_9010_worker(db, db_bench, keys, mix, wseed)));
         }
     }
-    let run = handle.block_on(join_tasks(worker_handles));
+    let run = handle.block_on(join_tasks_until(worker_handles, deadline));
 
     for db_bench in &benches {
         db_bench.end();
@@ -1057,18 +1057,18 @@ fn read_write_9010_all_dbs(
             strong: benches[di].strong.results(),
             weak: benches[di].weak.results(),
         });
-        handle.block_on(db.shutdown());
     }
+    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
 
     run?;
-    Ok((results, failures.load(Ordering::Relaxed)))
+    shutdown?;
+    Ok(results)
 }
 
 async fn read_write_9010_worker(
     db: Database,
     db_bench: Arc<DbBench>,
     keys: Arc<[Vec<u8>]>,
-    failures: Arc<AtomicU64>,
     mix: RwMix,
     seed: u64,
 ) -> Result<(), GError> {
@@ -1086,30 +1086,25 @@ async fn read_write_9010_worker(
             // span the transaction future.
             let i0 = rng.random_range(0..keys.len());
             let i1 = rng.random_range(0..keys.len());
-            let res = match tt {
+            match tt {
                 TransactionType::Write => {
                     db_bench
                         .write
                         .measure(|| write_tx(&db, &coll, &keys[i0], &keys[i1]))
-                        .await
+                        .await?;
                 }
                 TransactionType::ReadStrong => {
                     db_bench
                         .strong
                         .measure(|| read_tx(&db, &coll, &keys[i0], &keys[i1]))
-                        .await
+                        .await?;
                 }
                 TransactionType::ReadWeak => {
                     db_bench
                         .weak
                         .measure(|| weak_read_tx(&coll, &keys[i0]))
-                        .await
+                        .await?;
                 }
-            };
-            if res.is_err() {
-                // Count transaction failures but keep going, so the step's overall
-                // progress is not derailed by individual errors.
-                failures.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1149,6 +1144,7 @@ fn init_keys(
     handle: &Handle,
     backend: Arc<dyn Backend>,
     num: usize,
+    drain_timeout: Duration,
 ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     if !num.is_multiple_of(100) {
         return Err("num must be multiple of 100".into());
@@ -1187,7 +1183,10 @@ fn init_keys(
     handle.block_on(async {
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
-    handle.block_on(db.shutdown());
+    handle.block_on(shutdown_databases_until(
+        std::slice::from_ref(&db),
+        tokio::time::Instant::now() + drain_timeout,
+    ))?;
     Ok(keys)
 }
 
@@ -1221,10 +1220,21 @@ fn run_deadlock(
             for overlap in 1..=k {
                 let db = open_db(handle, backend.clone());
                 let mut ben = Benchmarker::new(args.duration, time_scale);
-                let res =
-                    overlapping_multi_rmw(&mut ben, &db, handle, DEADLOCK_NUM_WRITERS, k, overlap);
-                handle.block_on(db.shutdown());
+                let res = overlapping_multi_rmw(
+                    &mut ben,
+                    &db,
+                    handle,
+                    DEADLOCK_NUM_WRITERS,
+                    k,
+                    overlap,
+                    args.drain_timeout,
+                );
+                let shutdown = handle.block_on(shutdown_databases_until(
+                    std::slice::from_ref(&db),
+                    ben.deadline(args.drain_timeout),
+                ));
                 res?;
+                shutdown?;
 
                 let results = ben.bench.results();
                 let overlap_pct = 100 * overlap / k;
@@ -1304,8 +1314,9 @@ fn dump_stats(
         let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists;
         writeln!(
             out,
-            "{numdb},{i},{},{},{},{},{},{}",
+            "{numdb},{i},{},{},{},{},{},{},{}",
             res.stats.tx_n,
+            res.logical_tx(),
             res.stats.tx_retries,
             res.stats.obj_writes,
             res.stats.obj_reads,
@@ -1382,7 +1393,8 @@ fn dump_client_stats(
 
     writeln!(
         out,
-        "{numdb},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},{},{},{},{},{},{peak_threads},{failures}",
+        "{numdb},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},{},{},{},{},{},{peak_threads},\
+         {failures}",
         wall.as_secs_f64() * 1000.0,
         cpu_user.as_secs_f64() * 1000.0,
         cpu_sys.as_secs_f64() * 1000.0,
