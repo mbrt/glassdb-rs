@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::{
-    LogicalTime, Observation, Requirement, StorageError, TLogger, TValue, Timeline, TxCommitStatus,
-    TxLock, TxLog, TxStatus,
+    Observation, Requirement, SequencePoint, StorageError, TLogger, TValue, Timeline,
+    TxCommitStatus, TxLock, TxLog, TxStatus,
 };
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
@@ -74,7 +74,7 @@ struct TxStatusEntry {
 #[derive(Clone, Copy)]
 struct FinalStatus {
     status: TxCommitStatus,
-    watermark: LogicalTime,
+    watermark: SequencePoint,
 }
 
 struct FinalStatusCache {
@@ -357,7 +357,7 @@ impl Monitor {
     pub(crate) async fn committed_at(
         &self,
         tid: &TxId,
-        at: LogicalTime,
+        at: SequencePoint,
     ) -> Result<bool, TransError> {
         Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
     }

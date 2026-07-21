@@ -172,7 +172,10 @@ pub struct ListPage {
 /// The conditional-only contract with an object store (ADR-023, ADR-042).
 ///
 /// The surface is content-CAS only: there are no metadata tags, and the opaque
-/// [`Version`] is the sole conditional token. For mutations,
+/// [`Version`] is the sole conditional token. Single-object reads and
+/// conditional mutations must be linearizable, including reads invoked after a
+/// definitive mutation completes. Eventually consistent implementations are
+/// not supported. For mutations,
 /// [`BackendError::Unavailable`] is the only returned outcome that may have
 /// applied; every other error guarantees the mutation did not apply. Backend
 /// futures are cancelled by being dropped: wrap a call in

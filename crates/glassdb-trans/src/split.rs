@@ -2269,7 +2269,11 @@ mod tests {
         let source_path = paths::from_node(COLL, "L");
         let (backend, gate) =
             FirstSourceWriteGate::wrap(Arc::new(MemoryBackend::new()), source_path.clone());
-        let s = store_with_backend(backend as Arc<dyn Backend>);
+        let backend: Arc<dyn Backend> = backend;
+        let s = store_with_backend(backend.clone());
+        // This writer models a separately opened database, so it owns a
+        // distinct database-local path coordinator over the shared backend.
+        let peer = store_with_backend(backend);
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
         let id = TxId::with_priority(1, b"racing-split");
@@ -2312,7 +2316,7 @@ mod tests {
         gate.wait_until_entered().await;
 
         assert!(
-            s.store_node(COLL, "L", &shrunk, Some(&source_version))
+            peer.store_node(COLL, "L", &shrunk, Some(&source_version))
                 .await
                 .unwrap()
         );

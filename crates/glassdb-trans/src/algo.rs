@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId};
 use glassdb_storage::{
-    LeafObservation, LeafObservationCheck, LockType, LogicalTime, NodeLocks, Requirement,
+    LeafObservation, LeafObservationCheck, LockType, NodeLocks, Requirement, SequencePoint,
     ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus, TxLock, TxLog,
     TxWrite,
 };
@@ -1097,7 +1097,7 @@ impl Algo {
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
-        validation_start: LogicalTime,
+        validation_start: SequencePoint,
     ) -> Result<Acquired, TransError> {
         let mut serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
         let mut conflicts: usize = 0;
@@ -1197,7 +1197,7 @@ impl Algo {
         &self,
         data: &Data,
         context: ValidationContext<'_>,
-        validation_start: LogicalTime,
+        validation_start: SequencePoint,
     ) -> Result<bool, TransError> {
         let lock_validation = context.lock_validation();
         let physical_reads_valid = self
@@ -1219,7 +1219,7 @@ impl Algo {
     async fn validate_read_observations(
         &self,
         data: &Data,
-        validation_start: LogicalTime,
+        validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         for read in &data.reads {
@@ -1245,7 +1245,7 @@ impl Algo {
     async fn validate_scan_observations(
         &self,
         data: &Data,
-        validation_start: LogicalTime,
+        validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         for coverage in data.scans.iter().flat_map(|scan| &scan.covered) {
@@ -1302,7 +1302,7 @@ impl Algo {
         &self,
         data: &Data,
         own_lock_holder: Option<&TxId>,
-        validation_start: LogicalTime,
+        validation_start: SequencePoint,
     ) -> Result<bool, TransError> {
         let requirement = Requirement::AtLeast(validation_start);
         for scan in &data.scans {

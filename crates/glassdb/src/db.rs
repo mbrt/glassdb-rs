@@ -2,7 +2,6 @@
 //! the transaction retry loop, collections, and stats.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -102,11 +101,10 @@ impl DatabaseBuilder {
                 "name must be alphanumeric, got {name:?}"
             )));
         }
-        check_or_create_db_meta(&b, &name).await?;
-
         let backend = Arc::new(StatsBackend::new(b));
-        let dyn_backend: Arc<dyn Backend> = backend.clone();
+        check_or_create_db_meta(&backend, &name).await?;
         let timeline = Timeline::new();
+        let dyn_backend: Arc<dyn Backend> = backend.clone();
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone());
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
@@ -180,9 +178,7 @@ impl DatabaseBuilder {
             splitter,
             retry,
             stats: Mutex::new(Stats::default()),
-            shutting_down: AtomicBool::new(false),
-            tx_in_flight: AtomicUsize::new(0),
-            tx_drained: Notify::new(),
+            operations: OperationLifecycle::new(),
             background: bg,
         });
         Ok(Database { inner })
@@ -212,13 +208,9 @@ pub(crate) struct DbInner {
     pub(crate) splitter: Splitter,
     pub(crate) retry: RetryConfig,
     stats: Mutex<Stats>,
-    // Graceful-shutdown bookkeeping. `shutting_down` flips first so any
-    // subsequent `Database::tx` call rejects with `Error::ShuttingDown`. In-flight
-    // transactions increment `tx_in_flight` while their future runs; the
-    // decrement notifies `tx_drained` so `Database::shutdown` can await drain.
-    shutting_down: AtomicBool,
-    tx_in_flight: AtomicUsize,
-    tx_drained: Notify,
+    // Admission and drain cover every public asynchronous operation, including
+    // the few APIs that do not run through a transaction.
+    operations: OperationLifecycle,
     // Sole strong owner of the background task manager. Subsystems (Monitor,
     // Gc, Algo) hold `Weak<Background>`s so that captured clones inside
     // spawned tasks do not form a cycle that would prevent `Background::drop`
@@ -258,27 +250,16 @@ impl Database {
         Database::builder(name, b).open().await
     }
 
-    /// Gracefully shuts the database down: refuses any new [`Database::tx`] calls
-    /// (they return [`Error::ShuttingDown`]) and awaits every in-flight
-    /// transaction future to complete. Idempotent; safe to call from multiple
-    /// `Database` clones concurrently.
+    /// Gracefully shuts the database down: refuses new public asynchronous
+    /// operations (they return [`Error::ShuttingDown`]) and awaits admitted
+    /// operations and background protocol work. Idempotent; safe to call from
+    /// multiple [`Database`] clones concurrently.
     ///
-    /// Background loops (GC, transaction-log refresh, async lock cleanup) and
-    /// best-effort tasks are torn down via [`Drop`] when the last [`Database`] clone
-    /// is dropped; calling `shutdown` is *not* required for cleanup to happen.
-    /// Clean-shutdown background tasks, such as async aborts scheduled by a
-    /// cancelled transaction, are awaited before `shutdown` returns.
+    /// Dropping the last [`Database`] still aborts background work, but
+    /// `shutdown` additionally waits for those tasks to stop. It cannot wait for
+    /// a backend mutation whose future was previously abandoned by cancellation.
     pub async fn shutdown(&self) {
-        self.inner.shutting_down.store(true, Ordering::SeqCst);
-        loop {
-            // Acquire the wait future BEFORE re-checking the counter so a
-            // racing in-flight drop's notify cannot be missed.
-            let notified = self.inner.tx_drained.notified();
-            if self.inner.tx_in_flight.load(Ordering::SeqCst) == 0 {
-                break;
-            }
-            notified.await;
-        }
+        self.inner.operations.shutdown().await;
         // Drain background write-backs and async aborts first: a backgrounded
         // write-back submits through the locker's dedup, so it must complete
         // before the dedup is closed.
@@ -347,29 +328,61 @@ impl Database {
     }
 }
 
-/// RAII counter for in-flight user transactions. The increment happens on
-/// construction (so `Database::shutdown` sees the new tx) and the decrement on drop
-/// (so a cancelled transaction future still releases its slot). When the
-/// counter hits zero, [`DbInner::tx_drained`] is notified, releasing any
-/// `shutdown` waiter.
-struct InFlightGuard<'a> {
-    inner: &'a DbInner,
+struct OperationLifecycle {
+    state: Mutex<OperationState>,
+    drained: Notify,
 }
 
-impl<'a> InFlightGuard<'a> {
-    fn new(inner: &'a DbInner) -> Self {
-        inner.tx_in_flight.fetch_add(1, Ordering::SeqCst);
-        Self { inner }
+struct OperationState {
+    shutting_down: bool,
+    active: usize,
+}
+
+impl OperationLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OperationState {
+                shutting_down: false,
+                active: 0,
+            }),
+            drained: Notify::new(),
+        }
+    }
+
+    fn admit(&self) -> Result<OperationGuard<'_>, Error> {
+        let mut state = self.state.lock().unwrap();
+        if state.shutting_down {
+            return Err(Error::ShuttingDown);
+        }
+        state.active += 1;
+        Ok(OperationGuard { lifecycle: self })
+    }
+
+    async fn shutdown(&self) {
+        loop {
+            let notified = self.drained.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                state.shutting_down = true;
+                if state.active == 0 {
+                    return;
+                }
+            }
+            notified.await;
+        }
     }
 }
 
-impl Drop for InFlightGuard<'_> {
+pub(crate) struct OperationGuard<'a> {
+    lifecycle: &'a OperationLifecycle,
+}
+
+impl Drop for OperationGuard<'_> {
     fn drop(&mut self) {
-        if self.inner.tx_in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // notify_waiters wakes every current waiter (`shutdown` uses
-            // exactly one) and remains correct even if multiple shutdowns
-            // race.
-            self.inner.tx_drained.notify_waiters();
+        let mut state = self.lifecycle.state.lock().unwrap();
+        state.active -= 1;
+        if state.active == 0 {
+            self.lifecycle.drained.notify_waiters();
         }
     }
 }
@@ -379,18 +392,19 @@ impl DbInner {
         Collection::new(path, self.clone())
     }
 
+    /// Admits one public asynchronous operation or rejects it once shutdown has
+    /// begun.
+    pub(crate) fn admit_operation(&self) -> Result<OperationGuard<'_>, Error> {
+        self.operations.admit()
+    }
+
     pub(crate) async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return Err(Error::ShuttingDown);
-        }
-        // RAII: increment now and decrement on drop, so a cancelled (dropped)
-        // future still notifies the shutdown waiter.
-        let _guard = InFlightGuard::new(self);
+        let _guard = self.admit_operation()?;
 
         let mut stats = Stats {
             tx_n: 1,

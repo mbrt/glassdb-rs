@@ -13,6 +13,7 @@
 - Keep implementation methods in order of visibility
 - Comments should be used to explain why something is done, not what
 - Functions' docstring should describe the function's purpose, not its implementation, nor callers
+- Avoid `tokio::sync::Mutex` as it has non-obvious correctness issues.
 
 ### Tests
 

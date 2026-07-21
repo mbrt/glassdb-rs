@@ -39,7 +39,7 @@ pub enum Error {
     #[error("storage unavailable: {0}")]
     Unavailable(String),
     /// The database is shutting down and is no longer accepting new
-    /// transactions. Existing in-flight transactions are allowed to complete.
+    /// asynchronous operations. Existing admitted operations may complete.
     #[error("database is shutting down")]
     ShuttingDown,
     /// Invalid user input.
