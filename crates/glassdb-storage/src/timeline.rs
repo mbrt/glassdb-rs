@@ -1,8 +1,9 @@
-//! Database-local logical time for ordering cache currentness evidence.
+//! Database-local sequence points for ordering cache currentness evidence.
 //!
-//! Logical time is monotonic within one open database, but it is neither wall
-//! time nor a durable timestamp. A [`Timeline`] is shared by the decoded object
-//! cache and every higher-level component that captures currentness barriers.
+//! Sequence points are strictly ordered within one open database, but they are
+//! neither wall time nor durable timestamps. A [`Timeline`] is shared by the
+//! decoded object cache and every higher-level component that captures
+//! currentness barriers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,23 +13,19 @@ use glassdb_concurr::rt;
 
 /// A point on one database-local [`Timeline`].
 ///
-/// Logical times cannot be persisted or exchanged between database instances
+/// Sequence points cannot be persisted or exchanged between database instances
 /// or processes. Mixing values from different timelines is invalid; this is a
 /// documented boundary rather than a dynamically checked one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LogicalTime(u64);
+pub struct SequencePoint(u64);
 
-impl LogicalTime {
+impl SequencePoint {
     pub(crate) fn from_raw(value: u64) -> Self {
-        LogicalTime(value)
+        SequencePoint(value)
     }
 
     pub(crate) fn raw(self) -> u64 {
         self.0
-    }
-
-    pub(crate) fn saturating_sub(self, duration: Duration) -> Self {
-        LogicalTime(self.0.saturating_sub(duration_to_nanos(duration)))
     }
 }
 
@@ -59,7 +56,7 @@ struct Inner {
     last: AtomicU64,
 }
 
-/// Allocates logical times shared by one open database.
+/// Allocates sequence points shared by one open database.
 #[derive(Clone)]
 pub struct Timeline(Arc<Inner>);
 
@@ -76,17 +73,9 @@ impl Timeline {
         }))
     }
 
-    /// Returns a barrier satisfied by every operation started from now on and
-    /// not by any operation that has already completed.
-    pub fn now(&self) -> LogicalTime {
-        LogicalTime(
-            duration_to_nanos(self.0.source.elapsed())
-                .max(self.0.last.load(Ordering::SeqCst).saturating_add(1)),
-        )
-    }
-
-    /// Allocates the unique logical start time for a backend operation.
-    pub(crate) fn tick(&self) -> LogicalTime {
+    /// Allocates a barrier satisfied by every operation invoked afterward and
+    /// not by any operation that definitively completed beforehand.
+    pub fn now(&self) -> SequencePoint {
         let elapsed = duration_to_nanos(self.0.source.elapsed());
         let mut current = self.0.last.load(Ordering::SeqCst);
         loop {
@@ -96,10 +85,20 @@ impl Timeline {
                 .last
                 .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
             {
-                Ok(_) => return LogicalTime(next),
+                Ok(_) => return SequencePoint(next),
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    /// Derives the approximate sequence cutoff used only by bounded-staleness
+    /// reads.
+    pub(crate) fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
+        SequencePoint(
+            self.now()
+                .raw()
+                .saturating_sub(duration_to_nanos(max_staleness)),
+        )
     }
 }
 
@@ -111,4 +110,34 @@ impl Default for Timeline {
 
 fn duration_to_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixedSource(Duration);
+
+    impl TimeSource for FixedSource {
+        fn elapsed(&self) -> Duration {
+            self.0
+        }
+    }
+
+    #[test]
+    fn allocations_are_strictly_ordered_at_one_instant() {
+        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::ZERO)));
+        let first = timeline.now();
+        let second = timeline.now();
+        let third = timeline.clone().now();
+
+        assert!(first < second);
+        assert!(second < third);
+    }
+
+    #[test]
+    fn elapsed_time_is_a_floor_for_sequence_points() {
+        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(2))));
+        assert!(timeline.now().raw() >= 2_000_000_000);
+    }
 }

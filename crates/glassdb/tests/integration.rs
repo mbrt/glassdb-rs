@@ -9,7 +9,7 @@ use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{Backend, Collection, Database, Error, SplitPolicy, Transaction};
 use glassdb_data::{CollectionPath, paths};
 use glassdb_storage::{CollectionRoot, TxCommitStatus};
-use tokio::sync::{Barrier, oneshot};
+use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
     Database::open("example", b).await.unwrap()
@@ -547,6 +547,27 @@ async fn shutdown_drains_background_write_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn shutdown_rejects_every_public_async_entry_point() {
+    let db = init_db(mem()).await;
+    let coll = db.collection(b"demo-coll");
+    coll.create().await.unwrap();
+
+    db.shutdown().await;
+
+    assert!(matches!(coll.read(b"key").await, Err(Error::ShuttingDown)));
+    assert!(matches!(
+        coll.read_stale(b"key", std::time::Duration::ZERO).await,
+        Err(Error::ShuttingDown)
+    ));
+    assert!(matches!(coll.create().await, Err(Error::ShuttingDown)));
+    assert!(matches!(coll.collections().await, Err(Error::ShuttingDown)));
+    assert!(matches!(
+        db.tx(|_| async { Ok::<(), Error>(()) }).await,
+        Err(Error::ShuttingDown)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
 async fn list_keys() {
     let db = init_db(mem()).await;
     let coll = db.collection(b"demo-coll");
@@ -903,27 +924,31 @@ async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
     assert_eq!(list_collections_of(&parent).await, vec![b"child".to_vec()]);
 }
 
-// Two registrations that read the same parent-root version must converge after
-// one loses its CAS, and both temporary structure-read holders must be released.
+// Concurrent registrations serialize their backend CASes on the parent-root
+// path, converge, and release both temporary structure-read holders.
 #[tokio::test]
-async fn concurrent_subcollection_registration_survives_parent_cas_contention() {
+async fn concurrent_subcollection_registration_is_serialized_and_converges() {
     let mem = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem.clone());
     let parent_prefix = CollectionPath::new("example", b"parent").physical_prefix();
     let parent_root = paths::collection_info(&parent_prefix);
-    let barrier = Arc::new(Barrier::new(3));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
     let parent_writes = Arc::new(AtomicUsize::new(0));
     backend.set_before({
         let parent_root = parent_root.clone();
-        let barrier = barrier.clone();
+        let entered = entered.clone();
+        let release = release.clone();
         let parent_writes = parent_writes.clone();
         move |op| {
             let block = matches!(op, BackendOp::WriteIf { path, .. } if *path == parent_root)
-                && parent_writes.fetch_add(1, Ordering::SeqCst) < 2;
-            let barrier = barrier.clone();
+                && parent_writes.fetch_add(1, Ordering::SeqCst) == 0;
+            let entered = entered.clone();
+            let release = release.clone();
             let future: HookFuture = Box::pin(async move {
                 if block {
-                    barrier.wait().await;
+                    entered.notify_one();
+                    release.notified().await;
                 }
                 Ok(())
             });
@@ -939,9 +964,16 @@ async fn concurrent_subcollection_registration_survives_parent_cas_contention() 
     let left_create = tokio::spawn(async move { left.create().await });
     let right_create = tokio::spawn(async move { right.create().await });
 
-    // The first two parent-root CASes now share the same pre-write barrier, so
-    // both were prepared from the same version and one must retry.
-    barrier.wait().await;
+    entered.notified().await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        parent_writes.load(Ordering::SeqCst),
+        1,
+        "only one same-path backend CAS may be active"
+    );
+    release.notify_one();
     left_create.await.unwrap().unwrap();
     right_create.await.unwrap().unwrap();
 

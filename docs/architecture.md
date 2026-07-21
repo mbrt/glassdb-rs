@@ -261,6 +261,13 @@ primitive S3 and GCS provide natively. All coordination state lives in object
 *content*, and every mutation names either absence or an exact content revision
 — there are no tags, metadata, writer ids, or unconditional mutations.
 
+Correctness assumes that each backend provides linearizable single-object reads
+and conditional mutations, including read-after-definitive-completion. An
+eventually consistent backend is therefore not supported. A definitive response
+establishes an ordering edge; an `Unavailable` result does not. Provider retries
+remain inside one logical backend invocation so that attempts do not manufacture
+ordering edges between themselves.
+
 `list` returns one recursive prefix page of actual object paths. Its cursor is
 an opaque provider token valid only for the same backend and prefix, and only a
 page without a next cursor completes the traversal. A rejected token returns
@@ -643,9 +650,14 @@ drives this:
    a competitor's abort write, the CAS semantics ensure exactly one succeeds.
    The loser observes the version mismatch and backs off.
 
-## Storage & Caching
+## Storage, Caching & Consistency
 
-GlassDB uses one decoded object store to minimize backend calls (ADR-036):
+The decoded object cache is also the coordination boundary for point
+operations, not just a performance optimization. Its design combines the
+unified typed cache from
+[ADR-036](adr/036-decoded-object-cache-with-bounded-freshness.md) with the causal
+ordering protocol from
+[ADR-043](adr/043-causally-coordinated-backend-operations.md):
 
 ```
 ┌───────────────────────────────────────┐
@@ -662,8 +674,8 @@ GlassDB uses one decoded object store to minimize backend calls (ADR-036):
                   ▼
 ┌───────────────────────────────────────┐
 │       CachedStore (per database)      │
-│ Decoded values, revisions, retained   │
-│ observations and currentness evidence │
+│ Decoded LRU, retained observations,   │
+│ evidence, and per-path coordination   │
 └─────────────────┬─────────────────────┘
                   │ miss or insufficient evidence
                   ▼
@@ -673,43 +685,159 @@ GlassDB uses one decoded object store to minimize backend calls (ADR-036):
 ```
 
 All typed physical objects share one byte-weighted, path-keyed LRU under a
-single `cache_size` budget. A path has one decoded type; using the same path
+single `cache_size` budget. Codecs provide encoding, decoding, and decoded-size
+accounting. A physical path has one decoded type; accessing the same path
 through another codec is an internal error. Key values are not cached
-separately. The reader derives a value from its leaf's effective writer and that
+separately: the reader derives a value from its leaf's effective writer and that
 writer's decoded transaction object.
 
-**LRU Cache** (`glassdb-storage/src/cache.rs`). A thread-safe, byte-weighted LRU
-cache (default 512 MiB, configurable via `DatabaseBuilder::cache_size`). Entries
-are evicted least-recently-used first when the total decoded-size estimate
-exceeds the limit.
+The LRU (`glassdb-storage/src/cache.rs`) has a 512 MiB default budget,
+configurable through `DatabaseBuilder::cache_size`, and evicts least-recently
+used entries first. Eviction removes discoverable cache state but does not
+revoke observations already retained by readers or transactions.
 
-**CachedStore** (`glassdb-storage/src/cached_store.rs`). Each current entry is
-`Present` (decoded value, opaque CAS revision, and currentness watermark),
-`Absent`, or `Missing`. Typed stores provide codecs and decoded-size accounting.
-`Requirement::Any` accepts any usable current entry. `Requirement::AtLeast(t)`
-requires evidence that the state was current after a lower bound captured once
-at an OCC phase boundary; otherwise the store performs a version-conditional
-read. Unchanged responses advance evidence without transferring or decoding the
-body. Concurrent compatible currentness checks coalesce.
+### Knowledge and causal evidence
 
-Reads retain exact `Observation`s. Their evidence can remain useful after the
-current entry changes or is evicted, but obsolete states are never discoverable
-by a new `Any` read. Successful mutations publish their decoded result; conflict
-and in-doubt outcomes invalidate only the exact starting knowledge. Deletion
-accepts a present observation and forwards its revision: success advances that
-state's evidence and publishes absence, while `NotFound` converges on absence
-without claiming the old state survived to the delete. A typed `TLogger` may
-serve cached final transaction objects indefinitely because their immutability
-is a transaction-object invariant; the generic store does not know what a final
-transaction is. The monitor separately keeps a small count-bounded status cache
-for finalized transactions.
+`CachedStore` (`glassdb-storage/src/cached_store.rs`) stores only usable
+knowledge for a path:
 
-Transaction execution may use cached state. Transaction validation captures one
-lower bound and propagates it through leaf and transaction-object dependencies.
-A post-bound lock CAS can satisfy that bound without another read. If the
-physical leaf has changed, validation compares the observed logical writer or
-membership with the newer consistent state; another operation's post-bound
-evidence can therefore save I/O without being mistaken for logical finality.
+- `Present`, with the decoded value, opaque CAS revision, and currentness
+  evidence
+- `Absent`, with evidence that non-existence was established definitively
+
+Uncertainty is represented by the absence of a cache entry. There is no stored
+`Missing` variant that an ordinary lookup can accidentally reuse. An
+`Observation` may retain an exact historical present or absent state and its
+evidence after the shared cache entry has been evicted or invalidated. Uncertain
+state is not returned as an observation.
+
+Causal evidence is a `SequencePoint`: a strictly ordered event allocated by one
+open `Database`. Sequence points are neither persisted nor shared between
+independent database opens. Their numeric distance has no semantic meaning,
+except that the allocator is coupled to a monotonic elapsed-time floor for the
+intentionally approximate `read_stale` age policy.
+
+Callers express the minimum acceptable evidence as a `Requirement`:
+
+| Requirement | Cache state it accepts |
+| --- | --- |
+| `Any` | Any usable present or absent entry |
+| `AtLeast(t)` | Present or absent state proven current at or after `t` |
+
+An observation's `current_after` point is evidence that the observed state was
+current at that point. It is never a claim about response time. A definitive
+backend operation contributes its invocation point, allocated immediately
+before dispatch. If the same backend state is observed again, its evidence
+watermark advances monotonically; a different state replaces the old
+discoverable knowledge.
+
+### Per-path operation ordering
+
+`CachedStore` owns a clone-shared `PathCoordinator`. For causally coordinated
+point operations, the implementation follows this order:
+
+```text
+check cache
+-> acquire the path lane
+-> check cache again
+-> allocate invocation point
+-> invoke backend
+-> reconcile cache and observations
+-> release lane
+-> make the future ready
+```
+
+The second cache check prevents a waiter from issuing a backend request that an
+earlier operation made unnecessary. The invocation point is allocated only
+after admission to the lane, so local causal order and backend invocation order
+agree. Reconciliation happens before the lane is released and before the
+operation can be observed as complete.
+
+Actual backend point calls for the same path do not overlap within one open
+database. Calls for different paths remain concurrent, and code must not hold
+two path lanes simultaneously. Compatible reads can share one in-flight backend
+read; a read may join only when that flight's invocation point satisfies its
+requirement. A stricter reader queues and rechecks the cache after the current
+flight completes.
+
+An `Any` cache hit deliberately bypasses the lane. It may return older usable
+state while a same-path mutation is in flight, but never state already marked
+obsolete or uncertain. Code requiring a causal cut uses `AtLeast(t)` instead.
+
+The protocol covers typed single-object reads and conditional mutations.
+Listing is not path-coordinated: each page receives its own invocation point,
+and a multi-page listing is not a backend snapshot. Database metadata is the
+narrow startup-only exception; it uses raw backend operations because it is
+created or validated once before normal concurrent access begins.
+
+### Reconciliation and cancellation
+
+Definitive outcomes are published while the path lane is held:
+
+- A successful read installs the exact observed present or absent state.
+- A successful create, compare-and-swap, or delete installs the exact resulting
+  observation.
+- A successful precondition check advances the retained expected observation to
+  the mutation's invocation point.
+- A clean precondition failure invalidates only matching expected knowledge. It
+  proves that state obsolete but normally does not identify its replacement. A
+  definitive `NotFound` establishes absence where the operation's semantics make
+  that conclusion exact.
+- If a changed object's body cannot be decoded, its prior cache entry is
+  invalidated; malformed new bytes must not leave stale state discoverable.
+- An indeterminate mutation removes all usable knowledge for the path before
+  returning `Unavailable`.
+
+Cancellation is part of the protocol. Cancellation while waiting for a lane has
+no cache effect because no backend call was invoked. After mutation dispatch, a
+`MutationGuard` owns the conservative fallback: if the future is cancelled,
+panics, or otherwise exits without definitive reconciliation, it invalidates
+the entire path before releasing the lane. The remote mutation may still take
+effect later, so local coordination does not pretend to order a subsequent call
+after an abandoned remote call. Read cancellation requires no invalidation
+because reads cannot change backend state; other readers retry admission if a
+shared read flight disappears.
+
+### Assumptions and invariants
+
+The cache and coordinator rely on, and preserve, these properties:
+
+1. Backend single-object reads and conditional mutations are linearizable, and
+   a read invoked after a definitive mutation completion observes that mutation
+   or a later state.
+2. Conditional mutations remain semantically safe if their original predicate
+   becomes true again. Revisions describe state and may exhibit ABA;
+   create-if-absent is restricted to permanent idempotent paths or fresh
+   identity paths whose existence alone cannot publish newer live state.
+3. For one open database, no two actual backend point calls for the same
+   physical path overlap, except that an abandoned mutation may still be
+   executing remotely after local cancellation.
+4. A same-path operation is not invoked after an earlier definitive local
+   completion until that earlier outcome has been reconciled. Different paths
+   have no artificial ordering dependency.
+5. A discoverable cache entry always represents usable knowledge. Clean
+   conflicts cannot overwrite newer knowledge, while indeterminate or abandoned
+   mutations leave the path with no discoverable knowledge.
+6. `current_after` never exceeds the invocation point that established it, and
+   evidence for an unchanged state advances monotonically.
+7. Successful mutations publish the exact installed state. Their callers can
+   therefore use the returned observations without immediate verification
+   reads.
+8. Per-path lanes and sequence points are database-local coordination.
+   Independent database opens and external writers are governed by backend
+   linearizability and conditional revisions, not by a shared in-memory
+   timeline.
+
+Transaction execution may use cached state freely before commit. Transaction
+validation captures one lower bound and propagates it through leaf and
+transaction-object dependencies. A post-bound lock CAS can satisfy that bound
+without another read. If a physical leaf changed, validation compares the
+observed logical writer or membership with the newer consistent state;
+post-bound evidence can therefore save I/O without being mistaken for logical
+finality. A typed `TLogger` may serve cached final transaction objects
+indefinitely because their immutability is a transaction-object invariant; the
+generic store does not interpret finality. The monitor separately keeps a small
+count-bounded status cache for finalized transactions.
 
 ## Data Model
 

@@ -1,28 +1,97 @@
 //! Background task management.
 //!
-//! [`Background`] is an owning collection of detached tasks. Best-effort tasks
-//! are spawned with [`Background::spawn`] and run until completion or until the
-//! manager is dropped. Clean-shutdown tasks are spawned with
-//! [`Background::spawn_waited`] and are also awaited by [`Background::shutdown`].
-//! Dropping `Background` aborts every spawned task regardless of lane.
+//! [`Background`] owns protocol producers and clean-shutdown work. Graceful
+//! shutdown closes admission, aborts and joins best-effort producers, then
+//! drains work spawned with [`Background::spawn_waited`]. Dropping `Background`
+//! aborts every spawned task regardless of lane.
 
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::rt::{self, JoinHandle};
+use crate::rt;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+struct TrackedTask {
+    cancel: CancellationToken,
+    completion: Arc<TaskCompletion>,
+}
+
+impl TrackedTask {
+    fn spawn<F>(future: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancel = CancellationToken::new();
+        let completion = Arc::new(TaskCompletion::new());
+        let guard = CompletionGuard(completion.clone());
+        let task_cancel = cancel.clone();
+        drop(rt::spawn(async move {
+            let _guard = guard;
+            tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => {}
+                _ = future => {}
+            }
+        }));
+        Self { cancel, completion }
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    async fn wait(&self) {
+        self.completion.wait().await;
+    }
+}
+
+struct TaskCompletion {
+    done: AtomicBool,
+    notify: Notify,
+}
+
+impl TaskCompletion {
+    fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct CompletionGuard(Arc<TaskCompletion>);
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+}
 
 /// Manages a set of background tasks. When the `Background` is dropped, every
 /// tracked task is aborted; the abort fires at the task's next `.await`.
 pub struct Background {
     inner: Mutex<Inner>,
-    shutdown_drained: Notify,
 }
 
 struct Inner {
-    best_effort: Vec<JoinHandle<()>>,
-    waited: Vec<JoinHandle<()>>,
-    draining_waited: bool,
+    best_effort: Vec<TrackedTask>,
+    waited: Vec<TrackedTask>,
+    shutting_down: bool,
+    complete: bool,
 }
 
 impl Background {
@@ -32,66 +101,63 @@ impl Background {
             inner: Mutex::new(Inner {
                 best_effort: Vec::new(),
                 waited: Vec::new(),
-                draining_waited: false,
+                shutting_down: false,
+                complete: false,
             }),
-            shutdown_drained: Notify::new(),
         }
     }
 
-    /// Spawns `f` as a best-effort background task. The task runs until it
-    /// completes or the `Background` is dropped; [`Background::shutdown`] does
-    /// not wait for it.
+    /// Spawns `f` as a best-effort background task. Graceful shutdown aborts
+    /// and joins the task. Work submitted after shutdown starts is discarded.
     pub fn spawn<F>(&self, f: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let handle = rt::spawn(f);
-        self.inner.lock().unwrap().best_effort.push(handle);
+        let mut inner = self.inner.lock().unwrap();
+        if inner.shutting_down {
+            return;
+        }
+        inner.best_effort.push(TrackedTask::spawn(f));
     }
 
-    /// Spawns `f` as a clean-shutdown background task. The task runs until it
-    /// completes, and [`Background::shutdown`] waits for it.
+    /// Spawns `f` as clean-shutdown work. The task runs to completion and
+    /// [`Background::shutdown`] waits for it. Work submitted after shutdown
+    /// starts is discarded.
     pub fn spawn_waited<F>(&self, f: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let handle = rt::spawn(f);
-        self.inner.lock().unwrap().waited.push(handle);
+        let mut inner = self.inner.lock().unwrap();
+        if inner.shutting_down {
+            return;
+        }
+        inner.waited.push(TrackedTask::spawn(f));
     }
 
-    /// Waits for all tasks spawned with [`Background::spawn_waited`] to finish.
-    ///
-    /// Best-effort tasks are left running. Concurrent callers coordinate so
-    /// every caller returns only after the current clean-shutdown drain has
-    /// completed.
+    /// Closes task admission, aborts and joins best-effort tasks, and waits for
+    /// all clean-shutdown work. Concurrent calls are idempotent, and a later
+    /// call resumes the drain if an earlier shutdown future was cancelled.
     pub async fn shutdown(&self) {
-        loop {
-            let mut wait = None;
-            let handles = {
-                let mut inner = self.inner.lock().unwrap();
-                if inner.draining_waited {
-                    wait = Some(self.shutdown_drained.notified());
-                    None
-                } else if inner.waited.is_empty() {
-                    return;
-                } else {
-                    inner.draining_waited = true;
-                    Some(std::mem::take(&mut inner.waited))
-                }
-            };
-            let Some(handles) = handles else {
-                wait.expect("missing drain notification").await;
-                continue;
-            };
-
-            for handle in handles {
-                let _ = handle.await;
-            }
-
+        let (best_effort, waited) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.draining_waited = false;
-            self.shutdown_drained.notify_waiters();
+            inner.shutting_down = true;
+            if inner.complete {
+                return;
+            }
+            (inner.best_effort.clone(), inner.waited.clone())
+        };
+
+        for task in &best_effort {
+            task.cancel();
         }
+        for task in best_effort {
+            task.wait().await;
+        }
+        for task in waited {
+            task.wait().await;
+        }
+
+        self.inner.lock().unwrap().complete = true;
     }
 }
 
@@ -103,17 +169,10 @@ impl Default for Background {
 
 impl Drop for Background {
     fn drop(&mut self) {
-        // Take handles out so any `JoinHandle` still observed elsewhere (none
-        // by construction here, but defensive) is left alone.
         let inner = self.inner.get_mut().unwrap();
-        let best_effort = std::mem::take(&mut inner.best_effort);
-        let waited = std::mem::take(&mut inner.waited);
-        for h in best_effort.iter().chain(waited.iter()) {
-            h.abort();
+        for task in inner.best_effort.iter().chain(inner.waited.iter()) {
+            task.cancel();
         }
-        // Handles are dropped here, detaching the (now-aborted) tasks. The
-        // sim runtime's wrapping `select!` and tokio's native abort both drop
-        // the spawned future at its next `.await`.
     }
 }
 
@@ -157,11 +216,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_ignores_best_effort_tasks() {
+    async fn shutdown_aborts_best_effort_tasks() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let b = Background::new();
         let done = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
         let d = done.clone();
+        let probe = DropProbe(dropped.clone());
         b.spawn(async move {
+            let _probe = probe;
             std::future::pending::<()>().await;
             d.store(true, Ordering::SeqCst);
         });
@@ -169,6 +238,63 @@ mod tests {
         b.shutdown().await;
 
         assert!(!done.load(Ordering::SeqCst));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_tasks() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let b = Background::new();
+        b.shutdown().await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(dropped.clone());
+        b.spawn(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_can_be_resumed() {
+        let b = Arc::new(Background::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        b.spawn_waited({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+            }
+        });
+        entered.notified().await;
+
+        let first = tokio::spawn({
+            let b = b.clone();
+            async move { b.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        first.abort();
+        let _ = first.await;
+
+        let resumed = tokio::spawn({
+            let b = b.clone();
+            async move { b.shutdown().await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!resumed.is_finished());
+        release.notify_one();
+        resumed.await.unwrap();
     }
 
     #[tokio::test]

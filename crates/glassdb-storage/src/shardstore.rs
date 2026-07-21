@@ -20,7 +20,7 @@ use crate::node::{Node, NodeLocks};
 use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
-use crate::timeline::LogicalTime;
+use crate::timeline::SequencePoint;
 
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 
@@ -103,7 +103,7 @@ impl LeafObservation {
     }
 
     /// The watermark after which this exact leaf state was known to be current.
-    pub fn current_after(&self) -> LogicalTime {
+    pub fn current_after(&self) -> SequencePoint {
         match self {
             LeafObservation::Root(observed) => observed.current_after(),
             LeafObservation::Node(observed) => observed.current_after(),
@@ -239,7 +239,7 @@ impl ShardStore {
     pub async fn check_leaf_current(
         &self,
         observed: &LeafObservation,
-        bound: LogicalTime,
+        bound: SequencePoint,
     ) -> Result<LeafObservationCheck, StorageError> {
         match observed {
             LeafObservation::Root(root) => match self.roots.check_current(root, bound).await? {

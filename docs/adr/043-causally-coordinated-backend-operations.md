@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted — implemented.
 
 This depends on
 [ADR-042](042-conditional-only-backend-mutations.md), partially supersedes
@@ -45,10 +45,10 @@ elapsed-time floor so `read_stale` can derive an approximate cutoff; numeric
 distance between sequence points otherwise has no meaning, and no
 `MonotonicInstant` becomes part of the cache interface.
 
-For reasoning, every backend call has a conceptual interval from invocation to
-local completion. An invoked call is pending until it settles definitively or in
-doubt. These are specification labels, not an `Operation` struct or a
-`Completion` enum.
+For reasoning, every causally coordinated backend call has a conceptual interval
+from invocation to local completion. An invoked call is pending until it settles
+definitively or in doubt. These are specification labels, not an `Operation`
+struct or a `Completion` enum.
 
 The invocation point is allocated immediately before dispatch. Local completion
 occurs after the result has been reconciled with local knowledge and before the
@@ -222,17 +222,20 @@ wait for abandoned mutations and cannot promise that none will apply after
 shutdown returns; this is the same boundary as a crashed database instance. A
 caller may independently bound shutdown with a timeout.
 
-Database metadata initialization uses the same invocation/completion lifecycle
-and conditional primitives. Cancelling `Database::open` abandons an invoked
+Database metadata initialization precedes creation of the database-local
+timeline and does not allocate sequence points. Metadata is read only during
+startup, publishes no cache knowledge, and uses conditional primitives to make
+concurrent initialization safe. Cancelling `Database::open` abandons an invoked
 create-if-absent and is treated as crashing an opener; metadata creation is
 idempotent under that exception.
 
 ### Complete backend boundary
 
-Production engine code performs every backend operation through this boundary.
-Database metadata and cached point objects use the same invocation/completion
-lifecycle; point objects additionally use path lanes and cache reconciliation.
-Backend tests and standalone backend benchmarks may call a raw backend directly.
+Production engine point-object operations use the coordinated boundary. Cached
+point objects use invocation points, path lanes, and cache reconciliation.
+Database metadata initialization is the startup exception described above and
+uses the raw conditional backend primitives. Backend tests and standalone
+backend benchmarks may also call a raw backend directly.
 
 Listing is not a point operation and takes no path lane. Each page has its own
 conceptual operation interval and invocation point. S3 documents a continuation

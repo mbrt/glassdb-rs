@@ -1,4 +1,4 @@
-//! The decoded object cache with bounded requirement (ADR-036).
+//! The causally coordinated decoded object cache (ADR-036, ADR-043).
 //!
 //! One database-local cached object store sits between the [`Backend`] and every
 //! typed storage abstraction. All typed stores share this single byte-bounded
@@ -9,9 +9,9 @@
 //!
 //! Requirement is a local currentness watermark, not a durable guarantee. Each
 //! cache entry is `Present` (a decoded value, its [`Revision`], and a
-//! current-after [`LogicalTime`]), `Absent` (a current-after watermark,
-//! no revision), or `Missing` (no entry: a positively known-obsolete value that
-//! a new lookup cannot rediscover). A successful read returns an [`Observation`]
+//! current-after [`SequencePoint`]), `Absent` (a current-after watermark,
+//! no revision), or uncertain (no entry: no usable discoverable knowledge). A
+//! successful read returns an [`Observation`]
 //! that references monotonic currentness evidence shared with the current cache
 //! entry; the observation stays usable even after that entry is evicted or
 //! invalidated, because invalidation changes what a *new* read may use but does
@@ -20,25 +20,25 @@
 //!
 //! Reads take a [`Requirement`]: `Any` accepts any usable cached entry and reads
 //! the backend on a miss; `AtLeast(T)` accepts an entry only when its watermark
-//! is at least `T`, otherwise it checks through the backend. The store
-//! records `started-at` immediately before each backend call: a successful read
-//! or mutation linearized at some point after `started-at`, so that is the
-//! result's watermark. Watermarks never regress, and a mutation is published
-//! only after backend success.
+//! is at least `T`, otherwise it checks through the backend. Actual same-path
+//! backend calls are serialized, and the store allocates an invocation point
+//! immediately before dispatch. Reconciliation happens before the path lane is
+//! released and before the operation becomes ready.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_backend::{self as backend, Backend, BackendError};
-use tokio::sync::Notify;
+use glassdb_concurr::shard::Sharded;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::cache::{Cache, Weighable};
 use crate::error::StorageError;
-use crate::timeline::{LogicalTime, Timeline};
+use crate::timeline::{SequencePoint, Timeline};
 
 /// Encoding, decoding, and decoded-size accounting for one physical object type.
 ///
@@ -92,7 +92,7 @@ pub enum Requirement {
     Any,
     /// Accept an entry only when its watermark is at least this time; otherwise
     /// check through the backend.
-    AtLeast(LogicalTime),
+    AtLeast(SequencePoint),
 }
 
 impl Requirement {
@@ -115,7 +115,7 @@ impl Requirement {
             // An explicit bounded-staleness read has no transaction validation
             // barrier or mutation receipt to inherit, so its policy must sample
             // the database timeline here.
-            Requirement::AtLeast(timeline.now().saturating_sub(max_staleness))
+            Requirement::AtLeast(timeline.approximate_cutoff(max_staleness))
         }
     }
 }
@@ -163,16 +163,16 @@ pub enum ObservationCheck<V> {
 struct Evidence(Arc<AtomicU64>);
 
 impl Evidence {
-    fn new(t: LogicalTime) -> Self {
+    fn new(t: SequencePoint) -> Self {
         Evidence(Arc::new(AtomicU64::new(t.raw())))
     }
 
-    fn get(&self) -> LogicalTime {
-        LogicalTime::from_raw(self.0.load(Ordering::SeqCst))
+    fn get(&self) -> SequencePoint {
+        SequencePoint::from_raw(self.0.load(Ordering::SeqCst))
     }
 
     /// Advances the watermark to at least `t`, never regressing it.
-    fn advance(&self, t: LogicalTime) {
+    fn advance(&self, t: SequencePoint) {
         self.0.fetch_max(t.raw(), Ordering::SeqCst);
     }
 }
@@ -218,7 +218,7 @@ impl<V> Observation<V> {
 
     /// The watermark: the observed state was current at some point after this
     /// time.
-    pub fn current_after(&self) -> LogicalTime {
+    pub fn current_after(&self) -> SequencePoint {
         self.evidence.get()
     }
 
@@ -269,18 +269,6 @@ struct CacheEntry {
     state: EntryState,
 }
 
-impl CacheEntry {
-    fn evidence(&self) -> &Evidence {
-        match &self.state {
-            EntryState::Present { evidence, .. } | EntryState::Absent { evidence } => evidence,
-        }
-    }
-
-    fn evidence_time(&self) -> LogicalTime {
-        self.evidence().get()
-    }
-}
-
 impl Weighable for CacheEntry {
     fn size(&self) -> usize {
         // A present entry weighs its decoded size plus the revision token; an
@@ -312,7 +300,7 @@ enum FlightOutcome {
 
 /// One in-flight backend currentness check of a path, tracked for coalescing.
 struct InFlight {
-    started: LogicalTime,
+    invoked: SequencePoint,
     outcome: Mutex<Option<FlightOutcome>>,
     notify: Notify,
 }
@@ -337,6 +325,303 @@ impl InFlight {
     }
 }
 
+// Coordination has a different lifetime from cached knowledge, so it uses the
+// same sharding policy as the cache without sharing its storage or locks.
+type PathMapShard = Mutex<HashMap<Arc<str>, Weak<PathState>>>;
+type PathMap = Sharded<PathMapShard>;
+
+/// Database-local admission for actual backend calls on physical paths.
+#[derive(Clone)]
+struct PathCoordinator {
+    paths: Arc<PathMap>,
+}
+
+impl PathCoordinator {
+    fn new() -> Self {
+        Self {
+            paths: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
+        }
+    }
+
+    fn state(&self, path: &Arc<str>) -> Arc<PathState> {
+        let mut paths = self.paths.for_key(path.as_bytes()).lock().unwrap();
+        if let Some(state) = paths.get(path.as_ref()).and_then(Weak::upgrade) {
+            return state;
+        }
+        let state = Arc::new(PathState {
+            path: path.clone(),
+            coordinator: Arc::downgrade(&self.paths),
+            gate: Arc::new(Semaphore::new(1)),
+            flight: Mutex::new(None),
+        });
+        paths.insert(path.clone(), Arc::downgrade(&state));
+        state
+    }
+
+    async fn acquire(&self, path: &Arc<str>) -> PathPermit {
+        let state = self.state(path);
+        let permit = state
+            .gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("path semaphores are never closed");
+        PathPermit {
+            state,
+            permit: Some(permit),
+        }
+    }
+
+    async fn admit_read(&self, path: &Arc<str>, req: Requirement) -> ReadAdmission {
+        let state = self.state(path);
+        let flight = state.flight.lock().unwrap().clone();
+        if let Some(flight) = flight.filter(|flight| satisfies(flight.invoked, req)) {
+            return ReadAdmission::Join(flight);
+        }
+        let permit = state
+            .gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("path semaphores are never closed");
+        ReadAdmission::Lead(PathPermit {
+            state,
+            permit: Some(permit),
+        })
+    }
+}
+
+struct PathState {
+    path: Arc<str>,
+    coordinator: Weak<PathMap>,
+    gate: Arc<Semaphore>,
+    flight: Mutex<Option<Arc<InFlight>>>,
+}
+
+impl Drop for PathState {
+    fn drop(&mut self) {
+        let Some(paths) = self.coordinator.upgrade() else {
+            return;
+        };
+        let mut paths = paths.for_key(self.path.as_bytes()).lock().unwrap();
+        if paths
+            .get(self.path.as_ref())
+            .is_some_and(|state| state.upgrade().is_none())
+        {
+            paths.remove(self.path.as_ref());
+        }
+    }
+}
+
+struct PathPermit {
+    state: Arc<PathState>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PathPermit {
+    fn lead_read(self, invoked: SequencePoint) -> FlightLeader {
+        let flight = Arc::new(InFlight {
+            invoked,
+            outcome: Mutex::new(None),
+            notify: Notify::new(),
+        });
+        let previous = self.state.flight.lock().unwrap().replace(flight.clone());
+        assert!(
+            previous.is_none(),
+            "path permit had an existing read flight"
+        );
+        FlightLeader {
+            permit: Some(self),
+            flight,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for PathPermit {
+    fn drop(&mut self) {
+        self.permit.take();
+    }
+}
+
+enum ReadAdmission {
+    Join(Arc<InFlight>),
+    Lead(PathPermit),
+}
+
+#[derive(Clone)]
+struct PresentSeed {
+    value: Arc<dyn Any + Send + Sync>,
+    size: usize,
+    revision: Revision,
+    evidence: Evidence,
+}
+
+enum ExpectedPredicate {
+    Absent,
+    Present(Revision),
+}
+
+/// Evidence cells proven current when a mutation predicate succeeds.
+///
+/// A retained observation and a matching cache entry can have distinct cells
+/// after eviction and reload, so both must be preserved until reconciliation.
+struct ExpectedEvidence {
+    observation: Option<Evidence>,
+    cached: Option<Evidence>,
+}
+
+impl ExpectedEvidence {
+    fn new(observation: Option<Evidence>) -> Self {
+        Self {
+            observation,
+            cached: None,
+        }
+    }
+
+    fn capture_cached(&mut self, cached: Evidence) {
+        let already_captured = self
+            .observation
+            .as_ref()
+            .is_some_and(|observation| Arc::ptr_eq(&observation.0, &cached.0))
+            || self
+                .cached
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.0, &cached.0));
+        if already_captured {
+            return;
+        }
+        debug_assert!(
+            self.cached.is_none(),
+            "a mutation captures at most one matching cache entry"
+        );
+        self.cached = Some(cached);
+    }
+
+    fn advance(&self, invoked: SequencePoint) {
+        for evidence in self.observation.iter().chain(self.cached.iter()) {
+            evidence.advance(invoked);
+        }
+    }
+}
+
+struct ExpectedState {
+    predicate: ExpectedPredicate,
+    evidence: ExpectedEvidence,
+}
+
+impl ExpectedState {
+    fn absent(evidence: Option<Evidence>) -> Self {
+        Self {
+            predicate: ExpectedPredicate::Absent,
+            evidence: ExpectedEvidence::new(evidence),
+        }
+    }
+
+    fn present(revision: Revision, evidence: Evidence) -> Self {
+        Self {
+            predicate: ExpectedPredicate::Present(revision),
+            evidence: ExpectedEvidence::new(Some(evidence)),
+        }
+    }
+
+    fn capture_cached(&mut self, entry: Option<CacheEntry>) {
+        let cached = match (&self.predicate, entry.map(|entry| entry.state)) {
+            (ExpectedPredicate::Absent, Some(EntryState::Absent { evidence })) => Some(evidence),
+            (
+                ExpectedPredicate::Present(revision),
+                Some(EntryState::Present {
+                    revision: cached_revision,
+                    evidence,
+                    ..
+                }),
+            ) if *revision == cached_revision => Some(evidence),
+            _ => None,
+        };
+        if let Some(cached) = cached {
+            self.evidence.capture_cached(cached);
+        }
+    }
+
+    fn advance(&self, invoked: SequencePoint) {
+        self.evidence.advance(invoked);
+    }
+
+    fn matches(&self, entry: &CacheEntry) -> bool {
+        match (&self.predicate, &entry.state) {
+            (ExpectedPredicate::Absent, EntryState::Absent { .. }) => true,
+            (
+                ExpectedPredicate::Present(revision),
+                EntryState::Present {
+                    revision: current, ..
+                },
+            ) => revision == current,
+            _ => false,
+        }
+    }
+}
+
+struct MutationGuard {
+    cache: Arc<Cache<CacheEntry>>,
+    path: Arc<str>,
+    expected: ExpectedState,
+    permit: Option<PathPermit>,
+    armed: bool,
+}
+
+impl MutationGuard {
+    fn new(
+        cache: Arc<Cache<CacheEntry>>,
+        path: Arc<str>,
+        mut expected: ExpectedState,
+        permit: PathPermit,
+    ) -> Self {
+        expected.capture_cached(cache.get(path.as_ref()));
+        Self {
+            cache,
+            path,
+            expected,
+            permit: Some(permit),
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn invalidate_expected(&self) {
+        self.cache.update(&self.path, |old| match old {
+            Some(entry) if self.expected.matches(&entry) => None,
+            other => other,
+        });
+    }
+
+    fn make_uncertain(&self) {
+        self.cache.delete(&self.path);
+    }
+
+    fn finish(mut self) {
+        self.armed = false;
+        self.permit.take();
+    }
+
+    fn finish_uncertain(mut self) {
+        self.make_uncertain();
+        self.armed = false;
+        self.permit.take();
+    }
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.make_uncertain();
+        }
+        self.permit.take();
+    }
+}
+
 /// The decoded object cache over a [`Backend`] (ADR-036). Reads and mutations of
 /// every physical object class go through this boundary; listing is an uncached
 /// pass-through. Cloning is cheap (shared `Arc`s), so every typed store holds its
@@ -353,12 +638,11 @@ pub struct CachedStore {
     // or had to fetch a body — the signal behind the transaction-layer
     // cache-hit stat.
     body_reads: Arc<AtomicU64>,
-    inflight: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
+    coordinator: PathCoordinator,
 }
 
 struct FlightLeader {
-    store: CachedStore,
-    path: Arc<str>,
+    permit: Option<PathPermit>,
     flight: Arc<InFlight>,
     armed: bool,
 }
@@ -368,15 +652,19 @@ impl FlightLeader {
         self.flight.finish(outcome);
         self.remove();
         self.armed = false;
+        self.permit.take();
     }
 
     fn remove(&self) {
-        let mut inflight = self.store.inflight.lock().unwrap();
-        if inflight
-            .get(self.path.as_ref())
+        let Some(permit) = &self.permit else {
+            return;
+        };
+        let mut flight = permit.state.flight.lock().unwrap();
+        if flight
+            .as_ref()
             .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.flight))
         {
-            inflight.remove(self.path.as_ref());
+            flight.take();
         }
     }
 }
@@ -388,6 +676,7 @@ impl Drop for FlightLeader {
         }
         self.flight.finish(FlightOutcome::Cancelled);
         self.remove();
+        self.permit.take();
     }
 }
 
@@ -400,7 +689,7 @@ impl CachedStore {
             cache: Arc::new(Cache::new(max_size)),
             timeline,
             body_reads: Arc::new(AtomicU64::new(0)),
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            coordinator: PathCoordinator::new(),
         }
     }
 
@@ -422,7 +711,7 @@ impl CachedStore {
     /// Reads the object at `path`, serving a cached entry that satisfies `req`
     /// or checking through the backend otherwise. Returns an [`Observation`],
     /// whose `value()` is `None` for an object that does not exist. A new read
-    /// never returns a positively known-obsolete (`Missing`) value.
+    /// never returns a positively known-obsolete value from uncertain state.
     async fn read<C: Codec>(
         &self,
         path: &str,
@@ -432,7 +721,7 @@ impl CachedStore {
         if let Some(obs) = self.try_hit::<C>(&key, req)? {
             return Ok(obs);
         }
-        let fetched = self.fetch::<C>(&key, req).await?;
+        let fetched = self.fetch::<C>(&key, req, None).await?;
         self.to_observation::<C>(&key, fetched)
     }
 
@@ -466,186 +755,172 @@ impl CachedStore {
             }
             return Ok(ObservationCheck::Changed(current));
         }
-        let started = self.next_tick();
-        match &obs.revision {
-            Some(rev) => match self
-                .backend
-                .read_if_modified(&obs.path, rev.version())
-                .await
-            {
-                Err(BackendError::Precondition) => {
-                    // Unchanged: advance the observation's (and, if it is still
-                    // current, the cache entry's) watermark without decoding.
-                    obs.evidence.advance(started);
-                    self.advance_present(&obs.path, rev, started);
-                    Ok(ObservationCheck::Current)
-                }
-                Ok(reply) => {
-                    let f = self.publish_present::<C>(
-                        &obs.path,
-                        &reply.contents,
-                        reply.version,
-                        started,
-                    )?;
-                    Ok(ObservationCheck::Changed(
-                        self.to_observation::<C>(&obs.path, f)?,
-                    ))
-                }
-                Err(BackendError::NotFound) => {
-                    let f = self.publish_absent(&obs.path, started);
-                    Ok(ObservationCheck::Changed(
-                        self.to_observation::<C>(&obs.path, f)?,
-                    ))
-                }
-                Err(e) => Err(e.into()),
-            },
-            None => match self.backend.read(&obs.path).await {
-                Err(BackendError::NotFound) => {
-                    obs.evidence.advance(started);
-                    self.install_absent(&obs.path, started);
-                    Ok(ObservationCheck::Current)
-                }
-                Ok(reply) => {
-                    let f = self.publish_present::<C>(
-                        &obs.path,
-                        &reply.contents,
-                        reply.version,
-                        started,
-                    )?;
-                    Ok(ObservationCheck::Changed(
-                        self.to_observation::<C>(&obs.path, f)?,
-                    ))
-                }
-                Err(e) => Err(e.into()),
-            },
+        let fetched = self.fetch::<C>(&path, req, Some(obs)).await?;
+        let current = self.to_observation::<C>(&path, fetched)?;
+        if same_observed_state(obs, &current) {
+            let merged = obs.current_after().max(current.current_after());
+            obs.evidence.advance(merged);
+            current.evidence.advance(merged);
+            Ok(ObservationCheck::Current)
+        } else {
+            Ok(ObservationCheck::Changed(current))
         }
     }
 
     /// Creates the object only if absent. On success publishes the value; on a
     /// conflict (it already exists) invalidates the cached absence and reports
-    /// [`CasResult::Conflict`]; an in-doubt outcome invalidates the absence and
-    /// surfaces `Unavailable`.
+    /// [`CasResult::Conflict`]; an in-doubt outcome makes path knowledge
+    /// uncertain and surfaces `Unavailable`.
     async fn create<C: Codec>(
         &self,
         path: &str,
+        expected_absence: Option<&Observation<C::Value>>,
         value: Arc<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
         let bytes = C::encode(&value)?;
         let size = C::size(&value);
-        let started = self.next_tick();
-        match self.backend.write_if_not_exists(path, bytes).await {
-            Ok(v) => Ok(CasResult::Committed(self.commit_write::<C>(
-                path,
-                value,
-                size,
-                Revision(v),
-                started,
-            ))),
+        let path: Arc<str> = Arc::from(path);
+        let expected = ExpectedState::absent(expected_absence.map(|obs| obs.evidence.clone()));
+        let permit = self.coordinator.acquire(&path).await;
+        let mut guard = MutationGuard::new(self.cache.clone(), path.clone(), expected, permit);
+        let invoked = self.next_invocation();
+        guard.arm();
+        match self.backend.write_if_not_exists(&path, bytes).await {
+            Ok(v) => {
+                let obs = self.commit_write::<C>(&path, value, size, Revision(v), invoked);
+                guard.expected.advance(invoked);
+                guard.finish();
+                Ok(CasResult::Committed(obs))
+            }
             Err(BackendError::Precondition) => {
-                self.invalidate_absent(path);
+                guard.invalidate_expected();
+                guard.finish();
                 Ok(CasResult::Conflict)
             }
             Err(BackendError::Unavailable(msg)) => {
-                self.invalidate_absent(path);
+                guard.finish_uncertain();
                 Err(StorageError::Unavailable(msg))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                guard.finish();
+                Err(e.into())
+            }
         }
     }
 
     /// Compare-and-swaps the object from `expected` to `value`. On success the
     /// expected observation is proven to have remained current right up to the
     /// swap, so its watermark is advanced, and the new value is published; a
-    /// conflict or an in-doubt outcome invalidates the exact starting revision
-    /// only if it is still the current entry.
+    /// conflict invalidates the exact starting revision if still cached, while
+    /// an in-doubt outcome makes all path knowledge uncertain.
     async fn cas<C: Codec>(
         &self,
-        path: &str,
         value: Arc<C::Value>,
-        expected: &Revision,
+        expected: &Observation<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
         let bytes = C::encode(&value)?;
         let size = C::size(&value);
-        let started = self.next_tick();
-        match self.backend.write_if(path, bytes, expected.version()).await {
+        let path = expected.path.clone();
+        let revision = expected
+            .revision
+            .clone()
+            .ok_or_else(|| StorageError::other("CAS requires a present observation"))?;
+        let expected_state = ExpectedState::present(revision.clone(), expected.evidence.clone());
+        let permit = self.coordinator.acquire(&path).await;
+        let mut guard =
+            MutationGuard::new(self.cache.clone(), path.clone(), expected_state, permit);
+        let invoked = self.next_invocation();
+        guard.arm();
+        match self
+            .backend
+            .write_if(&path, bytes, revision.version())
+            .await
+        {
             Ok(v) => {
-                // Capture the expected state's shared evidence before publishing
-                // the new value; a successful CAS proves that state stayed
-                // current up to the swap, so advance it (and every retained
-                // observation of it) afterward, once the install can no longer
-                // mistake it for newer knowledge.
-                let expected_ev = self.evidence_if_present(path, expected);
-                let obs = self.commit_write::<C>(path, value, size, Revision(v), started);
-                if let Some(ev) = expected_ev {
-                    ev.advance(started);
-                }
+                let obs = self.commit_write::<C>(&path, value, size, Revision(v), invoked);
+                guard.expected.advance(invoked);
+                guard.finish();
                 Ok(CasResult::Committed(obs))
             }
-            // A CAS whose object vanished is a lost race, like a precondition
-            // miss: the starting revision is obsolete.
-            Err(BackendError::Precondition | BackendError::NotFound) => {
-                self.invalidate_present(path, expected);
+            Err(BackendError::NotFound) => {
+                self.publish_absent(&path, invoked, None);
+                guard.finish();
+                Ok(CasResult::Conflict)
+            }
+            Err(BackendError::Precondition) => {
+                guard.invalidate_expected();
+                guard.finish();
                 Ok(CasResult::Conflict)
             }
             Err(BackendError::Unavailable(msg)) => {
-                self.invalidate_present(path, expected);
+                guard.finish_uncertain();
                 Err(StorageError::Unavailable(msg))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                guard.finish();
+                Err(e.into())
+            }
         }
     }
 
     /// Deletes the exact present observation and returns the installed absence.
-    /// A missing object is successful convergence; a conflict or in-doubt
-    /// outcome invalidates only the expected revision.
+    /// A missing object is successful convergence; a conflict invalidates the
+    /// expected revision if still cached, while an in-doubt outcome makes all
+    /// path knowledge uncertain.
     async fn delete<C: Codec>(
         &self,
         expected: &Observation<C::Value>,
     ) -> Result<Observation<C::Value>, StorageError> {
         let revision = expected
             .revision
-            .as_ref()
+            .clone()
             .ok_or_else(|| StorageError::other("delete requires a present observation"))?;
-        let path = expected.path.as_ref();
-        let started = self.next_tick();
-        match self.backend.delete_if(path, revision.version()).await {
+        let path = expected.path.clone();
+        let expected_state = ExpectedState::present(revision.clone(), expected.evidence.clone());
+        let permit = self.coordinator.acquire(&path).await;
+        let mut guard =
+            MutationGuard::new(self.cache.clone(), path.clone(), expected_state, permit);
+        let invoked = self.next_invocation();
+        guard.arm();
+        match self.backend.delete_if(&path, revision.version()).await {
             Ok(()) => {
-                let evidence = self.install_absent(path, started);
-                // Publish absence before advancing the old state's evidence so
-                // the non-regression rule cannot retain that old state at the
-                // same watermark.
-                expected.evidence.advance(started);
-                Ok(Observation {
-                    path: expected.path.clone(),
+                let evidence = self.install_absent(&path, invoked, None);
+                guard.expected.advance(invoked);
+                let observation = Observation {
+                    path: path.clone(),
                     value: None,
                     revision: None,
                     evidence,
                     cache_hit: false,
-                })
+                };
+                guard.finish();
+                Ok(observation)
             }
             Err(BackendError::NotFound) => {
-                // Let the non-regression rule retain knowledge from an
-                // operation started later. This matters when a path is
-                // concurrently recreated with equivalent contents and hence
-                // the same content-derived revision.
-                let evidence = self.install_absent(path, started);
-                Ok(Observation {
-                    path: expected.path.clone(),
+                let evidence = self.install_absent(&path, invoked, None);
+                let observation = Observation {
+                    path: path.clone(),
                     value: None,
                     revision: None,
                     evidence,
                     cache_hit: false,
-                })
+                };
+                guard.finish();
+                Ok(observation)
             }
             Err(BackendError::Precondition) => {
-                self.invalidate_present(path, revision);
+                guard.invalidate_expected();
+                guard.finish();
                 Err(StorageError::Precondition)
             }
             Err(BackendError::Unavailable(msg)) => {
-                self.invalidate_present(path, revision);
+                guard.finish_uncertain();
                 Err(StorageError::Unavailable(msg))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                guard.finish();
+                Err(e.into())
+            }
         }
     }
 
@@ -657,13 +932,14 @@ impl CachedStore {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<backend::ListPage, StorageError> {
+        let _invoked = self.next_invocation();
         Ok(self.backend.list(prefix, cursor, limit).await?)
     }
 
-    /// Allocates a unique `started-at` watermark, ordered before the backend
+    /// Allocates a unique invocation watermark, ordered before the backend
     /// call it precedes.
-    fn next_tick(&self) -> LogicalTime {
-        self.timeline.tick()
+    fn next_invocation(&self) -> SequencePoint {
+        self.timeline.now()
     }
 
     /// Serves a cached entry that already satisfies `req`, or `None` when the
@@ -711,57 +987,79 @@ impl CachedStore {
     }
 
     /// Fetches from the backend, coalescing with an in-flight check of the same
-    /// path when that check's start satisfies `req`.
+    /// path when that check's invocation satisfies `req`.
     async fn fetch<C: Codec>(
         &self,
         path: &Arc<str>,
         req: Requirement,
+        fallback: Option<&Observation<C::Value>>,
     ) -> Result<FetchResult, StorageError> {
         loop {
-            let (flight, leader, expected) = {
-                let mut map = self.inflight.lock().unwrap();
-                if let Some(flight) = map
-                    .get(path.as_ref())
-                    .filter(|flight| satisfies(flight.started, req))
-                {
-                    (flight.clone(), false, None)
-                } else {
-                    let started = self.next_tick();
-                    let expected = match self.cache.get(path.as_ref()).map(|entry| entry.state) {
-                        Some(EntryState::Present { revision, .. }) => Some(revision),
-                        _ => None,
-                    };
-                    let flight = Arc::new(InFlight {
-                        started,
-                        outcome: Mutex::new(None),
-                        notify: Notify::new(),
+            match self.coordinator.admit_read(path, req).await {
+                ReadAdmission::Join(flight) => match flight.wait().await {
+                    FlightOutcome::Success(fetched) => return Ok(fetched),
+                    FlightOutcome::Error(error) => return Err(error),
+                    FlightOutcome::Cancelled => {}
+                },
+                ReadAdmission::Lead(permit) => {
+                    if let Some(observed) = fallback
+                        && satisfies(observed.current_after(), req)
+                    {
+                        return Ok(fetch_from_observation(observed, true));
+                    }
+                    if let Some(observed) = self.try_hit::<C>(path, req)? {
+                        return Ok(fetch_from_observation(&observed, true));
+                    }
+                    let seed = self.present_seed::<C>(path, fallback)?;
+                    let invoked = self.next_invocation();
+                    let leader = permit.lead_read(invoked);
+                    let result = self.do_fetch::<C>(path, invoked, seed).await;
+                    leader.complete(match &result {
+                        Ok(fetched) => FlightOutcome::Success(fetched.clone()),
+                        Err(error) => FlightOutcome::Error(error.clone()),
                     });
-                    map.insert(path.to_string(), flight.clone());
-                    (flight, true, expected)
+                    return result;
                 }
-            };
-
-            if leader {
-                let guard = FlightLeader {
-                    store: self.clone(),
-                    path: path.clone(),
-                    flight: flight.clone(),
-                    armed: true,
-                };
-                let result = self.do_fetch::<C>(path, flight.started, expected).await;
-                guard.complete(match &result {
-                    Ok(fetched) => FlightOutcome::Success(fetched.clone()),
-                    Err(error) => FlightOutcome::Error(error.clone()),
-                });
-                return result;
-            }
-
-            match flight.wait().await {
-                FlightOutcome::Success(fetched) => return Ok(fetched),
-                FlightOutcome::Error(error) => return Err(error),
-                FlightOutcome::Cancelled => {}
             }
         }
+    }
+
+    fn present_seed<C: Codec>(
+        &self,
+        path: &Arc<str>,
+        fallback: Option<&Observation<C::Value>>,
+    ) -> Result<Option<PresentSeed>, StorageError> {
+        if let Some(CacheEntry {
+            state:
+                EntryState::Present {
+                    value,
+                    size,
+                    revision,
+                    evidence,
+                },
+        }) = self.cache.get(path)
+        {
+            downcast::<C>(path, value.clone())?;
+            return Ok(Some(PresentSeed {
+                value,
+                size,
+                revision,
+                evidence,
+            }));
+        }
+        let Some(observed) = fallback else {
+            return Ok(None);
+        };
+        let (Some(value), Some(revision)) = (&observed.value, &observed.revision) else {
+            return Ok(None);
+        };
+        let erased: Arc<dyn Any + Send + Sync> = value.clone();
+        Ok(Some(PresentSeed {
+            value: erased,
+            size: C::size(value),
+            revision: revision.clone(),
+            evidence: observed.evidence.clone(),
+        }))
     }
 
     /// Runs one backend read for a path: a version-conditional check when
@@ -769,26 +1067,27 @@ impl CachedStore {
     async fn do_fetch<C: Codec>(
         &self,
         path: &str,
-        started: LogicalTime,
-        expected: Option<Revision>,
+        invoked: SequencePoint,
+        seed: Option<PresentSeed>,
     ) -> Result<FetchResult, StorageError> {
-        match &expected {
-            Some(rev) => match self.backend.read_if_modified(path, rev.version()).await {
+        match seed {
+            Some(seed) => match self
+                .backend
+                .read_if_modified(path, seed.revision.version())
+                .await
+            {
                 Ok(reply) => {
-                    self.publish_present::<C>(path, &reply.contents, reply.version, started)
+                    self.publish_present::<C>(path, &reply.contents, reply.version, invoked)
                 }
-                Err(BackendError::Precondition) => {
-                    self.publish_unchanged::<C>(path, rev.clone(), started)
-                        .await
-                }
-                Err(BackendError::NotFound) => Ok(self.publish_absent(path, started)),
+                Err(BackendError::Precondition) => Ok(self.publish_unchanged(path, seed, invoked)),
+                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, None)),
                 Err(e) => Err(e.into()),
             },
             None => match self.backend.read(path).await {
                 Ok(reply) => {
-                    self.publish_present::<C>(path, &reply.contents, reply.version, started)
+                    self.publish_present::<C>(path, &reply.contents, reply.version, invoked)
                 }
-                Err(BackendError::NotFound) => Ok(self.publish_absent(path, started)),
+                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, None)),
                 Err(e) => Err(e.into()),
             },
         }
@@ -800,14 +1099,21 @@ impl CachedStore {
         path: &str,
         bytes: &[u8],
         version: backend::Version,
-        started: LogicalTime,
+        invoked: SequencePoint,
     ) -> Result<FetchResult, StorageError> {
         self.body_reads.fetch_add(1, Ordering::SeqCst);
-        let decoded = C::decode(path, bytes)?;
+        let decoded = match C::decode(path, bytes) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.cache.delete(path);
+                return Err(error);
+            }
+        };
         let size = C::size(&decoded);
         let value: Arc<dyn Any + Send + Sync> = Arc::new(decoded);
         let revision = Revision(version);
-        let evidence = self.install_present(path, value.clone(), size, revision.clone(), started);
+        let evidence =
+            self.install_present(path, value.clone(), size, revision.clone(), invoked, None);
         Ok(FetchResult {
             value: Some(value),
             revision: Some(revision),
@@ -816,42 +1122,39 @@ impl CachedStore {
         })
     }
 
-    /// Handles a "not modified" response: reuses the cached body and advances
-    /// its watermark, or full-reads if the entry was evicted meanwhile.
-    async fn publish_unchanged<C: Codec>(
+    /// Handles a "not modified" response by reusing the body retained for the
+    /// conditional request.
+    fn publish_unchanged(
         &self,
         path: &str,
-        revision: Revision,
-        started: LogicalTime,
-    ) -> Result<FetchResult, StorageError> {
-        if let Some(entry) = self.cache.get(path)
-            && let EntryState::Present {
-                value,
-                revision: r,
-                evidence,
-                ..
-            } = entry.state
-            && r == revision
-        {
-            evidence.advance(started);
-            return Ok(FetchResult {
-                value: Some(value),
-                revision: Some(revision),
-                evidence,
-                cache_hit: true,
-            });
-        }
-        // The cached body is gone (evicted) or changed locally, so recover it.
-        match self.backend.read(path).await {
-            Ok(reply) => self.publish_present::<C>(path, &reply.contents, reply.version, started),
-            Err(BackendError::NotFound) => Ok(self.publish_absent(path, started)),
-            Err(e) => Err(e.into()),
+        seed: PresentSeed,
+        invoked: SequencePoint,
+    ) -> FetchResult {
+        seed.evidence.advance(invoked);
+        let evidence = self.install_present(
+            path,
+            seed.value.clone(),
+            seed.size,
+            seed.revision.clone(),
+            invoked,
+            Some(seed.evidence),
+        );
+        FetchResult {
+            value: Some(seed.value),
+            revision: Some(seed.revision),
+            evidence,
+            cache_hit: true,
         }
     }
 
     /// Publishes a confirmed absence.
-    fn publish_absent(&self, path: &str, started: LogicalTime) -> FetchResult {
-        let evidence = self.install_absent(path, started);
+    fn publish_absent(
+        &self,
+        path: &str,
+        invoked: SequencePoint,
+        preferred: Option<Evidence>,
+    ) -> FetchResult {
+        let evidence = self.install_absent(path, invoked, preferred);
         FetchResult {
             value: None,
             revision: None,
@@ -867,10 +1170,10 @@ impl CachedStore {
         value: Arc<C::Value>,
         size: usize,
         revision: Revision,
-        started: LogicalTime,
+        invoked: SequencePoint,
     ) -> Observation<C::Value> {
         let erased: Arc<dyn Any + Send + Sync> = value.clone();
-        let evidence = self.install_present(path, erased, size, revision.clone(), started);
+        let evidence = self.install_present(path, erased, size, revision.clone(), invoked, None);
         Observation {
             path: Arc::from(path),
             value: Some(value),
@@ -880,143 +1183,86 @@ impl CachedStore {
         }
     }
 
-    /// Installs a present entry under the non-regression rule: an entry already
-    /// confirmed current at least as recently is kept (the caller still gets an
-    /// observation of what it read); a same-revision entry only advances its
-    /// watermark; otherwise the new value is installed. Returns the evidence the
-    /// caller's observation should reference.
+    /// Installs a present entry, merging evidence when the current entry has the
+    /// same revision.
     fn install_present(
         &self,
         path: &str,
         value: Arc<dyn Any + Send + Sync>,
         size: usize,
         revision: Revision,
-        started: LogicalTime,
+        invoked: SequencePoint,
+        preferred: Option<Evidence>,
     ) -> Evidence {
+        let preferred = preferred.unwrap_or_else(|| Evidence::new(invoked));
+        preferred.advance(invoked);
         let mut out: Option<Evidence> = None;
-        self.cache.update(path, |old| {
-            match old {
+        self.cache.update(path, |old| match old {
+            Some(CacheEntry {
+                state:
+                    EntryState::Present {
+                        value: old_value,
+                        size: old_size,
+                        revision: old_revision,
+                        evidence,
+                    },
+            }) if old_revision == revision => {
+                evidence.advance(invoked);
+                out = Some(evidence.clone());
                 Some(CacheEntry {
-                    state:
-                        EntryState::Present {
-                            value: old_value,
-                            size: old_size,
-                            revision: r,
-                            evidence,
-                        },
-                }) if r == revision => {
-                    evidence.advance(started);
-                    out = Some(evidence.clone());
-                    Some(CacheEntry {
-                        state: EntryState::Present {
-                            value: old_value,
-                            size: old_size,
-                            revision: r,
-                            evidence,
-                        },
-                    })
-                }
-                Some(entry) if entry.evidence_time() >= started => {
-                    // Newer knowledge is already cached: keep it and hand the
-                    // caller a detached watermark for the state it observed.
-                    out = Some(Evidence::new(started));
-                    Some(entry)
-                }
-                _ => {
-                    let ev = Evidence::new(started);
-                    out = Some(ev.clone());
-                    Some(CacheEntry {
-                        state: EntryState::Present {
-                            value,
-                            size,
-                            revision,
-                            evidence: ev,
-                        },
-                    })
-                }
+                    state: EntryState::Present {
+                        value: old_value,
+                        size: old_size,
+                        revision: old_revision,
+                        evidence,
+                    },
+                })
+            }
+            _ => {
+                out = Some(preferred.clone());
+                Some(CacheEntry {
+                    state: EntryState::Present {
+                        value,
+                        size,
+                        revision,
+                        evidence: preferred,
+                    },
+                })
             }
         });
         out.expect("update closure always sets the evidence")
     }
 
-    /// Installs a confirmed absence under the same non-regression rule.
-    fn install_absent(&self, path: &str, started: LogicalTime) -> Evidence {
+    /// Installs confirmed absence, merging evidence with an existing absence.
+    fn install_absent(
+        &self,
+        path: &str,
+        invoked: SequencePoint,
+        preferred: Option<Evidence>,
+    ) -> Evidence {
+        let preferred = preferred.unwrap_or_else(|| Evidence::new(invoked));
+        preferred.advance(invoked);
         let mut out: Option<Evidence> = None;
         self.cache.update(path, |old| match old {
             Some(CacheEntry {
                 state: EntryState::Absent { evidence },
             }) => {
-                evidence.advance(started);
+                evidence.advance(invoked);
                 out = Some(evidence.clone());
                 Some(CacheEntry {
                     state: EntryState::Absent { evidence },
                 })
             }
-            Some(entry) if entry.evidence_time() >= started => {
-                out = Some(Evidence::new(started));
-                Some(entry)
-            }
             _ => {
-                let ev = Evidence::new(started);
-                out = Some(ev.clone());
+                out = Some(preferred.clone());
                 Some(CacheEntry {
-                    state: EntryState::Absent { evidence: ev },
+                    state: EntryState::Absent {
+                        evidence: preferred,
+                    },
                 })
             }
         });
         out.expect("update closure always sets the evidence")
-    }
-
-    /// Returns a clone of the current entry's shared evidence iff it is still
-    /// present at `expected`, without advancing it.
-    fn evidence_if_present(&self, path: &str, expected: &Revision) -> Option<Evidence> {
-        match self.cache.get(path).map(|e| e.state) {
-            Some(EntryState::Present {
-                revision, evidence, ..
-            }) if &revision == expected => Some(evidence),
-            _ => None,
-        }
-    }
-
-    /// Advances the current entry's watermark iff it is still present at
-    /// `expected`, proving that exact state remained current up to `started`.
-    fn advance_present(&self, path: &str, expected: &Revision, started: LogicalTime) {
-        self.cache.update(path, |old| {
-            if let Some(CacheEntry {
-                state:
-                    EntryState::Present {
-                        revision, evidence, ..
-                    },
-            }) = &old
-                && revision == expected
-            {
-                evidence.advance(started);
-            }
-            old
-        });
-    }
-
-    /// Invalidates the exact starting present entry (to `Missing`) only if its
-    /// revision is still `expected`; never discards a different state installed
-    /// later.
-    fn invalidate_present(&self, path: &str, expected: &Revision) {
-        self.cache.update(path, |old| match &old {
-            Some(CacheEntry {
-                state: EntryState::Present { revision, .. },
-            }) if revision == expected => None,
-            _ => old,
-        });
-    }
-
-    /// Invalidates a cached absence (to `Missing`), leaving any concurrently
-    /// installed present value untouched.
-    fn invalidate_absent(&self, path: &str) {
-        self.cache.update(path, |old| match &old {
-            Some(CacheEntry {
-                state: EntryState::Absent { .. },
-            }) => None,
-            _ => old,
-        });
     }
 
     /// Converts a type-erased fetch result into a typed observation.
@@ -1100,7 +1346,7 @@ impl<C: Codec> TypedCachedStore<C> {
     pub(crate) async fn check_current(
         &self,
         observed: &Observation<C::Value>,
-        bound: LogicalTime,
+        bound: SequencePoint,
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
         Self::check_path(observed.path())?;
         self.store
@@ -1123,11 +1369,7 @@ impl<C: Codec> TypedCachedStore<C> {
                 "create requires an absence observation for the same path",
             ));
         }
-        let result = self.store.create::<C>(path, value).await?;
-        if let (Some(expected), CasResult::Committed(installed)) = (expected_absence, &result) {
-            expected.evidence.advance(installed.current_after());
-        }
-        Ok(result)
+        self.store.create::<C>(path, expected_absence, value).await
     }
 
     /// Conditionally replaces the exact observed revision.
@@ -1137,17 +1379,10 @@ impl<C: Codec> TypedCachedStore<C> {
         value: Arc<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
         Self::check_path(expected.path())?;
-        let revision = expected
-            .revision()
-            .ok_or_else(|| StorageError::other("CAS requires a present observation"))?;
-        let result = self
-            .store
-            .cas::<C>(expected.path(), value, revision)
-            .await?;
-        if let CasResult::Committed(installed) = &result {
-            expected.evidence.advance(installed.current_after());
+        if expected.revision().is_none() {
+            return Err(StorageError::other("CAS requires a present observation"));
         }
-        Ok(result)
+        self.store.cas::<C>(value, expected).await
     }
 
     /// Deletes an exact present observation and caches the resulting absence.
@@ -1164,11 +1399,31 @@ impl<C: Codec> TypedCachedStore<C> {
 }
 
 /// Reports whether an entry confirmed current at `evidence` satisfies `req`.
-fn satisfies(evidence: LogicalTime, req: Requirement) -> bool {
+fn satisfies(evidence: SequencePoint, req: Requirement) -> bool {
     match req {
         Requirement::Any => true,
         Requirement::AtLeast(t) => evidence >= t,
     }
+}
+
+fn fetch_from_observation<V: Send + Sync + 'static>(
+    observed: &Observation<V>,
+    cache_hit: bool,
+) -> FetchResult {
+    let value = observed
+        .value
+        .as_ref()
+        .map(|value| value.clone() as Arc<dyn Any + Send + Sync>);
+    FetchResult {
+        value,
+        revision: observed.revision.clone(),
+        evidence: observed.evidence.clone(),
+        cache_hit,
+    }
+}
+
+fn same_observed_state<V>(left: &Observation<V>, right: &Observation<V>) -> bool {
+    left.path == right.path && left.revision == right.revision
 }
 
 /// Downcasts a type-erased cached value to the codec's decoded type. A mismatch
@@ -1434,7 +1689,7 @@ mod tests {
     }
 
     // Model invariant: `Any` never returns an entry a conflict invalidated. A
-    // stale CAS turns the exact starting entry into `Missing`, so the next `Any`
+    // stale CAS makes the exact starting entry uncertain, so the next `Any`
     // re-reads the backend and observes the winner.
     #[tokio::test]
     async fn any_rereads_after_conflict_invalidates_starting_entry() {
@@ -1519,7 +1774,7 @@ mod tests {
         let w = obs.current_after();
 
         replace_value(&s2, &obs, v(b"b")).await;
-        s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> Missing
+        s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> uncertain
 
         assert_eq!(obs.value().unwrap().as_slice(), b"a", "still inspectable");
 
@@ -1598,6 +1853,26 @@ mod tests {
         assert_eq!(got.value().unwrap().as_slice(), b"b");
     }
 
+    // A reload can create independent evidence for the same revision. A
+    // successful CAS proves both retained observations current at invocation.
+    #[tokio::test]
+    async fn successful_cas_advances_observation_and_reloaded_evidence() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+
+        store.store.cache.delete("p");
+        let reloaded = store.read("p", Requirement::Any).await.unwrap();
+        assert!(expected.same_state(&reloaded));
+        assert!(!Arc::ptr_eq(&expected.evidence.0, &reloaded.evidence.0));
+
+        let before = store.store.timeline.now();
+        replace_value(&store, &expected, v(b"b")).await;
+
+        assert!(expected.current_after() >= before);
+        assert!(reloaded.current_after() >= before);
+    }
+
     // Model invariant: a CAS conflict neither advances the expected observation
     // nor installs the proposed value.
     #[tokio::test]
@@ -1630,11 +1905,11 @@ mod tests {
         );
     }
 
-    // Model invariant: an in-doubt CAS invalidates only its exact starting entry
-    // and does not advance the observation's watermark. The underlying write may
-    // still have landed, which a later `Any` read discovers.
+    // Model invariant: an in-doubt CAS makes all discoverable path knowledge
+    // uncertain and does not advance the observation's watermark. The
+    // underlying write may still have landed, which a later `Any` read discovers.
     #[tokio::test]
-    async fn cas_in_doubt_invalidates_only_starting_entry() {
+    async fn cas_in_doubt_makes_path_uncertain() {
         let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
         let backend: Arc<dyn Backend> = hook.clone();
         let s = bytes_store(backend);
@@ -1665,7 +1940,7 @@ mod tests {
             obs.current_after() < before,
             "an in-doubt outcome must not advance the observation"
         );
-        // The starting entry became Missing, so Any re-reads and finds the write
+        // The path became uncertain, so Any re-reads and finds the write
         // that actually landed.
         let got = s.read("p", Requirement::Any).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"b");
@@ -1696,6 +1971,52 @@ mod tests {
 
         let got = s.read("p", Requirement::Any).await.unwrap();
         assert!(!got.exists(), "a failed create must not publish its value");
+    }
+
+    // Conditional mutations are state-based: an old absence predicate is safe
+    // to execute after the path existed and became absent again.
+    #[tokio::test]
+    async fn create_executes_after_absence_aba() {
+        let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = rec.log();
+        let backend: Arc<dyn Backend> = rec;
+        let local = bytes_store(backend.clone());
+        let peer = bytes_store(backend);
+
+        let absent = local.read("p", Requirement::Any).await.unwrap();
+        let present = create_value(&peer, "p", v(b"temporary")).await;
+        peer.delete(&present).await.unwrap();
+        clear(&log);
+
+        let created = local
+            .create("p", Some(&absent), v(b"final"))
+            .await
+            .unwrap()
+            .into_observation()
+            .unwrap();
+        assert_eq!(created.value().unwrap().as_slice(), b"final");
+        assert_eq!(count(&log, "write_if_not_exists"), 1);
+    }
+
+    // Providers may derive revisions from content. Returning to the same bytes
+    // therefore restores the original CAS predicate, which remains valid.
+    #[tokio::test]
+    async fn cas_executes_after_revision_aba() {
+        let content = Arc::new(ContentVersionBackend::default());
+        let backend: Arc<dyn Backend> = content.clone();
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+        content
+            .delete_if("p", expected.revision().unwrap().version())
+            .await
+            .unwrap();
+        content
+            .write_if_not_exists("p", b"a".to_vec())
+            .await
+            .unwrap();
+
+        let replacement = replace_value(&store, &expected, v(b"b")).await;
+        assert_eq!(replacement.value().unwrap().as_slice(), b"b");
     }
 
     // Model invariant: repeated conditional checks advance but never
@@ -1794,10 +2115,11 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
     }
 
-    // Regression: a NotFound delete that finishes after an equivalent state is
-    // recreated must not overwrite that later present evidence with absence.
+    // A writer outside this database is not ordered by the local path lane. A
+    // sufficiently fresh read still discovers a recreation that happened while
+    // a local NotFound response was delayed.
     #[tokio::test]
-    async fn delete_not_found_preserves_later_equivalent_recreation() {
+    async fn fresh_read_discovers_external_recreation_after_delayed_not_found() {
         let content = Arc::new(ContentVersionBackend::default());
         let inner: Arc<dyn Backend> = content.clone();
         let hook = HookBackend::new(inner);
@@ -1834,14 +2156,17 @@ mod tests {
             async move { store.delete(&expected).await }
         });
         entered.notified().await;
-        let recreated = create_value(&store, "p", v(b"a")).await;
+        content
+            .write_if_not_exists("p", b"a".to_vec())
+            .await
+            .unwrap();
         release.notify_one();
 
         assert!(deleting.await.unwrap().unwrap().is_absent());
-        let current = store.read("p", Requirement::Any).await.unwrap();
+        let bound = store.store.timeline.now();
+        let current = store.read("p", Requirement::AtLeast(bound)).await.unwrap();
         assert!(current.exists());
-        assert!(current.same_state(&recreated));
-        assert!(current.cache_hit());
+        assert_eq!(current.value().unwrap().as_slice(), b"a");
     }
 
     // Model invariant: a stale conditional delete invalidates only its exact
@@ -1971,27 +2296,24 @@ mod tests {
         ));
     }
 
-    // Gated race: a delayed old read completing after a newer write cannot
-    // overwrite the newer entry, and it is stamped with its own earlier start.
+    // Regression: a read invoked after a same-path create is admitted cannot
+    // race past it and publish a false absence.
     #[tokio::test]
-    async fn delayed_read_cannot_overwrite_newer_write() {
-        let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+    async fn read_invoked_after_create_cannot_publish_false_absence() {
+        let recording = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = recording.log();
+        let inner: Arc<dyn Backend> = recording;
+        let hook = HookBackend::new(inner);
         let backend: Arc<dyn Backend> = hook.clone();
-        // Seed the backend through a separate store so the store under test
-        // starts with a cold cache and must read the backend.
-        let seeder = bytes_store(backend.clone());
-        let seeded = create_value(&seeder, "p", v(b"a")).await;
         let s = bytes_store(backend);
 
         let entered = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
-        // Gate *after* the backend read returns: the read has already captured
-        // the old body ("a") and is parked before publishing it.
-        hook.set_after({
+        hook.set_before({
             let entered = entered.clone();
             let released = released.clone();
-            move |op, _| {
-                if !matches!(op, BackendOp::Read { .. }) {
+            move |op| {
+                if !matches!(op, BackendOp::WriteIfNotExists { path, .. } if *path == "p") {
                     return ready(Ok(()));
                 }
                 entered.store(true, Ordering::SeqCst);
@@ -2005,33 +2327,28 @@ mod tests {
             }
         });
 
-        let read = tokio::spawn({
+        let creating = tokio::spawn({
             let s = s.clone();
-            async move { s.read("p", Requirement::Any).await }
+            async move { create_value(&s, "p", v(b"a")).await }
         });
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
-        // A newer write lands while the read is parked before publishing.
-        let wb = replace_value(&s, &seeded, v(b"b")).await;
+        let reading = tokio::spawn({
+            let s = s.clone();
+            async move { s.read("p", Requirement::Any).await }
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!reading.is_finished(), "the read waits behind the create");
         released.store(true, Ordering::SeqCst);
 
-        let o = read.await.unwrap().unwrap();
-        assert_eq!(
-            o.value().unwrap().as_slice(),
-            b"a",
-            "the read observed the old body"
-        );
-        assert!(
-            o.current_after() < wb.current_after(),
-            "the delayed read is stamped with its own earlier start"
-        );
-        let got = s.read("p", Requirement::Any).await.unwrap();
-        assert_eq!(
-            got.value().unwrap().as_slice(),
-            b"b",
-            "the newer write is not overwritten by the delayed read"
-        );
+        creating.await.unwrap();
+        let observed = reading.await.unwrap().unwrap();
+        assert_eq!(observed.value().unwrap().as_slice(), b"a");
+        assert_eq!(count(&log, "write_if_not_exists"), 1);
+        assert_eq!(count(&log, "read"), 0, "the queued read reused the write");
     }
 
     // Gated race: two concurrent `Any` reads of a cold path share one in-flight
@@ -2090,6 +2407,226 @@ mod tests {
         assert_eq!(count(&log, "read"), 1, "the two reads coalesced");
     }
 
+    // A busy path must not serialize backend work for an unrelated path.
+    #[tokio::test]
+    async fn different_paths_run_in_parallel() {
+        let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = rec.log();
+        let inner: Arc<dyn Backend> = rec;
+        let hook = HookBackend::new(inner);
+        let backend: Arc<dyn Backend> = hook.clone();
+        let seeder = bytes_store(backend.clone());
+        create_value(&seeder, "p", v(b"a")).await;
+        create_value(&seeder, "q", v(b"b")).await;
+        let store = bytes_store(backend);
+        clear(&log);
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        hook.set_before({
+            let entered = entered.clone();
+            let released = released.clone();
+            move |operation| {
+                if !matches!(operation, BackendOp::Read { path } if *path == "p") {
+                    return ready(Ok(()));
+                }
+                entered.store(true, Ordering::SeqCst);
+                let released = released.clone();
+                Box::pin(async move {
+                    while !released.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+
+        let p = tokio::spawn({
+            let store = store.clone();
+            async move { store.read("p", Requirement::Any).await }
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let q = tokio::spawn({
+            let store = store.clone();
+            async move { store.read("q", Requirement::Any).await }
+        });
+        for _ in 0..64 {
+            if q.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(q.is_finished(), "the q read was blocked by the p lane");
+        assert_eq!(q.await.unwrap().unwrap().value().unwrap().as_slice(), b"b");
+        released.store(true, Ordering::SeqCst);
+        assert_eq!(p.await.unwrap().unwrap().value().unwrap().as_slice(), b"a");
+        assert_eq!(count(&log, "read"), 2);
+    }
+
+    // `Any` deliberately bypasses the lane on a hit, so it may observe the old
+    // cached state while a mutation is awaiting its acknowledgement.
+    #[tokio::test]
+    async fn any_cache_hit_during_mutation_returns_previous_state() {
+        let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let backend: Arc<dyn Backend> = hook.clone();
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        hook.set_after({
+            let entered = entered.clone();
+            let released = released.clone();
+            move |operation, outcome| {
+                if !matches!(operation, BackendOp::WriteIf { path, .. } if *path == "p")
+                    || !outcome.is_success()
+                {
+                    return ready(Ok(()));
+                }
+                entered.store(true, Ordering::SeqCst);
+                let released = released.clone();
+                Box::pin(async move {
+                    while !released.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+
+        let replacing = tokio::spawn({
+            let store = store.clone();
+            async move { replace_value(&store, &expected, v(b"b")).await }
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let old = store.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(old.value().unwrap().as_slice(), b"a");
+        assert!(old.cache_hit());
+
+        released.store(true, Ordering::SeqCst);
+        let new = replacing.await.unwrap();
+        assert_eq!(new.value().unwrap().as_slice(), b"b");
+        assert_eq!(
+            store
+                .read("p", Requirement::Any)
+                .await
+                .unwrap()
+                .value()
+                .unwrap()
+                .as_slice(),
+            b"b"
+        );
+    }
+
+    // Dropping a mutation after dispatch removes discoverable knowledge before
+    // releasing the lane, even when the remote write already applied.
+    #[tokio::test]
+    async fn cancelling_invoked_mutation_makes_cache_uncertain() {
+        let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = rec.log();
+        let inner: Arc<dyn Backend> = rec;
+        let hook = HookBackend::new(inner);
+        let backend: Arc<dyn Backend> = hook.clone();
+        let store = bytes_store(backend);
+        let expected = create_value(&store, "p", v(b"a")).await;
+        clear(&log);
+
+        let entered = Arc::new(Notify::new());
+        hook.set_after({
+            let entered = entered.clone();
+            move |operation, outcome| {
+                let gate = matches!(operation, BackendOp::WriteIf { path, .. } if *path == "p")
+                    && outcome.is_success();
+                let entered = entered.clone();
+                Box::pin(async move {
+                    if gate {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        let replacing = tokio::spawn({
+            let store = store.clone();
+            async move { replace_value(&store, &expected, v(b"b")).await }
+        });
+        entered.notified().await;
+        replacing.abort();
+        let _ = replacing.await;
+        hook.clear_after();
+
+        let current = store.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(current.value().unwrap().as_slice(), b"b");
+        assert!(!current.cache_hit());
+        assert_eq!(count(&log, "write_if"), 1);
+        assert_eq!(count(&log, "read"), 1);
+    }
+
+    // Cancellation while queued has not invoked the mutation and therefore
+    // leaves the cache knowledge established by the lane owner intact.
+    #[tokio::test]
+    async fn cancelling_queued_mutation_preserves_cache() {
+        let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = rec.log();
+        let inner: Arc<dyn Backend> = rec;
+        let hook = HookBackend::new(inner);
+        let backend: Arc<dyn Backend> = hook.clone();
+        let seeder = bytes_store(backend.clone());
+        let expected = create_value(&seeder, "p", v(b"a")).await;
+        let store = bytes_store(backend);
+        clear(&log);
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        hook.set_after({
+            let entered = entered.clone();
+            let released = released.clone();
+            move |operation, _| {
+                if !matches!(operation, BackendOp::Read { path } if *path == "p") {
+                    return ready(Ok(()));
+                }
+                entered.store(true, Ordering::SeqCst);
+                let released = released.clone();
+                Box::pin(async move {
+                    while !released.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        let reading = tokio::spawn({
+            let store = store.clone();
+            async move { store.read("p", Requirement::Any).await }
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let queued = tokio::spawn({
+            let store = store.clone();
+            async move { replace_value(&store, &expected, v(b"b")).await }
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        queued.abort();
+        let _ = queued.await;
+        released.store(true, Ordering::SeqCst);
+        reading.await.unwrap().unwrap();
+        hook.clear_after();
+
+        assert_eq!(count(&log, "write_if"), 0);
+        clear(&log);
+        let current = store.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(current.value().unwrap().as_slice(), b"a");
+        assert!(current.cache_hit());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
     // Gated race: a stricter waiter whose bound is not satisfied by the in-flight
     // check's start does not coalesce; it issues its own check.
     #[tokio::test]
@@ -2140,9 +2677,14 @@ mod tests {
             let s = s.clone();
             async move { s.read("p", Requirement::AtLeast(strict)).await }
         });
-        while entered.load(Ordering::SeqCst) < 2 {
+        for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "the stricter check waits for the same-path lane"
+        );
         released.store(true, Ordering::SeqCst);
         a.await.unwrap().unwrap();
         b.await.unwrap().unwrap();
@@ -2180,7 +2722,7 @@ mod tests {
 
         assert_eq!(
             Requirement::within(&timeline, Duration::from_secs(3)),
-            Requirement::AtLeast(LogicalTime::from_raw(7_000_000_000))
+            Requirement::AtLeast(SequencePoint::from_raw(7_000_000_000))
         );
         assert_eq!(
             Requirement::within(&timeline, Duration::MAX),

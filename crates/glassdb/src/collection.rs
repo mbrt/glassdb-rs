@@ -35,6 +35,7 @@ impl Collection {
         key: &[u8],
         max_staleness: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
+        let _guard = self.db.admit_operation()?;
         let key = KeyRef::new(self.path.clone(), key);
         let r = Reader::new(
             Resolver::new(self.db.shards.clone(), self.db.tmon.clone()),
@@ -90,6 +91,7 @@ impl Collection {
 
     /// Ensures the collection exists, creating it if necessary.
     pub async fn create(&self) -> Result<(), Error> {
+        let _guard = self.db.admit_operation()?;
         let root = CollectionRoot::new();
         let prefix = self.path.physical_prefix();
         self.db.shards.create_root(&prefix, &root).await?;
@@ -124,6 +126,7 @@ impl Collection {
     ///
     /// Listing a collection that does not exist returns [`Error::NotFound`].
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
+        let _guard = self.db.admit_operation()?;
         // This non-transactional API returns one current directory snapshot and
         // has no later OCC validation/CAS from which to inherit a watermark.
         let requirement = glassdb_storage::Requirement::AtLeast(self.db.timeline.now());

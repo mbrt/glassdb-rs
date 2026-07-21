@@ -574,9 +574,12 @@ fn proto_ts_to_system(ts: prost_types::Timestamp) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::Timeline;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::RecordingBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+    use tokio::sync::Notify;
 
     fn new_tlogger() -> TLogger {
         let backend = Arc::new(MemoryBackend::new());
@@ -640,6 +643,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
+    }
+
+    // Regression for the false-NotFound race: once a transaction-log create
+    // owns its path lane, a same-path status read must wait instead of reaching
+    // the backend and observing absence before the create linearizes. After the
+    // create completes, the reader rechecks and reuses the published object.
+    #[tokio::test]
+    async fn commit_status_waits_for_in_flight_create() {
+        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let transaction_path = paths::from_transaction("db", &id);
+        let create_started = Arc::new(Notify::new());
+        let release_create = Arc::new(Notify::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        backend.set_before({
+            let transaction_path = transaction_path.clone();
+            let create_started = create_started.clone();
+            let release_create = release_create.clone();
+            let reads = reads.clone();
+            move |operation| {
+                let is_target = operation.path() == transaction_path;
+                let is_read = is_target
+                    && matches!(
+                        operation,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                if is_read {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+                let gate_create =
+                    is_target && matches!(operation, BackendOp::WriteIfNotExists { .. });
+                let create_started = create_started.clone();
+                let release_create = release_create.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if gate_create {
+                        create_started.notify_one();
+                        release_create.notified().await;
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+
+        let objects = CachedStore::new(backend, 1 << 20, Timeline::new());
+        let logger = TLogger::new(objects, "db");
+        let log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+
+        let creating = tokio::spawn({
+            let logger = logger.clone();
+            async move { logger.set(&log).await }
+        });
+        create_started.notified().await;
+
+        let read_started = Arc::new(Notify::new());
+        let reading = tokio::spawn({
+            let logger = logger.clone();
+            let read_started = read_started.clone();
+            async move {
+                read_started.notify_one();
+                logger.commit_status_at(&id, Requirement::Any).await
+            }
+        });
+        read_started.notified().await;
+
+        assert!(
+            !reading.is_finished(),
+            "the status read must wait for the path lane"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no backend read is issued");
+
+        release_create.notify_one();
+        creating.await.unwrap().unwrap();
+        let status = reading.await.unwrap().unwrap();
+        assert_eq!(status.status, TxCommitStatus::Ok);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the queued read must reuse the create's published state"
+        );
     }
 
     #[tokio::test]
