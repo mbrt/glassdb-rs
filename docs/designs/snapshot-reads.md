@@ -294,7 +294,8 @@ snapshot begin chooses the newest sealed epoch satisfying its freshness request.
 Writers use the correctness-first sequence:
 
 1. execute the user body without coordination;
-2. install every point, absence/membership, range, catalog, and structure intent;
+2. install every point, absence/membership, range, and catalog intent, while
+   proving structural gates absent for ordinary node rewrites;
 3. revalidate and capture actual predecessors while holding those locks;
 4. durably prepare an authoritative manifest, then write and verify every
    named immutable payload or physical root, recording an immutable
@@ -314,14 +315,15 @@ therefore implies `epoch(T) <= epoch(U)`.
 
 This proof includes predicates, not only point values. Every epoch-bearing
 transaction must lock and revalidate every point, absence/membership, range,
-catalog, and structure predicate on which its writes may depend before
-admission. Any optimization that admits an epoch-bearing transaction without
-preserving those predicate edges invalidates the sealed-cut proof.
+and catalog predicate on which its writes may depend before admission, and must
+prove structural gates absent for ordinary node rewrites. Any optimization that
+admits an epoch-bearing transaction without preserving those edges invalidates
+the sealed-cut proof.
 
-ADR-033 supplies the concrete range rule: any transaction containing both a
-scan and a write takes structure-read and membership-read locks on every leaf
-covered through each scan's effective frontier, then revalidates while holding
-them. If a limited page's frontier moves outward, it retains the locks, extends
+ADR-033 and ADR-044 supply the concrete range rule: any transaction containing
+both a scan and a write takes membership-read locks on every leaf covered
+through each scan's effective frontier, then revalidates while holding them.
+If a limited page's frontier moves outward, it retains the locks, extends
 the covered range, and repeats to a fixpoint before epoch admission.
 
 The preparation manifest is a GC root from before its named objects are created
@@ -681,9 +683,9 @@ plan must cover:
 - partial manifests, commit versus forced abort of a live lease, lost
   acknowledgements, root tombstone/recreate versus delayed reclamation, and
   delayed artifacts after an epoch seals;
-- serialization-edge tests for point, absence/membership, range, catalog, and
-  structure predicates, including delayed older installs and later-epoch
-  readers;
+- serialization-edge tests for point, absence/membership, range, and catalog
+  predicates plus structural-gate admission, including delayed older installs
+  and later-epoch readers;
 - shared strict/snapshot conformance tests for ADR-033's half-open `range`,
   `prefix`, `all`, exclusive `after`, `limit`, `next_after`, sorted materialized
   pages, zero limit, invalid bounds, and a collection missing at the selected
@@ -776,7 +778,8 @@ dynamic range-sharding B-link topology. On acceptance:
 - ADR-041 supersedes ADR-016, ADR-018, and ADR-031 where they make the physical
   `_i` root authoritative for collection existence and parent-child membership,
   plus ADR-022's unconditional deletion of reusable root paths.
-- ADR-031/032's copy-before-shrink topology remains the physical routing proof;
+- ADR-031/032/044's copy-before-shrink topology and structural gate remain the
+  physical routing proof;
   history retention adds the no-premature-teardown constraint.
 - ADR-037 extends rather than supersedes ADR-033: `ReadTransaction` uses the same
   forward `KeyScan`/`KeyPage` surface. Calls inside one snapshot execution share

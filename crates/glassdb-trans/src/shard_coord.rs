@@ -87,6 +87,9 @@ pub(crate) enum FoldOutcome {
     /// `superseded` carries the `current_writer` transaction ids a write-back
     /// overwrote — GC reverse-check candidates (ADR-022); empty for a release.
     Released { superseded: Vec<TxId> },
+    /// The submitted leaf no longer owns one of this operation's keys. The
+    /// caller must descend again and regroup before retrying.
+    Reroute,
     /// The single read-write commit-install landed: this transaction's write
     /// lock is in the shard's version chain, or it was already there (idempotent,
     /// help-forwarded). The committed object may now be published (ADR-027).
@@ -191,6 +194,11 @@ pub(crate) trait ShardResolver: Send + Sync {
     /// non-idempotent resolver cannot downgrade uncertainty while abandoning
     /// the round.
     fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome;
+
+    /// The outcome delivered when a structural change invalidated routing.
+    fn reroute_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        self.exhausted_outcome(in_doubt)
+    }
 
     /// The raw keys this member may **create or update**, so the coordinator can
     /// verify the loaded leaf still owns them before folding (ADR-031). A split
@@ -378,7 +386,7 @@ impl CasWorker {
                     let members = shard_members(batch);
                     for member in members.values() {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                            outcome: member.resolver.exhausted_outcome(saw_in_doubt),
+                            outcome: member.resolver.reroute_outcome(saw_in_doubt),
                             cas_precondition: None,
                         });
                     }
@@ -421,11 +429,7 @@ impl CasWorker {
                 // and fold nothing for it. Its caller re-resolves through the
                 // directory and re-submits on the leaf that now owns the key.
                 if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
-                    results.push((
-                        tx.clone(),
-                        m.resolver.exhausted_outcome(saw_in_doubt),
-                        false,
-                    ));
+                    results.push((tx.clone(), m.resolver.reroute_outcome(saw_in_doubt), false));
                     continue;
                 }
                 match m.resolver.resolve(&ctx, &entries, &locks).await? {

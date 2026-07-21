@@ -2,12 +2,15 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
-This would supersede [ADR-032](032-node-locking-and-coordinated-splits.md)'s
+Supersedes [ADR-032](032-node-locking-and-coordinated-splits.md)'s
 requirement that every node mutation and escalated scan hold a shared structure
 lock. ADR-032's split linearization, right-link, membership-lock, structural
 recovery, and hard-cap decisions remain unchanged.
+
+Also supersedes [ADR-033](033-transactional-key-iteration.md)'s requirement that
+an escalated scan hold structure-R; its membership-R predicate lock remains.
 
 ## Context
 

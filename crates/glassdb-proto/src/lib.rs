@@ -41,10 +41,9 @@ mod tests {
                         key: b"Hello".to_vec(),
                         lock_type: lock::LockType::Write as i32,
                     }],
-                    leaf_locks: vec![LeafLock {
-                        target: Some(leaf_lock::Target::Root(true)),
+                    membership_locks: vec![MembershipLock {
+                        target: Some(membership_lock::Target::Root(true)),
                         lock_type: lock::LockType::Read as i32,
-                        scope: lock::Scope::Structure as i32,
                     }],
                 }),
             }],

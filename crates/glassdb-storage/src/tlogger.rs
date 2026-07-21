@@ -96,7 +96,6 @@ pub struct TxListPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxLock {
     Entry { key: KeyRef, typ: LockType },
-    Structure { leaf: LeafRef, typ: LockType },
     Membership { leaf: LeafRef, typ: LockType },
 }
 
@@ -104,9 +103,7 @@ impl TxLock {
     /// Returns the lock type recorded for this backreference.
     pub fn typ(&self) -> LockType {
         match self {
-            TxLock::Entry { typ, .. }
-            | TxLock::Structure { typ, .. }
-            | TxLock::Membership { typ, .. } => *typ,
+            TxLock::Entry { typ, .. } | TxLock::Membership { typ, .. } => *typ,
         }
     }
 }
@@ -146,9 +143,7 @@ impl Codec for TxLog {
                 .iter()
                 .map(|lock| match lock {
                     TxLock::Entry { key, .. } => key.key().len(),
-                    TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => {
-                        leaf.node_token().map_or(0, str::len)
-                    }
+                    TxLock::Membership { leaf, .. } => leaf.node_token().map_or(0, str::len),
                 })
                 .sum::<usize>()
             + std::mem::size_of::<TxLog>()
@@ -408,25 +403,22 @@ fn decode_tx_log_from_proto(
                     typ: parse_lock_type(lock.lock_type),
                 });
             }
-            for lock in &locks.leaf_locks {
+            for lock in &locks.membership_locks {
                 let leaf = match lock.target.as_ref() {
-                    Some(pb::leaf_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
-                    Some(pb::leaf_lock::Target::Node(token)) if !token.is_empty() => {
+                    Some(pb::membership_lock::Target::Root(true)) => {
+                        LeafRef::root(collection.clone())
+                    }
+                    Some(pb::membership_lock::Target::Node(token)) if !token.is_empty() => {
                         LeafRef::node(collection.clone(), token.as_str())
                     }
-                    _ => return Err(StorageError::other("transaction log has invalid leaf lock")),
-                };
-                let typ = parse_lock_type(lock.lock_type);
-                let lock = match pb::lock::Scope::try_from(lock.scope) {
-                    Ok(pb::lock::Scope::Structure) => TxLock::Structure { leaf, typ },
-                    Ok(pb::lock::Scope::Membership) => TxLock::Membership { leaf, typ },
                     _ => {
                         return Err(StorageError::other(
-                            "transaction log leaf lock has invalid scope",
+                            "transaction log has invalid membership lock",
                         ));
                     }
                 };
-                res.locks.push(lock);
+                let typ = parse_lock_type(lock.lock_type);
+                res.locks.push(TxLock::Membership { leaf, typ });
             }
         }
     }
@@ -496,7 +488,7 @@ fn marshal_lock(
 ) -> Result<(), StorageError> {
     let collection = match lock {
         TxLock::Entry { key, .. } => key.collection(),
-        TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => leaf.collection(),
+        TxLock::Membership { leaf, .. } => leaf.collection(),
     };
     let coll = coll_writes
         .entry(collection.clone())
@@ -512,20 +504,14 @@ fn marshal_lock(
             key: key.key().to_vec(),
             lock_type: lock_type_to_proto(*typ) as i32,
         }),
-        TxLock::Structure { leaf, typ } | TxLock::Membership { leaf, typ } => {
+        TxLock::Membership { leaf, typ } => {
             let target = match leaf.node_token() {
-                Some(token) => pb::leaf_lock::Target::Node(token.to_string()),
-                None => pb::leaf_lock::Target::Root(true),
+                Some(token) => pb::membership_lock::Target::Node(token.to_string()),
+                None => pb::membership_lock::Target::Root(true),
             };
-            let scope = match lock {
-                TxLock::Structure { .. } => pb::lock::Scope::Structure,
-                TxLock::Membership { .. } => pb::lock::Scope::Membership,
-                TxLock::Entry { .. } => unreachable!(),
-            };
-            clocks.leaf_locks.push(pb::LeafLock {
+            clocks.membership_locks.push(pb::MembershipLock {
                 target: Some(target),
                 lock_type: lock_type_to_proto(*typ) as i32,
-                scope: scope as i32,
             });
         }
     }
@@ -571,9 +557,7 @@ fn validate_single_database(log: &TxLog) -> Result<(), StorageError> {
     for lock in &log.locks {
         match lock {
             TxLock::Entry { key, .. } => check(key.collection())?,
-            TxLock::Structure { leaf, .. } | TxLock::Membership { leaf, .. } => {
-                check(leaf.collection())?
-            }
+            TxLock::Membership { leaf, .. } => check(leaf.collection())?,
         }
     }
     Ok(())
@@ -799,7 +783,7 @@ mod tests {
                 prev_writer: TxId::from_bytes(vec![9]),
             }],
             locks: vec![
-                TxLock::Structure {
+                TxLock::Membership {
                     leaf: LeafRef::root(collection),
                     typ: LockType::Read,
                 },
@@ -815,8 +799,7 @@ mod tests {
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
-        // Locks include the collection lock and the key lock.
-        assert!(got.locks.contains(&TxLock::Structure {
+        assert!(got.locks.contains(&TxLock::Membership {
             leaf: LeafRef::root(CollectionPath::new("db", b"root")),
             typ: LockType::Read,
         }));

@@ -946,7 +946,7 @@ async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
 }
 
 // Concurrent registrations serialize their backend CASes on the parent-root
-// path, converge, and release both temporary structure-read holders.
+// path and converge without introducing structural holders.
 #[tokio::test]
 async fn concurrent_subcollection_registration_is_serialized_and_converges() {
     let mem = Arc::new(MemoryBackend::new());
@@ -1006,8 +1006,8 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
     let stored = mem.read(&parent_root).await.unwrap();
     let root = CollectionRoot::decode(&stored.contents).unwrap();
     assert!(
-        root.node().structure_lock().holders().is_empty(),
-        "registration must release every temporary structure reader"
+        root.node().structural_gate().holders().is_empty(),
+        "registration must not introduce a structural holder"
     );
 }
 

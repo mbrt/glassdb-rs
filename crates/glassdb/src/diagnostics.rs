@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-pub use glassdb_trans::{DedupKeySnapshot, TxLockSnapshot};
+pub use glassdb_trans::{DedupKeySnapshot, HeldLeafSnapshot, TxLockSnapshot};
 
 /// A snapshot of the shard coordinator's and locker's live state. Returned by
 /// [`crate::Database::diagnostics`].
@@ -50,22 +50,13 @@ impl fmt::Display for Diagnostics {
         }
         writeln!(f, "  transactions ({}):", self.transactions.len())?;
         for t in &self.transactions {
-            writeln!(f, "    {} ({} locks)", t.tx_id, t.locks.len())?;
-            for l in &t.locks {
-                match l {
-                    glassdb_storage::TxLock::Entry { key, typ } => writeln!(
-                        f,
-                        "      Entry {typ} {}/{:?}",
-                        key.collection().physical_prefix(),
-                        key.key()
-                    )?,
-                    glassdb_storage::TxLock::Structure { leaf, typ } => {
-                        writeln!(f, "      Structure {typ} {}", leaf.physical_path())?
-                    }
-                    glassdb_storage::TxLock::Membership { leaf, typ } => {
-                        writeln!(f, "      Membership {typ} {}", leaf.physical_path())?
-                    }
-                }
+            writeln!(f, "    {} ({} leaves)", t.tx_id, t.leaves.len())?;
+            for leaf in &t.leaves {
+                writeln!(
+                    f,
+                    "      {} entry={} membership={}",
+                    leaf.path, leaf.entry_lock, leaf.membership_lock
+                )?;
             }
         }
         Ok(())

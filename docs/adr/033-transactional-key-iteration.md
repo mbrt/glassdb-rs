@@ -8,6 +8,10 @@ Builds on [ADR-031](031-dynamic-range-sharding.md) for ordered B-link traversal
 and [ADR-032](032-node-locking-and-coordinated-splits.md) for per-leaf structure
 and membership coordination.
 
+[ADR-044](044-cas-fenced-structural-gate.md) supersedes this ADR's structure-R
+requirement for escalated scans. Membership-R remains the predicate lock and
+cross-conflicts with structural-gate acquisition.
+
 ## Context
 
 Applications need to enumerate a collection inside a transaction and derive

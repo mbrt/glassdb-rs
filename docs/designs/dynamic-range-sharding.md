@@ -64,24 +64,24 @@ CAS. Leaves are the shards; interior nodes are the range index.
   the cache), **follow the right-sibling link** or re-descend from a refreshed
   `_i`. No central read on a cache hit.
 - **Split (grow)** — background; a root split grows height **in place** at `_i`.
-  A split takes the node **structure write lock** for priority and mutual
+  A split closes the node's exclusive **structural gate** for priority and mutual
   exclusion (wound-wait) but keeps ADR-031's **shrink-CAS linearization** and
   right-link tolerance — it is coordinated, not atomically committed across its
   objects ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). It holds
-  **one node's structure-W at a time**, releasing it right after the shrink CAS;
+  **one node's gate at a time**, releasing it with the shrink CAS;
   the parent separator is a separately-locked follow-on, so there is no lock chain
   and no cross-level deadlock. Non-root index splits recurse upward the same way.
 - **Merge (shrink)** — deferred; the node format reserves sibling links and range
   bounds so it is addable without a format migration.
-- **Node locks** — two read/write locks per node beside the per-key entry locks:
-  a **structure** lock (data mutations _and_ escalated scans hold read;
-  split/merge holds write) and a **membership** lock (escalated scans hold read;
-  create/delete hold write; overwrites/reads hold neither)
-  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md)). Uncontended
-  pure reads take neither, so the hot path stays lock-free; an invalidated
-  read-only scan escalates on retry. Because an escalated scan holds
-  structure-read, it conflicts with a split's structure-write, so no scanner lock
-  is transferred across a split.
+- **Node coordination** — an exclusive **structural gate** beside the per-key
+  entry and membership locks. Ordinary mutations and escalated scans do not
+  hold the gate; their node CAS proves it absent. A split closes it only after
+  reconciling every entry and membership holder. Escalated scans hold
+  membership-R, create/delete hold membership-W, and overwrites hold neither.
+  Gate acquisition cross-conflicts with both membership modes, so no scanner
+  lock is transferred across a split
+  ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
+  [ADR-044](../adr/044-cas-fenced-structural-gate.md)).
 - **Membership** — per-leaf: create/delete take the node **membership write lock**
   (serializing membership change within a leaf, mirroring v1's collection-level
   lock at finer granularity) — this is also what distinguishes a delete from an
@@ -221,16 +221,20 @@ ADR — this overview and the diagrams above are the map into it.
   model and encoding, cached self-correcting descent, the leaf split and in-place
   root split, per-range membership and phantom prevention, and what it
   supersedes/reuses. Its per-leaf read-lock escalation is superseded by ADR-032;
-  its lock-free split is refined (structure lock + priority) by ADR-032.
+  its lock-free split is refined by ADR-032 and ADR-044's structural gate.
 - **[ADR-032](../adr/032-node-locking-and-coordinated-splits.md) — Node-level
   locking and coordinated splits.** *Accepted — implemented.* The node
-  structure/membership
-  read/write lock taxonomy (create/delete take the membership write lock),
-  splits coordinated by the structure write lock and wound-wait priority (keeping
+  membership lock and the original shared-structure taxonomy, create/delete
+  membership locking, splits coordinated by wound-wait priority (keeping
   ADR-031's shrink-CAS linearization), the membership version as OCC fast-path
   token, structural-log orphan recovery, and the conditional progress guarantee
   with a hard object-size cap. Supersedes ADR-031's read-lock escalation and
   refines its split coordination.
+- **[ADR-044](../adr/044-cas-fenced-structural-gate.md) — CAS-fenced structural
+  gate.** *Accepted — implemented.* Replaces shared structure readers with an
+  exclusive gate used only for shape changes. Ordinary node rewrites prove the
+  gate absent in their CAS; gate acquisition quiesces entry and membership
+  holders across independent database instances.
 - **[ADR-033](../adr/033-transactional-key-iteration.md) — Transactional key
   iteration.** *Accepted — implemented.* The range/scan API (half-open bounds,
   keys-only, paging) and its OCC/lock isolation built on the ADR-032 taxonomy.

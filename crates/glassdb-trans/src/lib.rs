@@ -22,7 +22,7 @@ pub use reader::{ReadOutcome, ReadValue, Reader};
 pub use resolver::{Resolver, ScanResult};
 pub use shard_coord::{ShardCoordinator, ShardCoordinatorStats, SplitHinter};
 pub use split::{Splitter, SplitterStats};
-pub use tlocker::{Locker, TxLockSnapshot};
+pub use tlocker::{HeldLeafSnapshot, Locker, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface does not force callers to pull
 // in `glassdb-concurr` directly.

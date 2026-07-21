@@ -35,13 +35,13 @@
 //! rewritten into a two-entry index over them, growing the tree's height while
 //! preserving the collection metadata.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
-use glassdb_data::{CollectionPath, KeyRef, TxId, paths};
+use glassdb_data::{CollectionPath, TxId, paths};
 use glassdb_storage::{
     Directory, IndexNode, LeafObservation, LockType, Node, Observation, Requirement, Shard,
     ShardStore, SplitPolicy, StorageError, StructuralLog, Timeline, TxCommitStatus, TxLog,
@@ -50,7 +50,9 @@ use tokio::sync::Notify;
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{NodeLockReconciler, StructureWriteResolver, resolve_entry_locks_at};
+use crate::node_locking::{
+    NodeLockReconciler, QuiescedEntries, StructuralGateResolver, quiesce_entries,
+};
 use crate::resolver::Resolver;
 use crate::shard_coord::{FoldOutcome, ShardCoordinator, SplitHinter};
 
@@ -303,86 +305,58 @@ impl Splitter {
         }
     }
 
-    /// Adds a child name to a parent collection under the root's structure-read
-    /// protocol.
+    /// Adds a child name while the root's structural gate is open.
     pub async fn register_subcollection(
         &self,
         parent_prefix: &str,
         name: &[u8],
     ) -> Result<(), TransError> {
-        let id = self.candidates.new_id();
-        self.mon.begin_tx(&id);
-        let mut acquired = false;
         for _ in 0..50 {
             let (mut root, version) = self
                 .shards
                 .load_root(parent_prefix, Requirement::Any)
                 .await?;
-            let locks = root.node_locks_mut();
-            if locks.structure().lock_type() == LockType::Write && !locks.structure().contains(&id)
-            {
-                // TODO: Wait for the holder through Monitor before retrying. Sleeping alone can
-                // repeatedly return the same cached root without observing the released lock.
-                rt::sleep(Duration::from_millis(5)).await;
+            if let Some(holder) = root.node().structural_gate().holders().first().cloned() {
+                if self.mon.tx_status(&holder).await?.is_final() {
+                    self.release_structural_gate(parent_prefix, None, &holder)
+                        .await?;
+                } else {
+                    tokio::select! {
+                        _ = self.mon.wait_for_tx(&holder) => {}
+                        _ = rt::sleep(Duration::from_millis(5)) => {}
+                    }
+                }
                 continue;
             }
-            locks.add_structure_reader(id.clone());
+            if !root.add_subcollection(name.to_vec()) {
+                return Ok(());
+            }
+            let content_limit = self
+                .candidates
+                .policy()
+                .node_max_bytes
+                .saturating_sub(self.candidates.policy().split_headroom_bytes);
+            let mut index_root = root.clone();
+            index_root.set_node(Node::index(IndexNode::from_children([
+                (Vec::new(), "x".repeat(24)),
+                (vec![0], "y".repeat(24)),
+            ])));
+            if root.content_encoded_len() > content_limit
+                || index_root.content_encoded_len() > content_limit
+            {
+                return Err(TransError::InvalidInput(
+                    "subcollection directory exceeds the node size limit".into(),
+                ));
+            }
             if self
                 .shards
                 .store_root(parent_prefix, &root, &version)
                 .await?
             {
-                acquired = true;
-                break;
+                return Ok(());
             }
         }
-        if !acquired {
-            self.mon.abort_tx(&id).await?;
-            return Err(TransError::Retry);
-        }
-
-        let result = async {
-            loop {
-                let (mut root, version) = self
-                    .shards
-                    .load_root(parent_prefix, Requirement::Any)
-                    .await?;
-                if !root.node().structure_lock().contains(&id) {
-                    return Err(TransError::Retry);
-                }
-                if !root.add_subcollection(name.to_vec()) {
-                    return Ok(());
-                }
-                let content_limit = self
-                    .candidates
-                    .policy()
-                    .node_max_bytes
-                    .saturating_sub(self.candidates.policy().split_headroom_bytes);
-                let mut index_root = root.clone();
-                index_root.set_node(Node::index(IndexNode::from_children([
-                    (Vec::new(), "x".repeat(24)),
-                    (vec![0], "y".repeat(24)),
-                ])));
-                if root.content_encoded_len() > content_limit
-                    || index_root.content_encoded_len() > content_limit
-                {
-                    return Err(TransError::InvalidInput(
-                        "subcollection directory exceeds the node size limit".into(),
-                    ));
-                }
-                if self
-                    .shards
-                    .store_root(parent_prefix, &root, &version)
-                    .await?
-                {
-                    return Ok(());
-                }
-            }
-        }
-        .await;
-        let _ = self.release_structure_write(parent_prefix, None, &id).await;
-        let _ = self.mon.abort_tx(&id).await;
-        result
+        Err(TransError::Retry)
     }
 
     /// Queues a separator whose parent insert must be re-driven by a later
@@ -490,7 +464,7 @@ impl Splitter {
     /// Acquires a source node's structure-write lock under wound-wait. A leaf
     /// joins the shared coordinator round; roots and interior indexes use the
     /// direct structural CAS path because they carry no data-mutation traffic.
-    async fn acquire_structure_write(
+    async fn acquire_structural_gate(
         &self,
         prefix: &str,
         token: Option<&str>,
@@ -503,16 +477,16 @@ impl Splitter {
                 .await?;
             if node.as_leaf().is_some() {
                 return self
-                    .acquire_leaf_structure_write(&self.coord, prefix, token, id)
+                    .acquire_leaf_structural_gate(&self.coord, prefix, token, id)
                     .await;
             }
         }
-        self.acquire_structure_write_direct(prefix, token, id).await
+        self.acquire_structural_gate_direct(prefix, token, id).await
     }
 
     /// Acquires a leaf's structure-write through the shard coordinator, then
     /// reloads the landed version needed by the split's shrink CAS.
-    async fn acquire_leaf_structure_write(
+    async fn acquire_leaf_structural_gate(
         &self,
         coord: &ShardCoordinator,
         prefix: &str,
@@ -524,7 +498,7 @@ impl Splitter {
             .submit_shard(
                 &path,
                 id,
-                Arc::new(StructureWriteResolver::new(id.clone(), path.clone())),
+                Arc::new(StructuralGateResolver::new(id.clone(), path.clone())),
                 Requirement::Any,
             )
             .await?;
@@ -543,8 +517,8 @@ impl Splitter {
             .map(|observation| Requirement::AtLeast(observation.current_after()))
             .unwrap_or(Requirement::Any);
         let (node, version) = self.shards.load_node(prefix, token, requirement).await?;
-        if node.structure_lock().lock_type() == LockType::Write
-            && node.structure_lock().contains(id)
+        if node.structural_gate().lock_type() == LockType::Write
+            && node.structural_gate().contains(id)
         {
             Ok(Some((node, version)))
         } else {
@@ -553,7 +527,7 @@ impl Splitter {
     }
 
     /// Direct structure-write acquisition for roots and interior index nodes.
-    async fn acquire_structure_write_direct(
+    async fn acquire_structural_gate_direct(
         &self,
         prefix: &str,
         token: Option<&str>,
@@ -572,23 +546,47 @@ impl Splitter {
                     Err(e) => return Err(e.into()),
                 },
             };
-            if node.structure_lock().lock_type() == LockType::Write
-                && node.structure_lock().contains(id)
+            if node.structural_gate().lock_type() == LockType::Write
+                && node.structural_gate().contains(id)
             {
                 return Ok(Some((node, version)));
             }
 
+            let collection = CollectionPath::from_physical_prefix(prefix)
+                .map_err(|e| TransError::with_source("parsing collection prefix", e))?;
+            let entries: BTreeMap<Vec<u8>, _> = node
+                .as_leaf()
+                .into_iter()
+                .flat_map(Shard::entries)
+                .cloned()
+                .map(|entry| (entry.key.clone(), entry))
+                .collect();
+            let entries = match quiesce_entries(
+                &self.resolver,
+                &self.mon,
+                &collection,
+                id,
+                &entries,
+                Requirement::Any,
+            )
+            .await?
+            {
+                QuiescedEntries::Ready(entries) => entries,
+                QuiescedEntries::Wait(_) => return Ok(None),
+            };
             let mut locks = node.locks().clone();
             let reconciler = NodeLockReconciler::new(&self.mon, id);
             if reconciler
-                .acquire_structure_write(&mut locks)
+                .acquire_structural_gate(&mut locks)
                 .await?
                 .is_some()
             {
                 return Ok(None);
             }
 
-            self.resolve_node_entries(prefix, &mut node, id).await?;
+            if node.as_leaf().is_some() {
+                node.set_leaf(Shard::from_entries(entries.into_values()))?;
+            }
             node.set_locks(locks);
             if self
                 .store_structural_node(prefix, token, &node, &version)
@@ -615,7 +613,7 @@ impl Splitter {
     }
 
     /// Releases a structure-write holder after its node mutation has landed.
-    async fn release_structure_write(
+    async fn release_structural_gate(
         &self,
         prefix: &str,
         token: Option<&str>,
@@ -633,7 +631,7 @@ impl Splitter {
                     (root.node().clone(), version)
                 }
             };
-            if !node.remove_structure_holder(id) {
+            if !node.remove_structural_gate(id) {
                 return Ok(());
             }
             if self
@@ -670,45 +668,6 @@ impl Splitter {
         }
     }
 
-    /// Help-forwards finalized entry holders before a split removes their
-    /// structure-read holders.
-    async fn resolve_node_entries(
-        &self,
-        prefix: &str,
-        node: &mut Node,
-        id: &TxId,
-    ) -> Result<(), TransError> {
-        let collection = CollectionPath::from_physical_prefix(prefix)
-            .map_err(|e| TransError::with_source("parsing collection prefix", e))?;
-        let Some(shard) = node.as_leaf() else {
-            return Ok(());
-        };
-        let mut entries = Vec::with_capacity(shard.len());
-        for entry in shard.entries() {
-            let resolved = resolve_entry_locks_at(
-                &self.resolver,
-                &self.mon,
-                &KeyRef::new(collection.clone(), &entry.key),
-                Some(entry),
-                Some(id),
-                Requirement::Any,
-            )
-            .await?;
-            let mut entry = entry.clone();
-            entry.current_writer = resolved.writer;
-            entry.deleted = resolved.deleted;
-            entry
-                .locked_by
-                .retain(|holder| holder == id || resolved.pending.contains(holder));
-            if entry.locked_by.is_empty() {
-                entry.lock_type = LockType::None;
-            }
-            entries.push(entry);
-        }
-        node.set_leaf(Shard::from_entries(entries))?;
-        Ok(())
-    }
-
     /// Fences the source writer before recovery classifies created nodes.
     async fn fence_source_writer_for_recovery(
         &self,
@@ -728,10 +687,10 @@ impl Splitter {
                     None => return Ok(true),
                 },
             };
-            if node.structure_lock().lock_type() != LockType::Write {
+            if node.structural_gate().lock_type() != LockType::Write {
                 return Ok(true);
             }
-            let Some(holder) = node.structure_lock().holders().first() else {
+            let Some(holder) = node.structural_gate().holders().first() else {
                 return Ok(true);
             };
             if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
@@ -740,7 +699,7 @@ impl Splitter {
             // A finalized holder may still have a shrink CAS in flight. This
             // cleanup CAS either wins first, fencing that shrink, or loses to
             // it and the next iteration observes the landed right-link.
-            self.release_structure_write(prefix, token, holder).await?;
+            self.release_structural_gate(prefix, token, holder).await?;
         }
         Err(TransError::Retry)
     }
@@ -764,20 +723,20 @@ impl Splitter {
         id: &TxId,
     ) -> Result<(), TransError> {
         let Some((mut node, version)) = self
-            .acquire_structure_write(prefix, Some(token), id)
+            .acquire_structural_gate(prefix, Some(token), id)
             .await?
         else {
             return Err(TransError::Retry);
         };
         if !node.over_soft_cap(self.candidates.policy()) {
-            return self.release_structure_write(prefix, Some(token), id).await;
+            return self.release_structural_gate(prefix, Some(token), id).await;
         }
 
         let right_token = paths::random_node_token();
         let Some((right, split_key)) = node.split(&right_token) else {
-            return self.release_structure_write(prefix, Some(token), id).await;
+            return self.release_structural_gate(prefix, Some(token), id).await;
         };
-        node.remove_structure_holder(id);
+        node.remove_structural_gate(id);
 
         let record_id = right_token.clone();
         let structural_record = self
@@ -835,11 +794,11 @@ impl Splitter {
 
     /// Performs the write-ahead, child creation, and root rewrite.
     async fn coordinate_root_split(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
-        let Some((node, version)) = self.acquire_structure_write(prefix, None, id).await? else {
+        let Some((node, version)) = self.acquire_structural_gate(prefix, None, id).await? else {
             return Err(TransError::Retry);
         };
         if !node.over_soft_cap(self.candidates.policy()) {
-            return self.release_structure_write(prefix, None, id).await;
+            return self.release_structural_gate(prefix, None, id).await;
         }
 
         let l_token = paths::random_node_token();
@@ -858,7 +817,7 @@ impl Splitter {
         if sized_root.content_encoded_len() > content_limit
             || sized_root.encoded_len() > self.candidates.policy().node_max_bytes
         {
-            self.release_structure_write(prefix, None, id).await?;
+            self.release_structural_gate(prefix, None, id).await?;
             return Err(TransError::InvalidInput(
                 "root metadata exceeds the coordination node size limit".into(),
             ));
@@ -932,7 +891,7 @@ impl Splitter {
         token: Option<&str>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let release = self.release_structure_write(prefix, token, id).await;
+        let release = self.release_structural_gate(prefix, token, id).await;
         self.finalize_split(id).await;
         release?;
         Ok(())
@@ -1052,7 +1011,7 @@ impl Splitter {
     ) -> Result<(), TransError> {
         // Separator publication starts from routing state, not from an existing
         // parent observation. Establish one operation epoch, then let the
-        // structure-lock CAS supply all stricter downstream watermarks.
+        // structural-gate CAS supply all stricter downstream watermarks.
         let publication_start = Requirement::AtLeast(self.timeline.now());
         for _ in 0..PARENT_RETRIES {
             let Some(parent) = self
@@ -1074,7 +1033,7 @@ impl Splitter {
             let lock_id = self.candidates.new_id();
             self.mon.begin_tx(&lock_id);
             let acquired = match self
-                .acquire_structure_write(prefix, parent_token.as_deref(), &lock_id)
+                .acquire_structural_gate(prefix, parent_token.as_deref(), &lock_id)
                 .await
             {
                 Ok(acquired) => acquired,
@@ -1143,6 +1102,9 @@ impl Splitter {
                     "separator exceeds the coordination node size limit".into(),
                 ));
             }
+            // Publishing the new shape and reopening the gate share one CAS,
+            // so no ordinary rewrite can slip between those transitions.
+            updated.remove_structural_gate(&lock_id);
             let stored = match self
                 .store_structural_node(prefix, parent_token.as_deref(), &updated, &locked_version)
                 .await
@@ -1165,7 +1127,7 @@ impl Splitter {
                 return Ok(());
             }
             let _ = self
-                .release_structure_write(prefix, parent_token.as_deref(), &lock_id)
+                .release_structural_gate(prefix, parent_token.as_deref(), &lock_id)
                 .await;
             self.finalize_split(&lock_id).await;
             // Precondition miss: the parent changed, re-find and retry.
@@ -1235,7 +1197,7 @@ fn split_into_children(
     let (right, split_key) = source
         .split(right_token)
         .expect("root over the soft cap has at least two entries/children");
-    source.remove_structure_holder(structure_holder);
+    source.remove_structural_gate(structure_holder);
     (source, right, split_key)
 }
 
@@ -1246,7 +1208,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
-    use glassdb_data::TxId;
+    use glassdb_data::{KeyRef, TxId};
     use glassdb_storage::{CachedStore, CollectionRoot, LockType, ShardEntry, TLogger, TxWrite};
 
     const COLL: &str = "db/_c/NqxgQ0";
@@ -1372,9 +1334,9 @@ mod tests {
         (splitter, mon, base_secs * 1_000_000_000)
     }
 
-    fn leaf_with_structure_reader(keys: &[&[u8]], holder: &TxId) -> Node {
+    fn leaf_with_membership_reader(keys: &[&[u8]], holder: &TxId) -> Node {
         let mut node = leaf_node(keys, None, None);
-        node.add_structure_reader(holder.clone());
+        node.add_membership_reader(holder.clone());
         node
     }
 
@@ -1382,9 +1344,7 @@ mod tests {
         let mut entries: Vec<_> = keys.iter().map(|key| live(key)).collect();
         entries[0].lock_type = LockType::Write;
         entries[0].locked_by.push(holder.clone());
-        let mut node = Node::leaf(Shard::from_entries(entries));
-        node.add_structure_reader(holder.clone());
-        node
+        Node::leaf(Shard::from_entries(entries))
     }
 
     fn nonroot_record(source: &str, right: &str, split_key: &[u8]) -> StructuralLog {
@@ -1692,7 +1652,7 @@ mod tests {
         let mut node = Node::leaf(Shard::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
         ));
-        node.add_structure_reader(holder.clone());
+        node.add_membership_reader(holder.clone());
         let mut root = CollectionRoot::new();
         root.set_node(node);
         s.create_root(COLL, &root).await.unwrap();
@@ -1728,7 +1688,7 @@ mod tests {
             .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
-        root.node_locks_mut().remove_structure_holder(&holder);
+        root.node_locks_mut().remove_membership_holder(&holder);
         assert!(s.store_root(COLL, &root, &version).await.unwrap());
 
         sp.run_once().await;
@@ -1753,7 +1713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_wounds_a_younger_structure_reader_and_lands() {
+    async fn split_wounds_a_younger_entry_holder_and_lands() {
         let s = store();
         let bg = Arc::new(Background::new());
         let (sp, mon, split_ts) = splitter_at(&s, &bg, tiny(), 1_000_000);
@@ -1787,7 +1747,7 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         for leaf in leaves {
             let node = leaf.node().unwrap();
-            assert!(node.structure_lock().holders().is_empty());
+            assert!(node.structural_gate().holders().is_empty());
             assert!(
                 node.as_leaf()
                     .unwrap()
@@ -1798,8 +1758,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_help_forwards_a_committed_structure_reader_before_moving_its_entry() {
-        let s = store();
+    async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let s = store_with_backend(backend.clone());
+        let other = store_with_backend(backend);
         let bg = Arc::new(Background::new());
         let (sp, mon, _) = splitter_at(&s, &bg, tiny(), 1_000_000);
         let holder = TxId::with_priority(1, b"committed");
@@ -1820,8 +1782,7 @@ mod tests {
         let upper = entries.last_mut().unwrap();
         upper.lock_type = LockType::Write;
         upper.locked_by.push(holder.clone());
-        let mut node = Node::leaf(Shard::from_entries(entries));
-        node.add_structure_reader(holder.clone());
+        let node = Node::leaf(Shard::from_entries(entries));
         s.store_node(COLL, "L", &node, None).await.unwrap();
         let mut root = CollectionRoot::new();
         root.set_node(Node::index(IndexNode::from_children([(
@@ -1836,7 +1797,7 @@ mod tests {
             .leaf_for(COLL, b"d", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
-        assert!(leaf.node().unwrap().structure_lock().holders().is_empty());
+        assert!(leaf.node().unwrap().structural_gate().holders().is_empty());
         let entry = leaf
             .node()
             .unwrap()
@@ -1848,10 +1809,56 @@ mod tests {
         assert_eq!(entry.current_writer.as_ref(), Some(&holder));
         assert!(entry.locked_by.is_empty());
         assert_eq!(entry.lock_type, LockType::None);
+
+        // A different instance still targeting the pre-split source must
+        // re-descend and converge without recreating the removed holder.
+        let other_bg = Arc::new(Background::new());
+        let other_mon = Monitor::new(
+            TLogger::new(other.objects.clone(), "db"),
+            other.timeline.clone(),
+            Arc::downgrade(&other_bg),
+        );
+        let other_resolver = Resolver::new(other.shards.clone(), other_mon.clone());
+        let other_coord = ShardCoordinator::with_hinter(
+            other.shards.clone(),
+            other_resolver,
+            other_mon.clone(),
+            RetryConfig::default(),
+            SplitPolicy::default(),
+            Arc::new(crate::shard_coord::NoSplitHints),
+        );
+        let other_locker = crate::tlocker::Locker::new(
+            other_coord,
+            Directory::new(other.shards.clone()),
+            other_mon,
+            RetryConfig::default(),
+        );
+        other_locker
+            .write_back_single_put(
+                &holder,
+                &paths::from_node(COLL, "L"),
+                b"d",
+                &KeyRef::new(collection(), b"d"),
+                None,
+            )
+            .await;
+        let current = Directory::new(other.shards.clone())
+            .leaf_for(COLL, b"d", Requirement::Any)
+            .await
+            .unwrap();
+        let current = current
+            .node()
+            .unwrap()
+            .as_leaf()
+            .unwrap()
+            .lookup(b"d")
+            .unwrap();
+        assert_eq!(current.current_writer.as_ref(), Some(&holder));
+        assert!(current.locked_by.is_empty());
     }
 
     #[tokio::test]
-    async fn split_defers_to_an_older_structure_reader_then_lands() {
+    async fn split_defers_to_an_older_membership_reader_then_lands() {
         let s = store();
         let bg = Arc::new(Background::new());
         let (sp, mon, split_ts) = splitter_at(&s, &bg, tiny(), 1_000_000);
@@ -1860,7 +1867,7 @@ mod tests {
         s.store_node(
             COLL,
             "L",
-            &leaf_with_structure_reader(&[b"a", b"b", b"c", b"d"], &older),
+            &leaf_with_membership_reader(&[b"a", b"b", b"c", b"d"], &older),
             None,
         )
         .await
@@ -2153,7 +2160,7 @@ mod tests {
         sp.mon.begin_tx(&id);
 
         let mut source = leaf_node(&[b"a", b"b"], None, None);
-        source.set_structure_writer(id.clone());
+        source.set_structural_gate(id.clone());
         s.store_node(COLL, "L", &source, None).await.unwrap();
         s.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
             .await
@@ -2358,14 +2365,14 @@ mod tests {
         let id = TxId::with_priority(1, b"racing-split");
 
         let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
-        original.set_structure_writer(id.clone());
+        original.set_structural_gate(id.clone());
         s.store_node(COLL, "L", &original, None).await.unwrap();
         let (mut shrunk, source_version) = s
             .load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         let (right, split_key) = shrunk.split("R").unwrap();
-        shrunk.remove_structure_holder(&id);
+        shrunk.remove_structural_gate(&id);
         s.store_node(COLL, "R", &right, None).await.unwrap();
         let mut root = CollectionRoot::new();
         root.set_node(Node::index(IndexNode::from_children([(

@@ -7,7 +7,51 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
-Open follow-up work is tracked in [Performance TODOs](perf-todos.md).
+## ADR-044: CAS-fenced structural gate
+
+[ADR-044](../adr/044-cas-fenced-structural-gate.md) removes shared structure
+readers from ordinary transactions. Stable-leaf work now checks that the
+exclusive structural gate is absent in the same node CAS that installs or
+publishes data; only a structural mutation closes the gate and quiesces the
+whole node.
+
+### compare-refs summary
+
+- command: `BASE=51b1bbc1 LABEL_A=before LABEL_B=cas-gate DIAGNOSTICS=1 DRAIN_TIMEOUT=90s compare-refs.sh --summary`
+- base: `51b1bbc15853d270c75966456dab3efbb010cf2b` (before)
+- target: current worktree based on `51b1bbc1` (cas-gate)
+- ratio = cas-gate / before (throughput >1 good; latency/ops/cost <1 good)
+- summary parameters: 5,000 keys, two 3-second rw9010 runs at 1 and 10
+  Databases, two 3-second deadlock sweeps, three deterministic efficiency
+  repeats, and adaptive mixbench cells capped at 20 seconds
+- every rw9010 and mixbench cell completed with zero transaction failures. The
+  high-contention per-shape mixbench cell was unconverged on both sides
+- the historical baseline needed a 90-second completion grace for mixbench; the
+  default 30-second summary grace rejected the first run before the target ran
+
+### Results
+
+- rw9010 throughput geomean: balanced `0.79`, read-heavy `0.94`, write-heavy
+  `1.30`. The short sweep is mixed and should not be treated as a proven
+  throughput improvement
+- rw9010 backend operations/transaction geomean: balanced `0.64`, read-heavy
+  `0.80`, write-heavy `0.51`; node operations and transaction-log operations
+  both fall in all three mixes
+- deterministic efficiency score: `122.18` to `120.39` (`0.985`, effectively
+  unchanged). Single-RMW cost falls to `0.932` and multi-RMW cost to `0.967`;
+  batch-write cost rises to `1.031`
+- deadlock p50 and p90 geomeans are `0.99` and `0.97`, both within the noisy
+  workload's unchanged band
+- converged mixbench cells are also mixed: low-contention shared topology loses
+  7–19% throughput while aggregate backend operations/transaction stay within
+  2%; several per-shape write cells perform fewer backend operations but do not
+  convert that saving into higher throughput
+
+The deterministic stable-leaf regression tests provide the direct protocol
+check: an ordinary mutation neither records a structural lock nor resolves an
+unrelated entry holder, and a single-RMW transaction falls back from the fast
+path when a gate is present. The benchmark confirms the expected reduction in
+backend work without establishing an overall throughput win.
 
 ## ADR-031–ADR-043 and transaction-log refactoring
 
