@@ -243,11 +243,25 @@ struct CasReq {
 
 impl MergeRequest for CasReq {
     fn merge(&self, other: &Self) -> Option<Self> {
-        // Always union leaf members into one round (ADR-028): even same-key
-        // conflicting writers share a single load + CAS. The fold resolves the
-        // conflict in-round by wound-wait order — the older member stages its
-        // lock and the younger emits `Wait` — so there is no benefit to keeping
-        // contenders in separate batches.
+        // One transaction can have several operations in flight on the same leaf
+        // at once — e.g. GC releasing a presumed-dead transaction's holds
+        // (ADR-029) while that transaction's own acquire is still resolving on
+        // the same object (ADR-025). Each submission carries its own outcome
+        // slot, but a fold round runs at most one resolver per transaction id
+        // and the dedup delivers to *every* merged submission. Merging two
+        // submissions that share an id would collapse them to a single map
+        // entry — silently dropping one submission's resolver and its outcome
+        // slot, leaving that caller a delivered-but-empty slot. Decline the
+        // merge on any id overlap so the colliding submission runs in its own
+        // subsequent round instead.
+        if other.members.keys().any(|tx| self.members.contains_key(tx)) {
+            return None;
+        }
+        // Otherwise union distinct-id leaf members into one round (ADR-028):
+        // even same-key conflicting writers share a single load + CAS. The fold
+        // resolves the conflict in-round by wound-wait order — the older member
+        // stages its lock and the younger emits `Wait` — so there is no benefit
+        // to keeping contenders in separate batches.
         let mut members = self.members.clone();
         for (tx, m) in &other.members {
             members.insert(tx.clone(), m.clone());
@@ -1371,6 +1385,70 @@ mod tests {
             trace[1].1.contains(&b"a".to_vec()),
             "the younger member observes the older's staged entry"
         );
+    }
+
+    // Regression (fuzz `concurrent_tx`,
+    // corpus/cd4e97be8a631c59fe32bc49de539f38056bcb40): one transaction can have
+    // two operations in flight on the same leaf at once — GC releasing a
+    // presumed-dead transaction's holds (ADR-029) while that transaction's own
+    // acquire is still resolving on the same object (ADR-025). Both submissions
+    // carry their own outcome slot, but a fold round runs one resolver per id and
+    // the dedup delivers to every merged submission; merging them would collapse
+    // the two slots into one and leave the loser a delivered-but-empty slot. The
+    // coordinator must instead serialize same-id submissions into separate rounds
+    // so each gets its own outcome rather than panicking.
+    #[tokio::test(start_paused = true)]
+    async fn same_tx_concurrent_submits_each_get_an_outcome() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>);
+        let tx = TxId::with_priority(1, b"t");
+
+        // The acquire submits first, becomes the dedup driver, and parks in the
+        // gated load; the release for the same id then arrives for the same leaf.
+        gate.arm();
+        let (c1, t1) = (coord.clone(), tx.clone());
+        let acquire = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(StageLock {
+                    key: b"k".to_vec(),
+                    tx: t1.clone(),
+                    admission: StageAdmission::ExistingKeys,
+                }),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+
+        let (c2, t2) = (coord.clone(), tx.clone());
+        let release = tokio::spawn(async move {
+            c2.submit_shard(&leaf(), &t2, Arc::new(SkipRelease), Requirement::Any)
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        // Neither submission may be left with an empty slot: both resolve to
+        // their own outcome (the merge was declined, so they ran in separate
+        // rounds instead of collapsing).
+        assert!(matches!(
+            acquire.await.unwrap().unwrap(),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Locked { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            release.await.unwrap().unwrap(),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Released { .. },
+                ..
+            })
+        ));
+        coord.close().await;
     }
 
     // Capacity is a member-local result: a create that crosses the reserved
