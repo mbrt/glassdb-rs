@@ -2,16 +2,19 @@
 //! reducing lock contention on hot DB-level maps. Ported from the Go
 //! `internal/shard` package.
 
-use std::thread::available_parallelism;
+use std::{sync::OnceLock, thread::available_parallelism};
 
 const FNV_OFFSET_32: u32 = 2166136261;
 const FNV_PRIME_32: u32 = 16777619;
 
+// Sharded maps cannot resize, so changing the recommendation for maps created
+// later would only add inconsistency while repeatedly querying OS affinity.
+static SHARD_COUNT: OnceLock<usize> = OnceLock::new();
+
 /// Returns the recommended number of shards: the next power of two greater than
 /// or equal to the available parallelism (the Rust analog of `GOMAXPROCS`).
 pub fn count() -> usize {
-    let par = available_parallelism().map(|n| n.get()).unwrap_or(1);
-    next_pow2(par)
+    *SHARD_COUNT.get_or_init(|| next_pow2(available_parallelism().map(|n| n.get()).unwrap_or(1)))
 }
 
 /// Returns the shard index for `key` given `n` shards. `n` must be a power of
