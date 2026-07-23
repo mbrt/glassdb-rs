@@ -1255,12 +1255,13 @@ impl Locker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::ProtocolTiming;
     use crate::resolver::Resolver;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::{Background, Clock, RetryConfig};
     use glassdb_data::{CollectionPath, paths};
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Node, Shard, ShardEntry, ShardStore, SplitPolicy,
@@ -1288,7 +1289,14 @@ mod tests {
         let objects = CachedStore::new(b.clone(), 1024, timeline.clone());
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let mon = Monitor::with_config(
+            tl,
+            timeline.clone(),
+            Arc::downgrade(&bg),
+            Clock::real(),
+            RetryConfig::default(),
+            ProtocolTiming::simulation(),
+        );
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
