@@ -525,13 +525,7 @@ impl Splitter {
 
         let requirement = outcome
             .and_then(|coordinated| coordinated.cas_precondition)
-            .map(|observation| {
-                Requirement::AtLeast(
-                    observation
-                        .current_after()
-                        .expect("a successful structural-gate CAS verifies its precondition"),
-                )
-            })
+            .map(|observation| Requirement::AtLeast(observation.current_after()))
             .unwrap_or(Requirement::Any);
         let (node, version) = self.shards.load_node(prefix, token, requirement).await?;
         if node.structural_gate().lock_type() == LockType::Write
@@ -612,24 +606,13 @@ impl Splitter {
                 let (_, locked_version) = match token {
                     Some(token) => {
                         self.shards
-                            .load_node(
-                                prefix,
-                                token,
-                                Requirement::AtLeast(version.current_after().expect(
-                                    "a successful structural CAS verifies its precondition",
-                                )),
-                            )
+                            .load_node(prefix, token, Requirement::AtLeast(version.current_after()))
                             .await?
                     }
                     None => {
                         let (root, version) = self
                             .shards
-                            .load_root(
-                                prefix,
-                                Requirement::AtLeast(version.current_after().expect(
-                                    "a successful structural CAS verifies its precondition",
-                                )),
-                            )
+                            .load_root(prefix, Requirement::AtLeast(version.current_after()))
                             .await?;
                         (root.node().clone(), version)
                     }
@@ -1089,11 +1072,7 @@ impl Splitter {
                     prefix,
                     &locked_parent,
                     split_key,
-                    Requirement::AtLeast(
-                        locked_version
-                            .current_after()
-                            .expect("a successful gate CAS verifies its precondition"),
-                    ),
+                    Requirement::AtLeast(locked_version.current_after()),
                 )
                 .await
             {

@@ -864,13 +864,7 @@ impl Locker {
             let requirement = locked
                 .validations
                 .get(&group.path)
-                .map(|observation| {
-                    Requirement::AtLeast(
-                        observation
-                            .current_after()
-                            .expect("a successful lock CAS verifies its precondition"),
-                    )
-                })
+                .map(|observation| Requirement::AtLeast(observation.current_after()))
                 .unwrap_or(Requirement::Any);
             if let Ok(mut s) = self
                 .write_back_routed(
@@ -916,13 +910,7 @@ impl Locker {
             // The commit-install CAS certified this precondition immediately
             // before installing our holder and advanced its watermark.
             installed_from
-                .map(|observation| {
-                    Requirement::AtLeast(
-                        observation
-                            .current_after()
-                            .expect("a successful install CAS verifies its precondition"),
-                    )
-                })
+                .map(|observation| Requirement::AtLeast(observation.current_after()))
                 .unwrap_or(Requirement::Any),
         )
         .await

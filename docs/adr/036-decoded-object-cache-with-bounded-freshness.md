@@ -7,6 +7,8 @@ Accepted — implemented.
 The operation-order and cache-publication rules are partially superseded by
 [ADR-043](043-causally-coordinated-backend-operations.md). Its decoded-cache,
 observation, and bounded-validation decisions remain authoritative.
+Its non-persistence consequence is narrowed for the optional L2 by
+[ADR-045](045-optional-persistent-encoded-body-l2-cache.md).
 
 This supersedes
 [ADR-030](030-seed-shard-loads.md)'s `Latest` / `AllowStale` cache-freshness API

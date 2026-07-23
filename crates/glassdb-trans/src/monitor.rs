@@ -118,7 +118,7 @@ struct TxStatusEntry {
 #[derive(Clone, Copy)]
 struct FinalStatus {
     status: TxCommitStatus,
-    watermark: Option<SequencePoint>,
+    watermark: SequencePoint,
 }
 
 struct FinalStatusCache {
@@ -694,11 +694,10 @@ impl Monitor {
         let cached = self.inner.final_status.lock().unwrap().get(tid);
         let mut observed = match requirement {
             Some(requirement) => {
-                let requirement = cached
-                    .and_then(|status| status.watermark)
-                    .map_or(requirement, |watermark| {
-                        requirement.stricter(Requirement::AtLeast(watermark))
-                    });
+                let requirement = match cached {
+                    Some(status) => requirement.stricter(Requirement::AtLeast(status.watermark)),
+                    None => requirement,
+                };
                 self.inner.tl.get_at(tid, requirement).await
             }
             None => self.inner.tl.get_at(tid, self.current_requirement()).await,
@@ -1187,7 +1186,7 @@ mod tests {
         let third = TxId::from_bytes(b"third".to_vec());
         let status = FinalStatus {
             status: TxCommitStatus::Ok,
-            watermark: Some(watermark),
+            watermark,
         };
 
         cache.insert(first.clone(), status);

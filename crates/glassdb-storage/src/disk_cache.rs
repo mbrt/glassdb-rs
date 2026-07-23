@@ -18,11 +18,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, oneshot};
 
 use crate::cache_stats::CacheMetrics;
+use crate::timeline::SequencePoint;
 
 const CACHE_FILE: &str = "l2.cache";
-const SLOT_BYTES: u64 = 32;
-const RECORD_HEADER_BYTES: u64 = 40;
+const SLOT_BYTES: u64 = 40;
+const RECORD_HEADER_BYTES: u64 = 48;
 const RECORD_ALIGNMENT: u64 = 8;
+const INDEX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const FILTER_BYTES: usize = 4 * 1024 * 1024;
 const FILTER_HIT_EPOCH: u64 = 1 << 20;
 const WORK_QUEUE_ITEMS: usize = 4096;
@@ -113,7 +115,7 @@ impl Layout {
             || !geometry.segment_bytes.is_multiple_of(geometry.block_bytes)
             || geometry.index_divisor == 0
             || geometry.minimum_segments < 2
-            || !geometry.block_bytes.is_multiple_of(SLOT_BYTES)
+            || geometry.block_bytes < SLOT_BYTES
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -183,13 +185,24 @@ pub struct PersistentCache {
     metrics: Arc<CacheMetrics>,
 }
 
+/// Result of opening a persistent cache.
+pub struct OpenedPersistentCache {
+    /// The opened cache, possibly disabled when initialization failed.
+    pub cache: PersistentCache,
+    /// The greatest sequence point recovered while opening the cache. The
+    /// database timeline must start after this point before using `cache`.
+    pub last_sequence_point: Option<SequencePoint>,
+}
+
 pub(crate) struct EncodedBody {
     pub(crate) revision: Vec<u8>,
     pub(crate) body: Vec<u8>,
+    pub(crate) current_after: SequencePoint,
 }
 
 impl PersistentCache {
-    /// Opens a best-effort persistent cache without blocking the async runtime.
+    /// Opens a best-effort persistent cache and reports the sequence point
+    /// recovered during initialization without blocking the async runtime.
     ///
     /// Initialization failures disable the returned cache and are reported
     /// through tracing and cache statistics.
@@ -197,7 +210,7 @@ impl PersistentCache {
         config: PersistentCacheConfig,
         database_name: &str,
         database_uuid: DatabaseUuid,
-    ) -> Self {
+    ) -> OpenedPersistentCache {
         Self::open_in_background(config, database_name, database_uuid, PRODUCTION_GEOMETRY).await
     }
 
@@ -206,7 +219,7 @@ impl PersistentCache {
         config: PersistentCacheConfig,
         database_name: &str,
         database_uuid: DatabaseUuid,
-    ) -> Self {
+    ) -> OpenedPersistentCache {
         Self::open_in_background(config, database_name, database_uuid, TEST_GEOMETRY).await
     }
 
@@ -289,6 +302,7 @@ impl PersistentCache {
         path: Arc<str>,
         revision: Vec<u8>,
         body: Vec<u8>,
+        current_after: SequencePoint,
         fence: FenceGuard,
     ) {
         let Some(inner) = &self.inner else {
@@ -319,6 +333,7 @@ impl PersistentCache {
             path,
             revision,
             body,
+            current_after,
             fence,
             _payload: payload,
         });
@@ -406,14 +421,14 @@ impl PersistentCache {
         database_name: &str,
         database_uuid: DatabaseUuid,
         geometry: CacheGeometry,
-    ) -> Self {
+    ) -> OpenedPersistentCache {
         let metrics = Arc::new(CacheMetrics::new());
 
         // Real filesystem activity cannot be replayed by the deterministic
         // executor. Fail open until the simulator has a modeled disk cache.
         if rt::in_sim() {
             tracing::warn!("persistent cache disabled in deterministic simulation");
-            return Self::disabled(metrics);
+            return Self::disabled_open(metrics);
         }
 
         let fallback_metrics = metrics.clone();
@@ -434,7 +449,7 @@ impl PersistentCache {
         {
             fallback_metrics.l2_error();
             tracing::warn!(%error, "persistent-cache initialization thread failed to start");
-            return Self::disabled(fallback_metrics);
+            return Self::disabled_open(fallback_metrics);
         }
 
         match rt::timeout(OPEN_TIMEOUT, result).await {
@@ -442,12 +457,12 @@ impl PersistentCache {
             Ok(Err(_)) => {
                 fallback_metrics.l2_error();
                 tracing::warn!("persistent-cache initialization thread stopped");
-                Self::disabled(fallback_metrics)
+                Self::disabled_open(fallback_metrics)
             }
             Err(_) => {
                 fallback_metrics.l2_error();
                 tracing::warn!("persistent-cache initialization timed out");
-                Self::disabled(fallback_metrics)
+                Self::disabled_open(fallback_metrics)
             }
         }
     }
@@ -459,13 +474,20 @@ impl PersistentCache {
         }
     }
 
+    fn disabled_open(metrics: Arc<CacheMetrics>) -> OpenedPersistentCache {
+        OpenedPersistentCache {
+            cache: Self::disabled(metrics),
+            last_sequence_point: None,
+        }
+    }
+
     fn open_with_geometry(
         config: PersistentCacheConfig,
         database_name: &str,
         database_uuid: DatabaseUuid,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
-    ) -> Self {
+    ) -> OpenedPersistentCache {
         let opened = open_disk(
             config,
             database_name,
@@ -473,15 +495,21 @@ impl PersistentCache {
             geometry,
             metrics.clone(),
         );
-        match opened.and_then(|(disk, writer)| CacheInner::start(disk, writer, metrics.clone())) {
-            Ok(inner) => Self {
-                inner: Some(Arc::new(inner)),
-                metrics,
+        match opened.and_then(|(disk, writer, last_sequence_point)| {
+            CacheInner::start(disk, writer, metrics.clone())
+                .map(|inner| (inner, last_sequence_point))
+        }) {
+            Ok((inner, last_sequence_point)) => OpenedPersistentCache {
+                cache: Self {
+                    inner: Some(Arc::new(inner)),
+                    metrics,
+                },
+                last_sequence_point,
             },
             Err(error) => {
                 metrics.l2_error();
                 tracing::warn!(error = %error, "persistent cache disabled during initialization");
-                Self::disabled(metrics)
+                Self::disabled_open(metrics)
             }
         }
     }
@@ -754,6 +782,7 @@ enum Work {
         path: Arc<str>,
         revision: Vec<u8>,
         body: Vec<u8>,
+        current_after: SequencePoint,
         // Drop releases the path only after publication finishes.
         fence: FenceGuard,
         _payload: PayloadReservation,
@@ -880,11 +909,13 @@ struct Slot {
     generation: u64,
     record_offset: u64,
     record_bytes: u64,
+    current_after: SequencePoint,
 }
 
 struct Record {
     revision: Vec<u8>,
     body: Vec<u8>,
+    current_after: SequencePoint,
 }
 
 impl Disk {
@@ -946,6 +977,43 @@ impl Disk {
         Ok(None)
     }
 
+    fn last_sequence_point(&self) -> io::Result<Option<SequencePoint>> {
+        let block_bytes = usize::try_from(self.geometry.block_bytes).map_err(|_| overflow())?;
+        let scan_bytes = INDEX_SCAN_BYTES / block_bytes * block_bytes;
+        let scan_bytes = scan_bytes.max(block_bytes);
+        let mut bytes = vec![0; scan_bytes];
+        let mut offset = self.layout.metadata_bytes;
+        let index_end = offset
+            .checked_add(self.layout.index_bytes)
+            .ok_or_else(overflow)?;
+        let mut maximum = None;
+        while offset < index_end {
+            let remaining = usize::try_from(index_end - offset).map_err(|_| overflow())?;
+            let read_bytes = remaining.min(bytes.len());
+            self.read_exact_at(&mut bytes[..read_bytes], offset)?;
+            for bucket in bytes[..read_bytes].chunks_exact(block_bytes) {
+                for raw in bucket.chunks_exact(SLOT_BYTES as usize) {
+                    let slot = decode_slot(raw);
+                    if slot.generation != 0 && self.slot_range(slot).is_some() {
+                        maximum = Some(
+                            maximum.map_or(slot.current_after, |current: SequencePoint| {
+                                current.max(slot.current_after)
+                            }),
+                        );
+                    }
+                }
+            }
+            offset += read_bytes as u64;
+        }
+        if maximum.is_some_and(|point| point.raw() == u64::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persistent-cache sequence point exhausted",
+            ));
+        }
+        Ok(maximum)
+    }
+
     fn read_record(&self, path: &str, slot: Slot) -> io::Result<Option<Record>> {
         let Some(segment) = self.slot_range(slot) else {
             return Ok(None);
@@ -961,38 +1029,45 @@ impl Disk {
         }
         let revision_bytes = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let body_bytes = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let current_after =
+            SequencePoint::from_raw(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+        if current_after != slot.current_after {
+            return Err(invalid_record());
+        }
         let expected_record_bytes =
             record_bytes(revision_bytes, body_bytes, self.geometry).ok_or_else(invalid_record)?;
         if expected_record_bytes != slot.record_bytes {
             return Err(invalid_record());
         }
-        let content_end = 40usize
+        let content_end = (RECORD_HEADER_BYTES as usize)
             .checked_add(revision_bytes)
             .and_then(|end| end.checked_add(body_bytes))
             .filter(|end| *end <= bytes.len())
             .ok_or_else(invalid_record)?;
-        let revision_end = 40 + revision_bytes;
-        let revision = &bytes[40..revision_end];
+        let revision_end = RECORD_HEADER_BYTES as usize + revision_bytes;
+        let revision = &bytes[RECORD_HEADER_BYTES as usize..revision_end];
         let body = &bytes[revision_end..content_end];
         let expected_digest = record_digest(
             self.geometry,
             &self.identity,
             path,
-            &bytes[..8],
+            &bytes[..16],
             revision,
             body,
         )?;
-        if bytes[8..40] != expected_digest {
+        if bytes[16..48] != expected_digest {
             return Err(invalid_record());
         }
         Ok(Some(Record {
             revision: revision.to_vec(),
             body: body.to_vec(),
+            current_after,
         }))
     }
 
     fn slot_range(&self, slot: Slot) -> Option<usize> {
-        if !slot.record_offset.is_multiple_of(RECORD_ALIGNMENT)
+        if slot.current_after.raw() == 0
+            || !slot.record_offset.is_multiple_of(RECORD_ALIGNMENT)
             || slot.record_bytes < self.geometry.minimum_record_bytes
             || !slot.record_bytes.is_multiple_of(RECORD_ALIGNMENT)
             || slot.record_bytes
@@ -1045,7 +1120,13 @@ struct WriterState {
 }
 
 impl WriterState {
-    fn append(&mut self, path: &str, revision: &[u8], body: &[u8]) -> io::Result<Slot> {
+    fn append(
+        &mut self,
+        path: &str,
+        revision: &[u8],
+        body: &[u8],
+        current_after: SequencePoint,
+    ) -> io::Result<Slot> {
         let record_bytes = record_bytes(revision.len(), body.len(), self.disk.geometry)
             .ok_or_else(invalid_record)?;
         self.ensure_space(record_bytes)?;
@@ -1054,23 +1135,25 @@ impl WriterState {
         let mut record = vec![0; record_bytes as usize];
         record[0..4].copy_from_slice(&(revision.len() as u32).to_le_bytes());
         record[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        record[8..16].copy_from_slice(&current_after.raw().to_le_bytes());
         let digest = record_digest(
             self.disk.geometry,
             &self.disk.identity,
             path,
-            &record[..8],
+            &record[..16],
             revision,
             body,
         )?;
-        record[8..40].copy_from_slice(&digest);
-        let revision_end = 40 + revision.len();
-        record[40..revision_end].copy_from_slice(revision);
+        record[16..48].copy_from_slice(&digest);
+        let revision_end = RECORD_HEADER_BYTES as usize + revision.len();
+        record[RECORD_HEADER_BYTES as usize..revision_end].copy_from_slice(revision);
         record[revision_end..revision_end + body.len()].copy_from_slice(body);
         let slot = Slot {
             fingerprint: self.disk.path_fingerprint(path),
             generation,
             record_offset: self.append_offset,
             record_bytes,
+            current_after,
         };
         self.disk.write_all_at(&record, self.append_offset)?;
         self.publish(slot)?;
@@ -1231,7 +1314,7 @@ fn open_disk(
     database_uuid: DatabaseUuid,
     geometry: CacheGeometry,
     metrics: Arc<CacheMetrics>,
-) -> io::Result<(Arc<Disk>, WriterState)> {
+) -> io::Result<(Arc<Disk>, WriterState, Option<SequencePoint>)> {
     let layout = Layout::derive(config.capacity_bytes, geometry)?;
     let identity = identity_digest(geometry, database_name, database_uuid)?;
     std::fs::create_dir_all(&config.directory)?;
@@ -1286,6 +1369,11 @@ fn open_disk(
         segment_generations: generations.into_boxed_slice(),
         metrics,
     });
+    let last_sequence_point = if valid {
+        disk.last_sequence_point()?
+    } else {
+        None
+    };
     let clean_tail = read_clean_tail(&disk, maximum)?;
     let (active_segment, append_offset) = clean_tail.unwrap_or((None, 0));
     let writer = WriterState {
@@ -1298,7 +1386,7 @@ fn open_disk(
         last_sync: Instant::now(),
         promotion_tokens: 0,
     };
-    Ok((disk, writer))
+    Ok((disk, writer, last_sequence_point))
 }
 
 fn initialize_file(
@@ -1386,6 +1474,7 @@ fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
             Some(EncodedBody {
                 revision: record.revision,
                 body: record.body,
+                current_after: record.current_after,
             })
         }
         Ok(None) => {
@@ -1442,11 +1531,12 @@ fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<W
                 path,
                 revision,
                 body,
+                current_after,
                 fence,
                 _payload: _,
             } => {
                 let result = if shared.enabled.load(Ordering::Acquire) && fence.is_current() {
-                    let result = writer.append(&path, &revision, &body);
+                    let result = writer.append(&path, &revision, &body, current_after);
                     if let Ok(slot) = result {
                         let earned = slot.record_bytes / 7;
                         let cap = (writer.disk.geometry.segment_bytes
@@ -1560,7 +1650,7 @@ fn promote(
     if fence.snapshot() != (epoch, false) || shared.disk.current_slot(path)? != Some(slot) {
         return Ok(());
     }
-    let promoted = writer.append(path, &record.revision, &record.body)?;
+    let promoted = writer.append(path, &record.revision, &record.body, record.current_after)?;
     writer.promotion_tokens -= promoted.record_bytes;
     Ok(())
 }
@@ -1641,6 +1731,7 @@ fn encode_slot(slot: Slot) -> [u8; SLOT_BYTES as usize] {
     bytes[8..16].copy_from_slice(&slot.generation.to_le_bytes());
     bytes[16..24].copy_from_slice(&slot.record_offset.to_le_bytes());
     bytes[24..32].copy_from_slice(&slot.record_bytes.to_le_bytes());
+    bytes[32..40].copy_from_slice(&slot.current_after.raw().to_le_bytes());
     bytes
 }
 
@@ -1650,6 +1741,9 @@ fn decode_slot(bytes: &[u8]) -> Slot {
         generation: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
         record_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
         record_bytes: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        current_after: SequencePoint::from_raw(u64::from_le_bytes(
+            bytes[32..40].try_into().unwrap(),
+        )),
     }
 }
 
@@ -1700,6 +1794,10 @@ mod tests {
     }
 
     fn open(dir: &TempDir, database_uuid: DatabaseUuid) -> PersistentCache {
+        open_result(dir, database_uuid).cache
+    }
+
+    fn open_result(dir: &TempDir, database_uuid: DatabaseUuid) -> OpenedPersistentCache {
         PersistentCache::open_with_geometry(
             config(dir),
             "db",
@@ -1716,10 +1814,30 @@ mod tests {
         }
     }
 
+    fn point(value: u64) -> SequencePoint {
+        SequencePoint::from_raw(value)
+    }
+
     fn publish(cache: &PersistentCache, path: &str, revision: &[u8], body: &[u8]) {
+        publish_at(cache, path, revision, body, point(1));
+    }
+
+    fn publish_at(
+        cache: &PersistentCache,
+        path: &str,
+        revision: &[u8],
+        body: &[u8],
+        current_after: SequencePoint,
+    ) {
         let fence = Arc::new(PathFence::default());
         let guard = cache.begin_fence(fence, Arc::new(())).unwrap();
-        cache.replace(Arc::from(path), revision.to_vec(), body.to_vec(), guard);
+        cache.replace(
+            Arc::from(path),
+            revision.to_vec(),
+            body.to_vec(),
+            current_after,
+            guard,
+        );
     }
 
     #[test]
@@ -1769,21 +1887,41 @@ mod tests {
         let first_uuid = uuid(1);
         let cache = open(&dir, first_uuid);
         assert!(cache.is_enabled());
-        publish(&cache, "db/object", b"r1", b"body");
+        publish_at(&cache, "db/object", b"r1", b"body", point(17));
         cache.shutdown().await;
         drop(cache);
 
-        let reopened = open(&dir, first_uuid);
+        let opened = open_result(&dir, first_uuid);
+        assert_eq!(opened.last_sequence_point, Some(point(17)));
+        let reopened = opened.cache;
         assert!(reopened.is_enabled());
         let got = reopened.lookup(Arc::from("db/object")).await.unwrap();
         assert_eq!(got.revision, b"r1");
         assert_eq!(got.body, b"body");
+        assert_eq!(got.current_after, point(17));
         reopened.shutdown().await;
         drop(reopened);
 
         let different = open(&dir, uuid(2));
         assert!(different.lookup(Arc::from("db/object")).await.is_none());
         different.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reopen_scans_the_maximum_persisted_sequence_point() {
+        let dir = TempDir::new().unwrap();
+        let database_uuid = uuid(1);
+        let cache = open(&dir, database_uuid);
+        publish_at(&cache, "db/low", b"r1", b"low", point(8));
+        publish_at(&cache, "db/high", b"r2", b"high", point(34));
+        publish_at(&cache, "db/middle", b"r3", b"middle", point(21));
+        cache.shutdown().await;
+        drop(cache);
+
+        let opened = open_result(&dir, database_uuid);
+        assert_eq!(opened.last_sequence_point, Some(point(34)));
+        let reopened = opened.cache;
+        reopened.shutdown().await;
     }
 
     #[tokio::test]
@@ -1921,12 +2059,14 @@ mod tests {
             Arc::from("db/object"),
             b"r1".to_vec(),
             b"old".to_vec(),
+            point(1),
             older,
         );
         cache.replace(
             Arc::from("db/object"),
             b"r2".to_vec(),
             b"new".to_vec(),
+            point(2),
             newer,
         );
 
@@ -1942,19 +2082,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let database_uuid = uuid(1);
         let metrics = Arc::new(CacheMetrics::new());
-        let (disk, mut writer) =
+        let (disk, mut writer, _) =
             open_disk(config(&dir), "db", database_uuid, TEST_GEOMETRY, metrics).unwrap();
-        writer.append("db/object", b"r1", b"body").unwrap();
+        writer
+            .append("db/object", b"r1", b"body", point(1))
+            .unwrap();
         let old_segment = writer.active_segment.unwrap();
         drop(writer);
         drop(disk);
 
         let metrics = Arc::new(CacheMetrics::new());
-        let (disk, mut recovered) =
+        let (disk, mut recovered, last_sequence_point) =
             open_disk(config(&dir), "db", database_uuid, TEST_GEOMETRY, metrics).unwrap();
+        assert_eq!(last_sequence_point, Some(point(1)));
         assert_eq!(disk.lookup("db/object").unwrap().unwrap().body, b"body");
         assert_eq!(recovered.active_segment, None);
-        recovered.append("db/new", b"r2", b"new").unwrap();
+        recovered.append("db/new", b"r2", b"new", point(2)).unwrap();
         assert_ne!(recovered.active_segment, Some(old_segment));
     }
 
@@ -1970,7 +2113,7 @@ mod tests {
     #[test]
     fn record_size_is_charged_and_aligned() {
         assert_eq!(record_bytes(2, 4, TEST_GEOMETRY), Some(4096));
-        assert_eq!(record_bytes(2, 4097, TEST_GEOMETRY), Some(4144));
+        assert_eq!(record_bytes(2, 4097, TEST_GEOMETRY), Some(4152));
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
 pub use directory::{Directory, LeafGroup, LeafLocator};
-pub use disk_cache::{PersistentCache, PersistentCacheConfig};
+pub use disk_cache::{OpenedPersistentCache, PersistentCache, PersistentCacheConfig};
 pub use error::StorageError;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};

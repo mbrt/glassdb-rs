@@ -16,8 +16,6 @@ pub struct CacheStats {
     pub l2_bytes_read: u64,
     /// Bytes written to the L2 container.
     pub l2_bytes_written: u64,
-    /// Backend conditional reads seeded by unverified L2 bodies.
-    pub l2_conditional_validations: u64,
     /// L2 initialization, runtime, or corruption errors.
     pub l2_errors: u64,
 }
@@ -30,7 +28,6 @@ impl AddAssign for CacheStats {
         self.l2_misses += rhs.l2_misses;
         self.l2_bytes_read += rhs.l2_bytes_read;
         self.l2_bytes_written += rhs.l2_bytes_written;
-        self.l2_conditional_validations += rhs.l2_conditional_validations;
         self.l2_errors += rhs.l2_errors;
     }
 }
@@ -46,9 +43,6 @@ impl Sub for CacheStats {
             l2_misses: self.l2_misses.saturating_sub(rhs.l2_misses),
             l2_bytes_read: self.l2_bytes_read.saturating_sub(rhs.l2_bytes_read),
             l2_bytes_written: self.l2_bytes_written.saturating_sub(rhs.l2_bytes_written),
-            l2_conditional_validations: self
-                .l2_conditional_validations
-                .saturating_sub(rhs.l2_conditional_validations),
             l2_errors: self.l2_errors.saturating_sub(rhs.l2_errors),
         }
     }
@@ -61,7 +55,6 @@ pub(crate) struct CacheMetrics {
     l2_misses: AtomicU64,
     l2_bytes_read: AtomicU64,
     l2_bytes_written: AtomicU64,
-    l2_conditional_validations: AtomicU64,
     l2_errors: AtomicU64,
 }
 
@@ -74,7 +67,6 @@ impl CacheMetrics {
             l2_misses: AtomicU64::new(0),
             l2_bytes_read: AtomicU64::new(0),
             l2_bytes_written: AtomicU64::new(0),
-            l2_conditional_validations: AtomicU64::new(0),
             l2_errors: AtomicU64::new(0),
         }
     }
@@ -105,11 +97,6 @@ impl CacheMetrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    pub(crate) fn l2_conditional_validation(&self) {
-        self.l2_conditional_validations
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn l2_error(&self) {
         self.l2_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -127,7 +114,6 @@ impl CacheMetrics {
             l2_misses: take!(l2_misses),
             l2_bytes_read: take!(l2_bytes_read),
             l2_bytes_written: take!(l2_bytes_written),
-            l2_conditional_validations: take!(l2_conditional_validations),
             l2_errors: take!(l2_errors),
         }
     }

@@ -4,10 +4,12 @@
 
 Accepted — implemented.
 
-This extends [ADR-036](036-decoded-object-cache-with-bounded-freshness.md).
-Its decoded LRU and currentness protocol remain the L1; this ADR adds a
-disposable encoded-body tier beneath it. Database-local `LogicalTime` evidence
-remains non-persistable.
+This extends [ADR-036](036-decoded-object-cache-with-bounded-freshness.md) and
+narrows [ADR-043](043-causally-coordinated-backend-operations.md)'s
+non-persistence boundary. Its decoded LRU and currentness protocol remain the
+L1; this ADR adds a disposable encoded-body tier beneath it. Cache-local
+`SequencePoint` evidence may cross database opens only through the L2 container
+assigned to the same database identity.
 
 ## Context
 
@@ -26,8 +28,9 @@ linger. Encryption and secure erasure are not required.
 A persistent body can avoid more than transferred bytes. `Requirement::Any`
 may begin optimistic execution from arbitrarily old state because strong
 operations validate observations before returning or committing. Preserving
-that benefit across restart requires treating a disk body as unverified stale
-state, not merely retaining it for a conditional backend read.
+the body's original currentness evidence avoids a special evidence state, but
+requires ordering the reopened database's timeline after every body it can
+rediscover.
 
 ## Decision
 
@@ -47,33 +50,39 @@ random UUID persisted in mandatory v2 database metadata, so callers do not
 configure a separate identity and repointing discards incompatible contents.
 
 The L2 stores present physical objects as their path, opaque backend revision,
-and exact encoded body. It stores neither decoded values, negative results,
-database-local freshness evidence, nor semantics interpreted above the codec
+exact encoded body, and `current_after` sequence point. It stores neither
+decoded values, negative results, nor semantics interpreted above the codec
 boundary. All physical object classes share the tier.
 
 Each record has a collision-resistant binding over its format version, path,
-revision, and body. Verify it before decoding or using the revision for a
-conditional read. Otherwise, a damaged body paired with a still-current
-revision could be incorrectly certified by an unchanged backend response.
+revision, currentness point, and body. Verify it before decoding or using the
+revision for a conditional read. Otherwise, a damaged body paired with a
+still-current revision could be incorrectly certified by an unchanged backend
+response.
 
-### Treat a disk hit as unverified local knowledge
+### Chain reopened timelines after persisted evidence
 
-Extend the cache evidence model with an explicit `Unverified` state. It is not a
-fabricated timestamp and cannot satisfy any `AtLeast` requirement.
+Persist each body's `current_after` point in both its record and index slot. On
+open, while holding the container's exclusive lock and before starting database
+operations, scan every discoverable index slot and find the greatest point
+`M`. Initialize the database timeline so its first allocated point is strictly
+greater than `M`. No reservation protocol is needed because the cache has one
+exclusive owner during both the scan and normal operation.
 
-On an L1 miss:
+An L2 hit retains its persisted point and uses the ordinary evidence model:
 
-- `Any` may return an L2 body and install it in L1 as `Unverified`;
-- `AtLeast(T)` may use its saved revision and body for a conditional backend
-  read, but only a backend operation started after `T` can verify it; and
-- an unchanged response promotes the saved body with that operation's start
-  watermark, while a changed or missing response replaces or removes it.
+- `Any` may return the body immediately;
+- `AtLeast(T)` accepts it only when its point reaches `T`; and
+- an unchanged conditional response advances the same state to that operation's
+  invocation point, while a changed or missing response replaces or removes it.
 
-Finite-staleness and strong reads therefore infer no freshness from persistence.
-Optimistic execution and CAS loops may start from old state and self-correct
-during validation or after a precondition failure. Typed stores may retain
-stronger existing invariants, such as indefinitely serving immutable terminal
-transaction objects.
+Every bound allocated by the reopened database is later than every discoverable
+persisted entry, so those entries require validation for new causal work. Clamp
+finite-staleness cutoffs to the new session's first point as well, preventing
+arbitrary process downtime from making previous-session evidence appear recent.
+Sequence points remain non-portable: their persisted representation is valid
+only for the continuously identified L2 container, and independent database
+opens remain separate causality domains.
 
 ### Use a cache-native fixed-capacity segment store
 
@@ -84,11 +93,12 @@ disk-resident, set-associative hash index.
 Treat every index slot as an untrusted hint. Publication appends a
 self-validating record before publishing its pointer. Before following a hint,
 bound its offset and length; after reading it, verify a digest that binds the
-cache identity, requested path, revision, and body. A partial record, torn
-pointer, collision, corrupt body, or pointer into a reused segment is therefore
-a bounded extra read or a miss. An older intact record yields only an older
-`Unverified` candidate. These permitted outcomes require no write-ahead log,
-atomic multi-record transaction, MVCC, or compaction.
+cache identity, requested path, revision, point, and body. A partial record,
+torn pointer, collision, corrupt body, or pointer into a reused segment is
+therefore a bounded extra read or a miss. An older intact record yields only an
+older candidate with correspondingly older evidence. These permitted outcomes
+require no write-ahead log, atomic multi-record transaction, MVCC, or
+compaction.
 
 Reusing the oldest segment provides byte-bounded FIFO eviction without a
 per-hit durable write or an in-memory index proportional to entry count. A
@@ -123,9 +133,9 @@ opener.
 
 The file length is exactly `C`; an unused tail of less than one segment follows
 the segment ring. The index occupies approximately 1/64 of the configured
-capacity. Its 4 KiB buckets contain 128 slots of 32 bytes each. Since records
-consume at least 4 KiB, the index has slightly more than two slots for every
-record that can physically fit, keeping its maximum load below 50%.
+capacity. Its 4 KiB buckets contain 102 slots of 40 bytes each and 16 unused
+bytes. Since records consume at least 4 KiB, the index has about 1.59 slots for
+every record that can physically fit, keeping its maximum load below 63%.
 
 The file contains these regions:
 
@@ -137,9 +147,10 @@ data_offset .. end of complete segment fixed 64 MiB segment ring
 remaining bytes                        unused tail
 ```
 
-Changing the byte order, hash, sizes, geometry, or record encoding requires a
-new format version. A v1 implementation may discard rather than migrate any
-other version or a file whose length differs from the requested capacity.
+Changing the byte order, hash, sizes, geometry, or record encoding after release
+requires a new format version. The v1 implementation may discard rather than
+migrate any other version or a file whose length differs from the requested
+capacity.
 
 #### Use an immutable header and clean-shutdown marker
 
@@ -222,7 +233,7 @@ SHA-256(
 ```
 
 The fingerprint modulo the bucket count selects a bucket. Each slot consists of
-four little-endian `u64` values:
+five little-endian `u64` values:
 
 ```text
 offset   size   field
@@ -230,16 +241,17 @@ offset   size   field
 8        8      segment_generation
 16       8      absolute_record_offset
 24       8      record_bytes
+32       8      current_after
 ```
 
 Generation zero denotes an empty slot. A lookup reads one bucket and considers
 slots with a matching fingerprint and current segment generation. Before any
-record read it rejects an unaligned, undersized, oversized, outside-ring,
-segment-header-overlapping, or cross-segment range. It then accepts a candidate
-only if its encoded lengths reproduce `record_bytes` and its full digest
-verifies against the requested path. Thus a fingerprint collision or torn slot
-only causes a bounded extra read or an early eviction; it cannot return another
-path.
+record read it rejects a zero point or an unaligned, undersized, oversized,
+outside-ring, segment-header-overlapping, or cross-segment range. It then
+accepts a candidate only if its encoded lengths reproduce `record_bytes`, its
+record point equals the slot point, and its full digest verifies against the
+requested path. Thus a fingerprint collision or torn slot only causes a bounded
+extra read or an early eviction; it cannot return another path.
 
 Publication clears every occupied slot with the same fingerprint before
 installing one new pointer; invalidation clears all such slots. A path fence is
@@ -254,13 +266,14 @@ eviction.
 #### Store exact, independently verifiable records
 
 Records start at 8-byte boundaries after the segment header. Their fixed
-40-byte header is:
+48-byte header is:
 
 ```text
 offset   size   field
 0        4      revision_bytes
 4        4      body_bytes
-8        32     record_digest
+8        8      current_after
+16       32     record_digest
 ```
 
 The content is `revision || body`, followed by zero padding. `record_bytes` is
@@ -271,10 +284,10 @@ compress it.
 
 The record digest covers `glassdb-l2-record-v1`, the cache-identity digest, the
 requested path length as a little-endian `u32`, the requested path, header bytes
-0..8, and the unpadded revision and body. The path and revision use the
+0..16, and the unpadded revision and body. The path and revision use the
 canonical byte encodings already used by the backend cache key and conditional
 read. The path need not be stored because every lookup already supplies it and
-the digest binds it to the record. This deliberately gives up rebuilding an
+the digest binds it to the record. This deliberately gives up rebuilding the
 index by scanning records.
 
 A record is admitted only if it fits completely between the segment header and
@@ -284,7 +297,7 @@ records bypass L2. Padding is zeroed by writers and ignored by readers.
 
 Append a complete record before writing its index slot. Clearing a slot or
 publishing a newer pointer needs no tombstone: an unusable slot is a miss, while
-an older intact record remains a permitted `Unverified` value.
+an older intact record remains a permitted older value.
 
 #### Recover clean shutdowns exactly
 
@@ -296,9 +309,13 @@ cache entry and the unused capacity in the active segment.
 
 On every open, validate the immutable header and read the 16 meaningful bytes
 of every segment header. Ignore invalid generations and recover the next
-generation as one greater than the maximum valid generation. Resume the active
-segment only when the clean-tail marker validates against that maximum;
-otherwise ignore it. Neither records nor the index are scanned.
+generation as one greater than the maximum valid generation. Scan the complete
+fixed index and take the greatest `current_after` from slots whose generation
+and record range are usable. This scan initializes the reopened timeline; it
+does not read records. A corrupt point can conservatively advance the timeline,
+while an exhausted point disables the disposable cache rather than wrapping.
+Resume the active segment only when the clean-tail marker validates against the
+maximum segment generation; otherwise ignore it.
 
 After an unclean shutdown without a usable marker, initialize an unused segment
 on the first admission if one exists; otherwise reuse the segment with the
@@ -389,7 +406,8 @@ current process already invalidated.
 Queue saturation may drop an optional admission or promotion. If the worker or
 fence cannot make a required supersession or invalidation visible, disable L2
 for that open database and fall back to L1 plus the backend. After restart, an
-older surviving candidate is safe under the `Unverified` rules.
+older surviving candidate is safe because its evidence precedes the reopened
+timeline.
 
 ### Fail open and expose degradation
 
@@ -402,7 +420,6 @@ Expose a small, outcome-oriented statistics surface:
 
 - L1 hits and misses;
 - L2 hits and misses;
-- backend conditional validations seeded by unverified L2 bodies;
 - L2 bytes read and written; and
 - L2 errors.
 
@@ -437,9 +454,11 @@ benchmarks cover the target body sizes and capacities.
 - Set associativity can evict entries early, and an L2 hit requires an index
   read plus a record read. Promotion adds at most one eighth of steady-state
   append traffic.
-- Recovery does not scan the index or records. Clean shutdowns retain the exact
-  append tail; an unclean shutdown can abandon one partial-segment tail and
-  accelerate eviction.
+- Recovery scans the index, approximately 1/64 of configured capacity, before
+  database operations begin. It does not scan records. A slow scan fails open
+  under the initialization deadline.
+- Clean shutdowns retain the exact append tail; an unclean shutdown can abandon
+  one partial-segment tail and accelerate eviction.
 - GlassDB owns a small disk format, allocator, and index. Weak failure semantics
   keep them narrow, but they still require adversarial crash and corruption
   testing.

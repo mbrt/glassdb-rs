@@ -102,9 +102,8 @@ impl LeafObservation {
         }
     }
 
-    /// The watermark after which this exact leaf state was known to be current,
-    /// or `None` when restored persistent state has not yet been verified.
-    pub fn current_after(&self) -> Option<SequencePoint> {
+    /// The watermark after which this exact leaf state was known to be current.
+    pub fn current_after(&self) -> SequencePoint {
         match self {
             LeafObservation::Root(observed) => observed.current_after(),
             LeafObservation::Node(observed) => observed.current_after(),
@@ -621,7 +620,8 @@ mod tests {
 
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
+        let shards = ShardStore::new(objects);
         TestStore { shards, timeline }
     }
 

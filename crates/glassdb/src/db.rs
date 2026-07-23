@@ -129,12 +129,15 @@ impl DatabaseBuilder {
         }
         let backend = Arc::new(StatsBackend::new(b));
         let database_uuid = check_or_create_db_meta(&backend, &name).await?;
-        let timeline = Timeline::new();
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let persistent = match persistent_cache {
-            Some(config) => Some(PersistentCache::open(config, &name, database_uuid).await),
-            None => None,
+        let (persistent, last_sequence_point) = match persistent_cache {
+            Some(config) => {
+                let opened = PersistentCache::open(config, &name, database_uuid).await;
+                (Some(opened.cache), opened.last_sequence_point)
+            }
+            None => (None, None),
         };
+        let timeline = Timeline::starting_after(last_sequence_point);
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);

@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+Its non-persistence boundary is narrowed for the optional L2 by
+[ADR-045](045-optional-persistent-encoded-body-l2-cache.md).
+
 This depends on
 [ADR-042](042-conditional-only-backend-mutations.md), partially supersedes
 [ADR-036](036-decoded-object-cache-with-bounded-freshness.md)'s operation-order

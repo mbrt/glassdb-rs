@@ -8,11 +8,9 @@
 //! internal error.
 //!
 //! Requirement is a local currentness watermark, not a durable guarantee. Each
-//! cache entry is `Present` (a decoded value, its [`Revision`], and optional
+//! cache entry is `Present` (a decoded value, its [`Revision`], and a
 //! current-after [`SequencePoint`]), `Absent` (a current-after watermark,
 //! no revision), or uncertain (no entry: no usable discoverable knowledge).
-//! Bodies restored from the persistent L2 begin with unverified evidence and
-//! cannot satisfy an `AtLeast` requirement. A
 //! successful read returns an [`Observation`]
 //! that references monotonic currentness evidence shared with the current cache
 //! entry; the observation stays usable even after that entry is evicted or
@@ -171,17 +169,12 @@ pub enum ObservationCheck<V> {
 struct Evidence(Arc<AtomicU64>);
 
 impl Evidence {
-    fn verified(t: SequencePoint) -> Self {
+    fn new(t: SequencePoint) -> Self {
         Evidence(Arc::new(AtomicU64::new(t.raw())))
     }
 
-    fn unverified() -> Self {
-        Evidence(Arc::new(AtomicU64::new(0)))
-    }
-
-    fn get(&self) -> Option<SequencePoint> {
-        let raw = self.0.load(Ordering::SeqCst);
-        (raw != 0).then(|| SequencePoint::from_raw(raw))
+    fn get(&self) -> SequencePoint {
+        SequencePoint::from_raw(self.0.load(Ordering::SeqCst))
     }
 
     /// Advances the watermark to at least `t`, never regressing it.
@@ -229,9 +222,8 @@ impl<V> Observation<V> {
         self.revision.as_ref()
     }
 
-    /// The watermark after which the state was known to be current, or `None`
-    /// when a persistent body has not yet been verified by the backend.
-    pub fn current_after(&self) -> Option<SequencePoint> {
+    /// The watermark after which the state was known to be current.
+    pub fn current_after(&self) -> SequencePoint {
         self.evidence.get()
     }
 
@@ -389,7 +381,7 @@ impl PathCoordinator {
     async fn admit_read(&self, path: &Arc<str>, req: Requirement) -> ReadAdmission {
         let state = self.state(path);
         let flight = state.flight.lock().unwrap().clone();
-        if let Some(flight) = flight.filter(|flight| satisfies(Some(flight.invoked), req)) {
+        if let Some(flight) = flight.filter(|flight| satisfies(flight.invoked, req)) {
             return ReadAdmission::Join(flight);
         }
         let permit = state
@@ -470,7 +462,6 @@ struct PresentSeed {
     size: usize,
     revision: Revision,
     evidence: Evidence,
-    from_l2: bool,
 }
 
 enum ExpectedPredicate {
@@ -747,7 +738,9 @@ impl Drop for FlightLeader {
 impl CachedStore {
     /// Creates a cached store over `backend`, sharing the single byte-bounded
     /// LRU sized by `max_size`, ordering evidence on `timeline`, and optionally
-    /// using an already-open persistent encoded-body tier.
+    /// using an already-open persistent encoded-body tier. When that tier is
+    /// present, `timeline` must start after the sequence point returned with
+    /// the same opened cache.
     pub fn new(
         backend: Arc<dyn Backend>,
         max_size: usize,
@@ -840,9 +833,7 @@ impl CachedStore {
         let path = Arc::clone(&obs.path);
         if let Some(current) = self.try_hit::<C>(&path, req)? {
             if current.revision == obs.revision {
-                if let Some(current_after) = current.current_after() {
-                    obs.evidence.advance(current_after);
-                }
+                obs.evidence.advance(current.current_after());
                 return Ok(ObservationCheck::Current);
             }
             return Ok(ObservationCheck::Changed(current));
@@ -850,15 +841,9 @@ impl CachedStore {
         let fetched = self.fetch::<C>(&path, req, Some(obs)).await?;
         let current = self.to_observation::<C>(&path, fetched)?;
         if same_observed_state(obs, &current) {
-            if let Some(merged) = obs
-                .current_after()
-                .into_iter()
-                .chain(current.current_after())
-                .max()
-            {
-                obs.evidence.advance(merged);
-                current.evidence.advance(merged);
-            }
+            let merged = obs.current_after().max(current.current_after());
+            obs.evidence.advance(merged);
+            current.evidence.advance(merged);
             Ok(ObservationCheck::Current)
         } else {
             Ok(ObservationCheck::Changed(current))
@@ -1125,17 +1110,17 @@ impl CachedStore {
                     let state = permit.state.clone();
                     let mut seed = self.present_seed::<C>(path, fallback)?;
                     if seed.is_none()
-                        && let Some(l2_seed) = self.load_l2::<C>(path, &state).await
+                        && let Some(persistent_seed) = self.load_l2::<C>(path, &state).await
                     {
                         if req == Requirement::Any {
                             return Ok(FetchResult {
-                                value: Some(l2_seed.value),
-                                revision: Some(l2_seed.revision),
-                                evidence: l2_seed.evidence,
+                                value: Some(persistent_seed.value),
+                                revision: Some(persistent_seed.revision),
+                                evidence: persistent_seed.evidence,
                                 cache_hit: true,
                             });
                         }
-                        seed = Some(l2_seed);
+                        seed = Some(persistent_seed);
                     }
                     let invoked = self.next_invocation();
                     let leader = permit.lead_read(invoked);
@@ -1166,13 +1151,11 @@ impl CachedStore {
         }) = self.cache.get(path)
         {
             downcast::<C>(path, value.clone())?;
-            let from_l2 = evidence.get().is_none();
             return Ok(Some(PresentSeed {
                 value,
                 size,
                 revision,
                 evidence,
-                from_l2,
             }));
         }
         let Some(observed) = fallback else {
@@ -1187,7 +1170,6 @@ impl CachedStore {
             size: C::size(value),
             revision: revision.clone(),
             evidence: observed.evidence.clone(),
-            from_l2: observed.evidence.get().is_none(),
         }))
     }
 
@@ -1254,8 +1236,7 @@ impl CachedStore {
             value.clone(),
             size,
             revision.clone(),
-            None,
-            Some(Evidence::unverified()),
+            Evidence::new(encoded.current_after),
         );
         persistent.record_present_hit(path, &state.l2_fence, state.clone());
         Some(PresentSeed {
@@ -1263,7 +1244,6 @@ impl CachedStore {
             size,
             revision,
             evidence,
-            from_l2: true,
         })
     }
 
@@ -1277,31 +1257,18 @@ impl CachedStore {
         state: &Arc<PathState>,
     ) -> Result<FetchResult, StorageError> {
         match seed {
-            Some(seed) => {
-                if seed.from_l2 {
-                    self.metrics.l2_conditional_validation();
+            Some(seed) => match self
+                .backend
+                .read_if_modified(path, seed.revision.version())
+                .await
+            {
+                Ok(reply) => {
+                    self.publish_present::<C>(path, reply.contents, reply.version, invoked, state)
                 }
-                match self
-                    .backend
-                    .read_if_modified(path, seed.revision.version())
-                    .await
-                {
-                    Ok(reply) => self.publish_present::<C>(
-                        path,
-                        reply.contents,
-                        reply.version,
-                        invoked,
-                        state,
-                    ),
-                    Err(BackendError::Precondition) => {
-                        Ok(self.publish_unchanged(path, seed, invoked))
-                    }
-                    Err(BackendError::NotFound) => {
-                        Ok(self.publish_absent(path, invoked, None, state))
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
+                Err(BackendError::Precondition) => Ok(self.publish_unchanged(path, seed, invoked)),
+                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, None, state)),
+                Err(e) => Err(e.into()),
+            },
             None => match self.backend.read(path).await {
                 Ok(reply) => {
                     self.publish_present::<C>(path, reply.contents, reply.version, invoked, state)
@@ -1340,14 +1307,14 @@ impl CachedStore {
             value.clone(),
             size,
             revision.clone(),
-            Some(invoked),
-            None,
+            Evidence::new(invoked),
         );
         if let (Some(persistent), Some(fence)) = (&self.persistent, fence) {
             persistent.replace(
                 Arc::from(path),
                 revision.serialize().as_bytes().to_vec(),
                 bytes,
+                invoked,
                 fence,
             );
         }
@@ -1373,8 +1340,7 @@ impl CachedStore {
             seed.value.clone(),
             seed.size,
             seed.revision.clone(),
-            Some(invoked),
-            Some(seed.evidence),
+            seed.evidence,
         );
         FetchResult {
             value: Some(seed.value),
@@ -1389,11 +1355,11 @@ impl CachedStore {
         &self,
         path: &str,
         invoked: SequencePoint,
-        preferred: Option<Evidence>,
+        incoming: Option<Evidence>,
         state: &Arc<PathState>,
     ) -> FetchResult {
         let fence = self.begin_read_fence(state);
-        let evidence = self.install_absent(path, invoked, preferred);
+        let evidence = self.install_absent(path, invoked, incoming);
         self.invalidate_read_l2(Arc::from(path), fence);
         FetchResult {
             value: None,
@@ -1426,7 +1392,7 @@ impl CachedStore {
     ) -> Observation<C::Value> {
         let erased: Arc<dyn Any + Send + Sync> = value.clone();
         let evidence =
-            self.install_present(path, erased, size, revision.clone(), Some(invoked), None);
+            self.install_present(path, erased, size, revision.clone(), Evidence::new(invoked));
         Observation {
             path: Arc::from(path),
             value: Some(value),
@@ -1444,17 +1410,9 @@ impl CachedStore {
         value: Arc<dyn Any + Send + Sync>,
         size: usize,
         revision: Revision,
-        verified_after: Option<SequencePoint>,
-        preferred: Option<Evidence>,
+        incoming: Evidence,
     ) -> Evidence {
-        let preferred = preferred.unwrap_or_else(|| {
-            verified_after.map_or_else(Evidence::unverified, Evidence::verified)
-        });
-        if let Some(invoked) = verified_after {
-            preferred.advance(invoked);
-        }
-        let mut out: Option<Evidence> = None;
-        self.cache.update(path, |old| match old {
+        self.cache.update_with_result(path, |old| match old {
             Some(CacheEntry {
                 state:
                     EntryState::Present {
@@ -1464,32 +1422,35 @@ impl CachedStore {
                         evidence,
                     },
             }) if old_revision == revision => {
-                if let Some(invoked) = verified_after {
-                    evidence.advance(invoked);
-                }
-                out = Some(evidence.clone());
-                Some(CacheEntry {
-                    state: EntryState::Present {
-                        value: old_value,
-                        size: old_size,
-                        revision: old_revision,
-                        evidence,
-                    },
-                })
+                evidence.advance(incoming.get());
+                let installed = evidence.clone();
+                (
+                    Some(CacheEntry {
+                        state: EntryState::Present {
+                            value: old_value,
+                            size: old_size,
+                            revision: old_revision,
+                            evidence,
+                        },
+                    }),
+                    installed,
+                )
             }
             _ => {
-                out = Some(preferred.clone());
-                Some(CacheEntry {
-                    state: EntryState::Present {
-                        value,
-                        size,
-                        revision,
-                        evidence: preferred,
-                    },
-                })
+                let installed = incoming.clone();
+                (
+                    Some(CacheEntry {
+                        state: EntryState::Present {
+                            value,
+                            size,
+                            revision,
+                            evidence: incoming,
+                        },
+                    }),
+                    installed,
+                )
             }
-        });
-        out.expect("update closure always sets the evidence")
+        })
     }
 
     /// Installs confirmed absence, merging evidence with an existing absence.
@@ -1497,31 +1458,33 @@ impl CachedStore {
         &self,
         path: &str,
         invoked: SequencePoint,
-        preferred: Option<Evidence>,
+        incoming: Option<Evidence>,
     ) -> Evidence {
-        let preferred = preferred.unwrap_or_else(|| Evidence::verified(invoked));
-        preferred.advance(invoked);
-        let mut out: Option<Evidence> = None;
-        self.cache.update(path, |old| match old {
+        let incoming = incoming.unwrap_or_else(|| Evidence::new(invoked));
+        incoming.advance(invoked);
+        self.cache.update_with_result(path, |old| match old {
             Some(CacheEntry {
                 state: EntryState::Absent { evidence },
             }) => {
                 evidence.advance(invoked);
-                out = Some(evidence.clone());
-                Some(CacheEntry {
-                    state: EntryState::Absent { evidence },
-                })
+                let installed = evidence.clone();
+                (
+                    Some(CacheEntry {
+                        state: EntryState::Absent { evidence },
+                    }),
+                    installed,
+                )
             }
             _ => {
-                out = Some(preferred.clone());
-                Some(CacheEntry {
-                    state: EntryState::Absent {
-                        evidence: preferred,
-                    },
-                })
+                let installed = incoming.clone();
+                (
+                    Some(CacheEntry {
+                        state: EntryState::Absent { evidence: incoming },
+                    }),
+                    installed,
+                )
             }
-        });
-        out.expect("update closure always sets the evidence")
+        })
     }
 
     /// Converts a type-erased fetch result into a typed observation.
@@ -1658,10 +1621,10 @@ impl<C: Codec> TypedCachedStore<C> {
 }
 
 /// Reports whether an entry confirmed current at `evidence` satisfies `req`.
-fn satisfies(evidence: Option<SequencePoint>, req: Requirement) -> bool {
+fn satisfies(evidence: SequencePoint, req: Requirement) -> bool {
     match req {
         Requirement::Any => true,
-        Requirement::AtLeast(t) => evidence.is_some_and(|evidence| evidence >= t),
+        Requirement::AtLeast(t) => evidence >= t,
     }
 }
 
@@ -1894,9 +1857,8 @@ mod tests {
     async fn persistent_store(
         directory: &TempDir,
         backend: Arc<dyn Backend>,
-        timeline: Timeline,
-    ) -> CachedStore {
-        let persistent = PersistentCache::open_with_test_geometry(
+    ) -> (CachedStore, Timeline) {
+        let opened = PersistentCache::open_with_test_geometry(
             PersistentCacheConfig {
                 directory: directory.path().to_path_buf(),
                 capacity_bytes: 2 * 1024 * 1024,
@@ -1905,7 +1867,9 @@ mod tests {
             cache_uuid(),
         )
         .await;
-        CachedStore::new(backend, 1 << 20, timeline, Some(persistent))
+        let timeline = Timeline::starting_after(opened.last_sequence_point);
+        let store = CachedStore::new(backend, 1 << 20, timeline.clone(), Some(opened.cache));
+        (store, timeline)
     }
 
     #[cfg(sim)]
@@ -1915,7 +1879,7 @@ mod tests {
         let cache_file = directory.path().join("l2.cache");
         rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
             let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-            let store = persistent_store(&directory, backend, Timeline::new()).await;
+            let (store, _) = persistent_store(&directory, backend).await;
             assert!(
                 store
                     .persistent
@@ -1969,10 +1933,7 @@ mod tests {
         let t = s.store.timeline.now();
         let o2 = s.read("p", Requirement::AtLeast(t)).await.unwrap();
         assert_eq!(count(&log, "read_if_modified"), 1, "stale entry is checked");
-        assert!(
-            o2.current_after() >= Some(t),
-            "watermark advanced to the bound"
-        );
+        assert!(o2.current_after() >= t, "watermark advanced to the bound");
         assert!(o2.current_after() >= o1.current_after(), "never regresses");
     }
 
@@ -1986,13 +1947,13 @@ mod tests {
             .read("p", Requirement::AtLeast(s.store.timeline.now()))
             .await
             .unwrap();
-        let w = o.current_after().unwrap();
+        let w = o.current_after();
         clear(&log);
 
         let o2 = s.read("p", Requirement::AtLeast(w)).await.unwrap();
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
-        assert!(o2.current_after() >= Some(w));
+        assert!(o2.current_after() >= w);
     }
 
     // Model invariant: `Any` never returns an entry a conflict invalidated. A
@@ -2078,7 +2039,7 @@ mod tests {
             .unwrap()
             .into_observation()
             .unwrap();
-        let w = obs.current_after().unwrap();
+        let w = obs.current_after();
 
         replace_value(&s2, &obs, v(b"b")).await;
         s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> uncertain
@@ -2150,10 +2111,10 @@ mod tests {
             .into_observation()
             .unwrap();
         assert!(
-            obs.current_after() >= Some(before),
+            obs.current_after() >= before,
             "expected observation advanced past the CAS start"
         );
-        assert!(nb.current_after() >= Some(before));
+        assert!(nb.current_after() >= before);
         assert_eq!(nb.value().unwrap().as_slice(), b"b");
 
         let got = s.read("p", Requirement::Any).await.unwrap();
@@ -2176,8 +2137,8 @@ mod tests {
         let before = store.store.timeline.now();
         replace_value(&store, &expected, v(b"b")).await;
 
-        assert!(expected.current_after() >= Some(before));
-        assert!(reloaded.current_after() >= Some(before));
+        assert!(expected.current_after() >= before);
+        assert!(reloaded.current_after() >= before);
     }
 
     // Model invariant: a CAS conflict neither advances the expected observation
@@ -2201,8 +2162,7 @@ mod tests {
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
         assert!(!r.committed());
         assert!(
-            obs.current_after()
-                .is_some_and(|watermark| watermark < before),
+            obs.current_after() < before,
             "conflict must not advance the observation"
         );
         let got = s1.read("p", Requirement::Any).await.unwrap();
@@ -2245,8 +2205,7 @@ mod tests {
         hook.clear_after();
 
         assert!(
-            obs.current_after()
-                .is_some_and(|watermark| watermark < before),
+            obs.current_after() < before,
             "an in-doubt outcome must not advance the observation"
         );
         // The path became uncertain, so Any re-reads and finds the write
@@ -2341,7 +2300,7 @@ mod tests {
             .await
             .unwrap()
             .current_after();
-        assert!(w1 >= Some(t1));
+        assert!(w1 >= t1);
         let t2 = s.store.timeline.now();
         let w2 = s
             .read("p", Requirement::AtLeast(t2))
@@ -2387,8 +2346,8 @@ mod tests {
         let absent = s.delete(&expected).await.unwrap();
 
         assert!(absent.is_absent());
-        assert!(absent.current_after() >= Some(before));
-        assert!(expected.current_after() >= Some(before));
+        assert!(absent.current_after() >= before);
+        assert!(expected.current_after() >= before);
         assert_eq!(count(&log, "delete_if"), 1);
         clear(&log);
         assert!(s.read("p", Requirement::Any).await.unwrap().is_absent());
@@ -2416,12 +2375,8 @@ mod tests {
         let absent = local.delete(&expected).await.unwrap();
 
         assert!(absent.is_absent());
-        assert!(absent.current_after() >= Some(before));
-        assert!(
-            expected
-                .current_after()
-                .is_some_and(|watermark| watermark < before)
-        );
+        assert!(absent.current_after() >= before);
+        assert!(expected.current_after() < before);
         assert_eq!(count(&log, "delete_if"), 1);
         clear(&log);
         assert!(local.read("p", Requirement::Any).await.unwrap().is_absent());
@@ -2503,11 +2458,7 @@ mod tests {
             local.delete(&expected).await,
             Err(StorageError::Precondition)
         ));
-        assert!(
-            expected
-                .current_after()
-                .is_some_and(|watermark| watermark < before)
-        );
+        assert!(expected.current_after() < before);
         clear(&log);
 
         let current = local.read("p", Requirement::Any).await.unwrap();
@@ -2545,11 +2496,7 @@ mod tests {
         ));
         hook.clear_after();
 
-        assert!(
-            expected
-                .current_after()
-                .is_some_and(|watermark| watermark < before)
-        );
+        assert!(expected.current_after() < before);
         clear(&log);
         assert!(store.read("p", Requirement::Any).await.unwrap().is_absent());
         assert_eq!(count(&log, "read"), 1);
@@ -2583,11 +2530,7 @@ mod tests {
         ));
         hook.clear_before();
 
-        assert!(
-            expected
-                .current_after()
-                .is_some_and(|watermark| watermark < before)
-        );
+        assert!(expected.current_after() < before);
         clear(&log);
         let current = store.read("p", Requirement::Any).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"a");
@@ -3106,11 +3049,7 @@ mod tests {
         release.notify_one();
         let observed = read.await.unwrap();
 
-        assert!(
-            observed
-                .current_after()
-                .is_some_and(|watermark| watermark < later)
-        );
+        assert!(observed.current_after() < later);
     }
 
     #[tokio::test]
@@ -3159,42 +3098,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_hit_is_unverified_until_a_conditional_read() {
+    async fn persistent_evidence_precedes_the_reopened_session() {
         let directory = TempDir::new().unwrap();
         let backend = Arc::new(MemoryBackend::new());
         backend
             .write_if_not_exists("p", b"one".to_vec())
             .await
             .unwrap();
-        let erased: Arc<dyn Backend> = backend.clone();
+        let recorded = Arc::new(RecordingBackend::new(backend));
+        let log = recorded.log();
+        let erased: Arc<dyn Backend> = recorded;
 
-        let first = persistent_store(&directory, erased.clone(), Timeline::new()).await;
+        let (first, _) = persistent_store(&directory, erased.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
         let loaded = first_typed.read("p", Requirement::Any).await.unwrap();
-        assert!(loaded.current_after().is_some());
+        let persisted = loaded.current_after();
         drop(first_typed);
         first.shutdown().await;
         drop(first);
 
-        let timeline = Timeline::new();
-        let reopened = persistent_store(&directory, erased, timeline.clone()).await;
+        let (reopened, timeline) = persistent_store(&directory, erased).await;
+        let bound = timeline.now();
+        assert!(bound > persisted);
+
         let typed: TypedCachedStore<Bytes> = reopened.typed();
         let restored = typed.read("p", Requirement::Any).await.unwrap();
         assert_eq!(restored.value().unwrap().as_slice(), b"one");
-        assert_eq!(restored.current_after(), None);
+        assert_eq!(restored.current_after(), persisted);
         assert!(restored.cache_hit());
         assert_eq!(reopened.body_reads(), 0);
 
-        let bound = timeline.now();
+        clear(&log);
         let verified = typed.read("p", Requirement::AtLeast(bound)).await.unwrap();
-        assert!(verified.current_after() >= Some(bound));
+        assert!(verified.current_after() >= bound);
         assert_eq!(reopened.body_reads(), 0);
+        assert_eq!(
+            count(&log, "read_if_modified"),
+            1,
+            "persisted evidence should seed a conditional backend read"
+        );
         let stats = reopened.cache_stats_and_reset();
         assert_eq!(stats.l2_hits, 1, "cache stats: {stats:?}");
-        assert_eq!(
-            stats.l2_conditional_validations, 1,
-            "cache stats: {stats:?}"
-        );
 
         drop(typed);
         reopened.shutdown().await;
@@ -3210,7 +3154,7 @@ mod tests {
             .unwrap();
         let erased: Arc<dyn Backend> = backend.clone();
 
-        let first = persistent_store(&directory, erased.clone(), Timeline::new()).await;
+        let (first, _) = persistent_store(&directory, erased.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
         let old = first_typed.read("p", Requirement::Any).await.unwrap();
         let changed = first_typed.compare_and_swap(&old, v(b"two")).await.unwrap();
@@ -3219,11 +3163,11 @@ mod tests {
         first.shutdown().await;
         drop(first);
 
-        let reopened = persistent_store(&directory, erased, Timeline::new()).await;
+        let (reopened, _) = persistent_store(&directory, erased).await;
         let typed: TypedCachedStore<Bytes> = reopened.typed();
         let loaded = typed.read("p", Requirement::Any).await.unwrap();
         assert_eq!(loaded.value().unwrap().as_slice(), b"two");
-        assert!(loaded.current_after().is_some());
+        assert!(loaded.current_after() > SequencePoint::default());
         assert_eq!(reopened.body_reads(), 1);
         let stats = reopened.cache_stats_and_reset();
         assert_eq!(stats.l2_hits, 0, "cache stats: {stats:?}");
