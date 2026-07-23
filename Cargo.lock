@@ -1550,8 +1550,12 @@ dependencies = [
  "hashlink",
  "prost",
  "prost-types",
+ "rustix",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

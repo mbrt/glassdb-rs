@@ -1162,7 +1162,7 @@ mod tests {
 
     fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(b, 1024, timeline.clone());
+        let objects = CachedStore::new(b, 1024, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(

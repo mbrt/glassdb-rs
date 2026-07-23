@@ -83,10 +83,18 @@ impl<V: Weighable + Clone> CacheShard<V> {
     where
         F: FnOnce(Option<V>) -> Option<V>,
     {
+        self.update_with_result(key, |old| (f(old), ()));
+    }
+
+    fn update_with_result<F, R>(&self, key: &str, f: F) -> R
+    where
+        F: FnOnce(Option<V>) -> (Option<V>, R),
+    {
         let mut inner = self.inner.lock().unwrap();
         let old = inner.map.get(key).cloned();
         let old_size = old.as_ref().map_or(0, Weighable::size);
-        match f(old) {
+        let (new, result) = f(old);
+        match new {
             None => {
                 // Remove an existing entry, or leave an absent one absent.
                 inner.delete_entry(key);
@@ -101,6 +109,7 @@ impl<V: Weighable + Clone> CacheShard<V> {
                 inner.remove_oldest();
             }
         }
+        result
     }
 
     fn delete(&self, key: &str) {
@@ -160,6 +169,15 @@ impl<V: Weighable + Clone> Cache<V> {
         let mut total = 0;
         self.sh.each(|s| total += s.size());
         total
+    }
+
+    /// Atomically updates `key` and returns an auxiliary result produced by the
+    /// update closure.
+    pub(crate) fn update_with_result<F, R>(&self, key: &str, f: F) -> R
+    where
+        F: FnOnce(Option<V>) -> (Option<V>, R),
+    {
+        self.sh.for_key(key.as_bytes()).update_with_result(key, f)
     }
 }
 
@@ -244,6 +262,17 @@ mod tests {
             None
         });
         assert_eq!(c.size(), 0);
+    }
+
+    #[test]
+    fn update_with_result_updates_and_returns() {
+        let c = CacheShard::new(100);
+        c.set("a", e("before"));
+
+        let previous = c.update_with_result("a", |old| (Some(e("after")), old));
+
+        assert_eq!(previous, Some(e("before")));
+        assert_eq!(c.get("a"), Some(e("after")));
     }
 
     #[test]

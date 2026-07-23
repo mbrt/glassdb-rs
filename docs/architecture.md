@@ -674,10 +674,16 @@ ordering protocol from
                   ▼
 ┌───────────────────────────────────────┐
 │       CachedStore (per database)      │
-│ Decoded LRU, retained observations,   │
+│ Decoded L1, retained observations,    │
 │ evidence, and per-path coordination   │
 └─────────────────┬─────────────────────┘
                   │ miss or insufficient evidence
+                  ▼
+┌───────────────────────────────────────┐
+│ Optional persistent encoded-body L2   │
+│ Fixed-capacity bodies and evidence    │
+└─────────────────┬─────────────────────┘
+                  │ miss or validation
                   ▼
 ┌───────────────────────────────────────┐
 │         Backend (Object Storage)      │
@@ -696,6 +702,20 @@ configurable through `DatabaseBuilder::cache_size`, and evicts least-recently
 used entries first. Eviction removes discoverable cache state but does not
 revoke observations already retained by readers or transactions.
 
+`DatabaseBuilder::persistent_cache` optionally adds a fixed-capacity L2 in a
+caller-selected directory. Its public configuration contains only the directory
+and capacity; GlassDB derives the identity from the database name and persistent
+database UUID. Production geometry uses 64 MiB segments and requires at least
+131 MiB. L2 stores exact encoded present bodies, opaque revisions, and their
+currentness points, while L1 owns decoded values and live evidence cells.
+
+Filesystem work does not run on Tokio's blocking pool. Cache lookups and
+write-behind work share one bounded cache-owned worker, so overload bypasses L2
+instead of creating an unbounded blocking-task backlog. Opening and shutdown
+are deadline-bounded and fail open; shutdown detaches a stuck worker after its
+deadline. The deterministic executor disables L2 until filesystem behavior has
+a replayable simulation model.
+
 ### Knowledge and causal evidence
 
 `CachedStore` (`glassdb-storage/src/cached_store.rs`) stores only usable
@@ -712,10 +732,12 @@ evidence after the shared cache entry has been evicted or invalidated. Uncertain
 state is not returned as an observation.
 
 Causal evidence is a `SequencePoint`: a strictly ordered event allocated by one
-open `Database`. Sequence points are neither persisted nor shared between
-independent database opens. Their numeric distance has no semantic meaning,
-except that the allocator is coupled to a monotonic elapsed-time floor for the
-intentionally approximate `read_stale` age policy.
+open `Database`. The optional L2 persists points only to chain the next open of
+the same database identity after its discoverable cached evidence. Sequence
+points are not otherwise exchanged or shared between independent database
+opens. Their numeric distance has no semantic meaning, except that the allocator
+is coupled to a monotonic elapsed-time floor for the intentionally approximate
+`read_stale` age policy.
 
 Callers express the minimum acceptable evidence as a `Requirement`:
 
@@ -725,11 +747,17 @@ Callers express the minimum acceptable evidence as a `Requirement`:
 | `AtLeast(t)` | Present or absent state proven current at or after `t` |
 
 An observation's `current_after` point is evidence that the observed state was
-current at that point. It is never a claim about response time. A definitive
-backend operation contributes its invocation point, allocated immediately
-before dispatch. If the same backend state is observed again, its evidence
-watermark advances monotonically; a different state replaces the old
-discoverable knowledge.
+current at that point. A persisted L2 body retains its original point. Opening
+the L2 returns the greatest discoverable point to `Database`, which starts the
+new timeline strictly after it and passes that timeline to `CachedStore`. Thus
+`Any` may use a persisted body immediately, while every bound allocated in the
+new session requires validation until the body's evidence advances.
+Finite-staleness cutoffs are clamped to that session boundary for the same
+reason. A point is never a claim about response time. A definitive backend
+operation contributes its invocation point, allocated immediately before
+dispatch. If the same backend state is observed again, its evidence watermark
+advances monotonically; a different state replaces the old discoverable
+knowledge.
 
 ### Per-path operation ordering
 
@@ -823,10 +851,11 @@ The cache and coordinator rely on, and preserve, these properties:
 7. Successful mutations publish the exact installed state. Their callers can
    therefore use the returned observations without immediate verification
    reads.
-8. Per-path lanes and sequence points are database-local coordination.
-   Independent database opens and external writers are governed by backend
-   linearizability and conditional revisions, not by a shared in-memory
-   timeline.
+8. Per-path lanes and sequence points are database-local coordination. L2
+   session chaining orders persisted cache evidence but does not share operation
+   completion across opens. Independent opens and external writers are governed
+   by backend linearizability and conditional revisions, not by a shared
+   in-memory timeline.
 
 Transaction execution may use cached state freely before commit. Transaction
 validation captures one lower bound and propagates it through leaf and

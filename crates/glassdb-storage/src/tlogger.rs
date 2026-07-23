@@ -622,14 +622,14 @@ mod tests {
     fn new_tlogger() -> TLogger {
         let backend = Arc::new(MemoryBackend::new());
         let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TLogger::new(objects, "db")
     }
 
     fn new_recording_tlogger() -> (TLogger, OpLog) {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
-        let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new());
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new(), None);
         (TLogger::new(objects, "db"), operations)
     }
 
@@ -864,7 +864,7 @@ mod tests {
             }
         });
 
-        let objects = CachedStore::new(backend, 1 << 20, Timeline::new());
+        let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
         let logger = TLogger::new(objects, "db");
         let log = TxLog::new(id.clone(), TxCommitStatus::Ok);
 
@@ -987,7 +987,7 @@ mod tests {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let timeline = Timeline::new();
-        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone());
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
         let logger = TLogger::new(objects, "db");
         let id = TxId::from_bytes(vec![4, 3, 2, 1]);
         logger
@@ -1013,7 +1013,7 @@ mod tests {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let timeline = Timeline::new();
-        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone());
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
         let logger = TLogger::new(objects, "db");
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger

@@ -1261,7 +1261,7 @@ mod tests {
 
     fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TestStore {
             shards: ShardStore::new(objects.clone()),
             objects,

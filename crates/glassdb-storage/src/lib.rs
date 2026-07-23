@@ -2,8 +2,10 @@
 //! transaction-log persistence, and structural split recovery records.
 
 pub mod cache;
+mod cache_stats;
 mod cached_store;
 mod directory;
+mod disk_cache;
 mod error;
 mod lock;
 mod node;
@@ -17,10 +19,12 @@ pub mod txobject;
 mod version;
 
 pub use cache::{Cache, Weighable};
+pub use cache_stats::CacheStats;
 pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
 pub use directory::{Directory, LeafGroup, LeafLocator};
+pub use disk_cache::{OpenedPersistentCache, PersistentCache, PersistentCacheConfig};
 pub use error::StorageError;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};

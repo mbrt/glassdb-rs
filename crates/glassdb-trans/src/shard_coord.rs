@@ -800,7 +800,7 @@ mod tests {
         retry: RetryConfig,
     ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
@@ -815,7 +815,7 @@ mod tests {
     // actually landed in storage without touching the coordinator's cache.
     fn cold_store(backend: Arc<dyn Backend>) -> ShardStore {
         let timeline = Timeline::new();
-        ShardStore::new(CachedStore::new(backend, 1 << 20, timeline))
+        ShardStore::new(CachedStore::new(backend, 1 << 20, timeline, None))
     }
 
     fn entry(

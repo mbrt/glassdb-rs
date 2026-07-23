@@ -1286,7 +1286,7 @@ mod tests {
 
     fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(b.clone(), 1024, timeline.clone());
+        let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(

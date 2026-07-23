@@ -661,6 +661,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_timeout_uses_virtual_time() {
+        let elapsed = block_on_with(LowestFirst, 0, async {
+            let start = now_nanos();
+            let result =
+                crate::rt::timeout(Duration::from_secs(10), std::future::pending::<()>()).await;
+            assert_eq!(result, Err(crate::rt::TimedOut));
+            now_nanos() - start
+        });
+        assert_eq!(elapsed, Duration::from_secs(10).as_nanos() as u64);
+    }
+
+    #[test]
     fn seeded_select_order_is_deterministic_per_seed() {
         // Records the branch a non-biased `tokio::select!` picks for 32 decisions
         // where both branches are immediately ready, so the only thing choosing

@@ -6,6 +6,7 @@ use std::ops::Sub;
 use std::time::Duration;
 
 use glassdb_backend::BackendStats;
+use glassdb_storage::CacheStats;
 
 /// Holds cumulative performance counters for a database.
 ///
@@ -13,6 +14,9 @@ use glassdb_backend::BackendStats;
 /// measure a specific interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Decoded L1 and persistent encoded-body L2 cache activity.
+    pub cache: CacheStats,
+
     /// Number of completed transactions.
     pub tx_n: u64,
     /// Time spent within transactions.
@@ -55,6 +59,7 @@ pub struct Stats {
 
 impl Stats {
     pub(crate) fn add(&mut self, other: &Stats) {
+        self.cache += other.cache;
         self.tx_n += other.tx_n;
         self.tx_time += other.tx_time;
         self.tx_reads += other.tx_reads;
@@ -79,6 +84,10 @@ impl Stats {
         self.obj_lists += b.obj_lists;
     }
 
+    pub(crate) fn add_cache(&mut self, cache: CacheStats) {
+        self.cache += cache;
+    }
+
     pub(crate) fn add_protocol(
         &mut self,
         lock_calls: u64,
@@ -100,6 +109,7 @@ impl Sub for Stats {
 
     fn sub(self, other: Stats) -> Stats {
         Stats {
+            cache: self.cache - other.cache,
             tx_n: self.tx_n.saturating_sub(other.tx_n),
             tx_time: self.tx_time.saturating_sub(other.tx_time),
             tx_reads: self.tx_reads.saturating_sub(other.tx_reads),
@@ -127,8 +137,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subtraction_covers_protocol_counters() {
+    fn subtraction_covers_cache_and_protocol_counters() {
         let before = Stats {
+            cache: CacheStats {
+                l1_hits: 4,
+                l2_hits: 2,
+                ..Default::default()
+            },
             coord_submissions: 10,
             coord_rounds: 8,
             split_candidates: 3,
@@ -137,6 +152,11 @@ mod tests {
             ..Default::default()
         };
         let after = Stats {
+            cache: CacheStats {
+                l1_hits: 9,
+                l2_hits: 3,
+                ..Default::default()
+            },
             coord_submissions: 14,
             coord_rounds: 10,
             split_candidates: 5,
@@ -145,6 +165,8 @@ mod tests {
             ..Default::default()
         };
         let delta = after - before;
+        assert_eq!(delta.cache.l1_hits, 5);
+        assert_eq!(delta.cache.l2_hits, 1);
         assert_eq!(delta.coord_submissions, 4);
         assert_eq!(delta.coord_rounds, 2);
         assert_eq!(delta.split_candidates, 2);

@@ -620,7 +620,8 @@ mod tests {
 
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone()));
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
+        let shards = ShardStore::new(objects);
         TestStore { shards, timeline }
     }
 
