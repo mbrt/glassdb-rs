@@ -1406,6 +1406,7 @@ dependencies = [
  "glassdb-trans",
  "proptest",
  "prost",
+ "rayon",
  "thiserror",
  "tokio",
  "tokio-util",

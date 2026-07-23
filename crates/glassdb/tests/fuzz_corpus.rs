@@ -9,57 +9,71 @@
 //! deterministic executor with the `sim` harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test --profile sim-test -p glassdb --features sim
 //! ```
 #![cfg(all(sim, feature = "sim"))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use glassdb::middleware::{OpRecord, first_divergence};
 use glassdb::sim::{ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_input};
+use rayon::prelude::*;
 
-fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]) {
+type ReplayFn = fn(&[u8]) -> Vec<OpRecord>;
+
+fn divergence_error(label: &str, first: &[OpRecord], second: &[OpRecord]) -> Option<String> {
     if let Some((idx, a, b)) = first_divergence(first, second) {
-        panic!(
+        return Some(format!(
             "{label}: op stream diverged at index {idx}\n  \
              run 1 ({} ops): {a:?}\n  run 2 ({} ops): {b:?}",
             first.len(),
             second.len(),
-        );
+        ));
     }
+    None
+}
+
+fn replay_corpus_file(path: &Path, replay: ReplayFn) -> Result<(), String> {
+    let data = std::fs::read(path)
+        .map_err(|error| format!("read corpus file {}: {error}", path.display()))?;
+    let first = std::panic::catch_unwind(|| replay(&data))
+        .map_err(|_| format!("corpus replay failed for {}", path.display()))?;
+    let second = std::panic::catch_unwind(|| replay(&data))
+        .map_err(|_| format!("second corpus replay failed for {}", path.display()))?;
+    if let Some(error) = divergence_error(
+        &format!("corpus replay for {}", path.display()),
+        &first,
+        &second,
+    ) {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Replays every committed input under `fuzz/corpus/<target>` through `replay`,
 /// which panics on any invariant violation, and compares two back-to-back
 /// recorded op streams. On failure the offending file is named: it is the exact
 /// libFuzzer reproducer for `cargo +nightly fuzz run <target> <file>`.
-fn replay_committed_corpus(target: &str, replay: fn(&[u8]) -> Vec<OpRecord>) {
+fn replay_committed_corpus(target: &str, replay: ReplayFn) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fuzz/corpus")
         .join(target);
-    let mut count = 0usize;
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("read corpus dir") {
         let path = entry.expect("read corpus entry").path();
-        if !path.is_file() {
-            continue;
+        if path.is_file() {
+            paths.push(path);
         }
-        let data = std::fs::read(&path).expect("read corpus file");
-        let first = match std::panic::catch_unwind(|| replay(&data)) {
-            Ok(log) => log,
-            Err(_) => panic!("corpus replay failed for {}", path.display()),
-        };
-        let second = match std::panic::catch_unwind(|| replay(&data)) {
-            Ok(log) => log,
-            Err(_) => panic!("second corpus replay failed for {}", path.display()),
-        };
-        assert_no_divergence(
-            &format!("corpus replay for {}", path.display()),
-            &first,
-            &second,
-        );
-        count += 1;
     }
-    assert!(count > 0, "no corpus files under {}", dir.display());
+    paths.sort_unstable();
+    assert!(!paths.is_empty(), "no corpus files under {}", dir.display());
+
+    if let Err(error) = paths
+        .par_iter()
+        .try_for_each(|path| replay_corpus_file(path, replay))
+    {
+        panic!("{error}");
+    }
 }
 
 #[test]

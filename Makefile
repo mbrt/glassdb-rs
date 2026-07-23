@@ -50,10 +50,11 @@ flamegraph:
 # self-check (tests/concurrent_sim.rs) and the committed fuzz-corpus replay
 # (tests/fuzz_corpus.rs).
 test-sim:
-	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test \
+	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
 		-p glassdb-data -p glassdb-concurr -p glassdb-backend \
 		-p glassdb-storage -p glassdb-trans
-	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test -p glassdb --features sim
+	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
+		-p glassdb --features sim
 
 # Run the deterministic concurrency fuzzers. Requires the nightly toolchain and
 # cargo-fuzz (`cargo install cargo-fuzz`). `cargo fuzz` sets its own RUSTFLAGS
