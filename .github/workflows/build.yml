@@ -34,14 +34,6 @@ jobs:
     - name: Test sim
       run: make test-sim
 
-    - name: Overlapping RMW performance smoke
-      run: |
-        cargo run --release -p glassdb-bench-scale --bin rtbench -- \
-          --backend=memory --delays=s3 --delay-scale=0.001 \
-          --test-name=deadlock --duration=100ms --num-runs=1 \
-          --drain-timeout=2s --deadlock-out=target/deadlock-smoke.csv
-      timeout-minutes: 5
-
   proto-codegen:
     runs-on: ubuntu-latest
     steps:

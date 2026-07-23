@@ -1,3 +1,4 @@
 /target
+__pycache__/
 # cargo-flamegraph drops raw perf data in the repo root (see hack/perf).
 /perf.data*

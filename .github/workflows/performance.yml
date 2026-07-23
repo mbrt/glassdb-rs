@@ -1,0 +1,168 @@
+name: Performance comparison
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compare:
+    name: Compare to main
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
+    steps:
+
+    - name: Initialize result artifact
+      env:
+        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
+        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+      run: |
+        install -d "$PERF_BIN" \
+          "$PERF_RESULTS/score/main" "$PERF_RESULTS/score/pr" \
+          "$PERF_RESULTS/mix/main" "$PERF_RESULTS/mix/pr"
+
+    - uses: actions/checkout@v4
+
+    - name: Check out main baseline
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+        path: .perf-main
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target/performance
+
+    - name: Test performance report generator
+      run: python3 -m unittest hack.ci.test_perf_report
+
+    - name: Build baseline and candidate benchmarks
+      env:
+        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
+      run: |
+        cargo build --release --manifest-path .perf-main/Cargo.toml \
+          --package glassdb-bench-score --bin autoresearch \
+          --package glassdb-bench-scale --bin mixbench
+        install -m 755 "$CARGO_TARGET_DIR/release/autoresearch" \
+          "$PERF_BIN/main-autoresearch"
+        install -m 755 "$CARGO_TARGET_DIR/release/mixbench" \
+          "$PERF_BIN/main-mixbench"
+
+        cargo build --release \
+          --package glassdb-bench-score --bin autoresearch \
+          --package glassdb-bench-scale --bin mixbench
+        install -m 755 "$CARGO_TARGET_DIR/release/autoresearch" \
+          "$PERF_BIN/pr-autoresearch"
+        install -m 755 "$CARGO_TARGET_DIR/release/mixbench" \
+          "$PERF_BIN/pr-mixbench"
+
+    - name: Measure backend-operation score
+      timeout-minutes: 3
+      env:
+        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
+        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+      run: |
+        run_score() {
+          local side="$1" binary="$2" repetition="$3"
+          "$binary" --json --count 1 \
+            > "$PERF_RESULTS/score/$side/$repetition.json"
+        }
+
+        for repetition in $(seq 1 11); do
+          printf -v repetition_id '%02d' "$repetition"
+          if (( repetition % 2 == 1 )); then
+            run_score main "$PERF_BIN/main-autoresearch" "$repetition_id"
+            run_score pr "$PERF_BIN/pr-autoresearch" "$repetition_id"
+          else
+            run_score pr "$PERF_BIN/pr-autoresearch" "$repetition_id"
+            run_score main "$PERF_BIN/main-autoresearch" "$repetition_id"
+          fi
+        done
+
+    - name: Measure focused high-contention mix
+      timeout-minutes: 8
+      env:
+        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
+        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+      run: |
+        mix_args=(
+          --delays=s3
+          --delay-scale=0.02
+          --duration=1s
+          --max-duration=20s
+          --target-ci=0.15
+          --modes=hi
+          --topologies=shared
+          --workers-per-shape=8
+          --hot-keys=8
+          --multi-keys=8
+          --drain-timeout=30s
+          --json
+        )
+        run_mix() {
+          local side="$1" binary="$2" repetition="$3"
+          "$binary" "${mix_args[@]}" \
+            > "$PERF_RESULTS/mix/$side/$repetition.json"
+        }
+
+        for repetition in 1 2 3; do
+          printf -v repetition_id '%02d' "$repetition"
+          if (( repetition % 2 == 1 )); then
+            run_mix main "$PERF_BIN/main-mixbench" "$repetition_id"
+            run_mix pr "$PERF_BIN/pr-mixbench" "$repetition_id"
+          else
+            run_mix pr "$PERF_BIN/pr-mixbench" "$repetition_id"
+            run_mix main "$PERF_BIN/main-mixbench" "$repetition_id"
+          fi
+        done
+
+    - name: Render job summary
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        CANDIDATE_SHA: ${{ github.sha }}
+        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+      run: |
+        python3 hack/ci/perf_report.py \
+          --input "$PERF_RESULTS" \
+          --base-label "main (${BASE_SHA:0:12})" \
+          --candidate-label "PR merge (${CANDIDATE_SHA:0:12})" \
+          --output "$PERF_RESULTS/report.md"
+        cat "$PERF_RESULTS/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on pull request
+      if: >-
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.actor != 'dependabot[bot]'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: >-
+        gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+        --body-file "$PERF_RESULTS/report.md"
+
+    - name: Upload performance results
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results
+        path: ${{ runner.temp }}/glassdb-performance-results
+        if-no-files-found: error
+        retention-days: 7
