@@ -43,6 +43,12 @@ glassdb-trans = { path = "crates/glassdb-trans", version = "0.1.0" }
 [profile.release]
 opt-level = 3
 
+# Simulation replay executes thousands of complete database runs, so optimize
+# it while retaining the test profile's assertions and overflow checks.
+[profile.sim-test]
+inherits = "test"
+opt-level = 1
+
 # Release-grade code with debug symbols retained, for readable profiler stacks
 # (see hack/perf). Kept separate from `[profile.release]` so the benchmark/metric
 # builds are unaffected.

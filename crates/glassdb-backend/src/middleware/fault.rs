@@ -251,6 +251,16 @@ mod tests {
     use super::*;
     use crate::memory::MemoryBackend;
 
+    // Delay injection has its own deterministic test. Fault-only tests disable
+    // it so they do not wait on behavior they never assert.
+    fn fault_only_options() -> FaultOptions {
+        FaultOptions {
+            delay_prob: 0,
+            max_delay: Duration::ZERO,
+            ..FaultOptions::from_intensity(255)
+        }
+    }
+
     #[tokio::test]
     async fn inactive_passes_through() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -265,7 +275,7 @@ mod tests {
     async fn fault_tape_guides_injection() {
         async fn run(tape: Vec<u8>) -> Vec<bool> {
             let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-            let fb = FaultBackend::with_tape(mem, tape, 7, FaultOptions::from_intensity(255));
+            let fb = FaultBackend::with_tape(mem, tape, 7, fault_only_options());
             fb.set_active(true);
             let mut outcomes = Vec::new();
             for i in 0..32 {
@@ -417,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn active_eventually_injects_faults() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let fb = FaultBackend::new(mem, 7, FaultOptions::from_intensity(255));
+        let fb = FaultBackend::new(mem, 7, fault_only_options());
         fb.set_active(true);
         // With max intensity, some conditional writes are faulted within a few
         // dozen attempts.

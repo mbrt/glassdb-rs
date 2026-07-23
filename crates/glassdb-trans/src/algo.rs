@@ -1395,6 +1395,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::monitor::ProtocolTiming;
     use crate::reader::Reader;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
@@ -1447,7 +1448,14 @@ mod tests {
         // Leak the background so spawned async aborts can run for the test's
         // lifetime without us threading the owner through every helper.
         std::mem::forget(bg);
-        let tmon = Monitor::new(tlogger.clone(), timeline.clone(), bg_weak.clone());
+        let tmon = Monitor::with_config(
+            tlogger.clone(),
+            timeline.clone(),
+            bg_weak.clone(),
+            Clock::real(),
+            RetryConfig::default(),
+            ProtocolTiming::simulation(),
+        );
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
