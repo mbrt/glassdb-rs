@@ -211,7 +211,7 @@ impl PersistentCache {
         database_name: &str,
         database_uuid: DatabaseUuid,
     ) -> OpenedPersistentCache {
-        Self::open_in_background(config, database_name, database_uuid, PRODUCTION_GEOMETRY).await
+        Self::open_on_worker(config, database_name, database_uuid, PRODUCTION_GEOMETRY).await
     }
 
     #[cfg(test)]
@@ -220,7 +220,7 @@ impl PersistentCache {
         database_name: &str,
         database_uuid: DatabaseUuid,
     ) -> OpenedPersistentCache {
-        Self::open_in_background(config, database_name, database_uuid, TEST_GEOMETRY).await
+        Self::open_on_worker(config, database_name, database_uuid, TEST_GEOMETRY).await
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -416,7 +416,7 @@ impl PersistentCache {
         }
     }
 
-    async fn open_in_background(
+    async fn open_on_worker(
         config: PersistentCacheConfig,
         database_name: &str,
         database_uuid: DatabaseUuid,
@@ -432,23 +432,17 @@ impl PersistentCache {
         }
 
         let fallback_metrics = metrics.clone();
-        let database_name = database_name.to_owned();
         let (completion, result) = oneshot::channel();
-        if let Err(error) = std::thread::Builder::new()
-            .name("glassdb-l2-open".to_string())
-            .spawn(move || {
-                let cache = Self::open_with_geometry(
-                    config,
-                    &database_name,
-                    database_uuid,
-                    geometry,
-                    metrics,
-                );
-                let _ = completion.send(cache);
-            })
-        {
+        if let Err(error) = Self::spawn_worker(
+            config,
+            database_name.to_owned(),
+            database_uuid,
+            geometry,
+            metrics,
+            completion,
+        ) {
             fallback_metrics.l2_error();
-            tracing::warn!(%error, "persistent-cache initialization thread failed to start");
+            tracing::warn!(%error, "persistent-cache worker thread failed to start");
             return Self::disabled_open(fallback_metrics);
         }
 
@@ -456,12 +450,45 @@ impl PersistentCache {
             Ok(Ok(cache)) => cache,
             Ok(Err(_)) => {
                 fallback_metrics.l2_error();
-                tracing::warn!("persistent-cache initialization thread stopped");
+                tracing::warn!("persistent-cache worker stopped during initialization");
                 Self::disabled_open(fallback_metrics)
             }
             Err(_) => {
                 fallback_metrics.l2_error();
                 tracing::warn!("persistent-cache initialization timed out");
+                Self::disabled_open(fallback_metrics)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn open_with_geometry(
+        config: PersistentCacheConfig,
+        database_name: &str,
+        database_uuid: DatabaseUuid,
+        geometry: CacheGeometry,
+        metrics: Arc<CacheMetrics>,
+    ) -> OpenedPersistentCache {
+        let fallback_metrics = metrics.clone();
+        let (completion, result) = oneshot::channel();
+        let started = Self::spawn_worker(
+            config,
+            database_name.to_owned(),
+            database_uuid,
+            geometry,
+            metrics,
+            completion,
+        );
+        if let Err(error) = started {
+            fallback_metrics.l2_error();
+            tracing::warn!(%error, "persistent-cache worker thread failed to start");
+            return Self::disabled_open(fallback_metrics);
+        }
+        match result.await {
+            Ok(opened) => opened,
+            Err(_) => {
+                fallback_metrics.l2_error();
+                tracing::warn!("persistent-cache worker stopped during initialization");
                 Self::disabled_open(fallback_metrics)
             }
         }
@@ -481,36 +508,64 @@ impl PersistentCache {
         }
     }
 
-    fn open_with_geometry(
+    fn spawn_worker(
         config: PersistentCacheConfig,
-        database_name: &str,
+        database_name: String,
         database_uuid: DatabaseUuid,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
-    ) -> OpenedPersistentCache {
-        let opened = open_disk(
+        completion: oneshot::Sender<OpenedPersistentCache>,
+    ) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("glassdb-l2".to_string())
+            .spawn(move || {
+                Self::run_opening_worker(
+                    config,
+                    database_name,
+                    database_uuid,
+                    geometry,
+                    metrics,
+                    completion,
+                );
+            })
+            .map(|_| ())
+    }
+
+    fn run_opening_worker(
+        config: PersistentCacheConfig,
+        database_name: String,
+        database_uuid: DatabaseUuid,
+        geometry: CacheGeometry,
+        metrics: Arc<CacheMetrics>,
+        completion: oneshot::Sender<OpenedPersistentCache>,
+    ) {
+        let (disk, writer, last_sequence_point) = match open_disk(
             config,
-            database_name,
+            &database_name,
             database_uuid,
             geometry,
             metrics.clone(),
-        );
-        match opened.and_then(|(disk, writer, last_sequence_point)| {
-            CacheInner::start(disk, writer, metrics.clone())
-                .map(|inner| (inner, last_sequence_point))
-        }) {
-            Ok((inner, last_sequence_point)) => OpenedPersistentCache {
-                cache: Self {
-                    inner: Some(Arc::new(inner)),
-                    metrics,
-                },
-                last_sequence_point,
-            },
+        ) {
+            Ok(opened) => opened,
             Err(error) => {
                 metrics.l2_error();
                 tracing::warn!(error = %error, "persistent cache disabled during initialization");
-                Self::disabled_open(metrics)
+                let _ = completion.send(Self::disabled_open(metrics));
+                return;
             }
+        };
+        let (inner, worker) = CacheInner::prepare(disk, writer, metrics.clone());
+        let opened = OpenedPersistentCache {
+            cache: Self {
+                inner: Some(Arc::new(inner)),
+                metrics,
+            },
+            last_sequence_point,
+        };
+        // A timed-out opener drops the receiver, so the worker must release the
+        // file lock instead of becoming an unreachable detached cache.
+        if completion.send(opened).is_ok() {
+            worker.run();
         }
     }
 }
@@ -585,7 +640,11 @@ struct CacheInner {
 }
 
 impl CacheInner {
-    fn start(disk: Arc<Disk>, writer: WriterState, metrics: Arc<CacheMetrics>) -> io::Result<Self> {
+    fn prepare(
+        disk: Arc<Disk>,
+        writer: WriterState,
+        metrics: Arc<CacheMetrics>,
+    ) -> (Self, CacheWorker) {
         let (sender, receiver) = mpsc::sync_channel(WORK_QUEUE_ITEMS);
         let completion = Arc::new(Completion::new());
         let shared = Arc::new(Shared {
@@ -599,21 +658,21 @@ impl CacheInner {
             optional_queued: AtomicUsize::new(0),
             shutdown_requested: AtomicBool::new(false),
         });
-        let worker_shared = shared.clone();
-        let worker_completion = completion.clone();
-        std::thread::Builder::new()
-            .name("glassdb-l2".to_string())
-            .spawn(move || {
-                let _completion = CompletionGuard(worker_completion);
-                run_worker(worker_shared, writer, receiver);
-            })?;
-        Ok(Self {
-            shared,
-            sender,
-            enqueue_gate: Mutex::new(()),
-            shutdown_started: AtomicBool::new(false),
-            completion,
-        })
+        (
+            Self {
+                shared: shared.clone(),
+                sender,
+                enqueue_gate: Mutex::new(()),
+                shutdown_started: AtomicBool::new(false),
+                completion: completion.clone(),
+            },
+            CacheWorker {
+                shared,
+                writer,
+                receiver,
+                completion,
+            },
+        )
     }
 
     fn enqueue_required(&self, work: Work) {
@@ -675,6 +734,20 @@ impl CacheInner {
         if self.shared.disable() {
             tracing::warn!("{message}");
         }
+    }
+}
+
+struct CacheWorker {
+    shared: Arc<Shared>,
+    writer: WriterState,
+    receiver: Receiver<Work>,
+    completion: Arc<Completion>,
+}
+
+impl CacheWorker {
+    fn run(self) {
+        let _completion = CompletionGuard(self.completion);
+        run_worker(self.shared, self.writer, self.receiver);
     }
 }
 
@@ -1793,11 +1866,11 @@ mod tests {
         DatabaseUuid::from_bytes(bytes).unwrap()
     }
 
-    fn open(dir: &TempDir, database_uuid: DatabaseUuid) -> PersistentCache {
-        open_result(dir, database_uuid).cache
+    async fn open(dir: &TempDir, database_uuid: DatabaseUuid) -> PersistentCache {
+        open_result(dir, database_uuid).await.cache
     }
 
-    fn open_result(dir: &TempDir, database_uuid: DatabaseUuid) -> OpenedPersistentCache {
+    async fn open_result(dir: &TempDir, database_uuid: DatabaseUuid) -> OpenedPersistentCache {
         PersistentCache::open_with_geometry(
             config(dir),
             "db",
@@ -1805,6 +1878,7 @@ mod tests {
             TEST_GEOMETRY,
             Arc::new(CacheMetrics::new()),
         )
+        .await
     }
 
     fn config(dir: &TempDir) -> PersistentCacheConfig {
@@ -1849,7 +1923,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_is_ordered_with_worker_writes() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1));
+        let cache = open(&dir, uuid(1)).await;
         publish(&cache, "db/object", b"r1", b"body");
 
         let record = cache.lookup(Arc::from("db/object")).await.unwrap();
@@ -1862,7 +1936,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_returns_when_worker_is_stalled() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1));
+        let cache = open(&dir, uuid(1)).await;
         let inner = cache.inner.as_ref().unwrap().clone();
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
@@ -1885,13 +1959,13 @@ mod tests {
     async fn clean_reopen_preserves_record_and_identity_change_discards() {
         let dir = TempDir::new().unwrap();
         let first_uuid = uuid(1);
-        let cache = open(&dir, first_uuid);
+        let cache = open(&dir, first_uuid).await;
         assert!(cache.is_enabled());
         publish_at(&cache, "db/object", b"r1", b"body", point(17));
         cache.shutdown().await;
         drop(cache);
 
-        let opened = open_result(&dir, first_uuid);
+        let opened = open_result(&dir, first_uuid).await;
         assert_eq!(opened.last_sequence_point, Some(point(17)));
         let reopened = opened.cache;
         assert!(reopened.is_enabled());
@@ -1902,7 +1976,7 @@ mod tests {
         reopened.shutdown().await;
         drop(reopened);
 
-        let different = open(&dir, uuid(2));
+        let different = open(&dir, uuid(2)).await;
         assert!(different.lookup(Arc::from("db/object")).await.is_none());
         different.shutdown().await;
     }
@@ -1911,14 +1985,14 @@ mod tests {
     async fn reopen_scans_the_maximum_persisted_sequence_point() {
         let dir = TempDir::new().unwrap();
         let database_uuid = uuid(1);
-        let cache = open(&dir, database_uuid);
+        let cache = open(&dir, database_uuid).await;
         publish_at(&cache, "db/low", b"r1", b"low", point(8));
         publish_at(&cache, "db/high", b"r2", b"high", point(34));
         publish_at(&cache, "db/middle", b"r3", b"middle", point(21));
         cache.shutdown().await;
         drop(cache);
 
-        let opened = open_result(&dir, database_uuid);
+        let opened = open_result(&dir, database_uuid).await;
         assert_eq!(opened.last_sequence_point, Some(point(34)));
         let reopened = opened.cache;
         reopened.shutdown().await;
@@ -1928,8 +2002,8 @@ mod tests {
     async fn concurrent_owner_is_disabled_without_disturbing_the_owner() {
         let dir = TempDir::new().unwrap();
         let database_uuid = uuid(1);
-        let owner = open(&dir, database_uuid);
-        let contender = open(&dir, database_uuid);
+        let owner = open(&dir, database_uuid).await;
+        let contender = open(&dir, database_uuid).await;
 
         assert!(owner.is_enabled());
         assert!(!contender.is_enabled());
@@ -1939,7 +2013,7 @@ mod tests {
         publish(&owner, "db/object", b"r1", b"body");
         owner.shutdown().await;
         drop(owner);
-        let reopened = open(&dir, database_uuid);
+        let reopened = open(&dir, database_uuid).await;
         assert_eq!(
             reopened.lookup(Arc::from("db/object")).await.unwrap().body,
             b"body"
@@ -1951,12 +2025,12 @@ mod tests {
     async fn damaged_record_is_a_miss() {
         let dir = TempDir::new().unwrap();
         let database_uuid = uuid(1);
-        let first = open(&dir, database_uuid);
+        let first = open(&dir, database_uuid).await;
         publish(&first, "db/object", b"r1", b"body");
         first.shutdown().await;
         drop(first);
 
-        let reopened = open(&dir, database_uuid);
+        let reopened = open(&dir, database_uuid).await;
         let inner = reopened.inner.as_ref().unwrap();
         let slot = inner
             .shared
@@ -1988,7 +2062,7 @@ mod tests {
     #[tokio::test]
     async fn segment_ring_reuses_the_oldest_segment() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1));
+        let cache = open(&dir, uuid(1)).await;
         for index in 0..450 {
             publish(&cache, &format!("db/object-{index}"), b"r1", b"body");
         }
@@ -2004,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn full_index_bucket_evicts_its_oldest_pointer() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1));
+        let cache = open(&dir, uuid(1)).await;
         let disk = &cache.inner.as_ref().unwrap().shared.disk;
         let bucket_count = disk.layout.bucket_count(disk.geometry);
         let mut paths = Vec::new();
@@ -2035,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn record_larger_than_a_segment_is_not_admitted() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1));
+        let cache = open(&dir, uuid(1)).await;
         publish(
             &cache,
             "db/oversized",
@@ -2050,7 +2124,7 @@ mod tests {
     #[tokio::test]
     async fn newer_path_epoch_cancels_an_older_admission() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1));
+        let cache = open(&dir, uuid(1)).await;
         let fence = Arc::new(PathFence::default());
         let older = cache.begin_fence(fence.clone(), Arc::new(())).unwrap();
         let newer = cache.begin_fence(fence.clone(), Arc::new(())).unwrap();
