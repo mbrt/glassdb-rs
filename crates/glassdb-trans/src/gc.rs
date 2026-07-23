@@ -473,7 +473,7 @@ mod tests {
 
     fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "db");
         let shards = ShardStore::new(objects);
         let bg = Arc::new(Background::new());

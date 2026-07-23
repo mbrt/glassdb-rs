@@ -1,21 +1,42 @@
 //! Runtime indirection seam.
 //!
-//! Production builds re-export real `tokio` (`spawn`, `time::{sleep, Instant}`,
-//! `task::{JoinHandle, yield_now}`) with zero overhead. Under `--cfg sim` these
-//! route through the in-repo deterministic executor ([`crate::exec`]) when one is
-//! running on the current thread, and fall back to real `tokio` otherwise (so
-//! ordinary `#[tokio::test]` unit tests still work under a `sim` build).
+//! Production builds delegate to real `tokio`. Under `--cfg sim`, task spawning
+//! and time route through the in-repo deterministic executor ([`crate::exec`])
+//! when one is running on the current thread, and fall back to real `tokio`
+//! otherwise (so ordinary `#[tokio::test]` unit tests still work under a `sim`
+//! build).
 //!
-//! Only `spawn` and time need redirection: `tokio::sync` and `tokio::select!`
-//! are runtime-agnostic and are used directly elsewhere (non-`biased` selects
-//! stay deterministic under sim via the seeded branch-poll RNG; see
-//! `exec::block_on_with`).
+//! `tokio::sync` and `tokio::select!` are runtime-agnostic and are used directly
+//! elsewhere (non-`biased` selects stay deterministic under sim via the seeded
+//! branch-poll RNG; see `exec::block_on_with`).
+
+use std::future::Future;
+use std::time::Duration;
+
+/// Error returned when a runtime-seam deadline expires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedOut;
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "operation timed out")
+    }
+}
+
+impl std::error::Error for TimedOut {}
 
 #[cfg(not(sim))]
 mod imp {
+    use super::{Duration, Future, TimedOut};
+
     pub use tokio::task::JoinHandle;
     pub use tokio::task::yield_now;
     pub use tokio::time::{Instant, sleep};
+
+    /// Reports whether the deterministic executor is active.
+    pub fn in_sim() -> bool {
+        false
+    }
 
     /// The current wall-clock time. In production this is just the real clock.
     pub fn system_now() -> std::time::SystemTime {
@@ -30,18 +51,28 @@ mod imp {
     {
         tokio::spawn(f)
     }
+
+    /// Runs `future` until it completes or `duration` elapses.
+    pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, TimedOut>
+    where
+        F: Future,
+    {
+        tokio::time::timeout(duration, future)
+            .await
+            .map_err(|_| TimedOut)
+    }
 }
 
 #[cfg(sim)]
 mod imp {
-    use std::future::Future;
     use std::ops::Add;
     use std::pin::Pin;
     use std::sync::OnceLock;
     use std::task::{Context, Poll};
-    use std::time::Duration;
 
     use crate::exec;
+
+    use super::{Duration, Future, TimedOut};
 
     pub use crate::exec::{
         PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId, block_on_with, in_sim,
@@ -131,6 +162,26 @@ mod imp {
             exec::DetYield::default().await
         } else {
             tokio::task::yield_now().await
+        }
+    }
+
+    /// Runs `future` until it completes or the active clock advances by
+    /// `duration`.
+    pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, TimedOut>
+    where
+        F: Future,
+    {
+        if exec::in_sim() {
+            tokio::pin!(future);
+            tokio::select! {
+                biased;
+                value = &mut future => Ok(value),
+                _ = exec::det_sleep(duration) => Err(TimedOut),
+            }
+        } else {
+            tokio::time::timeout(duration, future)
+                .await
+                .map_err(|_| TimedOut)
         }
     }
 

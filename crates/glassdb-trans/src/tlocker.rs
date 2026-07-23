@@ -864,7 +864,13 @@ impl Locker {
             let requirement = locked
                 .validations
                 .get(&group.path)
-                .map(|observation| Requirement::AtLeast(observation.current_after()))
+                .map(|observation| {
+                    Requirement::AtLeast(
+                        observation
+                            .current_after()
+                            .expect("a successful lock CAS verifies its precondition"),
+                    )
+                })
                 .unwrap_or(Requirement::Any);
             if let Ok(mut s) = self
                 .write_back_routed(
@@ -910,7 +916,13 @@ impl Locker {
             // The commit-install CAS certified this precondition immediately
             // before installing our holder and advanced its watermark.
             installed_from
-                .map(|observation| Requirement::AtLeast(observation.current_after()))
+                .map(|observation| {
+                    Requirement::AtLeast(
+                        observation
+                            .current_after()
+                            .expect("a successful install CAS verifies its precondition"),
+                    )
+                })
                 .unwrap_or(Requirement::Any),
         )
         .await
@@ -1286,7 +1298,7 @@ mod tests {
 
     fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(b.clone(), 1024, timeline.clone());
+        let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "test");
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(

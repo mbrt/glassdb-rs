@@ -1441,7 +1441,7 @@ mod tests {
         cache_bytes: usize,
     ) -> (Algo, Tctx) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone());
+        let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone(), None);
         let tlogger = TLogger::new(objects.clone(), TEST_DB);
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
@@ -2957,6 +2957,7 @@ mod tests {
             tctx.backend.clone(),
             1 << 20,
             external_timeline.clone(),
+            None,
         ));
         let leaf_path = paths::collection_info(TEST_COLL);
         let loaded = external

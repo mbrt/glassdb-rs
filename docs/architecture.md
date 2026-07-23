@@ -674,10 +674,16 @@ ordering protocol from
                   ▼
 ┌───────────────────────────────────────┐
 │       CachedStore (per database)      │
-│ Decoded LRU, retained observations,   │
+│ Decoded L1, retained observations,    │
 │ evidence, and per-path coordination   │
 └─────────────────┬─────────────────────┘
                   │ miss or insufficient evidence
+                  ▼
+┌───────────────────────────────────────┐
+│ Optional persistent encoded-body L2   │
+│ Fixed-capacity, unverified candidates │
+└─────────────────┬─────────────────────┘
+                  │ miss or validation
                   ▼
 ┌───────────────────────────────────────┐
 │         Backend (Object Storage)      │
@@ -695,6 +701,20 @@ The LRU (`glassdb-storage/src/cache.rs`) has a 512 MiB default budget,
 configurable through `DatabaseBuilder::cache_size`, and evicts least-recently
 used entries first. Eviction removes discoverable cache state but does not
 revoke observations already retained by readers or transactions.
+
+`DatabaseBuilder::persistent_cache` optionally adds a fixed-capacity L2 in a
+caller-selected directory. Its public configuration contains only the directory
+and capacity; GlassDB derives the identity from the database name and persistent
+database UUID. Production geometry uses 64 MiB segments and requires at least
+131 MiB. L2 stores exact encoded present bodies and opaque revisions, while L1
+continues to own decoded values and currentness evidence.
+
+Filesystem work does not run on Tokio's blocking pool. Cache lookups and
+write-behind work share one bounded cache-owned worker, so overload bypasses L2
+instead of creating an unbounded blocking-task backlog. Opening and shutdown
+are deadline-bounded and fail open; shutdown detaches a stuck worker after its
+deadline. The deterministic executor disables L2 until filesystem behavior has
+a replayable simulation model.
 
 ### Knowledge and causal evidence
 
@@ -724,12 +744,13 @@ Callers express the minimum acceptable evidence as a `Requirement`:
 | `Any` | Any usable present or absent entry |
 | `AtLeast(t)` | Present or absent state proven current at or after `t` |
 
-An observation's `current_after` point is evidence that the observed state was
-current at that point. It is never a claim about response time. A definitive
-backend operation contributes its invocation point, allocated immediately
-before dispatch. If the same backend state is observed again, its evidence
-watermark advances monotonically; a different state replaces the old
-discoverable knowledge.
+An observation's optional `current_after` point is evidence that the observed
+state was current at that point. A persisted L2 body starts with no point and
+cannot satisfy `AtLeast`; `Any` may still use it as optimistic state. It is never
+a claim about response time. A definitive backend operation contributes its
+invocation point, allocated immediately before dispatch. If the same backend
+state is observed again, its evidence watermark advances monotonically; a
+different state replaces the old discoverable knowledge.
 
 ### Per-path operation ordering
 

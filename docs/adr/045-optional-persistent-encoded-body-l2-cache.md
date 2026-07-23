@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 This extends [ADR-036](036-decoded-object-cache-with-bounded-freshness.md).
 Its decoded LRU and currentness protocol remain the L1; this ADR adds a
@@ -42,8 +42,9 @@ typed stores -> decoded L1 -> encoded-body L2 -> Backend
 The L2 is disabled by default. Enabling it requires an explicit directory and
 byte capacity. A directory has one process owner at a time and is assigned by
 the operator to one backend and database. An exclusive lock prevents accidental
-concurrent use; an operator-supplied identity prevents accidental reuse after
-repointing.
+concurrent use. GlassDB derives the cache identity from the database name and a
+random UUID persisted in mandatory v2 database metadata, so callers do not
+configure a separate identity and repointing discards incompatible contents.
 
 The L2 stores present physical objects as their path, opaque backend revision,
 and exact encoded body. It stores neither decoded values, negative results,
@@ -143,9 +144,19 @@ other version or a file whose length differs from the requested capacity.
 #### Use an immutable header and clean-shutdown marker
 
 Use SHA-256 for identity, lookup fingerprints, and record binding in v1. The
-operator supplies a stable, non-empty cache identity for the backend and
-database; the header stores its SHA-256 digest. Digest inputs have distinct
-ASCII domain prefixes so one structure cannot be substituted for another.
+header stores the derived identity digest:
+
+```text
+SHA-256(
+    "glassdb-l2-identity-v1"
+    || little_endian_u32(database_name.len())
+    || database_name
+    || database_uuid
+)
+```
+
+Digest inputs have distinct ASCII domain prefixes so one structure cannot be
+substituted for another.
 
 The first 4 KiB has this layout:
 
@@ -387,13 +398,22 @@ unavailable, locked, full, corrupt, incompatible, or slow cache is bypassed or
 discarded. Cache failures appear in tracing and statistics, not as database
 operation errors.
 
-Expose L1 and L2 hits and misses, bytes read and written, conditional
-validations, read admissions, mutation invalidations, dead bytes, FIFO and
-index-pressure evictions, second-chance filter hits, promotion attempts and
-bytes, budget and queue drops, rejected admissions, corruption, discards,
-errors, disablement, and physical allocation. The feature remains opt-in until
-crash-injection tests and working-set benchmarks cover the target body sizes
-and capacities.
+Expose a small, outcome-oriented statistics surface:
+
+- L1 hits and misses;
+- L2 hits and misses;
+- backend conditional validations seeded by unverified L2 bodies;
+- L2 bytes read and written; and
+- L2 errors.
+
+The error counter aggregates initialization, runtime, and corruption failures;
+tracing carries the specific cause. Admission, invalidation, eviction,
+promotion, queue, discard, disablement, dead-byte, and allocation details are
+implementation mechanisms rather than stable public statistics. Diagnosing
+them requires tracing or a focused benchmark.
+
+The feature remains opt-in until crash-injection tests and working-set
+benchmarks cover the target body sizes and capacities.
 
 ## Consequences
 
@@ -403,6 +423,8 @@ and capacities.
   finite-staleness guarantees remain unchanged.
 - Cache failures reduce performance but cannot alter data, recovery, or database
   availability.
+- Outcome-oriented statistics retain cache usefulness, I/O, validation, and
+  health signals without making internal mechanisms part of the stable API.
 - The fixed preallocated file gives an application-level byte ceiling without
   compaction or copy-on-write space amplification. Filesystem metadata and
   allocation granularity remain outside that ceiling.
@@ -421,8 +443,9 @@ and capacities.
 - GlassDB owns a small disk format, allocator, and index. Weak failure semantics
   keep them narrow, but they still require adversarial crash and corruption
   testing.
-- A directory cannot be repointed or shared concurrently. Deleted or superseded
-  bodies may remain recoverable until segment reuse or wholesale discard.
+- A directory cannot be shared concurrently. Repointing it discards the old
+  identity's contents. Deleted or superseded bodies may remain recoverable
+  until segment reuse or wholesale discard.
 
 ## Alternatives considered
 

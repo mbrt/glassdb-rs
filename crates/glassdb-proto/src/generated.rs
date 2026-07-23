@@ -264,6 +264,10 @@ pub struct DatabaseMetadata {
     /// On-disk format version identifier (e.g. "v2").
     #[prost(string, tag = "1")]
     pub version: ::prost::alloc::string::String,
+    /// Persistent RFC-compatible UUIDv4 for this logical database. Exactly 16
+    /// bytes and mandatory for the v2 format.
+    #[prost(bytes = "vec", tag = "2")]
+    pub database_uuid: ::prost::alloc::vec::Vec<u8>,
 }
 /// The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
 /// root node - a leaf while the collection is small, an index once it grows - and

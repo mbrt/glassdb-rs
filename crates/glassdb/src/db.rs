@@ -8,7 +8,10 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
 use glassdb_data::{CollectionPath, TxId};
-use glassdb_storage::{CachedStore, Directory, ShardStore, SplitPolicy, TLogger, Timeline};
+use glassdb_storage::{
+    CachedStore, Directory, PersistentCache, PersistentCacheConfig, ShardStore, SplitPolicy,
+    TLogger, Timeline,
+};
 use glassdb_trans::{
     Algo, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator, Splitter, TransError,
 };
@@ -39,6 +42,7 @@ pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     cache_size: usize,
+    persistent_cache: Option<PersistentCacheConfig>,
     deterministic_time: bool,
     retry: RetryConfig,
     split_policy: SplitPolicy,
@@ -51,6 +55,15 @@ impl DatabaseBuilder {
     /// necessary.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = bytes;
+        self
+    }
+
+    /// Enables the best-effort persistent encoded-body cache.
+    ///
+    /// The cache identity is derived automatically from the database name and
+    /// its persistent UUID. Production capacities must be at least 131 MiB.
+    pub fn persistent_cache(mut self, config: PersistentCacheConfig) -> Self {
+        self.persistent_cache = Some(config);
         self
     }
 
@@ -102,6 +115,7 @@ impl DatabaseBuilder {
             name,
             backend: b,
             cache_size,
+            persistent_cache,
             deterministic_time,
             retry,
             split_policy,
@@ -114,10 +128,14 @@ impl DatabaseBuilder {
             )));
         }
         let backend = Arc::new(StatsBackend::new(b));
-        check_or_create_db_meta(&backend, &name).await?;
+        let database_uuid = check_or_create_db_meta(&backend, &name).await?;
         let timeline = Timeline::new();
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone());
+        let persistent = match persistent_cache {
+            Some(config) => Some(PersistentCache::open(config, &name, database_uuid).await),
+            None => None,
+        };
+        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
@@ -182,6 +200,7 @@ impl DatabaseBuilder {
         let inner = Arc::new(DbInner {
             name,
             backend,
+            objects,
             shards,
             timeline,
             tmon,
@@ -202,6 +221,7 @@ impl DatabaseBuilder {
             name: name.into(),
             backend,
             cache_size: DEFAULT_CACHE_SIZE,
+            persistent_cache: None,
             deterministic_time: false,
             retry: RetryConfig::default(),
             split_policy: SplitPolicy::default(),
@@ -213,6 +233,7 @@ impl DatabaseBuilder {
 pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) backend: Arc<StatsBackend>,
+    pub(crate) objects: CachedStore,
     pub(crate) shards: ShardStore,
     pub(crate) timeline: Timeline,
     pub(crate) tmon: Monitor,
@@ -279,6 +300,7 @@ impl Database {
         // before the dedup is closed.
         self.inner.background.shutdown().await;
         self.inner.coord.close().await;
+        self.inner.objects.shutdown().await;
     }
 
     /// Returns a top-level collection with the given name.
@@ -324,9 +346,11 @@ impl Database {
         let lock_calls = self.inner.locker.lock_calls_and_reset() as u64;
         let coord = self.inner.coord.stats_and_reset();
         let split = self.inner.splitter.stats_and_reset();
+        let cache = self.inner.objects.cache_stats_and_reset();
         let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
         s.add_protocol(lock_calls, coord, split);
+        s.add_cache(cache);
         *s
     }
 

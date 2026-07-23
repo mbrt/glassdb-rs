@@ -493,7 +493,7 @@ mod tests {
     // `Background` must be kept alive for the monitor's lifetime.
     fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone());
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DB);
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
@@ -516,7 +516,7 @@ mod tests {
 
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone()));
+        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
         TestStore { shards, timeline }
     }
 

@@ -8,9 +8,11 @@
 //! internal error.
 //!
 //! Requirement is a local currentness watermark, not a durable guarantee. Each
-//! cache entry is `Present` (a decoded value, its [`Revision`], and a
+//! cache entry is `Present` (a decoded value, its [`Revision`], and optional
 //! current-after [`SequencePoint`]), `Absent` (a current-after watermark,
-//! no revision), or uncertain (no entry: no usable discoverable knowledge). A
+//! no revision), or uncertain (no entry: no usable discoverable knowledge).
+//! Bodies restored from the persistent L2 begin with unverified evidence and
+//! cannot satisfy an `AtLeast` requirement. A
 //! successful read returns an [`Observation`]
 //! that references monotonic currentness evidence shared with the current cache
 //! entry; the observation stays usable even after that entry is evicted or
@@ -33,12 +35,18 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_backend::{self as backend, Backend, BackendError};
-use glassdb_concurr::shard::Sharded;
+use glassdb_concurr::{rt, shard::Sharded};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::cache::{Cache, Weighable};
+use crate::cache_stats::{CacheMetrics, CacheStats};
+#[cfg(test)]
+use crate::disk_cache::PersistentCacheConfig;
+use crate::disk_cache::{EncodedBody, FenceGuard, PathFence, PersistentCache};
 use crate::error::StorageError;
 use crate::timeline::{SequencePoint, Timeline};
+
+const PERSISTENT_CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Encoding, decoding, and decoded-size accounting for one physical object type.
 ///
@@ -163,12 +171,17 @@ pub enum ObservationCheck<V> {
 struct Evidence(Arc<AtomicU64>);
 
 impl Evidence {
-    fn new(t: SequencePoint) -> Self {
+    fn verified(t: SequencePoint) -> Self {
         Evidence(Arc::new(AtomicU64::new(t.raw())))
     }
 
-    fn get(&self) -> SequencePoint {
-        SequencePoint::from_raw(self.0.load(Ordering::SeqCst))
+    fn unverified() -> Self {
+        Evidence(Arc::new(AtomicU64::new(0)))
+    }
+
+    fn get(&self) -> Option<SequencePoint> {
+        let raw = self.0.load(Ordering::SeqCst);
+        (raw != 0).then(|| SequencePoint::from_raw(raw))
     }
 
     /// Advances the watermark to at least `t`, never regressing it.
@@ -216,9 +229,9 @@ impl<V> Observation<V> {
         self.revision.as_ref()
     }
 
-    /// The watermark: the observed state was current at some point after this
-    /// time.
-    pub fn current_after(&self) -> SequencePoint {
+    /// The watermark after which the state was known to be current, or `None`
+    /// when a persistent body has not yet been verified by the backend.
+    pub fn current_after(&self) -> Option<SequencePoint> {
         self.evidence.get()
     }
 
@@ -353,6 +366,7 @@ impl PathCoordinator {
             coordinator: Arc::downgrade(&self.paths),
             gate: Arc::new(Semaphore::new(1)),
             flight: Mutex::new(None),
+            l2_fence: Arc::new(PathFence::default()),
         });
         paths.insert(path.clone(), Arc::downgrade(&state));
         state
@@ -375,7 +389,7 @@ impl PathCoordinator {
     async fn admit_read(&self, path: &Arc<str>, req: Requirement) -> ReadAdmission {
         let state = self.state(path);
         let flight = state.flight.lock().unwrap().clone();
-        if let Some(flight) = flight.filter(|flight| satisfies(flight.invoked, req)) {
+        if let Some(flight) = flight.filter(|flight| satisfies(Some(flight.invoked), req)) {
             return ReadAdmission::Join(flight);
         }
         let permit = state
@@ -396,6 +410,7 @@ struct PathState {
     coordinator: Weak<PathMap>,
     gate: Arc<Semaphore>,
     flight: Mutex<Option<Arc<InFlight>>>,
+    l2_fence: Arc<PathFence>,
 }
 
 impl Drop for PathState {
@@ -455,6 +470,7 @@ struct PresentSeed {
     size: usize,
     revision: Revision,
     evidence: Evidence,
+    from_l2: bool,
 }
 
 enum ExpectedPredicate {
@@ -563,15 +579,18 @@ impl ExpectedState {
 
 struct MutationGuard {
     cache: Arc<Cache<CacheEntry>>,
+    persistent: Option<PersistentCache>,
     path: Arc<str>,
     expected: ExpectedState,
     permit: Option<PathPermit>,
+    l2_fence: Option<FenceGuard>,
     armed: bool,
 }
 
 impl MutationGuard {
     fn new(
         cache: Arc<Cache<CacheEntry>>,
+        persistent: Option<PersistentCache>,
         path: Arc<str>,
         mut expected: ExpectedState,
         permit: PathPermit,
@@ -579,15 +598,60 @@ impl MutationGuard {
         expected.capture_cached(cache.get(path.as_ref()));
         Self {
             cache,
+            persistent,
             path,
             expected,
             permit: Some(permit),
-            armed: false,
+            l2_fence: None,
+            armed: true,
         }
     }
 
-    fn arm(&mut self) {
-        self.armed = true;
+    fn changed<R>(mut self, current_at: Option<SequencePoint>, apply: impl FnOnce() -> R) -> R {
+        self.begin_path_change();
+        let result = apply();
+        if let Some(current_at) = current_at {
+            self.expected.advance(current_at);
+        }
+        self.invalidate_l2();
+        self.armed = false;
+        self.permit.take();
+        result
+    }
+
+    fn conflict(mut self) {
+        self.begin_path_change();
+        self.invalidate_expected();
+        self.invalidate_l2();
+        self.armed = false;
+        self.permit.take();
+    }
+
+    fn uncertain(mut self) {
+        self.begin_path_change();
+        self.make_uncertain();
+        self.invalidate_l2();
+        self.armed = false;
+        self.permit.take();
+    }
+
+    fn unchanged(mut self) {
+        self.armed = false;
+        self.permit.take();
+    }
+
+    fn begin_path_change(&mut self) {
+        if self.l2_fence.is_some() {
+            return;
+        }
+        let Some(persistent) = &self.persistent else {
+            return;
+        };
+        let permit = self
+            .permit
+            .as_ref()
+            .expect("an active mutation retains its path permit");
+        self.l2_fence = persistent.begin_fence(permit.state.l2_fence.clone(), permit.state.clone());
     }
 
     fn invalidate_expected(&self) {
@@ -601,22 +665,20 @@ impl MutationGuard {
         self.cache.delete(&self.path);
     }
 
-    fn finish(mut self) {
-        self.armed = false;
-        self.permit.take();
-    }
-
-    fn finish_uncertain(mut self) {
-        self.make_uncertain();
-        self.armed = false;
-        self.permit.take();
+    fn invalidate_l2(&mut self) {
+        let (Some(persistent), Some(fence)) = (&self.persistent, self.l2_fence.take()) else {
+            return;
+        };
+        persistent.invalidate(self.path.clone(), fence);
     }
 }
 
 impl Drop for MutationGuard {
     fn drop(&mut self) {
         if self.armed {
+            self.begin_path_change();
             self.make_uncertain();
+            self.invalidate_l2();
         }
         self.permit.take();
     }
@@ -639,6 +701,8 @@ pub struct CachedStore {
     // cache-hit stat.
     body_reads: Arc<AtomicU64>,
     coordinator: PathCoordinator,
+    metrics: Arc<CacheMetrics>,
+    persistent: Option<PersistentCache>,
 }
 
 struct FlightLeader {
@@ -682,14 +746,26 @@ impl Drop for FlightLeader {
 
 impl CachedStore {
     /// Creates a cached store over `backend`, sharing the single byte-bounded
-    /// LRU sized by `max_size` and ordering evidence on `timeline`.
-    pub fn new(backend: Arc<dyn Backend>, max_size: usize, timeline: Timeline) -> Self {
+    /// LRU sized by `max_size`, ordering evidence on `timeline`, and optionally
+    /// using an already-open persistent encoded-body tier.
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        max_size: usize,
+        timeline: Timeline,
+        persistent: Option<PersistentCache>,
+    ) -> Self {
+        let metrics = persistent
+            .as_ref()
+            .map(PersistentCache::metrics)
+            .unwrap_or_else(|| Arc::new(CacheMetrics::new()));
         CachedStore {
             backend,
             cache: Arc::new(Cache::new(max_size)),
             timeline,
             body_reads: Arc::new(AtomicU64::new(0)),
             coordinator: PathCoordinator::new(),
+            metrics,
+            persistent,
         }
     }
 
@@ -699,6 +775,18 @@ impl CachedStore {
     /// conditional check that returned "not modified".
     pub fn body_reads(&self) -> u64 {
         self.body_reads.load(Ordering::SeqCst)
+    }
+
+    /// Returns cache activity since the previous sample.
+    pub fn cache_stats_and_reset(&self) -> CacheStats {
+        self.metrics.snapshot_and_reset()
+    }
+
+    /// Drains and syncs the persistent cache, when configured.
+    pub async fn shutdown(&self) {
+        if let Some(persistent) = &self.persistent {
+            persistent.shutdown().await;
+        }
     }
 
     pub(crate) fn typed<C: Codec>(&self) -> TypedCachedStore<C> {
@@ -719,8 +807,10 @@ impl CachedStore {
     ) -> Result<Observation<C::Value>, StorageError> {
         let key: Arc<str> = Arc::from(path);
         if let Some(obs) = self.try_hit::<C>(&key, req)? {
+            self.metrics.l1_hit();
             return Ok(obs);
         }
+        self.metrics.l1_miss();
         let fetched = self.fetch::<C>(&key, req, None).await?;
         self.to_observation::<C>(&key, fetched)
     }
@@ -750,7 +840,9 @@ impl CachedStore {
         let path = Arc::clone(&obs.path);
         if let Some(current) = self.try_hit::<C>(&path, req)? {
             if current.revision == obs.revision {
-                obs.evidence.advance(current.current_after());
+                if let Some(current_after) = current.current_after() {
+                    obs.evidence.advance(current_after);
+                }
                 return Ok(ObservationCheck::Current);
             }
             return Ok(ObservationCheck::Changed(current));
@@ -758,9 +850,15 @@ impl CachedStore {
         let fetched = self.fetch::<C>(&path, req, Some(obs)).await?;
         let current = self.to_observation::<C>(&path, fetched)?;
         if same_observed_state(obs, &current) {
-            let merged = obs.current_after().max(current.current_after());
-            obs.evidence.advance(merged);
-            current.evidence.advance(merged);
+            if let Some(merged) = obs
+                .current_after()
+                .into_iter()
+                .chain(current.current_after())
+                .max()
+            {
+                obs.evidence.advance(merged);
+                current.evidence.advance(merged);
+            }
             Ok(ObservationCheck::Current)
         } else {
             Ok(ObservationCheck::Changed(current))
@@ -782,27 +880,31 @@ impl CachedStore {
         let path: Arc<str> = Arc::from(path);
         let expected = ExpectedState::absent(expected_absence.map(|obs| obs.evidence.clone()));
         let permit = self.coordinator.acquire(&path).await;
-        let mut guard = MutationGuard::new(self.cache.clone(), path.clone(), expected, permit);
+        let guard = MutationGuard::new(
+            self.cache.clone(),
+            self.persistent.clone(),
+            path.clone(),
+            expected,
+            permit,
+        );
         let invoked = self.next_invocation();
-        guard.arm();
         match self.backend.write_if_not_exists(&path, bytes).await {
             Ok(v) => {
-                let obs = self.commit_write::<C>(&path, value, size, Revision(v), invoked);
-                guard.expected.advance(invoked);
-                guard.finish();
+                let obs = guard.changed(Some(invoked), || {
+                    self.commit_write::<C>(&path, value, size, Revision(v), invoked)
+                });
                 Ok(CasResult::Committed(obs))
             }
             Err(BackendError::Precondition) => {
-                guard.invalidate_expected();
-                guard.finish();
+                guard.conflict();
                 Ok(CasResult::Conflict)
             }
             Err(BackendError::Unavailable(msg)) => {
-                guard.finish_uncertain();
+                guard.uncertain();
                 Err(StorageError::Unavailable(msg))
             }
             Err(e) => {
-                guard.finish();
+                guard.unchanged();
                 Err(e.into())
             }
         }
@@ -827,37 +929,39 @@ impl CachedStore {
             .ok_or_else(|| StorageError::other("CAS requires a present observation"))?;
         let expected_state = ExpectedState::present(revision.clone(), expected.evidence.clone());
         let permit = self.coordinator.acquire(&path).await;
-        let mut guard =
-            MutationGuard::new(self.cache.clone(), path.clone(), expected_state, permit);
+        let guard = MutationGuard::new(
+            self.cache.clone(),
+            self.persistent.clone(),
+            path.clone(),
+            expected_state,
+            permit,
+        );
         let invoked = self.next_invocation();
-        guard.arm();
         match self
             .backend
             .write_if(&path, bytes, revision.version())
             .await
         {
             Ok(v) => {
-                let obs = self.commit_write::<C>(&path, value, size, Revision(v), invoked);
-                guard.expected.advance(invoked);
-                guard.finish();
+                let obs = guard.changed(Some(invoked), || {
+                    self.commit_write::<C>(&path, value, size, Revision(v), invoked)
+                });
                 Ok(CasResult::Committed(obs))
             }
             Err(BackendError::NotFound) => {
-                self.publish_absent(&path, invoked, None);
-                guard.finish();
+                guard.changed(None, || self.install_absent(&path, invoked, None));
                 Ok(CasResult::Conflict)
             }
             Err(BackendError::Precondition) => {
-                guard.invalidate_expected();
-                guard.finish();
+                guard.conflict();
                 Ok(CasResult::Conflict)
             }
             Err(BackendError::Unavailable(msg)) => {
-                guard.finish_uncertain();
+                guard.uncertain();
                 Err(StorageError::Unavailable(msg))
             }
             Err(e) => {
-                guard.finish();
+                guard.unchanged();
                 Err(e.into())
             }
         }
@@ -878,47 +982,51 @@ impl CachedStore {
         let path = expected.path.clone();
         let expected_state = ExpectedState::present(revision.clone(), expected.evidence.clone());
         let permit = self.coordinator.acquire(&path).await;
-        let mut guard =
-            MutationGuard::new(self.cache.clone(), path.clone(), expected_state, permit);
+        let guard = MutationGuard::new(
+            self.cache.clone(),
+            self.persistent.clone(),
+            path.clone(),
+            expected_state,
+            permit,
+        );
         let invoked = self.next_invocation();
-        guard.arm();
         match self.backend.delete_if(&path, revision.version()).await {
             Ok(()) => {
-                let evidence = self.install_absent(&path, invoked, None);
-                guard.expected.advance(invoked);
-                let observation = Observation {
-                    path: path.clone(),
-                    value: None,
-                    revision: None,
-                    evidence,
-                    cache_hit: false,
-                };
-                guard.finish();
+                let observation = guard.changed(Some(invoked), || {
+                    let evidence = self.install_absent(&path, invoked, None);
+                    Observation {
+                        path: path.clone(),
+                        value: None,
+                        revision: None,
+                        evidence,
+                        cache_hit: false,
+                    }
+                });
                 Ok(observation)
             }
             Err(BackendError::NotFound) => {
-                let evidence = self.install_absent(&path, invoked, None);
-                let observation = Observation {
-                    path: path.clone(),
-                    value: None,
-                    revision: None,
-                    evidence,
-                    cache_hit: false,
-                };
-                guard.finish();
+                let observation = guard.changed(None, || {
+                    let evidence = self.install_absent(&path, invoked, None);
+                    Observation {
+                        path: path.clone(),
+                        value: None,
+                        revision: None,
+                        evidence,
+                        cache_hit: false,
+                    }
+                });
                 Ok(observation)
             }
             Err(BackendError::Precondition) => {
-                guard.invalidate_expected();
-                guard.finish();
+                guard.conflict();
                 Err(StorageError::Precondition)
             }
             Err(BackendError::Unavailable(msg)) => {
-                guard.finish_uncertain();
+                guard.uncertain();
                 Err(StorageError::Unavailable(msg))
             }
             Err(e) => {
-                guard.finish();
+                guard.unchanged();
                 Err(e.into())
             }
         }
@@ -963,6 +1071,10 @@ impl CachedStore {
                     return Ok(None);
                 }
                 let value = downcast::<C>(path, value)?;
+                if let Some(persistent) = &self.persistent {
+                    let state = self.coordinator.state(path);
+                    persistent.record_present_hit(path, &state.l2_fence, state.clone());
+                }
                 Ok(Some(Observation {
                     path: path.clone(),
                     value: Some(value),
@@ -1010,10 +1122,24 @@ impl CachedStore {
                     if let Some(observed) = self.try_hit::<C>(path, req)? {
                         return Ok(fetch_from_observation(&observed, true));
                     }
-                    let seed = self.present_seed::<C>(path, fallback)?;
+                    let state = permit.state.clone();
+                    let mut seed = self.present_seed::<C>(path, fallback)?;
+                    if seed.is_none()
+                        && let Some(l2_seed) = self.load_l2::<C>(path, &state).await
+                    {
+                        if req == Requirement::Any {
+                            return Ok(FetchResult {
+                                value: Some(l2_seed.value),
+                                revision: Some(l2_seed.revision),
+                                evidence: l2_seed.evidence,
+                                cache_hit: true,
+                            });
+                        }
+                        seed = Some(l2_seed);
+                    }
                     let invoked = self.next_invocation();
                     let leader = permit.lead_read(invoked);
-                    let result = self.do_fetch::<C>(path, invoked, seed).await;
+                    let result = self.do_fetch::<C>(path, invoked, seed, &state).await;
                     leader.complete(match &result {
                         Ok(fetched) => FlightOutcome::Success(fetched.clone()),
                         Err(error) => FlightOutcome::Error(error.clone()),
@@ -1040,11 +1166,13 @@ impl CachedStore {
         }) = self.cache.get(path)
         {
             downcast::<C>(path, value.clone())?;
+            let from_l2 = evidence.get().is_none();
             return Ok(Some(PresentSeed {
                 value,
                 size,
                 revision,
                 evidence,
+                from_l2,
             }));
         }
         let Some(observed) = fallback else {
@@ -1059,7 +1187,84 @@ impl CachedStore {
             size: C::size(value),
             revision: revision.clone(),
             evidence: observed.evidence.clone(),
+            from_l2: observed.evidence.get().is_none(),
         }))
+    }
+
+    async fn load_l2<C: Codec>(
+        &self,
+        path: &Arc<str>,
+        state: &Arc<PathState>,
+    ) -> Option<PresentSeed> {
+        let persistent = self.persistent.clone()?;
+        if state.l2_fence.is_active() || !persistent.is_enabled() {
+            return None;
+        }
+        let encoded = match rt::timeout(
+            PERSISTENT_CACHE_LOOKUP_TIMEOUT,
+            persistent.lookup(path.clone()),
+        )
+        .await
+        {
+            Ok(encoded) => encoded?,
+            Err(_) => {
+                persistent.disable_slow_lookup();
+                return None;
+            }
+        };
+        self.decode_l2::<C>(path, state, persistent, encoded)
+    }
+
+    fn decode_l2<C: Codec>(
+        &self,
+        path: &Arc<str>,
+        state: &Arc<PathState>,
+        persistent: PersistentCache,
+        encoded: EncodedBody,
+    ) -> Option<PresentSeed> {
+        let token = match String::from_utf8(encoded.revision) {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(path = %path, %error, "discarding invalid persistent-cache revision");
+                persistent.reject_corrupt_candidate(
+                    path.clone(),
+                    state.l2_fence.clone(),
+                    state.clone(),
+                );
+                return None;
+            }
+        };
+        let decoded = match C::decode(path, &encoded.body) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!(path = %path, %error, "discarding undecodable persistent-cache body");
+                persistent.reject_corrupt_candidate(
+                    path.clone(),
+                    state.l2_fence.clone(),
+                    state.clone(),
+                );
+                return None;
+            }
+        };
+        let size = C::size(&decoded);
+        let value: Arc<dyn Any + Send + Sync> = Arc::new(decoded);
+        let revision = Revision(backend::Version::new(token));
+        let evidence = self.install_present(
+            path,
+            value.clone(),
+            size,
+            revision.clone(),
+            None,
+            Some(Evidence::unverified()),
+        );
+        persistent.record_present_hit(path, &state.l2_fence, state.clone());
+        Some(PresentSeed {
+            value,
+            size,
+            revision,
+            evidence,
+            from_l2: true,
+        })
     }
 
     /// Runs one backend read for a path: a version-conditional check when
@@ -1069,25 +1274,39 @@ impl CachedStore {
         path: &str,
         invoked: SequencePoint,
         seed: Option<PresentSeed>,
+        state: &Arc<PathState>,
     ) -> Result<FetchResult, StorageError> {
         match seed {
-            Some(seed) => match self
-                .backend
-                .read_if_modified(path, seed.revision.version())
-                .await
-            {
-                Ok(reply) => {
-                    self.publish_present::<C>(path, &reply.contents, reply.version, invoked)
+            Some(seed) => {
+                if seed.from_l2 {
+                    self.metrics.l2_conditional_validation();
                 }
-                Err(BackendError::Precondition) => Ok(self.publish_unchanged(path, seed, invoked)),
-                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, None)),
-                Err(e) => Err(e.into()),
-            },
+                match self
+                    .backend
+                    .read_if_modified(path, seed.revision.version())
+                    .await
+                {
+                    Ok(reply) => self.publish_present::<C>(
+                        path,
+                        reply.contents,
+                        reply.version,
+                        invoked,
+                        state,
+                    ),
+                    Err(BackendError::Precondition) => {
+                        Ok(self.publish_unchanged(path, seed, invoked))
+                    }
+                    Err(BackendError::NotFound) => {
+                        Ok(self.publish_absent(path, invoked, None, state))
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
             None => match self.backend.read(path).await {
                 Ok(reply) => {
-                    self.publish_present::<C>(path, &reply.contents, reply.version, invoked)
+                    self.publish_present::<C>(path, reply.contents, reply.version, invoked, state)
                 }
-                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, None)),
+                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, None, state)),
                 Err(e) => Err(e.into()),
             },
         }
@@ -1097,23 +1316,41 @@ impl CachedStore {
     fn publish_present<C: Codec>(
         &self,
         path: &str,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         version: backend::Version,
         invoked: SequencePoint,
+        state: &Arc<PathState>,
     ) -> Result<FetchResult, StorageError> {
         self.body_reads.fetch_add(1, Ordering::SeqCst);
-        let decoded = match C::decode(path, bytes) {
+        let decoded = match C::decode(path, &bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
+                let fence = self.begin_read_fence(state);
                 self.cache.delete(path);
+                self.invalidate_read_l2(Arc::from(path), fence);
                 return Err(error);
             }
         };
         let size = C::size(&decoded);
         let value: Arc<dyn Any + Send + Sync> = Arc::new(decoded);
         let revision = Revision(version);
-        let evidence =
-            self.install_present(path, value.clone(), size, revision.clone(), invoked, None);
+        let fence = self.begin_read_fence(state);
+        let evidence = self.install_present(
+            path,
+            value.clone(),
+            size,
+            revision.clone(),
+            Some(invoked),
+            None,
+        );
+        if let (Some(persistent), Some(fence)) = (&self.persistent, fence) {
+            persistent.replace(
+                Arc::from(path),
+                revision.serialize().as_bytes().to_vec(),
+                bytes,
+                fence,
+            );
+        }
         Ok(FetchResult {
             value: Some(value),
             revision: Some(revision),
@@ -1136,7 +1373,7 @@ impl CachedStore {
             seed.value.clone(),
             seed.size,
             seed.revision.clone(),
-            invoked,
+            Some(invoked),
             Some(seed.evidence),
         );
         FetchResult {
@@ -1153,13 +1390,28 @@ impl CachedStore {
         path: &str,
         invoked: SequencePoint,
         preferred: Option<Evidence>,
+        state: &Arc<PathState>,
     ) -> FetchResult {
+        let fence = self.begin_read_fence(state);
         let evidence = self.install_absent(path, invoked, preferred);
+        self.invalidate_read_l2(Arc::from(path), fence);
         FetchResult {
             value: None,
             revision: None,
             evidence,
             cache_hit: false,
+        }
+    }
+
+    fn begin_read_fence(&self, state: &Arc<PathState>) -> Option<FenceGuard> {
+        self.persistent
+            .as_ref()?
+            .begin_fence(state.l2_fence.clone(), state.clone())
+    }
+
+    fn invalidate_read_l2(&self, path: Arc<str>, fence: Option<FenceGuard>) {
+        if let (Some(persistent), Some(fence)) = (&self.persistent, fence) {
+            persistent.invalidate(path, fence);
         }
     }
 
@@ -1173,7 +1425,8 @@ impl CachedStore {
         invoked: SequencePoint,
     ) -> Observation<C::Value> {
         let erased: Arc<dyn Any + Send + Sync> = value.clone();
-        let evidence = self.install_present(path, erased, size, revision.clone(), invoked, None);
+        let evidence =
+            self.install_present(path, erased, size, revision.clone(), Some(invoked), None);
         Observation {
             path: Arc::from(path),
             value: Some(value),
@@ -1191,11 +1444,15 @@ impl CachedStore {
         value: Arc<dyn Any + Send + Sync>,
         size: usize,
         revision: Revision,
-        invoked: SequencePoint,
+        verified_after: Option<SequencePoint>,
         preferred: Option<Evidence>,
     ) -> Evidence {
-        let preferred = preferred.unwrap_or_else(|| Evidence::new(invoked));
-        preferred.advance(invoked);
+        let preferred = preferred.unwrap_or_else(|| {
+            verified_after.map_or_else(Evidence::unverified, Evidence::verified)
+        });
+        if let Some(invoked) = verified_after {
+            preferred.advance(invoked);
+        }
         let mut out: Option<Evidence> = None;
         self.cache.update(path, |old| match old {
             Some(CacheEntry {
@@ -1207,7 +1464,9 @@ impl CachedStore {
                         evidence,
                     },
             }) if old_revision == revision => {
-                evidence.advance(invoked);
+                if let Some(invoked) = verified_after {
+                    evidence.advance(invoked);
+                }
                 out = Some(evidence.clone());
                 Some(CacheEntry {
                     state: EntryState::Present {
@@ -1240,7 +1499,7 @@ impl CachedStore {
         invoked: SequencePoint,
         preferred: Option<Evidence>,
     ) -> Evidence {
-        let preferred = preferred.unwrap_or_else(|| Evidence::new(invoked));
+        let preferred = preferred.unwrap_or_else(|| Evidence::verified(invoked));
         preferred.advance(invoked);
         let mut out: Option<Evidence> = None;
         self.cache.update(path, |old| match old {
@@ -1399,10 +1658,10 @@ impl<C: Codec> TypedCachedStore<C> {
 }
 
 /// Reports whether an entry confirmed current at `evidence` satisfies `req`.
-fn satisfies(evidence: SequencePoint, req: Requirement) -> bool {
+fn satisfies(evidence: Option<SequencePoint>, req: Requirement) -> bool {
     match req {
         Requirement::Any => true,
-        Requirement::AtLeast(t) => evidence >= t,
+        Requirement::AtLeast(t) => evidence.is_some_and(|evidence| evidence >= t),
     }
 }
 
@@ -1450,6 +1709,8 @@ mod tests {
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
+    use glassdb_data::DatabaseUuid;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::timeline::TimeSource;
@@ -1605,7 +1866,7 @@ mod tests {
     // A store over a recording memory backend, plus the op log for counting
     // backend traffic.
     fn bytes_store(backend: Arc<dyn Backend>) -> TypedCachedStore<Bytes> {
-        CachedStore::new(backend, 1 << 20, Timeline::new()).typed()
+        CachedStore::new(backend, 1 << 20, Timeline::new(), None).typed()
     }
 
     fn store_rec() -> (TypedCachedStore<Bytes>, OpLog) {
@@ -1621,6 +1882,49 @@ mod tests {
 
     fn clear(log: &OpLog) {
         log.lock().unwrap().clear();
+    }
+
+    fn cache_uuid() -> DatabaseUuid {
+        let mut bytes = [7; 16];
+        bytes[6] = 0x47;
+        bytes[8] = 0x87;
+        DatabaseUuid::from_bytes(bytes).unwrap()
+    }
+
+    async fn persistent_store(
+        directory: &TempDir,
+        backend: Arc<dyn Backend>,
+        timeline: Timeline,
+    ) -> CachedStore {
+        let persistent = PersistentCache::open_with_test_geometry(
+            PersistentCacheConfig {
+                directory: directory.path().to_path_buf(),
+                capacity_bytes: 2 * 1024 * 1024,
+            },
+            "db",
+            cache_uuid(),
+        )
+        .await;
+        CachedStore::new(backend, 1 << 20, timeline, Some(persistent))
+    }
+
+    #[cfg(sim)]
+    #[test]
+    fn persistent_cache_fails_open_in_deterministic_simulation() {
+        let directory = TempDir::new().unwrap();
+        let cache_file = directory.path().join("l2.cache");
+        rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
+            let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let store = persistent_store(&directory, backend, Timeline::new()).await;
+            assert!(
+                store
+                    .persistent
+                    .as_ref()
+                    .is_some_and(|persistent| !persistent.is_enabled())
+            );
+        });
+
+        assert!(!cache_file.exists());
     }
 
     async fn create_value(
@@ -1665,7 +1969,10 @@ mod tests {
         let t = s.store.timeline.now();
         let o2 = s.read("p", Requirement::AtLeast(t)).await.unwrap();
         assert_eq!(count(&log, "read_if_modified"), 1, "stale entry is checked");
-        assert!(o2.current_after() >= t, "watermark advanced to the bound");
+        assert!(
+            o2.current_after() >= Some(t),
+            "watermark advanced to the bound"
+        );
         assert!(o2.current_after() >= o1.current_after(), "never regresses");
     }
 
@@ -1679,13 +1986,13 @@ mod tests {
             .read("p", Requirement::AtLeast(s.store.timeline.now()))
             .await
             .unwrap();
-        let w = o.current_after();
+        let w = o.current_after().unwrap();
         clear(&log);
 
         let o2 = s.read("p", Requirement::AtLeast(w)).await.unwrap();
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
-        assert!(o2.current_after() >= w);
+        assert!(o2.current_after() >= Some(w));
     }
 
     // Model invariant: `Any` never returns an entry a conflict invalidated. A
@@ -1771,7 +2078,7 @@ mod tests {
             .unwrap()
             .into_observation()
             .unwrap();
-        let w = obs.current_after();
+        let w = obs.current_after().unwrap();
 
         replace_value(&s2, &obs, v(b"b")).await;
         s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> uncertain
@@ -1843,10 +2150,10 @@ mod tests {
             .into_observation()
             .unwrap();
         assert!(
-            obs.current_after() >= before,
+            obs.current_after() >= Some(before),
             "expected observation advanced past the CAS start"
         );
-        assert!(nb.current_after() >= before);
+        assert!(nb.current_after() >= Some(before));
         assert_eq!(nb.value().unwrap().as_slice(), b"b");
 
         let got = s.read("p", Requirement::Any).await.unwrap();
@@ -1869,8 +2176,8 @@ mod tests {
         let before = store.store.timeline.now();
         replace_value(&store, &expected, v(b"b")).await;
 
-        assert!(expected.current_after() >= before);
-        assert!(reloaded.current_after() >= before);
+        assert!(expected.current_after() >= Some(before));
+        assert!(reloaded.current_after() >= Some(before));
     }
 
     // Model invariant: a CAS conflict neither advances the expected observation
@@ -1894,7 +2201,8 @@ mod tests {
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
         assert!(!r.committed());
         assert!(
-            obs.current_after() < before,
+            obs.current_after()
+                .is_some_and(|watermark| watermark < before),
             "conflict must not advance the observation"
         );
         let got = s1.read("p", Requirement::Any).await.unwrap();
@@ -1937,7 +2245,8 @@ mod tests {
         hook.clear_after();
 
         assert!(
-            obs.current_after() < before,
+            obs.current_after()
+                .is_some_and(|watermark| watermark < before),
             "an in-doubt outcome must not advance the observation"
         );
         // The path became uncertain, so Any re-reads and finds the write
@@ -2032,7 +2341,7 @@ mod tests {
             .await
             .unwrap()
             .current_after();
-        assert!(w1 >= t1);
+        assert!(w1 >= Some(t1));
         let t2 = s.store.timeline.now();
         let w2 = s
             .read("p", Requirement::AtLeast(t2))
@@ -2078,8 +2387,8 @@ mod tests {
         let absent = s.delete(&expected).await.unwrap();
 
         assert!(absent.is_absent());
-        assert!(absent.current_after() >= before);
-        assert!(expected.current_after() >= before);
+        assert!(absent.current_after() >= Some(before));
+        assert!(expected.current_after() >= Some(before));
         assert_eq!(count(&log, "delete_if"), 1);
         clear(&log);
         assert!(s.read("p", Requirement::Any).await.unwrap().is_absent());
@@ -2107,8 +2416,12 @@ mod tests {
         let absent = local.delete(&expected).await.unwrap();
 
         assert!(absent.is_absent());
-        assert!(absent.current_after() >= before);
-        assert!(expected.current_after() < before);
+        assert!(absent.current_after() >= Some(before));
+        assert!(
+            expected
+                .current_after()
+                .is_some_and(|watermark| watermark < before)
+        );
         assert_eq!(count(&log, "delete_if"), 1);
         clear(&log);
         assert!(local.read("p", Requirement::Any).await.unwrap().is_absent());
@@ -2190,7 +2503,11 @@ mod tests {
             local.delete(&expected).await,
             Err(StorageError::Precondition)
         ));
-        assert!(expected.current_after() < before);
+        assert!(
+            expected
+                .current_after()
+                .is_some_and(|watermark| watermark < before)
+        );
         clear(&log);
 
         let current = local.read("p", Requirement::Any).await.unwrap();
@@ -2228,7 +2545,11 @@ mod tests {
         ));
         hook.clear_after();
 
-        assert!(expected.current_after() < before);
+        assert!(
+            expected
+                .current_after()
+                .is_some_and(|watermark| watermark < before)
+        );
         clear(&log);
         assert!(store.read("p", Requirement::Any).await.unwrap().is_absent());
         assert_eq!(count(&log, "read"), 1);
@@ -2262,7 +2583,11 @@ mod tests {
         ));
         hook.clear_before();
 
-        assert!(expected.current_after() < before);
+        assert!(
+            expected
+                .current_after()
+                .is_some_and(|watermark| watermark < before)
+        );
         clear(&log);
         let current = store.read("p", Requirement::Any).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"a");
@@ -2286,7 +2611,12 @@ mod tests {
     // A path used through a mismatched typed store is an internal error.
     #[tokio::test]
     async fn wrong_decoded_type_is_internal_error() {
-        let store = CachedStore::new(Arc::new(MemoryBackend::new()), 1 << 20, Timeline::new());
+        let store = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            Timeline::new(),
+            None,
+        );
         let bytes = store.typed::<Bytes>();
         let ints = store.typed::<Ints>();
         create_value(&bytes, "p", v(b"abcd")).await;
@@ -2717,8 +3047,13 @@ mod tests {
         let clock = Arc::new(TestClock::default());
         clock.set(Duration::from_secs(10));
         let timeline = Timeline::with_source(clock);
-        let _store: TypedCachedStore<Bytes> =
-            CachedStore::new(Arc::new(MemoryBackend::new()), 1 << 20, timeline.clone()).typed();
+        let _store: TypedCachedStore<Bytes> = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            timeline.clone(),
+            None,
+        )
+        .typed();
 
         assert_eq!(
             Requirement::within(&timeline, Duration::from_secs(3)),
@@ -2760,7 +3095,7 @@ mod tests {
         clock.set(Duration::from_secs(1));
         let timeline = Timeline::with_source(clock.clone());
         let store: TypedCachedStore<Bytes> =
-            CachedStore::new(hooked, 1 << 20, timeline.clone()).typed();
+            CachedStore::new(hooked, 1 << 20, timeline.clone(), None).typed();
         let read_store = store.clone();
         let read =
             tokio::spawn(async move { read_store.read("p", Requirement::Any).await.unwrap() });
@@ -2771,7 +3106,11 @@ mod tests {
         release.notify_one();
         let observed = read.await.unwrap();
 
-        assert!(observed.current_after() < later);
+        assert!(
+            observed
+                .current_after()
+                .is_some_and(|watermark| watermark < later)
+        );
     }
 
     #[tokio::test]
@@ -2801,7 +3140,7 @@ mod tests {
             }
         });
         let store: TypedCachedStore<Bytes> =
-            CachedStore::new(hooked, 1 << 20, Timeline::new()).typed();
+            CachedStore::new(hooked, 1 << 20, Timeline::new(), None).typed();
         let leader = tokio::spawn({
             let store = store.clone();
             async move { store.read("p", Requirement::Any).await }
@@ -2817,5 +3156,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(observed.value().unwrap().as_slice(), b"one");
+    }
+
+    #[tokio::test]
+    async fn persistent_hit_is_unverified_until_a_conditional_read() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(MemoryBackend::new());
+        backend
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
+        let erased: Arc<dyn Backend> = backend.clone();
+
+        let first = persistent_store(&directory, erased.clone(), Timeline::new()).await;
+        let first_typed: TypedCachedStore<Bytes> = first.typed();
+        let loaded = first_typed.read("p", Requirement::Any).await.unwrap();
+        assert!(loaded.current_after().is_some());
+        drop(first_typed);
+        first.shutdown().await;
+        drop(first);
+
+        let timeline = Timeline::new();
+        let reopened = persistent_store(&directory, erased, timeline.clone()).await;
+        let typed: TypedCachedStore<Bytes> = reopened.typed();
+        let restored = typed.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(restored.value().unwrap().as_slice(), b"one");
+        assert_eq!(restored.current_after(), None);
+        assert!(restored.cache_hit());
+        assert_eq!(reopened.body_reads(), 0);
+
+        let bound = timeline.now();
+        let verified = typed.read("p", Requirement::AtLeast(bound)).await.unwrap();
+        assert!(verified.current_after() >= Some(bound));
+        assert_eq!(reopened.body_reads(), 0);
+        let stats = reopened.cache_stats_and_reset();
+        assert_eq!(stats.l2_hits, 1, "cache stats: {stats:?}");
+        assert_eq!(
+            stats.l2_conditional_validations, 1,
+            "cache stats: {stats:?}"
+        );
+
+        drop(typed);
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mutation_invalidates_a_persisted_body_without_admitting_the_write() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(MemoryBackend::new());
+        backend
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
+        let erased: Arc<dyn Backend> = backend.clone();
+
+        let first = persistent_store(&directory, erased.clone(), Timeline::new()).await;
+        let first_typed: TypedCachedStore<Bytes> = first.typed();
+        let old = first_typed.read("p", Requirement::Any).await.unwrap();
+        let changed = first_typed.compare_and_swap(&old, v(b"two")).await.unwrap();
+        assert!(changed.committed());
+        drop(first_typed);
+        first.shutdown().await;
+        drop(first);
+
+        let reopened = persistent_store(&directory, erased, Timeline::new()).await;
+        let typed: TypedCachedStore<Bytes> = reopened.typed();
+        let loaded = typed.read("p", Requirement::Any).await.unwrap();
+        assert_eq!(loaded.value().unwrap().as_slice(), b"two");
+        assert!(loaded.current_after().is_some());
+        assert_eq!(reopened.body_reads(), 1);
+        let stats = reopened.cache_stats_and_reset();
+        assert_eq!(stats.l2_hits, 0, "cache stats: {stats:?}");
+        assert_eq!(stats.l2_misses, 1, "cache stats: {stats:?}");
+
+        drop(typed);
+        reopened.shutdown().await;
     }
 }
