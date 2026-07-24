@@ -7,6 +7,14 @@ Proposed.
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md).
 
+[ADR-046](046-incarnation-addressed-collections.md) proposes the authoritative
+model for collection identity and path resolution, and [ADR-047] proposes its
+ordinary-transaction semantics. If these proceed, this ADR must version their
+ID-based parent directories; its reusable name-derived `_i` tombstone model does
+not carry forward.
+
+[ADR-047]: 047-transactional-collection-management.md
+
 On acceptance, this supersedes the ADR-016, ADR-018, and ADR-031 clauses that
 make the physical `_i` root authoritative for collection existence and
 parent-child membership. It also supersedes ADR-022's unconditional deletion

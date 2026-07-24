@@ -36,12 +36,20 @@ partition, which — made growable — resolves all four at once.
 A **B-link tree** of objects per collection (Lehman–Yao), mutated only by content
 CAS. Leaves are the shards; interior nodes are the range index.
 
+- **Collection identity** — every collection has an opaque, never-reused ID and
+  lives below `<db>/_c/<collection-id>/`. A reserved ID names the permanent,
+  regular root collection returned by `Database::root_collection()`. Each
+  collection root stores its bounded direct `child-name → collection-id`
+  directory; there is no database-wide path catalog
+  ([ADR-046](../adr/046-incarnation-addressed-collections.md)).
 - **Objects**
-  - _Root object_ (`_i`, fixed well-known path): **is** the tree's current root
+  - _Root object_ (`<db>/_c/<collection-id>/_i`): **is** the tree's current root
     node — a leaf while the collection is small, an index node once it grows —
-    and also carries the collection metadata (existence + subcollection list).
-    There is no separate anchor: the root keeps a fixed address, so height grows
-    by **splitting the root in place** and every descent starts at `_i`.
+    and also carries the direct child directory. Logical existence comes from
+    the exact ID stored in the parent's directory rather than physical-root
+    presence. There is no separate anchor: the root keeps a fixed address within
+    its incarnation, so height grows by **splitting the root in place** and every
+    descent starts at `_i`.
   - _Index node_ (interior, incl. the root at height ≥ 2): ordered separator keys
     → child pointers, a **high-key**, and a **right-sibling** link. Maps a key
     range to its child.
@@ -62,7 +70,8 @@ CAS. Leaves are the shards; interior nodes are the range index.
 - **Reads/writes (hot path)** — descend via cached interior nodes (incl. `_i`) to
   the leaf, read the leaf. If a node's high-key shows the key moved (a split raced
   the cache), **follow the right-sibling link** or re-descend from a refreshed
-  `_i`. No central read on a cache hit.
+  `_i`. An open handle routes by collection ID, without revalidating its logical
+  path. No central read on a cache hit.
 - **Split (grow)** — background; a root split grows height **in place** at `_i`.
   A split closes the node's exclusive **structural gate** for priority and mutual
   exclusion (wound-wait) but keeps ADR-031's **shrink-CAS linearization** and
@@ -98,6 +107,13 @@ CAS. Leaves are the shards; interior nodes are the range index.
   same predicate read locks to bound starvation
   ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
   [ADR-033](../adr/033-transactional-key-iteration.md)).
+- **Collection drop** — an ordinary transaction freezes topology and fences
+  every reachable or publishable node before removing the exact parent
+  `name → id` entry. The fence is carried in node coordination state, so strict
+  point operations detect a stale incarnation on the node they already access;
+  committed deletion adds no ancestry or root lookup. Logical removal is
+  immediate and physical prefix reclamation is asynchronous
+  ([ADR-047](../adr/047-transactional-collection-management.md)).
 - **Wound-wait / leases / GC** — unchanged mechanisms at leaf/index granularity;
   GC and recovery re-resolve a key's shard through the *current* topology, and a
   crash-orphaned split sibling is reclaimed from a **structural log entry**
@@ -119,7 +135,7 @@ single GET/CAS on `_i`.
 
 ```mermaid
 graph TD
-    Root["_i — root (leaf)<br/>range (-∞, +∞) · high-key +∞<br/>right-sibling → nil<br/>entries: user:42 → {lock, writer, …}<br/>+ collection metadata (subcollections)"]
+    Root["_i — root (leaf)<br/>range (-∞, +∞) · high-key +∞<br/>right-sibling → nil<br/>entries: user:42 → {lock, writer, …}<br/>+ child directory (name → ID)"]
 
     classDef root fill:#e8ecff,stroke:#5566aa,color:#111
     class Root root
@@ -132,7 +148,7 @@ them (height 1 → 2):
 
 ```mermaid
 graph TD
-    Root["_i — root (index) · high-key +∞<br/>(-∞, m) → L0<br/>[m, +∞) → L1<br/>+ collection metadata"]
+    Root["_i — root (index) · high-key +∞<br/>(-∞, m) → L0<br/>[m, +∞) → L1<br/>+ child directory (name → ID)"]
     Root --> L0["Leaf L0<br/>(-∞, m) · hi m<br/>apple, cat"]
     Root --> L1["Leaf L1<br/>[m, +∞) · hi +∞<br/>mango, pear"]
 
@@ -161,7 +177,7 @@ height 3). Only leaves hold key entries; interior nodes map ranges to children.
 
 ```mermaid
 graph TD
-    Root["_i — root (index) · hi +∞<br/>(-∞, m) → I1<br/>[m, +∞) → I2<br/>+ collection metadata"]
+    Root["_i — root (index) · hi +∞<br/>(-∞, m) → I1<br/>[m, +∞) → I2<br/>+ child directory (name → ID)"]
 
     Root --> I1["Index I1 · hi m<br/>(-∞, f) → L0<br/>[f, m) → L1"]
     Root --> I2["Index I2 · hi +∞<br/>[m, t) → L2<br/>[t, +∞) → L3"]
@@ -207,7 +223,7 @@ Notes:
   the range's start leaf and stops when a leaf's low bound passes the range end.
 - Only leaves hold key entries (lock/MVCC state); index nodes hold separator keys
   → child pointers. The root is the `_i` object itself — once the tree has grown
-  it holds separators (plus the collection metadata), not keys.
+  it holds separators (plus the child directory), not keys.
 
 ## Constituent ADRs
 
@@ -242,6 +258,17 @@ ADR — this overview and the diagrams above are the map into it.
   structural-log namespace.** *Accepted — implemented.* Keeps short-lived,
   low-cardinality split recovery records under database-wide `_s`, independent
   from transaction `_t` schema, GC, and scheduling.
+- **[ADR-046](../adr/046-incarnation-addressed-collections.md) —
+  Incarnation-addressed collection format.** *Proposed.* Replaces logical paths
+  as physical addresses with never-reused IDs, introduces the regular reserved
+  root collection and direct `name → ID` directories, and makes path resolution
+  fallible without yet changing transaction semantics.
+- **[ADR-047](../adr/047-transactional-collection-management.md) —
+  Transactional collection management.** *Proposed.* Builds ordinary
+  transaction create/open/list/drop on ADR-046, freezes collection topology, and
+  fences every reachable or publishable node through ADR-044's structural gate
+  before a non-empty collection is dropped without adding a lifecycle lookup to
+  the key hot path.
 
 Planned follow-on ADRs, as the open questions below resolve: merge/rebalance,
 split-point policy, and node fan-out/sizing.
@@ -255,17 +282,13 @@ split-point policy, and node fan-out/sizing.
 - **Hard object-size cap tuning.** The implemented defaults cap a node at 1 MiB
   and reserve 64 KiB for transient lock metadata. Content growth stops at the
   remaining 960 KiB; an individually unsplittable key and an overflowing
-  subcollection directory are permanent invalid-input errors. Future tuning may
-  still adjust those configurable defaults and their foreground-latency trade-off.
+  child directory are permanent invalid-input errors. Future tuning may still
+  adjust those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
   `AllowStale` seeding).
 - **Fast paths.** How the single read-write fast path (ADR-027) and read-only
   fast path interact with a stale cached descent.
-- **Subcollection directory.** It lives in the root object `_i`; whether it should
-  be split out or itself range-sharded when subcollections grow unbounded
-  (ADR-018's deferred item), and how much its churn coupling with root-level
-  index rewrites matters in practice.
 - **Node fan-out / sizing.** Interior fan-out and leaf soft cap vs tree height,
   CAS cost, and cache footprint — to be pinned by a benchmark plan.
 
@@ -279,4 +302,6 @@ shard *entry* model (ADR-017), transaction object (ADR-019), commit/write-back
 (ADR-023), and the shard-mutation coordinator (ADR-028/029), which the split
 plugs into as another coordinator-driven mutation. See the
 [ADR-031 status](../adr/031-dynamic-range-sharding.md#status) for the exact
-clauses.
+clauses. ADR-046 separately replaces path-derived collection identity and
+name-only child membership with direct `name → ID` directories; ADR-047 makes
+their management transactional.

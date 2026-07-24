@@ -14,6 +14,15 @@ ADR-017, the transaction object (ADR-019), the commit/write-back protocol
 (ADR-020), wound-wait/leases (ADR-021), GC (ADR-022), and the shard-mutation
 coordinator (ADR-028/029) all carry over unchanged.
 
+[ADR-046](046-incarnation-addressed-collections.md) proposes replacing this
+ADR's physical-root existence marker and name-only subcollection directory with
+direct parent mappings and incarnation-unique physical prefixes. [ADR-047]
+proposes transactional management and all-node deletion fencing on top, using
+ADR-044's structural gate for per-node quiescence. The B-link topology and key
+hot-path decisions here are unchanged.
+
+[ADR-047]: 047-transactional-collection-management.md
+
 ## Context
 
 Coordination state lives in a fixed set of `C = 1024` **hash** shard objects per
