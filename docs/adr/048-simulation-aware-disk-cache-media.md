@@ -1,4 +1,4 @@
-# ADR-046: Simulation-aware disk-cache media
+# ADR-048: Simulation-aware disk-cache media
 
 ## Status
 

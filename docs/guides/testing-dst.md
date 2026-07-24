@@ -10,7 +10,7 @@ graded against the five stated intents:
 4. Fuzz-guided exploration of edge cases
 5. Efficient
 
-Sources: ADR-008/010/011/012/013/046, `porting-go.md`, the
+Sources: ADR-008/010/011/012/013/048, `porting-go.md`, the
 `rt`/`exec`/`fault` modules, and the upstream documentation for
 [`madsim`](https://github.com/madsim-rs/madsim),
 [`turmoil`](https://github.com/tokio-rs/turmoil), and
@@ -22,7 +22,7 @@ assessment includes the filesystem simulation added in 0.7.1.
 The current approach is a **minimal in-repo deterministic executor** (~600 LOC)
 that redirects runtime-dependent operations and reuses the runtime-independent
 parts of `tokio`. Object-store faults are injected at the `Backend` trait rather
-than through a simulated network. ADR-046 applies the same principle to the
+than through a simulated network. ADR-048 applies the same principle to the
 optional disk cache through a narrow byte-level media model rather than a
 general simulated filesystem. For _this_ system — a **library over object
 storage** where clients coordinate only through the store and there is no
@@ -48,7 +48,7 @@ This costs ownership of a small executor, media model, and `--cfg sim` seam.
   a seeded RNG, and tokio's own `select!` branch RNG is seeded via `RngSeed`.
   Two schedulers provide a **schedule-tape** (libFuzzer bytes choose the next
   task) and **PCT** (randomized priorities + change points). `FaultBackend`
-  consumes an independent backend-fault tape. ADR-046 adds a third,
+  consumes an independent backend-fault tape. ADR-048 adds a third,
   media-fault stream and a byte-level `SimMedia` for the optional disk cache.
   Active only under `--cfg sim`; production is plain `tokio` plus `FileMedia`.
 
@@ -91,7 +91,7 @@ authority. Those facts drive the comparison:
 - The disk cache is the important exception: a simulated durable byte store is
   directly useful. Turmoil's filesystem is relevant prior art, but its general
   host/filesystem model and durability policy are broader and different from
-  the one exclusively owned cache container. ADR-046 keeps the existing guided
+  the one exclusively owned cache container. ADR-048 keeps the existing guided
   scheduler and adds only that narrow media seam.
 - Media durability and corruption are explored primarily at the
   `PersistentCache` boundary. Selected `CachedStore` simulations cover
@@ -270,7 +270,7 @@ This is the current approach's clearest win, and the reason it exists.
 **Where the alternatives would still win.** If GlassDB needed a real SDK client
 over a simulated network, or a broad POSIX-like filesystem shared by many files
 and hosts, Turmoil — optionally hardened with mad-turmoil — would be the
-better-matched tool. ADR-011 parks it as a future network option, and ADR-046
+better-matched tool. ADR-011 parks it as a future network option, and ADR-048
 keeps its filesystem usable as prior art or a future independent adapter. For
 the current objectives (guided transaction interleavings and deep
 single-container cache recovery), the in-repo executor remains the stronger
