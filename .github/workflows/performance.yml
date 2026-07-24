@@ -56,20 +56,26 @@ jobs:
       env:
         PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
       run: |
+        # Build baseline and candidate into separate target dirs. They are
+        # distinct source trees, so sharing one target dir lets cargo reuse a
+        # stale artifact from the other tree (e.g. glassdb-proto), producing
+        # spurious compile errors against outdated generated types.
         cargo build --release --manifest-path .perf-main/Cargo.toml \
+          --target-dir "$CARGO_TARGET_DIR/main" \
           --package glassdb-bench-score --bin autoresearch \
           --package glassdb-bench-scale --bin mixbench
-        install -m 755 "$CARGO_TARGET_DIR/release/autoresearch" \
+        install -m 755 "$CARGO_TARGET_DIR/main/release/autoresearch" \
           "$PERF_BIN/main-autoresearch"
-        install -m 755 "$CARGO_TARGET_DIR/release/mixbench" \
+        install -m 755 "$CARGO_TARGET_DIR/main/release/mixbench" \
           "$PERF_BIN/main-mixbench"
 
         cargo build --release \
+          --target-dir "$CARGO_TARGET_DIR/pr" \
           --package glassdb-bench-score --bin autoresearch \
           --package glassdb-bench-scale --bin mixbench
-        install -m 755 "$CARGO_TARGET_DIR/release/autoresearch" \
+        install -m 755 "$CARGO_TARGET_DIR/pr/release/autoresearch" \
           "$PERF_BIN/pr-autoresearch"
-        install -m 755 "$CARGO_TARGET_DIR/release/mixbench" \
+        install -m 755 "$CARGO_TARGET_DIR/pr/release/mixbench" \
           "$PERF_BIN/pr-mixbench"
 
     - name: Measure backend-operation score
