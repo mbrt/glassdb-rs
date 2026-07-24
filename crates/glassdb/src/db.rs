@@ -61,7 +61,7 @@ impl DatabaseBuilder {
     /// Enables the best-effort persistent encoded-body cache.
     ///
     /// The cache identity is derived automatically from the database name and
-    /// its persistent UUID. Production capacities must be at least 131 MiB.
+    /// its persistent ID. Production capacities must be at least 131 MiB.
     pub fn persistent_cache(mut self, config: PersistentCacheConfig) -> Self {
         self.persistent_cache = Some(config);
         self
@@ -128,16 +128,20 @@ impl DatabaseBuilder {
             )));
         }
         let backend = Arc::new(StatsBackend::new(b));
-        let database_uuid = check_or_create_db_meta(&backend, &name).await?;
+        let database_id = check_or_create_db_meta(&backend, &name).await?;
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let (persistent, last_sequence_point) = match persistent_cache {
+        let (persistent, timeline) = match persistent_cache {
             Some(config) => {
-                let opened = PersistentCache::open(config, &name, database_uuid).await;
-                (Some(opened.cache), opened.last_sequence_point)
+                let opened = PersistentCache::open(config, &name, database_id).await;
+                // ADR-045: PersistentCache keeps track of sequence points
+                // across restarts, so the timeline must start after the last
+                // recovered point. If done incorrectly, a stale object in cache
+                // could appear as newer than a fresh read from Backend
+                let timeline = Timeline::starting_after(opened.last_sequence_point);
+                (Some(opened.cache), timeline)
             }
-            None => (None, None),
+            None => (None, Timeline::new()),
         };
-        let timeline = Timeline::starting_after(last_sequence_point);
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
