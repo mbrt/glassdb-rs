@@ -705,7 +705,7 @@ revoke observations already retained by readers or transactions.
 `DatabaseBuilder::persistent_cache` optionally adds a fixed-capacity L2 in a
 caller-selected directory. Its public configuration contains only the directory
 and capacity; GlassDB derives the identity from the database name and persistent
-database UUID. Production geometry uses 64 MiB segments and requires at least
+database ID. Production geometry uses 64 MiB segments and requires at least
 131 MiB. L2 stores exact encoded present bodies, opaque revisions, and their
 currentness points, while L1 owns decoded values and live evidence cells.
 

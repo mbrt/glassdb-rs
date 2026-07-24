@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glassdb_concurr::rt;
-use glassdb_data::DatabaseUuid;
+use glassdb_data::DatabaseId;
 use rustix::fs::{FallocateFlags, FlockOperation};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, oneshot};
@@ -209,18 +209,18 @@ impl PersistentCache {
     pub async fn open(
         config: PersistentCacheConfig,
         database_name: &str,
-        database_uuid: DatabaseUuid,
+        database_id: DatabaseId,
     ) -> OpenedPersistentCache {
-        Self::open_on_worker(config, database_name, database_uuid, PRODUCTION_GEOMETRY).await
+        Self::open_on_worker(config, database_name, database_id, PRODUCTION_GEOMETRY).await
     }
 
     #[cfg(test)]
     pub(crate) async fn open_with_test_geometry(
         config: PersistentCacheConfig,
         database_name: &str,
-        database_uuid: DatabaseUuid,
+        database_id: DatabaseId,
     ) -> OpenedPersistentCache {
-        Self::open_on_worker(config, database_name, database_uuid, TEST_GEOMETRY).await
+        Self::open_on_worker(config, database_name, database_id, TEST_GEOMETRY).await
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -419,7 +419,7 @@ impl PersistentCache {
     async fn open_on_worker(
         config: PersistentCacheConfig,
         database_name: &str,
-        database_uuid: DatabaseUuid,
+        database_id: DatabaseId,
         geometry: CacheGeometry,
     ) -> OpenedPersistentCache {
         let metrics = Arc::new(CacheMetrics::new());
@@ -436,7 +436,7 @@ impl PersistentCache {
         if let Err(error) = Self::spawn_worker(
             config,
             database_name.to_owned(),
-            database_uuid,
+            database_id,
             geometry,
             metrics,
             completion,
@@ -465,7 +465,7 @@ impl PersistentCache {
     async fn open_with_geometry(
         config: PersistentCacheConfig,
         database_name: &str,
-        database_uuid: DatabaseUuid,
+        database_id: DatabaseId,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
     ) -> OpenedPersistentCache {
@@ -474,7 +474,7 @@ impl PersistentCache {
         let started = Self::spawn_worker(
             config,
             database_name.to_owned(),
-            database_uuid,
+            database_id,
             geometry,
             metrics,
             completion,
@@ -511,7 +511,7 @@ impl PersistentCache {
     fn spawn_worker(
         config: PersistentCacheConfig,
         database_name: String,
-        database_uuid: DatabaseUuid,
+        database_id: DatabaseId,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
         completion: oneshot::Sender<OpenedPersistentCache>,
@@ -522,7 +522,7 @@ impl PersistentCache {
                 Self::run_opening_worker(
                     config,
                     database_name,
-                    database_uuid,
+                    database_id,
                     geometry,
                     metrics,
                     completion,
@@ -534,7 +534,7 @@ impl PersistentCache {
     fn run_opening_worker(
         config: PersistentCacheConfig,
         database_name: String,
-        database_uuid: DatabaseUuid,
+        database_id: DatabaseId,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
         completion: oneshot::Sender<OpenedPersistentCache>,
@@ -542,7 +542,7 @@ impl PersistentCache {
         let (disk, writer, last_sequence_point) = match open_disk(
             config,
             &database_name,
-            database_uuid,
+            database_id,
             geometry,
             metrics.clone(),
         ) {
@@ -1384,12 +1384,12 @@ impl WriterState {
 fn open_disk(
     config: PersistentCacheConfig,
     database_name: &str,
-    database_uuid: DatabaseUuid,
+    database_id: DatabaseId,
     geometry: CacheGeometry,
     metrics: Arc<CacheMetrics>,
 ) -> io::Result<(Arc<Disk>, WriterState, Option<SequencePoint>)> {
     let layout = Layout::derive(config.capacity_bytes, geometry)?;
-    let identity = identity_digest(geometry, database_name, database_uuid)?;
+    let identity = identity_digest(geometry, database_name, database_id)?;
     std::fs::create_dir_all(&config.directory)?;
     let path = config.directory.join(CACHE_FILE);
     let file = OpenOptions::new()
@@ -1731,7 +1731,7 @@ fn promote(
 fn identity_digest(
     geometry: CacheGeometry,
     database_name: &str,
-    database_uuid: DatabaseUuid,
+    database_id: DatabaseId,
 ) -> io::Result<[u8; 32]> {
     let name_len = u32::try_from(database_name.len()).map_err(|_| {
         io::Error::new(
@@ -1743,7 +1743,7 @@ fn identity_digest(
     digest.update(geometry.identity_domain);
     digest.update(name_len.to_le_bytes());
     digest.update(database_name.as_bytes());
-    digest.update(database_uuid.as_bytes());
+    digest.update(database_id.as_bytes());
     Ok(digest.finalize().into())
 }
 
@@ -1859,22 +1859,19 @@ mod tests {
 
     const TEST_CAPACITY: u64 = 2 * 1024 * 1024;
 
-    fn uuid(byte: u8) -> DatabaseUuid {
-        let mut bytes = [byte; 16];
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        DatabaseUuid::from_bytes(bytes).unwrap()
+    fn id(byte: u8) -> DatabaseId {
+        DatabaseId::from_bytes([byte; 16])
     }
 
-    async fn open(dir: &TempDir, database_uuid: DatabaseUuid) -> PersistentCache {
-        open_result(dir, database_uuid).await.cache
+    async fn open(dir: &TempDir, database_id: DatabaseId) -> PersistentCache {
+        open_result(dir, database_id).await.cache
     }
 
-    async fn open_result(dir: &TempDir, database_uuid: DatabaseUuid) -> OpenedPersistentCache {
+    async fn open_result(dir: &TempDir, database_id: DatabaseId) -> OpenedPersistentCache {
         PersistentCache::open_with_geometry(
             config(dir),
             "db",
-            database_uuid,
+            database_id,
             TEST_GEOMETRY,
             Arc::new(CacheMetrics::new()),
         )
@@ -1923,7 +1920,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_is_ordered_with_worker_writes() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1)).await;
+        let cache = open(&dir, id(1)).await;
         publish(&cache, "db/object", b"r1", b"body");
 
         let record = cache.lookup(Arc::from("db/object")).await.unwrap();
@@ -1936,7 +1933,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_returns_when_worker_is_stalled() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1)).await;
+        let cache = open(&dir, id(1)).await;
         let inner = cache.inner.as_ref().unwrap().clone();
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
@@ -1958,14 +1955,14 @@ mod tests {
     #[tokio::test]
     async fn clean_reopen_preserves_record_and_identity_change_discards() {
         let dir = TempDir::new().unwrap();
-        let first_uuid = uuid(1);
-        let cache = open(&dir, first_uuid).await;
+        let first_id = id(1);
+        let cache = open(&dir, first_id).await;
         assert!(cache.is_enabled());
         publish_at(&cache, "db/object", b"r1", b"body", point(17));
         cache.shutdown().await;
         drop(cache);
 
-        let opened = open_result(&dir, first_uuid).await;
+        let opened = open_result(&dir, first_id).await;
         assert_eq!(opened.last_sequence_point, Some(point(17)));
         let reopened = opened.cache;
         assert!(reopened.is_enabled());
@@ -1976,7 +1973,7 @@ mod tests {
         reopened.shutdown().await;
         drop(reopened);
 
-        let different = open(&dir, uuid(2)).await;
+        let different = open(&dir, id(2)).await;
         assert!(different.lookup(Arc::from("db/object")).await.is_none());
         different.shutdown().await;
     }
@@ -1984,15 +1981,15 @@ mod tests {
     #[tokio::test]
     async fn reopen_scans_the_maximum_persisted_sequence_point() {
         let dir = TempDir::new().unwrap();
-        let database_uuid = uuid(1);
-        let cache = open(&dir, database_uuid).await;
+        let database_id = id(1);
+        let cache = open(&dir, database_id).await;
         publish_at(&cache, "db/low", b"r1", b"low", point(8));
         publish_at(&cache, "db/high", b"r2", b"high", point(34));
         publish_at(&cache, "db/middle", b"r3", b"middle", point(21));
         cache.shutdown().await;
         drop(cache);
 
-        let opened = open_result(&dir, database_uuid).await;
+        let opened = open_result(&dir, database_id).await;
         assert_eq!(opened.last_sequence_point, Some(point(34)));
         let reopened = opened.cache;
         reopened.shutdown().await;
@@ -2001,9 +1998,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_owner_is_disabled_without_disturbing_the_owner() {
         let dir = TempDir::new().unwrap();
-        let database_uuid = uuid(1);
-        let owner = open(&dir, database_uuid).await;
-        let contender = open(&dir, database_uuid).await;
+        let database_id = id(1);
+        let owner = open(&dir, database_id).await;
+        let contender = open(&dir, database_id).await;
 
         assert!(owner.is_enabled());
         assert!(!contender.is_enabled());
@@ -2013,7 +2010,7 @@ mod tests {
         publish(&owner, "db/object", b"r1", b"body");
         owner.shutdown().await;
         drop(owner);
-        let reopened = open(&dir, database_uuid).await;
+        let reopened = open(&dir, database_id).await;
         assert_eq!(
             reopened.lookup(Arc::from("db/object")).await.unwrap().body,
             b"body"
@@ -2024,13 +2021,13 @@ mod tests {
     #[tokio::test]
     async fn damaged_record_is_a_miss() {
         let dir = TempDir::new().unwrap();
-        let database_uuid = uuid(1);
-        let first = open(&dir, database_uuid).await;
+        let database_id = id(1);
+        let first = open(&dir, database_id).await;
         publish(&first, "db/object", b"r1", b"body");
         first.shutdown().await;
         drop(first);
 
-        let reopened = open(&dir, database_uuid).await;
+        let reopened = open(&dir, database_id).await;
         let inner = reopened.inner.as_ref().unwrap();
         let slot = inner
             .shared
@@ -2062,7 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn segment_ring_reuses_the_oldest_segment() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1)).await;
+        let cache = open(&dir, id(1)).await;
         for index in 0..450 {
             publish(&cache, &format!("db/object-{index}"), b"r1", b"body");
         }
@@ -2078,7 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn full_index_bucket_evicts_its_oldest_pointer() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1)).await;
+        let cache = open(&dir, id(1)).await;
         let disk = &cache.inner.as_ref().unwrap().shared.disk;
         let bucket_count = disk.layout.bucket_count(disk.geometry);
         let mut paths = Vec::new();
@@ -2109,7 +2106,7 @@ mod tests {
     #[tokio::test]
     async fn record_larger_than_a_segment_is_not_admitted() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1)).await;
+        let cache = open(&dir, id(1)).await;
         publish(
             &cache,
             "db/oversized",
@@ -2124,7 +2121,7 @@ mod tests {
     #[tokio::test]
     async fn newer_path_epoch_cancels_an_older_admission() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, uuid(1)).await;
+        let cache = open(&dir, id(1)).await;
         let fence = Arc::new(PathFence::default());
         let older = cache.begin_fence(fence.clone(), Arc::new(())).unwrap();
         let newer = cache.begin_fence(fence.clone(), Arc::new(())).unwrap();
@@ -2154,10 +2151,10 @@ mod tests {
     #[test]
     fn unclean_reopen_keeps_completed_records_without_reusing_the_old_tail() {
         let dir = TempDir::new().unwrap();
-        let database_uuid = uuid(1);
+        let database_id = id(1);
         let metrics = Arc::new(CacheMetrics::new());
         let (disk, mut writer, _) =
-            open_disk(config(&dir), "db", database_uuid, TEST_GEOMETRY, metrics).unwrap();
+            open_disk(config(&dir), "db", database_id, TEST_GEOMETRY, metrics).unwrap();
         writer
             .append("db/object", b"r1", b"body", point(1))
             .unwrap();
@@ -2167,7 +2164,7 @@ mod tests {
 
         let metrics = Arc::new(CacheMetrics::new());
         let (disk, mut recovered, last_sequence_point) =
-            open_disk(config(&dir), "db", database_uuid, TEST_GEOMETRY, metrics).unwrap();
+            open_disk(config(&dir), "db", database_id, TEST_GEOMETRY, metrics).unwrap();
         assert_eq!(last_sequence_point, Some(point(1)));
         assert_eq!(disk.lookup("db/object").unwrap().unwrap().body, b"body");
         assert_eq!(recovered.active_segment, None);

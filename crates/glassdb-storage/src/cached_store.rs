@@ -1672,7 +1672,7 @@ mod tests {
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
-    use glassdb_data::DatabaseUuid;
+    use glassdb_data::DatabaseId;
     use tempfile::TempDir;
 
     use super::*;
@@ -1847,11 +1847,8 @@ mod tests {
         log.lock().unwrap().clear();
     }
 
-    fn cache_uuid() -> DatabaseUuid {
-        let mut bytes = [7; 16];
-        bytes[6] = 0x47;
-        bytes[8] = 0x87;
-        DatabaseUuid::from_bytes(bytes).unwrap()
+    fn cache_id() -> DatabaseId {
+        DatabaseId::from_bytes([7; 16])
     }
 
     async fn persistent_store(
@@ -1864,7 +1861,7 @@ mod tests {
                 capacity_bytes: 2 * 1024 * 1024,
             },
             "db",
-            cache_uuid(),
+            cache_id(),
         )
         .await;
         let timeline = Timeline::starting_after(opened.last_sequence_point);

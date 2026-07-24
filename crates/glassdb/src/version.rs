@@ -1,7 +1,7 @@
 //! Database metadata version check. Ported from the Go `version.go`.
 
 use glassdb_backend::Backend;
-use glassdb_data::{DATABASE_UUID_BYTES, DatabaseUuid};
+use glassdb_data::{DATABASE_ID_BYTES, DatabaseId};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -18,13 +18,13 @@ const DB_META_PATH: &str = "glassdb";
 pub(crate) async fn check_or_create_db_meta(
     b: &impl Backend,
     name: &str,
-) -> Result<DatabaseUuid, Error> {
+) -> Result<DatabaseId, Error> {
     match check_db_version(b, name).await {
-        Ok(uuid) => return Ok(uuid),
+        Ok(id) => return Ok(id),
         Err(Error::NotFound) => {}
         Err(e) => return Err(e),
     }
-    let proposed = DatabaseUuid::new_random();
+    let proposed = DatabaseId::new_random();
     match set_db_metadata(b, name, proposed).await {
         Ok(()) => Ok(proposed),
         Err(Error::Precondition) => {
@@ -35,7 +35,7 @@ pub(crate) async fn check_or_create_db_meta(
     }
 }
 
-async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseUuid, Error> {
+async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseId, Error> {
     let p = format!("{name}/{DB_META_PATH}");
     // The metadata lives in the object body (ADR-023): the slimmed backend
     // trait has no object tags. It is an evolvable protobuf message so new
@@ -49,20 +49,19 @@ async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseUuid, 
             meta.version
         )));
     }
-    let bytes: [u8; DATABASE_UUID_BYTES] = meta.database_uuid.try_into().map_err(|_| {
+    let bytes: [u8; DATABASE_ID_BYTES] = meta.database_id.try_into().map_err(|_| {
         Error::internal(format!(
-            "database metadata UUID must contain exactly {DATABASE_UUID_BYTES} bytes"
+            "database metadata ID must contain exactly {DATABASE_ID_BYTES} bytes"
         ))
     })?;
-    DatabaseUuid::from_bytes(bytes)
-        .ok_or_else(|| Error::internal("database metadata UUID is not an RFC-compatible UUIDv4"))
+    Ok(DatabaseId::from_bytes(bytes))
 }
 
-async fn set_db_metadata(b: &impl Backend, name: &str, uuid: DatabaseUuid) -> Result<(), Error> {
+async fn set_db_metadata(b: &impl Backend, name: &str, id: DatabaseId) -> Result<(), Error> {
     let p = format!("{name}/{DB_META_PATH}");
     let body = pb::DatabaseMetadata {
         version: DB_VERSION.to_string(),
-        database_uuid: uuid.as_bytes().to_vec(),
+        database_id: id.as_bytes().to_vec(),
     }
     .encode_to_vec();
     b.write_if_not_exists(&p, body).await?;
@@ -85,12 +84,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arbitrary_16_byte_id_is_accepted() {
+        let b = MemoryBackend::new();
+        let id = DatabaseId::from_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+        let body = pb::DatabaseMetadata {
+            version: DB_VERSION.to_string(),
+            database_id: id.as_bytes().to_vec(),
+        }
+        .encode_to_vec();
+        b.write_if_not_exists(&format!("mydb/{DB_META_PATH}"), body)
+            .await
+            .unwrap();
+
+        assert_eq!(check_or_create_db_meta(&b, "mydb").await.unwrap(), id);
+    }
+
+    #[tokio::test]
     async fn wrong_version_is_rejected() {
         let b = MemoryBackend::new();
         let p = format!("mydb/{DB_META_PATH}");
         let body = pb::DatabaseMetadata {
             version: "v1".to_string(),
-            database_uuid: DatabaseUuid::new_random().as_bytes().to_vec(),
+            database_id: DatabaseId::new_random().as_bytes().to_vec(),
         }
         .encode_to_vec();
         b.write_if_not_exists(&p, body).await.unwrap();
@@ -103,18 +121,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_uuid_is_rejected() {
+    async fn invalid_id_length_is_rejected() {
         let b = MemoryBackend::new();
-        let p = format!("mydb/{DB_META_PATH}");
-        let body = pb::DatabaseMetadata {
-            version: DB_VERSION.to_string(),
-            database_uuid: Vec::new(),
-        }
-        .encode_to_vec();
-        b.write_if_not_exists(&p, body).await.unwrap();
+        for (name, database_id) in [("missing", vec![]), ("short", vec![0; 15])] {
+            let p = format!("{name}/{DB_META_PATH}");
+            let body = pb::DatabaseMetadata {
+                version: DB_VERSION.to_string(),
+                database_id,
+            }
+            .encode_to_vec();
+            b.write_if_not_exists(&p, body).await.unwrap();
 
-        let err = check_or_create_db_meta(&b, "mydb").await.unwrap_err();
-        assert!(matches!(err, Error::Internal { .. }), "got {err:?}");
+            let err = check_or_create_db_meta(&b, name).await.unwrap_err();
+            assert!(matches!(err, Error::Internal { .. }), "{name}: got {err:?}");
+        }
     }
 
     #[tokio::test]
@@ -133,18 +153,18 @@ mod tests {
     // Changing the on-disk format must break this test.
     #[test]
     fn golden_encoding() {
-        let uuid = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x46, 0x07, 0x88, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+        let id = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
         ];
         let got = pb::DatabaseMetadata {
             version: DB_VERSION.to_string(),
-            database_uuid: uuid.to_vec(),
+            database_id: id.to_vec(),
         }
         .encode_to_vec();
-        // field 1 (string), len 2, "v2"; field 2 (bytes), len 16, UUID.
+        // field 1 (string), len 2, "v2"; field 2 (bytes), len 16, ID.
         let mut expected = vec![0x0a, 0x02, 0x76, 0x32, 0x12, 0x10];
-        expected.extend(uuid);
+        expected.extend(id);
         assert_eq!(got, expected, "db-metadata encoding drifted");
     }
 }

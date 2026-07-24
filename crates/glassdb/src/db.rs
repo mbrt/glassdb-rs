@@ -61,7 +61,7 @@ impl DatabaseBuilder {
     /// Enables the best-effort persistent encoded-body cache.
     ///
     /// The cache identity is derived automatically from the database name and
-    /// its persistent UUID. Production capacities must be at least 131 MiB.
+    /// its persistent ID. Production capacities must be at least 131 MiB.
     pub fn persistent_cache(mut self, config: PersistentCacheConfig) -> Self {
         self.persistent_cache = Some(config);
         self
@@ -128,11 +128,11 @@ impl DatabaseBuilder {
             )));
         }
         let backend = Arc::new(StatsBackend::new(b));
-        let database_uuid = check_or_create_db_meta(&backend, &name).await?;
+        let database_id = check_or_create_db_meta(&backend, &name).await?;
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let (persistent, last_sequence_point) = match persistent_cache {
             Some(config) => {
-                let opened = PersistentCache::open(config, &name, database_uuid).await;
+                let opened = PersistentCache::open(config, &name, database_id).await;
                 (Some(opened.cache), opened.last_sequence_point)
             }
             None => (None, None),
