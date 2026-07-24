@@ -172,12 +172,8 @@ def load_mix_runs(path: Path) -> list[MixRun]:
                 tx_per_sec=_nonnegative(
                     row.get("txPerSec"), f"{result_path}: {name}.txPerSec"
                 ),
-                p50_ms=_nonnegative(
-                    row.get("p50Ms"), f"{result_path}: {name}.p50Ms"
-                ),
-                p90_ms=_nonnegative(
-                    row.get("p90Ms"), f"{result_path}: {name}.p90Ms"
-                ),
+                p50_ms=_nonnegative(row.get("p50Ms"), f"{result_path}: {name}.p50Ms"),
+                p90_ms=_nonnegative(row.get("p90Ms"), f"{result_path}: {name}.p90Ms"),
                 converged=converged,
                 committed=_count(
                     row.get("committed"), f"{result_path}: {name}.committed"
@@ -190,9 +186,7 @@ def load_mix_runs(path: Path) -> list[MixRun]:
             raise ReportError(
                 f"{result_path}: shapes are {sorted(shapes)}; expected {sorted(SHAPES)}"
             )
-        aggregate = _object(
-            cell.get("aggregateOps"), f"{result_path}: aggregateOps"
-        )
+        aggregate = _object(cell.get("aggregateOps"), f"{result_path}: aggregateOps")
         runs.append(
             MixRun(
                 shapes=shapes,
@@ -247,7 +241,6 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
         "",
         f"- Base: `{_escape(base_label)}`",
         f"- Candidate: `{_escape(candidate_label)}`",
-        "- Numeric changes are informational and never fail the PR check.",
         "",
         "## Backend-operation score",
         "",
@@ -294,9 +287,13 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
     unconverged = []
     for side, runs in (("main", base_mix), ("PR", candidate_mix)):
         for repetition, run in enumerate(runs, start=1):
-            missing = [name for name, shape in run.shapes.items() if not shape.converged]
+            missing = [
+                name for name, shape in run.shapes.items() if not shape.converged
+            ]
             if missing:
-                unconverged.append(f"{side} run {repetition}: {', '.join(sorted(missing))}")
+                unconverged.append(
+                    f"{side} run {repetition}: {', '.join(sorted(missing))}"
+                )
     if unconverged:
         lines.append(
             "⚠️ Some shapes hit the time cap before reaching the requested "
