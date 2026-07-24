@@ -911,8 +911,8 @@ impl Splitter {
     /// Recovers every unresolved structural record in this database.
     async fn recover_structural_logs(&self) -> bool {
         // Recovery has no transaction validation or preceding tree CAS. Capture
-        // one sweep epoch so log discovery, source fencing, and reachability are
-        // all at least as new as the recovery decision that consumes them.
+        // one sweep epoch for log discovery; each record's own freshness then
+        // gates its source fencing and reachability (see `recover_record`).
         let recovery_start = Requirement::AtLeast(self.timeline.now());
         let records = match self
             .shards
@@ -931,7 +931,7 @@ impl Splitter {
         };
         let active = !records.is_empty();
         for (record_id, record) in records {
-            if let Err(e) = self.recover_record(&record, recovery_start).await {
+            if let Err(e) = self.recover_record(&record).await {
                 tracing::debug!(
                     target: "glassdb::splitter",
                     record = %record_id,
@@ -947,11 +947,17 @@ impl Splitter {
     async fn recover_record(
         &self,
         observed: &Observation<StructuralLog>,
-        requirement: Requirement,
     ) -> Result<(), TransError> {
         let record = observed
             .value()
             .ok_or_else(|| TransError::other("structural record disappeared after listing"))?;
+        // Pin fencing and reachability to the record's own freshness rather than
+        // the listing epoch. A split acquires its source gate before writing this
+        // record, so the record's watermark is at least as fresh as that gate. An
+        // older listing epoch can otherwise be satisfied by a pre-split cached
+        // snapshot that shows neither the gate nor the created children, making an
+        // in-flight split look unapplied and reclaiming its now-live child.
+        let requirement = Requirement::AtLeast(observed.current_after());
         let source_token = (!record.is_root).then_some(record.source_token.as_str());
         if !self
             .fence_source_writer_for_recovery(&record.prefix, source_token, requirement)
@@ -2226,8 +2232,7 @@ mod tests {
         let observed = s.write_structural_log("R", &record).await.unwrap();
 
         assert!(matches!(
-            sp.recover_record(&observed, Requirement::AtLeast(s.timeline.now()))
-                .await,
+            sp.recover_record(&observed).await,
             Err(TransError::Retry)
         ));
         assert!(
@@ -2244,9 +2249,7 @@ mod tests {
         );
 
         sp.mon.abort_tx(&id).await.unwrap();
-        sp.recover_record(&observed, Requirement::AtLeast(s.timeline.now()))
-            .await
-            .unwrap();
+        sp.recover_record(&observed).await.unwrap();
         assert!(matches!(
             s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
                 .await,
@@ -2257,6 +2260,93 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Regression: structural recovery must fence an in-flight split by reading
+    /// the source *freshly*, not from a snapshot it cached before the split took
+    /// the gate.
+    ///
+    /// A split acquires its source structural gate before writing its structural
+    /// record, so the record's watermark is at least as fresh as that gate.
+    /// Recovery once fenced (and tested reachability) at a single sweep-start
+    /// epoch, which a pre-split cached snapshot — no gate, no sibling — could
+    /// satisfy; recovery then judged the live split unapplied and deleted its
+    /// freshly created, now-live child, breaking the leaf right-link chain.
+    /// Pinning the reads to the record's own watermark forces recovery past the
+    /// gate write.
+    ///
+    /// Here `s` (recovery) caches the pre-gate source, a peer sharing the backend
+    /// then takes the gate and creates the child, and recovery must defer instead
+    /// of reclaiming the child. Reading the source from the stale cache (as the
+    /// buggy sweep epoch allowed) reclaims `R`; the fresh read observes the live
+    /// holder and defers.
+    #[tokio::test]
+    async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let s = store_with_backend(backend.clone());
+        let peer = store_with_backend(backend);
+        let bg = Arc::new(Background::new());
+        let sp = splitter(&s, &bg, tiny());
+        let id = TxId::with_priority(1, b"inflight-split");
+        sp.mon.begin_tx(&id);
+
+        // Initial tree, written by the peer: a root index over a single leaf L
+        // that carries no structural gate.
+        peer.store_node(COLL, "L", &leaf_node(&[b"a", b"b"], None, None), None)
+            .await
+            .unwrap();
+        let mut root = CollectionRoot::new();
+        root.set_node(Node::index(IndexNode::from_children([(
+            Vec::new(),
+            "L".to_string(),
+        )])));
+        peer.create_root(COLL, &root).await.unwrap();
+
+        // Recovery reads L first, caching the pre-gate snapshot (no gate). A weak
+        // freshness bound would later be satisfied by exactly this stale entry.
+        s.load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+
+        // The in-flight split (peer, sharing the backend): take the source gate
+        // and create the sibling. `s`'s cache is unaware of both writes.
+        let (mut gated, version) = peer
+            .load_node(COLL, "L", Requirement::AtLeast(peer.timeline.now()))
+            .await
+            .unwrap();
+        gated.set_structural_gate(id.clone());
+        assert!(
+            peer.store_node(COLL, "L", &gated, Some(&version))
+                .await
+                .unwrap()
+        );
+        peer.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
+            .await
+            .unwrap();
+
+        // The record is written after the gate, so its watermark is at least as
+        // fresh; recovery reading at that watermark must observe the live gate.
+        let record = nonroot_record("L", "R", b"m");
+        let observed = s.write_structural_log("R", &record).await.unwrap();
+
+        assert!(
+            matches!(sp.recover_record(&observed).await, Err(TransError::Retry)),
+            "recovery must defer to the live split rather than reclaim its child"
+        );
+        assert!(
+            s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
+                .await
+                .is_ok(),
+            "the live split's child must survive recovery"
+        );
+        assert_eq!(
+            s.list_structural_logs("db", Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the in-flight split's record is left for a later sweep"
         );
     }
 
@@ -2293,9 +2383,7 @@ mod tests {
         };
         let observed = s.write_structural_log("R", &record).await.unwrap();
 
-        sp.recover_record(&observed, Requirement::AtLeast(s.timeline.now()))
-            .await
-            .unwrap();
+        sp.recover_record(&observed).await.unwrap();
 
         let (root_node, _) = s
             .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
@@ -2447,8 +2535,7 @@ mod tests {
         gate.arm();
         let recovering = {
             let sp = sp.clone();
-            let requirement = Requirement::AtLeast(s.timeline.now());
-            tokio::spawn(async move { sp.recover_record(&observed, requirement).await })
+            tokio::spawn(async move { sp.recover_record(&observed).await })
         };
         gate.wait_until_entered().await;
 

@@ -560,11 +560,11 @@ impl ShardStore {
                 "root write received a node observation",
             ));
         };
-        match self
+        let res = self
             .roots
             .compare_and_swap(expected, Arc::new(root.clone()))
-            .await
-        {
+            .await;
+        match res {
             Ok(CasResult::Committed(_)) => Ok(true),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
