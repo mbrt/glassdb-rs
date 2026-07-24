@@ -78,16 +78,10 @@ impl TryFrom<&String> for CollectionPath {
 #[derive(Clone)]
 pub struct Collection {
     address: CollectionAddress,
-    binding: Option<CollectionBinding>,
+    // TODO(ADR-047): Extend the handle with its direct parent address when
+    // lifecycle operations need exact parent/name binding checks.
+    name: Option<Arc<[u8]>>,
     db: Arc<DbInner>,
-}
-
-/// The direct logical binding retained for future lifecycle operations.
-#[allow(dead_code)]
-#[derive(Clone)]
-struct CollectionBinding {
-    parent: CollectionAddress,
-    name: Arc<[u8]>,
 }
 
 impl Collection {
@@ -223,7 +217,6 @@ impl Collection {
                     name.to_vec(),
                     Collection::new_child(
                         CollectionAddress::new(self.db.name.as_str(), id),
-                        self.address.clone(),
                         name,
                         self.db.clone(),
                     ),
@@ -235,29 +228,21 @@ impl Collection {
 
     /// Returns this handle's direct logical name, or `None` for the database root.
     pub fn name(&self) -> Option<&[u8]> {
-        self.binding.as_ref().map(|binding| binding.name.as_ref())
+        self.name.as_deref()
     }
 
     pub(crate) fn new_root(db: Arc<DbInner>) -> Self {
         Self {
             address: CollectionAddress::root(db.name.as_str()),
-            binding: None,
+            name: None,
             db,
         }
     }
 
-    pub(crate) fn new_child(
-        address: CollectionAddress,
-        parent: CollectionAddress,
-        name: &[u8],
-        db: Arc<DbInner>,
-    ) -> Self {
+    pub(crate) fn new_child(address: CollectionAddress, name: &[u8], db: Arc<DbInner>) -> Self {
         Self {
             address,
-            binding: Some(CollectionBinding {
-                parent,
-                name: Arc::from(name),
-            }),
+            name: Some(Arc::from(name)),
             db,
         }
     }

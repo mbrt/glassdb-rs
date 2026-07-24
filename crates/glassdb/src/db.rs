@@ -638,7 +638,6 @@ impl DbInner {
         Ok(root.child(name).map(|id| {
             Collection::new_child(
                 CollectionAddress::new(self.name.as_str(), id),
-                parent.address().clone(),
                 name,
                 self.clone(),
             )
@@ -682,12 +681,7 @@ impl DbInner {
         {
             Ok(CollectionPublish::Published) => {
                 unpublished.disarm();
-                Ok(Collection::new_child(
-                    address,
-                    parent.address().clone(),
-                    name,
-                    self.clone(),
-                ))
+                Ok(Collection::new_child(address, name, self.clone()))
             }
             Ok(CollectionPublish::Existing(existing)) => {
                 self.schedule_root_cleanup(observation);
@@ -696,7 +690,6 @@ impl DbInner {
                     CreateMode::Strict => Err(Error::AlreadyExists),
                     CreateMode::IfAbsent => Ok(Collection::new_child(
                         CollectionAddress::new(self.name.as_str(), existing),
-                        parent.address().clone(),
                         name,
                         self.clone(),
                     )),
