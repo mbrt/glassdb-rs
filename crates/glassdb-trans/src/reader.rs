@@ -117,50 +117,78 @@ impl Reader {
         key: &KeyRef,
         requirement: glassdb_storage::Requirement,
     ) -> Result<ReadOutcome, StorageError> {
-        let (resolved, leaf) = self
-            .resolver
-            .resolve_key(key, requirement)
-            .await
-            .map_err(trans_to_storage)?;
-        let mut cache_hit = leaf.cache_hit;
-        cache_hit &= resolved.cache_hit;
-        let leaf = leaf.observation;
-        let Some(writer) = resolved.writer else {
+        let mut requirement = requirement;
+        let mut refreshed = false;
+        loop {
+            let (resolved, leaf) = self
+                .resolver
+                .resolve_key(key, requirement)
+                .await
+                .map_err(trans_to_storage)?;
+            let mut cache_hit = leaf.cache_hit;
+            cache_hit &= resolved.cache_hit;
+            let leaf = leaf.observation;
+            let Some(writer) = resolved.writer else {
+                return Ok(ReadOutcome {
+                    value: None,
+                    last_writer: None,
+                    cache_hit,
+                    leaf,
+                });
+            };
+            let last_writer = Some(writer.clone());
+            let cv = self
+                .resolver
+                .committed_value(key, &writer)
+                .await
+                .map_err(trans_to_storage)?;
+            if cv.status != TxCommitStatus::Ok {
+                // The resolved writer's transaction object is not authoritatively
+                // committed. A staleness-tolerant resolution can name a writer
+                // whose committed log was already garbage-collected: it read a
+                // cached leaf still pointing at a `current_writer` that newer
+                // commits superseded, and GC reclaimed that log once no *fresh*
+                // leaf referenced it (ADR-022). That is a stale-leaf signal, not
+                // a genuine absence, so re-resolve once against fresh evidence,
+                // which sees the key's current writer whose log still exists. A
+                // writer that is still unresolvable under fresh evidence is truly
+                // in-doubt: report absence so transaction validation retries
+                // rather than trusting an empty placeholder.
+                let fresh = Requirement::AtLeast(self.timeline.now());
+                if !refreshed && requirement.stricter(fresh) != requirement {
+                    requirement = fresh;
+                    refreshed = true;
+                    continue;
+                }
+                return Ok(ReadOutcome {
+                    value: None,
+                    last_writer,
+                    cache_hit: false,
+                    leaf,
+                });
+            }
+            if cv.value.not_written {
+                // The writer committed but wrote no value for this key: a genuine
+                // absence, independent of freshness.
+                return Ok(ReadOutcome {
+                    value: None,
+                    last_writer,
+                    cache_hit: false,
+                    leaf,
+                });
+            }
+            cache_hit &= cv.cache_hit;
+            let version = Version { writer };
+            let value = (!cv.value.deleted).then_some(ReadValue {
+                value: cv.value.value,
+                version,
+            });
             return Ok(ReadOutcome {
-                value: None,
-                last_writer: None,
+                value,
+                last_writer,
                 cache_hit,
                 leaf,
             });
-        };
-        let last_writer = Some(writer.clone());
-        let cv = self
-            .resolver
-            .committed_value(key, &writer)
-            .await
-            .map_err(trans_to_storage)?;
-        if cv.status != TxCommitStatus::Ok || cv.value.not_written {
-            // The writer's value is not authoritatively resolvable yet (e.g. its
-            // object is in-doubt). Report absence so transaction validation can
-            // retry rather than trusting an empty placeholder.
-            return Ok(ReadOutcome {
-                value: None,
-                last_writer,
-                cache_hit: false,
-                leaf,
-            });
         }
-        cache_hit &= cv.cache_hit;
-        let version = Version { writer };
-        let value = (!cv.value.deleted).then_some(ReadValue {
-            value: cv.value.value,
-            version,
-        });
-        Ok(ReadOutcome {
-            value,
-            last_writer,
-            cache_hit,
-            leaf,
-        })
     }
 }
