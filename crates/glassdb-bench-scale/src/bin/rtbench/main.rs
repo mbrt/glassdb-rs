@@ -58,7 +58,7 @@ use tokio::runtime::Handle;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
 use glassdb::s3::{FakeS3, FakeS3Options, tuned_http_client};
-use glassdb::{Collection, Database, Error as GError, Stats};
+use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, Results};
 use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
@@ -618,8 +618,11 @@ fn independent_single_rmw(
             let db = db.clone();
             let bench = b.bench.clone();
             handle.spawn(async move {
-                let coll = db.collection(format!("c{i}").as_bytes());
-                coll.create().await?;
+                let name = format!("c{i}");
+                let coll = db
+                    .root_collection()
+                    .create_collection_if_absent(name.as_bytes())
+                    .await?;
                 let coll = &coll;
                 let db = &db;
                 while !bench.is_finished() {
@@ -661,8 +664,11 @@ fn independent_multi_rmw(
             let db = db.clone();
             let bench = b.bench.clone();
             handle.spawn(async move {
-                let coll = db.collection(format!("c{i}").as_bytes());
-                coll.create().await?;
+                let name = format!("c{i}");
+                let coll = db
+                    .root_collection()
+                    .create_collection_if_absent(name.as_bytes())
+                    .await?;
                 let keys: Vec<Vec<u8>> = (0..numkeys)
                     .map(|j| format!("key{j}").into_bytes())
                     .collect();
@@ -710,8 +716,7 @@ fn overlapping_multi_rmw(
     n_overlap: usize,
     drain_timeout: Duration,
 ) -> Result<(), GError> {
-    let coll = db.collection(b"omrmw");
-    handle.block_on(coll.create())?;
+    let coll = handle.block_on(db.root_collection().create_collection_if_absent(b"omrmw"))?;
 
     let n_keys = n_writers * n_keys_per_writer - n_overlap;
     let all_keys: Vec<Vec<u8>> = (0..n_keys)
@@ -1146,7 +1151,9 @@ async fn read_write_9010_worker(
     seed: u64,
 ) -> Result<(), GError> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let coll = db.collection(READ_WRITE_9010_CNAME.as_bytes());
+    let coll = db
+        .open_collection(&CollectionPath::new(READ_WRITE_9010_CNAME.as_bytes())?)
+        .await?;
     // Per-worker transaction mix (writers, strong-readers, weak-readers),
     // selected by `--rw-mix` (default 1,6,3 = the 10%-write rw9010 mix).
     let (num_w, num_strong_r, num_weak_r) = mix;
@@ -1224,8 +1231,10 @@ fn init_keys(
     }
     let db = open_db(handle, backend);
     let keys = handle.block_on(async {
-        let coll = db.collection(READ_WRITE_9010_CNAME.as_bytes());
-        coll.create().await?;
+        let coll = db
+            .root_collection()
+            .create_collection_if_absent(READ_WRITE_9010_CNAME.as_bytes())
+            .await?;
         let mut keys: Vec<Vec<u8>> = vec![Vec::new(); num];
         // Initialize in batches of 100 keys.
         let mut i = 0;

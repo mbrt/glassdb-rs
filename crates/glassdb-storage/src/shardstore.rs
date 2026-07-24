@@ -146,8 +146,8 @@ impl LoadedLeaf {
 /// [`ShardStore::store_leaf`].
 pub enum LeafKind {
     /// The leaf is the root node carried in the collection root `_i`; the stored
-    /// [`CollectionRoot`] is preserved (subcollections + membership) with only
-    /// its node replaced.
+    /// [`CollectionRoot`] is preserved (child directory and node metadata) with
+    /// only its node replaced.
     Root(CollectionRoot),
     /// The leaf is a standalone node `_n`; its bounds are preserved.
     Node(Node),
@@ -415,8 +415,7 @@ impl ShardStore {
 
     /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
     /// `path` is a collection root `_i`, else a standalone node `_n`. Returns the
-    /// empty leaf with no version when the object does not exist yet (the root
-    /// leaf is created lazily on the first key write). Returns
+    /// [`StorageError::NotFound`] when the object is missing. Returns
     /// [`StorageError::Precondition`] if a concurrent split turned the routed
     /// path into an index, so the caller can re-descend.
     pub async fn load_leaf(
@@ -441,12 +440,7 @@ impl ShardStore {
                         kind: LeafKind::Root(root),
                     })
                 }
-                None => Ok(LoadedLeaf {
-                    entries: Shard::new(),
-                    locks: NodeLocks::default(),
-                    observation: LeafObservation::Root(observed),
-                    kind: LeafKind::Root(CollectionRoot::new()),
-                }),
+                None => Err(StorageError::NotFound),
             }
         } else {
             let observed = self.nodes.read(path, requirement).await?;
@@ -461,12 +455,7 @@ impl ShardStore {
                         kind: LeafKind::Node(node),
                     })
                 }
-                None => Ok(LoadedLeaf {
-                    entries: Shard::new(),
-                    locks: NodeLocks::default(),
-                    observation: LeafObservation::Node(observed),
-                    kind: LeafKind::Node(Node::leaf(Shard::new())),
-                }),
+                None => Err(StorageError::NotFound),
             }
         }
     }
@@ -489,32 +478,24 @@ impl ShardStore {
                 node.set_locks(locks.clone());
                 root.set_node(node);
                 if observed.is_absent() {
-                    self.roots
-                        .create(observed.path(), Some(observed), Arc::new(root))
-                        .await
-                        .map(|result| result.committed())
-                } else {
-                    self.roots
-                        .compare_and_swap(observed, Arc::new(root))
-                        .await
-                        .map(|result| result.committed())
+                    return Err(StorageError::NotFound);
                 }
+                self.roots
+                    .compare_and_swap(observed, Arc::new(root))
+                    .await
+                    .map(|result| result.committed())
             }
             (LeafKind::Node(node), LeafObservation::Node(observed)) => {
                 let mut node = node.clone();
                 node.set_leaf(entries.clone())?;
                 node.set_locks(locks.clone());
                 if observed.is_absent() {
-                    self.nodes
-                        .create(observed.path(), Some(observed), Arc::new(node))
-                        .await
-                        .map(|result| result.committed())
-                } else {
-                    self.nodes
-                        .compare_and_swap(observed, Arc::new(node))
-                        .await
-                        .map(|result| result.committed())
+                    return Err(StorageError::NotFound);
                 }
+                self.nodes
+                    .compare_and_swap(observed, Arc::new(node))
+                    .await
+                    .map(|result| result.committed())
             }
             _ => {
                 return Err(StorageError::other(format!(
@@ -591,6 +572,36 @@ impl ShardStore {
             Ok(CasResult::Conflict) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Creates a collection root if absent and returns its exact installed
+    /// observation. `None` means another object already occupies the path.
+    pub async fn create_root_observed(
+        &self,
+        prefix: &str,
+        root: &CollectionRoot,
+    ) -> Result<Option<Observation<CollectionRoot>>, StorageError> {
+        match self
+            .roots
+            .create(
+                &paths::collection_info(prefix),
+                None,
+                Arc::new(root.clone()),
+            )
+            .await?
+        {
+            CasResult::Committed(observed) => Ok(Some(observed)),
+            CasResult::Conflict => Ok(None),
+        }
+    }
+
+    /// Deletes the exact observed collection root, converging if it is missing.
+    pub async fn delete_root(
+        &self,
+        expected: &Observation<CollectionRoot>,
+    ) -> Result<(), StorageError> {
+        self.roots.delete(expected).await?;
+        Ok(())
     }
 }
 
@@ -711,7 +722,10 @@ mod tests {
 
         // An uncached node has nothing to serve, so it falls through to a read.
         let other = paths::from_node(COLL, "tok2");
-        reader.load_leaf(&other, Requirement::Any).await.unwrap();
+        assert!(matches!(
+            reader.load_leaf(&other, Requirement::Any).await,
+            Err(StorageError::NotFound)
+        ));
         assert_eq!(count(&log, "read"), 2, "uncached Any falls through");
     }
 
@@ -721,6 +735,12 @@ mod tests {
     async fn store_is_visible_to_next_load() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = paths::from_node(COLL, "tok");
+        assert!(
+            store
+                .store_node(COLL, "tok", &Node::leaf(Shard::new()), None)
+                .await
+                .unwrap()
+        );
 
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))

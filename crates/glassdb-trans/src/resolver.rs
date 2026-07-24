@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use glassdb_data::{CollectionPath, KeyRef, TxId};
+use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore, StorageError,
     TxCommitStatus,
@@ -92,7 +92,7 @@ impl Resolver {
     /// a changed covered-leaf set falls back to logical page validation.
     pub async fn live_keys_scan(
         &self,
-        collection: &CollectionPath,
+        collection: &CollectionAddress,
     ) -> Result<ScanResult, StorageError> {
         self.scan_keys(collection, &ScanRange::all(), &[], None, None)
             .await
@@ -103,7 +103,7 @@ impl Resolver {
     /// limited-page recheck from reading beyond the range already protected.
     pub async fn scan_keys(
         &self,
-        collection: &CollectionPath,
+        collection: &CollectionAddress,
         range: &ScanRange,
         overlay: &[ScanMutation],
         own_lock_holder: Option<&TxId>,
@@ -136,7 +136,7 @@ impl Resolver {
     /// freshness requirement.
     pub(crate) async fn scan_keys_at(
         &self,
-        collection: &CollectionPath,
+        collection: &CollectionAddress,
         range: &ScanRange,
         overlay: &[ScanMutation],
         own_lock_holder: Option<&TxId>,
@@ -249,7 +249,7 @@ impl Resolver {
     /// the leaf entries themselves.
     pub(crate) async fn scan_coverage(
         &self,
-        collection: &CollectionPath,
+        collection: &CollectionAddress,
         range: &ScanRange,
         frontier: Option<&[u8]>,
         own_lock_holder: Option<&TxId>,
@@ -474,13 +474,13 @@ mod tests {
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::Background;
     use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, Shard, TLogger, Timeline};
+    use glassdb_storage::{CachedStore, CollectionRoot, Shard, TLogger, Timeline};
 
     const DB: &str = "db";
-    const COLL: &str = "db/_c/NqxgQ0";
+    const COLL: &str = "db/_c/0000000000000000000000";
 
-    fn collection() -> CollectionPath {
-        CollectionPath::new(DB, b"coll")
+    fn collection() -> CollectionAddress {
+        CollectionAddress::root(DB)
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -491,13 +491,19 @@ mod tests {
     // paired with the monitor backing it (a clone, sharing its caches) so a test
     // can commit holder values the resolver then help-forwards. The returned
     // `Background` must be kept alive for the monitor's lifetime.
-    fn resolver_over(backend: Arc<dyn Backend>) -> (Resolver, Monitor, Timeline, Arc<Background>) {
+    async fn resolver_over(
+        backend: Arc<dyn Backend>,
+    ) -> (Resolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DB);
         let bg = Arc::new(Background::new());
         let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
+        shards
+            .create_root(COLL, &CollectionRoot::new())
+            .await
+            .unwrap();
         (Resolver::new(shards, mon.clone()), mon, timeline, bg)
     }
 
@@ -514,9 +520,13 @@ mod tests {
         }
     }
 
-    fn store_over(backend: Arc<dyn Backend>) -> TestStore {
+    async fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
         let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
+        shards
+            .create_root(COLL, &CollectionRoot::new())
+            .await
+            .unwrap();
         TestStore { shards, timeline }
     }
 
@@ -644,7 +654,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
 
         // Seed through a separate cache so the resolver-under-test starts cold.
-        let seed_store = store_over(backend.clone());
+        let seed_store = store_over(backend.clone()).await;
         let a = b"apple".to_vec();
         let b = b"mango".to_vec();
         let c = b"lonely".to_vec();
@@ -655,7 +665,7 @@ mod tests {
         seed_writer(&seed_store, &b, &tomb, true).await;
         // `c` is deliberately left absent.
 
-        let (resolver, _mon, _timeline, _bg) = resolver_over(backend.clone());
+        let (resolver, _mon, _timeline, _bg) = resolver_over(backend.clone()).await;
 
         let pa = key_ref(&a);
         let pb = key_ref(&b);
@@ -690,12 +700,12 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(recorder);
 
         // Seed through a separate cache so the resolver-under-test starts cold.
-        let seed_store = store_over(backend.clone());
+        let seed_store = store_over(backend.clone()).await;
         let key = b"rmw-key";
         let writer = TxId::with_priority(1, b"w");
         seed_writer(&seed_store, key, &writer, false).await;
 
-        let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone());
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone()).await;
         let key_path = key_ref(key);
 
         // Warm the resolver's own cache with one cold load.
@@ -735,13 +745,13 @@ mod tests {
     #[tokio::test]
     async fn effective_writer_resolves_single_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let seed_store = store_over(backend.clone());
+        let seed_store = store_over(backend.clone()).await;
         let live = TxId::with_priority(1, b"live");
         let dead = TxId::with_priority(2, b"dead");
         seed_writer(&seed_store, b"live-key", &live, false).await;
         seed_writer(&seed_store, b"dead-key", &dead, true).await;
 
-        let (resolver, _mon, _timeline, _bg) = resolver_over(backend);
+        let (resolver, _mon, _timeline, _bg) = resolver_over(backend).await;
         assert_eq!(
             effective_writer(&resolver, &key_ref(b"live-key")).await,
             Some(live)
@@ -762,8 +772,8 @@ mod tests {
     #[tokio::test]
     async fn effective_writer_help_forwards_committed_holder() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let seed_store = store_over(backend.clone());
-        let (resolver, mon, _timeline, _bg) = resolver_over(backend);
+        let seed_store = store_over(backend.clone()).await;
+        let (resolver, mon, _timeline, _bg) = resolver_over(backend).await;
 
         let live = TxId::with_priority(1, b"live");
         commit_value(&mon, b"live-key", &live, false).await;

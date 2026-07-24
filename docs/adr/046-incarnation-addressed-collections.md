@@ -2,12 +2,12 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 Constituent decision of the
 [dynamic-range-sharding design](../designs/dynamic-range-sharding.md).
 
-On acceptance, this supersedes the clauses in ADR-016, ADR-018, and ADR-031
+This supersedes the clauses in ADR-016, ADR-018, and ADR-031
 that derive physical collection addresses from logical names, make physical
 `_i` presence authoritative for existence, and store a name-only child list.
 The B-link tree, node-locking, and key-membership decisions of ADR-031/032 are

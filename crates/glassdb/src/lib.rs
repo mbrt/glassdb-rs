@@ -25,17 +25,18 @@ mod stats;
 mod tx;
 mod version;
 
-pub use collection::Collection;
+pub use collection::{Collection, CollectionPath};
 pub use db::{Database, DatabaseBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
-pub use iter::{CollectionsIter, KeysIter};
+pub use iter::{CollectionEntry, CollectionsIter, KeysIter};
 pub use scan::{KeyPage, KeyScan};
 pub use stats::Stats;
 pub use tx::Transaction;
 
 // The split soft-cap policy, so callers can tune when a collection's B-link
 // tree splits (see [`DatabaseBuilder::split_policy`]).
+pub use glassdb_data::MAX_COLLECTION_NAME_BYTES;
 pub use glassdb_storage::{CacheStats, PersistentCacheConfig, SplitPolicy};
 pub use glassdb_trans::ProtocolTiming;
 

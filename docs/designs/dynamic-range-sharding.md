@@ -259,10 +259,10 @@ ADR — this overview and the diagrams above are the map into it.
   low-cardinality split recovery records under database-wide `_s`, independent
   from transaction `_t` schema, GC, and scheduling.
 - **[ADR-046](../adr/046-incarnation-addressed-collections.md) —
-  Incarnation-addressed collection format.** *Proposed.* Replaces logical paths
-  as physical addresses with never-reused IDs, introduces the regular reserved
-  root collection and direct `name → ID` directories, and makes path resolution
-  fallible without yet changing transaction semantics.
+  Incarnation-addressed collection format.** *Accepted — implemented.* Replaces
+  logical paths as physical addresses with never-reused IDs, introduces the
+  regular reserved root collection and direct `name → ID` directories, and
+  makes path resolution fallible without yet changing transaction semantics.
 - **[ADR-047](../adr/047-transactional-collection-management.md) —
   Transactional collection management.** *Proposed.* Builds ordinary
   transaction create/open/list/drop on ADR-046, freezes collection topology, and

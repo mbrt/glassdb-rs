@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture, HookOutcome};
 use glassdb::backend::{Backend, BackendError};
-use glassdb::{Collection, Database, Error};
+use glassdb::{Collection, CollectionPath, Database, Error};
 use glassdb_storage::TxCommitStatus;
 
 type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + Send + Sync>;
@@ -199,8 +199,11 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
 
     // Seed the key so the read finds a value and the overwrite is an eligible
     // single read-write.
@@ -235,13 +238,19 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     seed(&coll, b"k", 10).await;
 
     // A second, independent client over the same backend is the competitor.
     let other = Database::open("example", backend.clone()).await.unwrap();
-    let other_coll = other.collection(b"c");
+    let other_coll = other
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
 
     settle_writebacks().await;
 
@@ -284,8 +293,11 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
 
     // Seed the key so the overwrite is an eligible single read-write.
     seed(&coll, b"k", 10).await;
@@ -325,8 +337,11 @@ async fn logged_commit_lost_ack_retries_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     seed(&coll, b"a", 0).await;
     seed(&coll, b"b", 0).await;
 
@@ -376,8 +391,11 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     seed(&coll, b"a", 0).await;
     seed(&coll, b"b", 0).await;
 
@@ -415,8 +433,11 @@ async fn clean_conflict_on_single_rw_still_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     seed(&coll, b"k", 41).await;
 
     settle_writebacks().await;

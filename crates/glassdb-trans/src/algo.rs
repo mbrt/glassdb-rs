@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
-use glassdb_data::{CollectionPath, KeyRef, TxId};
+use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     LeafObservation, LeafObservationCheck, LockType, NodeLocks, Requirement, SequencePoint,
     ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus, TxLock, TxLog,
@@ -119,7 +119,7 @@ impl WriteAccess {
 #[derive(Debug, Clone)]
 pub struct ScanAccess {
     /// Collection the scan ranged over.
-    pub collection: CollectionPath,
+    pub collection: CollectionAddress,
     /// Normalized logical range and page limit.
     pub range: ScanRange,
     /// Staged membership mutations visible when the scan ran.
@@ -1409,10 +1409,10 @@ mod tests {
     };
 
     const TEST_DB: &str = "testp";
-    const TEST_COLL: &str = "testp/_c/Nk";
+    const TEST_COLL: &str = "testp/_c/0000000000000000000000";
 
-    fn test_collection() -> CollectionPath {
-        CollectionPath::new(TEST_DB, b"c")
+    fn test_collection() -> CollectionAddress {
+        CollectionAddress::root(TEST_DB)
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {

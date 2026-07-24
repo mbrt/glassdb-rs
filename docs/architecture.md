@@ -872,43 +872,42 @@ count-bounded status cache for finalized transactions.
 
 ### Path Encoding
 
-Logical collection paths are structured as a database root plus raw collection
-name segments. Logical keys pair one of those collection paths with raw key
-bytes. They are not encoded as physical object paths.
+`CollectionPath` values are unresolved sequences of raw names. Resolving one
+walks the direct-child directory in each parent root and returns a `Collection`
+bound to an opaque 16-byte incarnation ID. Logical keys pair that bound address
+with raw key bytes; point operations route by ID without revalidating ancestors.
 
 Only backend objects have type markers (`glassdb-data/src/paths.rs`):
 
 | Type Marker | Meaning                         | Example                           |
 | ----------- | ------------------------------- | --------------------------------- |
-| `_c`        | Physical collection namespace   | `mydb/_c/RqKoS6_iOrB`             |
-| `_i`        | Collection root                  | `mydb/_c/RqKoS6_iOrB/_i`          |
-| `_n`        | Standalone B-link node           | `mydb/_c/RqKoS6_iOrB/_n/<token>`  |
+| `_c`        | Physical collection namespace   | `mydb/_c/<collection-id>`         |
+| `_i`        | Collection root                  | `mydb/_c/<collection-id>/_i`      |
+| `_n`        | Standalone B-link node           | `mydb/_c/<collection-id>/_n/<token>` |
 | `_t`        | Sharded transaction object       | `mydb/_t/<shard>/<transaction-id>`|
 | `_s`        | Structural recovery record       | `mydb/_s/<record-id>`             |
 
-Collection names are base64-encoded only when rendering a physical collection
-namespace. Keys live inside leaf objects and remain raw bytes. Transaction
-objects likewise store raw key bytes and root-relative collection-name segments;
-the database root comes from the transaction object's location, so moving a
-database does not invalidate its logs. The physical namespace encoding uses a
-custom **order-preserving** base64 alphabet (`glassdb-data/src/base64.rs`).
+Collection IDs—not names—are encoded into physical collection namespaces with
+the custom **order-preserving** base64 alphabet
+(`glassdb-data/src/base64.rs`). Keys live inside leaf objects and remain raw
+bytes. Transaction objects store raw keys and collection IDs; the database root
+comes from the transaction object's location, so moving a database does not
+invalidate its logs.
 
 ### Collections
 
-A `Collection` is a scoped namespace for keys, similar to a table or a prefix.
-Each collection has a pseudo-key (its collection info object, `_i`) that
-represents the "list of keys" in the collection. This pseudo-key is locked when
-keys are created or deleted, ensuring consistency for key enumeration:
+A `Collection` is a scoped namespace for keys, similar to a table. The database
+has a permanent, key-bearing root collection whose reserved ID is outside the
+generated-ID domain. Every collection root `_i` is both the B-link tree root and
+a bounded, sorted directory from direct child name to child ID. That parent
+entry—not physical `_i` presence—is authoritative for logical existence.
 
-- **Create a key**: lock the collection info in write + lock the new key in
-  create.
-- **Delete a key**: lock the collection info in write + lock the key in write.
-- **Iterate keys**: lock the collection info in read.
-- **Read/write an existing key**: no collection lock needed.
-
-The `Collection` helpers (`read`, `read_stale`, `write`, `delete`, `update`,
-`create`) each run a one-shot transaction via the same retry loop as
-`Database::tx`.
+Standalone creation first installs an unreachable empty root at a fresh ID,
+then publishes `name → ID` with a conditional rewrite of the parent. The
+`Collection` data helpers (`read`, `read_stale`, `write`, `delete`, `update`)
+run through the same transaction machinery as `Database::tx`; collection open,
+existence, create, and immediate-child listing are fallible asynchronous
+operations outside transactions.
 
 ### Versioning
 

@@ -1,5 +1,7 @@
 //! The public error type for the GlassDB API.
 
+use std::convert::Infallible;
+
 use glassdb_backend::{BackendError, Cause};
 use glassdb_storage::StorageError;
 use glassdb_trans::TransError;
@@ -15,6 +17,9 @@ pub enum Error {
     /// The requested object does not exist.
     #[error("object not found")]
     NotFound,
+    /// The requested collection name is already bound.
+    #[error("collection already exists")]
+    AlreadyExists,
     /// The transaction was explicitly aborted by the user.
     #[error("aborted transaction")]
     Aborted,
@@ -108,6 +113,12 @@ impl From<BackendError> for Error {
             BackendError::Unavailable(s) => Error::InDoubt(s),
             BackendError::Other { msg, source } => Error::Internal { msg, source },
         }
+    }
+}
+
+impl From<Infallible> for Error {
+    fn from(never: Infallible) -> Self {
+        match never {}
     }
 }
 

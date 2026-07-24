@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 
-use crate::{Database, Error};
+use crate::{CollectionPath, Database, Error};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, assert_valid_listing, key_name, tiny_split_policy};
@@ -177,7 +177,9 @@ async fn run_api_program(
         .collect();
     let actions = &program.actions;
     let should_abort = program.abort;
-    let collection = db.collection(API_COLLECTION);
+    let collection = db
+        .open_collection(&CollectionPath::new(API_COLLECTION)?)
+        .await?;
     let collection = &collection;
     let allowed = &allowed;
     let result = db
@@ -269,8 +271,8 @@ impl SimWorkload for ApiWorkload {
     }
 
     async fn seed(&self, db: &Database) {
-        db.collection(API_COLLECTION)
-            .create()
+        db.root_collection()
+            .create_collection_if_absent(API_COLLECTION)
             .await
             .expect("create API collection");
     }
@@ -284,7 +286,10 @@ impl SimWorkload for ApiWorkload {
     }
 
     async fn verify(&self, db: &Database, state: &Mutex<ApiAcct>, _failures_enabled: bool) {
-        let collection = db.collection(API_COLLECTION);
+        let collection = db
+            .open_collection(&CollectionPath::new(API_COLLECTION).unwrap())
+            .await
+            .expect("open API collection");
         let listed: Vec<Vec<u8>> = collection
             .keys()
             .await

@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
-use glassdb::{Collection, Database, Error as GError, Stats};
+use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
 use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
@@ -652,7 +652,9 @@ async fn worker(
     seed: u64,
     ctx: WorkerCtx,
 ) -> Result<(), GError> {
-    let coll = db.collection(COLL.as_bytes());
+    let coll = db
+        .open_collection(&CollectionPath::new(COLL.as_bytes())?)
+        .await?;
     let mut rng = StdRng::seed_from_u64(seed);
     let n = match shape {
         Shape::RwMany | Shape::RoMulti => ctx.multi_keys.min(ctx.pool_size).max(1),
@@ -736,8 +738,10 @@ fn seed_pool(
 ) -> Result<(), Box<dyn Error>> {
     let db = open_db(handle, backend);
     handle.block_on(async {
-        let coll = db.collection(COLL.as_bytes());
-        coll.create().await?;
+        let coll = db
+            .root_collection()
+            .create_collection_if_absent(COLL.as_bytes())
+            .await?;
         let mut i = 0;
         while i < pool_size {
             let end = (i + 100).min(pool_size);

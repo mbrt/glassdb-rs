@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::backend::{Backend, BackendError};
-use glassdb::{Database, Error};
+use glassdb::{CollectionPath, Database, Error};
 
 /// Controls a hook that injects `Unavailable` on coordination-leaf reads.
 struct ReadFaults {
@@ -107,8 +107,11 @@ fn read_int(b: &[u8]) -> i64 {
 /// durable in the shared store (and absent from any other database's cache).
 async fn seed_shared(mem: Arc<dyn Backend>, key: &[u8], v: i64) {
     let db = Database::open("example", mem).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     coll.write(key, &write_int(v)).await.unwrap();
 }
 
@@ -123,7 +126,10 @@ async fn transient_read_unavailability_is_retried_transparently() {
     // A second database with a cold cache reads through the faulty transport.
     let (backend, faults) = ReadFaults::wrap(mem.clone());
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
 
     // Fault the first two key reads; the bounded retry rides over them.
     faults.fail_next_key_reads(2);
@@ -162,7 +168,10 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
 
     let (backend, faults) = ReadFaults::wrap(mem.clone());
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
 
     faults.fail_key_reads_forever();
 

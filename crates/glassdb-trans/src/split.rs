@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
-use glassdb_data::{CollectionPath, TxId, paths};
+use glassdb_data::{CollectionAddress, CollectionId, TxId, paths};
 use glassdb_storage::{
     Directory, IndexNode, LeafObservation, LockType, Node, Observation, Requirement, Shard,
     ShardStore, SplitPolicy, StorageError, StructuralLog, Timeline, TxCommitStatus, TxLog,
@@ -76,6 +76,15 @@ const PARENT_RETRIES: usize = 8;
 /// so a malformed or concurrently-mutated chain can never spin the splitter. A
 /// well-formed chain up to a split key is far shorter than this.
 const MAX_RECONCILE_HOPS: usize = 4096;
+
+/// Result of conditionally publishing a direct child in a collection root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionPublish {
+    /// This call installed the requested binding.
+    Published,
+    /// The name was already bound to an incarnation.
+    Existing(CollectionId),
+}
 
 /// A leaf separator a split could not publish into its parent index on the
 /// first try (a lost CAS): re-driven by a later [`Splitter`] sweep so the
@@ -311,12 +320,13 @@ impl Splitter {
         }
     }
 
-    /// Adds a child name while the root's structural gate is open.
-    pub async fn register_subcollection(
+    /// Publishes a child binding while the root's structural gate is open.
+    pub async fn publish_subcollection(
         &self,
         parent_prefix: &str,
         name: &[u8],
-    ) -> Result<(), TransError> {
+        id: CollectionId,
+    ) -> Result<CollectionPublish, TransError> {
         let mut backoff = self.retry.backoff();
         for _ in 0..50 {
             let (mut root, version) = self
@@ -338,9 +348,13 @@ impl Splitter {
                 }
                 continue;
             }
-            if !root.add_subcollection(name.to_vec()) {
-                return Ok(());
+            if let Some(existing) = root.child(name) {
+                return Ok(CollectionPublish::Existing(existing));
             }
+            assert!(
+                root.add_child(name.to_vec(), id)?,
+                "child absence was checked above"
+            );
             let content_limit = self
                 .candidates
                 .policy()
@@ -363,7 +377,7 @@ impl Splitter {
                 .store_root(parent_prefix, &root, &version)
                 .await?
             {
-                return Ok(());
+                return Ok(CollectionPublish::Published);
             }
             rt::sleep(backoff.next_delay()).await;
         }
@@ -563,7 +577,7 @@ impl Splitter {
                 return Ok(Some((node, version)));
             }
 
-            let collection = CollectionPath::from_physical_prefix(prefix)
+            let collection = CollectionAddress::from_physical_prefix(prefix)
                 .map_err(|e| TransError::with_source("parsing collection prefix", e))?;
             let entries: BTreeMap<Vec<u8>, _> = node
                 .as_leaf()
@@ -1228,10 +1242,10 @@ mod tests {
     use glassdb_data::{KeyRef, TxId};
     use glassdb_storage::{CachedStore, CollectionRoot, LockType, ShardEntry, TLogger, TxWrite};
 
-    const COLL: &str = "db/_c/NqxgQ0";
+    const COLL: &str = "db/_c/0000000000000000000000";
 
-    fn collection() -> CollectionPath {
-        CollectionPath::new("db", b"coll")
+    fn collection() -> CollectionAddress {
+        CollectionAddress::root("db")
     }
 
     // A soft cap so tight a two-entry leaf is at the cap and a third overflows it,
@@ -1390,7 +1404,15 @@ mod tests {
 
         let registering = tokio::spawn({
             let splitter = splitter.clone();
-            async move { splitter.register_subcollection(COLL, b"child").await }
+            async move {
+                splitter
+                    .publish_subcollection(
+                        COLL,
+                        b"child",
+                        CollectionId::from_slice(&[1; 16]).unwrap(),
+                    )
+                    .await
+            }
         });
         tokio::task::yield_now().await;
         rt::sleep(Duration::from_secs(2)).await;
@@ -1409,8 +1431,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            root.subcollections().collect::<Vec<_>>(),
-            vec![b"child".as_slice()]
+            root.children().collect::<Vec<_>>(),
+            vec![(
+                b"child".as_slice(),
+                CollectionId::from_slice(&[1; 16]).unwrap()
+            )]
         );
         assert!(root.node().structural_gate().holders().is_empty());
     }

@@ -1,8 +1,9 @@
 //! Database metadata version check. Ported from the Go `version.go`.
 
-use glassdb_backend::Backend;
-use glassdb_data::{DATABASE_ID_BYTES, DatabaseId};
+use glassdb_backend::{Backend, BackendError};
+use glassdb_data::{CollectionAddress, DATABASE_ID_BYTES, DatabaseId};
 use glassdb_proto as pb;
+use glassdb_storage::CollectionRoot;
 use prost::Message;
 
 use crate::error::Error;
@@ -24,6 +25,7 @@ pub(crate) async fn check_or_create_db_meta(
         Err(Error::NotFound) => {}
         Err(e) => return Err(e),
     }
+    ensure_root_for_initialization(b, name).await?;
     let proposed = DatabaseId::new_random();
     match set_db_metadata(b, name, proposed).await {
         Ok(()) => Ok(proposed),
@@ -32,6 +34,21 @@ pub(crate) async fn check_or_create_db_meta(
             check_db_version(b, name).await
         }
         Err(e) => Err(Error::with_source("creating db metadata", e)),
+    }
+}
+
+async fn ensure_root_for_initialization(b: &impl Backend, name: &str) -> Result<(), Error> {
+    let path =
+        glassdb_data::paths::collection_info(&CollectionAddress::root(name).physical_prefix());
+    let body = CollectionRoot::new().encode();
+    match b.write_if_not_exists(&path, body).await {
+        Ok(_) => Ok(()),
+        Err(BackendError::Precondition) => {
+            let stored = b.read(&path).await?;
+            CollectionRoot::decode(&stored.contents)?;
+            Ok(())
+        }
+        Err(error) => Err(Error::from(error)),
     }
 }
 

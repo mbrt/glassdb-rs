@@ -69,7 +69,7 @@ impl Transaction {
     /// Takes `&self`, so multiple reads can be polled concurrently (e.g. with
     /// `futures::future::join_all`) to fetch keys in parallel.
     pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        let key = KeyRef::new(c.path().clone(), key);
+        let key = KeyRef::new(c.address().clone(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
         {
@@ -133,7 +133,7 @@ impl Transaction {
                 .staged
                 .iter()
                 .filter_map(|(key, value)| {
-                    if key.collection() != c.path() {
+                    if key.collection() != c.address() {
                         return None;
                     }
                     let present = match value {
@@ -152,12 +152,12 @@ impl Transaction {
 
         let result = self
             .resolver
-            .scan_keys(c.path(), &range, &overlay, None, None)
+            .scan_keys(c.address(), &range, &overlay, None, None)
             .await
             .map_err(Error::from_read)?;
         let keys = result.keys;
         self.inner.lock().unwrap().scans.push(ScanAccess {
-            collection: c.path().clone(),
+            collection: c.address().clone(),
             range,
             overlay,
             keys: keys.clone(),
@@ -169,7 +169,7 @@ impl Transaction {
 
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        let key = KeyRef::new(c.path().clone(), key);
+        let key = KeyRef::new(c.address().clone(), key);
         self.inner
             .lock()
             .unwrap()
@@ -180,7 +180,7 @@ impl Transaction {
 
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
-        let key = KeyRef::new(c.path().clone(), key);
+        let key = KeyRef::new(c.address().clone(), key);
         self.inner
             .lock()
             .unwrap()
@@ -333,7 +333,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use crate::{Backend, Database, KeyScan, memory::MemoryBackend};
+    use crate::{Backend, CollectionPath, Database, KeyScan, memory::MemoryBackend};
 
     // ADR-031 phantom prevention, the in-flight case: when a key is created
     // *while* a listing transaction is running — after it scanned the leaf but
@@ -346,8 +346,8 @@ mod tests {
     async fn listing_retries_to_include_a_key_added_during_the_scan() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let db = Database::open("example", backend).await.unwrap();
-        let coll = db.collection(b"phantom-retry");
-        coll.create().await.unwrap();
+        let path = CollectionPath::new(b"phantom-retry").unwrap();
+        let coll = db.create_collection(&path).await.unwrap();
 
         let seed: Vec<Vec<u8>> = (0u32..5).map(|i| i.to_be_bytes().to_vec()).collect();
         for k in &seed {

@@ -19,7 +19,7 @@ use tokio::runtime::Runtime;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
-use glassdb::{Backend, Collection, Database, Error, Transaction};
+use glassdb::{Backend, Collection, CollectionPath, Database, Error, Transaction};
 
 // Number of iterations used for the one-off stats summary printed per backend.
 const STATS_ITERS: i64 = 30;
@@ -76,8 +76,11 @@ async fn open_db(backend: Arc<dyn Backend>) -> Database {
 
 async fn open_coll(backend: Arc<dyn Backend>, name: &[u8]) -> (Database, Collection) {
     let db = open_db(backend).await;
-    let coll = db.collection(name);
-    coll.create().await.expect("create coll");
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(name)
+        .await
+        .expect("create coll");
     (db, coll)
 }
 
@@ -263,7 +266,9 @@ fn bench_concurr_multi_rmw(c: &mut Criterion, rt: &Runtime) {
         // Two databases over the same backend; one runs a background contender.
         let (db1, coll1) = rt.block_on(open_coll(backend.clone(), b"rmw-b"));
         let db2 = rt.block_on(open_db(backend));
-        let coll2 = db2.collection(b"rmw-b");
+        let coll2 = rt
+            .block_on(db2.open_collection(&CollectionPath::new(b"rmw-b").unwrap()))
+            .expect("open coll");
 
         // The contender is a spawned task on the *shared* measured runtime, so
         // it multiplexes over the same worker pool as the measured workload

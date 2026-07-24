@@ -18,15 +18,11 @@ message TransactionLog {
 }
 
 message CollectionWrites {
-    CollectionPath collection = 1;
+    // Stable incarnation ID. The database root comes from the enclosing
+    // transaction object's physical path and is deliberately omitted.
+    bytes collection_id = 1;
     repeated Write writes = 2;
     CollectionLocks locks = 3;
-}
-
-// A relocatable logical collection path. The database root comes from the
-// enclosing transaction object's physical path and is deliberately omitted.
-message CollectionPath {
-    repeated bytes segments = 1;
 }
 
 message Write {
@@ -164,7 +160,13 @@ message CollectionRoot {
     // The B-link tree root node. Its high-key is +infinity and its right-sibling
     // is empty (the root has no siblings).
     Node node = 1;
-    // Child collection names (raw bytes), the subcollection directory; sorted so
-    // the encoding is canonical.
-    repeated bytes subcollections = 2;
+    // Direct child bindings, sorted by raw name so the encoding is canonical.
+    repeated CollectionDirectoryEntry children = 2;
+}
+
+message CollectionDirectoryEntry {
+    // Raw child name.
+    bytes name = 1;
+    // Stable 16-byte incarnation ID.
+    bytes collection_id = 2;
 }

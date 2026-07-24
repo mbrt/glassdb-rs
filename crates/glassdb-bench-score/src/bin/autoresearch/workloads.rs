@@ -66,9 +66,9 @@ fn read_int(b: &[u8]) -> i64 {
 // --- Setup helpers --------------------------------------------------------
 
 async fn create_coll(db: &Database, name: &str) -> Result<Collection, Error> {
-    let coll = db.collection(name.as_bytes());
-    coll.create().await?;
-    Ok(coll)
+    db.root_collection()
+        .create_collection_if_absent(name.as_bytes())
+        .await
 }
 
 fn make_keys(n: usize) -> Vec<Vec<u8>> {

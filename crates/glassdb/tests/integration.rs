@@ -6,13 +6,26 @@ use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
-use glassdb::{Backend, Collection, Database, Error, ProtocolTiming, SplitPolicy, Transaction};
-use glassdb_data::{CollectionPath, paths};
+use glassdb::{
+    Backend, Collection, CollectionPath, Database, Error, ProtocolTiming, SplitPolicy, Transaction,
+};
 use glassdb_storage::{CollectionRoot, TxCommitStatus};
 use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
     Database::open("example", b).await.unwrap()
+}
+
+async fn create_top(db: &Database, name: &[u8]) -> Collection {
+    db.create_collection_if_absent(&CollectionPath::new(name).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn open_top(db: &Database, name: &[u8]) -> Collection {
+    db.open_collection(&CollectionPath::new(name).unwrap())
+        .await
+        .unwrap()
 }
 
 fn mem() -> Arc<dyn Backend> {
@@ -55,8 +68,11 @@ async fn rw() {
     let key = b"key1";
     let val = b"value1";
 
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     coll.write(key, val).await.unwrap();
     let buf = coll.read(key).await.unwrap().unwrap();
@@ -80,8 +96,11 @@ async fn individually_oversized_key_is_invalid_input() {
         .open()
         .await
         .unwrap();
-    let coll = db.collection(b"demo");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo")
+        .await
+        .unwrap();
     let before = db.stats();
 
     let err = coll.write(&[b'k'; 128], b"value").await.unwrap_err();
@@ -101,8 +120,11 @@ async fn individually_oversized_key_is_invalid_input() {
 #[tokio::test(start_paused = true)]
 async fn stats_report_locker_activity() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     let before = db.stats();
     coll.write(b"key1", b"value1").await.unwrap();
@@ -150,12 +172,11 @@ async fn stats_report_transactional_decoded_cache_hits() {
     let backend = mem();
     let writer_db = init_db(backend.clone()).await;
     let reader_db = init_db(backend).await;
-    let writer = writer_db.collection(b"cache-stats");
-    let reader = reader_db.collection(b"cache-stats");
     let key = b"key";
     let value = b"value";
 
-    writer.create().await.unwrap();
+    let writer = create_top(&writer_db, b"cache-stats").await;
+    let reader = open_top(&reader_db, b"cache-stats").await;
     writer.write(key, value).await.unwrap();
 
     let before_cold = reader_db.stats();
@@ -205,8 +226,11 @@ async fn delete() {
     let key = b"key1";
     let val = b"value1";
 
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     coll.write(key, val).await.unwrap();
     coll.delete(key).await.unwrap();
@@ -238,8 +262,11 @@ async fn read_then_delete_single_tx() {
     let key = b"key1";
     let val = b"value1";
 
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
     coll.write(key, val).await.unwrap();
 
     // Read the existing value, then delete the same key, in one transaction.
@@ -267,10 +294,10 @@ async fn read_from_another() {
     let key = b"key1";
     let val = b"value1";
 
-    db1.collection(coll).create().await.unwrap();
-    db1.collection(coll).write(key, val).await.unwrap();
+    let db1coll = create_top(&db1, coll).await;
+    db1coll.write(key, val).await.unwrap();
 
-    let buf = db2.collection(coll).read(key).await.unwrap().unwrap();
+    let buf = open_top(&db2, coll).await.read(key).await.unwrap().unwrap();
     assert_eq!(buf, val);
 }
 
@@ -286,8 +313,11 @@ async fn read_deleted_from_another() {
     let val = b"value1";
     let newval = b"value1-modified";
 
-    let db1coll = db1.collection(coll);
-    db1coll.create().await.unwrap();
+    let db1coll = db1
+        .root_collection()
+        .create_collection_if_absent(coll)
+        .await
+        .unwrap();
     let db1coll = &db1coll;
     db1.tx(|tx| async move {
         tx.write(db1coll, key1, val)?;
@@ -296,7 +326,7 @@ async fn read_deleted_from_another() {
     .await
     .unwrap();
 
-    let db2coll = &db2.collection(coll);
+    let db2coll = &open_top(&db2, coll).await;
     db2.tx(|tx| async move {
         tx.write(db2coll, key1, newval)?;
         tx.delete(db2coll, key2)
@@ -320,10 +350,9 @@ async fn read_deleted_from_another() {
 #[tokio::test(start_paused = true)]
 async fn rmw_single() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"rmw-c");
     let key = b"key";
 
-    coll.create().await.unwrap();
+    let coll = create_top(&db, b"rmw-c").await;
     rmw(&db, &coll, key, 30).await.unwrap();
 
     let stats = db.stats();
@@ -363,26 +392,23 @@ async fn concurrent_rmw() {
     let coll_name = b"rmw-c";
     let key = b"key";
 
-    db1.collection(coll_name).create().await.unwrap();
-
-    let coll1 = db1.collection(coll_name);
-    let coll2 = db2.collection(coll_name);
+    let coll1 = create_top(&db1, coll_name).await;
+    let coll2 = open_top(&db2, coll_name).await;
     let (r1, r2) = tokio::join!(rmw(&db1, &coll1, key, 30), rmw(&db2, &coll2, key, 30),);
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2.collection(coll_name).read(key).await.unwrap().unwrap();
+    let val = coll2.read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
 #[tokio::test(start_paused = true)]
 async fn multiple_rmw_single() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"multiple-rmw-c");
     let key1 = b"key1";
     let key2 = b"key2";
 
-    coll.create().await.unwrap();
+    let coll = create_top(&db, b"multiple-rmw-c").await;
     multiple_rmw(&db, &coll, key1, key2, 30).await.unwrap();
 
     let val = coll.read(key1).await.unwrap().unwrap();
@@ -402,10 +428,8 @@ async fn concurrent_multiple_rmw() {
     let key1 = b"key1";
     let key2 = b"key2";
 
-    db1.collection(coll_name).create().await.unwrap();
-
-    let coll1 = db1.collection(coll_name);
-    let coll2 = db2.collection(coll_name);
+    let coll1 = create_top(&db1, coll_name).await;
+    let coll2 = open_top(&db2, coll_name).await;
     let (r1, r2) = tokio::join!(
         multiple_rmw(&db1, &coll1, key1, key2, 30),
         multiple_rmw(&db2, &coll2, key1, key2, 30),
@@ -413,9 +437,9 @@ async fn concurrent_multiple_rmw() {
     r1.unwrap();
     r2.unwrap();
 
-    let val = db2.collection(coll_name).read(key1).await.unwrap().unwrap();
+    let val = coll2.read(key1).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
-    let val = db2.collection(coll_name).read(key2).await.unwrap().unwrap();
+    let val = coll2.read(key2).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
 }
 
@@ -426,8 +450,7 @@ async fn concurrent_reads() {
     use futures::future::join_all;
 
     let db = init_db(mem()).await;
-    let coll = &db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = &create_top(&db, b"demo-coll").await;
 
     let keys: Vec<Vec<u8>> = (0..15).map(|i| format!("key{i}").into_bytes()).collect();
     let keys = &keys;
@@ -471,8 +494,11 @@ async fn read_stale() {
     use std::time::Duration;
 
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
     let key = b"key";
 
     let staleness = Duration::from_millis(300);
@@ -522,8 +548,11 @@ async fn diagnostics_returns_typed_snapshot() {
     // After running a transaction, the snapshot is still callable and renders
     // through the Display impl; the schema (typed fields) is the contract we
     // care about here.
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
     let coll_ref = &coll;
     db.tx(|tx| async move {
         tx.write(coll_ref, b"k1", b"v1")?;
@@ -547,8 +576,11 @@ async fn diagnostics_returns_typed_snapshot() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_drains_background_write_back() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     let coll_ref = &coll;
     db.tx(|tx| async move {
@@ -570,8 +602,11 @@ async fn shutdown_drains_background_write_back() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_rejects_every_public_async_entry_point() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     db.shutdown().await;
 
@@ -580,7 +615,10 @@ async fn shutdown_rejects_every_public_async_entry_point() {
         coll.read_stale(b"key", std::time::Duration::ZERO).await,
         Err(Error::ShuttingDown)
     ));
-    assert!(matches!(coll.create().await, Err(Error::ShuttingDown)));
+    assert!(matches!(
+        coll.create_collection(b"child").await,
+        Err(Error::ShuttingDown)
+    ));
     assert!(matches!(coll.collections().await, Err(Error::ShuttingDown)));
     assert!(matches!(
         db.tx(|_| async { Ok::<(), Error>(()) }).await,
@@ -591,8 +629,11 @@ async fn shutdown_rejects_every_public_async_entry_point() {
 #[tokio::test(start_paused = true)]
 async fn list_keys() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     let keys: Vec<Vec<u8>> = (0u32..100).map(|i| i.to_be_bytes().to_vec()).collect();
     let test_val = b"val";
@@ -633,8 +674,11 @@ async fn list_keys() {
 #[tokio::test]
 async fn transactional_key_scan_supports_ranges_prefixes_and_paging() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"key-scan");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"key-scan")
+        .await
+        .unwrap();
     for key in [
         b"a".as_slice(),
         b"aa",
@@ -689,8 +733,11 @@ async fn transactional_key_scan_supports_ranges_prefixes_and_paging() {
 #[tokio::test]
 async fn transactional_key_scan_reflects_staged_membership() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"scan-own-writes");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"scan-own-writes")
+        .await
+        .unwrap();
     coll.write(b"a", b"old").await.unwrap();
     coll.write(b"c", b"old").await.unwrap();
 
@@ -718,8 +765,11 @@ async fn transactional_key_scan_reflects_staged_membership() {
 #[tokio::test]
 async fn scan_then_create_prevents_phantom_write_skew() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"scan-write-skew");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"scan-write-skew")
+        .await
+        .unwrap();
     let first_scans = Arc::new(Barrier::new(2));
 
     let run = |key: &'static [u8]| {
@@ -764,14 +814,17 @@ async fn scan_then_create_prevents_phantom_write_skew() {
 #[tokio::test]
 async fn key_scan_validates_ranges_and_collection_existence() {
     let db = init_db(mem()).await;
-    let missing = db.collection(b"missing-scan");
     assert!(matches!(
-        missing.scan_keys(glassdb::KeyScan::all()).await,
+        db.open_collection(&CollectionPath::new(b"missing-scan").unwrap())
+            .await,
         Err(glassdb::Error::NotFound)
     ));
 
-    let coll = db.collection(b"scan-validation");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"scan-validation")
+        .await
+        .unwrap();
     assert!(matches!(
         coll.scan_keys(glassdb::KeyScan::range(b"z", b"a")).await,
         Err(glassdb::Error::InvalidInput(_))
@@ -793,8 +846,11 @@ async fn key_scan_validates_ranges_and_collection_existence() {
 #[tokio::test]
 async fn keys_listing_is_phantom_safe() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"phantom");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"phantom")
+        .await
+        .unwrap();
 
     // Seed a stable set of keys.
     let seed: Vec<Vec<u8>> = (0u32..20).map(|i| i.to_be_bytes().to_vec()).collect();
@@ -844,8 +900,11 @@ async fn listing_hides_keys_from_aborted_transactions() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let (backend, pause) = PauseControl::wrap(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"aborted-vis");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"aborted-vis")
+        .await
+        .unwrap();
 
     // Two committed keys the listing must always see.
     coll.write(b"real-a", b"v").await.unwrap();
@@ -894,18 +953,22 @@ async fn listing_hides_keys_from_aborted_transactions() {
 #[tokio::test(start_paused = true)]
 async fn list_collections() {
     let db = init_db(mem()).await;
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
 
     let colls: Vec<Vec<u8>> = (0u32..50).map(|i| i.to_be_bytes().to_vec()).collect();
     for c in &colls {
-        coll.collection(c).create().await.unwrap();
+        coll.create_collection(c).await.unwrap();
     }
 
     let got: Vec<Vec<u8>> = coll
         .collections()
         .await
         .unwrap()
+        .map(|entry| entry.map(|entry| entry.name))
         .collect::<Result<_, _>>()
         .unwrap();
 
@@ -923,25 +986,32 @@ async fn list_collections_of(coll: &Collection) -> Vec<Vec<u8>> {
     coll.collections()
         .await
         .unwrap()
+        .map(|entry| entry.map(|entry| entry.name))
         .collect::<Result<_, _>>()
         .unwrap()
 }
 
 // The subcollection directory lives in the parent root (ADR-031), so listing is
 // driven by that directory, not a backend prefix scan. A collection with no
-// children lists nothing, and re-creating the same child does not duplicate it.
+// children lists nothing, and create-if-absent returns the existing binding.
 #[tokio::test(start_paused = true)]
-async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
+async fn subcollection_listing_is_root_driven_and_create_if_absent_is_idempotent() {
     let db = init_db(mem()).await;
-    let parent = db.collection(b"parent");
-    parent.create().await.unwrap();
+    let parent = db
+        .root_collection()
+        .create_collection_if_absent(b"parent")
+        .await
+        .unwrap();
 
     // A freshly created collection has no subcollections.
     assert!(list_collections_of(&parent).await.is_empty());
 
-    // Creating the same child twice registers it exactly once.
-    parent.collection(b"child").create().await.unwrap();
-    parent.collection(b"child").create().await.unwrap();
+    // Repeating create-if-absent returns the same incarnation and registers it
+    // exactly once.
+    let first = parent.create_collection_if_absent(b"child").await.unwrap();
+    let second = parent.create_collection_if_absent(b"child").await.unwrap();
+    first.write(b"k", b"v").await.unwrap();
+    assert_eq!(second.read(b"k").await.unwrap().unwrap(), b"v");
     assert_eq!(list_collections_of(&parent).await, vec![b"child".to_vec()]);
 }
 
@@ -951,19 +1021,29 @@ async fn subcollection_listing_is_root_driven_and_create_is_idempotent() {
 async fn concurrent_subcollection_registration_is_serialized_and_converges() {
     let mem = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem.clone());
-    let parent_prefix = CollectionPath::new("example", b"parent").physical_prefix();
-    let parent_root = paths::collection_info(&parent_prefix);
+    let db = init_db(backend.clone() as Arc<dyn Backend>).await;
+    let parent = create_top(&db, b"parent").await;
+
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let parent_writes = Arc::new(AtomicUsize::new(0));
+    let parent_root = Arc::new(Mutex::new(None::<String>));
     backend.set_before({
         let parent_root = parent_root.clone();
         let entered = entered.clone();
         let release = release.clone();
         let parent_writes = parent_writes.clone();
         move |op| {
-            let block = matches!(op, BackendOp::WriteIf { path, .. } if *path == parent_root)
-                && parent_writes.fetch_add(1, Ordering::SeqCst) == 0;
+            let parent_cas = matches!(op, BackendOp::WriteIf { path, .. } if path.ends_with("/_i"));
+            if let BackendOp::WriteIf { path, .. } = op
+                && parent_cas
+            {
+                parent_root
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| (*path).to_owned());
+            }
+            let block = parent_cas && parent_writes.fetch_add(1, Ordering::SeqCst) == 0;
             let entered = entered.clone();
             let release = release.clone();
             let future: HookFuture = Box::pin(async move {
@@ -977,13 +1057,10 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
         }
     });
 
-    let db = init_db(backend as Arc<dyn Backend>).await;
-    let parent = db.collection(b"parent");
-    parent.create().await.unwrap();
-    let left = parent.collection(b"left");
-    let right = parent.collection(b"right");
-    let left_create = tokio::spawn(async move { left.create().await });
-    let right_create = tokio::spawn(async move { right.create().await });
+    let left_parent = parent.clone();
+    let right_parent = parent.clone();
+    let left_create = tokio::spawn(async move { left_parent.create_collection(b"left").await });
+    let right_create = tokio::spawn(async move { right_parent.create_collection(b"right").await });
 
     entered.notified().await;
     for _ in 0..64 {
@@ -1003,6 +1080,11 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
         list_collections_of(&parent).await,
         vec![b"left".to_vec(), b"right".to_vec()]
     );
+    let parent_root = parent_root
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("parent CAS path was recorded");
     let stored = mem.read(&parent_root).await.unwrap();
     let root = CollectionRoot::decode(&stored.contents).unwrap();
     assert!(
@@ -1016,11 +1098,13 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
 #[tokio::test(start_paused = true)]
 async fn subcollection_listing_is_scoped_to_direct_parent() {
     let db = init_db(mem()).await;
-    let parent = db.collection(b"parent");
-    parent.create().await.unwrap();
-    let child = parent.collection(b"child");
-    child.create().await.unwrap();
-    child.collection(b"grandchild").create().await.unwrap();
+    let parent = db
+        .root_collection()
+        .create_collection_if_absent(b"parent")
+        .await
+        .unwrap();
+    let child = parent.create_collection(b"child").await.unwrap();
+    child.create_collection(b"grandchild").await.unwrap();
 
     assert_eq!(list_collections_of(&parent).await, vec![b"child".to_vec()]);
     assert_eq!(
@@ -1034,8 +1118,11 @@ async fn subcollection_listing_is_scoped_to_direct_parent() {
 #[tokio::test(start_paused = true)]
 async fn listing_a_missing_collection_is_not_found() {
     let db = init_db(mem()).await;
-    let missing = db.collection(b"missing");
-    assert!(matches!(missing.collections().await, Err(Error::NotFound)));
+    assert!(matches!(
+        db.open_collection(&CollectionPath::new(b"missing").unwrap())
+            .await,
+        Err(Error::NotFound)
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1054,8 +1141,11 @@ async fn builder_custom_options() {
         .await
         .unwrap();
 
-    let coll = db.collection(b"demo-coll");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"demo-coll")
+        .await
+        .unwrap();
     coll.write(b"key1", b"value1").await.unwrap();
     let buf = coll.read(b"key1").await.unwrap().unwrap();
     assert_eq!(buf, b"value1");
@@ -1070,8 +1160,11 @@ async fn cancelled_tx_future_does_not_block_followups() {
     use std::time::Duration;
 
     let db = init_db(mem()).await;
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     coll.write(b"k", &write_int(1)).await.unwrap();
 
     let coll_ref = &coll;
@@ -1217,8 +1310,11 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let (backend, pause) = PauseControl::wrap(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();
     coll.write(b"k2", &write_int(2)).await.unwrap();
 
@@ -1290,8 +1386,11 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let (backend, pause) = PauseControl::wrap(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
-    let coll = db.collection(b"c");
-    coll.create().await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();
     coll.write(b"k2", &write_int(2)).await.unwrap();
 

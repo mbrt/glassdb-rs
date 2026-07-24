@@ -439,14 +439,16 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_storage::{CachedStore, Directory, LockType, Shard, ShardEntry, Timeline, TxWrite};
+    use glassdb_storage::{
+        CachedStore, CollectionRoot, Directory, LockType, Shard, ShardEntry, Timeline, TxWrite,
+    };
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
 
-    const COLL: &str = "db/_c/NqxgQ0";
+    const COLL: &str = "db/_c/0000000000000000000000";
 
-    fn collection() -> glassdb_data::CollectionPath {
-        glassdb_data::CollectionPath::new("db", b"coll")
+    fn collection() -> glassdb_data::CollectionAddress {
+        glassdb_data::CollectionAddress::root("db")
     }
 
     // A fixed wall-clock anchor so the horizon is a pure function of the
@@ -467,15 +469,21 @@ mod tests {
         mon: Monitor,
     }
 
-    fn new_ctx() -> Ctx {
-        new_ctx_with(Arc::new(MemoryBackend::new()))
+    async fn new_ctx() -> Ctx {
+        new_ctx_with(Arc::new(MemoryBackend::new())).await
     }
 
-    fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
+    async fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "db");
         let shards = ShardStore::new(objects);
+        assert!(
+            shards
+                .create_root(COLL, &CollectionRoot::new())
+                .await
+                .unwrap()
+        );
         let bg = Arc::new(Background::new());
         let clock = Clock::anchored_at(base());
         let mon = Monitor::with_config(
@@ -633,7 +641,7 @@ mod tests {
     // so the list feed is exercised too.
     #[tokio::test(start_paused = true)]
     async fn committed_unreferenced_is_collected() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let (old, new) = (tx(1), tx(2));
         ctx.tl
             .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
@@ -652,7 +660,7 @@ mod tests {
     // value: it must never be collected.
     #[tokio::test(start_paused = true)]
     async fn committed_still_referenced_is_kept() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(1);
         ctx.tl
             .set(&committed(t.clone(), PAST_HORIZON, &[b"k"], &[]))
@@ -672,7 +680,7 @@ mod tests {
     // live transaction whose lock this non-atomic check cannot yet rule out.
     #[tokio::test(start_paused = true)]
     async fn recent_pending_is_kept() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(1);
         let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
         log.timestamp = Some(base());
@@ -696,7 +704,7 @@ mod tests {
     // never deleted in the same cycle it is aborted. Fed via the write-back hint.
     #[tokio::test(start_paused = true)]
     async fn dead_pending_is_force_aborted_and_locks_released() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(1);
         let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
         log.timestamp = Some(base());
@@ -722,7 +730,7 @@ mod tests {
     // retained, so a stuck owner cannot be resurrected or stranded.
     #[tokio::test(start_paused = true)]
     async fn recent_aborted_tombstone_is_kept() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(1);
         let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
         log.timestamp = Some(base());
@@ -742,7 +750,7 @@ mod tests {
     // (the vestigial entry removed) and is then deleted.
     #[tokio::test(start_paused = true)]
     async fn expired_aborted_prunes_locks_and_is_deleted() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(1);
         let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
         log.timestamp = Some(base() - PAST_HORIZON);
@@ -760,7 +768,7 @@ mod tests {
     // A candidate with no object at all is a harmless no-op.
     #[tokio::test(start_paused = true)]
     async fn missing_candidate_is_noop() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(9);
         ctx.gc.schedule_tx_cleanup(t.clone());
         run_once(&ctx.gc).await;
@@ -773,7 +781,7 @@ mod tests {
     async fn sparse_scan_obeys_request_budget() {
         let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
         let log = rec.log();
-        let ctx = new_ctx_with(rec);
+        let ctx = new_ctx_with(rec).await;
         let mut scan = test_scan((0..paths::TRANSACTION_SHARD_COUNT).collect(), None);
 
         assert!(ctx.gc.next_list_page(&mut scan).await.is_empty());
@@ -792,7 +800,7 @@ mod tests {
     // affected shard instead of abandoning the pass or discarding its order.
     #[tokio::test(start_paused = true)]
     async fn invalid_cursor_restarts_current_shard() {
-        let ctx = new_ctx();
+        let ctx = new_ctx().await;
         let t = tx(1);
         ctx.tl
             .set(&committed(t.clone(), PAST_HORIZON, &[], &[]))
@@ -819,7 +827,7 @@ mod tests {
         let (backend, gate) = Gate::wrap(mem);
         let rec = Arc::new(RecordingBackend::new(backend));
         let log = rec.log();
-        let ctx = new_ctx_with(rec);
+        let ctx = new_ctx_with(rec).await;
 
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);

@@ -1262,7 +1262,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, Clock, RetryConfig};
-    use glassdb_data::{CollectionPath, paths};
+    use glassdb_data::{CollectionAddress, paths};
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Node, Shard, ShardEntry, ShardStore, SplitPolicy,
         TLogger, Timeline, TxCommitStatus,
@@ -1280,11 +1280,14 @@ mod tests {
         _bg: Arc<Background>,
     }
 
-    fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
-        new_test_locker_with_policy(b, SplitPolicy::default())
+    async fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
+        new_test_locker_with_policy(b, SplitPolicy::default()).await
     }
 
-    fn new_test_locker_with_policy(b: Arc<dyn Backend>, policy: SplitPolicy) -> (Locker, TlCtx) {
+    async fn new_test_locker_with_policy(
+        b: Arc<dyn Backend>,
+        policy: SplitPolicy,
+    ) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "test");
@@ -1298,6 +1301,12 @@ mod tests {
             ProtocolTiming::simulation(),
         );
         let shards = ShardStore::new(objects.clone());
+        assert!(
+            shards
+                .create_root(COLL, &CollectionRoot::new())
+                .await
+                .unwrap()
+        );
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let dir = Directory::new(shards.clone());
         let coord = ShardCoordinator::with_hinter(
@@ -1321,8 +1330,8 @@ mod tests {
         )
     }
 
-    fn init_tl_test() -> (Locker, TlCtx) {
-        new_test_locker(Arc::new(MemoryBackend::new()))
+    async fn init_tl_test() -> (Locker, TlCtx) {
+        new_test_locker(Arc::new(MemoryBackend::new())).await
     }
 
     // Builds a deterministic, valid transaction ID. A smaller `order` yields an
@@ -1331,10 +1340,10 @@ mod tests {
         TxId::with_priority(order * 1_000_000_000, name.as_bytes())
     }
 
-    const COLL: &str = "test/_c/OMWWQM1gOF";
+    const COLL: &str = "test/_c/0000000000000000000000";
 
-    fn collection() -> CollectionPath {
-        CollectionPath::new("test", b"example")
+    fn collection() -> CollectionAddress {
+        CollectionAddress::root("test")
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -1404,6 +1413,15 @@ mod tests {
         loaded.entries.lookup(key).cloned()
     }
 
+    async fn replace_root(ctx: &TlCtx, root: &CollectionRoot) {
+        let (_, observed) = ctx
+            .shards
+            .load_root(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .await
+            .unwrap();
+        assert!(ctx.shards.store_root(COLL, root, &observed).await.unwrap());
+    }
+
     // Acquires shard locks in parallel mode, asserting success.
     async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
         match locker
@@ -1419,7 +1437,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_write_creates_entry() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
@@ -1451,7 +1469,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
-        let (locker, ctx) = new_test_locker(recorder);
+        let (locker, ctx) = new_test_locker(recorder).await;
         let unrelated = mk_tid(1, "unrelated");
         let tx = mk_tid(2, "tx");
         let mut root = CollectionRoot::new();
@@ -1462,7 +1480,7 @@ mod tests {
             current_writer: None,
             deleted: false,
         }])));
-        ctx.shards.create_root(COLL, &root).await.unwrap();
+        replace_root(&ctx, &root).await;
         log.lock().unwrap().clear();
         ctx.monitor.begin_tx(&tx);
 
@@ -1480,7 +1498,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn mutation_waits_for_a_live_structural_gate() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let gate = mk_tid(1, "gate");
         let tx = mk_tid(2, "tx");
         ctx.monitor.begin_tx(&gate);
@@ -1489,7 +1507,7 @@ mod tests {
         node.set_structural_gate(gate.clone());
         let mut root = CollectionRoot::new();
         root.set_node(node);
-        ctx.shards.create_root(COLL, &root).await.unwrap();
+        replace_root(&ctx, &root).await;
 
         let waiting_locker = locker.clone();
         let waiting_tx = tx.clone();
@@ -1559,7 +1577,8 @@ mod tests {
             ..SplitPolicy::default()
         };
 
-        let (locker, ctx) = new_test_locker_with_policy(Arc::new(MemoryBackend::new()), policy);
+        let (locker, ctx) =
+            new_test_locker_with_policy(Arc::new(MemoryBackend::new()), policy).await;
         seed_committed(&ctx, b"a", b"old").await;
         ctx.monitor.begin_tx(&tx);
 
@@ -1588,7 +1607,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_does_not_take_membership_lock() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"old").await;
         let tx = mk_tid(1, "tx");
@@ -1610,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_membership_reader_does_not_bump_version() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"old").await;
         let tx = mk_tid(1, "scan");
@@ -1645,7 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_read_locks() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         let tx1 = mk_tid(1, "tx1");
         let tx2 = mk_tid(2, "tx2");
@@ -1666,7 +1685,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn older_wounds_younger_write_holder() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
 
         // Seed a committed value so the key exists (write lock, not create).
@@ -1694,7 +1713,7 @@ mod tests {
     // the holder finalizes — it never aborts on the conflict.
     #[tokio::test(start_paused = true)]
     async fn younger_waits_for_older_holder() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"v0").await;
 
@@ -1740,7 +1759,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn younger_proceeds_after_older_holder_commits() {
         use glassdb_storage::{TxLog, TxWrite};
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"v0").await;
 
@@ -1800,7 +1819,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_back_publishes_and_releases() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
@@ -1841,7 +1860,7 @@ mod tests {
     // that txid just lost its reference and is the GC candidate hint (ADR-022).
     #[tokio::test]
     async fn write_back_returns_superseded_writer() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
 
         // First committer publishes the pointer for `key`; it supersedes nothing.
@@ -1866,7 +1885,7 @@ mod tests {
     // pending so it can re-acquire under the same id (ADR-024).
     #[tokio::test]
     async fn release_locks_drops_held_locks_without_publishing() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
@@ -1902,7 +1921,7 @@ mod tests {
 
     #[tokio::test]
     async fn tx_locks_snapshot_lists_held_shards() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
@@ -2024,19 +2043,20 @@ mod tests {
     }
 
     /// A locker whose backend records ops and gates the first read.
-    fn gated_locker() -> (Locker, TlCtx, OpLog, Arc<Gate>) {
-        gated_locker_with(true)
+    async fn gated_locker() -> (Locker, TlCtx, OpLog, Arc<Gate>) {
+        gated_locker_with(true).await
     }
 
     /// As [`gated_locker`], but `armed` chooses whether the gate is active from
     /// the start (gate acquisition) or deferred until `arm` (gate a later phase,
     /// e.g. write-back, after un-gated setup).
-    fn gated_locker_with(armed: bool) -> (Locker, TlCtx, OpLog, Arc<Gate>) {
+    async fn gated_locker_with(armed: bool) -> (Locker, TlCtx, OpLog, Arc<Gate>) {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem, armed);
         let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
-        let (locker, ctx) = new_test_locker(recorder);
+        let (locker, ctx) = new_test_locker(recorder).await;
+        log.lock().unwrap().clear();
         (locker, ctx, log, gate)
     }
 
@@ -2063,7 +2083,7 @@ mod tests {
     // load + one store serves both, and both end up holding the shared read lock.
     #[tokio::test(start_paused = true)]
     async fn concurrent_readers_share_one_cas() {
-        let (locker, ctx, log, gate) = gated_locker();
+        let (locker, ctx, log, gate) = gated_locker().await;
         let key = b"key";
         let tx1 = mk_tid(1, "r1");
         let tx2 = mk_tid(2, "r2");
@@ -2108,7 +2128,7 @@ mod tests {
     // so they batch into one CAS round rather than each doing its own load+store.
     #[tokio::test(start_paused = true)]
     async fn concurrent_disjoint_writers_share_one_cas() {
-        let (locker, ctx, log, gate) = gated_locker_with(false);
+        let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
         seed_committed(&ctx, &ka, b"a").await;
@@ -2153,7 +2173,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn disjoint_creates_serialize_on_membership_write() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
         let old = mk_tid(1, "old");
@@ -2208,7 +2228,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn concurrent_write_backs_share_one_cas() {
         // Gate is deferred so the un-gated lock+commit setup runs first.
-        let (locker, ctx, log, gate) = gated_locker_with(false);
+        let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
         let shard_path = paths::collection_info(COLL);
@@ -2250,7 +2270,7 @@ mod tests {
     // installs the new acquirer's lock.
     #[tokio::test(start_paused = true)]
     async fn write_back_folds_into_acquire_round() {
-        let (locker, ctx, log, gate) = gated_locker_with(false);
+        let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
         let shard_path = paths::collection_info(COLL);
@@ -2291,7 +2311,7 @@ mod tests {
     // release path) batch into one CAS round (ADR-026); neither publishes a value.
     #[tokio::test(start_paused = true)]
     async fn concurrent_releases_share_one_cas() {
-        let (locker, ctx, log, gate) = gated_locker_with(false);
+        let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
         let shard_path = paths::collection_info(COLL);
@@ -2339,7 +2359,7 @@ mod tests {
     // wounded, it simply waits its turn.
     #[tokio::test(start_paused = true)]
     async fn same_key_writers_share_one_cas() {
-        let (locker, ctx, log, gate) = gated_locker();
+        let (locker, ctx, log, gate) = gated_locker().await;
         let key = b"key";
         let old = mk_tid(1, "old");
         let young = mk_tid(2, "young");
@@ -2394,7 +2414,7 @@ mod tests {
     // guarantees liveness without either transaction being wounded.
     #[tokio::test(start_paused = true)]
     async fn same_key_younger_proceeds_after_older_releases() {
-        let (locker, ctx, log, gate) = gated_locker();
+        let (locker, ctx, log, gate) = gated_locker().await;
         let key = b"key";
         let old = mk_tid(1, "old");
         let young = mk_tid(2, "young");
@@ -2438,7 +2458,7 @@ mod tests {
     // loser waits and, after the winner releases, proceeds. Both make progress.
     #[tokio::test(start_paused = true)]
     async fn equal_priority_same_key_one_winner_no_livelock() {
-        let (locker, ctx, log, gate) = gated_locker();
+        let (locker, ctx, log, gate) = gated_locker().await;
         let key = b"key";
         // Same priority (order 1), distinct prefixes: `aaaa` < `bbbb` by the
         // fold's byte tiebreak, so `a` is the deterministic round winner.
@@ -2501,7 +2521,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn release_and_acquire_same_key_commute() {
         for (wb_order, acq_order) in [(1u64, 2u64), (2u64, 1u64)] {
-            let (locker, ctx, log, gate) = gated_locker_with(false);
+            let (locker, ctx, log, gate) = gated_locker_with(false).await;
             let key = b"key";
             let shard_path = paths::collection_info(COLL);
 
@@ -2552,7 +2572,7 @@ mod tests {
     // coordination, so it is empty while idle and after an uncontended lock.
     #[tokio::test]
     async fn close_cancels_new_locks_and_snapshot_tracks_idle() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         assert!(
             ctx.coord.dedup_snapshot().is_empty(),
             "no coordination while idle"
@@ -2583,7 +2603,7 @@ mod tests {
     // acquires the key without hanging.
     #[tokio::test(start_paused = true)]
     async fn dropped_waiter_leaves_locker_usable() {
-        let (locker, ctx) = init_tl_test();
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"v0").await;
 

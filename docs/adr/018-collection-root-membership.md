@@ -13,9 +13,9 @@ over — ADR-031 makes `_i` itself the B-link tree's (fixed-path) root node, fol
 the collection metadata into it, and generalizes root-version validation to
 per-leaf version validation.
 
-[ADR-046](046-incarnation-addressed-collections.md) proposes superseding this
-ADR's physical-root existence rule, name-derived child addressing, and
-name-only subcollection directory with incarnation IDs and direct parent
+[ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
+physical-root existence rule, name-derived child addressing, and name-only
+subcollection directory with incarnation IDs and direct parent
 mappings. [ADR-047](047-transactional-collection-management.md) proposes making
 creation, listing, and teardown of that hierarchy transactional. This ADR's
 key-membership decisions remain historical input to ADR-031/032.

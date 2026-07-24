@@ -1,22 +1,93 @@
-//! A named group of key-value pairs. Ported from the Go `collection.go`.
+//! Collection handles, unresolved collection paths, and standalone collection
+//! management.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_data::{CollectionPath, KeyRef};
-use glassdb_storage::CollectionRoot;
+use glassdb_data::{CollectionAddress, KeyRef, MAX_COLLECTION_NAME_BYTES};
+use glassdb_storage::Requirement;
 use glassdb_trans::{Reader, Resolver};
 
-use crate::db::DbInner;
+use crate::db::{CreateMode, DbInner};
 use crate::error::Error;
-use crate::iter::{CollectionsIter, KeysIter};
+use crate::iter::{CollectionEntry, CollectionsIter, KeysIter};
 use crate::scan::{KeyPage, KeyScan};
 
-/// A named group of key-value pairs within a database.
+/// An unresolved sequence of logical collection names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CollectionPath {
+    segments: Arc<[Vec<u8>]>,
+}
+
+impl CollectionPath {
+    /// Creates a path containing one top-level collection name.
+    pub fn new(name: impl AsRef<[u8]>) -> Result<Self, Error> {
+        validate_collection_name(name.as_ref())?;
+        Ok(Self {
+            segments: vec![name.as_ref().to_vec()].into(),
+        })
+    }
+
+    /// Returns a path extended by one direct child name.
+    pub fn child(&self, name: impl AsRef<[u8]>) -> Result<Self, Error> {
+        validate_collection_name(name.as_ref())?;
+        let mut segments = self.segments.to_vec();
+        segments.push(name.as_ref().to_vec());
+        Ok(Self {
+            segments: segments.into(),
+        })
+    }
+
+    /// Returns the path's raw names from outermost to innermost.
+    pub fn segments(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
+        self.segments.iter().map(Vec::as_slice)
+    }
+}
+
+impl From<&CollectionPath> for CollectionPath {
+    fn from(path: &CollectionPath) -> Self {
+        path.clone()
+    }
+}
+
+impl TryFrom<&str> for CollectionPath {
+    type Error = Error;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        Self::new(name.as_bytes())
+    }
+}
+
+impl TryFrom<String> for CollectionPath {
+    type Error = Error;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name.as_bytes())
+    }
+}
+
+impl TryFrom<&String> for CollectionPath {
+    type Error = Error;
+
+    fn try_from(name: &String) -> Result<Self, Self::Error> {
+        Self::new(name.as_bytes())
+    }
+}
+
+/// A named group of key-value pairs bound to one collection incarnation.
 #[derive(Clone)]
 pub struct Collection {
-    path: CollectionPath,
+    address: CollectionAddress,
+    binding: Option<CollectionBinding>,
     db: Arc<DbInner>,
+}
+
+/// The direct logical binding retained for future lifecycle operations.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct CollectionBinding {
+    parent: CollectionAddress,
+    name: Arc<[u8]>,
 }
 
 impl Collection {
@@ -36,7 +107,7 @@ impl Collection {
         max_staleness: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
         let _guard = self.db.admit_operation()?;
-        let key = KeyRef::new(self.path.clone(), key);
+        let key = KeyRef::new(self.address.clone(), key);
         let r = Reader::new(
             Resolver::new(self.db.shards.clone(), self.db.tmon.clone()),
             self.db.timeline.clone(),
@@ -84,24 +155,35 @@ impl Collection {
             .await
     }
 
-    /// Returns a sub-collection with the given name.
-    pub fn collection(&self, name: &[u8]) -> Collection {
-        self.db.open_collection(self.path.child(name))
+    /// Opens the direct child currently bound to `name`.
+    pub async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
+        let name = name.as_ref();
+        validate_collection_name(name)?;
+        self.db.open_child(self, name).await
     }
 
-    /// Ensures the collection exists, creating it if necessary.
-    pub async fn create(&self) -> Result<(), Error> {
-        let _guard = self.db.admit_operation()?;
-        let root = CollectionRoot::new();
-        let prefix = self.path.physical_prefix();
-        self.db.shards.create_root(&prefix, &root).await?;
-        if let Some((parent, name)) = self.path.parent() {
-            self.db
-                .splitter
-                .register_subcollection(&parent.physical_prefix(), &name)
-                .await?;
-        }
-        Ok(())
+    /// Reports whether a direct child is currently bound to `name`.
+    pub async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
+        let name = name.as_ref();
+        validate_collection_name(name)?;
+        self.db.child_exists(self, name).await
+    }
+
+    /// Strictly creates and binds a new direct child.
+    pub async fn create_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
+        let name = name.as_ref();
+        validate_collection_name(name)?;
+        self.db.create_child(self, name, CreateMode::Strict).await
+    }
+
+    /// Returns the direct child bound to `name`, creating it when absent.
+    pub async fn create_collection_if_absent(
+        &self,
+        name: impl AsRef<[u8]>,
+    ) -> Result<Collection, Error> {
+        let name = name.as_ref();
+        validate_collection_name(name)?;
+        self.db.create_child(self, name, CreateMode::IfAbsent).await
     }
 
     /// Returns an iterator over the keys in the collection.
@@ -121,29 +203,75 @@ impl Collection {
             .await
     }
 
-    /// Returns an iterator over the sub-collections in this collection, in name
-    /// order.
+    /// Returns the direct child bindings in raw-name order.
     ///
-    /// Listing a collection that does not exist returns [`Error::NotFound`].
+    /// The returned handles remain bound to the listed incarnations even if a
+    /// later lifecycle operation changes the logical names.
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
         let _guard = self.db.admit_operation()?;
-        // This non-transactional API returns one current directory snapshot and
-        // has no later OCC validation/CAS from which to inherit a watermark.
-        let requirement = glassdb_storage::Requirement::AtLeast(self.db.timeline.now());
-        let (root, _version) = self
+        let requirement = Requirement::AtLeast(self.db.timeline.now());
+        let (root, _) = self
             .db
             .shards
-            .load_root(&self.path.physical_prefix(), requirement)
-            .await?;
-        let names: Vec<Vec<u8>> = root.subcollections().map(<[u8]>::to_vec).collect();
-        Ok(CollectionsIter::new(names))
+            .load_root(&self.address.physical_prefix(), requirement)
+            .await
+            .map_err(Error::from_read)?;
+        let entries = root
+            .children()
+            .map(|(name, id)| {
+                CollectionEntry::new(
+                    name.to_vec(),
+                    Collection::new_child(
+                        CollectionAddress::new(self.db.name.as_str(), id),
+                        self.address.clone(),
+                        name,
+                        self.db.clone(),
+                    ),
+                )
+            })
+            .collect();
+        Ok(CollectionsIter::new(entries))
     }
 
-    pub(crate) fn new(path: CollectionPath, db: Arc<DbInner>) -> Self {
-        Collection { path, db }
+    /// Returns this handle's direct logical name, or `None` for the database root.
+    pub fn name(&self) -> Option<&[u8]> {
+        self.binding.as_ref().map(|binding| binding.name.as_ref())
     }
 
-    pub(crate) fn path(&self) -> &CollectionPath {
-        &self.path
+    pub(crate) fn new_root(db: Arc<DbInner>) -> Self {
+        Self {
+            address: CollectionAddress::root(db.name.as_str()),
+            binding: None,
+            db,
+        }
     }
+
+    pub(crate) fn new_child(
+        address: CollectionAddress,
+        parent: CollectionAddress,
+        name: &[u8],
+        db: Arc<DbInner>,
+    ) -> Self {
+        Self {
+            address,
+            binding: Some(CollectionBinding {
+                parent,
+                name: Arc::from(name),
+            }),
+            db,
+        }
+    }
+
+    pub(crate) fn address(&self) -> &CollectionAddress {
+        &self.address
+    }
+}
+
+pub(crate) fn validate_collection_name(name: &[u8]) -> Result<(), Error> {
+    if name.is_empty() || name.len() > MAX_COLLECTION_NAME_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "collection name must contain 1..={MAX_COLLECTION_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
