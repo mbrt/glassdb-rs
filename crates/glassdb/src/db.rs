@@ -130,14 +130,18 @@ impl DatabaseBuilder {
         let backend = Arc::new(StatsBackend::new(b));
         let database_id = check_or_create_db_meta(&backend, &name).await?;
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let (persistent, last_sequence_point) = match persistent_cache {
+        let (persistent, timeline) = match persistent_cache {
             Some(config) => {
                 let opened = PersistentCache::open(config, &name, database_id).await;
-                (Some(opened.cache), opened.last_sequence_point)
+                // ADR-045: PersistentCache keeps track of sequence points
+                // across restarts, so the timeline must start after the last
+                // recovered point. If done incorrectly, a stale object in cache
+                // could appear as newer than a fresh read from Backend
+                let timeline = Timeline::starting_after(opened.last_sequence_point);
+                (Some(opened.cache), timeline)
             }
-            None => (None, None),
+            None => (None, Timeline::new()),
         };
-        let timeline = Timeline::starting_after(last_sequence_point);
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let shards = ShardStore::new(objects.clone());
         let tl = TLogger::new(objects.clone(), &name);
