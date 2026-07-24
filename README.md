@@ -50,8 +50,7 @@ use glassdb::backend::memory::MemoryBackend;
 async fn main() -> Result<(), glassdb::Error> {
     let db = Database::open("example", MemoryBackend::new()).await?;
 
-    let users = db.collection(b"users");
-    users.create().await?;
+    let users = db.create_collection_if_absent("users").await?;
 
     // Single-key helpers run in their own transaction.
     users.write(b"alice", b"hello").await?;

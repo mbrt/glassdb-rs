@@ -8,6 +8,13 @@ replaces it with a dynamic, order-preserving, range-partitioned directory
 (B-link tree); the rest of this ADR (MVCC + S2PL on a content-CAS directory, the
 three object kinds, dropping tags) stands.
 
+[ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
+collection-existence and name-only subcollection-directory clauses with
+incarnation IDs and direct `name → ID` parent directories. [ADR-047]
+proposes making management of that hierarchy transactional.
+
+[ADR-047]: 047-transactional-collection-management.md
+
 ## Context
 
 GlassDB stores per-key **lock state** (`lock-type`, `locked-by`, `last-writer`)

@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId};
+use glassdb_data::{CollectionAddress, KeyRef, LeafRef, TxId};
 use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
@@ -357,7 +357,7 @@ pub(crate) enum QuiescedEntries {
 pub(crate) async fn quiesce_entries(
     resolver: &Resolver,
     monitor: &Monitor,
-    collection: &CollectionPath,
+    collection: &CollectionAddress,
     id: &TxId,
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
     requirement: Requirement,

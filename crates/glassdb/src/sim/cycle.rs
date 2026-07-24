@@ -7,7 +7,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 
-use crate::{Collection, Database, Error};
+use crate::{Collection, CollectionPath, Database, Error};
 
 use super::harness::SimWorkload;
 use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, key_name, read_int, write_int};
@@ -184,8 +184,11 @@ impl SimWorkload for CycleWorkload {
     }
 
     async fn seed(&self, db: &Database) {
-        let coll = db.collection(CYCLE_COLLECTION);
-        coll.create().await.expect("create collection");
+        let coll = db
+            .root_collection()
+            .create_collection_if_absent(CYCLE_COLLECTION)
+            .await
+            .expect("create collection");
         // Lay down the ring (key(i) -> (i + 1) % N).
         let node_count = self.node_count;
         let coll = &coll;
@@ -200,7 +203,10 @@ impl SimWorkload for CycleWorkload {
     }
 
     async fn run_op(db: &Database, op: &usize, _state: &AtomicUsize) -> Result<(), Error> {
-        cycle_swap(db, &db.collection(CYCLE_COLLECTION), *op).await
+        let coll = db
+            .open_collection(&CollectionPath::new(CYCLE_COLLECTION)?)
+            .await?;
+        cycle_swap(db, &coll, *op).await
     }
 
     async fn verify(&self, db: &Database, state: &AtomicUsize, _failures_enabled: bool) {
@@ -213,7 +219,10 @@ impl SimWorkload for CycleWorkload {
         // Read every node's final next-pointer and assert the ring is still a
         // single N-cycle. The invariant holds whether or not faults occurred,
         // since each swap is atomic.
-        let coll = db.collection(CYCLE_COLLECTION);
+        let coll = db
+            .open_collection(&CollectionPath::new(CYCLE_COLLECTION).unwrap())
+            .await
+            .expect("open cycle collection");
         let node_count = self.node_count;
         let mut next = vec![0usize; node_count];
         for (k, slot) in next.iter_mut().enumerate() {
@@ -253,7 +262,10 @@ impl SimWorkload for CycleWorkload {
             let db = Self::open_db(&backbone)
                 .await
                 .expect("open cycle observer database");
-            let coll = db.collection(CYCLE_COLLECTION);
+            let coll = db
+                .open_collection(&CollectionPath::new(CYCLE_COLLECTION).unwrap())
+                .await
+                .expect("open cycle observer collection");
             for _ in 0..snapshot_reads {
                 rt::yield_now().await;
                 state.fetch_add(1, Ordering::SeqCst);

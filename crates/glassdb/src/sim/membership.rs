@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 
-use crate::{Database, Error, KeyScan};
+use crate::{CollectionPath, Database, Error, KeyScan};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, assert_valid_listing, key_name, tiny_split_policy};
@@ -186,8 +186,8 @@ impl SimWorkload for MembershipWorkload {
 
     async fn seed(&self, db: &Database) {
         // The collection starts empty; just create it.
-        db.collection(MEMBERSHIP_COLLECTION)
-            .create()
+        db.root_collection()
+            .create_collection_if_absent(MEMBERSHIP_COLLECTION)
             .await
             .expect("create collection");
     }
@@ -197,7 +197,9 @@ impl SimWorkload for MembershipWorkload {
         op: &MembOp,
         state: &Mutex<MembershipAcct>,
     ) -> Result<(), Error> {
-        let coll = db.collection(MEMBERSHIP_COLLECTION);
+        let coll = db
+            .open_collection(&CollectionPath::new(MEMBERSHIP_COLLECTION)?)
+            .await?;
         let coll = &coll;
         match op {
             MembOp::Put(k) => {
@@ -249,7 +251,10 @@ impl SimWorkload for MembershipWorkload {
     }
 
     async fn verify(&self, db: &Database, state: &Mutex<MembershipAcct>, failures_enabled: bool) {
-        let coll = db.collection(MEMBERSHIP_COLLECTION);
+        let coll = db
+            .open_collection(&CollectionPath::new(MEMBERSHIP_COLLECTION).unwrap())
+            .await
+            .expect("open membership collection");
         let keys: Vec<Vec<u8>> = coll
             .keys()
             .await

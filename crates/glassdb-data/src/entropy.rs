@@ -1,5 +1,5 @@
 //! The randomness seam shared by the data types that mint high-entropy
-//! identifiers (transaction IDs and B-link node tokens).
+//! identifiers (transaction IDs, collection IDs, and B-link node tokens).
 //!
 //! In normal builds this draws from the OS via `rand`. Under the deterministic
 //! simulation executor (`--cfg sim`) it draws from the run's seeded RNG instead,

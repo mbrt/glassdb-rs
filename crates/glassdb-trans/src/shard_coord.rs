@@ -763,23 +763,23 @@ mod tests {
     // the shard store backing it (a clone sharing the cache, so a test can warm or
     // seed the cache the coordinator reads). The returned `Background` must be
     // kept alive for the monitor's lifetime.
-    fn coord_over(
+    async fn coord_over(
         backend: Arc<dyn Backend>,
     ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
-        coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints))
+        coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints)).await
     }
 
-    fn coord_over_with(
+    async fn coord_over_with(
         backend: Arc<dyn Backend>,
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
     ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
-        coord_over_retry(backend, policy, hinter, RetryConfig::default())
+        coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
     }
 
     // A coordinator with a near-zero CAS backoff, so an exhaustion regression
     // does not pay the production retry delay.
-    fn coord_over_fast(
+    async fn coord_over_fast(
         backend: Arc<dyn Backend>,
     ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
         coord_over_retry(
@@ -791,14 +791,27 @@ mod tests {
                 max_interval: Duration::from_nanos(1),
             },
         )
+        .await
     }
 
-    fn coord_over_retry(
+    async fn coord_over_retry(
         backend: Arc<dyn Backend>,
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
         retry: RetryConfig,
     ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+        let seed_timeline = Timeline::new();
+        let seed_store = ShardStore::new(CachedStore::new(
+            backend.clone(),
+            1 << 20,
+            seed_timeline,
+            None,
+        ));
+        let _ = seed_store
+            .store_node(COLL, "L", &Node::leaf(Shard::new()), None)
+            .await
+            .unwrap();
+
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), COLL);
@@ -836,6 +849,10 @@ mod tests {
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
     async fn store_shard_entries(store: &ShardStore, path: &str, entries: Vec<ShardEntry>) {
+        let _ = store
+            .store_node(COLL, "L", &Node::leaf(Shard::new()), None)
+            .await
+            .unwrap();
         let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
         let shard = Shard::from_entries(entries);
         assert!(
@@ -847,6 +864,19 @@ mod tests {
                     loaded.kind(),
                     &loaded.observation,
                 )
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn replace_leaf_node(store: &ShardStore, node: &Node) {
+        let observed = store
+            .load_node_state(COLL, "L", Requirement::Any)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .store_node(COLL, "L", node, Some(&observed))
                 .await
                 .unwrap()
         );
@@ -1058,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn shard_stage_is_cas_persisted() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone());
+        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
@@ -1096,7 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn reroutes_when_a_split_moved_the_key_out_of_the_leaf() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, store, _timeline, _bg) = coord_over(backend.clone());
+        let (coord, store, _timeline, _bg) = coord_over(backend.clone()).await;
 
         // Seed the leaf as a shrunk left half: it owns keys < "m" and links to a
         // right sibling. "z" now lives in that sibling, not here.
@@ -1108,7 +1138,7 @@ mod tests {
         )]))
         .with_high_key(Some(b"m".to_vec()))
         .with_right_sibling(Some("R".to_string()));
-        assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
+        replace_leaf_node(&store, &node).await;
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
@@ -1150,10 +1180,10 @@ mod tests {
     #[tokio::test]
     async fn owned_key_folds_normally_despite_a_high_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, store, _timeline, _bg) = coord_over(backend.clone());
+        let (coord, store, _timeline, _bg) = coord_over(backend.clone()).await;
 
         let node = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
-        assert!(store.store_node(COLL, "L", &node, None).await.unwrap());
+        replace_leaf_node(&store, &node).await;
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
@@ -1192,7 +1222,8 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
+        log.lock().unwrap().clear();
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
@@ -1216,7 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn shard_prunes_vestigial_entries_on_cas() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, shards, _timeline, _bg) = coord_over(backend.clone());
+        let (coord, shards, _timeline, _bg) = coord_over(backend.clone()).await;
         let writer = TxId::with_priority(1, b"w");
         store_shard_entries(
             &shards,
@@ -1274,7 +1305,7 @@ mod tests {
             vec![entry(b"seed", LockType::None, None, Some(&writer))],
         )
         .await;
-        let (coord, shards, timeline, _bg) = coord_over(backend.clone());
+        let (coord, shards, timeline, _bg) = coord_over(backend.clone()).await;
         shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
 
         let tx = TxId::with_priority(2, b"t");
@@ -1316,7 +1347,8 @@ mod tests {
         let (backend, gate) = Gate::wrap(mem);
         let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
-        let (coord, _shards, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>);
+        let (coord, _shards, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>).await;
+        log.lock().unwrap().clear();
 
         let trace: FoldTrace = Arc::new(Mutex::new(Vec::new()));
         let old = TxId::with_priority(1, b"old");
@@ -1401,7 +1433,7 @@ mod tests {
     async fn same_tx_concurrent_submits_each_get_an_outcome() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
         let tx = TxId::with_priority(1, b"t");
 
         // The acquire submits first, becomes the dedup driver, and parks in the
@@ -1489,7 +1521,7 @@ mod tests {
         };
         let hints = Arc::new(HintCounter::default());
         let (coord, shards, _timeline, _bg) =
-            coord_over_with(backend.clone(), policy, hints.clone());
+            coord_over_with(backend.clone(), policy, hints.clone()).await;
         store_shard_entries(&shards, &leaf(), vec![seed]).await;
         log.lock().unwrap().clear();
 
@@ -1562,7 +1594,7 @@ mod tests {
     #[tokio::test]
     async fn submit_after_close_is_cancelled() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _timeline, _bg) = coord_over(backend);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
         coord.close().await;
 
         let tx = TxId::with_priority(1, b"t");
@@ -1680,18 +1712,17 @@ mod tests {
     #[tokio::test]
     async fn in_doubt_cas_stays_in_doubt_across_a_later_precondition_miss() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let backend: Arc<dyn Backend> = in_doubt_then_miss(mem);
-        let (coord, shards, _timeline, _bg) = coord_over(backend);
-
         // The leaf must exist so the round's CAS is a `write_if` (the faulted op),
         // not a create.
         let seed = TxId::with_priority(1, b"seed");
         store_shard_entries(
-            &shards,
+            &cold_store(mem.clone()),
             &leaf(),
             vec![entry(b"seed", LockType::None, None, Some(&seed))],
         )
         .await;
+        let backend: Arc<dyn Backend> = in_doubt_then_miss(mem);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
 
         let tx = TxId::with_priority(2, b"install");
         let seen_in_doubt = Arc::new(Mutex::new(None));
@@ -1802,16 +1833,15 @@ mod tests {
     #[tokio::test]
     async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(mem);
-        let (coord, shards, _timeline, _bg) = coord_over_fast(backend);
-
         let seed = TxId::with_priority(1, b"seed");
         store_shard_entries(
-            &shards,
+            &cold_store(mem.clone()),
             &leaf(),
             vec![entry(b"seed", LockType::None, None, Some(&seed))],
         )
         .await;
+        let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(mem);
+        let (coord, _shards, _timeline, _bg) = coord_over_fast(backend).await;
 
         let tx = TxId::with_priority(2, b"install");
         let out = coord

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use arbitrary::{Arbitrary, Unstructured};
 
-use crate::{Collection, Database, Error};
+use crate::{Collection, CollectionPath, Database, Error};
 
 use super::harness::SimWorkload;
 use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, key_name, read_int, write_int};
@@ -215,8 +215,11 @@ impl SimWorkload for RmwWorkload {
     }
 
     async fn seed(&self, db: &Database) {
-        let coll = db.collection(INCREMENT_COLLECTION);
-        coll.create().await.expect("create collection");
+        let coll = db
+            .root_collection()
+            .create_collection_if_absent(INCREMENT_COLLECTION)
+            .await
+            .expect("create collection");
         // Seed every key to zero up front, so a read of an untouched key returns
         // 0 rather than NotFound and the increment accounting is exact.
         let coll = &coll;
@@ -231,11 +234,17 @@ impl SimWorkload for RmwWorkload {
     }
 
     async fn run_op(db: &Database, op: &RmwOp, state: &Mutex<RmwAcct>) -> Result<(), Error> {
-        run_one(db, &db.collection(INCREMENT_COLLECTION), op, state).await
+        let coll = db
+            .open_collection(&CollectionPath::new(INCREMENT_COLLECTION)?)
+            .await?;
+        run_one(db, &coll, op, state).await
     }
 
     async fn verify(&self, db: &Database, state: &Mutex<RmwAcct>, failures_enabled: bool) {
-        let coll = db.collection(INCREMENT_COLLECTION);
+        let coll = db
+            .open_collection(&CollectionPath::new(INCREMENT_COLLECTION).unwrap())
+            .await
+            .expect("open increment collection");
         let expected = expected_increments(self);
         let mut finals = vec![0i64; RMW_KEY_COUNT];
         for (k, slot) in finals.iter_mut().enumerate() {
@@ -266,8 +275,11 @@ mod tests {
     async fn missing_preseeded_key_is_not_treated_as_zero() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let db = open_det_db(&backend, SplitPolicy::default()).await.unwrap();
-        let collection = db.collection(INCREMENT_COLLECTION);
-        collection.create().await.unwrap();
+        let collection = db
+            .root_collection()
+            .create_collection_if_absent(INCREMENT_COLLECTION)
+            .await
+            .unwrap();
         let collection = &collection;
 
         let result = db

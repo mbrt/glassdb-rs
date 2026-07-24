@@ -1,128 +1,71 @@
-//! Logical collection/key references and physical backend-object paths.
-//! Collection names and keys remain structured until a collection prefix or a
-//! leaf/transaction object must be addressed in the backend.
+//! Collection/key references and physical backend-object paths.
 
 use std::sync::Arc;
 
 use crate::base64;
+use crate::collection_id::CollectionId;
 use crate::txid::TxId;
 
-/// A collection's logical identity.
-///
-/// Collection names remain raw bytes here. The `_c/<base64>` representation is
-/// produced only when addressing physical objects in the backend.
+/// The physical address of one collection incarnation within a database.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CollectionPath {
+pub struct CollectionAddress {
     db_root: Arc<str>,
-    segments: Arc<[Vec<u8>]>,
+    id: CollectionId,
 }
 
-impl CollectionPath {
-    /// Creates a top-level collection path.
-    pub fn new(db_root: impl Into<Arc<str>>, name: impl AsRef<[u8]>) -> Self {
-        Self::from_segments(db_root, [name.as_ref().to_vec()])
-    }
-
-    /// Creates a collection path from its database root and ordered name segments.
-    pub fn from_segments<I, B>(db_root: impl Into<Arc<str>>, segments: I) -> Self
-    where
-        I: IntoIterator<Item = B>,
-        B: AsRef<[u8]>,
-    {
+impl CollectionAddress {
+    /// Creates an address from a database root and collection identity.
+    pub fn new(db_root: impl Into<Arc<str>>, id: CollectionId) -> Self {
         let db_root = db_root.into();
-        let segments: Vec<Vec<u8>> = segments
-            .into_iter()
-            .map(|segment| segment.as_ref().to_vec())
-            .collect();
         assert!(!db_root.is_empty(), "database root must not be empty");
-        assert!(
-            !segments.is_empty(),
-            "collection path must contain at least one name"
-        );
-        CollectionPath {
-            db_root,
-            segments: segments.into(),
-        }
+        CollectionAddress { db_root, id }
     }
 
-    /// Returns this collection's database root.
+    /// Creates the permanent root collection address for `db_root`.
+    pub fn root(db_root: impl Into<Arc<str>>) -> Self {
+        Self::new(db_root, CollectionId::root())
+    }
+
+    /// Returns this address's database root.
     pub fn db_root(&self) -> &str {
         &self.db_root
     }
 
-    /// Returns the raw collection-name segments from outermost to innermost.
-    pub fn segments(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.segments.iter().map(Vec::as_slice)
-    }
-
-    /// Returns a child collection path.
-    pub fn child(&self, name: impl AsRef<[u8]>) -> Self {
-        let mut segments = self.segments.to_vec();
-        segments.push(name.as_ref().to_vec());
-        CollectionPath {
-            db_root: self.db_root.clone(),
-            segments: segments.into(),
-        }
-    }
-
-    /// Returns the parent collection and this collection's name when nested.
-    pub fn parent(&self) -> Option<(Self, Vec<u8>)> {
-        if self.segments.len() <= 1 {
-            return None;
-        }
-        let mut segments = self.segments.to_vec();
-        let name = segments.pop().expect("nested collection has a final name");
-        Some((
-            CollectionPath {
-                db_root: self.db_root.clone(),
-                segments: segments.into(),
-            },
-            name,
-        ))
+    /// Returns this collection's stable incarnation identity.
+    pub fn id(&self) -> CollectionId {
+        self.id
     }
 
     /// Renders the collection prefix used for physical backend objects.
     pub fn physical_prefix(&self) -> String {
-        let mut prefix = self.db_root.to_string();
-        for segment in self.segments.iter() {
-            prefix.push_str("/_c/");
-            prefix.push_str(&base64::encode(segment));
-        }
-        prefix
+        format!("{}/_c/{}", self.db_root, base64::encode(self.id.as_bytes()))
     }
 
-    /// Parses a physical `_c/<base64>` collection prefix.
+    /// Parses an incarnation-addressed physical collection prefix.
     pub fn from_physical_prefix(prefix: &str) -> Result<Self, PathError> {
-        let mut parts = prefix.split('/');
-        let db_root = parts
-            .next()
-            .filter(|part| !part.is_empty())
-            .ok_or_else(|| PathError::Parse(prefix.to_string()))?;
-        let rest: Vec<&str> = parts.collect();
-        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+        let Some((db_root, encoded)) = prefix.split_once("/_c/") else {
+            return Err(PathError::Parse(prefix.to_string()));
+        };
+        if db_root.is_empty() || encoded.is_empty() || encoded.contains('/') {
             return Err(PathError::Parse(prefix.to_string()));
         }
-        let mut segments = Vec::with_capacity(rest.len() / 2);
-        for pair in rest.chunks_exact(2) {
-            if pair[0] != "_c" {
-                return Err(PathError::Parse(prefix.to_string()));
-            }
-            segments.push(base64::decode(pair[1])?);
-        }
-        Ok(CollectionPath::from_segments(db_root, segments))
+        let bytes = base64::decode(encoded)?;
+        let id =
+            CollectionId::from_slice(&bytes).ok_or_else(|| PathError::Parse(prefix.to_string()))?;
+        Ok(CollectionAddress::new(db_root, id))
     }
 }
 
 /// A logical key stored inside a collection leaf.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyRef {
-    collection: CollectionPath,
+    collection: CollectionAddress,
     key: Arc<[u8]>,
 }
 
 impl KeyRef {
     /// Creates a logical key reference.
-    pub fn new(collection: CollectionPath, key: impl AsRef<[u8]>) -> Self {
+    pub fn new(collection: CollectionAddress, key: impl AsRef<[u8]>) -> Self {
         KeyRef {
             collection,
             key: Arc::from(key.as_ref()),
@@ -130,7 +73,7 @@ impl KeyRef {
     }
 
     /// Returns the containing collection.
-    pub fn collection(&self) -> &CollectionPath {
+    pub fn collection(&self) -> &CollectionAddress {
         &self.collection
     }
 
@@ -143,21 +86,21 @@ impl KeyRef {
 /// A physical leaf within a collection's coordination tree.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LeafRef {
-    Root(CollectionPath),
+    Root(CollectionAddress),
     Node {
-        collection: CollectionPath,
+        collection: CollectionAddress,
         token: Arc<str>,
     },
 }
 
 impl LeafRef {
     /// Creates a collection-root leaf reference.
-    pub fn root(collection: CollectionPath) -> Self {
+    pub fn root(collection: CollectionAddress) -> Self {
         LeafRef::Root(collection)
     }
 
     /// Creates a standalone-node leaf reference.
-    pub fn node(collection: CollectionPath, token: impl Into<Arc<str>>) -> Self {
+    pub fn node(collection: CollectionAddress, token: impl Into<Arc<str>>) -> Self {
         LeafRef::Node {
             collection,
             token: token.into(),
@@ -165,7 +108,7 @@ impl LeafRef {
     }
 
     /// Returns the collection whose tree contains this leaf.
-    pub fn collection(&self) -> &CollectionPath {
+    pub fn collection(&self) -> &CollectionAddress {
         match self {
             LeafRef::Root(collection) | LeafRef::Node { collection, .. } => collection,
         }
@@ -190,7 +133,9 @@ impl LeafRef {
     /// Parses a physical collection-root or node path.
     pub fn from_physical_path(path: &str) -> Result<Self, PathError> {
         if let Some(prefix) = path.strip_suffix("/_i") {
-            return Ok(LeafRef::root(CollectionPath::from_physical_prefix(prefix)?));
+            return Ok(LeafRef::root(CollectionAddress::from_physical_prefix(
+                prefix,
+            )?));
         }
         let Some((prefix, token)) = path.rsplit_once("/_n/") else {
             return Err(PathError::Parse(path.to_string()));
@@ -199,7 +144,7 @@ impl LeafRef {
             return Err(PathError::Parse(path.to_string()));
         }
         Ok(LeafRef::node(
-            CollectionPath::from_physical_prefix(prefix)?,
+            CollectionAddress::from_physical_prefix(prefix)?,
             token,
         ))
     }
@@ -491,30 +436,28 @@ fn typed_prefix(prefix: &str, t: Type) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn logical_collection_and_key_paths_round_trip() {
-        let parent = CollectionPath::new("db", b"parent");
-        let child = parent.child(b"child");
-        assert_eq!(child.db_root(), "db");
-        assert_eq!(
-            child.segments().collect::<Vec<_>>(),
-            vec![b"parent".as_slice(), b"child".as_slice()]
-        );
-        assert_eq!(
-            CollectionPath::from_physical_prefix(&child.physical_prefix()).unwrap(),
-            child
-        );
-        assert_eq!(child.parent(), Some((parent.clone(), b"child".to_vec())));
-        assert_eq!(parent.parent(), None);
+    fn collection_id(byte: u8) -> CollectionId {
+        CollectionId::from_slice(&[byte; 16]).unwrap()
+    }
 
-        let key = KeyRef::new(child, b"Hello");
+    #[test]
+    fn collection_address_and_key_round_trip() {
+        let collection = CollectionAddress::new("db", collection_id(7));
+        assert_eq!(collection.db_root(), "db");
+        assert_eq!(collection.id(), collection_id(7));
+        assert_eq!(
+            CollectionAddress::from_physical_prefix(&collection.physical_prefix()).unwrap(),
+            collection
+        );
+
+        let key = KeyRef::new(collection, b"Hello");
         assert_eq!(key.key(), b"Hello");
         assert_eq!(key.collection().db_root(), "db");
     }
 
     #[test]
     fn leaf_paths_round_trip() {
-        let collection = CollectionPath::new("db", b"collection");
+        let collection = CollectionAddress::new("db", collection_id(1));
         for leaf in [
             LeafRef::root(collection.clone()),
             LeafRef::node(collection, "token"),
@@ -620,8 +563,8 @@ mod tests {
         assert_eq!(base64::encode(&[0, 1, 2, 3, 4]), "00420kF");
         assert_eq!(base64::encode(b"ab"), "NL8");
         assert_eq!(
-            CollectionPath::new("db", b"settings").physical_prefix(),
-            "db/_c/RqKoS6_iOrB"
+            CollectionAddress::root("db").physical_prefix(),
+            "db/_c/0000000000000000000000"
         );
         assert_eq!(
             from_transaction("db", &TxId::from_bytes(vec![1, 2, 3, 4])),

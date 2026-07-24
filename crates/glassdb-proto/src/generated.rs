@@ -45,19 +45,14 @@ pub mod transaction_log {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionWrites {
-    #[prost(message, optional, tag = "1")]
-    pub collection: ::core::option::Option<CollectionPath>,
+    /// Stable incarnation ID. The database root comes from the enclosing
+    /// transaction object's physical path and is deliberately omitted.
+    #[prost(bytes = "vec", tag = "1")]
+    pub collection_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, repeated, tag = "2")]
     pub writes: ::prost::alloc::vec::Vec<Write>,
     #[prost(message, optional, tag = "3")]
     pub locks: ::core::option::Option<CollectionLocks>,
-}
-/// A relocatable logical collection path. The database root comes from the
-/// enclosing transaction object's physical path and is deliberately omitted.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CollectionPath {
-    #[prost(bytes = "vec", repeated, tag = "1")]
-    pub segments: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Write {
@@ -280,8 +275,16 @@ pub struct CollectionRoot {
     /// is empty (the root has no siblings).
     #[prost(message, optional, tag = "1")]
     pub node: ::core::option::Option<Node>,
-    /// Child collection names (raw bytes), the subcollection directory; sorted so
-    /// the encoding is canonical.
-    #[prost(bytes = "vec", repeated, tag = "2")]
-    pub subcollections: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Direct child bindings, sorted by raw name so the encoding is canonical.
+    #[prost(message, repeated, tag = "2")]
+    pub children: ::prost::alloc::vec::Vec<CollectionDirectoryEntry>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CollectionDirectoryEntry {
+    /// Raw child name.
+    #[prost(bytes = "vec", tag = "1")]
+    pub name: ::prost::alloc::vec::Vec<u8>,
+    /// Stable 16-byte incarnation ID.
+    #[prost(bytes = "vec", tag = "2")]
+    pub collection_id: ::prost::alloc::vec::Vec<u8>,
 }

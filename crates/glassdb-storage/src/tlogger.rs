@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{CollectionPath, KeyRef, LeafRef, TxId, paths};
+use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef, TxId, paths};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -387,7 +387,7 @@ fn decode_tx_log_from_proto(
     };
 
     for cw in &tr.writes {
-        let collection = decode_collection_path(db_root, cw.collection.as_ref())?;
+        let collection = decode_collection_id(db_root, &cw.collection_id)?;
         for w in &cw.writes {
             res.writes.push(TxWrite {
                 key: KeyRef::new(collection.clone(), &w.key),
@@ -430,7 +430,7 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
         return Err(StorageError::other("empty transaction ID"));
     }
     validate_single_database(l)?;
-    let mut coll_writes: BTreeMap<CollectionPath, pb::CollectionWrites> = BTreeMap::new();
+    let mut coll_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> = BTreeMap::new();
 
     for e in &l.writes {
         marshal_write(&mut coll_writes, e)?;
@@ -457,7 +457,7 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
 }
 
 fn marshal_write(
-    coll_writes: &mut BTreeMap<CollectionPath, pb::CollectionWrites>,
+    coll_writes: &mut BTreeMap<CollectionAddress, pb::CollectionWrites>,
     e: &TxWrite,
 ) -> Result<(), StorageError> {
     let val_delete = if e.deleted {
@@ -474,7 +474,7 @@ fn marshal_write(
     let coll = coll_writes
         .entry(collection.clone())
         .or_insert_with(|| pb::CollectionWrites {
-            collection: Some(encode_collection_path(collection)),
+            collection_id: collection.id().as_bytes().to_vec(),
             writes: Vec::new(),
             locks: Some(pb::CollectionLocks::default()),
         });
@@ -483,7 +483,7 @@ fn marshal_write(
 }
 
 fn marshal_lock(
-    coll_writes: &mut BTreeMap<CollectionPath, pb::CollectionWrites>,
+    coll_writes: &mut BTreeMap<CollectionAddress, pb::CollectionWrites>,
     lock: &TxLock,
 ) -> Result<(), StorageError> {
     let collection = match lock {
@@ -493,7 +493,7 @@ fn marshal_lock(
     let coll = coll_writes
         .entry(collection.clone())
         .or_insert_with(|| pb::CollectionWrites {
-            collection: Some(encode_collection_path(collection)),
+            collection_id: collection.id().as_bytes().to_vec(),
             writes: Vec::new(),
             locks: Some(pb::CollectionLocks::default()),
         });
@@ -518,28 +518,18 @@ fn marshal_lock(
     Ok(())
 }
 
-fn encode_collection_path(collection: &CollectionPath) -> pb::CollectionPath {
-    pb::CollectionPath {
-        segments: collection.segments().map(<[u8]>::to_vec).collect(),
-    }
-}
-
-fn decode_collection_path(
+fn decode_collection_id(
     db_root: &str,
-    collection: Option<&pb::CollectionPath>,
-) -> Result<CollectionPath, StorageError> {
-    let collection = collection
-        .filter(|collection| !collection.segments.is_empty())
-        .ok_or_else(|| StorageError::other("transaction log has no collection path"))?;
-    Ok(CollectionPath::from_segments(
-        db_root,
-        collection.segments.iter(),
-    ))
+    collection_id: &[u8],
+) -> Result<CollectionAddress, StorageError> {
+    let id = CollectionId::from_slice(collection_id)
+        .ok_or_else(|| StorageError::other("transaction log has an invalid collection ID"))?;
+    Ok(CollectionAddress::new(db_root, id))
 }
 
 fn validate_single_database(log: &TxLog) -> Result<(), StorageError> {
     let mut db_root: Option<String> = None;
-    let mut check = |collection: &CollectionPath| -> Result<(), StorageError> {
+    let mut check = |collection: &CollectionAddress| -> Result<(), StorageError> {
         match db_root.as_deref() {
             Some(root) if root != collection.db_root() => Err(StorageError::other(
                 "transaction log spans multiple database roots",
@@ -624,6 +614,10 @@ mod tests {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TLogger::new(objects, "db")
+    }
+
+    fn test_collection(db_root: &str, byte: u8) -> CollectionAddress {
+        CollectionAddress::new(db_root, CollectionId::from_slice(&[byte; 16]).unwrap())
     }
 
     fn new_recording_tlogger() -> (TLogger, OpLog) {
@@ -770,7 +764,7 @@ mod tests {
     async fn round_trip() {
         let t = new_tlogger();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let collection = CollectionPath::new("db", b"root");
+        let collection = test_collection("db", 1);
         let key = KeyRef::new(collection.clone(), b"hello");
         let log = TxLog {
             id: id.clone(),
@@ -800,7 +794,7 @@ mod tests {
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
         assert!(got.locks.contains(&TxLock::Membership {
-            leaf: LeafRef::root(CollectionPath::new("db", b"root")),
+            leaf: LeafRef::root(test_collection("db", 1)),
             typ: LockType::Read,
         }));
         assert!(got.locks.contains(&TxLock::Entry {
@@ -906,7 +900,7 @@ mod tests {
     async fn get_returns_log_and_version() {
         let t = new_tlogger();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let key = KeyRef::new(CollectionPath::new("db", b"root"), b"hello");
+        let key = KeyRef::new(test_collection("db", 1), b"hello");
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         log.writes = vec![TxWrite {
@@ -927,15 +921,12 @@ mod tests {
     }
 
     #[test]
-    fn encoded_collection_paths_are_relocatable() {
+    fn encoded_collection_ids_are_relocatable() {
         let id = TxId::from_bytes(vec![1]);
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(42));
         log.writes.push(TxWrite {
-            key: KeyRef::new(
-                CollectionPath::new("original", b"parent").child(b"child"),
-                b"key",
-            ),
+            key: KeyRef::new(test_collection("original", 7), b"key"),
             value: Arc::from(&b"value"[..]),
             deleted: false,
             prev_writer: TxId::default(),
@@ -946,12 +937,8 @@ mod tests {
 
         assert_eq!(relocated.writes[0].key.collection().db_root(), "moved");
         assert_eq!(
-            relocated.writes[0]
-                .key
-                .collection()
-                .segments()
-                .collect::<Vec<_>>(),
-            vec![b"parent".as_slice(), b"child".as_slice()]
+            relocated.writes[0].key.collection().id(),
+            test_collection("original", 7).id()
         );
         assert_eq!(
             marshal_log(&relocated, relocated.timestamp.unwrap()).unwrap(),
@@ -966,13 +953,13 @@ mod tests {
         log.timestamp = Some(UNIX_EPOCH);
         log.writes = vec![
             TxWrite {
-                key: KeyRef::new(CollectionPath::new("first", b"c"), b"a"),
+                key: KeyRef::new(test_collection("first", 1), b"a"),
                 value: Arc::from(&b"a"[..]),
                 deleted: false,
                 prev_writer: TxId::default(),
             },
             TxWrite {
-                key: KeyRef::new(CollectionPath::new("second", b"c"), b"b"),
+                key: KeyRef::new(test_collection("second", 1), b"b"),
                 value: Arc::from(&b"b"[..]),
                 deleted: false,
                 prev_writer: TxId::default(),

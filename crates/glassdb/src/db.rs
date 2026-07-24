@@ -7,17 +7,18 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig};
-use glassdb_data::{CollectionPath, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::{
-    CachedStore, Directory, PersistentCache, PersistentCacheConfig, ShardStore, SplitPolicy,
-    TLogger, Timeline,
+    CachedStore, CollectionRoot, Directory, Observation, PersistentCache, PersistentCacheConfig,
+    Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
-    Algo, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator, Splitter, TransError,
+    Algo, CollectionPublish, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator,
+    Splitter, TransError,
 };
 use tokio::sync::Notify;
 
-use crate::collection::Collection;
+use crate::collection::{Collection, CollectionPath};
 use crate::diagnostics::Diagnostics;
 use crate::error::Error;
 use crate::stats::Stats;
@@ -144,6 +145,19 @@ impl DatabaseBuilder {
         };
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let shards = ShardStore::new(objects.clone());
+        let root_prefix = CollectionAddress::root(name.as_str()).physical_prefix();
+        match shards
+            .load_root(&root_prefix, Requirement::AtLeast(timeline.now()))
+            .await
+        {
+            Ok(_) => {}
+            Err(StorageError::NotFound) => {
+                return Err(Error::internal(
+                    "initialized database is missing its permanent root collection",
+                ));
+            }
+            Err(error) => return Err(Error::from_read(error)),
+        }
         let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
         let clock = if deterministic_time {
@@ -263,6 +277,12 @@ pub(crate) struct DbInner {
     background: Arc<Background>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CreateMode {
+    Strict,
+    IfAbsent,
+}
+
 /// An open GlassDB database instance.
 #[derive(Clone)]
 pub struct Database {
@@ -310,10 +330,61 @@ impl Database {
         self.inner.objects.shutdown().await;
     }
 
-    /// Returns a top-level collection with the given name.
-    pub fn collection(&self, name: &[u8]) -> Collection {
-        self.inner
-            .open_collection(CollectionPath::new(self.inner.name.as_str(), name))
+    /// Returns the permanent, key-bearing root collection.
+    pub fn root_collection(&self) -> Collection {
+        Collection::new_root(self.inner.clone())
+    }
+
+    /// Resolves a logical path to its currently bound collection incarnation.
+    ///
+    /// A string names one top-level collection; use [`CollectionPath`] for a
+    /// nested path.
+    pub async fn open_collection<P>(&self, path: P) -> Result<Collection, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        let path = path.try_into().map_err(Into::into)?;
+        self.inner.open_path(&path).await
+    }
+
+    /// Reports whether every component of a logical collection path is bound.
+    ///
+    /// A string names one top-level collection; use [`CollectionPath`] for a
+    /// nested path.
+    pub async fn collection_exists<P>(&self, path: P) -> Result<bool, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        let path = path.try_into().map_err(Into::into)?;
+        self.inner.path_exists(&path).await
+    }
+
+    /// Strictly creates the final component of `path`.
+    ///
+    /// Every ancestor must already exist. A string names one top-level
+    /// collection; use [`CollectionPath`] for a nested path.
+    pub async fn create_collection<P>(&self, path: P) -> Result<Collection, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        let path = path.try_into().map_err(Into::into)?;
+        self.inner.create_path(&path, CreateMode::Strict).await
+    }
+
+    /// Returns the final component of `path`, creating it when absent.
+    ///
+    /// Every ancestor must already exist. A string names one top-level
+    /// collection; use [`CollectionPath`] for a nested path.
+    pub async fn create_collection_if_absent<P>(&self, path: P) -> Result<Collection, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        let path = path.try_into().map_err(Into::into)?;
+        self.inner.create_path(&path, CreateMode::IfAbsent).await
     }
 
     /// Executes `f` within a serializable transaction, retrying on conflicts.
@@ -436,10 +507,6 @@ impl Drop for OperationGuard<'_> {
 }
 
 impl DbInner {
-    pub(crate) fn open_collection(self: &Arc<Self>, path: CollectionPath) -> Collection {
-        Collection::new(path, self.clone())
-    }
-
     /// Admits one public asynchronous operation or rejects it once shutdown has
     /// begun.
     pub(crate) fn admit_operation(&self) -> Result<OperationGuard<'_>, Error> {
@@ -463,6 +530,188 @@ impl DbInner {
         stats.tx_time = begin.elapsed();
         self.update_stats(&stats);
         res
+    }
+
+    pub(crate) async fn open_path(
+        self: &Arc<Self>,
+        path: &CollectionPath,
+    ) -> Result<Collection, Error> {
+        let _guard = self.admit_operation()?;
+        self.resolve_path(path).await
+    }
+
+    pub(crate) async fn path_exists(
+        self: &Arc<Self>,
+        path: &CollectionPath,
+    ) -> Result<bool, Error> {
+        let _guard = self.admit_operation()?;
+        let mut parent = Collection::new_root(self.clone());
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        for name in path.segments() {
+            let Some(child) = self.resolve_child_at(&parent, name, requirement).await? else {
+                return Ok(false);
+            };
+            parent = child;
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn create_path(
+        self: &Arc<Self>,
+        path: &CollectionPath,
+        mode: CreateMode,
+    ) -> Result<Collection, Error> {
+        let _guard = self.admit_operation()?;
+        let mut segments = path.segments();
+        let name = segments
+            .next_back()
+            .expect("CollectionPath always has one segment");
+        let mut parent = Collection::new_root(self.clone());
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        for segment in segments {
+            parent = self
+                .resolve_child_at(&parent, segment, requirement)
+                .await?
+                .ok_or(Error::NotFound)?;
+        }
+        self.create_child_inner(&parent, name, mode).await
+    }
+
+    pub(crate) async fn open_child(
+        self: &Arc<Self>,
+        parent: &Collection,
+        name: &[u8],
+    ) -> Result<Collection, Error> {
+        let _guard = self.admit_operation()?;
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        self.resolve_child_at(parent, name, requirement)
+            .await?
+            .ok_or(Error::NotFound)
+    }
+
+    pub(crate) async fn child_exists(
+        self: &Arc<Self>,
+        parent: &Collection,
+        name: &[u8],
+    ) -> Result<bool, Error> {
+        let _guard = self.admit_operation()?;
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        Ok(self
+            .resolve_child_at(parent, name, requirement)
+            .await?
+            .is_some())
+    }
+
+    pub(crate) async fn create_child(
+        self: &Arc<Self>,
+        parent: &Collection,
+        name: &[u8],
+        mode: CreateMode,
+    ) -> Result<Collection, Error> {
+        let _guard = self.admit_operation()?;
+        self.create_child_inner(parent, name, mode).await
+    }
+
+    async fn resolve_path(self: &Arc<Self>, path: &CollectionPath) -> Result<Collection, Error> {
+        let mut parent = Collection::new_root(self.clone());
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        for name in path.segments() {
+            parent = self
+                .resolve_child_at(&parent, name, requirement)
+                .await?
+                .ok_or(Error::NotFound)?;
+        }
+        Ok(parent)
+    }
+
+    async fn resolve_child_at(
+        self: &Arc<Self>,
+        parent: &Collection,
+        name: &[u8],
+        requirement: Requirement,
+    ) -> Result<Option<Collection>, Error> {
+        let (root, _) = self
+            .shards
+            .load_root(&parent.address().physical_prefix(), requirement)
+            .await
+            .map_err(Error::from_read)?;
+        Ok(root.child(name).map(|id| {
+            Collection::new_child(
+                CollectionAddress::new(self.name.as_str(), id),
+                name,
+                self.clone(),
+            )
+        }))
+    }
+
+    async fn create_child_inner(
+        self: &Arc<Self>,
+        parent: &Collection,
+        name: &[u8],
+        mode: CreateMode,
+    ) -> Result<Collection, Error> {
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        if let Some(existing) = self.resolve_child_at(parent, name, requirement).await? {
+            return match mode {
+                CreateMode::Strict => Err(Error::AlreadyExists),
+                CreateMode::IfAbsent => Ok(existing),
+            };
+        }
+
+        let (id, observation) = loop {
+            let id = CollectionId::new_random();
+            let address = CollectionAddress::new(self.name.as_str(), id);
+            match self
+                .shards
+                .create_root_observed(&address.physical_prefix(), &CollectionRoot::new())
+                .await?
+            {
+                Some(observation) => break (id, observation),
+                None => continue,
+            }
+        };
+        let address = CollectionAddress::new(self.name.as_str(), id);
+        let mut unpublished = UnpublishedRootGuard::new(self.clone(), observation.clone());
+        unpublished.mark_publication_ambiguous();
+
+        match self
+            .splitter
+            .publish_subcollection(&parent.address().physical_prefix(), name, id)
+            .await
+        {
+            Ok(CollectionPublish::Published) => {
+                unpublished.disarm();
+                Ok(Collection::new_child(address, name, self.clone()))
+            }
+            Ok(CollectionPublish::Existing(existing)) => {
+                self.schedule_root_cleanup(observation);
+                unpublished.disarm();
+                match mode {
+                    CreateMode::Strict => Err(Error::AlreadyExists),
+                    CreateMode::IfAbsent => Ok(Collection::new_child(
+                        CollectionAddress::new(self.name.as_str(), existing),
+                        name,
+                        self.clone(),
+                    )),
+                }
+            }
+            Err(error) => {
+                if !matches!(error, TransError::Storage(StorageError::Unavailable(_))) {
+                    self.schedule_root_cleanup(observation);
+                }
+                unpublished.disarm();
+                Err(error.into())
+            }
+        }
+    }
+
+    fn schedule_root_cleanup(&self, observation: Observation<CollectionRoot>) {
+        let shards = self.shards.clone();
+        self.background.spawn_waited(async move {
+            if let Err(error) = shards.delete_root(&observation).await {
+                tracing::debug!(%error, "unpublished collection-root cleanup deferred");
+            }
+        });
     }
 
     fn update_stats(&self, s: &Stats) {
@@ -608,6 +857,40 @@ impl DbInner {
             return Err(e.into());
         }
         result
+    }
+}
+
+struct UnpublishedRootGuard {
+    db: Arc<DbInner>,
+    observation: Option<Observation<CollectionRoot>>,
+    safe_to_delete: bool,
+}
+
+impl UnpublishedRootGuard {
+    fn new(db: Arc<DbInner>, observation: Observation<CollectionRoot>) -> Self {
+        Self {
+            db,
+            observation: Some(observation),
+            safe_to_delete: true,
+        }
+    }
+
+    fn mark_publication_ambiguous(&mut self) {
+        self.safe_to_delete = false;
+    }
+
+    fn disarm(&mut self) {
+        self.observation = None;
+    }
+}
+
+impl Drop for UnpublishedRootGuard {
+    fn drop(&mut self) {
+        if self.safe_to_delete
+            && let Some(observation) = self.observation.take()
+        {
+            self.db.schedule_root_cleanup(observation);
+        }
     }
 }
 

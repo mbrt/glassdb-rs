@@ -1120,7 +1120,7 @@ mod tests {
     use super::*;
     use glassdb_backend::middleware::RecordingBackend;
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_data::CollectionPath;
+    use glassdb_data::CollectionAddress;
     use glassdb_storage::{CachedStore, LockType, Timeline, TxWrite};
 
     #[test]
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
-        KeyRef::new(CollectionPath::new("test", b"collection"), key)
+        KeyRef::new(CollectionAddress::root("test"), key)
     }
 
     struct TestCtx {

@@ -33,7 +33,7 @@ pub struct LeafLocator {
 }
 
 impl LeafLocator {
-    /// Returns the observed node, or `None` for an uncreated collection root.
+    /// Returns the observed node.
     pub fn node(&self) -> Option<&Node> {
         self.observation.node()
     }
@@ -48,7 +48,7 @@ pub struct LeafGroup<T> {
 }
 
 impl<T> LeafGroup<T> {
-    /// Returns the observed node, or `None` for an uncreated collection root.
+    /// Returns the observed node.
     pub fn node(&self) -> Option<&Node> {
         self.observation.node()
     }
@@ -98,8 +98,7 @@ impl Directory {
     /// Resolves the leaf that owns `key`, descending from the root `_i` and
     /// following right-sibling links to self-correct past in-progress splits.
     ///
-    /// Always returns a locator. An uncreated collection is represented by its
-    /// absent root observation, with no decoded node.
+    /// A missing collection root is reported as [`StorageError::NotFound`].
     pub async fn leaf_for(
         &self,
         prefix: &str,
@@ -110,11 +109,7 @@ impl Directory {
         let observation = self.shards.load_root_state(prefix, requirement).await?;
         let cache_hit = observation.cache_hit();
         if observation.is_absent() {
-            return Ok(LeafLocator {
-                path,
-                observation,
-                cache_hit,
-            });
+            return Err(StorageError::NotFound);
         }
         let cur = Located {
             path,
@@ -214,8 +209,8 @@ impl Directory {
         leaf: Requirement,
     ) -> Result<LeafLocator, StorageError> {
         let loc = self.leaf_for(prefix, key, interior).await?;
-        // Same requirement, or an uncreated root leaf (nothing to check).
-        if interior == leaf || loc.observation.is_absent() {
+        // The same requirement needs no terminal refresh.
+        if interior == leaf {
             return Ok(loc);
         }
         // Check the terminal node at the stricter requirement and resume the
@@ -554,7 +549,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_data::CollectionPath;
+    use glassdb_data::CollectionAddress;
 
     use crate::Timeline;
     use crate::cached_store::CachedStore;
@@ -565,7 +560,7 @@ mod tests {
     use crate::shard::ShardEntry;
     use crate::shardstore::ShardStore;
 
-    const COLL: &str = "db/_c/NqxgQ0";
+    const COLL: &str = "db/_c/0000000000000000000000";
 
     #[derive(Clone)]
     struct TestStore {
@@ -648,17 +643,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_collection_routes_to_uncreated_root_leaf() {
+    async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
         let dir = Directory::new(s.shards.clone());
-        let loc = dir
-            .leaf_for(COLL, b"k", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .unwrap();
-        assert_eq!(loc.path, paths::collection_info(COLL));
-        assert!(loc.observation.is_absent(), "root leaf is not created yet");
-        assert!(loc.node().is_none());
-        // Listing an absent collection yields no leaves.
+        assert!(matches!(
+            dir.leaf_for(COLL, b"k", Requirement::AtLeast(s.timeline.now()))
+                .await,
+            Err(StorageError::NotFound)
+        ));
+        // Structural traversal can still model absence as no reachable leaves.
         assert!(
             dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
@@ -739,7 +732,13 @@ mod tests {
             .await
             .unwrap();
         let paths: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
-        assert_eq!(paths, vec!["db/_c/NqxgQ0/_n/L0", "db/_c/NqxgQ0/_n/L1"]);
+        assert_eq!(
+            paths,
+            vec![
+                "db/_c/0000000000000000000000/_n/L0",
+                "db/_c/0000000000000000000000/_n/L1"
+            ]
+        );
 
         let leftmost = dir
             .leftmost_leaf(COLL, Requirement::AtLeast(s.timeline.now()))
@@ -909,20 +908,14 @@ mod tests {
         let s = store();
         seed_two_level(&s).await;
         let dir = Directory::new(s.shards.clone());
-        assert_eq!(CollectionPath::new("db", b"coll").physical_prefix(), COLL);
+        assert_eq!(CollectionAddress::root("db").physical_prefix(), COLL);
 
         let groups = dir
             .group_keys_by_leaf(
                 [
-                    (KeyRef::new(CollectionPath::new("db", b"coll"), b"cat"), 'c'),
-                    (
-                        KeyRef::new(CollectionPath::new("db", b"coll"), b"mango"),
-                        'm',
-                    ),
-                    (
-                        KeyRef::new(CollectionPath::new("db", b"coll"), b"apple"),
-                        'a',
-                    ),
+                    (KeyRef::new(CollectionAddress::root("db"), b"cat"), 'c'),
+                    (KeyRef::new(CollectionAddress::root("db"), b"mango"), 'm'),
+                    (KeyRef::new(CollectionAddress::root("db"), b"apple"), 'a'),
                 ],
                 Requirement::AtLeast(s.timeline.now()),
             )

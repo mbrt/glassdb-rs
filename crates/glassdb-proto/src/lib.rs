@@ -21,9 +21,7 @@ mod tests {
             }),
             status: transaction_log::Status::Committed as i32,
             writes: vec![CollectionWrites {
-                collection: Some(CollectionPath {
-                    segments: vec![b"root".to_vec()],
-                }),
+                collection_id: vec![1; 16],
                 writes: vec![
                     Write {
                         key: b"Hello".to_vec(),

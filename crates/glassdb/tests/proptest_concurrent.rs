@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::{Backend, Collection, Database, Error};
+use glassdb::{Backend, Collection, CollectionPath, Database, Error};
 use proptest::prelude::*;
 
 fn write_int(n: i64) -> Vec<u8> {
@@ -88,11 +88,11 @@ async fn run_workload(a1: u32, a2: u32, a3: u32, b1: u32, b2: u32, b3: u32) {
     let db1 = Database::open("example", backend.clone()).await.unwrap();
     let db2 = Database::open("example", backend).await.unwrap();
 
-    let coll1 = db1.collection(b"fuzz-coll");
-    let coll2 = db2.collection(b"fuzz-coll");
     let (k1, k2, k3): (&[u8], &[u8], &[u8]) = (b"k1", b"k2", b"k3");
 
-    coll1.create().await.unwrap();
+    let path = CollectionPath::new(b"fuzz-coll").unwrap();
+    let coll1 = db1.create_collection_if_absent(&path).await.unwrap();
+    let coll2 = db2.open_collection(&path).await.unwrap();
     let seed_coll = &coll1;
     db1.tx(|tx| async move {
         for k in [k1, k2, k3] {
