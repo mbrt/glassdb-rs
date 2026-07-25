@@ -24,6 +24,8 @@ pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
 pub use directory::{Directory, LeafGroup, LeafLocator};
+// The media model also supports ordinary Tokio tests; its deterministic harness
+// requires an active simulation build.
 #[cfg(all(feature = "sim", sim))]
 #[doc(hidden)]
 pub use disk_cache::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};

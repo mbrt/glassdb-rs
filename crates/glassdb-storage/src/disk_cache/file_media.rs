@@ -1,3 +1,5 @@
+//! Native Linux media for the persistent cache.
+
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;

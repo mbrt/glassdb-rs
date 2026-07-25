@@ -1,3 +1,5 @@
+//! Isolated deterministic fault harness for the persistent cache.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,7 +81,7 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
     let mut cache = None;
     let mut identity = 0;
     let mut next_sequence_point = 1u64;
-    let mut known: HashMap<u8, Vec<KnownRecord>> = HashMap::new();
+    let mut known: HashMap<(u8, u8), Vec<KnownRecord>> = HashMap::new();
     let mut events = Vec::with_capacity(commands.len());
 
     for command in commands {
@@ -98,9 +100,10 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                 let recovered = opened.last_sequence_point.map(SequencePoint::raw);
                 if let Some(point) = recovered {
                     assert!(
-                        known.get(&identity).is_some_and(|records| records
-                            .iter()
-                            .any(|record| record.sequence_point == point)),
+                        known.iter().any(|((known_identity, _), records)| {
+                            *known_identity == identity
+                                && records.iter().any(|record| record.sequence_point == point)
+                        }),
                         "cache recovered a sequence point that was never admitted"
                     );
                 }
@@ -121,11 +124,14 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                     let path = path(command.path);
                     let revision = revision(sequence_point, command.pattern);
                     let body = body(command.argument, command.pattern);
-                    known.entry(identity).or_default().push(KnownRecord {
-                        revision: revision.clone(),
-                        body: body.clone(),
-                        sequence_point,
-                    });
+                    known
+                        .entry((identity, command.path))
+                        .or_default()
+                        .push(KnownRecord {
+                            revision: revision.clone(),
+                            body: body.clone(),
+                            sequence_point,
+                        });
                     current.replace(
                         path,
                         revision,
@@ -151,7 +157,7 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                     None
                 };
                 let record_digest = record.map(|record| {
-                    let valid = known.get(&identity).is_some_and(|records| {
+                    let valid = known.get(&(identity, command.path)).is_some_and(|records| {
                         records.iter().any(|known| {
                             known.revision == record.revision
                                 && known.body == record.body

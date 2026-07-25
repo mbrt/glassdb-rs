@@ -1,4 +1,4 @@
-//! Best-effort persistent encoded-body disk cache (ADR-045).
+//! Best-effort persistent encoded-body disk cache (ADR-045, ADR-048).
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -46,6 +46,10 @@ const SYNC_BYTES: u64 = 64 * 1024 * 1024;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// One token per seven admission bytes bounds promotions to one eighth of
+// combined append traffic; the segment cap also limits short bursts.
+const PROMOTION_EARN_DIVISOR: u64 = 7;
+const PROMOTION_CAP_DIVISOR: u64 = 8;
 
 /// Configuration for the optional persistent encoded-body cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +62,7 @@ pub struct PersistentCacheConfig {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CacheGeometry {
+struct CacheGeometry {
     magic: [u8; 8],
     format_version: u64,
     block_bytes: u64,
@@ -73,7 +77,7 @@ pub(crate) struct CacheGeometry {
     record_domain: &'static [u8],
 }
 
-pub(crate) const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
+const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
     magic: *b"GLDBL2\0\0",
     format_version: 1,
     block_bytes: 4 * 1024,
@@ -89,7 +93,7 @@ pub(crate) const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
 };
 
 #[cfg(any(test, feature = "sim"))]
-pub(crate) const TEST_GEOMETRY: CacheGeometry = CacheGeometry {
+const TEST_GEOMETRY: CacheGeometry = CacheGeometry {
     magic: *b"GL2TEST\0",
     format_version: 1,
     block_bytes: 4 * 1024,
@@ -718,6 +722,7 @@ impl Drop for FenceGuard {
 struct CacheInner {
     shared: Arc<Shared>,
     sender: mpsc::Sender<Work>,
+    // Orders producers against shutdown so no work enters after shutdown starts.
     enqueue_gate: Mutex<()>,
     shutdown_started: AtomicBool,
     completion: Arc<Completion>,
@@ -1736,10 +1741,10 @@ async fn run_worker(
                 let result = if shared.enabled.load(Ordering::Acquire) && fence.is_current() {
                     let result = writer.append(&path, &revision, &body, current_after).await;
                     if let Ok(slot) = result {
-                        let earned = slot.record_bytes / 7;
+                        let earned = slot.record_bytes / PROMOTION_EARN_DIVISOR;
                         let cap = (writer.disk.geometry.segment_bytes
                             - writer.disk.geometry.block_bytes)
-                            / 8;
+                            / PROMOTION_CAP_DIVISOR;
                         writer.promotion_tokens =
                             writer.promotion_tokens.saturating_add(earned).min(cap);
                     }

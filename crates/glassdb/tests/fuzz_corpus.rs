@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use glassdb::middleware::{OpRecord, first_divergence};
 use glassdb::sim::{
-    ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_disk_cache_input,
-    record_input,
+    ApiWorkload, CycleWorkload, DiskCacheEvent, MembershipWorkload, RmwWorkload,
+    record_disk_cache_input, record_input,
 };
 use rayon::prelude::*;
 
@@ -105,6 +105,39 @@ fn replays_committed_disk_cache_corpus() {
     let data = std::fs::read(&path).expect("read disk-cache corpus seed");
     let first = record_disk_cache_input(&data);
     let second = record_disk_cache_input(&data);
+    let enabled_opens = first
+        .iter()
+        .filter(|event| matches!(event, DiskCacheEvent::Opened { enabled: true, .. }))
+        .count();
+    assert!(
+        enabled_opens >= 3,
+        "disk-cache corpus did not exercise reopen: {first:?}"
+    );
+    for path in [0, 1] {
+        assert!(
+            first.iter().any(|event| matches!(
+                event,
+                DiskCacheEvent::Lookup {
+                    path: actual,
+                    record_digest: Some(_),
+                    ..
+                } if *actual == path
+            )),
+            "disk-cache corpus never returned the admitted record for path {path}"
+        );
+    }
+    for operation in [5, 6, 7] {
+        assert!(
+            first.iter().any(|event| matches!(
+                event,
+                DiskCacheEvent::State {
+                    operation: actual,
+                    ..
+                } if *actual == operation
+            )),
+            "disk-cache corpus omitted lifecycle operation {operation}"
+        );
+    }
     assert_eq!(
         first,
         second,

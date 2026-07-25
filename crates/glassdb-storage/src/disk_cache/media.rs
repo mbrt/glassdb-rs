@@ -1,3 +1,5 @@
+//! Media interface for one persistent-cache container.
+
 use std::io;
 use std::path::Path;
 use std::sync::Arc;

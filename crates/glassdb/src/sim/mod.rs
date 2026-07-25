@@ -31,6 +31,8 @@ pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 
 use glassdb_storage::SplitPolicy;
+// The media model also supports ordinary Tokio tests; its deterministic harness
+// requires an active simulation build.
 #[cfg(sim)]
 pub use glassdb_storage::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};
 pub use glassdb_storage::{MediaFaultProfile, SimMedia};

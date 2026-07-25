@@ -37,7 +37,7 @@ fn isolated_cache_trace_is_reproducible() {
 }
 
 #[test]
-fn database_reopens_after_clean_shutdown_and_crash() {
+fn database_uses_cleanly_reopened_cache_and_survives_crash() {
     block_on_with(TapeScheduler::new(Vec::new()), 41, async {
         let backend = Arc::new(MemoryBackend::new());
         let media = SimMedia::new(MediaFaultProfile::Healthy, vec![0, 255, 0, 255], 41);
@@ -51,10 +51,25 @@ fn database_reopens_after_clean_shutdown_and_crash() {
         first.shutdown().await;
         drop(first);
 
+        // Populate L2 from a backend read, then make that admission durable.
+        let warming = open(backend.clone(), media.clone()).await;
+        assert_eq!(
+            warming.root_collection().read(b"key").await.unwrap(),
+            Some(b"value".to_vec())
+        );
+        warming.shutdown().await;
+        drop(warming);
+
         let clean = open(backend.clone(), media.clone()).await;
+        let before = clean.stats();
         assert_eq!(
             clean.root_collection().read(b"key").await.unwrap(),
             Some(b"value".to_vec())
+        );
+        let read_stats = clean.stats() - before;
+        assert!(
+            read_stats.cache.l2_hits > 0,
+            "clean reopen did not serve any object from L2: {read_stats:?}"
         );
 
         media.crash();

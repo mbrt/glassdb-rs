@@ -1,3 +1,5 @@
+//! Deterministic byte-level media for one persistent-cache container.
+
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -57,6 +59,15 @@ enum OperationEffect {
     Complete,
     PartialWrite,
 }
+
+// Selected faults stay sparse so cross-layer tests usually reach cache
+// behavior; Full spends more decisions exploring the isolated fault domain.
+const SELECTED_COMPLETE_CUTOFF: u8 = 240;
+const SELECTED_DELAY_CUTOFF: u8 = 248;
+const FULL_COMPLETE_CUTOFF: u8 = 224;
+const FULL_DELAY_CUTOFF: u8 = 240;
+const FULL_ERROR_CUTOFF: u8 = 248;
+const FULL_PARTIAL_CUTOFF: u8 = 252;
 
 impl SimMedia {
     /// Creates one simulated cache container with its own fault-decision tape.
@@ -174,22 +185,26 @@ impl Shared {
         };
         match self.profile {
             MediaFaultProfile::Healthy => Ok(OperationEffect::Complete),
-            MediaFaultProfile::Selected if decision < 240 => Ok(OperationEffect::Complete),
-            MediaFaultProfile::Selected if decision < 248 => {
+            MediaFaultProfile::Selected if decision < SELECTED_COMPLETE_CUTOFF => {
+                Ok(OperationEffect::Complete)
+            }
+            MediaFaultProfile::Selected if decision < SELECTED_DELAY_CUTOFF => {
                 self.delay(expected).await?;
                 Ok(OperationEffect::Complete)
             }
             MediaFaultProfile::Selected => Err(injected_error()),
-            MediaFaultProfile::Full if decision < 224 => Ok(OperationEffect::Complete),
-            MediaFaultProfile::Full if decision < 240 => {
+            MediaFaultProfile::Full if decision < FULL_COMPLETE_CUTOFF => {
+                Ok(OperationEffect::Complete)
+            }
+            MediaFaultProfile::Full if decision < FULL_DELAY_CUTOFF => {
                 self.delay(expected).await?;
                 Ok(OperationEffect::Complete)
             }
-            MediaFaultProfile::Full if decision < 248 => Err(injected_error()),
-            MediaFaultProfile::Full if decision < 252 && allow_partial_write => {
+            MediaFaultProfile::Full if decision < FULL_ERROR_CUTOFF => Err(injected_error()),
+            MediaFaultProfile::Full if decision < FULL_PARTIAL_CUTOFF && allow_partial_write => {
                 Ok(OperationEffect::PartialWrite)
             }
-            MediaFaultProfile::Full if decision < 252 => Err(injected_error()),
+            MediaFaultProfile::Full if decision < FULL_PARTIAL_CUTOFF => Err(injected_error()),
             MediaFaultProfile::Full => self.pending_until_failure(expected).await,
         }
     }
@@ -274,9 +289,9 @@ impl Shared {
                 old
             };
         }
-        state.working = Some(resolved.clone());
         state.durable = resolved;
         state.durable_exists = true;
+        state.working = None;
     }
 
     fn choose(&self) -> bool {
