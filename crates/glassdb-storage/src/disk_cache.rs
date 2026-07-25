@@ -963,11 +963,6 @@ enum Work {
         path: Arc<str>,
         completion: oneshot::Sender<Option<EncodedBody>>,
     },
-    #[cfg(test)]
-    Stall {
-        entered: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
-    },
     Replace {
         path: Arc<str>,
         revision: Vec<u8>,
@@ -1720,12 +1715,6 @@ async fn run_worker(
                 let _ = completion.send(lookup(&shared, &path).await);
                 Ok(())
             }
-            #[cfg(test)]
-            Work::Stall { entered, release } => {
-                let _ = entered.send(());
-                let _ = release.await;
-                Ok(())
-            }
             Work::Replace {
                 path,
                 revision,
@@ -2069,24 +2058,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shutdown_returns_when_worker_is_stalled() {
+    async fn shutdown_returns_when_media_operation_is_stalled() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, id(1)).await;
+        let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 1);
+        let cache = open_sim_result(&dir, id(1), media.clone()).await.cache;
         let inner = cache.inner.as_ref().unwrap().clone();
-        let (entered, entered_rx) = oneshot::channel();
-        let (release, release_rx) = oneshot::channel();
-        inner.enqueue_required(Work::Stall {
-            entered,
-            release: release_rx,
-        });
-        entered_rx
-            .await
-            .expect("worker stopped before entering the stalled operation");
+        let mut pause = media.pause_next_operation();
+        publish(&cache, "db/object", b"r1", b"body");
+        pause.wait_until_entered().await;
 
         cache.shutdown().await;
         assert!(!cache.is_enabled());
 
-        release.send(()).unwrap();
+        pause.resume();
         inner.completion.wait().await;
     }
 

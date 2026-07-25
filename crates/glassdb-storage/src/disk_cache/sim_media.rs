@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Tape, rt};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 use super::media::{CacheFile, CacheMedia};
 use super::{PersistentCacheMedia, compact};
@@ -44,6 +44,7 @@ struct Shared {
     tape: Mutex<Tape>,
     profile: MediaFaultProfile,
     changed: Notify,
+    next_operation_pause: Mutex<Option<PendingOperationPause>>,
 }
 
 struct State {
@@ -56,6 +57,17 @@ struct State {
     durable: Vec<u8>,
     durable_exists: bool,
     out_of_bounds_accesses: u64,
+}
+
+/// Control for one explicitly paused simulated media operation.
+pub struct MediaPause {
+    entered: oneshot::Receiver<()>,
+    resume: oneshot::Sender<()>,
+}
+
+struct PendingOperationPause {
+    entered: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
 }
 
 struct SimFile {
@@ -98,6 +110,7 @@ impl SimMedia {
                 tape: Mutex::new(Tape::new(fault_tape, seed)),
                 profile,
                 changed: Notify::new(),
+                next_operation_pause: Mutex::new(None),
             }),
         }
     }
@@ -175,6 +188,39 @@ impl SimMedia {
         let state = self.shared.state.lock().unwrap();
         state.durable_exists.then(|| state.durable.clone())
     }
+
+    /// Pauses the next operation until the returned control is resumed or dropped.
+    pub fn pause_next_operation(&self) -> MediaPause {
+        let (entered, entered_rx) = oneshot::channel();
+        let (resume, resume_rx) = oneshot::channel();
+        let mut next = self.shared.next_operation_pause.lock().unwrap();
+        assert!(
+            next.is_none(),
+            "a simulated media operation pause is already armed"
+        );
+        *next = Some(PendingOperationPause {
+            entered,
+            resume: resume_rx,
+        });
+        MediaPause {
+            entered: entered_rx,
+            resume,
+        }
+    }
+}
+
+impl MediaPause {
+    /// Waits until a media operation has entered this pause.
+    pub async fn wait_until_entered(&mut self) {
+        (&mut self.entered)
+            .await
+            .expect("simulated media stopped before entering the paused operation");
+    }
+
+    /// Resumes the paused media operation.
+    pub fn resume(self) {
+        let _ = self.resume.send(());
+    }
 }
 
 impl Shared {
@@ -185,6 +231,12 @@ impl Shared {
     ) -> io::Result<OperationEffect> {
         rt::yield_now().await;
         self.check_available(expected)?;
+        let pause = self.next_operation_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.resume.await;
+            self.check_available(expected)?;
+        }
 
         let decision = {
             let mut tape = self.tape.lock().unwrap();

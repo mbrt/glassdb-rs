@@ -21,7 +21,7 @@ mod version;
 /// Persistent-cache media and harnesses for deterministic simulation.
 #[cfg(feature = "sim")]
 pub mod sim {
-    pub use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
+    pub use crate::disk_cache::sim_media::{MediaFaultProfile, MediaPause, SimMedia};
 
     /// Isolated persistent-cache deterministic simulation harness.
     #[cfg(sim)]

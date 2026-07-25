@@ -18,7 +18,7 @@ mod slow_backend;
 
 pub use api::{ApiAcct, ApiAction, ApiTransaction, ApiWorkload};
 pub use cycle::CycleWorkload;
-pub use glassdb_storage::sim::{MediaFaultProfile, SimMedia};
+pub use glassdb_storage::sim::{MediaFaultProfile, MediaPause, SimMedia};
 pub use harness::{
     FaultConfig, SimWorkload, run_and_assert, run_and_assert_with_faults, run_and_record,
     run_and_record_with_faults,
