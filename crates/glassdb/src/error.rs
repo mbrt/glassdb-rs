@@ -20,6 +20,12 @@ pub enum Error {
     /// The requested collection name is already bound.
     #[error("collection already exists")]
     AlreadyExists,
+    /// The collection handle names an incarnation that has been deleted.
+    #[error("stale collection handle")]
+    StaleCollection,
+    /// The collection still has direct child collections.
+    #[error("collection is not empty")]
+    NotEmpty,
     /// The transaction was explicitly aborted by the user.
     #[error("aborted transaction")]
     Aborted,
@@ -126,6 +132,7 @@ impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         match e {
             StorageError::NotFound | StorageError::KeyNotFound => Error::NotFound,
+            StorageError::StaleCollection => Error::StaleCollection,
             StorageError::Precondition => Error::Precondition,
             StorageError::InvalidCursor => Error::internal("invalid listing cursor"),
             StorageError::Unavailable(s) => Error::InDoubt(s),
@@ -139,6 +146,7 @@ impl From<TransError> for Error {
         match e {
             TransError::Storage(s) => s.into(),
             TransError::AlreadyFinalized => Error::AlreadyFinalized,
+            TransError::StaleCollection => Error::StaleCollection,
             TransError::InvalidInput(msg) => Error::InvalidInput(msg),
             TransError::Other { msg, source } => Error::Internal { msg, source },
             TransError::Retry

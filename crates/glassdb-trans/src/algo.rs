@@ -23,6 +23,7 @@
 //! contended shard guarantees one contender makes progress. Only a genuine wound
 //! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -31,10 +32,11 @@ use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     LeafObservation, LeafObservationCheck, LockType, NodeLocks, Requirement, SequencePoint,
-    ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus, TxLock, TxLog,
-    TxWrite,
+    ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCollectionChange,
+    TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 
+use crate::collections::{CollectionData, CollectionManager, CollectionOp};
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
@@ -44,6 +46,7 @@ use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
 };
+use crate::split::Splitter;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -164,7 +167,8 @@ impl ScanRange {
                 .is_some_and(|end| self.start.as_slice() >= end)
     }
 
-    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+    /// Reports whether `key` lies in this normalized range.
+    pub fn contains(&self, key: &[u8]) -> bool {
         let above_start = if self.start_exclusive {
             key > self.start.as_slice()
         } else {
@@ -213,6 +217,7 @@ pub struct Data {
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
 pub struct Handle {
     data: Data,
+    collection_data: CollectionData,
     status: Status,
     id: TxId,
     /// Number of restarts so far; drives the serial-locking escalation.
@@ -230,6 +235,8 @@ pub struct Handle {
     /// The lock-holding restart paths (`restart`, `revalidate`) and the read-only
     /// validation paths deliberately do not back off.
     backoff: Backoff,
+    prepared_collections: BTreeSet<CollectionAddress>,
+    fenced_drops: BTreeSet<CollectionAddress>,
 }
 
 impl Handle {
@@ -470,6 +477,8 @@ pub struct Algo {
     clock: Clock,
     timeline: Timeline,
     split_policy: SplitPolicy,
+    collections: CollectionManager,
+    splitter: Splitter,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -491,7 +500,10 @@ impl Algo {
         background: Option<Weak<Background>>,
         resolver: Resolver,
         split_policy: SplitPolicy,
+        splitter: Splitter,
     ) -> Self {
+        let collections =
+            CollectionManager::new(shards.clone(), mon.clone(), RetryConfig::default());
         Algo {
             shards,
             resolver,
@@ -502,6 +514,8 @@ impl Algo {
             clock,
             timeline,
             split_policy,
+            collections,
+            splitter,
             background,
         }
     }
@@ -512,13 +526,23 @@ impl Algo {
         let id = TxId::new_at(self.clock.now());
         Handle {
             data: d,
+            collection_data: CollectionData::default(),
             status: Status::New,
             id,
             attempts: 0,
             engaged: false,
             lock_reads_on_retry: false,
             backoff: RetryConfig::default().backoff(),
+            prepared_collections: BTreeSet::new(),
+            fenced_drops: BTreeSet::new(),
         }
+    }
+
+    /// Starts a transaction carrying both key and collection-management data.
+    pub fn begin_with_collections(&self, data: Data, collection_data: CollectionData) -> Handle {
+        let mut handle = self.begin(data);
+        handle.collection_data = collection_data;
+        handle
     }
 
     /// Restarts a wounded transaction, preserving its priority (timestamp) while
@@ -529,11 +553,14 @@ impl Algo {
         Handle {
             id: old.id.renew(),
             data: old.data,
+            collection_data: old.collection_data,
             status: Status::New,
             attempts: old.attempts + 1,
             engaged: false,
             lock_reads_on_retry: old.lock_reads_on_retry,
             backoff: old.backoff,
+            prepared_collections: BTreeSet::new(),
+            fenced_drops: BTreeSet::new(),
         }
     }
 
@@ -545,7 +572,7 @@ impl Algo {
     /// the key (re-run holding its locks, ADR-024). CAS contention and suspected
     /// deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.data.writes.is_empty() {
+        if tx.data.writes.is_empty() && !tx.collection_data.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.data)?;
                 return self.commit_locked(tx).await;
@@ -557,7 +584,10 @@ impl Algo {
         // of an existing key commits with one object write + one shard CAS. On
         // ineligibility nothing has been written, so the full locked path takes
         // over under the same id.
-        if self.try_commit_single_rw(tx).await?.is_some() {
+        if tx.collection_data.reads.is_empty()
+            && tx.collection_data.changes.is_empty()
+            && self.try_commit_single_rw(tx).await?.is_some()
+        {
             return Ok(());
         }
         self.commit_locked(tx).await
@@ -568,7 +598,7 @@ impl Algo {
     /// if any was invalidated. The first attempt is optimistic; after a failure,
     /// the next attempt validates with point and predicate read locks.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if !tx.data.writes.is_empty() {
+        if !tx.data.writes.is_empty() || tx.collection_data.has_writes() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
             ));
@@ -582,6 +612,16 @@ impl Algo {
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
+            && self
+                .collections
+                .validate(
+                    None,
+                    &tx.collection_data.reads,
+                    &[],
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
             return Ok(());
         }
@@ -599,6 +639,17 @@ impl Algo {
         tx.data = data;
     }
 
+    /// Replaces both key and collection-management accesses before commit.
+    pub fn reset_with_collections(
+        &self,
+        tx: &mut Handle,
+        data: Data,
+        collection_data: CollectionData,
+    ) {
+        self.reset(tx, data);
+        tx.collection_data = collection_data;
+    }
+
     /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
     /// by marking its transaction object aborted). An optimistic read-only
     /// attempt never engaged, so there is nothing to abort.
@@ -606,7 +657,14 @@ impl Algo {
         if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
         }
-        self.mon.abort_tx(&tx.id).await
+        let result = self.mon.abort_tx(&tx.id).await;
+        let drops = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        let drop_cleanup = self.collections.clear_aborted_drops(&tx.id, &drops).await;
+        let prepared = tx.prepared_collections.iter().cloned().collect::<Vec<_>>();
+        let prepared_cleanup = self.collections.reclaim(&prepared).await;
+        result?;
+        drop_cleanup?;
+        prepared_cleanup
     }
 
     /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
@@ -657,6 +715,16 @@ impl Algo {
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
+            && self
+                .collections
+                .validate(
+                    None,
+                    &tx.collection_data.reads,
+                    &[],
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
             tx.status = Status::Committed;
             return Ok(());
@@ -673,6 +741,83 @@ impl Algo {
             tx.engaged = true;
         }
 
+        let active_drops = tx
+            .collection_data
+            .changes
+            .iter()
+            .filter(|change| change.op == CollectionOp::Drop)
+            .map(|change| change.collection.clone())
+            .collect::<BTreeSet<_>>();
+        let abandoned_drops = tx
+            .fenced_drops
+            .difference(&active_drops)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.collections
+            .clear_aborted_drops(&tx.id, &abandoned_drops)
+            .await?;
+        tx.fenced_drops.retain(|drop| active_drops.contains(drop));
+
+        if !tx.collection_data.changes.is_empty() {
+            let changes = tx
+                .collection_data
+                .changes
+                .iter()
+                .map(|change| TxCollectionChange {
+                    parent: change.parent.clone(),
+                    name: change.name.clone(),
+                    collection: change.collection.clone(),
+                    op: match change.op {
+                        CollectionOp::Create => TxCollectionOp::Create,
+                        CollectionOp::Drop => TxCollectionOp::Drop,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let prepared = tx
+                .prepared_collections
+                .iter()
+                .cloned()
+                .chain(
+                    tx.collection_data
+                        .changes
+                        .iter()
+                        .filter(|change| change.op == CollectionOp::Create)
+                        .map(|change| change.collection.clone()),
+                )
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Err(error) = self
+                .mon
+                .prepare_collections(&tx.id, changes, prepared)
+                .await
+            {
+                if matches!(error, TransError::AlreadyFinalized) {
+                    return self.restart(tx).await;
+                }
+                return Err(error);
+            }
+        }
+
+        tx.prepared_collections.extend(
+            tx.collection_data
+                .changes
+                .iter()
+                .filter(|change| change.op == CollectionOp::Create)
+                .map(|change| change.collection.clone()),
+        );
+        self.collections
+            .prepare_roots(&tx.collection_data.changes)
+            .await?;
+        let directory_locks = self
+            .collections
+            .lock_directories(
+                &tx.id,
+                &tx.collection_data.reads,
+                &tx.collection_data.changes,
+            )
+            .await?;
+
         // Capture before lock acquisition so every successful lock CAS is
         // eligible to certify the reads it protects against this same bound.
         let validation_start = self.timeline.now();
@@ -688,7 +833,8 @@ impl Algo {
         // (ADR-022). This tracks the latest acquire; a `revalidate` re-run that
         // drops keys may under-record, which only defers those stale locks to
         // lazy reclaim, never a correctness loss.
-        let locks = locked.locked_paths();
+        let mut locks = locked.locked_paths();
+        locks.extend(directory_locks);
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
         // Validate point reads and scans after their entry/predicate locks are
@@ -704,12 +850,39 @@ impl Algo {
                 validation_start,
             )
             .await?
+            || !self
+                .collections
+                .validate(
+                    Some(&tx.id),
+                    &tx.collection_data.reads,
+                    &tx.collection_data.changes,
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
+            self.collections.release_locks(&tx.id, &locks).await;
             return self.revalidate(tx).await;
         }
 
+        // Record the target before preparation begins so a partial fencing
+        // attempt is cleared if this same transaction reruns a different body.
+        tx.fenced_drops.extend(active_drops);
+        self.collections
+            .fence_drops(&tx.id, &tx.collection_data.changes, &self.splitter)
+            .await?;
+
         // Commit point: create-or-flip the transaction object to committed.
-        if let Err(e) = self.commit_writes(&tx.data.writes, locks, &tx.id).await {
+        if let Err(e) = self
+            .commit_writes(
+                &tx.data,
+                &tx.collection_data,
+                &tx.prepared_collections,
+                locks.clone(),
+                &tx.id,
+            )
+            .await
+        {
             if matches!(e, TransError::AlreadyFinalized) {
                 // The log was finalized as `aborted` out from under us: a wound
                 // landed between locking and commit.
@@ -719,7 +892,34 @@ impl Algo {
         }
         tx.status = Status::Committed;
 
+        if let Err(error) = self
+            .collections
+            .write_back(&tx.id, &tx.collection_data.changes, &locks)
+            .await
+        {
+            tracing::debug!(%error, "collection-directory write-back deferred");
+        }
         self.write_back(&tx.id, locked).await;
+
+        let active_prepared = tx
+            .collection_data
+            .changes
+            .iter()
+            .filter(|change| change.op == CollectionOp::Create)
+            .map(|change| change.collection.clone())
+            .collect::<BTreeSet<_>>();
+        let unused = tx
+            .prepared_collections
+            .difference(&active_prepared)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = self.collections.reclaim(&unused).await {
+            tracing::debug!(%error, "prepared-collection cleanup deferred");
+        }
+        let dropped = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        if let Err(error) = self.collections.reclaim(&dropped).await {
+            tracing::debug!(%error, "dropped-collection cleanup deferred");
+        }
         Ok(())
     }
 
@@ -736,11 +936,17 @@ impl Algo {
         // The escalated read-only path uses lock CASes as validation evidence,
         // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
+        let directory_locks = self
+            .collections
+            .lock_directories(&tx.id, &tx.collection_data.reads, &[])
+            .await?;
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return self.restart(tx).await,
         };
-        self.mon.record_tx_locks(&tx.id, locked.locked_paths());
+        let mut locks = locked.locked_paths();
+        locks.extend(directory_locks);
+        self.mon.record_tx_locks(&tx.id, locks.clone());
         if self
             .validate(
                 &tx.data,
@@ -751,9 +957,20 @@ impl Algo {
                 validation_start,
             )
             .await?
+            && self
+                .collections
+                .validate(
+                    Some(&tx.id),
+                    &tx.collection_data.reads,
+                    &[],
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
             return Ok(());
         }
+        self.collections.release_locks(&tx.id, &locks).await;
         self.revalidate(tx).await
     }
 
@@ -830,7 +1047,14 @@ impl Algo {
         // version-conditional CAS misses, invalidates that seed, and re-folds
         // over the winner — finding the read superseded, the fast path renews
         // (`Wounded`).
-        let (_, locator) = self.resolver.resolve_key(&key, Requirement::Any).await?;
+        let (_, locator) = self
+            .resolver
+            .resolve_key(&key, Requirement::Any)
+            .await
+            .map_err(|error| match error {
+                TransError::Storage(StorageError::NotFound) => TransError::StaleCollection,
+                other => other,
+            })?;
         if locator
             .node()
             .is_some_and(|node| node.structural_gate().lock_type() == LockType::Write)
@@ -1277,7 +1501,11 @@ impl Algo {
             return Ok(true);
         }
         let keys: Vec<KeyRef> = data.reads.iter().map(|read| read.key.clone()).collect();
-        let current = self.resolver.effective_writers(&keys, requirement).await?;
+        let current = self
+            .resolver
+            .effective_writers(&keys, requirement)
+            .await
+            .map_err(|error| map_missing_collection(keys.iter().map(KeyRef::collection), error))?;
         for r in &data.reads {
             if current.get(&r.key).and_then(Option::as_ref) != r.last_writer.as_ref() {
                 return Ok(false);
@@ -1309,7 +1537,10 @@ impl Algo {
                     own_lock_holder,
                     requirement,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    map_missing_collection(std::iter::once(&scan.collection), error)
+                })?;
             let mut fast = current.len() == scan.covered.len()
                 && !current.iter().zip(&scan.covered).any(|(now, observed)| {
                     now.path != observed.path
@@ -1341,7 +1572,10 @@ impl Algo {
                     scan.frontier.as_deref(),
                     requirement,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    map_missing_collection(std::iter::once(&scan.collection), error)
+                })?;
             if resolved.keys != scan.keys {
                 return Ok(false);
             }
@@ -1354,13 +1588,15 @@ impl Algo {
     /// carries its full back-reference set for GC's reverse check (ADR-022).
     async fn commit_writes(
         &self,
-        writes: &[WriteAccess],
+        data: &Data,
+        collection_data: &CollectionData,
+        prepared_collections: &BTreeSet<CollectionAddress>,
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
         let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
         tl.locks = locks;
-        for w in writes {
+        for w in &data.writes {
             let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
                 WriteOp::Put(value) => (value.clone(), false),
                 WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
@@ -1372,12 +1608,41 @@ impl Algo {
                 prev_writer: TxId::default(),
             });
         }
+        tl.collection_changes = collection_data
+            .changes
+            .iter()
+            .map(|change| TxCollectionChange {
+                parent: change.parent.clone(),
+                name: change.name.clone(),
+                collection: change.collection.clone(),
+                op: match change.op {
+                    CollectionOp::Create => TxCollectionOp::Create,
+                    CollectionOp::Drop => TxCollectionOp::Drop,
+                },
+            })
+            .collect();
+        tl.prepared_collections = prepared_collections.iter().cloned().collect();
         // `context` preserves the `AlreadyFinalized` sentinel and any in-doubt
         // outcome instead of collapsing them into a generic error.
         self.mon
             .commit_tx(tl)
             .await
             .map_err(|e| e.context("creating transaction object"))
+    }
+}
+
+fn map_missing_collection<'a>(
+    collections: impl IntoIterator<Item = &'a CollectionAddress>,
+    error: StorageError,
+) -> TransError {
+    if matches!(error, StorageError::NotFound)
+        && collections
+            .into_iter()
+            .any(|collection| !collection.id().is_root())
+    {
+        TransError::StaleCollection
+    } else {
+        error.into()
     }
 }
 
@@ -1402,7 +1667,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{LeafRef, paths};
+    use glassdb_data::{CollectionId, LeafRef, paths};
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Shard, ShardEntry, ShardStore, TLogger,
         TxCommitStatus,
@@ -1459,7 +1724,7 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        let (coord, _splitter) = crate::split::Splitter::with_coordinator(
+        let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             shards.clone(),
             timeline.clone(),
@@ -1497,6 +1762,7 @@ mod tests {
             None,
             resolver,
             glassdb_storage::SplitPolicy::default(),
+            splitter,
         );
         (
             algo,
@@ -1638,6 +1904,88 @@ mod tests {
             leaf,
             typ: LockType::Write,
         }));
+    }
+
+    #[tokio::test]
+    async fn committed_manifest_preserves_prepared_roots_from_earlier_attempts() {
+        let (tm, tctx) = new_algo().await;
+        let earlier = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
+        );
+        let active = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[2; 16]).expect("fixed ID has the required width"),
+        );
+        let prepared = BTreeSet::from([earlier.clone(), active.clone()]);
+        let collection_data = CollectionData {
+            reads: Vec::new(),
+            changes: vec![crate::collections::CollectionChange {
+                parent: test_collection(),
+                name: b"active".to_vec(),
+                collection: active.clone(),
+                expected: None,
+                op: CollectionOp::Create,
+            }],
+        };
+        let handle = tm.begin(Data::default());
+        let id = handle.id().clone();
+        tm.mon.begin_tx(&id);
+
+        tm.commit_writes(
+            &Data::default(),
+            &collection_data,
+            &prepared,
+            Vec::new(),
+            &id,
+        )
+        .await
+        .unwrap();
+
+        let log = tctx.tlogger.get_at(&id, Requirement::Any).await.unwrap();
+        let log = log.value().unwrap();
+        assert_eq!(log.prepared_collections, vec![earlier, active.clone()]);
+        assert_eq!(log.collection_changes.len(), 1);
+        assert_eq!(log.collection_changes[0].collection, active);
+    }
+
+    #[tokio::test]
+    async fn a_retried_body_clears_an_abandoned_partial_drop() {
+        let (tm, tctx) = new_algo().await;
+        let dropped = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
+        );
+        let mut handle = tm.begin(Data::default());
+        let id = handle.id().clone();
+        tm.mon.begin_tx(&id);
+        handle.status = Status::Validating;
+        handle.engaged = true;
+        handle.fenced_drops.insert(dropped.clone());
+
+        let mut root = CollectionRoot::new();
+        root.node_locks_mut().set_delete_intent(id.clone());
+        assert!(root.set_topology_freeze(id.clone()));
+        assert!(
+            tctx.shards
+                .create_root(&dropped.physical_prefix(), &root)
+                .await
+                .unwrap()
+        );
+
+        tm.commit(&mut handle).await.unwrap();
+
+        let (root, _) = tctx
+            .shards
+            .load_root(
+                &dropped.physical_prefix(),
+                Requirement::AtLeast(tctx.timeline.now()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(root.node().collection_delete_intent(), None);
+        assert_eq!(root.topology_freeze(), None);
+        tm.end(&mut handle).await.unwrap();
     }
 
     #[tokio::test]

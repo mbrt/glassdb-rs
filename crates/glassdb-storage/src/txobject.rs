@@ -76,6 +76,8 @@ mod tests {
                 prev_writer: TxId::default(),
             }],
             locks: Vec::new(),
+            collection_changes: Vec::new(),
+            prepared_collections: Vec::new(),
         }
     }
 
@@ -99,6 +101,8 @@ mod tests {
                 key: key(b"hello"),
                 typ: LockType::Write,
             }],
+            collection_changes: Vec::new(),
+            prepared_collections: Vec::new(),
         };
         let decoded = decode("db", &obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Pending);
@@ -116,6 +120,8 @@ mod tests {
             status: TxCommitStatus::Aborted,
             writes: Vec::new(),
             locks: Vec::new(),
+            collection_changes: Vec::new(),
+            prepared_collections: Vec::new(),
         };
         let decoded = decode("db", &obj.id, &encode(&obj).unwrap()).unwrap();
         assert_eq!(decoded.status, TxCommitStatus::Aborted);

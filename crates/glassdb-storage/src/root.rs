@@ -12,14 +12,15 @@
 //! This module defines an inert data type plus encode/decode and pure
 //! accessors/mutators. It does no I/O.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use glassdb_data::{CollectionId, MAX_COLLECTION_NAME_BYTES};
+use glassdb_data::{CollectionId, MAX_COLLECTION_NAME_BYTES, TxId};
 use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::node::{Node, NodeLocks};
+use crate::lock::LockType;
+use crate::node::{Node, NodeLock, NodeLocks};
 use crate::shard::Shard;
 
 /// A decoded collection root: the B-link root node plus collection metadata.
@@ -30,6 +31,10 @@ use crate::shard::Shard;
 pub struct CollectionRoot {
     node: Node,
     children: BTreeMap<Vec<u8>, CollectionId>,
+    directory_lock: NodeLock,
+    directory_version: u64,
+    topology_freeze: Option<TxId>,
+    topology_participants: BTreeSet<TxId>,
 }
 
 impl CollectionRoot {
@@ -39,6 +44,10 @@ impl CollectionRoot {
         CollectionRoot {
             node: Node::leaf(Shard::new()),
             children: BTreeMap::new(),
+            directory_lock: NodeLock::default(),
+            directory_version: 0,
+            topology_freeze: None,
+            topology_participants: BTreeSet::new(),
         }
     }
 
@@ -100,6 +109,86 @@ impl CollectionRoot {
             .map(|(name, id)| (name.as_slice(), *id))
     }
 
+    /// Returns the root-wide lock coordinating the direct-child directory.
+    pub fn directory_lock(&self) -> &NodeLock {
+        &self.directory_lock
+    }
+
+    /// Returns the directory activity version.
+    pub fn directory_version(&self) -> u64 {
+        self.directory_version
+    }
+
+    /// Installs a shared directory holder.
+    pub fn add_directory_reader(&mut self, id: TxId) {
+        self.directory_lock.add_reader(id);
+    }
+
+    /// Installs an exclusive directory holder.
+    pub fn set_directory_writer(&mut self, id: TxId) {
+        self.directory_lock.set_writer(id);
+    }
+
+    /// Removes one directory holder.
+    pub fn remove_directory_holder(&mut self, id: &TxId) -> bool {
+        self.directory_lock.remove(id)
+    }
+
+    /// Records one committed directory mutation batch.
+    pub fn advance_directory_version(&mut self) {
+        self.directory_version = self.directory_version.wrapping_add(1);
+    }
+
+    /// Returns the transaction currently freezing collection topology.
+    pub fn topology_freeze(&self) -> Option<&TxId> {
+        self.topology_freeze.as_ref()
+    }
+
+    /// Installs a topology freeze if no other transaction owns it.
+    pub fn set_topology_freeze(&mut self, id: TxId) -> bool {
+        if self
+            .topology_freeze
+            .as_ref()
+            .is_some_and(|holder| holder != &id)
+        {
+            return false;
+        }
+        self.topology_freeze = Some(id);
+        true
+    }
+
+    /// Clears a topology freeze owned by `id`.
+    pub fn remove_topology_freeze(&mut self, id: &TxId) -> bool {
+        if self.topology_freeze.as_ref() != Some(id) {
+            return false;
+        }
+        self.topology_freeze = None;
+        true
+    }
+
+    /// Returns structural operations that joined collection topology.
+    pub fn topology_participants(&self) -> impl Iterator<Item = &TxId> {
+        self.topology_participants.iter()
+    }
+
+    /// Joins collection topology unless a different transaction froze it.
+    pub fn add_topology_participant(&mut self, id: TxId) -> bool {
+        if self
+            .topology_freeze
+            .as_ref()
+            .is_some_and(|holder| holder != &id)
+        {
+            return false;
+        }
+        self.topology_participants.insert(id);
+        true
+    }
+
+    /// Removes a structural topology participant.
+    pub fn remove_topology_participant(&mut self, id: &TxId) -> bool {
+        self.topology_participants.remove(id)
+    }
+
     /// Encodes the root to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
@@ -149,6 +238,28 @@ impl CollectionRoot {
                 None => Node::leaf(Shard::new()),
             },
             children,
+            directory_lock: {
+                let lock = NodeLock::from_pb(raw.directory_lock);
+                match (lock.lock_type(), lock.holders()) {
+                    (LockType::None | LockType::Unknown, [])
+                    | (LockType::Read, [_, ..])
+                    | (LockType::Write, [_]) => lock,
+                    _ => {
+                        return Err(StorageError::other(
+                            "collection root has an invalid directory lock",
+                        ));
+                    }
+                }
+            },
+            directory_version: raw.directory_version,
+            topology_freeze: (!raw.topology_freeze.is_empty())
+                .then(|| TxId::from_bytes(raw.topology_freeze)),
+            topology_participants: raw
+                .topology_participants
+                .into_iter()
+                .filter(|id| !id.is_empty())
+                .map(TxId::from_bytes)
+                .collect(),
         })
     }
 
@@ -163,6 +274,18 @@ impl CollectionRoot {
                     name: name.clone(),
                     collection_id: id.as_bytes().to_vec(),
                 })
+                .collect(),
+            directory_lock: (!self.directory_lock.is_empty()).then(|| self.directory_lock.to_pb()),
+            directory_version: self.directory_version,
+            topology_freeze: self
+                .topology_freeze
+                .as_ref()
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
+            topology_participants: self
+                .topology_participants
+                .iter()
+                .map(|id| id.as_bytes().to_vec())
                 .collect(),
         }
     }
@@ -196,6 +319,42 @@ mod tests {
 
         let decoded = CollectionRoot::decode(&root.encode()).unwrap();
         assert_eq!(decoded, root);
+    }
+
+    #[test]
+    fn lifecycle_coordination_round_trips() {
+        let directory_reader = TxId::from_bytes(vec![1]);
+        let freeze = TxId::from_bytes(vec![2]);
+        let participant = TxId::from_bytes(vec![3]);
+        let mut root = CollectionRoot::new();
+        root.add_directory_reader(directory_reader.clone());
+        root.advance_directory_version();
+        assert!(root.set_topology_freeze(freeze.clone()));
+        assert!(root.add_topology_participant(freeze.clone()));
+        root.node_locks_mut()
+            .set_delete_intent(directory_reader.clone());
+
+        let decoded = CollectionRoot::decode(&root.encode()).unwrap();
+        assert_eq!(decoded.directory_version(), 1);
+        assert!(decoded.directory_lock().contains(&directory_reader));
+        assert_eq!(decoded.topology_freeze(), Some(&freeze));
+        assert!(
+            decoded
+                .topology_participants()
+                .any(|holder| holder == &freeze)
+        );
+        assert_eq!(
+            decoded.node().collection_delete_intent(),
+            Some(&directory_reader)
+        );
+
+        let mut unfrozen = CollectionRoot::new();
+        assert!(unfrozen.add_topology_participant(participant.clone()));
+        assert!(
+            unfrozen
+                .topology_participants()
+                .any(|holder| holder == &participant)
+        );
     }
 
     #[test]

@@ -79,7 +79,7 @@ async fn rw() {
     assert_eq!(buf, val);
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 2);
+    assert_eq!(stats.tx_n, 3);
     assert_eq!(stats.tx_writes, 1);
     assert_eq!(stats.tx_retries, 0);
 }
@@ -244,7 +244,7 @@ async fn delete() {
     );
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 3);
+    assert_eq!(stats.tx_n, 4);
     assert_eq!(stats.tx_writes, 2);
     assert!(stats.tx_retries <= 1);
 }
@@ -356,7 +356,7 @@ async fn rmw_single() {
     rmw(&db, &coll, key, 30).await.unwrap();
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 30);
+    assert_eq!(stats.tx_n, 31);
     assert_eq!(stats.tx_reads, 30);
     assert_eq!(stats.tx_writes, 30);
     assert_eq!(stats.tx_retries, 0);
@@ -415,7 +415,7 @@ async fn multiple_rmw_single() {
     assert_eq!(read_int(&val), 30);
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 31);
+    assert_eq!(stats.tx_n, 32);
     assert_eq!(stats.tx_retries, 0);
 }
 
@@ -480,7 +480,7 @@ async fn concurrent_reads() {
     }
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 31);
+    assert_eq!(stats.tx_n, 32);
     assert_eq!(stats.tx_retries, 0);
 
     for k in keys {
@@ -526,7 +526,7 @@ async fn read_stale() {
     }
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 30);
+    assert_eq!(stats.tx_n, 31);
     assert_eq!(stats.tx_retries, 0);
 }
 

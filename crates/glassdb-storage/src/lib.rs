@@ -49,5 +49,8 @@ pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LeafKind, LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::StructuralLog;
 pub use timeline::{SequencePoint, Timeline};
-pub use tlogger::{TLogger, TValue, TxCommitStatus, TxListPage, TxLock, TxLog, TxStatus, TxWrite};
+pub use tlogger::{
+    TLogger, TValue, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxLog,
+    TxStatus, TxWrite,
+};
 pub use version::Version;

@@ -7,14 +7,13 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
-use glassdb_data::{CollectionAddress, CollectionId, TxId};
+use glassdb_data::{CollectionAddress, DatabaseId, TxId};
 use glassdb_storage::{
-    CachedStore, CollectionRoot, Directory, Observation, PersistentCache, PersistentCacheConfig,
-    PersistentCacheMedia, Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
+    CachedStore, Directory, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
+    Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
-    Algo, CollectionPublish, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator,
-    Splitter, TransError,
+    Algo, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator, Splitter, TransError,
 };
 use tokio::sync::Notify;
 
@@ -221,10 +220,12 @@ impl DatabaseBuilder {
             Some(bg_weak),
             resolver,
             split_policy,
+            splitter.clone(),
         );
 
         let inner = Arc::new(DbInner {
             name,
+            database_id,
             backend,
             objects,
             shards,
@@ -268,6 +269,7 @@ impl DatabaseBuilder {
 
 pub(crate) struct DbInner {
     pub(crate) name: String,
+    pub(crate) database_id: DatabaseId,
     pub(crate) backend: Arc<StatsBackend>,
     pub(crate) objects: CachedStore,
     pub(crate) shards: ShardStore,
@@ -290,12 +292,6 @@ pub(crate) struct DbInner {
     // unwind. `Database::shutdown` uses the same owner to wait for tasks that opted
     // into clean-shutdown draining.
     background: Arc<Background>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum CreateMode {
-    Strict,
-    IfAbsent,
 }
 
 /// An open GlassDB database instance.
@@ -360,7 +356,9 @@ impl Database {
         P::Error: Into<Error>,
     {
         let path = path.try_into().map_err(Into::into)?;
-        self.inner.open_path(&path).await
+        self.inner
+            .tx(move |tx| open_path_in_transaction(tx, path.clone()))
+            .await
     }
 
     /// Reports whether every component of a logical collection path is bound.
@@ -373,7 +371,9 @@ impl Database {
         P::Error: Into<Error>,
     {
         let path = path.try_into().map_err(Into::into)?;
-        self.inner.path_exists(&path).await
+        self.inner
+            .tx(move |tx| path_exists_in_transaction(tx, path.clone()))
+            .await
     }
 
     /// Strictly creates the final component of `path`.
@@ -386,7 +386,9 @@ impl Database {
         P::Error: Into<Error>,
     {
         let path = path.try_into().map_err(Into::into)?;
-        self.inner.create_path(&path, CreateMode::Strict).await
+        self.inner
+            .tx(move |tx| create_path_in_transaction(tx, path.clone(), PathCreateMode::Strict))
+            .await
     }
 
     /// Returns the final component of `path`, creating it when absent.
@@ -399,7 +401,9 @@ impl Database {
         P::Error: Into<Error>,
     {
         let path = path.try_into().map_err(Into::into)?;
-        self.inner.create_path(&path, CreateMode::IfAbsent).await
+        self.inner
+            .tx(move |tx| create_path_in_transaction(tx, path.clone(), PathCreateMode::IfAbsent))
+            .await
     }
 
     /// Executes `f` within a serializable transaction, retrying on conflicts.
@@ -459,6 +463,44 @@ impl Database {
             coordinator_dedup: self.inner.coord.dedup_snapshot(),
             transactions: self.inner.locker.tx_locks_snapshot(),
         }
+    }
+}
+
+enum PathCreateMode {
+    Strict,
+    IfAbsent,
+}
+
+/// Resolves `path` through one serializable transaction.
+async fn open_path_in_transaction(
+    tx: Transaction,
+    path: CollectionPath,
+) -> Result<Collection, Error> {
+    tx.open_collection_path(&path).await
+}
+
+/// Checks every binding in `path` through one serializable transaction.
+async fn path_exists_in_transaction(tx: Transaction, path: CollectionPath) -> Result<bool, Error> {
+    tx.collection_path_exists(&path).await
+}
+
+/// Creates the final binding in `path` through one serializable transaction.
+async fn create_path_in_transaction(
+    tx: Transaction,
+    path: CollectionPath,
+    mode: PathCreateMode,
+) -> Result<Collection, Error> {
+    let mut segments = path.segments();
+    let name = segments
+        .next_back()
+        .expect("CollectionPath always has one segment");
+    let mut parent = tx.root_collection();
+    for segment in segments {
+        parent = tx.open_collection(&parent, segment).await?;
+    }
+    match mode {
+        PathCreateMode::Strict => tx.create_collection(&parent, name).await,
+        PathCreateMode::IfAbsent => Ok(tx.create_collection_if_absent(&parent, name).await?.0),
     }
 }
 
@@ -528,7 +570,7 @@ impl DbInner {
         self.operations.admit()
     }
 
-    pub(crate) async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
+    pub(crate) async fn tx<T, F, Fut>(self: &Arc<Self>, f: F) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
@@ -547,205 +589,18 @@ impl DbInner {
         res
     }
 
-    pub(crate) async fn open_path(
-        self: &Arc<Self>,
-        path: &CollectionPath,
-    ) -> Result<Collection, Error> {
-        let _guard = self.admit_operation()?;
-        self.resolve_path(path).await
-    }
-
-    pub(crate) async fn path_exists(
-        self: &Arc<Self>,
-        path: &CollectionPath,
-    ) -> Result<bool, Error> {
-        let _guard = self.admit_operation()?;
-        let mut parent = Collection::new_root(self.clone());
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        for name in path.segments() {
-            let Some(child) = self.resolve_child_at(&parent, name, requirement).await? else {
-                return Ok(false);
-            };
-            parent = child;
-        }
-        Ok(true)
-    }
-
-    pub(crate) async fn create_path(
-        self: &Arc<Self>,
-        path: &CollectionPath,
-        mode: CreateMode,
-    ) -> Result<Collection, Error> {
-        let _guard = self.admit_operation()?;
-        let mut segments = path.segments();
-        let name = segments
-            .next_back()
-            .expect("CollectionPath always has one segment");
-        let mut parent = Collection::new_root(self.clone());
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        for segment in segments {
-            parent = self
-                .resolve_child_at(&parent, segment, requirement)
-                .await?
-                .ok_or(Error::NotFound)?;
-        }
-        self.create_child_inner(&parent, name, mode).await
-    }
-
-    pub(crate) async fn open_child(
-        self: &Arc<Self>,
-        parent: &Collection,
-        name: &[u8],
-    ) -> Result<Collection, Error> {
-        let _guard = self.admit_operation()?;
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        self.resolve_child_at(parent, name, requirement)
-            .await?
-            .ok_or(Error::NotFound)
-    }
-
-    pub(crate) async fn child_exists(
-        self: &Arc<Self>,
-        parent: &Collection,
-        name: &[u8],
-    ) -> Result<bool, Error> {
-        let _guard = self.admit_operation()?;
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        Ok(self
-            .resolve_child_at(parent, name, requirement)
-            .await?
-            .is_some())
-    }
-
-    pub(crate) async fn create_child(
-        self: &Arc<Self>,
-        parent: &Collection,
-        name: &[u8],
-        mode: CreateMode,
-    ) -> Result<Collection, Error> {
-        let _guard = self.admit_operation()?;
-        self.create_child_inner(parent, name, mode).await
-    }
-
-    async fn resolve_path(self: &Arc<Self>, path: &CollectionPath) -> Result<Collection, Error> {
-        let mut parent = Collection::new_root(self.clone());
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        for name in path.segments() {
-            parent = self
-                .resolve_child_at(&parent, name, requirement)
-                .await?
-                .ok_or(Error::NotFound)?;
-        }
-        Ok(parent)
-    }
-
-    async fn resolve_child_at(
-        self: &Arc<Self>,
-        parent: &Collection,
-        name: &[u8],
-        requirement: Requirement,
-    ) -> Result<Option<Collection>, Error> {
-        let (root, _) = self
-            .shards
-            .load_root(&parent.address().physical_prefix(), requirement)
-            .await
-            .map_err(Error::from_read)?;
-        Ok(root.child(name).map(|id| {
-            Collection::new_child(
-                CollectionAddress::new(self.name.as_str(), id),
-                name,
-                self.clone(),
-            )
-        }))
-    }
-
-    async fn create_child_inner(
-        self: &Arc<Self>,
-        parent: &Collection,
-        name: &[u8],
-        mode: CreateMode,
-    ) -> Result<Collection, Error> {
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        if let Some(existing) = self.resolve_child_at(parent, name, requirement).await? {
-            return match mode {
-                CreateMode::Strict => Err(Error::AlreadyExists),
-                CreateMode::IfAbsent => Ok(existing),
-            };
-        }
-
-        let (id, observation) = loop {
-            let id = CollectionId::new_random();
-            let address = CollectionAddress::new(self.name.as_str(), id);
-            match self
-                .shards
-                .create_root_observed(&address.physical_prefix(), &CollectionRoot::new())
-                .await?
-            {
-                Some(observation) => break (id, observation),
-                None => continue,
-            }
-        };
-        let address = CollectionAddress::new(self.name.as_str(), id);
-        let mut unpublished = UnpublishedRootGuard::new(self.clone(), observation.clone());
-        unpublished.mark_publication_ambiguous();
-
-        match self
-            .splitter
-            .publish_subcollection(&parent.address().physical_prefix(), name, id)
-            .await
-        {
-            Ok(CollectionPublish::Published) => {
-                unpublished.disarm();
-                Ok(Collection::new_child(address, name, self.clone()))
-            }
-            Ok(CollectionPublish::Existing(existing)) => {
-                self.schedule_root_cleanup(observation);
-                unpublished.disarm();
-                match mode {
-                    CreateMode::Strict => Err(Error::AlreadyExists),
-                    CreateMode::IfAbsent => Ok(Collection::new_child(
-                        CollectionAddress::new(self.name.as_str(), existing),
-                        name,
-                        self.clone(),
-                    )),
-                }
-            }
-            Err(error) => {
-                if !matches!(error, TransError::Storage(StorageError::Unavailable(_))) {
-                    self.schedule_root_cleanup(observation);
-                }
-                unpublished.disarm();
-                Err(error.into())
-            }
-        }
-    }
-
-    fn schedule_root_cleanup(&self, observation: Observation<CollectionRoot>) {
-        let shards = self.shards.clone();
-        self.background.spawn_waited(async move {
-            if let Err(error) = shards.delete_root(&observation).await {
-                tracing::debug!(%error, "unpublished collection-root cleanup deferred");
-            }
-        });
-    }
-
     fn update_stats(&self, s: &Stats) {
         let mut stats = self.stats.lock().unwrap();
         stats.add(s);
     }
 
-    async fn tx_impl<T, F, Fut>(&self, mut f: F, stats: &mut Stats) -> Result<T, Error>
+    async fn tx_impl<T, F, Fut>(self: &Arc<Self>, mut f: F, stats: &mut Stats) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let tx = Transaction::new(
-            self.shards.clone(),
-            self.timeline.clone(),
-            self.tmon.clone(),
-            self.retry,
-        );
+        let tx = Transaction::new(self.clone());
         let mut handle = None;
         // RAII safety net: if this future is dropped between `algo.begin` and
         // `algo.end` (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
@@ -765,7 +620,7 @@ impl DbInner {
             }
 
             // Collect the accesses produced by the user function.
-            let access = tx.collect_accesses();
+            let (access, collection_access) = tx.collect_accesses();
             let metrics = tx.metrics();
             stats.tx_reads += access.reads.len() as u64;
             stats.tx_cache_hits += metrics.cache_hits;
@@ -778,11 +633,13 @@ impl DbInner {
                     // recovers it from the handle, so no separate clone is kept.
                     match handle.as_mut() {
                         None => {
-                            let h = self.algo.begin(access);
+                            let h = self.algo.begin_with_collections(access, collection_access);
                             abort_guard.arm(h.id().clone());
                             handle = Some(h);
                         }
-                        Some(h) => self.algo.reset(h, access),
+                        Some(h) => self
+                            .algo
+                            .reset_with_collections(h, access, collection_access),
                     }
                     v
                 }
@@ -791,13 +648,14 @@ impl DbInner {
                     // result of a spurious read, so validate only the reads.
                     let mut ro = access;
                     ro.writes.clear();
+                    let collection_ro = collection_access.into_read_only();
                     match handle.as_mut() {
                         None => {
-                            let h = self.algo.begin(ro);
+                            let h = self.algo.begin_with_collections(ro, collection_ro);
                             abort_guard.arm(h.id().clone());
                             handle = Some(h);
                         }
-                        Some(h) => self.algo.reset(h, ro),
+                        Some(h) => self.algo.reset_with_collections(h, ro, collection_ro),
                     }
                     let h = handle.as_mut().unwrap();
                     match self.algo.validate_reads(h).await {
@@ -872,40 +730,6 @@ impl DbInner {
             return Err(e.into());
         }
         result
-    }
-}
-
-struct UnpublishedRootGuard {
-    db: Arc<DbInner>,
-    observation: Option<Observation<CollectionRoot>>,
-    safe_to_delete: bool,
-}
-
-impl UnpublishedRootGuard {
-    fn new(db: Arc<DbInner>, observation: Observation<CollectionRoot>) -> Self {
-        Self {
-            db,
-            observation: Some(observation),
-            safe_to_delete: true,
-        }
-    }
-
-    fn mark_publication_ambiguous(&mut self) {
-        self.safe_to_delete = false;
-    }
-
-    fn disarm(&mut self) {
-        self.observation = None;
-    }
-}
-
-impl Drop for UnpublishedRootGuard {
-    fn drop(&mut self) {
-        if self.safe_to_delete
-            && let Some(observation) = self.observation.take()
-        {
-            self.db.schedule_root_cleanup(observation);
-        }
     }
 }
 

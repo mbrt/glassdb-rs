@@ -21,6 +21,9 @@ pub enum StorageError {
     /// A key was not found in a committed transaction log.
     #[error("key not found in committed transaction")]
     KeyNotFound,
+    /// The addressed collection incarnation was durably deleted.
+    #[error("stale collection handle")]
+    StaleCollection,
     /// Any other storage error (parsing, invariant violations, etc.), with an
     /// optional underlying cause.
     #[error("{msg}")]

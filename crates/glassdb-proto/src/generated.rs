@@ -7,6 +7,10 @@ pub struct TransactionLog {
     pub status: i32,
     #[prost(message, repeated, tag = "3")]
     pub writes: ::prost::alloc::vec::Vec<CollectionWrites>,
+    #[prost(message, repeated, tag = "4")]
+    pub collection_changes: ::prost::alloc::vec::Vec<CollectionChange>,
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub prepared_collection_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 /// Nested message and enum types in `TransactionLog`.
 pub mod transaction_log {
@@ -80,6 +84,53 @@ pub struct CollectionLocks {
     pub entry_locks: ::prost::alloc::vec::Vec<EntryLock>,
     #[prost(message, repeated, tag = "2")]
     pub membership_locks: ::prost::alloc::vec::Vec<MembershipLock>,
+    #[prost(enumeration = "lock::LockType", tag = "3")]
+    pub directory_lock: i32,
+    #[prost(bool, tag = "4")]
+    pub topology_lock: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CollectionChange {
+    #[prost(bytes = "vec", tag = "1")]
+    pub parent_collection_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub name: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub collection_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "collection_change::Operation", tag = "4")]
+    pub operation: i32,
+}
+/// Nested message and enum types in `CollectionChange`.
+pub mod collection_change {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Operation {
+        Unknown = 0,
+        Create = 1,
+        Drop = 2,
+    }
+    impl Operation {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unknown => "UNKNOWN",
+                Self::Create => "CREATE",
+                Self::Drop => "DROP",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "UNKNOWN" => Some(Self::Unknown),
+                "CREATE" => Some(Self::Create),
+                "DROP" => Some(Self::Drop),
+                _ => None,
+            }
+        }
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EntryLock {
@@ -201,6 +252,11 @@ pub struct Node {
     pub membership_lock: ::core::option::Option<NodeLock>,
     #[prost(uint64, tag = "7")]
     pub membership_version: u64,
+    /// A transaction preparing collection deletion. Its final status determines
+    /// whether this is an ignorable abandoned intent or a durable stale-handle
+    /// fence.
+    #[prost(bytes = "vec", tag = "8")]
+    pub collection_delete_intent: ::prost::alloc::vec::Vec<u8>,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }
@@ -232,6 +288,9 @@ pub struct StructuralLog {
     pub split_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bool, tag = "6")]
     pub is_root: bool,
+    /// The lifecycle-topology participant that owns this record.
+    #[prost(bytes = "vec", tag = "7")]
+    pub participant_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// An index node body: an ordered list of separator entries. The child owning a
 /// key is the last entry whose separator_key is <= the key.
@@ -278,6 +337,17 @@ pub struct CollectionRoot {
     /// Direct child bindings, sorted by raw name so the encoding is canonical.
     #[prost(message, repeated, tag = "2")]
     pub children: ::prost::alloc::vec::Vec<CollectionDirectoryEntry>,
+    /// Root-wide transactional coordination for the bounded child directory.
+    #[prost(message, optional, tag = "3")]
+    pub directory_lock: ::core::option::Option<NodeLock>,
+    #[prost(uint64, tag = "4")]
+    pub directory_version: u64,
+    /// Collection topology is frozen while this transaction prepares a drop.
+    #[prost(bytes = "vec", tag = "5")]
+    pub topology_freeze: ::prost::alloc::vec::Vec<u8>,
+    /// Structural operations that joined before the freeze was installed.
+    #[prost(bytes = "vec", repeated, tag = "6")]
+    pub topology_participants: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CollectionDirectoryEntry {

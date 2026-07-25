@@ -264,7 +264,7 @@ ADR — this overview and the diagrams above are the map into it.
   regular reserved root collection and direct `name → ID` directories, and
   makes path resolution fallible without yet changing transaction semantics.
 - **[ADR-047](../adr/047-transactional-collection-management.md) —
-  Transactional collection management.** *Proposed.* Builds ordinary
+  Transactional collection management.** *Accepted — implemented.* Builds ordinary
   transaction create/open/list/drop on ADR-046, freezes collection topology, and
   fences every reachable or publishable node through ADR-044's structural gate
   before a non-empty collection is dropped without adding a lifecycle lookup to

@@ -1,11 +1,13 @@
 //! Deterministic-simulation self-checks for the transaction API fuzz workload.
 //! The workload is inspired by FoundationDB's `FuzzApiCorrectness`: randomized
-//! calls within a transaction are checked against an exact state model while a
-//! tape-guided scheduler and fault injector explore interleavings and failures.
+//! key and collection-lifecycle calls are checked against an exact state model
+//! while a tape-guided scheduler and fault injector explore interleavings and
+//! failures.
 #![cfg(all(sim, feature = "sim"))]
 
 mod sim_support;
 
+use arbitrary::{Arbitrary, Unstructured};
 use sim_support::{
     assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape,
     record_once, record_with_tapes, tape,
@@ -26,26 +28,57 @@ fn program(client: usize, actions: Vec<ApiAction>, abort: bool) -> ApiTransactio
 }
 
 fn contended_api_workload() -> ApiWorkload {
-    use ApiAction::{Delete, Read, Write};
+    use ApiAction::{
+        CreateCollection, CreateCollectionIfAbsent, CreateNestedCollection, Delete, DropCollection,
+        DropNestedCollection, InspectCollections, Read, ReadCollection, Write, WriteCollection,
+        WriteNestedCollection,
+    };
     ApiWorkload {
         clients: vec![
             vec![
                 program(0, vec![Write(0, 1), Read(0), Write(3, 2), Read(3)], false),
                 program(0, vec![Write(0, 9), Delete(3), Read(0), Read(3)], true),
                 program(0, vec![Delete(0), Read(0), Write(6, 6), Read(6)], false),
+                program(0, vec![WriteCollection(0, 50)], false),
+                program(0, vec![CreateNestedCollection(0)], false),
+                program(0, vec![DropCollection(0)], false),
+                program(0, vec![DropNestedCollection(0)], false),
+                program(0, vec![DropCollection(0)], false),
             ],
             vec![
                 program(1, vec![Read(1), Write(1, 11), Read(1), Write(4, 14)], false),
                 program(1, vec![Delete(1), Write(7, 17), Read(7)], false),
                 program(1, vec![Delete(4), Write(4, 44), Read(4)], true),
+                program(1, vec![CreateCollection(0)], false),
+                program(1, vec![CreateCollection(0)], false),
+                program(1, vec![WriteNestedCollection(0, 51)], false),
+                program(1, vec![InspectCollections], false),
+                program(1, vec![DropNestedCollection(0)], false),
             ],
             vec![
                 program(2, vec![Write(2, 22), Write(5, 25), Read(2), Read(5)], false),
                 program(2, vec![Delete(2), Read(2), Write(2, 32), Read(2)], false),
                 program(2, vec![Delete(5), Read(5), Read(5)], false),
+                program(2, vec![CreateCollectionIfAbsent(1)], true),
+                program(2, vec![CreateCollectionIfAbsent(1)], false),
+                program(2, vec![ReadCollection(1)], false),
+                program(2, vec![WriteCollection(1, 52)], false),
+                program(2, vec![DropCollection(1)], false),
             ],
         ],
     }
+}
+
+#[test]
+fn arbitrary_programs_generate_collection_lifecycle_actions() {
+    // Two clients; client 0 gets one catalog-shaped transaction containing a
+    // collection write, while client 1 has no operations.
+    let mut input = Unstructured::new(&[0, 1, 0, 1, 3, 42, 0, 0]);
+    let workload = ApiWorkload::arbitrary(&mut input).expect("decode API workload");
+    assert!(matches!(
+        workload.clients[0][0].actions.as_slice(),
+        [ApiAction::WriteCollection(1, 42)]
+    ));
 }
 
 #[test]

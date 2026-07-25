@@ -223,7 +223,7 @@ impl NodeLock {
         self.locked_by.contains(id)
     }
 
-    fn add_reader(&mut self, id: TxId) {
+    pub(crate) fn add_reader(&mut self, id: TxId) {
         if !self.contains(&id) {
             self.locked_by.push(id);
             self.locked_by.sort();
@@ -231,12 +231,12 @@ impl NodeLock {
         self.typ = LockType::Read;
     }
 
-    fn set_writer(&mut self, id: TxId) {
+    pub(crate) fn set_writer(&mut self, id: TxId) {
         self.typ = LockType::Write;
         self.locked_by = vec![id];
     }
 
-    fn remove(&mut self, id: &TxId) -> bool {
+    pub(crate) fn remove(&mut self, id: &TxId) -> bool {
         let old_len = self.locked_by.len();
         self.locked_by.retain(|holder| holder != id);
         if self.locked_by.is_empty() {
@@ -250,7 +250,7 @@ impl NodeLock {
         self.locked_by.clear();
     }
 
-    fn to_pb(&self) -> pb::NodeLock {
+    pub(crate) fn to_pb(&self) -> pb::NodeLock {
         let mut locked_by: Vec<Vec<u8>> = self
             .locked_by
             .iter()
@@ -263,7 +263,7 @@ impl NodeLock {
         }
     }
 
-    fn from_pb(raw: Option<pb::NodeLock>) -> Self {
+    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Self {
         let Some(raw) = raw else {
             return NodeLock::default();
         };
@@ -278,7 +278,7 @@ impl NodeLock {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.locked_by.is_empty() && matches!(self.typ, LockType::None | LockType::Unknown)
     }
 }
@@ -293,6 +293,7 @@ pub struct NodeLocks {
     structure: NodeLock,
     membership: NodeLock,
     membership_version: u64,
+    delete_intent: Option<TxId>,
 }
 
 impl NodeLocks {
@@ -309,6 +310,25 @@ impl NodeLocks {
     /// Returns the membership activity version used by optimistic scans.
     pub fn membership_version(&self) -> u64 {
         self.membership_version
+    }
+
+    /// Returns the transaction preparing deletion of the containing collection.
+    pub fn delete_intent(&self) -> Option<&TxId> {
+        self.delete_intent.as_ref()
+    }
+
+    /// Installs the collection-delete intent owned by `id`.
+    pub fn set_delete_intent(&mut self, id: TxId) {
+        self.delete_intent = Some(id);
+    }
+
+    /// Removes the collection-delete intent when it is owned by `id`.
+    pub fn remove_delete_intent(&mut self, id: &TxId) -> bool {
+        if self.delete_intent.as_ref() != Some(id) {
+            return false;
+        }
+        self.delete_intent = None;
+        true
     }
 
     /// Closes the structural gate for one structural operation.
@@ -460,6 +480,21 @@ impl Node {
     /// Returns the node's exclusive structural gate.
     pub fn structural_gate(&self) -> &NodeLock {
         self.locks.structural_gate()
+    }
+
+    /// Returns the transaction preparing deletion of this node's collection.
+    pub fn collection_delete_intent(&self) -> Option<&TxId> {
+        self.locks.delete_intent()
+    }
+
+    /// Installs a collection-delete intent on this node.
+    pub fn set_collection_delete_intent(&mut self, id: TxId) {
+        self.locks.set_delete_intent(id);
+    }
+
+    /// Clears a collection-delete intent owned by `id`.
+    pub fn remove_collection_delete_intent(&mut self, id: &TxId) -> bool {
+        self.locks.remove_delete_intent(id)
     }
 
     /// Returns the complete node-level coordination state.
@@ -647,6 +682,12 @@ impl Node {
             membership_lock: (!self.locks.membership.is_empty())
                 .then(|| self.locks.membership.to_pb()),
             membership_version: self.locks.membership_version,
+            collection_delete_intent: self
+                .locks
+                .delete_intent
+                .as_ref()
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -660,6 +701,8 @@ impl Node {
         validate_structural_gate(&structure)?;
         let membership = NodeLock::from_pb(raw.membership_lock);
         validate_membership_lock(&membership)?;
+        let delete_intent = (!raw.collection_delete_intent.is_empty())
+            .then(|| TxId::from_bytes(raw.collection_delete_intent));
         Ok(Node {
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
             right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
@@ -668,6 +711,7 @@ impl Node {
                 structure,
                 membership,
                 membership_version: raw.membership_version,
+                delete_intent,
             },
         })
     }

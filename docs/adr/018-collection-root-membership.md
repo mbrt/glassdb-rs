@@ -16,8 +16,9 @@ per-leaf version validation.
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 physical-root existence rule, name-derived child addressing, and name-only
 subcollection directory with incarnation IDs and direct parent
-mappings. [ADR-047](047-transactional-collection-management.md) proposes making
-creation, listing, and teardown of that hierarchy transactional. This ADR's
+mappings. [ADR-047](047-transactional-collection-management.md) makes creation,
+listing, and teardown of that hierarchy transactional and supersedes the
+standalone lifecycle protocol. This ADR's
 key-membership decisions remain historical input to ADR-031/032.
 
 ## Context

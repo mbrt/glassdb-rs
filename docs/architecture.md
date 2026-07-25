@@ -82,7 +82,7 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend`     | `lib.rs`, `memory.rs`, `stats.rs`, `middleware/`                             | The `Backend` trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger, fault, recording)                          |
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
-| `glassdb-trans`       | `algo.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: commit algorithm, distributed locker, shard-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
+| `glassdb-trans`       | `algo.rs`, `collections.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: commit algorithm, transactional collection lifecycle, distributed locker, shard-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
 | `glassdb-storage`     | `cached_store.rs`, `shardstore.rs`, `shard.rs`, `root.rs`, `txobject.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, shard/root CAS store, shard & collection-root codecs, unified transaction-object codec, lock-state value type, transaction-log persistence, version tracking, generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
@@ -141,9 +141,9 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
  │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ release │
  │ validate│   │ · installs resolvers  │   │ refresh  │   │ →Locker │
  └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
-      │                    │ acquire / write-back / release     │
-      │                    │ + Algo CommitInstall + Gc release  │
-      │                    ▼                                    │
+      │                    │ acquire / write-back / release    │
+      │                    │ + Algo CommitInstall + Gc release │
+      │                    ▼                                   │
       │       ┌───────────────────────────────┐                │
       │       │ ShardCoordinator — MECHANISM  │                │
       │       │ one round/object: load once · │                │
@@ -158,6 +158,29 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
                                 ▼
             glassdb-backend  (content-CAS object store: GCS / S3)
 ```
+
+Collection management travels beside key access as `CollectionData`: logical
+directory reads plus exact create/drop binding changes. `Transaction` overlays
+those changes for read-your-writes behavior. At commit, `Algo` persists the
+prepared-root manifest (including roots left by an earlier body retry), locks
+and validates the affected parent directories, then uses the same
+transaction-log status flip as key writes. Directory write-back materializes
+committed `name → CollectionId` changes.
+
+Drop additionally freezes the target collection's split topology and installs
+the transaction ID as a delete intent on every root, index, and leaf object.
+Each structural split records a transaction-log topology backreference and
+remains registered in the root until its structural log is published or
+recovered, so a freeze can finish every pre-existing participant before node
+enumeration.
+
+Normal point operations inspect only the terminal node they already access:
+an aborted intent is removable, a pending intent participates in wound-wait,
+and a committed intent reports a stale collection handle. Physical
+incarnation-unique objects are reclaimed after the logical commit. GC replays
+committed directory write-back and collection cleanup independently of whether
+the same transaction object still stores a live value; a conditional-delete
+conflict retains the durable manifest for a later retry.
 
 `Algo` is shard-agnostic by construction: in non-test code it never imports
 `ShardStore`, calls `shard_index`, or sees a `ShardEntry`. It hands the `Locker`

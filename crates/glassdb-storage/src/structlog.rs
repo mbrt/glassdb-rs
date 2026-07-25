@@ -3,6 +3,8 @@
 use glassdb_proto as pb;
 use prost::Message;
 
+use glassdb_data::TxId;
+
 use crate::error::StorageError;
 
 /// The structural state needed to resolve a crash-interrupted split.
@@ -14,6 +16,7 @@ pub struct StructuralLog {
     pub created_tokens: Vec<String>,
     pub split_key: Vec<u8>,
     pub is_root: bool,
+    pub participant_id: Option<TxId>,
 }
 
 impl StructuralLog {
@@ -37,6 +40,11 @@ impl StructuralLog {
             created_tokens: self.created_tokens.clone(),
             split_key: self.split_key.clone(),
             is_root: self.is_root,
+            participant_id: self
+                .participant_id
+                .as_ref()
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -48,6 +56,8 @@ impl StructuralLog {
             created_tokens: raw.created_tokens,
             split_key: raw.split_key,
             is_root: raw.is_root,
+            participant_id: (!raw.participant_id.is_empty())
+                .then(|| TxId::from_bytes(raw.participant_id)),
         }
     }
 }
@@ -65,6 +75,7 @@ mod tests {
             created_tokens: vec!["right".to_string()],
             split_key: b"m".to_vec(),
             is_root: false,
+            participant_id: Some(TxId::from_bytes(b"participant".to_vec())),
         };
         assert_eq!(StructuralLog::decode(&record.encode()).unwrap(), record);
     }
@@ -78,6 +89,7 @@ mod tests {
             created_tokens: vec!["left".to_string(), "right".to_string()],
             split_key: Vec::new(),
             is_root: true,
+            participant_id: None,
         };
         assert_eq!(StructuralLog::decode(&record.encode()).unwrap(), record);
     }

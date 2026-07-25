@@ -34,6 +34,9 @@ pub enum TransError {
     /// User data cannot fit in the configured coordination-object limit.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The addressed collection incarnation was durably deleted.
+    #[error("stale collection handle")]
+    StaleCollection,
     /// Any other transaction error, with an optional underlying cause.
     #[error("{msg}")]
     Other {
@@ -92,6 +95,7 @@ impl From<BackendError> for TransError {
 pub(crate) fn trans_to_storage(e: TransError) -> StorageError {
     match e {
         TransError::Storage(s) => s,
+        TransError::StaleCollection => StorageError::StaleCollection,
         other => StorageError::other(other.to_string()),
     }
 }

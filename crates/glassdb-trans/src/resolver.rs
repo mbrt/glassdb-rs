@@ -290,6 +290,9 @@ impl Resolver {
     ) -> Result<LeafCoverage, StorageError> {
         let mut pending_membership = Vec::new();
         let node = loc.node();
+        if let Some(node) = node {
+            self.ensure_collection_live(node).await?;
+        }
         if let Some(node) = node
             && node.membership_lock().lock_type() == LockType::Write
         {
@@ -333,6 +336,9 @@ impl Resolver {
 
         let mut out = HashMap::with_capacity(keys.len());
         for group in &groups {
+            if let Some(node) = group.node() {
+                self.ensure_collection_live(node).await?;
+            }
             let leaf = group
                 .node()
                 .map(|node| {
@@ -374,6 +380,11 @@ impl Resolver {
             .dir
             .leaf_for_fresh(&prefix, raw_key, Requirement::Any, requirement)
             .await?;
+        if let Some(node) = loc.node() {
+            self.ensure_collection_live(node)
+                .await
+                .map_err(TransError::from)?;
+        }
         let leaf = loc
             .node()
             .map(|node| {
@@ -385,6 +396,29 @@ impl Resolver {
             .resolve_writer_at(key, leaf.and_then(|leaf| leaf.lookup(raw_key)), requirement)
             .await?;
         Ok((writer, loc))
+    }
+
+    async fn ensure_collection_live(
+        &self,
+        node: &glassdb_storage::Node,
+    ) -> Result<(), StorageError> {
+        let Some(holder) = node.collection_delete_intent() else {
+            return Ok(());
+        };
+        loop {
+            match self
+                .tmon
+                .tx_status(holder)
+                .await
+                .map_err(trans_to_storage)?
+            {
+                TxCommitStatus::Ok => return Err(StorageError::StaleCollection),
+                TxCommitStatus::Aborted => return Ok(()),
+                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
+                    self.tmon.wait_for_tx(holder).await;
+                }
+            }
+        }
     }
 
     /// Resolves the effective writer named by `entry`, using Monitor evidence

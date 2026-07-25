@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef, TxId, paths};
+use glassdb_data::{
+    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, TxId, paths,
+};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -42,6 +44,8 @@ pub struct TxLog {
     pub status: TxCommitStatus,
     pub writes: Vec<TxWrite>,
     pub locks: Vec<TxLock>,
+    pub collection_changes: Vec<TxCollectionChange>,
+    pub prepared_collections: Vec<CollectionAddress>,
 }
 
 impl TxLog {
@@ -53,8 +57,26 @@ impl TxLog {
             status,
             writes: Vec::new(),
             locks: Vec::new(),
+            collection_changes: Vec::new(),
+            prepared_collections: Vec::new(),
         }
     }
+}
+
+/// One direct-child directory mutation committed by a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxCollectionChange {
+    pub parent: CollectionAddress,
+    pub name: Vec<u8>,
+    pub collection: CollectionAddress,
+    pub op: TxCollectionOp,
+}
+
+/// The effect a transaction applies to one direct-child binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxCollectionOp {
+    Create,
+    Drop,
 }
 
 /// A single write within a transaction.
@@ -95,15 +117,31 @@ pub struct TxListPage {
 /// A transaction lock backreference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxLock {
-    Entry { key: KeyRef, typ: LockType },
-    Membership { leaf: LeafRef, typ: LockType },
+    Entry {
+        key: KeyRef,
+        typ: LockType,
+    },
+    Membership {
+        leaf: LeafRef,
+        typ: LockType,
+    },
+    Directory {
+        collection: CollectionAddress,
+        typ: LockType,
+    },
+    Topology {
+        collection: CollectionAddress,
+    },
 }
 
 impl TxLock {
     /// Returns the lock type recorded for this backreference.
     pub fn typ(&self) -> LockType {
         match self {
-            TxLock::Entry { typ, .. } | TxLock::Membership { typ, .. } => *typ,
+            TxLock::Entry { typ, .. }
+            | TxLock::Membership { typ, .. }
+            | TxLock::Directory { typ, .. } => *typ,
+            TxLock::Topology { .. } => LockType::Write,
         }
     }
 }
@@ -144,8 +182,15 @@ impl Codec for TxLog {
                 .map(|lock| match lock {
                     TxLock::Entry { key, .. } => key.key().len(),
                     TxLock::Membership { leaf, .. } => leaf.node_token().map_or(0, str::len),
+                    TxLock::Directory { .. } | TxLock::Topology { .. } => 0,
                 })
                 .sum::<usize>()
+            + log
+                .collection_changes
+                .iter()
+                .map(|change| change.name.len() + 32)
+                .sum::<usize>()
+            + log.prepared_collections.len() * 16
             + std::mem::size_of::<TxLog>()
     }
 
@@ -384,6 +429,8 @@ fn decode_tx_log_from_proto(
         status,
         writes: Vec::new(),
         locks: Vec::new(),
+        collection_changes: Vec::new(),
+        prepared_collections: Vec::new(),
     };
 
     for cw in &tr.writes {
@@ -420,7 +467,57 @@ fn decode_tx_log_from_proto(
                 let typ = parse_lock_type(lock.lock_type);
                 res.locks.push(TxLock::Membership { leaf, typ });
             }
+            let typ = parse_lock_type(locks.directory_lock);
+            if !matches!(typ, LockType::None | LockType::Unknown) {
+                res.locks.push(TxLock::Directory {
+                    collection: collection.clone(),
+                    typ,
+                });
+            }
+            if locks.topology_lock {
+                res.locks.push(TxLock::Topology {
+                    collection: collection.clone(),
+                });
+            }
         }
+    }
+    for change in &tr.collection_changes {
+        if change.name.is_empty() || change.name.len() > MAX_COLLECTION_NAME_BYTES {
+            return Err(StorageError::other(
+                "transaction log has an invalid collection name",
+            ));
+        }
+        let parent = decode_collection_id(db_root, &change.parent_collection_id)?;
+        let collection = decode_collection_id(db_root, &change.collection_id)?;
+        if collection.id().is_root() {
+            return Err(StorageError::other(
+                "transaction log changes the permanent root collection",
+            ));
+        }
+        let op = match change.operation() {
+            pb::collection_change::Operation::Create => TxCollectionOp::Create,
+            pb::collection_change::Operation::Drop => TxCollectionOp::Drop,
+            pb::collection_change::Operation::Unknown => {
+                return Err(StorageError::other(
+                    "transaction log has an unknown collection operation",
+                ));
+            }
+        };
+        res.collection_changes.push(TxCollectionChange {
+            parent,
+            name: change.name.clone(),
+            collection,
+            op,
+        });
+    }
+    for id in &tr.prepared_collection_ids {
+        let collection = decode_collection_id(db_root, id)?;
+        if collection.id().is_root() {
+            return Err(StorageError::other(
+                "transaction log prepares the permanent root collection",
+            ));
+        }
+        res.prepared_collections.push(collection);
     }
     Ok(res)
 }
@@ -438,6 +535,19 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
     for e in &l.locks {
         marshal_lock(&mut coll_writes, e)?;
     }
+    let collection_changes = l
+        .collection_changes
+        .iter()
+        .map(|change| pb::CollectionChange {
+            parent_collection_id: change.parent.id().as_bytes().to_vec(),
+            name: change.name.clone(),
+            collection_id: change.collection.id().as_bytes().to_vec(),
+            operation: match change.op {
+                TxCollectionOp::Create => pb::collection_change::Operation::Create as i32,
+                TxCollectionOp::Drop => pb::collection_change::Operation::Drop as i32,
+            },
+        })
+        .collect();
 
     let status = match l.status {
         TxCommitStatus::Ok => pb::transaction_log::Status::Committed,
@@ -452,6 +562,12 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
         timestamp: Some(system_to_proto_ts(ts)),
         status: status as i32,
         writes: coll_writes.into_values().collect(),
+        collection_changes,
+        prepared_collection_ids: l
+            .prepared_collections
+            .iter()
+            .map(|collection| collection.id().as_bytes().to_vec())
+            .collect(),
     };
     Ok(tr.encode_to_vec())
 }
@@ -489,6 +605,7 @@ fn marshal_lock(
     let collection = match lock {
         TxLock::Entry { key, .. } => key.collection(),
         TxLock::Membership { leaf, .. } => leaf.collection(),
+        TxLock::Directory { collection, .. } | TxLock::Topology { collection } => collection,
     };
     let coll = coll_writes
         .entry(collection.clone())
@@ -513,6 +630,12 @@ fn marshal_lock(
                 target: Some(target),
                 lock_type: lock_type_to_proto(*typ) as i32,
             });
+        }
+        TxLock::Directory { typ, .. } => {
+            clocks.directory_lock = lock_type_to_proto(*typ) as i32;
+        }
+        TxLock::Topology { .. } => {
+            clocks.topology_lock = true;
         }
     }
     Ok(())
@@ -548,7 +671,17 @@ fn validate_single_database(log: &TxLog) -> Result<(), StorageError> {
         match lock {
             TxLock::Entry { key, .. } => check(key.collection())?,
             TxLock::Membership { leaf, .. } => check(leaf.collection())?,
+            TxLock::Directory { collection, .. } | TxLock::Topology { collection } => {
+                check(collection)?
+            }
         }
+    }
+    for change in &log.collection_changes {
+        check(&change.parent)?;
+        check(&change.collection)?;
+    }
+    for collection in &log.prepared_collections {
+        check(collection)?;
     }
     Ok(())
 }
@@ -765,6 +898,7 @@ mod tests {
         let t = new_tlogger();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let collection = test_collection("db", 1);
+        let child = test_collection("db", 2);
         let key = KeyRef::new(collection.clone(), b"hello");
         let log = TxLog {
             id: id.clone(),
@@ -785,7 +919,21 @@ mod tests {
                     key: key.clone(),
                     typ: LockType::Write,
                 },
+                TxLock::Directory {
+                    collection: test_collection("db", 1),
+                    typ: LockType::Write,
+                },
+                TxLock::Topology {
+                    collection: test_collection("db", 1),
+                },
             ],
+            collection_changes: vec![TxCollectionChange {
+                parent: test_collection("db", 1),
+                name: b"child".to_vec(),
+                collection: child.clone(),
+                op: TxCollectionOp::Create,
+            }],
+            prepared_collections: vec![child],
         };
         t.set(&log).await.unwrap();
 
@@ -801,6 +949,15 @@ mod tests {
             key,
             typ: LockType::Write,
         }));
+        assert!(got.locks.contains(&TxLock::Directory {
+            collection: test_collection("db", 1),
+            typ: LockType::Write,
+        }));
+        assert!(got.locks.contains(&TxLock::Topology {
+            collection: test_collection("db", 1),
+        }));
+        assert_eq!(got.collection_changes, log.collection_changes);
+        assert_eq!(got.prepared_collections, log.prepared_collections);
 
         let status = t.commit_status_at(&id, Requirement::Any).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);

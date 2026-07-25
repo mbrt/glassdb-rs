@@ -23,6 +23,7 @@ use crate::structlog::StructuralLog;
 use crate::timeline::SequencePoint;
 
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
+const NODE_LIST_PAGE_SIZE: usize = 128;
 
 /// Reads and compare-and-swaps B-link node and collection-root objects.
 #[derive(Clone)]
@@ -354,6 +355,37 @@ impl ShardStore {
     pub async fn delete_node(&self, expected: &Observation<Node>) -> Result<(), StorageError> {
         self.nodes.delete(expected).await?;
         Ok(())
+    }
+
+    /// Lists every standalone node under one incarnation-unique collection
+    /// prefix, including temporarily unreachable structural nodes.
+    pub async fn list_nodes(
+        &self,
+        prefix: &str,
+        requirement: Requirement,
+    ) -> Result<Vec<(String, Observation<Node>)>, StorageError> {
+        let list_prefix = paths::nodes_prefix(prefix);
+        let limit = backend::ListLimit::new(NODE_LIST_PAGE_SIZE).unwrap();
+        let mut cursor = None;
+        let mut nodes = Vec::new();
+        loop {
+            let page = self
+                .nodes
+                .list(&list_prefix, cursor.as_ref(), limit)
+                .await?;
+            for path in page.objects {
+                let token = paths::node_token_of(&path)
+                    .map_err(|e| StorageError::with_source("parsing node path", e))?;
+                let observed = self.nodes.read(&path, requirement).await?;
+                if observed.exists() {
+                    nodes.push((token, observed));
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(nodes),
+            }
+        }
     }
 
     /// Creates a split write-ahead record and returns its exact observation.
@@ -798,6 +830,7 @@ mod tests {
                         created_tokens: vec![format!("node-{i:03}")],
                         split_key: vec![i as u8],
                         is_root: false,
+                        participant_id: None,
                     },
                 )
                 .await

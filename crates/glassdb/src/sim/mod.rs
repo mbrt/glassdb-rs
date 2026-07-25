@@ -7,7 +7,8 @@
 //! - [`RmwWorkload`] stresses shared-key serializability and in-doubt increments.
 //! - [`CycleWorkload`] detects isolation failures with non-commuting ring updates.
 //! - [`MembershipWorkload`] exercises key membership, splits, and listing.
-//! - [`ApiWorkload`] checks transaction-local reads, writes, deletes, and aborts.
+//! - [`ApiWorkload`] checks transaction-local key operations, collection
+//!   lifecycle, nested paths, and aborts.
 
 mod api;
 mod cycle;

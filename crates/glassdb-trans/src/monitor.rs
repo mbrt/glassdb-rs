@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
-use glassdb_data::{KeyRef, TxId};
+use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     Observation, Requirement, SequencePoint, StorageError, TLogger, TValue, Timeline,
-    TxCommitStatus, TxLock, TxLog, TxStatus,
+    TxCollectionChange, TxCommitStatus, TxLock, TxLog, TxStatus,
 };
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
@@ -113,6 +113,8 @@ struct TxStatusEntry {
     // The lock set this transaction holds, recorded by the engine once it has
     // acquired its locks.
     locks: Vec<TxLock>,
+    collection_changes: Vec<TxCollectionChange>,
+    prepared_collections: Vec<CollectionAddress>,
 }
 
 #[derive(Clone, Copy)]
@@ -256,6 +258,8 @@ impl Monitor {
                 last_observation: None,
                 refresh_state: RefreshState::NotStarted,
                 locks: Vec::new(),
+                collection_changes: Vec::new(),
+                prepared_collections: Vec::new(),
             },
         );
     }
@@ -268,6 +272,79 @@ impl Monitor {
         let mut st = self.shard_for(tid).lock().unwrap();
         if let Some(e) = st.local_tx.get_mut(tid) {
             e.locks = locks;
+        }
+    }
+
+    /// Persists the recovery manifest before prepared collection roots exist.
+    pub(crate) async fn prepare_collections(
+        &self,
+        tid: &TxId,
+        collection_changes: Vec<TxCollectionChange>,
+        prepared_collections: Vec<CollectionAddress>,
+    ) -> Result<(), TransError> {
+        {
+            let mut st = self.shard_for(tid).lock().unwrap();
+            let entry = st
+                .local_tx
+                .get_mut(tid)
+                .ok_or_else(|| TransError::other("collection transaction was not begun"))?;
+            entry.collection_changes = collection_changes;
+            entry.prepared_collections = prepared_collections;
+        }
+        self.persist_pending(tid).await
+    }
+
+    /// Persists the pending transaction's current recovery backreferences.
+    pub(crate) async fn persist_pending(&self, tid: &TxId) -> Result<(), TransError> {
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            let (last_observation, locks, collection_changes, prepared_collections) = {
+                let st = self.shard_for(tid).lock().unwrap();
+                let entry = st
+                    .local_tx
+                    .get(tid)
+                    .ok_or_else(|| TransError::other("pending transaction disappeared"))?;
+                (
+                    entry.last_observation.clone(),
+                    entry.locks.clone(),
+                    entry.collection_changes.clone(),
+                    entry.prepared_collections.clone(),
+                )
+            };
+            let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
+            log.timestamp = Some(self.inner.clock.now());
+            log.locks = locks;
+            log.collection_changes = collection_changes;
+            log.prepared_collections = prepared_collections;
+            let result = match last_observation.as_ref() {
+                Some(observed) => self.inner.tl.set_if(&log, observed).await,
+                None => self.inner.tl.set(&log).await,
+            };
+            match result {
+                Ok(observed) => {
+                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
+                        entry.last_observation = Some(observed);
+                    }
+                    self.start_refresh_tx(tid);
+                    return Ok(());
+                }
+                Err(StorageError::Precondition) => {
+                    let status = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
+                    if status.status.is_final() {
+                        return Err(TransError::AlreadyFinalized);
+                    }
+                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
+                        entry.last_observation = Some(status.observation);
+                    }
+                }
+                Err(StorageError::Unavailable(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            rt::sleep(backoff.next_delay()).await;
         }
     }
 
@@ -315,7 +392,11 @@ impl Monitor {
         // point: `set_final_log` creates the committed object when no pending
         // one was written (the short-transaction case where the lazy refresh
         // never fired), or CASes pending -> committed otherwise.
-        if !tl.locks.is_empty() || !tl.writes.is_empty() {
+        if !tl.locks.is_empty()
+            || !tl.writes.is_empty()
+            || !tl.collection_changes.is_empty()
+            || !tl.prepared_collections.is_empty()
+        {
             tl.status = TxCommitStatus::Ok;
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
             // path can recognize a wound (the log was already aborted out from
@@ -341,6 +422,8 @@ impl Monitor {
         let mut log = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
             log.locks = entry.locks.clone();
+            log.collection_changes = entry.collection_changes.clone();
+            log.prepared_collections = entry.prepared_collections.clone();
         }
         let res = self.set_final_log(&log).await;
 
@@ -413,6 +496,19 @@ impl Monitor {
         at: SequencePoint,
     ) -> Result<bool, TransError> {
         Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
+    }
+
+    /// Loads the complete persisted transaction log for lifecycle help.
+    pub(crate) async fn transaction_log_at(
+        &self,
+        tid: &TxId,
+        requirement: Requirement,
+    ) -> Result<TxLog, TransError> {
+        let observed = self.inner.tl.get_at(tid, requirement).await?;
+        observed
+            .value()
+            .map(|log| log.as_ref().clone())
+            .ok_or_else(|| TransError::other("transaction log disappeared during resolution"))
     }
 
     /// Returns status at the requested bound and whether resolving it reused
@@ -569,6 +665,8 @@ impl Monitor {
         if let Some(current) = expected.value() {
             tlog.writes = current.writes.clone();
             tlog.locks = current.locks.clone();
+            tlog.collection_changes = current.collection_changes.clone();
+            tlog.prepared_collections = current.prepared_collections.clone();
         }
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
@@ -1053,14 +1151,11 @@ impl Monitor {
             // Stamp the currently-held lock set (read synchronously before the
             // write) so the materialized pending object records its own
             // back-references for GC (ADR-022).
-            tl.locks = self
-                .shard_for(&tid)
-                .lock()
-                .unwrap()
-                .local_tx
-                .get(&tid)
-                .map(|e| e.locks.clone())
-                .unwrap_or_default();
+            if let Some(entry) = self.shard_for(&tid).lock().unwrap().local_tx.get(&tid) {
+                tl.locks = entry.locks.clone();
+                tl.collection_changes = entry.collection_changes.clone();
+                tl.prepared_collections = entry.prepared_collections.clone();
+            }
             let r = if let Some(observed) = &last_observation {
                 self.inner.tl.set_if(&tl, observed).await
             } else {

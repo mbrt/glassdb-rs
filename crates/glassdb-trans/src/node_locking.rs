@@ -145,6 +145,9 @@ impl<'a> NodeLockReconciler<'a> {
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
+        if let Some(holder) = self.reconcile_delete_intent(locks).await? {
+            return Ok(Some(holder));
+        }
         let Some(holder) = locks.structural_gate().holders().first().cloned() else {
             return Ok(None);
         };
@@ -167,6 +170,9 @@ impl<'a> NodeLockReconciler<'a> {
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
+        if let Some(holder) = self.reconcile_delete_intent(locks).await? {
+            return Ok(Some(holder));
+        }
         if locks.structural_gate().contains(self.id) {
             self.prune_finalized_membership(locks).await?;
             return Ok(None);
@@ -207,6 +213,33 @@ impl<'a> NodeLockReconciler<'a> {
         }
         locks.set_structural_gate(self.id.clone());
         Ok(None)
+    }
+
+    async fn reconcile_delete_intent(
+        &self,
+        locks: &mut NodeLocks,
+    ) -> Result<Option<TxId>, TransError> {
+        let Some(holder) = locks.delete_intent().cloned() else {
+            return Ok(None);
+        };
+        if &holder == self.id {
+            return Ok(None);
+        }
+        match self.monitor.tx_status(&holder).await? {
+            TxCommitStatus::Ok => Err(TransError::StaleCollection),
+            TxCommitStatus::Aborted => {
+                locks.remove_delete_intent(&holder);
+                Ok(None)
+            }
+            TxCommitStatus::Pending => match try_reclaim(self.monitor, self.id, &holder).await? {
+                Reclaim::Wounded => {
+                    locks.remove_delete_intent(&holder);
+                    Ok(None)
+                }
+                Reclaim::Wait => Ok(Some(holder)),
+            },
+            TxCommitStatus::Unknown => Ok(Some(holder)),
+        }
     }
 
     /// Acquires the requested membership lock, returning a holder to wait for.
