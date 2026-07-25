@@ -149,7 +149,7 @@ impl FinalStatusCache {
 }
 
 struct WaitRequest {
-    tx: oneshot::Sender<TxCommitStatus>,
+    tx: oneshot::Sender<()>,
 }
 
 /// Observer-relative liveness tracker for a watched remote pending transaction
@@ -194,6 +194,13 @@ struct Inner {
 #[derive(Clone)]
 pub struct Monitor {
     inner: Arc<Inner>,
+}
+
+/// A transaction status known to be durable and terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxFinalStatus {
+    Committed,
+    Aborted,
 }
 
 /// A transaction's commit status for a specific key, plus the value written.
@@ -410,7 +417,7 @@ impl Monitor {
 
         let mut st = self.shard_for(&tl.id).lock().unwrap();
         st.local_tx.remove(&tl.id);
-        notify_waiters(&mut st, &tl.id, TxCommitStatus::Ok);
+        notify_waiters(&mut st, &tl.id);
         Ok(())
     }
 
@@ -429,7 +436,7 @@ impl Monitor {
 
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid);
-        notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
+        notify_waiters(&mut st, tid);
         res
     }
 
@@ -532,16 +539,21 @@ impl Monitor {
         Ok((self.resolve_remote_tx_status(tid, status).await?, cache_hit))
     }
 
-    /// Waits asynchronously for the transaction to finalize, yielding its final
-    /// commit status. The returned future yields exactly one value; dropping it
-    /// cancels the wait. If the sender is dropped without finalizing, it yields
-    /// [`TxCommitStatus::Unknown`] (the default) so the caller re-resolves.
-    pub(crate) fn wait_for_tx(
-        &self,
-        tid: &TxId,
-    ) -> impl std::future::Future<Output = TxCommitStatus> + Send + use<> {
-        let rx = self.wait_for_tx_rx(tid);
-        async move { rx.await.unwrap_or_default() }
+    /// Waits for and returns a transaction's durable final status.
+    pub(crate) async fn await_tx_final(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
+        loop {
+            // Resolve before registering a waiter so local state retains
+            // precedence over a potentially newer final-status cache entry.
+            match self.tx_status(tid).await? {
+                TxCommitStatus::Ok => return Ok(TxFinalStatus::Committed),
+                TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
+                TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
+            }
+
+            // Notifications and poll failures are only wake-up hints. Resolve
+            // again before returning so an abandoned poll cannot decide status.
+            self.wait_for_tx_change(tid).await;
+        }
     }
 
     /// Returns the committed value a transaction wrote for `key`, reading from
@@ -873,10 +885,20 @@ impl Monitor {
 
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.remove(tid);
-        notify_waiters(&mut st, tid, TxCommitStatus::Aborted);
+        notify_waiters(&mut st, tid);
     }
 
-    fn wait_for_tx_rx(&self, tid: &TxId) -> oneshot::Receiver<TxCommitStatus> {
+    fn wait_for_tx_change(
+        &self,
+        tid: &TxId,
+    ) -> impl std::future::Future<Output = ()> + Send + use<> {
+        let rx = self.wait_for_tx_change_rx(tid);
+        async move {
+            let _ = rx.await;
+        }
+    }
+
+    fn wait_for_tx_change_rx(&self, tid: &TxId) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
 
         let mut st = self.shard_for(tid).lock().unwrap();
@@ -884,9 +906,8 @@ impl Monitor {
         let is_local = entry.is_some();
         let status = entry.map(|e| e.status).unwrap_or(TxCommitStatus::Unknown);
 
-        // Matches Go precedence: (isLocal && OK) || Aborted.
-        if (is_local && status == TxCommitStatus::Ok) || status == TxCommitStatus::Aborted {
-            let _ = tx.send(status);
+        if is_local && status.is_final() {
+            let _ = tx.send(());
             return rx;
         }
 
@@ -904,7 +925,7 @@ impl Monitor {
 
         // Remote transaction: spawn a poller. Waiter liveness is checked
         // between polls so the poller exits promptly once every caller has
-        // dropped its `wait_for_tx` future.
+        // dropped its `await_tx_final` future.
         st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
         drop(st);
 
@@ -912,11 +933,11 @@ impl Monitor {
         let tid = tid.clone();
         // Detached poller: it terminates either when the tx finalizes (final
         // status or a fetch error) or when every caller has dropped its
-        // `wait_for_tx` future.
+        // `await_tx_final` future.
         rt::spawn(async move {
-            let status = m.poll_tx_status_with_liveness(&tid).await;
+            m.poll_tx_status_with_liveness(&tid).await;
             let mut st = m.shard_for(&tid).lock().unwrap();
-            notify_waiters(&mut st, &tid, status);
+            notify_waiters(&mut st, &tid);
         });
 
         rx
@@ -1055,15 +1076,15 @@ impl Monitor {
     }
 
     /// Polls the remote tx status until it finalizes, a fetch fails, or every
-    /// caller has dropped its `wait_for_tx` future (signalled by closed
+    /// caller has dropped its `await_tx_final` future (signalled by closed
     /// `oneshot::Sender`s in the waiters list). The latter is the future-drop
     /// equivalent of the per-call cancellation contexts the Go original used.
     ///
     /// Returns the last status seen: the final status on success, or
     /// [`TxCommitStatus::Unknown`] / the last pending status on a fetch error or
-    /// abandoned poll. A waiter woken with a non-final status re-resolves the
-    /// holder (re-issuing `tx_status`), so a transient fetch error is retried and
-    /// a persistent one resurfaces there — the poll itself reports no error.
+    /// abandoned poll. [`Monitor::await_tx_final`] re-resolves after every wake,
+    /// so a transient fetch error is retried and a persistent one resurfaces
+    /// there — the poll itself reports no error.
     async fn poll_tx_status_with_liveness(&self, tid: &TxId) -> TxCommitStatus {
         let mut backoff = self.inner.retry.backoff();
         loop {
@@ -1200,12 +1221,12 @@ impl Monitor {
     }
 }
 
-fn notify_waiters(st: &mut State, tid: &TxId, status: TxCommitStatus) {
+fn notify_waiters(st: &mut State, tid: &TxId) {
     if let Some(ws) = st.waiters.remove(tid) {
         for w in ws {
             // `send` silently fails if the receiver has been dropped,
             // which is the new "waiter cancelled" signal.
-            let _ = w.tx.send(status);
+            let _ = w.tx.send(());
         }
     }
 }
@@ -1213,8 +1234,8 @@ fn notify_waiters(st: &mut State, tid: &TxId, status: TxCommitStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_backend::middleware::RecordingBackend;
-    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+    use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_data::CollectionAddress;
     use glassdb_storage::{CachedStore, LockType, Timeline, TxWrite};
 
@@ -1269,6 +1290,23 @@ mod tests {
             ProtocolTiming::default(),
         );
         (mon, TestCtx { tl, clock, _bg: bg })
+    }
+
+    async fn wait_for_waiters(mon: &Monitor, tid: &TxId, count: usize) {
+        for _ in 0..100 {
+            let waiting = mon
+                .shard_for(tid)
+                .lock()
+                .unwrap()
+                .waiters
+                .get(tid)
+                .map_or(0, Vec::len);
+            if waiting == count {
+                return;
+            }
+            rt::yield_now().await;
+        }
+        panic!("transaction did not register {count} waiters");
     }
 
     #[test]
@@ -1355,36 +1393,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_local_tx() {
+    async fn await_local_tx_final() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
 
-        let ch1 = mon1.wait_for_tx(&tx);
-        let ch2 = mon1.wait_for_tx(&tx);
+        let ch1 = {
+            let mon = mon1.clone();
+            let tx = tx.clone();
+            rt::spawn(async move { mon.await_tx_final(&tx).await })
+        };
+        let ch2 = {
+            let mon = mon1.clone();
+            let tx = tx.clone();
+            rt::spawn(async move { mon.await_tx_final(&tx).await })
+        };
+        wait_for_waiters(&mon1, &tx, 2).await;
 
         mon1.abort_tx(&tx).await.unwrap();
-        assert_eq!(ch1.await, TxCommitStatus::Aborted);
-        assert_eq!(ch2.await, TxCommitStatus::Aborted);
+        assert_eq!(ch1.await.unwrap().unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(ch2.await.unwrap().unwrap(), TxFinalStatus::Aborted);
     }
 
     #[tokio::test]
-    async fn wait_for_remote_tx() {
+    async fn await_remote_tx_final_coalesces_waiters() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon1.begin_tx(&tx);
 
-        let _ch1 = mon2.wait_for_tx(&tx);
-        let ch2 = mon2.wait_for_tx(&tx);
-        let ch3 = mon2.wait_for_tx(&tx);
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let mon = mon2.clone();
+            let tx = tx.clone();
+            waits.push(rt::spawn(async move { mon.await_tx_final(&tx).await }));
+        }
+        wait_for_waiters(&mon2, &tx, 3).await;
 
         mon1.abort_tx(&tx).await.unwrap();
 
-        assert_eq!(ch2.await, TxCommitStatus::Aborted);
-        assert_eq!(ch3.await, TxCommitStatus::Aborted);
+        for wait in waits {
+            assert_eq!(wait.await.unwrap().unwrap(), TxFinalStatus::Aborted);
+        }
+    }
+
+    #[tokio::test]
+    async fn await_final_uses_final_status_cache() {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let b: Arc<dyn Backend> = Arc::new(backend);
+        let (mon, _t) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"committed".to_vec());
+        let key = key_ref(b"key");
+        mon.begin_tx(&tx);
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Ok);
+        log.locks.push(TxLock::Entry {
+            key,
+            typ: LockType::Write,
+        });
+        mon.commit_tx(log).await.unwrap();
+        operations.lock().unwrap().clear();
+
+        assert_eq!(
+            mon.await_tx_final(&tx).await.unwrap(),
+            TxFinalStatus::Committed
+        );
+        assert!(
+            operations.lock().unwrap().is_empty(),
+            "a cached final status must not spawn a remote poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_final_preserves_local_status_precedence() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, _t) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"local-wound".to_vec());
+        mon.begin_tx(&tx);
+
+        let observed = mon
+            .inner
+            .tl
+            .commit_status_at(&tx, Requirement::Any)
+            .await
+            .unwrap()
+            .observation;
+        assert_eq!(
+            mon.force_abort(&tx, &observed).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
+        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
+
+        let wait = {
+            let mon = mon.clone();
+            let tx = tx.clone();
+            rt::spawn(async move { mon.await_tx_final(&tx).await })
+        };
+        wait_for_waiters(&mon, &tx, 1).await;
+
+        mon.mark_local_aborted(&tx, TxCommitStatus::Aborted);
+        assert_eq!(wait.await.unwrap().unwrap(), TxFinalStatus::Aborted);
+    }
+
+    #[tokio::test]
+    async fn await_final_propagates_polling_errors() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        backend.set_before(|operation| {
+            let fail = matches!(
+                operation,
+                BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+            );
+            let future: HookFuture = Box::pin(async move {
+                if fail {
+                    Err(BackendError::Unavailable(
+                        "injected transaction-status read failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            future
+        });
+        let b: Arc<dyn Backend> = backend;
+        let (mon, _t) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"remote".to_vec());
+
+        assert!(matches!(
+            mon.await_tx_final(&tx).await,
+            Err(TransError::Storage(StorageError::Unavailable(_)))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_final_is_cancelled_when_dropped() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, _t) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"pending".to_vec());
+        mon.begin_tx(&tx);
+
+        assert!(
+            rt::timeout(Duration::from_millis(1), mon.await_tx_final(&tx),)
+                .await
+                .is_err()
+        );
+        assert!(
+            mon.shard_for(&tx)
+                .lock()
+                .unwrap()
+                .waiters
+                .get(&tx)
+                .is_some_and(|waiters| waiters.iter().all(|waiter| waiter.tx.is_closed()))
+        );
+
+        mon.abort_tx(&tx).await.unwrap();
+        assert!(!mon.shard_for(&tx).lock().unwrap().waiters.contains_key(&tx));
     }
 
     #[tokio::test(start_paused = true)]

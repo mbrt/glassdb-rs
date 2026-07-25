@@ -28,7 +28,7 @@ use glassdb_storage::{
 
 use crate::algo::{LeafCoverage, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
-use crate::monitor::{KeyCommitStatus, Monitor};
+use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
 
 /// The result of a phantom-safe scan: the live keys in key order, the covered
 /// leaves' membership dependencies, and the effective page frontier.
@@ -405,19 +405,14 @@ impl Resolver {
         let Some(holder) = node.collection_delete_intent() else {
             return Ok(());
         };
-        loop {
-            match self
-                .tmon
-                .tx_status(holder)
-                .await
-                .map_err(trans_to_storage)?
-            {
-                TxCommitStatus::Ok => return Err(StorageError::StaleCollection),
-                TxCommitStatus::Aborted => return Ok(()),
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                    self.tmon.wait_for_tx(holder).await;
-                }
-            }
+        match self
+            .tmon
+            .await_tx_final(holder)
+            .await
+            .map_err(trans_to_storage)?
+        {
+            TxFinalStatus::Committed => Err(StorageError::StaleCollection),
+            TxFinalStatus::Aborted => Ok(()),
         }
     }
 

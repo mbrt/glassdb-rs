@@ -10,7 +10,7 @@ use glassdb_storage::{
 };
 
 use crate::error::TransError;
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, TxFinalStatus};
 use crate::node_locking::{Reclaim, try_reclaim};
 use crate::split::Splitter;
 
@@ -384,16 +384,13 @@ impl CollectionManager {
             if let Some(holder) = root.node().collection_delete_intent().cloned()
                 && Some(&holder) != own
             {
-                match self.monitor.tx_status(&holder).await? {
-                    TxCommitStatus::Ok => return Err(TransError::StaleCollection),
-                    TxCommitStatus::Aborted => {
+                match self.monitor.await_tx_final(&holder).await? {
+                    TxFinalStatus::Committed => return Err(TransError::StaleCollection),
+                    TxFinalStatus::Aborted => {
                         root.node_locks_mut().remove_delete_intent(&holder);
                         if self.shards.store_root(&prefix, &root, &observed).await? {
                             continue;
                         }
-                    }
-                    TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                        self.monitor.wait_for_tx(&holder).await;
                     }
                 }
                 rt::sleep(backoff.next_delay()).await;
@@ -409,15 +406,11 @@ impl CollectionManager {
             let Some(holder) = holder else {
                 return Ok((root, observed));
             };
-            match self.monitor.tx_status(&holder).await? {
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                    self.monitor.wait_for_tx(&holder).await;
-                    rt::sleep(backoff.next_delay()).await;
-                }
-                TxCommitStatus::Ok => {
+            match self.monitor.await_tx_final(&holder).await? {
+                TxFinalStatus::Committed => {
                     self.write_back_one(parent, &holder, None).await?;
                 }
-                TxCommitStatus::Aborted => {
+                TxFinalStatus::Aborted => {
                     root.remove_directory_holder(&holder);
                     if !self.shards.store_root(&prefix, &root, &observed).await? {
                         rt::sleep(backoff.next_delay()).await;
@@ -457,20 +450,7 @@ impl CollectionManager {
                     .find(|holder| *holder != id)
                     .cloned()
                     .ok_or_else(|| TransError::other("directory lock cannot be upgraded"))?;
-                match self.monitor.tx_status(&holder).await? {
-                    TxCommitStatus::Pending => {
-                        if matches!(
-                            try_reclaim(&self.monitor, id, &holder).await?,
-                            Reclaim::Wait
-                        ) {
-                            self.monitor.wait_for_tx(&holder).await;
-                        }
-                    }
-                    TxCommitStatus::Unknown => {
-                        self.monitor.wait_for_tx(&holder).await;
-                    }
-                    TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
-                }
+                self.resolve_conflicting_holder(&holder, id).await?;
                 rt::sleep(backoff.next_delay()).await;
                 continue;
             }
@@ -589,23 +569,10 @@ impl CollectionManager {
             if root.topology_freeze() != Some(id)
                 && let Some(holder) = root.topology_freeze().cloned()
             {
-                match self.monitor.tx_status(&holder).await? {
-                    TxCommitStatus::Ok => return Err(TransError::StaleCollection),
-                    TxCommitStatus::Aborted => {
+                match self.resolve_conflicting_holder(&holder, id).await? {
+                    TxFinalStatus::Committed => return Err(TransError::StaleCollection),
+                    TxFinalStatus::Aborted => {
                         root.remove_topology_freeze(&holder);
-                    }
-                    TxCommitStatus::Pending => {
-                        if matches!(
-                            try_reclaim(&self.monitor, id, &holder).await?,
-                            Reclaim::Wait
-                        ) {
-                            self.monitor.wait_for_tx(&holder).await;
-                        }
-                        continue;
-                    }
-                    TxCommitStatus::Unknown => {
-                        self.monitor.wait_for_tx(&holder).await;
-                        continue;
                     }
                 }
             }
@@ -629,24 +596,10 @@ impl CollectionManager {
                 .next()
                 .cloned()
                 .expect("participant presence was checked above");
-            match self.monitor.tx_status(&participant).await? {
-                TxCommitStatus::Pending => {
-                    if matches!(
-                        try_reclaim(&self.monitor, id, &participant).await?,
-                        Reclaim::Wait
-                    ) {
-                        self.monitor.wait_for_tx(&participant).await;
-                    }
-                }
-                TxCommitStatus::Unknown => {
-                    self.monitor.wait_for_tx(&participant).await;
-                }
-                TxCommitStatus::Ok | TxCommitStatus::Aborted => {
-                    splitter
-                        .settle_topology_participant(collection, &participant)
-                        .await?;
-                }
-            }
+            self.resolve_conflicting_holder(&participant, id).await?;
+            splitter
+                .settle_topology_participant(collection, &participant)
+                .await?;
             rt::sleep(backoff.next_delay()).await;
         }
     }
@@ -738,20 +691,38 @@ impl CollectionManager {
 
     async fn resolve_pending_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
         if matches!(try_reclaim(&self.monitor, id, holder).await?, Reclaim::Wait) {
-            self.monitor.wait_for_tx(holder).await;
+            self.monitor.await_tx_final(holder).await?;
         }
         Ok(())
     }
 
     async fn resolve_delete_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
+        match self.resolve_conflicting_holder(holder, id).await? {
+            TxFinalStatus::Committed => Err(TransError::StaleCollection),
+            TxFinalStatus::Aborted => Ok(()),
+        }
+    }
+
+    /// Resolves a collection conflict according to transaction priority.
+    async fn resolve_conflicting_holder(
+        &self,
+        holder: &TxId,
+        id: &TxId,
+    ) -> Result<TxFinalStatus, TransError> {
         match self.monitor.tx_status(holder).await? {
-            TxCommitStatus::Ok => Err(TransError::StaleCollection),
-            TxCommitStatus::Aborted => Ok(()),
-            TxCommitStatus::Pending => self.resolve_pending_holder(holder, id).await,
-            TxCommitStatus::Unknown => {
-                self.monitor.wait_for_tx(holder).await;
-                Ok(())
+            TxCommitStatus::Ok => Ok(TxFinalStatus::Committed),
+            TxCommitStatus::Aborted => Ok(TxFinalStatus::Aborted),
+            TxCommitStatus::Pending => {
+                if matches!(
+                    try_reclaim(&self.monitor, id, holder).await?,
+                    Reclaim::Wounded
+                ) {
+                    Ok(TxFinalStatus::Aborted)
+                } else {
+                    self.monitor.await_tx_final(holder).await
+                }
             }
+            TxCommitStatus::Unknown => self.monitor.await_tx_final(holder).await,
         }
     }
 

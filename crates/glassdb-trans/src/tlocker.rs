@@ -701,7 +701,7 @@ enum ShardOutcome {
 /// holder *finalizing* is real progress, while a poll timeout saw no event and
 /// only re-checks for a lock released without finalizing.
 enum Woke {
-    /// `wait_for_tx` fired: the holder committed or aborted.
+    /// The holder's committed or aborted status was durably verified.
     Finalized,
     /// The backed-off poll timer elapsed with no finalize event.
     PollTimeout,
@@ -1076,7 +1076,7 @@ impl Locker {
                     ..
                 }) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1126,7 +1126,7 @@ impl Locker {
                     ..
                 }) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1181,7 +1181,7 @@ impl Locker {
                 // cannot-deadlock serial order.
                 FoldOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1204,11 +1204,14 @@ impl Locker {
     /// Parks until the conflicting `holder` finalizes **or** `timeout` elapses,
     /// whichever comes first, then lets the caller re-resolve, reporting which
     /// woke it.
-    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Woke {
-        let wait = self.tmon.wait_for_tx(holder);
+    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Result<Woke, TransError> {
+        let wait = self.tmon.await_tx_final(holder);
         tokio::select! {
-            _ = wait => Woke::Finalized,
-            _ = rt::sleep(timeout) => Woke::PollTimeout,
+            status = wait => {
+                status?;
+                Ok(Woke::Finalized)
+            },
+            _ = rt::sleep(timeout) => Ok(Woke::PollTimeout),
         }
     }
 

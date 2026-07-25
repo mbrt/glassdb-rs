@@ -32,6 +32,7 @@ jobs:
       run: make test
 
     - name: Test sim
+      timeout-minutes: 8
       run: make test-sim
 
   proto-codegen:
