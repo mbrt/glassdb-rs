@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Clock, RetryConfig};
+use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
+#[cfg(feature = "sim")]
+use glassdb_storage::SimMedia;
 use glassdb_storage::{
     CachedStore, CollectionRoot, Directory, Observation, PersistentCache, PersistentCacheConfig,
     Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
@@ -44,6 +46,8 @@ pub struct DatabaseBuilder {
     backend: Arc<dyn Backend>,
     cache_size: usize,
     persistent_cache: Option<PersistentCacheConfig>,
+    #[cfg(feature = "sim")]
+    simulated_cache_media: Option<SimMedia>,
     deterministic_time: bool,
     retry: RetryConfig,
     split_policy: SplitPolicy,
@@ -65,6 +69,19 @@ impl DatabaseBuilder {
     /// its persistent ID. Production capacities must be at least 131 MiB.
     pub fn persistent_cache(mut self, config: PersistentCacheConfig) -> Self {
         self.persistent_cache = Some(config);
+        self
+    }
+
+    /// Enables the persistent cache over deterministic simulation media.
+    #[cfg(feature = "sim")]
+    #[doc(hidden)]
+    pub fn simulated_persistent_cache(
+        mut self,
+        config: PersistentCacheConfig,
+        media: SimMedia,
+    ) -> Self {
+        self.persistent_cache = Some(config);
+        self.simulated_cache_media = Some(media);
         self
     }
 
@@ -117,6 +134,8 @@ impl DatabaseBuilder {
             backend: b,
             cache_size,
             persistent_cache,
+            #[cfg(feature = "sim")]
+            simulated_cache_media,
             deterministic_time,
             retry,
             split_policy,
@@ -133,6 +152,14 @@ impl DatabaseBuilder {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let (persistent, timeline) = match persistent_cache {
             Some(config) => {
+                #[cfg(feature = "sim")]
+                let opened = match simulated_cache_media {
+                    Some(media) => {
+                        PersistentCache::open_simulated(config, &name, database_id, media).await
+                    }
+                    None => PersistentCache::open(config, &name, database_id).await,
+                };
+                #[cfg(not(feature = "sim"))]
                 let opened = PersistentCache::open(config, &name, database_id).await;
                 // ADR-045: PersistentCache keeps track of sequence points
                 // across restarts, so the timeline must start after the last
@@ -243,6 +270,8 @@ impl DatabaseBuilder {
             backend,
             cache_size: DEFAULT_CACHE_SIZE,
             persistent_cache: None,
+            #[cfg(feature = "sim")]
+            simulated_cache_media: None,
             deterministic_time: false,
             retry: RetryConfig::default(),
             split_policy: SplitPolicy::default(),
@@ -525,7 +554,7 @@ impl DbInner {
             tx_n: 1,
             ..Default::default()
         };
-        let begin = std::time::Instant::now();
+        let begin = rt::Instant::now();
         let res = self.tx_impl(f, &mut stats).await;
         stats.tx_time = begin.elapsed();
         self.update_stats(&stats);

@@ -361,6 +361,7 @@ dependencies = [
 name = "glassdb-storage"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "glassdb-backend",
  "glassdb-concurr",

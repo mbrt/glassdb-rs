@@ -1676,6 +1676,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(sim)]
+    use crate::disk_cache::{MediaFaultProfile, SimMedia};
     use crate::timeline::TimeSource;
 
     // A trivial identity codec so the concurrency layer can be exercised in
@@ -1870,22 +1872,135 @@ mod tests {
     }
 
     #[cfg(sim)]
+    async fn simulated_persistent_store(
+        directory: &TempDir,
+        backend: Arc<dyn Backend>,
+        media: SimMedia,
+    ) -> (CachedStore, Timeline) {
+        let opened = PersistentCache::open_with_sim_media(
+            PersistentCacheConfig {
+                directory: directory.path().to_path_buf(),
+                capacity_bytes: 2 * 1024 * 1024,
+            },
+            "db",
+            cache_id(),
+            media,
+        )
+        .await;
+        let timeline = Timeline::starting_after(opened.last_sequence_point);
+        let store = CachedStore::new(backend, 1 << 20, timeline.clone(), Some(opened.cache));
+        (store, timeline)
+    }
+
+    #[cfg(sim)]
     #[test]
-    fn persistent_cache_fails_open_in_deterministic_simulation() {
+    fn persistent_cache_runs_with_cached_store_in_deterministic_simulation() {
         let directory = TempDir::new().unwrap();
-        let cache_file = directory.path().join("l2.cache");
+        let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 0);
         rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
-            let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-            let (store, _) = persistent_store(&directory, backend).await;
+            let backend = Arc::new(MemoryBackend::new());
+            backend
+                .write_if_not_exists("p", b"one".to_vec())
+                .await
+                .unwrap();
+            let erased: Arc<dyn Backend> = backend;
+            let (first, _) =
+                simulated_persistent_store(&directory, erased.clone(), media.clone()).await;
+            let typed: TypedCachedStore<Bytes> = first.typed();
+            let loaded = typed.read("p", Requirement::Any).await.unwrap();
+            let persisted = loaded.current_after();
+            drop(typed);
+            first.shutdown().await;
+            drop(first);
+
+            let (reopened, timeline) = simulated_persistent_store(&directory, erased, media).await;
+            assert!(timeline.now() > persisted);
+            let typed: TypedCachedStore<Bytes> = reopened.typed();
+            let restored = typed.read("p", Requirement::Any).await.unwrap();
+            assert_eq!(restored.value().unwrap().as_slice(), b"one");
+            assert_eq!(restored.current_after(), persisted);
+            assert!(restored.cache_hit());
+            assert_eq!(reopened.body_reads(), 0);
+            drop(typed);
+            reopened.shutdown().await;
+        });
+    }
+
+    #[cfg(sim)]
+    #[test]
+    fn simulated_media_failure_remains_a_cached_store_performance_failure() {
+        let directory = TempDir::new().unwrap();
+        let media = SimMedia::new(MediaFaultProfile::Selected, vec![255], 0);
+        rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
+            let backend = Arc::new(MemoryBackend::new());
+            backend
+                .write_if_not_exists("p", b"one".to_vec())
+                .await
+                .unwrap();
+            let erased: Arc<dyn Backend> = backend;
+            let (store, _) = simulated_persistent_store(&directory, erased, media).await;
             assert!(
                 store
                     .persistent
                     .as_ref()
                     .is_some_and(|persistent| !persistent.is_enabled())
             );
-        });
 
-        assert!(!cache_file.exists());
+            let typed: TypedCachedStore<Bytes> = store.typed();
+            let loaded = typed.read("p", Requirement::Any).await.unwrap();
+            assert_eq!(loaded.value().unwrap().as_slice(), b"one");
+            drop(typed);
+            store.shutdown().await;
+        });
+    }
+
+    #[cfg(sim)]
+    #[test]
+    fn simulated_invalid_candidate_is_rejected_before_escape() {
+        let directory = TempDir::new().unwrap();
+        let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 0);
+        rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
+            let backend = Arc::new(MemoryBackend::new());
+            backend
+                .write_if_not_exists("p", b"backend".to_vec())
+                .await
+                .unwrap();
+            let opened = PersistentCache::open_with_sim_media(
+                PersistentCacheConfig {
+                    directory: directory.path().to_path_buf(),
+                    capacity_bytes: 2 * 1024 * 1024,
+                },
+                "db",
+                cache_id(),
+                media,
+            )
+            .await;
+            let persistent = opened.cache;
+            let guard = persistent
+                .begin_fence(Arc::new(PathFence::default()), Arc::new(()))
+                .unwrap();
+            persistent.replace(
+                Arc::from("p"),
+                vec![0xff],
+                b"untrusted".to_vec(),
+                SequencePoint::from_raw(1),
+                guard,
+            );
+
+            let erased: Arc<dyn Backend> = backend;
+            let store = CachedStore::new(
+                erased,
+                1 << 20,
+                Timeline::starting_after(opened.last_sequence_point),
+                Some(persistent),
+            );
+            let typed: TypedCachedStore<Bytes> = store.typed();
+            let loaded = typed.read("p", Requirement::Any).await.unwrap();
+            assert_eq!(loaded.value().unwrap().as_slice(), b"backend");
+            assert!(store.cache_stats_and_reset().l2_errors >= 1);
+            drop(typed);
+            store.shutdown().await;
+        });
     }
 
     async fn create_value(

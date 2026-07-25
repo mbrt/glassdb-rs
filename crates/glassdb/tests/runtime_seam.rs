@@ -16,6 +16,7 @@ const FORBIDDEN: &[&str] = &[
     "tokio::task",
     "tokio::runtime",
     "tokio::main",
+    "tokio::test",
     // Clocks, timers, intervals, and deadlines.
     "tokio::time",
     // Reactor- or blocking-pool-backed host I/O.
@@ -26,9 +27,20 @@ const FORBIDDEN: &[&str] = &[
     "tokio::signal",
     // This lock is prohibited by the repository's concurrency policy.
     "tokio::sync::Mutex",
+    // Native execution and host I/O must sit behind an explicit seam too.
+    "std::thread",
+    "thread::spawn(",
+    "thread::Builder",
+    "thread::sleep(",
+    "std::fs",
+    "std::os::unix::fs",
+    "rustix::fs",
+    "std::net",
+    "std::process",
     // Wall-clock time must use the clock/runtime seam as well.
     "SystemTime::now(",
     "std::time::SystemTime::now(",
+    "std::time::Instant::now(",
 ];
 
 const ALLOWED_TOKIO: &[&str] = &[
@@ -61,6 +73,8 @@ fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
             && pattern.contains("SystemTime::now("))
         || (path.ends_with("crates/glassdb-concurr/src/exec.rs")
             && matches!(pattern, "tokio::task" | "tokio::runtime"))
+        || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
+            && matches!(pattern, "std::fs" | "std::os::unix::fs" | "rustix::fs"))
 }
 
 fn unclassified_tokio_use(line: &str) -> Option<&str> {
@@ -87,6 +101,26 @@ fn unreviewed_tokio_apis_are_forbidden_by_default() {
         unclassified_tokio_use("tokio::future_runtime_api()"),
         Some("tokio::future_runtime_api()")
     );
+
+    for forbidden in [
+        "tokio::task::spawn_blocking",
+        "tokio::task::block_in_place",
+        "tokio::task::yield_now",
+        "tokio::runtime::Handle",
+        "tokio::time::sleep",
+        "tokio::fs::read",
+        "tokio::io::AsyncReadExt",
+        "tokio::net::TcpStream",
+        "tokio::process::Command",
+        "tokio::signal::ctrl_c",
+    ] {
+        assert!(
+            FORBIDDEN
+                .iter()
+                .any(|pattern| forbidden.starts_with(pattern)),
+            "`{forbidden}` escaped the forbidden Tokio inventory"
+        );
+    }
 }
 
 #[test]

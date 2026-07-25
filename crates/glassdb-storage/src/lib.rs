@@ -24,6 +24,12 @@ pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
 pub use directory::{Directory, LeafGroup, LeafLocator};
+#[cfg(all(feature = "sim", sim))]
+#[doc(hidden)]
+pub use disk_cache::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub use disk_cache::{MediaFaultProfile, SimMedia};
 pub use disk_cache::{OpenedPersistentCache, PersistentCache, PersistentCacheConfig};
 pub use error::StorageError;
 pub use lock::LockType;

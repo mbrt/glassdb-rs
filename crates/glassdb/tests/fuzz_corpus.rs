@@ -16,7 +16,10 @@
 use std::path::{Path, PathBuf};
 
 use glassdb::middleware::{OpRecord, first_divergence};
-use glassdb::sim::{ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_input};
+use glassdb::sim::{
+    ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_disk_cache_input,
+    record_input,
+};
 use rayon::prelude::*;
 
 type ReplayFn = fn(&[u8]) -> Vec<OpRecord>;
@@ -94,4 +97,18 @@ fn replays_committed_membership_corpus() {
 #[test]
 fn replays_committed_api_correctness_corpus() {
     replay_committed_corpus("api_correctness", record_input::<ApiWorkload>);
+}
+
+#[test]
+fn replays_committed_disk_cache_corpus() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/disk_cache/seed");
+    let data = std::fs::read(&path).expect("read disk-cache corpus seed");
+    let first = record_disk_cache_input(&data);
+    let second = record_disk_cache_input(&data);
+    assert_eq!(
+        first,
+        second,
+        "disk-cache corpus replay diverged for {}",
+        path.display()
+    );
 }

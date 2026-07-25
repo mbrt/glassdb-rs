@@ -31,6 +31,9 @@ pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 
 use glassdb_storage::SplitPolicy;
+#[cfg(sim)]
+pub use glassdb_storage::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};
+pub use glassdb_storage::{MediaFaultProfile, SimMedia};
 
 pub(super) const MAX_CLIENTS: usize = 4;
 pub(super) const MAX_OPS_PER_CLIENT: usize = 8;
