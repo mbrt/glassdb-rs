@@ -1677,7 +1677,7 @@ mod tests {
 
     use super::*;
     #[cfg(sim)]
-    use crate::disk_cache::{MediaFaultProfile, SimMedia};
+    use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
     use crate::timeline::TimeSource;
 
     // A trivial identity codec so the concurrency layer can be exercised in

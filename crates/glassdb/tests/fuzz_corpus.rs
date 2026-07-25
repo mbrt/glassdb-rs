@@ -16,10 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use glassdb::middleware::{OpRecord, first_divergence};
-use glassdb::sim::{
-    ApiWorkload, CycleWorkload, DiskCacheEvent, MembershipWorkload, RmwWorkload,
-    record_disk_cache_input, record_input,
-};
+use glassdb::sim::disk_cache::{DiskCacheEvent, record_disk_cache_input};
+use glassdb::sim::{ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_input};
 use rayon::prelude::*;
 
 type ReplayFn = fn(&[u8]) -> Vec<OpRecord>;

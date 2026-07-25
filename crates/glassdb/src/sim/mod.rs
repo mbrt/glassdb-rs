@@ -18,6 +18,7 @@ mod slow_backend;
 
 pub use api::{ApiAcct, ApiAction, ApiTransaction, ApiWorkload};
 pub use cycle::CycleWorkload;
+pub use glassdb_storage::sim::{MediaFaultProfile, SimMedia};
 pub use harness::{
     FaultConfig, SimWorkload, run_and_assert, run_and_assert_with_faults, run_and_record,
     run_and_record_with_faults,
@@ -30,12 +31,28 @@ pub use harness::{
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 
-use glassdb_storage::SplitPolicy;
-// The media model also supports ordinary Tokio tests; its deterministic harness
-// requires an active simulation build.
+use glassdb_storage::{PersistentCacheConfig, SplitPolicy};
+
+use crate::db::DatabaseBuilder;
+
+/// Isolated deterministic simulation for the persistent cache.
 #[cfg(sim)]
-pub use glassdb_storage::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};
-pub use glassdb_storage::{MediaFaultProfile, SimMedia};
+pub mod disk_cache {
+    pub use glassdb_storage::sim::harness::{
+        DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input,
+    };
+}
+
+impl DatabaseBuilder {
+    /// Enables the persistent cache over deterministic simulation media.
+    pub fn simulated_persistent_cache(
+        self,
+        config: PersistentCacheConfig,
+        media: SimMedia,
+    ) -> Self {
+        self.configure_persistent_cache(config, Some(media.into()))
+    }
+}
 
 pub(super) const MAX_CLIENTS: usize = 4;
 pub(super) const MAX_OPS_PER_CLIENT: usize = 8;

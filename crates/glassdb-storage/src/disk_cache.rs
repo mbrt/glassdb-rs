@@ -20,16 +20,12 @@ use crate::timeline::SequencePoint;
 mod file_media;
 mod media;
 #[cfg(all(feature = "sim", sim))]
-mod sim_harness;
+pub(crate) mod sim_harness;
 #[cfg(any(test, feature = "sim"))]
-mod sim_media;
+pub(crate) mod sim_media;
 
 use file_media::FileMedia;
 use media::{CacheFile, CacheMedia};
-#[cfg(all(feature = "sim", sim))]
-pub use sim_harness::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};
-#[cfg(any(test, feature = "sim"))]
-pub use sim_media::{MediaFaultProfile, SimMedia};
 
 const CACHE_FILE: &str = "l2.cache";
 const SLOT_BYTES: u64 = 40;
@@ -59,6 +55,16 @@ pub struct PersistentCacheConfig {
     /// Maximum file size, rounded down to the cache block size. Production
     /// caches require at least 131 MiB; 512 MiB or more is recommended.
     pub capacity_bytes: u64,
+}
+
+/// Opaque media selection for a persistent cache.
+///
+/// Callers normally omit this value to use native file media. Simulation media
+/// constructs a handle carrying its compact cache geometry.
+#[derive(Clone)]
+pub struct PersistentCacheMedia {
+    media: Arc<dyn CacheMedia>,
+    geometry: CacheGeometry,
 }
 
 #[derive(Clone, Copy)]
@@ -93,20 +99,24 @@ const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
 };
 
 #[cfg(any(test, feature = "sim"))]
-const TEST_GEOMETRY: CacheGeometry = CacheGeometry {
-    magic: *b"GL2TEST\0",
-    format_version: 1,
-    block_bytes: 4 * 1024,
-    minimum_record_bytes: 4 * 1024,
-    segment_bytes: 256 * 1024,
-    index_divisor: 64,
-    minimum_segments: 2,
-    identity_domain: b"glassdb-l2-identity-test-v1",
-    header_domain: b"glassdb-l2-header-test-v1",
-    marker_domain: b"glassdb-l2-clean-tail-test-v1",
-    path_domain: b"glassdb-l2-path-test-v1",
-    record_domain: b"glassdb-l2-record-test-v1",
-};
+mod compact {
+    use super::CacheGeometry;
+
+    pub(super) const GEOMETRY: CacheGeometry = CacheGeometry {
+        magic: *b"GL2TEST\0",
+        format_version: 1,
+        block_bytes: 4 * 1024,
+        minimum_record_bytes: 4 * 1024,
+        segment_bytes: 256 * 1024,
+        index_divisor: 64,
+        minimum_segments: 2,
+        identity_domain: b"glassdb-l2-identity-test-v1",
+        header_domain: b"glassdb-l2-header-test-v1",
+        marker_domain: b"glassdb-l2-clean-tail-test-v1",
+        path_domain: b"glassdb-l2-path-test-v1",
+        record_domain: b"glassdb-l2-record-test-v1",
+    };
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -225,32 +235,18 @@ impl PersistentCache {
         config: PersistentCacheConfig,
         database_name: &str,
         database_id: DatabaseId,
+        media: Option<PersistentCacheMedia>,
     ) -> OpenedPersistentCache {
+        let media = media.unwrap_or_else(|| PersistentCacheMedia {
+            media: Arc::new(FileMedia),
+            geometry: PRODUCTION_GEOMETRY,
+        });
         Self::open_on_media(
             config,
             database_name,
             database_id,
-            PRODUCTION_GEOMETRY,
-            Arc::new(FileMedia),
-        )
-        .await
-    }
-
-    /// Opens the cache over deterministic simulated media and compact geometry.
-    #[cfg(feature = "sim")]
-    #[doc(hidden)]
-    pub async fn open_simulated(
-        config: PersistentCacheConfig,
-        database_name: &str,
-        database_id: DatabaseId,
-        media: SimMedia,
-    ) -> OpenedPersistentCache {
-        Self::open_on_media(
-            config,
-            database_name,
-            database_id,
-            TEST_GEOMETRY,
-            Arc::new(media),
+            media.geometry,
+            media.media,
         )
         .await
     }
@@ -265,7 +261,7 @@ impl PersistentCache {
             config,
             database_name,
             database_id,
-            TEST_GEOMETRY,
+            compact::GEOMETRY,
             Arc::new(CacheMetrics::new()),
             Arc::new(FileMedia),
         )
@@ -277,13 +273,13 @@ impl PersistentCache {
         config: PersistentCacheConfig,
         database_name: &str,
         database_id: DatabaseId,
-        media: SimMedia,
+        media: sim_media::SimMedia,
     ) -> OpenedPersistentCache {
         Self::open_with_geometry(
             config,
             database_name,
             database_id,
-            TEST_GEOMETRY,
+            compact::GEOMETRY,
             Arc::new(CacheMetrics::new()),
             Arc::new(media),
         )
@@ -1986,6 +1982,7 @@ fn invalid_record() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::sim_media::{MediaFaultProfile, SimMedia};
     use super::*;
     use tempfile::TempDir;
 
@@ -2004,7 +2001,7 @@ mod tests {
             config(dir),
             "db",
             database_id,
-            TEST_GEOMETRY,
+            compact::GEOMETRY,
             Arc::new(CacheMetrics::new()),
             Arc::new(FileMedia),
         )
@@ -2273,7 +2270,7 @@ mod tests {
 
             let offset = match region {
                 Region::Header => 0,
-                Region::CleanTail => TEST_GEOMETRY.block_bytes,
+                Region::CleanTail => compact::GEOMETRY.block_bytes,
                 Region::IndexSlot => {
                     let needle = encode_slot(slot);
                     media
@@ -2283,7 +2280,7 @@ mod tests {
                         .position(|window| window == needle)
                         .expect("published index slot was not durable") as u64
                 }
-                Region::SegmentHeader => layout.segment_start(TEST_GEOMETRY, segment),
+                Region::SegmentHeader => layout.segment_start(compact::GEOMETRY, segment),
                 Region::Record => slot.record_offset + RECORD_HEADER_BYTES,
             };
             assert!(media.corrupt(offset, 0x80), "could not corrupt {region:?}");
@@ -2353,7 +2350,7 @@ mod tests {
             &cache,
             "db/oversized",
             b"r1",
-            &vec![0; TEST_GEOMETRY.segment_bytes as usize],
+            &vec![0; compact::GEOMETRY.segment_bytes as usize],
         );
 
         assert!(cache.lookup(Arc::from("db/oversized")).await.is_none());
@@ -2399,7 +2396,7 @@ mod tests {
             config(&dir),
             "db",
             database_id,
-            TEST_GEOMETRY,
+            compact::GEOMETRY,
             metrics,
             Arc::new(FileMedia),
         )
@@ -2418,7 +2415,7 @@ mod tests {
             config(&dir),
             "db",
             database_id,
-            TEST_GEOMETRY,
+            compact::GEOMETRY,
             metrics,
             Arc::new(FileMedia),
         )
@@ -2439,17 +2436,17 @@ mod tests {
 
     #[test]
     fn test_format_is_not_a_production_file() {
-        assert_ne!(TEST_GEOMETRY.magic, PRODUCTION_GEOMETRY.magic);
+        assert_ne!(compact::GEOMETRY.magic, PRODUCTION_GEOMETRY.magic);
         assert_ne!(
-            TEST_GEOMETRY.header_domain,
+            compact::GEOMETRY.header_domain,
             PRODUCTION_GEOMETRY.header_domain
         );
     }
 
     #[test]
     fn record_size_is_charged_and_aligned() {
-        assert_eq!(record_bytes(2, 4, TEST_GEOMETRY), Some(4096));
-        assert_eq!(record_bytes(2, 4097, TEST_GEOMETRY), Some(4152));
+        assert_eq!(record_bytes(2, 4, compact::GEOMETRY), Some(4096));
+        assert_eq!(record_bytes(2, 4097, compact::GEOMETRY), Some(4152));
     }
 
     #[test]

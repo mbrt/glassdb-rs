@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::rt::{TapeScheduler, block_on_with, yield_now};
-use glassdb::sim::{MediaFaultProfile, SimMedia, record_disk_cache_input};
+use glassdb::sim::disk_cache::record_disk_cache_input;
+use glassdb::sim::{MediaFaultProfile, SimMedia};
 use glassdb::{Database, PersistentCacheConfig, ProtocolTiming};
 
 const CAPACITY_BYTES: u64 = 2 * 1024 * 1024;

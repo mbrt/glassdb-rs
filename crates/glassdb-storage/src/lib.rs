@@ -18,21 +18,29 @@ mod tlogger;
 pub mod txobject;
 mod version;
 
+/// Persistent-cache media and harnesses for deterministic simulation.
+#[cfg(feature = "sim")]
+pub mod sim {
+    pub use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
+
+    /// Isolated persistent-cache deterministic simulation harness.
+    #[cfg(sim)]
+    pub mod harness {
+        pub use crate::disk_cache::sim_harness::{
+            DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input,
+        };
+    }
+}
+
 pub use cache::{Cache, Weighable};
 pub use cache_stats::CacheStats;
 pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
 pub use directory::{Directory, LeafGroup, LeafLocator};
-// The media model also supports ordinary Tokio tests; its deterministic harness
-// requires an active simulation build.
-#[cfg(all(feature = "sim", sim))]
-#[doc(hidden)]
-pub use disk_cache::{DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input};
-#[cfg(feature = "sim")]
-#[doc(hidden)]
-pub use disk_cache::{MediaFaultProfile, SimMedia};
-pub use disk_cache::{OpenedPersistentCache, PersistentCache, PersistentCacheConfig};
+pub use disk_cache::{
+    OpenedPersistentCache, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
+};
 pub use error::StorageError;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};

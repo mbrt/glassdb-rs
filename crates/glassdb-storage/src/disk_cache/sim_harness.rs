@@ -9,10 +9,8 @@ use glassdb_concurr::rt;
 use glassdb_data::DatabaseId;
 use sha2::{Digest, Sha256};
 
-use super::{
-    MediaFaultProfile, PathFence, PersistentCache, PersistentCacheConfig, SequencePoint, SimMedia,
-    TEST_GEOMETRY,
-};
+use super::sim_media::{MediaFaultProfile, SimMedia};
+use super::{PathFence, PersistentCache, PersistentCacheConfig, SequencePoint};
 
 const CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_COMMANDS: usize = 48;
@@ -89,12 +87,11 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
             0 => {
                 close(&mut cache).await;
                 identity = command.identity;
-                let opened = PersistentCache::open_on_media(
+                let opened = PersistentCache::open(
                     config(),
                     "db",
                     database_id(identity),
-                    TEST_GEOMETRY,
-                    Arc::new(media.clone()),
+                    Some(media.clone().into()),
                 )
                 .await;
                 let recovered = opened.last_sequence_point.map(SequencePoint::raw);
