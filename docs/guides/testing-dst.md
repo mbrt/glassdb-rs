@@ -28,7 +28,8 @@ general simulated filesystem. For _this_ system — a **library over object
 storage** where clients coordinate only through the store and there is no
 peer-to-peer network — it scores best on determinism, fuzz-guidability, and
 efficiency. The full media-fault space is explored against `PersistentCache`;
-`CachedStore` and `Database` use progressively narrower integration profiles.
+`CachedStore` uses selected faults, and every existing database fuzz target
+replays each input both without L2 and with L2 under basic media faults.
 This costs ownership of a small executor, media model, and `--cfg sim` seam.
 
 | Criterion                             | Current (in-repo `DetExecutor`)                                                        | madsim                                                                 | turmoil                                                                    | mad-turmoil                                                                 |
@@ -95,9 +96,12 @@ authority. Those facts drive the comparison:
   scheduler and adds only that narrow media seam.
 - Media durability and corruption are explored primarily at the
   `PersistentCache` boundary. Selected `CachedStore` simulations cover
-  currentness and invalidation, while full `Database` simulations cover only
-  identity, timeline, and lifecycle integration. This avoids multiplying the
-  full cache, backend, and transaction fault spaces.
+  currentness and invalidation. Rather than maintain a separate full-database
+  cache workload, each existing transaction fuzz target runs its decoded
+  workload once cache-free and once with `SimMedia`; that paired run uses only
+  delay and pre-effect error injection from its independent media tape. This
+  preserves broad identity, timeline, lifecycle, and crash/reopen integration
+  without multiplying those workloads by the complete media-fault space.
 - The bugs the DST hunts live in the **order of shared-state accesses** (a write
   landing between another tx's read and validate). Catching those needs control
   of _task interleaving_, which only the current executor provides directly.

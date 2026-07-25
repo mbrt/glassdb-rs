@@ -7,4 +7,6 @@
 
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| glassdb::sim::disk_cache::replay_disk_cache_input(data));
+fuzz_target!(|data: &[u8]| {
+    glassdb_storage::sim::disk_cache::replay_disk_cache_input(data)
+});

@@ -10,7 +10,7 @@ use glassdb_concurr::rt;
 use crate::{Collection, CollectionPath, Database, Error};
 
 use super::harness::SimWorkload;
-use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, key_name, read_int, write_int};
+use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, key_name, read_int, write_int};
 // ===========================================================================
 // Cycle workload (ported from FoundationDB's `Cycle.cpp`).
 //
@@ -241,6 +241,7 @@ impl SimWorkload for CycleWorkload {
         &self,
         backbone: &Arc<dyn Backend>,
         state: &Arc<AtomicUsize>,
+        media: Option<SimMedia>,
     ) -> Option<rt::JoinHandle<()>> {
         // A concurrent read-only observer: while the swaps mutate the ring it
         // snapshots all N pointers in one transaction (concurrent reads, unlike
@@ -259,7 +260,7 @@ impl SimWorkload for CycleWorkload {
         let backbone = backbone.clone();
         let state = state.clone();
         Some(rt::spawn(async move {
-            let db = Self::open_db(&backbone)
+            let db = Self::open_db(&backbone, media)
                 .await
                 .expect("open cycle observer database");
             let coll = db

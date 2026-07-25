@@ -35,14 +35,6 @@ use glassdb_storage::{PersistentCacheConfig, SplitPolicy};
 
 use crate::db::DatabaseBuilder;
 
-/// Isolated deterministic simulation for the persistent cache.
-#[cfg(sim)]
-pub mod disk_cache {
-    pub use glassdb_storage::sim::harness::{
-        DiskCacheEvent, record_disk_cache_input, replay_disk_cache_input,
-    };
-}
-
 impl DatabaseBuilder {
     /// Enables the persistent cache over deterministic simulation media.
     pub fn simulated_persistent_cache(

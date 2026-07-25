@@ -346,6 +346,7 @@ name = "glassdb-fuzz"
 version = "0.0.0"
 dependencies = [
  "glassdb",
+ "glassdb-storage",
  "libfuzzer-sys",
 ]
 

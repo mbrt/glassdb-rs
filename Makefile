@@ -45,14 +45,14 @@ flamegraph:
 
 # Run the test suite under the in-repo deterministic simulation executor
 # (ADR-011, `--cfg sim`). The cloud backend crates (s3/gcs) use real
-# tokio/reqwest/aws-sdk and are excluded. The `glassdb` run enables the `sim`
-# harness feature, which also pulls in the byte-for-byte op-stream determinism
-# self-check (tests/concurrent_sim.rs) and the committed fuzz-corpus replay
-# (tests/fuzz_corpus.rs).
+# tokio/reqwest/aws-sdk and are excluded. Storage and `glassdb` enable their
+# respective simulation harnesses so each crate owns its committed corpus
+# replay.
 test-sim:
 	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
-		-p glassdb-data -p glassdb-concurr -p glassdb-backend \
-		-p glassdb-storage -p glassdb-trans
+		-p glassdb-data -p glassdb-concurr -p glassdb-backend -p glassdb-trans
+	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
+		-p glassdb-storage --features sim
 	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
 		-p glassdb --features sim
 

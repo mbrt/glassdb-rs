@@ -13,6 +13,9 @@ libfuzzer-sys = "0.4"
 # deterministic executor (`glassdb::rt`, under `--cfg sim`). The `sim` feature
 # pulls in `arbitrary`; no external simulation runtime is needed.
 glassdb = { path = "../crates/glassdb", features = ["sim"] }
+# The isolated persistent-cache target terminates at the storage layer instead
+# of widening or forwarding its internal harness through `glassdb`.
+glassdb-storage = { path = "../crates/glassdb-storage", features = ["sim"] }
 
 [[bin]]
 name = "concurrent_tx"
