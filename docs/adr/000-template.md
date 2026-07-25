@@ -15,3 +15,7 @@ What is the change that we're proposing and/or doing?
 ## Consequences
 
 What becomes easier or more difficult to do because of this change?
+
+## Alternatives considered
+
+What were the main options that we considered and why did we discard them?
