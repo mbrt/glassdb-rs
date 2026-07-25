@@ -10,38 +10,48 @@ graded against the five stated intents:
 4. Fuzz-guided exploration of edge cases
 5. Efficient
 
-Sources: ADR-008/010/011/012/013, `porting-go.md`, the `rt`/`exec`/`fault`
-modules, and upstream docs for the alternatives.
+Sources: ADR-008/010/011/012/013/048, `porting-go.md`, the
+`rt`/`exec`/`fault` modules, and the upstream documentation for
+[`madsim`](https://github.com/madsim-rs/madsim),
+[`turmoil`](https://github.com/tokio-rs/turmoil), and
+[`mad-turmoil`](https://github.com/s2-streamstore/mad-turmoil). The Turmoil
+assessment includes the filesystem simulation added in 0.7.1.
 
 ## TL;DR
 
 The current approach is a **minimal in-repo deterministic executor** (~600 LOC)
-that redirects only `tokio::spawn` and `tokio::time` and reuses the rest of
-`tokio` unchanged, with faults injected at the `Backend` trait instead of at a
-simulated network. For _this_ system — a **library over object storage** where
-clients coordinate only through the store and there is no peer-to-peer network —
-it scores best on determinism, fuzz-guidability, and efficiency, at the cost of
-owning a small bespoke executor and a `--cfg sim` seam.
+that redirects runtime-dependent operations and reuses the runtime-independent
+parts of `tokio`. Object-store faults are injected at the `Backend` trait rather
+than through a simulated network. ADR-048 applies the same principle to the
+optional disk cache through a narrow byte-level media model rather than a
+general simulated filesystem. For _this_ system — a **library over object
+storage** where clients coordinate only through the store and there is no
+peer-to-peer network — it scores best on determinism, fuzz-guidability, and
+efficiency. The full media-fault space is explored against `PersistentCache`;
+`CachedStore` uses selected faults, and every existing database fuzz target
+replays each input both without L2 and with L2 under basic media faults.
+This costs ownership of a small executor, media model, and `--cfg sim` seam.
 
-| Criterion                             | Current (in-repo `DetExecutor`)                                                     | madsim                                                                 | turmoil                                                           | mad-turmoil                                                                 |
-| ------------------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Maintainable / minimal / tokio-robust | **Good** — tiny, owned, forkable; but bespoke executor + `tokio_unstable` coupling  | **Weak** — large dep, re-implements tokio, primary maintainer moved on | **Good** — tokio-org maintained, smaller; network-only            | **Partial** — small crate but global `libc` interposition + young 3rd-party |
-| Easy to use                           | **Good** — `rt` seam + `--cfg sim`; faults are plain middleware; users unaffected   | **Partial** — `--cfg madsim` + tokio alias; cloud backends excluded    | **Weak (here)** — must shim socket I/O the engine doesn't have    | **Partial** — turmoil structuring + `main()` init incantation               |
-| Fully deterministic & reproducible    | **Strong** — verified by byte-identical op-stream + corpus replay; all seams closed | **Good** — but leaks tokio's `select!`/`watch` RNG until tamed         | **Partial** — documented leaks (HashMap, `getrandom`, time) alone | **Strong** — closes turmoil's `libc` leaks; trace-diff meta-test            |
-| Fuzz-guided edge-case exploration     | **Strong** — schedule-tape + fault-tape gradient + PCT depth bound                  | **Weak** — own seeded scheduler, not byte-guidable                     | **Weak** — own seeded scheduler, network-event sampling           | **Weak** — same as turmoil                                                  |
-| Efficient                             | **Strong** — single thread, in-mem, virtual time, no net stack                      | **Partial** — full runtime + simulated net + RPC                       | **Partial** — per-host runtimes, tick stepping, net shims         | **Partial** — turmoil overhead + cheap overrides                            |
+| Criterion                             | Current (in-repo `DetExecutor`)                                                        | madsim                                                                 | turmoil                                                                    | mad-turmoil                                                                 |
+| ------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Maintainable / minimal / tokio-robust | **Good** — small and owned; but bespoke executor/media + `tokio_unstable` coupling     | **Partial** — large dependency that re-implements Tokio's runtime      | **Good** — tokio-org maintained; filesystem surface is new and unstable   | **Partial** — small crate but global `libc` interposition + young 3rd-party |
+| Easy to use                           | **Good** — `rt`/media seams + `--cfg sim`; users unaffected                           | **Partial** — `--cfg madsim` + tokio alias; cloud backends excluded    | **Partial (here)** — useful filesystem shim, mismatched host/runtime model | **Partial** — turmoil structuring + `main()` init incantation               |
+| Fully deterministic & reproducible    | **Strong** — verified by byte-identical op-stream + corpus replay; owned input streams | **Good** — but leaks tokio's `select!`/`watch` RNG until tamed         | **Partial** — seeded model does not close application entropy/time leaks   | **Strong** — closes turmoil's `libc` leaks; trace-diff meta-test            |
+| Fuzz-guided edge-case exploration     | **Strong** — schedule/backend/media tapes + PCT depth bound                            | **Weak** — own seeded scheduler, not byte-guidable                     | **Weak** — own seeded scheduler and event sampling                         | **Weak** — same as turmoil                                                  |
+| Efficient                             | **Strong** — single thread, narrow in-memory models, virtual time                      | **Partial** — full runtime + simulated net + RPC                       | **Partial** — per-host runtimes and general network/filesystem models      | **Partial** — turmoil overhead + cheap overrides                            |
 
 ## The four approaches in one paragraph each
 
 - **Current — in-repo `DetExecutor` (ADR-011).** A single-threaded executor with
   a pluggable `Scheduler` controls task **poll order at await points**. A `rt`
-  seam redirects only `spawn`/`time`; `tokio::sync`, `tokio::select!`, and
+  seam redirects task execution and time; `tokio::sync`, `tokio::select!`, and
   `tokio_util::CancellationToken` are reused as-is. Time is virtual, entropy is
   a seeded RNG, and tokio's own `select!` branch RNG is seeded via `RngSeed`.
-  Two schedulers: a **schedule-tape** (libFuzzer bytes choose the next task) and
-  **PCT** (randomized priorities + change points). Faults are a per-client
-  `Backend` middleware (`FaultBackend`). Active only under `--cfg sim`;
-  production is plain `tokio`.
+  Two schedulers provide a **schedule-tape** (libFuzzer bytes choose the next
+  task) and **PCT** (randomized priorities + change points). `FaultBackend`
+  consumes an independent backend-fault tape. ADR-048 adds a third,
+  media-fault stream and a byte-level `SimMedia` for the optional disk cache.
+  Active only under `--cfg sim`; production is plain `tokio` plus `FileMedia`.
 
 - **madsim.** A "magical deterministic simulator" that **re-implements** the
   tokio runtime, timer, `tokio::sync`, _and_ a full simulated network stack with
@@ -51,22 +61,24 @@ owning a small bespoke executor and a `--cfg sim` seam.
 
 - **turmoil.** A tokio-team framework for **distributed-systems** testing: each
   host runs on its own current-thread, time-paused tokio runtime, stepped a
-  fixed tick at a time; a seeded RNG drives a **simulated network** (latency,
-  drop, hold, partition, crash/bounce) through shims mirroring `tokio::net`. It
-  controls the _network_, not intra-host task interleaving, and is **not fully
-  deterministic on its own** (HashMap, `getrandom`, and `std` time leak).
+  fixed tick at a time. A seeded RNG drives a simulated network, and its
+  unstable filesystem shims model pending and synchronized bytes,
+  crash/bounce, and torn-write faults. It controls host events and I/O rather
+  than intra-host task poll order, and does not close application entropy and
+  host-time leaks by itself.
 
 - **mad-turmoil.** A small crate that adds **madsim-style determinism to
   turmoil** by overriding `libc` symbols (`clock_gettime`, `getrandom`,
   `getentropy`) plus seeding `fastrand`, closing the leaks turmoil has alone.
-  Sim-binary-only. It keeps turmoil's host/network model; it makes that model
-  reproducible rather than adding interleaving control.
+  Sim-binary-only. It keeps turmoil's host/network/filesystem model; it makes
+  that model reproducible rather than adding interleaving control.
 
 ## Why the architecture matters here
 
-GlassDB is a **stateless library over object storage**. Clients never talk to
-each other; the only shared, contended resource is the store. That single fact
-drives the whole comparison:
+GlassDB coordinates through **object storage**. Clients never talk to each
+other; the shared, contended correctness boundary is the store. The optional
+disk cache adds disposable local persistence but no new coordination
+authority. Those facts drive the comparison:
 
 - The meaningful fault boundary is **one client's transport to the store**, which
   is exactly the `Backend` trait. The current `FaultBackend` injects delay,
@@ -77,6 +89,19 @@ drives the whole comparison:
   HTTP/socket layer to object storage purely as overhead. madsim had the same
   problem in reverse: ADR-008 had to **manufacture** a network (one DB per node,
   an RPC `NetBackend`) just to make faults meaningful.
+- The disk cache is the important exception: a simulated durable byte store is
+  directly useful. Turmoil's filesystem is relevant prior art, but its general
+  host/filesystem model and durability policy are broader and different from
+  the one exclusively owned cache container. ADR-048 keeps the existing guided
+  scheduler and adds only that narrow media seam.
+- Media durability and corruption are explored primarily at the
+  `PersistentCache` boundary. Selected `CachedStore` simulations cover
+  currentness and invalidation. Rather than maintain a separate full-database
+  cache workload, each existing transaction fuzz target runs its decoded
+  workload once cache-free and once with `SimMedia`; that paired run uses only
+  delay and pre-effect error injection from its independent media tape. This
+  preserves broad identity, timeline, lifecycle, and crash/reopen integration
+  without multiplying those workloads by the complete media-fault space.
 - The bugs the DST hunts live in the **order of shared-state accesses** (a write
   landing between another tx's read and validate). Catching those needs control
   of _task interleaving_, which only the current executor provides directly.
@@ -98,16 +123,16 @@ drives the whole comparison:
     `coop::unconstrained` + current-thread `block_on` trick to seed the
     `select!` RNG. "Minimal in LOC" is true; "no fidelity burden" is not.
 
-- **madsim — Weak.** A large, deep dependency that re-implements the runtime,
-  timer, and network. ADR-011 flags it explicitly: the primary maintainer has
-  moved on, and a core testing substrate that is hard to fork if abandoned is a
-  liability. It must also track tokio's evolving surface, and forces a tokio
-  alias across the whole workspace (and excludes crates it can't build, e.g. the
-  cloud SDKs).
+- **madsim — Partial.** A large, deep dependency that re-implements the runtime,
+  timer, and network. Its broad compatibility surface must track Tokio and is
+  materially harder to audit or fork than the in-repo executor. It also forces a
+  Tokio alias across the whole workspace and excludes crates it cannot build,
+  such as the cloud SDKs.
 
 - **turmoil — Good.** Maintained by the tokio org and far smaller than madsim, so
-  it tracks tokio well. But it covers only the network dimension, so
-  "maintainable" comes with "you still own determinism elsewhere."
+  it tracks tokio well. Its filesystem support materially broadens its useful
+  scope, but remains explicitly unstable and still leaves application
+  determinism and poll-order exploration to the user.
 
 - **mad-turmoil — Partial.** ~10 KB crate, but its mechanism is **global `libc`
   symbol interposition**, which is inherently platform-specific (Linux vs macOS
@@ -127,10 +152,13 @@ drives the whole comparison:
   and excluding anything that can't compile against fake-tokio (the s3/gcs
   backends). Invasive at the build level.
 
-- **turmoil — Weak (for this system).** Its usage model is "put your socket types
-  behind a swappable `mod net` and write host/client futures." GlassDB has no
-  sockets to swap — coordination is object-storage calls — so adopting turmoil
-  means _inventing_ a network layer to simulate. High impedance mismatch.
+- **turmoil — Partial (for this system).** The full framework asks applications
+  to run as host/client futures and swap in its I/O shims. Its network remains
+  unnecessary for GlassDB, but its positioned-I/O filesystem shim is close
+  enough to the disk cache to be useful prior art or a future independent
+  adapter. Adopting the full runtime would still replace the guided scheduler,
+  while using only the filesystem would require adapting its unstable
+  durability and crash controls to GlassDB's media-fault tape.
 
 - **mad-turmoil — Partial.** Inherits turmoil's structuring requirement and adds a
   `main()` init incantation (`set_rng`, `fastrand::seed`, `SimClocksGuard`) that
@@ -158,9 +186,9 @@ drives the whole comparison:
   `biased` selects and `Notify`-based cancellation. So madsim alone is not "fully
   deterministic" for code that uses non-biased `select!` or `watch`.
 
-- **turmoil — Partial.** Documented to leak (`HashMap` `RandomState`, `getrandom`,
-  `std` time) unless the application buys in; reproducibility is best-effort
-  without help. This is precisely why mad-turmoil exists.
+- **turmoil — Partial.** A fixed builder seed controls Turmoil's own choices, but
+  application `HashMap` randomness, `getrandom`, and host time still require
+  discipline or interposition. This is precisely the gap mad-turmoil targets.
 
 - **mad-turmoil — Strong (for its model).** Closes turmoil's `libc`-level leaks;
   S2 reports a CI meta-test that reruns a seed and diffs TRACE logs "down to the
@@ -186,7 +214,7 @@ This is the current approach's clearest win, and the reason it exists.
 - **madsim / turmoil / mad-turmoil — Weak.** All three **seed their own
   schedulers** and expose no "consume _these_ bytes to pick the next task" hook
   (ADR-011 calls this out as a primary reason to build in-repo). They give
-  seed-breadth _random sampling_ of schedules/network events, not fuzzer-guided
+  seed-breadth _random sampling_ of schedules and I/O events, not fuzzer-guided
   interleaving search, and none offer a PCT-style depth guarantee out of the box.
   Bending them to a fuzzer tape would mean re-plumbing their scheduler, defeating
   the point of adopting a blessed substrate.
@@ -203,11 +231,11 @@ This is the current approach's clearest win, and the reason it exists.
 - **madsim — Partial.** A full runtime plus a simulated network and RPC layer; the
   ADR-008 topology added per-op RPC and (de)serialization across simulated links.
 
-- **turmoil / mad-turmoil — Partial.** Each host is its own tokio runtime stepped
-  per tick, with network shims and message (de)serialization; for GlassDB you'd be
-  paying to simulate HTTP-to-object-storage that the `Backend` fault middleware
-  models for free. mad-turmoil's `libc` overrides themselves are cheap, but the
-  turmoil substrate cost remains.
+- **turmoil / mad-turmoil — Partial.** Each host is its own Tokio runtime stepped
+  per tick. The full framework's network and general filesystem are more work
+  than GlassDB's `Backend` middleware and single-container `SimMedia`.
+  `mad-turmoil`'s `libc` overrides themselves are cheap, but the Turmoil
+  substrate cost remains.
 
 ## Net assessment of the current approach
 
@@ -215,14 +243,17 @@ This is the current approach's clearest win, and the reason it exists.
 
 - Directly **controls task interleaving**, which is where the target bugs live,
   and is the only one of the four that makes that control **fuzzer-guidable**
-  (schedule-tape + fault-tape) and **smartly sampled** (PCT).
+  (schedule, backend-fault, and media-fault streams) and **smartly sampled**
+  (PCT).
 - **Fully and verifiably deterministic** for its model (byte-identical op stream,
   corpus replay), including the tokio `select!`-RNG and HashMap leaks the others
   trip on.
 - **Minimal and owned**: no heavy external simulation runtime, trivially forkable,
   production stays on stock tokio behind `--cfg sim`.
-- **Efficient and well-matched** to a library-over-object-storage design; faults
-  live at the right boundary (`Backend`) and also run under normal tokio tests.
+- **Efficient and well-matched** to the actual boundaries: object-store faults
+  live at `Backend`, while persistent-cache faults live at the narrow
+  `CacheMedia` seam. Full media faults run against the isolated cache; broader
+  layers retain only the profiles needed for their integration invariants.
 
 **Cons / risks**
 
@@ -233,15 +264,18 @@ This is the current approach's clearest win, and the reason it exists.
   implementation details — an unstable surface that could shift.
 - A standing **`rt` seam discipline** (no direct `tokio::spawn`/`time`/wall-clock
   in engine paths), enforced by a source-level test.
+- The byte-level media model is another owned correctness dependency and cannot
+  reproduce platform-specific filesystem allocation, locking, or kernel
+  writeback behavior. Real-filesystem tests remain necessary.
 - **Scoped determinism**: no real multi-thread data races, OS scheduling, real
   cloud-SDK behavior, or true network partitions; the schedule space is sampled,
   not exhausted.
 
-**Where the alternatives would still win.** If GlassDB ever needed to test a
-_real SDK client over a genuinely simulated network_ (peer hosts, partitions,
-socket-level faults), turmoil — optionally hardened with mad-turmoil — is the
-better-matched tool, and ADR-011 explicitly parks it as a future option for that
-scenario. For the current objective (serializability under contention, faults,
-and crashes against object storage), the in-repo executor is the stronger fit on
-four of the five intents and competitive on the fifth (maintainability), with the
-fidelity burden being the conscious trade.
+**Where the alternatives would still win.** If GlassDB needed a real SDK client
+over a simulated network, or a broad POSIX-like filesystem shared by many files
+and hosts, Turmoil — optionally hardened with mad-turmoil — would be the
+better-matched tool. ADR-011 parks it as a future network option, and ADR-048
+keeps its filesystem usable as prior art or a future independent adapter. For
+the current objectives (guided transaction interleavings and deep
+single-container cache recovery), the in-repo executor remains the stronger
+fit, with ownership of the narrow media model as the conscious trade.

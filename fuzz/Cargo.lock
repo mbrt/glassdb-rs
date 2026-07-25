@@ -346,6 +346,7 @@ name = "glassdb-fuzz"
 version = "0.0.0"
 dependencies = [
  "glassdb",
+ "glassdb-storage",
  "libfuzzer-sys",
 ]
 
@@ -361,6 +362,7 @@ dependencies = [
 name = "glassdb-storage"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "glassdb-backend",
  "glassdb-concurr",

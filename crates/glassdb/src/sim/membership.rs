@@ -8,7 +8,9 @@ use glassdb_backend::Backend;
 use crate::{CollectionPath, Database, Error, KeyScan};
 
 use super::harness::{SimWorkload, open_det_db};
-use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, assert_valid_listing, key_name, tiny_split_policy};
+use super::{
+    MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name, tiny_split_policy,
+};
 // ===========================================================================
 // Membership workload (ADR-031 dynamic range sharding).
 //
@@ -179,9 +181,12 @@ impl SimWorkload for MembershipWorkload {
         Mutex::new(MembershipAcct::new())
     }
 
-    async fn open_db(backend: &Arc<dyn Backend>) -> Result<Database, Error> {
+    async fn open_db(
+        backend: &Arc<dyn Backend>,
+        media: Option<SimMedia>,
+    ) -> Result<Database, Error> {
         // A tiny split soft cap so a handful of keys forces B-link splits.
-        open_det_db(backend, tiny_split_policy()).await
+        open_det_db(backend, tiny_split_policy(), media).await
     }
 
     async fn seed(&self, db: &Database) {

@@ -1,13 +1,16 @@
 //! Deterministic concurrency fuzz target (see ADR-008 and ADR-011).
 //!
 //! libFuzzer bytes are split into an `rng_seed`, a [`RmwWorkload`], a
-//! [`FaultConfig`], and the remaining bytes, which are halved into a *schedule
-//! tape* and a *fault tape*. The harness runs every client as its own task over
+//! [`FaultConfig`], and the remaining bytes, which are deinterleaved into
+//! *schedule*, *backend-fault*, and *cache-media* tapes. The harness runs every
+//! decoded workload both without and with the persistent cache; the cached run
+//! uses only basic media delays and pre-effect failures. Every client runs as
+//! its own task over
 //! a shared in-process backend on the in-repo deterministic executor
 //! ([`glassdb::rt`], `--cfg sim`); a [`TapeScheduler`] consumes the schedule
-//! tape to choose task interleavings, while the fault tape guides transport
-//! failures, crash timing, and one-shot slow mutations. Both dimensions are
-//! therefore part of the libFuzzer input and become coverage-guidable.
+//! tape to choose task interleavings, while the other tapes independently guide
+//! transport and media faults. All three dimensions are therefore part of the
+//! libFuzzer input and become coverage-guidable.
 //! Scheduling, time, randomness, failures, and delays are all deterministic
 //! functions of the input, so a crashing input replays the exact interleaving.
 //!

@@ -1,6 +1,7 @@
 //! Shared deterministic execution, failure/delay injection, replay, and PCT harness.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -15,13 +16,15 @@ use glassdb_concurr::{Tape, rt};
 use glassdb_storage::SplitPolicy;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Database, Error, ProtocolTiming};
+use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 
-use super::MAX_CLIENTS;
 use super::slow_backend;
+use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
 
 const DB_NAME: &str = "fuzz";
 const SLOW_MUTATION_SEED: u64 = 0x510A_7E00_5EED_BA5E;
+const CACHE_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
+const CACHE_MEDIA_SEED: u64 = 0xCA43_5EED_D15C_0048;
 
 /// Controls transport failures, client crashes, and slow backend mutations in
 /// the deterministic simulation harness.
@@ -86,20 +89,29 @@ impl<'a> Arbitrary<'a> for FaultConfig {
         })
     }
 }
-/// Opens the simulation Database with the deterministic clock the fuzzer relies
-/// on for byte-identical replays, under the given split `policy`. Workloads open
-/// their databases through this helper (see [`SimWorkload::open_db`]) so the
-/// deterministic clock is applied uniformly regardless of the chosen policy.
+/// Opens a simulation database with deterministic time, the given split policy,
+/// and optional persistent-cache media.
 pub(crate) async fn open_det_db(
     backend: &Arc<dyn Backend>,
     policy: SplitPolicy,
+    media: Option<SimMedia>,
 ) -> Result<Database, Error> {
-    Database::builder(DB_NAME, backend.clone())
+    let builder = Database::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
         .split_policy(policy)
-        .protocol_timing(ProtocolTiming::simulation())
-        .open()
-        .await
+        .protocol_timing(ProtocolTiming::simulation());
+    let builder = if let Some(media) = media {
+        builder.simulated_persistent_cache(
+            PersistentCacheConfig {
+                directory: PathBuf::from("simulated-fuzz-cache"),
+                capacity_bytes: CACHE_CAPACITY_BYTES,
+            },
+            media,
+        )
+    } else {
+        builder
+    };
+    builder.open().await
 }
 /// The crash nemesis: cancels a few clients' abort signals at deterministic
 /// virtual times, modelling an abrupt client stop mid-transaction. Each cancelled
@@ -159,6 +171,44 @@ fn deinterleave<const N: usize>(tape: &[u8]) -> [Vec<u8>; N] {
         out[i % N].push(b);
     }
     out
+}
+
+const INIT_VERIFY_MEDIA_STREAM: usize = 0;
+const CLIENT_MEDIA_STREAM_BASE: usize = 1;
+const OBSERVER_MEDIA_STREAM: usize = CLIENT_MEDIA_STREAM_BASE + MAX_CLIENTS;
+const MEDIA_STREAMS: usize = OBSERVER_MEDIA_STREAM + 1;
+
+struct RunMedia {
+    init_and_verify: SimMedia,
+    clients: Vec<SimMedia>,
+    observer: SimMedia,
+}
+
+impl RunMedia {
+    fn new(tape: Vec<u8>, seed: u64, client_count: usize) -> Self {
+        assert!(client_count <= MAX_CLIENTS);
+        let streams = deinterleave::<MEDIA_STREAMS>(&tape);
+        let create = |stream: usize| {
+            // Broad transaction workloads need ordinary latency and error
+            // integration, while partial and indefinitely pending operations
+            // remain in the isolated cache fault domain.
+            SimMedia::new(
+                MediaFaultProfile::Selected,
+                streams[stream].clone(),
+                seed ^ CACHE_MEDIA_SEED.wrapping_mul(stream as u64 + 1),
+            )
+        };
+        Self {
+            // Concurrent database handles need distinct exclusively opened
+            // containers. Init and verification are sequential, so sharing
+            // their medium also exercises clean reopen and timeline recovery.
+            init_and_verify: create(INIT_VERIFY_MEDIA_STREAM),
+            clients: (0..client_count)
+                .map(|client| create(CLIENT_MEDIA_STREAM_BASE + client))
+                .collect(),
+            observer: create(OBSERVER_MEDIA_STREAM),
+        }
+    }
 }
 
 // Fault-tape stream layout: one stream for each nemesis, plus one per client
@@ -281,14 +331,18 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     /// A fresh oracle state for one run.
     fn new_state(&self) -> Self::State;
 
-    /// Opens a database for this workload over `backend`. The harness calls this
-    /// for the seed/verify database and for every client (and restart), so the
-    /// workload — not the harness — chooses the split soft-cap policy. The
-    /// default uses production caps; override to exercise B-link splits with few
-    /// keys. Implementations must go through [`open_det_db`] to keep the
-    /// deterministic clock byte-identical replays rely on.
-    fn open_db(backend: &Arc<dyn Backend>) -> impl Future<Output = Result<Database, Error>> + Send {
-        open_det_db(backend, SplitPolicy::default())
+    /// Opens a database for this workload over `backend` and optional simulated
+    /// cache media. The harness calls this for the seed/verify database and for
+    /// every client (and restart), so the workload — not the harness — chooses
+    /// the split soft-cap policy. The default uses production caps; override to
+    /// exercise B-link splits with few keys. Implementations must go through
+    /// [`open_det_db`] to preserve the deterministic clock required for
+    /// byte-identical replay.
+    fn open_db(
+        backend: &Arc<dyn Backend>,
+        media: Option<SimMedia>,
+    ) -> impl Future<Output = Result<Database, Error>> + Send {
+        open_det_db(backend, SplitPolicy::default(), media)
     }
 
     /// Creates and seeds this workload's collection(s) before the clients start,
@@ -321,6 +375,7 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
         &self,
         _backbone: &Arc<dyn Backend>,
         _state: &Arc<Self::State>,
+        _media: Option<SimMedia>,
     ) -> Option<rt::JoinHandle<()>> {
         None
     }
@@ -373,6 +428,7 @@ async fn run_generic<W: SimWorkload>(
     faults: FaultConfig,
     seed: u64,
     fault_tape: Vec<u8>,
+    media_tape: Option<Vec<u8>>,
 ) -> OpLog {
     // The fault tape guides each client's transport failures, crash timing,
     // outage windows, and the independent one-shot slow mutation. With an empty
@@ -382,10 +438,20 @@ async fn run_generic<W: SimWorkload>(
     // The store and a shared recorder form a faultless backbone; each client gets
     // its own transport (`FaultBackend`) over it.
     let (backbone, log) = make_backbone();
+    let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
+    let nclients = client_ops.len();
+    let run_media = media_tape.map(|tape| RunMedia::new(tape, seed, nclients));
 
     // Let the workload open and seed its collection(s), over the faultless
     // backbone so setup cannot fail spuriously.
-    let init_db = W::open_db(&backbone).await.expect("open init db");
+    let init_db = W::open_db(
+        &backbone,
+        run_media
+            .as_ref()
+            .map(|media| media.init_and_verify.clone()),
+    )
+    .await
+    .expect("open init db");
     workload.seed(&init_db).await;
     init_db.shutdown().await;
     drop(init_db);
@@ -394,8 +460,6 @@ async fn run_generic<W: SimWorkload>(
 
     // One transport per client over the shared backbone. Injectors are live
     // only while the clients run.
-    let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
-    let nclients = client_ops.len();
     let client_backbone: Arc<dyn Backend> = if faults.slow_mutations_enabled() {
         slow_backend::with_tape(
             backbone.clone(),
@@ -421,14 +485,17 @@ async fn run_generic<W: SimWorkload>(
     // captured-task cycle is broken by subsystems holding `Weak<Background>`).
     let mut handles = Vec::with_capacity(nclients);
     let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
-    for (ops, backend) in client_ops.into_iter().zip(client_backends) {
+    for (client, (ops, backend)) in client_ops.into_iter().zip(client_backends).enumerate() {
         let signal = CancellationToken::new();
         signals.push(signal.clone());
         let state = state.clone();
+        let media = run_media
+            .as_ref()
+            .map(|run_media| run_media.clients[client].clone());
         handles.push(rt::spawn(async move {
             let consumed = Arc::new(AtomicUsize::new(0));
             let crashed = {
-                let db = match W::open_db(&backend).await {
+                let db = match W::open_db(&backend, media.clone()).await {
                     Ok(db) => db,
                     Err(error) => {
                         assert_admissible_client_error(faults, "opening client database", error);
@@ -445,6 +512,11 @@ async fn run_generic<W: SimWorkload>(
                 }
                 crashed
             };
+            if crashed && let Some(media) = &media {
+                // The cancelled database models process loss, so its cache
+                // must cross the same unsynchronized durability boundary.
+                media.crash();
+            }
             // Crash-and-restart: a cancelled (crashed) client reopens the Database
             // on the same backend and finishes its remaining ops, recovering its
             // own orphaned locks via lease expiry. The in-doubt op it died on is
@@ -453,7 +525,7 @@ async fn run_generic<W: SimWorkload>(
             // completion.
             let n = consumed.load(Ordering::SeqCst);
             if crashed && n < ops.len() {
-                match W::open_db(&backend).await {
+                match W::open_db(&backend, media).await {
                     Ok(db) => {
                         let dummy = AtomicUsize::new(0);
                         run_generic_client::<W>(&db, &ops[n..], &state, &dummy, faults).await;
@@ -473,7 +545,11 @@ async fn run_generic<W: SimWorkload>(
     // its own slice of the fault tape (and a distinct fallback seed). The fixed
     // spawn order (clients, observer, crash, outage) keeps task ids — and thus
     // the schedule — deterministic.
-    let observer = workload.spawn_observer(&backbone, &state);
+    let observer = workload.spawn_observer(
+        &backbone,
+        &state,
+        run_media.as_ref().map(|media| media.observer.clone()),
+    );
     let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
 
     for h in handles {
@@ -497,9 +573,14 @@ async fn run_generic<W: SimWorkload>(
 
     // The workload reads the final committed state (driving recovery of any
     // crashed client's locks via lease expiry) and asserts its invariant.
-    let verify_db = W::open_db(&backbone)
-        .await
-        .expect("open fresh verification db");
+    let verify_db = W::open_db(
+        &backbone,
+        run_media
+            .as_ref()
+            .map(|media| media.init_and_verify.clone()),
+    )
+    .await
+    .expect("open fresh verification db");
     workload
         .verify(&verify_db, &state, faults.failures_enabled())
         .await;
@@ -516,7 +597,7 @@ async fn run_generic<W: SimWorkload>(
 /// Runs `workload` over a fresh in-memory store and asserts its invariant,
 /// without injecting faults.
 pub async fn run_and_assert<W: SimWorkload>(workload: W) {
-    run_generic(workload, FaultConfig::none(), 0, Vec::new()).await;
+    run_generic(workload, FaultConfig::none(), 0, Vec::new(), None).await;
 }
 
 /// Like [`run_and_assert`] but applies the failure and slow-mutation modes in
@@ -528,13 +609,13 @@ pub async fn run_and_assert_with_faults<W: SimWorkload>(
     seed: u64,
     fault_tape: Vec<u8>,
 ) {
-    run_generic(workload, faults, seed, fault_tape).await;
+    run_generic(workload, faults, seed, fault_tape, None).await;
 }
 
 /// Like [`run_and_assert`] but records the ordered stream of backend operations
 /// and returns the log, for byte-for-byte determinism comparison across runs.
 pub async fn run_and_record<W: SimWorkload>(workload: &W) -> OpLog {
-    run_generic(workload.clone(), FaultConfig::none(), 0, Vec::new()).await
+    run_generic(workload.clone(), FaultConfig::none(), 0, Vec::new(), None).await
 }
 
 /// Like [`run_and_record`] but with the configured failure/slow-mutation modes.
@@ -545,7 +626,7 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
     seed: u64,
     fault_tape: Vec<u8>,
 ) -> OpLog {
-    run_generic(workload.clone(), faults, seed, fault_tape).await
+    run_generic(workload.clone(), faults, seed, fault_tape, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +653,7 @@ struct DecodedFuzzInput<W> {
     faults: FaultConfig,
     schedule_tape: Vec<u8>,
     fault_tape: Vec<u8>,
+    media_tape: Vec<u8>,
 }
 
 #[cfg(sim)]
@@ -583,23 +665,38 @@ where
     let seed: u64 = u.arbitrary().unwrap_or(0);
     let workload = W::arbitrary(&mut u).unwrap_or_default();
     let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
-    // Split the remaining bytes into a schedule tape and a fault tape; the
-    // scheduler and fault schedule both fall back to defaults once spent.
-    let rest = u.take_rest();
-    let mid = rest.len() / 2;
+    // Each remaining byte guides exactly one of scheduling, backend faults, or
+    // cache-media faults, keeping mutations local to one decision stream.
+    let [schedule_tape, fault_tape, media_tape] = deinterleave::<3>(u.take_rest());
     DecodedFuzzInput {
         seed,
         workload,
         faults,
-        schedule_tape: rest[..mid].to_vec(),
-        fault_tape: rest[mid..].to_vec(),
+        schedule_tape,
+        fault_tape,
+        media_tape,
     }
 }
 
+#[cfg(sim)]
+fn run_fuzz_mode<W: SimWorkload>(
+    workload: W,
+    faults: FaultConfig,
+    seed: u64,
+    schedule_tape: Vec<u8>,
+    fault_tape: Vec<u8>,
+    media_tape: Option<Vec<u8>>,
+) -> OpLog {
+    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
+        run_generic(workload, faults, seed, fault_tape, media_tape).await
+    })
+}
+
 /// Decodes one libFuzzer input for workload `W` exactly as its target does and
-/// runs it on the deterministic executor, asserting the invariant. Panics on any
-/// violation. Shared by the fuzz target and the corpus-replay test so the two
-/// can never diverge.
+/// runs it on fresh deterministic executors without and with the persistent
+/// cache, asserting the invariant in both modes. The cached run injects only
+/// basic media delays and pre-effect failures. Panics on any violation. Shared
+/// by the fuzz target and the corpus-replay test so the two can never diverge.
 #[cfg(sim)]
 pub fn replay_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) {
     let DecodedFuzzInput {
@@ -608,15 +705,30 @@ pub fn replay_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) {
         faults,
         schedule_tape,
         fault_tape,
+        media_tape,
     } = decode_fuzz_input::<W>(data);
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
-        run_and_assert_with_faults(workload, faults, seed, fault_tape).await
-    });
+    run_fuzz_mode(
+        workload.clone(),
+        faults,
+        seed,
+        schedule_tape.clone(),
+        fault_tape.clone(),
+        None,
+    );
+    run_fuzz_mode(
+        workload,
+        faults,
+        seed,
+        schedule_tape,
+        fault_tape,
+        Some(media_tape),
+    );
 }
 
 /// Decodes one libFuzzer input exactly as [`replay_input`] does, runs it, and
-/// returns the recorded backend op stream. Used by corpus replay tests to prove
-/// committed inputs replay byte-for-byte, not just invariant-cleanly.
+/// returns the cache-free and cache-enabled backend op streams concatenated.
+/// Used by corpus replay tests to prove committed inputs replay byte-for-byte,
+/// not just invariant-cleanly.
 #[cfg(sim)]
 pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<OpRecord> {
     let DecodedFuzzInput {
@@ -625,12 +737,27 @@ pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<
         faults,
         schedule_tape,
         fault_tape,
+        media_tape,
     } = decode_fuzz_input::<W>(data);
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
-        let log = run_and_record_with_faults(&workload, faults, seed, fault_tape).await;
-        let recorded = log.lock().unwrap();
-        recorded.clone()
-    })
+    let without_cache = run_fuzz_mode(
+        workload.clone(),
+        faults,
+        seed,
+        schedule_tape.clone(),
+        fault_tape.clone(),
+        None,
+    );
+    let with_cache = run_fuzz_mode(
+        workload,
+        faults,
+        seed,
+        schedule_tape,
+        fault_tape,
+        Some(media_tape),
+    );
+    let mut recorded = without_cache.lock().unwrap().clone();
+    recorded.extend(with_cache.lock().unwrap().iter().cloned());
+    recorded
 }
 
 /// Runs `workload` once under a PCT schedule seeded by `seed`, asserting its

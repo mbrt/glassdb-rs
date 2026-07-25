@@ -42,7 +42,7 @@ s3-fake-server = ["s3", "glassdb-backend-s3/fake-server"]
 gcs = ["dep:glassdb-backend-gcs"]
 # Expose the deterministic-simulation workload harness (`glassdb::sim`) used by
 # the `fuzz/` crate and the op-stream self-check. See ADR-008 and ADR-011.
-sim = ["dep:arbitrary"]
+sim = ["dep:arbitrary", "glassdb-storage/sim"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }

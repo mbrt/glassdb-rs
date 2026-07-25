@@ -1,24 +1,31 @@
-//! Best-effort persistent encoded-body disk cache (ADR-045).
+//! Best-effort persistent encoded-body disk cache (ADR-045, ADR-048).
 
 use std::any::Any;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use glassdb_concurr::rt;
 use glassdb_data::DatabaseId;
-use rustix::fs::{FallocateFlags, FlockOperation};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::cache_stats::CacheMetrics;
 use crate::timeline::SequencePoint;
+
+mod file_media;
+mod media;
+#[cfg(all(feature = "sim", sim))]
+pub(crate) mod sim_harness;
+#[cfg(any(test, feature = "sim"))]
+pub(crate) mod sim_media;
+
+use file_media::FileMedia;
+use media::{CacheFile, CacheMedia};
 
 const CACHE_FILE: &str = "l2.cache";
 const SLOT_BYTES: u64 = 40;
@@ -35,6 +42,10 @@ const SYNC_BYTES: u64 = 64 * 1024 * 1024;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// One token per seven admission bytes bounds promotions to one eighth of
+// combined append traffic; the segment cap also limits short bursts.
+const PROMOTION_EARN_DIVISOR: u64 = 7;
+const PROMOTION_CAP_DIVISOR: u64 = 8;
 
 /// Configuration for the optional persistent encoded-body cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +57,18 @@ pub struct PersistentCacheConfig {
     pub capacity_bytes: u64,
 }
 
+/// Opaque media selection for a persistent cache.
+///
+/// Callers normally omit this value to use native file media. Simulation media
+/// constructs a handle carrying its compact cache geometry.
+#[derive(Clone)]
+pub struct PersistentCacheMedia {
+    media: Arc<dyn CacheMedia>,
+    geometry: CacheGeometry,
+}
+
 #[derive(Clone, Copy)]
-pub(crate) struct CacheGeometry {
+struct CacheGeometry {
     magic: [u8; 8],
     format_version: u64,
     block_bytes: u64,
@@ -62,7 +83,7 @@ pub(crate) struct CacheGeometry {
     record_domain: &'static [u8],
 }
 
-pub(crate) const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
+const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
     magic: *b"GLDBL2\0\0",
     format_version: 1,
     block_bytes: 4 * 1024,
@@ -77,21 +98,25 @@ pub(crate) const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
     record_domain: b"glassdb-l2-record-v1",
 };
 
-#[cfg(test)]
-pub(crate) const TEST_GEOMETRY: CacheGeometry = CacheGeometry {
-    magic: *b"GL2TEST\0",
-    format_version: 1,
-    block_bytes: 4 * 1024,
-    minimum_record_bytes: 4 * 1024,
-    segment_bytes: 256 * 1024,
-    index_divisor: 64,
-    minimum_segments: 2,
-    identity_domain: b"glassdb-l2-identity-test-v1",
-    header_domain: b"glassdb-l2-header-test-v1",
-    marker_domain: b"glassdb-l2-clean-tail-test-v1",
-    path_domain: b"glassdb-l2-path-test-v1",
-    record_domain: b"glassdb-l2-record-test-v1",
-};
+#[cfg(any(test, feature = "sim"))]
+mod compact {
+    use super::CacheGeometry;
+
+    pub(super) const GEOMETRY: CacheGeometry = CacheGeometry {
+        magic: *b"GL2TEST\0",
+        format_version: 1,
+        block_bytes: 4 * 1024,
+        minimum_record_bytes: 4 * 1024,
+        segment_bytes: 256 * 1024,
+        index_divisor: 64,
+        minimum_segments: 2,
+        identity_domain: b"glassdb-l2-identity-test-v1",
+        header_domain: b"glassdb-l2-header-test-v1",
+        marker_domain: b"glassdb-l2-clean-tail-test-v1",
+        path_domain: b"glassdb-l2-path-test-v1",
+        record_domain: b"glassdb-l2-record-test-v1",
+    };
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -210,8 +235,20 @@ impl PersistentCache {
         config: PersistentCacheConfig,
         database_name: &str,
         database_id: DatabaseId,
+        media: Option<PersistentCacheMedia>,
     ) -> OpenedPersistentCache {
-        Self::open_on_worker(config, database_name, database_id, PRODUCTION_GEOMETRY).await
+        let media = media.unwrap_or_else(|| PersistentCacheMedia {
+            media: Arc::new(FileMedia),
+            geometry: PRODUCTION_GEOMETRY,
+        });
+        Self::open_on_media(
+            config,
+            database_name,
+            database_id,
+            media.geometry,
+            media.media,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -220,7 +257,33 @@ impl PersistentCache {
         database_name: &str,
         database_id: DatabaseId,
     ) -> OpenedPersistentCache {
-        Self::open_on_worker(config, database_name, database_id, TEST_GEOMETRY).await
+        Self::open_with_geometry(
+            config,
+            database_name,
+            database_id,
+            compact::GEOMETRY,
+            Arc::new(CacheMetrics::new()),
+            Arc::new(FileMedia),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_with_sim_media(
+        config: PersistentCacheConfig,
+        database_name: &str,
+        database_id: DatabaseId,
+        media: sim_media::SimMedia,
+    ) -> OpenedPersistentCache {
+        Self::open_with_geometry(
+            config,
+            database_name,
+            database_id,
+            compact::GEOMETRY,
+            Arc::new(CacheMetrics::new()),
+            Arc::new(media),
+        )
+        .await
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -409,51 +472,52 @@ impl PersistentCache {
                 inner.wake_for_shutdown();
             }
             inner.completion.wait().await;
+            inner.join_worker().await;
         };
         if rt::timeout(SHUTDOWN_TIMEOUT, shutdown).await.is_err() {
             inner.shared.disable();
-            tracing::warn!("persistent cache shutdown timed out; detaching its worker");
+            inner.abort_worker();
+            tracing::warn!("persistent cache shutdown timed out; aborting its worker");
         }
     }
 
-    async fn open_on_worker(
+    async fn open_on_media(
         config: PersistentCacheConfig,
         database_name: &str,
         database_id: DatabaseId,
         geometry: CacheGeometry,
+        media: Arc<dyn CacheMedia>,
     ) -> OpenedPersistentCache {
         let metrics = Arc::new(CacheMetrics::new());
-
-        // Real filesystem activity cannot be replayed by the deterministic
-        // executor. Fail open until the simulator has a modeled disk cache.
-        if rt::in_sim() {
-            tracing::warn!("persistent cache disabled in deterministic simulation");
-            return Self::disabled_open(metrics);
-        }
-
         let fallback_metrics = metrics.clone();
         let (completion, result) = oneshot::channel();
-        if let Err(error) = Self::spawn_worker(
+        let worker = match Self::spawn_worker(
             config,
             database_name.to_owned(),
             database_id,
             geometry,
             metrics,
+            media,
             completion,
         ) {
-            fallback_metrics.l2_error();
-            tracing::warn!(%error, "persistent-cache worker thread failed to start");
-            return Self::disabled_open(fallback_metrics);
-        }
+            Ok(worker) => worker,
+            Err(error) => {
+                fallback_metrics.l2_error();
+                tracing::warn!(%error, "persistent-cache worker failed to start");
+                return Self::disabled_open(fallback_metrics);
+            }
+        };
 
         match rt::timeout(OPEN_TIMEOUT, result).await {
-            Ok(Ok(cache)) => cache,
+            Ok(Ok(opened)) => Self::attach_worker(opened, worker),
             Ok(Err(_)) => {
+                worker.abort();
                 fallback_metrics.l2_error();
                 tracing::warn!("persistent-cache worker stopped during initialization");
                 Self::disabled_open(fallback_metrics)
             }
             Err(_) => {
+                worker.abort();
                 fallback_metrics.l2_error();
                 tracing::warn!("persistent-cache initialization timed out");
                 Self::disabled_open(fallback_metrics)
@@ -468,25 +532,31 @@ impl PersistentCache {
         database_id: DatabaseId,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
+        media: Arc<dyn CacheMedia>,
     ) -> OpenedPersistentCache {
         let fallback_metrics = metrics.clone();
         let (completion, result) = oneshot::channel();
-        let started = Self::spawn_worker(
+        let worker = Self::spawn_worker(
             config,
             database_name.to_owned(),
             database_id,
             geometry,
             metrics,
+            media,
             completion,
         );
-        if let Err(error) = started {
-            fallback_metrics.l2_error();
-            tracing::warn!(%error, "persistent-cache worker thread failed to start");
-            return Self::disabled_open(fallback_metrics);
-        }
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                fallback_metrics.l2_error();
+                tracing::warn!(%error, "persistent-cache worker failed to start");
+                return Self::disabled_open(fallback_metrics);
+            }
+        };
         match result.await {
-            Ok(opened) => opened,
+            Ok(opened) => Self::attach_worker(opened, worker),
             Err(_) => {
+                worker.abort();
                 fallback_metrics.l2_error();
                 tracing::warn!("persistent-cache worker stopped during initialization");
                 Self::disabled_open(fallback_metrics)
@@ -508,35 +578,46 @@ impl PersistentCache {
         }
     }
 
+    fn attach_worker(
+        opened: OpenedPersistentCache,
+        worker: rt::DedicatedJoinHandle<()>,
+    ) -> OpenedPersistentCache {
+        if let Some(inner) = &opened.cache.inner {
+            inner.attach_worker(worker);
+        }
+        opened
+    }
+
     fn spawn_worker(
         config: PersistentCacheConfig,
         database_name: String,
         database_id: DatabaseId,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
+        media: Arc<dyn CacheMedia>,
         completion: oneshot::Sender<OpenedPersistentCache>,
-    ) -> io::Result<()> {
-        std::thread::Builder::new()
-            .name("glassdb-l2".to_string())
-            .spawn(move || {
-                Self::run_opening_worker(
-                    config,
-                    database_name,
-                    database_id,
-                    geometry,
-                    metrics,
-                    completion,
-                );
-            })
-            .map(|_| ())
+    ) -> Result<rt::DedicatedJoinHandle<()>, rt::SpawnError> {
+        rt::spawn_dedicated("glassdb-l2", async move {
+            Self::run_opening_worker(
+                config,
+                database_name,
+                database_id,
+                geometry,
+                metrics,
+                media,
+                completion,
+            )
+            .await;
+        })
     }
 
-    fn run_opening_worker(
+    async fn run_opening_worker(
         config: PersistentCacheConfig,
         database_name: String,
         database_id: DatabaseId,
         geometry: CacheGeometry,
         metrics: Arc<CacheMetrics>,
+        media: Arc<dyn CacheMedia>,
         completion: oneshot::Sender<OpenedPersistentCache>,
     ) {
         let (disk, writer, last_sequence_point) = match open_disk(
@@ -545,7 +626,10 @@ impl PersistentCache {
             database_id,
             geometry,
             metrics.clone(),
-        ) {
+            media,
+        )
+        .await
+        {
             Ok(opened) => opened,
             Err(error) => {
                 metrics.l2_error();
@@ -565,7 +649,7 @@ impl PersistentCache {
         // A timed-out opener drops the receiver, so the worker must release the
         // file lock instead of becoming an unreachable detached cache.
         if completion.send(opened).is_ok() {
-            worker.run();
+            worker.run().await;
         }
     }
 }
@@ -633,10 +717,13 @@ impl Drop for FenceGuard {
 
 struct CacheInner {
     shared: Arc<Shared>,
-    sender: SyncSender<Work>,
+    sender: mpsc::Sender<Work>,
+    // Orders producers against shutdown so no work enters after shutdown starts.
     enqueue_gate: Mutex<()>,
     shutdown_started: AtomicBool,
     completion: Arc<Completion>,
+    worker_joined: Completion,
+    worker: Mutex<Option<rt::DedicatedJoinHandle<()>>>,
 }
 
 impl CacheInner {
@@ -645,7 +732,7 @@ impl CacheInner {
         writer: WriterState,
         metrics: Arc<CacheMetrics>,
     ) -> (Self, CacheWorker) {
-        let (sender, receiver) = mpsc::sync_channel(WORK_QUEUE_ITEMS);
+        let (sender, receiver) = mpsc::channel(WORK_QUEUE_ITEMS);
         let completion = Arc::new(Completion::new());
         let shared = Arc::new(Shared {
             disk,
@@ -665,6 +752,8 @@ impl CacheInner {
                 enqueue_gate: Mutex::new(()),
                 shutdown_started: AtomicBool::new(false),
                 completion: completion.clone(),
+                worker_joined: Completion::new(),
+                worker: Mutex::new(None),
             },
             CacheWorker {
                 shared,
@@ -673,6 +762,26 @@ impl CacheInner {
                 completion,
             },
         )
+    }
+
+    fn attach_worker(&self, worker: rt::DedicatedJoinHandle<()>) {
+        *self.worker.lock().unwrap() = Some(worker);
+    }
+
+    fn abort_worker(&self) {
+        if let Some(worker) = self.worker.lock().unwrap().as_ref() {
+            worker.abort();
+        }
+    }
+
+    async fn join_worker(&self) {
+        let worker = self.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
+            self.worker_joined.finish();
+        } else {
+            self.worker_joined.wait().await;
+        }
     }
 
     fn enqueue_required(&self, work: Work) {
@@ -688,7 +797,7 @@ impl CacheInner {
                 self.disable_message("persistent-cache required-work queue is full");
                 drop(work);
             }
-            Err(TrySendError::Disconnected(work)) => {
+            Err(TrySendError::Closed(work)) => {
                 self.disable_message("persistent-cache worker stopped");
                 drop(work);
             }
@@ -717,7 +826,7 @@ impl CacheInner {
             Err(error) => {
                 self.shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
                 let work = match error {
-                    TrySendError::Full(work) | TrySendError::Disconnected(work) => work,
+                    TrySendError::Full(work) | TrySendError::Closed(work) => work,
                 };
                 work.remove_promotion(&self.shared);
                 false
@@ -737,17 +846,25 @@ impl CacheInner {
     }
 }
 
+impl Drop for CacheInner {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.get_mut().unwrap().take() {
+            worker.abort();
+        }
+    }
+}
+
 struct CacheWorker {
     shared: Arc<Shared>,
     writer: WriterState,
-    receiver: Receiver<Work>,
+    receiver: mpsc::Receiver<Work>,
     completion: Arc<Completion>,
 }
 
 impl CacheWorker {
-    fn run(self) {
+    async fn run(self) {
         let _completion = CompletionGuard(self.completion);
-        run_worker(self.shared, self.writer, self.receiver);
+        run_worker(self.shared, self.writer, self.receiver).await;
     }
 }
 
@@ -845,11 +962,6 @@ enum Work {
     Lookup {
         path: Arc<str>,
         completion: oneshot::Sender<Option<EncodedBody>>,
-    },
-    #[cfg(test)]
-    Stall {
-        entered: mpsc::Sender<()>,
-        release: Receiver<()>,
     },
     Replace {
         path: Arc<str>,
@@ -968,7 +1080,7 @@ impl HitFilter {
 }
 
 struct Disk {
-    file: File,
+    file: Arc<dyn CacheFile>,
     geometry: CacheGeometry,
     layout: Layout,
     identity: [u8; 32],
@@ -992,12 +1104,12 @@ struct Record {
 }
 
 impl Disk {
-    fn lookup(&self, path: &str) -> io::Result<Option<Record>> {
+    async fn lookup(&self, path: &str) -> io::Result<Option<Record>> {
         let fingerprint = self.path_fingerprint(path);
-        let mut slots = self.matching_slots(fingerprint)?;
+        let mut slots = self.matching_slots(fingerprint).await?;
         slots.sort_unstable_by_key(|slot| std::cmp::Reverse(slot.generation));
         for slot in slots {
-            match self.read_record(path, slot) {
+            match self.read_record(path, slot).await {
                 Ok(Some(record)) => return Ok(Some(record)),
                 Ok(None) => {}
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
@@ -1020,11 +1132,11 @@ impl Disk {
         u64::from_le_bytes(digest[..8].try_into().unwrap())
     }
 
-    fn matching_slots(&self, fingerprint: u64) -> io::Result<Vec<Slot>> {
+    async fn matching_slots(&self, fingerprint: u64) -> io::Result<Vec<Slot>> {
         let bucket = fingerprint % self.layout.bucket_count(self.geometry);
         let offset = self.layout.metadata_bytes + bucket * self.geometry.block_bytes;
         let mut bytes = vec![0; self.geometry.block_bytes as usize];
-        self.read_exact_at(&mut bytes, offset)?;
+        self.read_exact_at(&mut bytes, offset).await?;
         let mut slots = Vec::new();
         for raw in bytes.chunks_exact(SLOT_BYTES as usize) {
             let slot = decode_slot(raw);
@@ -1038,19 +1150,19 @@ impl Disk {
         Ok(slots)
     }
 
-    fn current_slot(&self, path: &str) -> io::Result<Option<Slot>> {
+    async fn current_slot(&self, path: &str) -> io::Result<Option<Slot>> {
         let fingerprint = self.path_fingerprint(path);
-        let mut slots = self.matching_slots(fingerprint)?;
+        let mut slots = self.matching_slots(fingerprint).await?;
         slots.sort_unstable_by_key(|slot| std::cmp::Reverse(slot.generation));
         for slot in slots {
-            if self.read_record(path, slot)?.is_some() {
+            if self.read_record(path, slot).await?.is_some() {
                 return Ok(Some(slot));
             }
         }
         Ok(None)
     }
 
-    fn last_sequence_point(&self) -> io::Result<Option<SequencePoint>> {
+    async fn last_sequence_point(&self) -> io::Result<Option<SequencePoint>> {
         let block_bytes = usize::try_from(self.geometry.block_bytes).map_err(|_| overflow())?;
         let scan_bytes = INDEX_SCAN_BYTES / block_bytes * block_bytes;
         let scan_bytes = scan_bytes.max(block_bytes);
@@ -1063,7 +1175,7 @@ impl Disk {
         while offset < index_end {
             let remaining = usize::try_from(index_end - offset).map_err(|_| overflow())?;
             let read_bytes = remaining.min(bytes.len());
-            self.read_exact_at(&mut bytes[..read_bytes], offset)?;
+            self.read_exact_at(&mut bytes[..read_bytes], offset).await?;
             for bucket in bytes[..read_bytes].chunks_exact(block_bytes) {
                 for raw in bucket.chunks_exact(SLOT_BYTES as usize) {
                     let slot = decode_slot(raw);
@@ -1087,7 +1199,7 @@ impl Disk {
         Ok(maximum)
     }
 
-    fn read_record(&self, path: &str, slot: Slot) -> io::Result<Option<Record>> {
+    async fn read_record(&self, path: &str, slot: Slot) -> io::Result<Option<Record>> {
         let Some(segment) = self.slot_range(slot) else {
             return Ok(None);
         };
@@ -1096,7 +1208,7 @@ impl Disk {
         }
         let record_len = usize::try_from(slot.record_bytes).map_err(|_| invalid_record())?;
         let mut bytes = vec![0; record_len];
-        self.read_exact_at(&mut bytes, slot.record_offset)?;
+        self.read_exact_at(&mut bytes, slot.record_offset).await?;
         if self.segment_generations[segment].load(Ordering::Acquire) != slot.generation {
             return Ok(None);
         }
@@ -1168,14 +1280,14 @@ impl Disk {
         (generation == slot.generation && generation != 0).then_some(segment)
     }
 
-    fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
-        self.file.read_exact_at(bytes, offset)?;
+    async fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+        self.file.read_exact_at(bytes, offset).await?;
         self.metrics.l2_read(bytes.len());
         Ok(())
     }
 
-    fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
-        self.file.write_all_at(bytes, offset)?;
+    async fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
+        self.file.write_all_at(bytes, offset).await?;
         self.metrics.l2_write(bytes.len());
         Ok(())
     }
@@ -1188,12 +1300,12 @@ struct WriterState {
     append_offset: u64,
     next_generation: u64,
     dirty_bytes: u64,
-    last_sync: Instant,
+    last_sync: rt::Instant,
     promotion_tokens: u64,
 }
 
 impl WriterState {
-    fn append(
+    async fn append(
         &mut self,
         path: &str,
         revision: &[u8],
@@ -1202,7 +1314,7 @@ impl WriterState {
     ) -> io::Result<Slot> {
         let record_bytes = record_bytes(revision.len(), body.len(), self.disk.geometry)
             .ok_or_else(invalid_record)?;
-        self.ensure_space(record_bytes)?;
+        self.ensure_space(record_bytes).await?;
         let segment = self.active_segment.expect("ensure_space selects a segment");
         let generation = self.disk.segment_generations[segment].load(Ordering::Acquire);
         let mut record = vec![0; record_bytes as usize];
@@ -1228,47 +1340,48 @@ impl WriterState {
             record_bytes,
             current_after,
         };
-        self.disk.write_all_at(&record, self.append_offset)?;
-        self.publish(slot)?;
+        self.disk.write_all_at(&record, self.append_offset).await?;
+        self.publish(slot).await?;
         self.append_offset += record_bytes;
         self.dirty_bytes = self.dirty_bytes.saturating_add(record_bytes + SLOT_BYTES);
         Ok(slot)
     }
 
-    fn invalidate(&mut self, path: &str) -> io::Result<()> {
+    async fn invalidate(&mut self, path: &str) -> io::Result<()> {
         let fingerprint = self.disk.path_fingerprint(path);
         let bucket = fingerprint % self.disk.layout.bucket_count(self.disk.geometry);
         let bucket_offset =
             self.disk.layout.metadata_bytes + bucket * self.disk.geometry.block_bytes;
         let mut bytes = vec![0; self.disk.geometry.block_bytes as usize];
-        self.disk.read_exact_at(&mut bytes, bucket_offset)?;
+        self.disk.read_exact_at(&mut bytes, bucket_offset).await?;
         let zero = [0u8; SLOT_BYTES as usize];
         for (index, raw) in bytes.chunks_exact(SLOT_BYTES as usize).enumerate() {
             let slot = decode_slot(raw);
             if slot.generation != 0 && slot.fingerprint == fingerprint {
                 self.disk
-                    .write_all_at(&zero, bucket_offset + index as u64 * SLOT_BYTES)?;
+                    .write_all_at(&zero, bucket_offset + index as u64 * SLOT_BYTES)
+                    .await?;
                 self.dirty_bytes = self.dirty_bytes.saturating_add(SLOT_BYTES);
             }
         }
         Ok(())
     }
 
-    fn sync_if_needed(&mut self, force_time: bool) -> io::Result<()> {
+    async fn sync_if_needed(&mut self, force_time: bool) -> io::Result<()> {
         if self.dirty_bytes == 0 {
             return Ok(());
         }
         if self.dirty_bytes >= SYNC_BYTES || force_time || self.last_sync.elapsed() >= SYNC_INTERVAL
         {
-            self.disk.file.sync_data()?;
+            self.disk.file.sync_data().await?;
             self.dirty_bytes = 0;
-            self.last_sync = Instant::now();
+            self.last_sync = rt::Instant::now();
         }
         Ok(())
     }
 
-    fn clean_shutdown(&mut self) -> io::Result<()> {
-        self.disk.file.sync_data()?;
+    async fn clean_shutdown(&mut self) -> io::Result<()> {
+        self.disk.file.sync_data().await?;
         let mut marker = vec![0; self.disk.geometry.block_bytes as usize];
         if let Some(segment) = self.active_segment {
             let generation = self.disk.segment_generations[segment].load(Ordering::Acquire);
@@ -1283,13 +1396,14 @@ impl WriterState {
             marker[16..48].copy_from_slice(&digest);
         }
         self.disk
-            .write_all_at(&marker, self.disk.geometry.block_bytes)?;
-        self.disk.file.sync_data()?;
+            .write_all_at(&marker, self.disk.geometry.block_bytes)
+            .await?;
+        self.disk.file.sync_data().await?;
         self.dirty_bytes = 0;
         Ok(())
     }
 
-    fn ensure_space(&mut self, record_bytes: u64) -> io::Result<()> {
+    async fn ensure_space(&mut self, record_bytes: u64) -> io::Result<()> {
         if let Some(segment) = self.active_segment {
             let end = self.disk.layout.segment_start(self.disk.geometry, segment)
                 + self.disk.geometry.segment_bytes;
@@ -1297,10 +1411,10 @@ impl WriterState {
                 return Ok(());
             }
         }
-        self.initialize_segment()
+        self.initialize_segment().await
     }
 
-    fn initialize_segment(&mut self) -> io::Result<()> {
+    async fn initialize_segment(&mut self) -> io::Result<()> {
         let mut unused = None;
         let mut oldest = None;
         for (index, generation) in self.disk.segment_generations.iter().enumerate() {
@@ -1323,7 +1437,7 @@ impl WriterState {
         header[0..8].copy_from_slice(&generation.to_le_bytes());
         header[8..16].copy_from_slice(&(!generation).to_le_bytes());
         let start = self.disk.layout.segment_start(self.disk.geometry, segment);
-        self.disk.write_all_at(&header, start)?;
+        self.disk.write_all_at(&header, start).await?;
         self.disk.segment_generations[segment].store(generation, Ordering::Release);
         self.active_segment = Some(segment);
         self.append_offset = start + self.disk.geometry.block_bytes;
@@ -1335,18 +1449,19 @@ impl WriterState {
         Ok(())
     }
 
-    fn publish(&mut self, slot: Slot) -> io::Result<()> {
+    async fn publish(&mut self, slot: Slot) -> io::Result<()> {
         let bucket = slot.fingerprint % self.disk.layout.bucket_count(self.disk.geometry);
         let bucket_offset =
             self.disk.layout.metadata_bytes + bucket * self.disk.geometry.block_bytes;
         let mut bytes = vec![0; self.disk.geometry.block_bytes as usize];
-        self.disk.read_exact_at(&mut bytes, bucket_offset)?;
+        self.disk.read_exact_at(&mut bytes, bucket_offset).await?;
         let zero = [0u8; SLOT_BYTES as usize];
         for (index, raw) in bytes.chunks_exact_mut(SLOT_BYTES as usize).enumerate() {
             let previous = decode_slot(raw);
             if previous.generation != 0 && previous.fingerprint == slot.fingerprint {
                 self.disk
-                    .write_all_at(&zero, bucket_offset + index as u64 * SLOT_BYTES)?;
+                    .write_all_at(&zero, bucket_offset + index as u64 * SLOT_BYTES)
+                    .await?;
                 raw.fill(0);
                 self.dirty_bytes = self.dirty_bytes.saturating_add(SLOT_BYTES);
             }
@@ -1373,53 +1488,49 @@ impl WriterState {
         let index = empty
             .or(stale)
             .unwrap_or_else(|| oldest.expect("a non-empty bucket has a replacement").0);
-        self.disk.write_all_at(
-            &encode_slot(slot),
-            bucket_offset + index as u64 * SLOT_BYTES,
-        )?;
+        self.disk
+            .write_all_at(
+                &encode_slot(slot),
+                bucket_offset + index as u64 * SLOT_BYTES,
+            )
+            .await?;
         Ok(())
     }
 }
 
-fn open_disk(
+async fn open_disk(
     config: PersistentCacheConfig,
     database_name: &str,
     database_id: DatabaseId,
     geometry: CacheGeometry,
     metrics: Arc<CacheMetrics>,
+    media: Arc<dyn CacheMedia>,
 ) -> io::Result<(Arc<Disk>, WriterState, Option<SequencePoint>)> {
     let layout = Layout::derive(config.capacity_bytes, geometry)?;
     let identity = identity_digest(geometry, database_name, database_id)?;
-    std::fs::create_dir_all(&config.directory)?;
-    let path = config.directory.join(CACHE_FILE);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
-    let current_len = file.metadata()?.len();
+    let file = media.open_exclusive(&config.directory).await?;
+    let current_len = file.len().await?;
     let valid = current_len == layout.capacity
         && current_len != 0
-        && header_valid(&file, geometry, layout, &identity, &metrics)?;
+        && header_valid(file.as_ref(), geometry, layout, &identity, &metrics).await?;
     if !valid {
         if current_len != 0 {
             tracing::info!(
-                path = %path.display(),
+                path = %config.directory.join(CACHE_FILE).display(),
                 current_bytes = current_len,
                 configured_bytes = layout.capacity,
                 "reinitializing incompatible persistent-cache container"
             );
         }
-        initialize_file(&file, geometry, layout, &identity, &metrics)?;
+        initialize_file(file.as_ref(), geometry, layout, &identity, &metrics).await?;
     }
 
     let mut generations = Vec::with_capacity(layout.segment_count);
     let mut maximum = 0;
     for segment in 0..layout.segment_count {
         let mut header = [0u8; 16];
-        file.read_exact_at(&mut header, layout.segment_start(geometry, segment))?;
+        file.read_exact_at(&mut header, layout.segment_start(geometry, segment))
+            .await?;
         metrics.l2_read(header.len());
         let generation = u64::from_le_bytes(header[0..8].try_into().unwrap());
         let complement = u64::from_le_bytes(header[8..16].try_into().unwrap());
@@ -1443,11 +1554,11 @@ fn open_disk(
         metrics,
     });
     let last_sequence_point = if valid {
-        disk.last_sequence_point()?
+        disk.last_sequence_point().await?
     } else {
         None
     };
-    let clean_tail = read_clean_tail(&disk, maximum)?;
+    let clean_tail = read_clean_tail(&disk, maximum).await?;
     let (active_segment, append_offset) = clean_tail.unwrap_or((None, 0));
     let writer = WriterState {
         disk: disk.clone(),
@@ -1456,43 +1567,43 @@ fn open_disk(
         append_offset,
         next_generation,
         dirty_bytes: 0,
-        last_sync: Instant::now(),
+        last_sync: rt::Instant::now(),
         promotion_tokens: 0,
     };
     Ok((disk, writer, last_sequence_point))
 }
 
-fn initialize_file(
-    file: &File,
+async fn initialize_file(
+    file: &dyn CacheFile,
     geometry: CacheGeometry,
     layout: Layout,
     identity: &[u8; 32],
     metrics: &CacheMetrics,
 ) -> io::Result<()> {
-    file.set_len(0)?;
-    file.set_len(layout.capacity)?;
-    rustix::fs::fallocate(file, FallocateFlags::empty(), 0, layout.capacity)?;
+    file.set_len(0).await?;
+    file.set_len(layout.capacity).await?;
+    file.allocate(layout.capacity).await?;
     let mut header = vec![0; geometry.block_bytes as usize];
     header[0..8].copy_from_slice(&geometry.magic);
     header[8..16].copy_from_slice(&geometry.format_version.to_le_bytes());
     header[16..48].copy_from_slice(identity);
     let digest = header_digest(geometry, &header[..48], layout.capacity);
     header[48..80].copy_from_slice(&digest);
-    file.write_all_at(&header, 0)?;
+    file.write_all_at(&header, 0).await?;
     metrics.l2_write(header.len());
-    file.sync_all()?;
+    file.sync_all().await?;
     Ok(())
 }
 
-fn header_valid(
-    file: &File,
+async fn header_valid(
+    file: &dyn CacheFile,
     geometry: CacheGeometry,
     layout: Layout,
     identity: &[u8; 32],
     metrics: &CacheMetrics,
 ) -> io::Result<bool> {
     let mut header = vec![0; geometry.block_bytes as usize];
-    file.read_exact_at(&mut header, 0)?;
+    file.read_exact_at(&mut header, 0).await?;
     metrics.l2_read(header.len());
     if header[0..8] != geometry.magic
         || u64::from_le_bytes(header[8..16].try_into().unwrap()) != geometry.format_version
@@ -1503,12 +1614,13 @@ fn header_valid(
     Ok(header[48..80] == header_digest(geometry, &header[..48], layout.capacity))
 }
 
-fn read_clean_tail(disk: &Disk, maximum: u64) -> io::Result<Option<(Option<usize>, u64)>> {
+async fn read_clean_tail(disk: &Disk, maximum: u64) -> io::Result<Option<(Option<usize>, u64)>> {
     if maximum == 0 {
         return Ok(None);
     }
     let mut marker = vec![0; disk.geometry.block_bytes as usize];
-    disk.read_exact_at(&mut marker, disk.geometry.block_bytes)?;
+    disk.read_exact_at(&mut marker, disk.geometry.block_bytes)
+        .await?;
     let generation = u64::from_le_bytes(marker[0..8].try_into().unwrap());
     let append_offset = u64::from_le_bytes(marker[8..16].try_into().unwrap());
     if generation != maximum
@@ -1537,11 +1649,11 @@ fn read_clean_tail(disk: &Disk, maximum: u64) -> io::Result<Option<(Option<usize
     Ok(None)
 }
 
-fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
+async fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
     if !shared.enabled.load(Ordering::Acquire) {
         return None;
     }
-    match shared.disk.lookup(path) {
+    match shared.disk.lookup(path).await {
         Ok(Some(record)) => {
             shared.metrics.l2_hit();
             Some(EncodedBody {
@@ -1563,41 +1675,44 @@ fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
     }
 }
 
-fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<Work>) {
+async fn run_worker(
+    shared: Arc<Shared>,
+    mut writer: WriterState,
+    mut receiver: mpsc::Receiver<Work>,
+) {
     loop {
         let work = if shared.shutdown_requested.load(Ordering::Acquire) {
             match receiver.try_recv() {
                 Ok(work) => work,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                    clean_shutdown(&shared, &mut writer);
+                    clean_shutdown(&shared, &mut writer).await;
                     break;
                 }
             }
         } else {
-            match receiver.recv_timeout(SYNC_INTERVAL) {
-                Ok(work) => work,
-                Err(RecvTimeoutError::Timeout) => {
+            tokio::select! {
+                biased;
+                work = receiver.recv() => {
+                    let Some(work) = work else {
+                        break;
+                    };
+                    work
+                }
+                _ = rt::sleep(SYNC_INTERVAL) => {
                     if shared.enabled.load(Ordering::Acquire)
-                        && let Err(error) = writer.sync_if_needed(true)
+                        && let Err(error) = writer.sync_if_needed(true).await
                         && shared.disable()
                     {
                         tracing::warn!(%error, "persistent cache disabled after sync failure");
                     }
                     continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
             }
         };
         let result = match work {
             Work::Lookup { path, completion } => {
                 shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
-                let _ = completion.send(lookup(&shared, &path));
-                Ok(())
-            }
-            #[cfg(test)]
-            Work::Stall { entered, release } => {
-                let _ = entered.send(());
-                let _ = release.recv();
+                let _ = completion.send(lookup(&shared, &path).await);
                 Ok(())
             }
             Work::Replace {
@@ -1609,12 +1724,12 @@ fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<W
                 _payload: _,
             } => {
                 let result = if shared.enabled.load(Ordering::Acquire) && fence.is_current() {
-                    let result = writer.append(&path, &revision, &body, current_after);
+                    let result = writer.append(&path, &revision, &body, current_after).await;
                     if let Ok(slot) = result {
-                        let earned = slot.record_bytes / 7;
+                        let earned = slot.record_bytes / PROMOTION_EARN_DIVISOR;
                         let cap = (writer.disk.geometry.segment_bytes
                             - writer.disk.geometry.block_bytes)
-                            / 8;
+                            / PROMOTION_CAP_DIVISOR;
                         writer.promotion_tokens =
                             writer.promotion_tokens.saturating_add(earned).min(cap);
                     }
@@ -1628,7 +1743,7 @@ fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<W
             }
             Work::Invalidate { path, fence } => {
                 let result = if shared.enabled.load(Ordering::Acquire) {
-                    writer.invalidate(&path)
+                    writer.invalidate(&path).await
                 } else {
                     Ok(())
                 };
@@ -1644,7 +1759,7 @@ fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<W
             } => {
                 shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
                 let result = if shared.enabled.load(Ordering::Acquire) {
-                    promote(&shared, &mut writer, &path, &fence, epoch)
+                    promote(&shared, &mut writer, &path, &fence, epoch).await
                 } else {
                     Ok(())
                 };
@@ -1654,13 +1769,13 @@ fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<W
                 result
             }
             Work::Shutdown => {
-                clean_shutdown(&shared, &mut writer);
+                clean_shutdown(&shared, &mut writer).await;
                 break;
             }
         };
         let _ = result;
         if shared.enabled.load(Ordering::Acquire)
-            && let Err(error) = writer.sync_if_needed(false)
+            && let Err(error) = writer.sync_if_needed(false).await
             && shared.disable()
         {
             tracing::warn!(%error, "persistent cache disabled after sync failure");
@@ -1668,9 +1783,9 @@ fn run_worker(shared: Arc<Shared>, mut writer: WriterState, receiver: Receiver<W
     }
 }
 
-fn clean_shutdown(shared: &Shared, writer: &mut WriterState) {
+async fn clean_shutdown(shared: &Shared, writer: &mut WriterState) {
     if shared.enabled.load(Ordering::Acquire)
-        && let Err(error) = writer.clean_shutdown()
+        && let Err(error) = writer.clean_shutdown().await
         && shared.disable()
     {
         tracing::warn!(%error, "persistent cache clean shutdown failed");
@@ -1685,7 +1800,7 @@ fn disable_after_work_error(shared: &Shared, result: &io::Result<()>) {
     }
 }
 
-fn promote(
+async fn promote(
     shared: &Shared,
     writer: &mut WriterState,
     path: &str,
@@ -1695,7 +1810,7 @@ fn promote(
     if fence.snapshot() != (epoch, false) {
         return Ok(());
     }
-    let Some(slot) = shared.disk.current_slot(path)? else {
+    let Some(slot) = shared.disk.current_slot(path).await? else {
         return Ok(());
     };
     let mut generations = shared
@@ -1717,13 +1832,15 @@ fn promote(
     if writer.promotion_tokens < slot.record_bytes {
         return Ok(());
     }
-    let Some(record) = shared.disk.read_record(path, slot)? else {
+    let Some(record) = shared.disk.read_record(path, slot).await? else {
         return Ok(());
     };
-    if fence.snapshot() != (epoch, false) || shared.disk.current_slot(path)? != Some(slot) {
+    if fence.snapshot() != (epoch, false) || shared.disk.current_slot(path).await? != Some(slot) {
         return Ok(());
     }
-    let promoted = writer.append(path, &record.revision, &record.body, record.current_after)?;
+    let promoted = writer
+        .append(path, &record.revision, &record.body, record.current_after)
+        .await?;
     writer.promotion_tokens -= promoted.record_bytes;
     Ok(())
 }
@@ -1854,6 +1971,7 @@ fn invalid_record() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::sim_media::{MediaFaultProfile, SimMedia};
     use super::*;
     use tempfile::TempDir;
 
@@ -1872,10 +1990,19 @@ mod tests {
             config(dir),
             "db",
             database_id,
-            TEST_GEOMETRY,
+            compact::GEOMETRY,
             Arc::new(CacheMetrics::new()),
+            Arc::new(FileMedia),
         )
         .await
+    }
+
+    async fn open_sim_result(
+        dir: &TempDir,
+        database_id: DatabaseId,
+        media: SimMedia,
+    ) -> OpenedPersistentCache {
+        PersistentCache::open_with_sim_media(config(dir), "db", database_id, media).await
     }
 
     fn config(dir: &TempDir) -> PersistentCacheConfig {
@@ -1931,24 +2058,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shutdown_returns_when_worker_is_stalled() {
+    async fn shutdown_returns_when_media_operation_is_stalled() {
         let dir = TempDir::new().unwrap();
-        let cache = open(&dir, id(1)).await;
+        let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 1);
+        let cache = open_sim_result(&dir, id(1), media.clone()).await.cache;
         let inner = cache.inner.as_ref().unwrap().clone();
-        let (entered, entered_rx) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
-        inner.enqueue_required(Work::Stall {
-            entered,
-            release: release_rx,
-        });
-        entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("worker did not enter the stalled operation");
+        let mut pause = media.pause_next_operation();
+        publish(&cache, "db/object", b"r1", b"body");
+        pause.wait_until_entered().await;
 
         cache.shutdown().await;
         assert!(!cache.is_enabled());
 
-        release.send(()).unwrap();
+        pause.resume();
         inner.completion.wait().await;
     }
 
@@ -2033,6 +2155,7 @@ mod tests {
             .shared
             .disk
             .current_slot("db/object")
+            .await
             .unwrap()
             .unwrap();
         let mut damaged = [0u8; 1];
@@ -2041,6 +2164,7 @@ mod tests {
             .disk
             .file
             .read_exact_at(&mut damaged, slot.record_offset + RECORD_HEADER_BYTES)
+            .await
             .unwrap();
         damaged[0] ^= 0xff;
         inner
@@ -2048,12 +2172,111 @@ mod tests {
             .disk
             .file
             .write_all_at(&damaged, slot.record_offset + RECORD_HEADER_BYTES)
+            .await
             .unwrap();
 
         assert!(reopened.lookup(Arc::from("db/object")).await.is_none());
         let stats = reopened.metrics.snapshot_and_reset();
         assert_eq!(stats.l2_errors, 1, "cache stats: {stats:?}");
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn simulated_crash_never_fabricates_a_partially_published_record() {
+        let dir = TempDir::new().unwrap();
+        let database_id = id(1);
+        let media = SimMedia::new(MediaFaultProfile::Healthy, (0..=255).collect(), 1);
+        let cache = open_sim_result(&dir, database_id, media.clone())
+            .await
+            .cache;
+        publish_at(&cache, "db/object", b"r1", b"body", point(17));
+        assert_eq!(
+            cache.lookup(Arc::from("db/object")).await.unwrap().body,
+            b"body"
+        );
+
+        media.crash();
+        drop(cache);
+        rt::yield_now().await;
+
+        let opened = open_sim_result(&dir, database_id, media).await;
+        assert!(
+            opened
+                .last_sequence_point
+                .is_none_or(|recovered| recovered == point(17)),
+            "recovery invented a sequence point"
+        );
+        if let Some(record) = opened.cache.lookup(Arc::from("db/object")).await {
+            assert_eq!(record.revision, b"r1");
+            assert_eq!(record.body, b"body");
+            assert_eq!(record.current_after, point(17));
+        }
+        opened.cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn simulated_corruption_of_each_format_region_is_fail_open() {
+        #[derive(Clone, Copy, Debug)]
+        enum Region {
+            Header,
+            CleanTail,
+            IndexSlot,
+            SegmentHeader,
+            Record,
+        }
+
+        for region in [
+            Region::Header,
+            Region::CleanTail,
+            Region::IndexSlot,
+            Region::SegmentHeader,
+            Region::Record,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let database_id = id(1);
+            let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 1);
+            let cache = open_sim_result(&dir, database_id, media.clone())
+                .await
+                .cache;
+            publish_at(&cache, "db/object", b"r1", b"body", point(17));
+            let record = cache.lookup(Arc::from("db/object")).await.unwrap();
+            assert_eq!(record.body, b"body");
+            let disk = &cache.inner.as_ref().unwrap().shared.disk;
+            let slot = disk.current_slot("db/object").await.unwrap().unwrap();
+            let layout = disk.layout;
+            let segment = disk
+                .segment_generations
+                .iter()
+                .position(|generation| generation.load(Ordering::Acquire) == slot.generation)
+                .unwrap();
+            cache.shutdown().await;
+            drop(cache);
+
+            let offset = match region {
+                Region::Header => 0,
+                Region::CleanTail => compact::GEOMETRY.block_bytes,
+                Region::IndexSlot => {
+                    let needle = encode_slot(slot);
+                    media
+                        .durable_bytes()
+                        .unwrap()
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                        .expect("published index slot was not durable") as u64
+                }
+                Region::SegmentHeader => layout.segment_start(compact::GEOMETRY, segment),
+                Region::Record => slot.record_offset + RECORD_HEADER_BYTES,
+            };
+            assert!(media.corrupt(offset, 0x80), "could not corrupt {region:?}");
+
+            let reopened = open_sim_result(&dir, database_id, media).await.cache;
+            if let Some(record) = reopened.lookup(Arc::from("db/object")).await {
+                assert_eq!(record.revision, b"r1", "region: {region:?}");
+                assert_eq!(record.body, b"body", "region: {region:?}");
+                assert_eq!(record.current_after, point(17), "region: {region:?}");
+            }
+            reopened.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -2111,7 +2334,7 @@ mod tests {
             &cache,
             "db/oversized",
             b"r1",
-            &vec![0; TEST_GEOMETRY.segment_bytes as usize],
+            &vec![0; compact::GEOMETRY.segment_bytes as usize],
         );
 
         assert!(cache.lookup(Arc::from("db/oversized")).await.is_none());
@@ -2148,43 +2371,66 @@ mod tests {
         cache.shutdown().await;
     }
 
-    #[test]
-    fn unclean_reopen_keeps_completed_records_without_reusing_the_old_tail() {
+    #[tokio::test]
+    async fn unclean_reopen_keeps_completed_records_without_reusing_the_old_tail() {
         let dir = TempDir::new().unwrap();
         let database_id = id(1);
         let metrics = Arc::new(CacheMetrics::new());
-        let (disk, mut writer, _) =
-            open_disk(config(&dir), "db", database_id, TEST_GEOMETRY, metrics).unwrap();
+        let (disk, mut writer, _) = open_disk(
+            config(&dir),
+            "db",
+            database_id,
+            compact::GEOMETRY,
+            metrics,
+            Arc::new(FileMedia),
+        )
+        .await
+        .unwrap();
         writer
             .append("db/object", b"r1", b"body", point(1))
+            .await
             .unwrap();
         let old_segment = writer.active_segment.unwrap();
         drop(writer);
         drop(disk);
 
         let metrics = Arc::new(CacheMetrics::new());
-        let (disk, mut recovered, last_sequence_point) =
-            open_disk(config(&dir), "db", database_id, TEST_GEOMETRY, metrics).unwrap();
+        let (disk, mut recovered, last_sequence_point) = open_disk(
+            config(&dir),
+            "db",
+            database_id,
+            compact::GEOMETRY,
+            metrics,
+            Arc::new(FileMedia),
+        )
+        .await
+        .unwrap();
         assert_eq!(last_sequence_point, Some(point(1)));
-        assert_eq!(disk.lookup("db/object").unwrap().unwrap().body, b"body");
+        assert_eq!(
+            disk.lookup("db/object").await.unwrap().unwrap().body,
+            b"body"
+        );
         assert_eq!(recovered.active_segment, None);
-        recovered.append("db/new", b"r2", b"new", point(2)).unwrap();
+        recovered
+            .append("db/new", b"r2", b"new", point(2))
+            .await
+            .unwrap();
         assert_ne!(recovered.active_segment, Some(old_segment));
     }
 
     #[test]
     fn test_format_is_not_a_production_file() {
-        assert_ne!(TEST_GEOMETRY.magic, PRODUCTION_GEOMETRY.magic);
+        assert_ne!(compact::GEOMETRY.magic, PRODUCTION_GEOMETRY.magic);
         assert_ne!(
-            TEST_GEOMETRY.header_domain,
+            compact::GEOMETRY.header_domain,
             PRODUCTION_GEOMETRY.header_domain
         );
     }
 
     #[test]
     fn record_size_is_charged_and_aligned() {
-        assert_eq!(record_bytes(2, 4, TEST_GEOMETRY), Some(4096));
-        assert_eq!(record_bytes(2, 4097, TEST_GEOMETRY), Some(4152));
+        assert_eq!(record_bytes(2, 4, compact::GEOMETRY), Some(4096));
+        assert_eq!(record_bytes(2, 4097, compact::GEOMETRY), Some(4152));
     }
 
     #[test]

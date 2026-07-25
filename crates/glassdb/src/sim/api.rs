@@ -11,7 +11,9 @@ use glassdb_backend::Backend;
 use crate::{CollectionPath, Database, Error};
 
 use super::harness::{SimWorkload, open_det_db};
-use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, assert_valid_listing, key_name, tiny_split_policy};
+use super::{
+    MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name, tiny_split_policy,
+};
 // ===========================================================================
 // Transaction API workload (inspired by FoundationDB FuzzApiCorrectness).
 //
@@ -266,8 +268,11 @@ impl SimWorkload for ApiWorkload {
         Mutex::new(ApiAcct::new(self.clients.len()))
     }
 
-    async fn open_db(backend: &Arc<dyn Backend>) -> Result<Database, Error> {
-        open_det_db(backend, tiny_split_policy()).await
+    async fn open_db(
+        backend: &Arc<dyn Backend>,
+        media: Option<SimMedia>,
+    ) -> Result<Database, Error> {
+        open_det_db(backend, tiny_split_policy(), media).await
     }
 
     async fn seed(&self, db: &Database) {

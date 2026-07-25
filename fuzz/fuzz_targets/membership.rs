@@ -1,14 +1,16 @@
 //! Deterministic membership/listing fuzz target (ADR-031 dynamic range sharding).
 //!
 //! libFuzzer bytes are split into an `rng_seed`, a [`MembershipWorkload`], a
-//! [`FaultConfig`], and the remaining bytes, which are halved into a *schedule
-//! tape* and a *fault tape* — the same layout as the `concurrent_tx` and `cycle`
-//! targets. Each client owns a disjoint slice of a small key universe and
-//! concurrently creates, deletes, and lists keys over a shared in-process
-//! backend on the in-repo deterministic executor ([`glassdb::rt`], `--cfg sim`).
-//! The databases open with a tiny split soft cap, so a couple of live keys
-//! overflow a leaf and drive B-link leaf/root splits, right-link traversal, and
-//! cross-leaf sorted listing.
+//! [`FaultConfig`], and the remaining bytes, which are deinterleaved into
+//! *schedule*, *backend-fault*, and *cache-media* tapes — the same layout as the
+//! `concurrent_tx` and `cycle` targets. The harness runs the decoded workload
+//! both without and with the persistent cache; the cached run uses only basic
+//! media delays and pre-effect failures. Each client owns a disjoint slice of a
+//! small key universe and concurrently creates, deletes, and lists keys over a
+//! shared in-process backend on the in-repo deterministic executor
+//! ([`glassdb::rt`], `--cfg sim`). The databases open with a tiny split soft
+//! cap, so a couple of live keys overflow a leaf and drive B-link leaf/root
+//! splits, right-link traversal, and cross-leaf sorted listing.
 //!
 //! The generic harness ([`glassdb::sim::replay_input`]) asserts that every
 //! committed listing is strictly sorted and drawn from the key universe, and

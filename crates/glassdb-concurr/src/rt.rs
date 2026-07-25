@@ -11,7 +11,12 @@
 //! branch-poll RNG; see `exec::block_on_with`).
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use futures::FutureExt;
+use tokio_util::sync::CancellationToken;
 
 /// Error returned when a runtime-seam deadline expires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,9 +30,144 @@ impl std::fmt::Display for TimedOut {
 
 impl std::error::Error for TimedOut {}
 
+/// Error returned when a dedicated task cannot be started.
+#[derive(Debug)]
+pub enum SpawnError {
+    /// No Tokio runtime is active to drive the dedicated future.
+    RuntimeUnavailable,
+    /// The operating-system thread could not be created.
+    Thread(std::io::Error),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::RuntimeUnavailable => write!(f, "no runtime is available"),
+            SpawnError::Thread(error) => {
+                write!(f, "dedicated thread could not be started: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SpawnError::RuntimeUnavailable => None,
+            SpawnError::Thread(error) => Some(error),
+        }
+    }
+}
+
+/// Failure reported when joining a dedicated task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DedicatedJoinError {
+    /// The task was cooperatively cancelled.
+    Cancelled,
+    /// The task panicked while being polled.
+    Panicked,
+}
+
+impl std::fmt::Display for DedicatedJoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DedicatedJoinError::Cancelled => write!(f, "dedicated task was cancelled"),
+            DedicatedJoinError::Panicked => write!(f, "dedicated task panicked"),
+        }
+    }
+}
+
+impl std::error::Error for DedicatedJoinError {}
+
+enum DedicatedOutcome<T> {
+    Completed(T),
+    Cancelled,
+    Panicked,
+}
+
+/// A handle to a task driven by a dedicated production thread or a simulated
+/// executor task.
+///
+/// Dropping the handle detaches the task. Call [`DedicatedJoinHandle::abort`]
+/// to request cooperative cancellation.
+pub struct DedicatedJoinHandle<T> {
+    result: tokio::sync::oneshot::Receiver<DedicatedOutcome<T>>,
+    abort: CancellationToken,
+}
+
+impl<T> DedicatedJoinHandle<T> {
+    /// Requests cancellation. The future is dropped when its driver can next
+    /// poll the cancellation signal.
+    pub fn abort(&self) {
+        self.abort.cancel();
+    }
+}
+
+impl<T> Future for DedicatedJoinHandle<T> {
+    type Output = Result<T, DedicatedJoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().result)
+            .poll(cx)
+            .map(|outcome| match outcome {
+                Ok(DedicatedOutcome::Completed(value)) => Ok(value),
+                Ok(DedicatedOutcome::Cancelled) => Err(DedicatedJoinError::Cancelled),
+                Ok(DedicatedOutcome::Panicked) | Err(_) => Err(DedicatedJoinError::Panicked),
+            })
+    }
+}
+
+async fn drive_dedicated<F>(future: F, abort: CancellationToken) -> DedicatedOutcome<F::Output>
+where
+    F: Future,
+{
+    let future = std::panic::AssertUnwindSafe(future).catch_unwind();
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = abort.cancelled() => DedicatedOutcome::Cancelled,
+        result = &mut future => {
+            if abort.is_cancelled() {
+                DedicatedOutcome::Cancelled
+            } else {
+                match result {
+                    Ok(value) => DedicatedOutcome::Completed(value),
+                    Err(_) => DedicatedOutcome::Panicked,
+                }
+            }
+        },
+    }
+}
+
+fn spawn_dedicated_native<N, F>(
+    name: N,
+    future: F,
+) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
+where
+    N: Into<String>,
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| SpawnError::RuntimeUnavailable)?;
+    let abort = CancellationToken::new();
+    let abort_inner = abort.clone();
+    let (sender, result) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let outcome = runtime.block_on(drive_dedicated(future, abort_inner));
+            let _ = sender.send(outcome);
+        })
+        .map_err(SpawnError::Thread)?;
+    Ok(DedicatedJoinHandle { result, abort })
+}
+
 #[cfg(not(sim))]
 mod imp {
-    use super::{Duration, Future, TimedOut};
+    use super::{
+        DedicatedJoinHandle, Duration, Future, SpawnError, TimedOut, spawn_dedicated_native,
+    };
 
     pub use tokio::task::JoinHandle;
     pub use tokio::task::yield_now;
@@ -43,6 +183,13 @@ mod imp {
         std::time::SystemTime::now()
     }
 
+    /// Returns the host's available parallelism.
+    pub fn available_parallelism() -> usize {
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1)
+    }
+
     /// Spawns a task on the ambient tokio runtime.
     pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
     where
@@ -50,6 +197,19 @@ mod imp {
         F::Output: Send + 'static,
     {
         tokio::spawn(f)
+    }
+
+    /// Drives `future` on one newly created, named operating-system thread.
+    pub fn spawn_dedicated<N, F>(
+        name: N,
+        future: F,
+    ) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
+    where
+        N: Into<String>,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        spawn_dedicated_native(name, future)
     }
 
     /// Runs `future` until it completes or `duration` elapses.
@@ -72,7 +232,10 @@ mod imp {
 
     use crate::exec;
 
-    use super::{Duration, Future, TimedOut};
+    use super::{
+        DedicatedJoinHandle, Duration, Future, SpawnError, TimedOut, drive_dedicated,
+        spawn_dedicated_native,
+    };
 
     pub use crate::exec::{
         PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId, block_on_with, in_sim,
@@ -145,6 +308,12 @@ mod imp {
         } else {
             SystemTime::now()
         }
+    }
+
+    /// Returns one in simulation builds so shard geometry is independent of
+    /// host affinity, including in ordinary Tokio tests.
+    pub fn available_parallelism() -> usize {
+        1
     }
 
     /// Sleeps for `dur` on the active clock.
@@ -259,6 +428,114 @@ mod imp {
             JoinHandle::Tokio(tokio::spawn(f))
         }
     }
+
+    /// Drives `future` as an ordinary deterministic task when simulation is
+    /// active, or on one named operating-system thread otherwise.
+    pub fn spawn_dedicated<N, F>(
+        name: N,
+        future: F,
+    ) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
+    where
+        N: Into<String>,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        if exec::in_sim() {
+            let abort = CancellationToken::new();
+            let result = exec::det_spawn(drive_dedicated(future, abort.clone()));
+            Ok(DedicatedJoinHandle { result, abort })
+        } else {
+            spawn_dedicated_native(name, future)
+        }
+    }
 }
 
 pub use imp::*;
+
+#[cfg(test)]
+mod dedicated_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{DedicatedJoinError, sleep, spawn_dedicated};
+
+    #[tokio::test]
+    async fn dedicated_task_uses_a_named_native_thread() {
+        let caller = std::thread::current().id();
+        let task = spawn_dedicated("glassdb-dedicated-test", async move {
+            sleep(Duration::from_millis(1)).await;
+            (
+                std::thread::current().id(),
+                std::thread::current().name().map(str::to_owned),
+            )
+        })
+        .unwrap();
+
+        let (thread, name) = task.await.unwrap();
+        assert_ne!(thread, caller);
+        assert_eq!(name.as_deref(), Some("glassdb-dedicated-test"));
+    }
+
+    #[tokio::test]
+    async fn dedicated_abort_waits_for_a_blocking_poll_to_return() {
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let mut task = spawn_dedicated("glassdb-dedicated-blocked", async move {
+            entered.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dedicated task did not enter its blocking poll");
+
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        assert_eq!(task.await, Err(DedicatedJoinError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn dedicated_panic_is_normalized() {
+        let task = spawn_dedicated("glassdb-dedicated-panic", async move {
+            panic!("dedicated test panic");
+        })
+        .unwrap();
+        assert_eq!(task.await, Err(DedicatedJoinError::Panicked));
+    }
+
+    #[tokio::test]
+    async fn dropping_dedicated_handle_detaches() {
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let (finished, finished_rx) = tokio::sync::oneshot::channel();
+        let task = spawn_dedicated("glassdb-dedicated-detach", async move {
+            let _ = release_rx.await;
+            let _ = finished.send(());
+        })
+        .unwrap();
+        drop(task);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("detached task did not finish")
+            .unwrap();
+    }
+
+    #[cfg(sim)]
+    #[test]
+    fn active_simulation_uses_an_executor_task() {
+        let caller = std::thread::current().id();
+        super::block_on_with(super::TapeScheduler::new(Vec::new()), 0, async move {
+            let task = spawn_dedicated("not-a-native-thread", async move {
+                super::yield_now().await;
+                std::thread::current().id()
+            })
+            .unwrap();
+            assert_eq!(task.await.unwrap(), caller);
+        });
+    }
+}

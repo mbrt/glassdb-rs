@@ -10,6 +10,7 @@ description = "GlassDB storage layer (internal crate)."
 workspace = true
 
 [dependencies]
+async-trait = "0.1.89"
 base64 = "0.22.1"
 glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
@@ -23,11 +24,14 @@ thiserror = "2.0.18"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1.44"
 
+[features]
+default = []
+sim = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
-async-trait = "0.1.89"
 criterion = "0.8.2"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }

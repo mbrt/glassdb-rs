@@ -3,7 +3,8 @@
 //! every input the fuzzer has ever found interesting must still satisfy its
 //! invariant (the serializability bound for `concurrent_tx`, the ring invariant
 //! for `cycle`, the sorted-listing + membership bound for `membership`, and
-//! the modeled transaction-API states for `api_correctness`).
+//! the modeled transaction-API states for `api_correctness`), both without and
+//! with the persistent cache enabled.
 //!
 //! Like the other simulation self-checks, this only builds under the in-repo
 //! deterministic executor with the `sim` harness feature:

@@ -274,7 +274,9 @@ mod tests {
     #[tokio::test]
     async fn missing_preseeded_key_is_not_treated_as_zero() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let db = open_det_db(&backend, SplitPolicy::default()).await.unwrap();
+        let db = open_det_db(&backend, SplitPolicy::default(), None)
+            .await
+            .unwrap();
         let collection = db
             .root_collection()
             .create_collection_if_absent(INCREMENT_COLLECTION)

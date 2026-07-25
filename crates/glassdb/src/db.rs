@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Clock, RetryConfig};
+use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::{
     CachedStore, CollectionRoot, Directory, Observation, PersistentCache, PersistentCacheConfig,
-    Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
+    PersistentCacheMedia, Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
     Algo, CollectionPublish, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator,
@@ -33,6 +33,12 @@ const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 /// replays are byte-identical.
 const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
 
+#[derive(Clone)]
+struct PersistentCacheSetup {
+    config: PersistentCacheConfig,
+    media: Option<PersistentCacheMedia>,
+}
+
 /// Builds and opens a [`Database`], tweaking optional settings before opening.
 ///
 /// Start from [`Database::builder`], chain any setters, then call
@@ -43,7 +49,7 @@ pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     cache_size: usize,
-    persistent_cache: Option<PersistentCacheConfig>,
+    persistent_cache: Option<PersistentCacheSetup>,
     deterministic_time: bool,
     retry: RetryConfig,
     split_policy: SplitPolicy,
@@ -63,9 +69,8 @@ impl DatabaseBuilder {
     ///
     /// The cache identity is derived automatically from the database name and
     /// its persistent ID. Production capacities must be at least 131 MiB.
-    pub fn persistent_cache(mut self, config: PersistentCacheConfig) -> Self {
-        self.persistent_cache = Some(config);
-        self
+    pub fn persistent_cache(self, config: PersistentCacheConfig) -> Self {
+        self.configure_persistent_cache(config, None)
     }
 
     /// Sets the delay before the first retry of a transient
@@ -132,12 +137,12 @@ impl DatabaseBuilder {
         let database_id = check_or_create_db_meta(&backend, &name).await?;
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let (persistent, timeline) = match persistent_cache {
-            Some(config) => {
-                let opened = PersistentCache::open(config, &name, database_id).await;
-                // ADR-045: PersistentCache keeps track of sequence points
-                // across restarts, so the timeline must start after the last
-                // recovered point. If done incorrectly, a stale object in cache
-                // could appear as newer than a fresh read from Backend
+            Some(setup) => {
+                let opened =
+                    PersistentCache::open(setup.config, &name, database_id, setup.media).await;
+                // ADR-045: PersistentCache keeps track of sequence points across
+                // restarts, so a stale cached object cannot appear newer than a
+                // fresh backend read.
                 let timeline = Timeline::starting_after(opened.last_sequence_point);
                 (Some(opened.cache), timeline)
             }
@@ -235,6 +240,16 @@ impl DatabaseBuilder {
             background: bg,
         });
         Ok(Database { inner })
+    }
+
+    /// Configures the persistent cache with an optional explicit media.
+    pub(crate) fn configure_persistent_cache(
+        mut self,
+        config: PersistentCacheConfig,
+        media: Option<PersistentCacheMedia>,
+    ) -> Self {
+        self.persistent_cache = Some(PersistentCacheSetup { config, media });
+        self
     }
 
     fn new(name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
@@ -525,7 +540,7 @@ impl DbInner {
             tx_n: 1,
             ..Default::default()
         };
-        let begin = std::time::Instant::now();
+        let begin = rt::Instant::now();
         let res = self.tx_impl(f, &mut stats).await;
         stats.tx_time = begin.elapsed();
         self.update_stats(&stats);
