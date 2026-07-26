@@ -633,7 +633,7 @@ impl DbInner {
                     // recovers it from the handle, so no separate clone is kept.
                     match handle.as_mut() {
                         None => {
-                            let h = self.algo.begin_with_collections(access, collection_access);
+                            let h = self.algo.begin(access, collection_access);
                             abort_guard.arm(h.id().clone());
                             handle = Some(h);
                         }
@@ -651,7 +651,7 @@ impl DbInner {
                     let collection_ro = collection_access.into_read_only();
                     match handle.as_mut() {
                         None => {
-                            let h = self.algo.begin_with_collections(ro, collection_ro);
+                            let h = self.algo.begin(ro, collection_ro);
                             abort_guard.arm(h.id().clone());
                             handle = Some(h);
                         }

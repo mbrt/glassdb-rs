@@ -524,13 +524,13 @@ impl Algo {
         }
     }
 
-    /// Starts a new transaction with the given data. The id's random prefix and
-    /// timestamp are deterministic under `--cfg sim`.
-    pub fn begin(&self, d: Data) -> Handle {
+    /// Starts a new transaction with its key and collection-management data.
+    /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
+    pub fn begin(&self, data: Data, collection_data: CollectionData) -> Handle {
         let id = TxId::new_at(self.clock.now());
         Handle {
-            data: d,
-            collection_data: CollectionData::default(),
+            data,
+            collection_data,
             status: Status::New,
             id,
             attempts: 0,
@@ -540,13 +540,6 @@ impl Algo {
             prepared_collections: BTreeSet::new(),
             fenced_drops: BTreeSet::new(),
         }
-    }
-
-    /// Starts a transaction carrying both key and collection-management data.
-    pub fn begin_with_collections(&self, data: Data, collection_data: CollectionData) -> Handle {
-        let mut handle = self.begin(data);
-        handle.collection_data = collection_data;
-        handle
     }
 
     /// Restarts a wounded transaction, preserving its priority (timestamp) while
@@ -1808,8 +1801,12 @@ mod tests {
         }
     }
 
+    fn begin_data(tm: &Algo, data: Data) -> Handle {
+        tm.begin(data, CollectionData::default())
+    }
+
     async fn commit_access(tm: &Algo, d: Data) -> Handle {
-        let mut h = tm.begin(d);
+        let mut h = begin_data(tm, d);
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         h
@@ -1845,11 +1842,14 @@ mod tests {
         let keyp = key_ref(b"k");
         let val = b"v";
 
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, val)],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, val)],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
@@ -1887,11 +1887,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
 
         let r = do_read(&tctx, &readp).await;
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&writep, b"v")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&writep, b"v")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
@@ -1935,7 +1938,7 @@ mod tests {
                 op: CollectionOp::Create,
             }],
         };
-        let handle = tm.begin(Data::default());
+        let handle = begin_data(&tm, Data::default());
         let id = handle.id().clone();
         tm.mon.begin_tx(&id);
 
@@ -1963,7 +1966,7 @@ mod tests {
             TEST_DB,
             CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
         );
-        let mut handle = tm.begin(Data::default());
+        let mut handle = begin_data(&tm, Data::default());
         let id = handle.id().clone();
         tm.mon.begin_tx(&id);
         handle.status = Status::Validating;
@@ -2004,11 +2007,14 @@ mod tests {
         let _ = h;
 
         let r = do_read(&tctx, &keyp).await;
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2038,11 +2044,14 @@ mod tests {
         // Another client overwrites `k`, making `ra` stale.
         commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra],
+                writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
+                scans: Vec::new(),
+            },
+        );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
 
@@ -2074,11 +2083,14 @@ mod tests {
         // Another client overwrites the key, making `ra` stale.
         let h2 = commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra],
+                writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
+            },
+        );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(
             matches!(err, TransError::Wounded | TransError::Retry),
@@ -2149,11 +2161,14 @@ mod tests {
 
         // A younger transaction wants the same key; it cannot wound the holder.
         // Drive its commit concurrently so we can observe it parked waiting.
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"a")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"a")],
+                scans: Vec::new(),
+            },
+        );
         let id_before = h.id().clone();
         let tm2 = tm.clone();
         let committing = tokio::spawn(async move {
@@ -2527,11 +2542,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")]).await;
 
         flaky.arm();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let id_before = h.id().clone();
         tm.commit(&mut h)
             .await
@@ -2639,11 +2657,14 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2693,11 +2714,14 @@ mod tests {
         );
 
         tctx.locker.lock_calls_and_reset();
-        let mut handle = tm.begin(Data {
-            reads: vec![read],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut handle = begin_data(
+            &tm,
+            Data {
+                reads: vec![read],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let committing_tm = tm.clone();
         let committing = tokio::spawn(async move {
             let result = committing_tm.commit(&mut handle).await;
@@ -2741,11 +2765,14 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2766,11 +2793,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2877,11 +2907,14 @@ mod tests {
 
         // End to end: the writer commits over H1 (help-forwarding it into the
         // chain, not orphaning it), and its value reads back.
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
+            },
+        );
         let h2 = h.id().clone();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2914,11 +2947,14 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         flaky.arm();
-        let mut h = tm.begin(Data {
-            reads: vec![r.clone()],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r.clone()],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let orphan = h.id().clone();
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(
@@ -2963,11 +2999,14 @@ mod tests {
 
         log.lock().unwrap().clear();
         tctx.locker.lock_calls_and_reset();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2997,11 +3036,14 @@ mod tests {
 
         log.lock().unwrap().clear();
         tctx.locker.lock_calls_and_reset();
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wdel(&keyp)],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wdel(&keyp)],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3028,11 +3070,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&ka, b"v2"), wa(&kb, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&ka, b"v2"), wa(&kb, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3052,11 +3097,14 @@ mod tests {
         let ra = do_read(&tctx, &ka).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&kb, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra],
+                writes: vec![wa(&kb, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3075,11 +3123,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: Vec::new(),
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
     }
@@ -3405,11 +3456,14 @@ mod tests {
         let rb = do_read(&tctx, &kb).await;
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![ra, rb],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra, rb],
+                writes: Vec::new(),
+                scans: Vec::new(),
+            },
+        );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
         assert!(h.should_lock_reads());
@@ -3455,11 +3509,14 @@ mod tests {
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.last_writer.as_ref(), Some(&deleted_by));
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: Vec::new(),
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
     }
 
@@ -3470,11 +3527,14 @@ mod tests {
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wdel(&keyp)],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wdel(&keyp)],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3490,11 +3550,14 @@ mod tests {
         let k1 = key_ref(b"k1");
         let k2 = key_ref(b"k2");
 
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3589,7 +3652,7 @@ mod tests {
 
         // No concurrent change: the listing validates and commits.
         tctx.locker.lock_calls_and_reset();
-        let mut h = tm.begin(data.clone());
+        let mut h = begin_data(&tm, data.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         assert_eq!(tctx.locker.lock_calls_and_reset(), 0);
@@ -3597,7 +3660,7 @@ mod tests {
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
 
-        let mut stale = tm.begin(data);
+        let mut stale = begin_data(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
         assert!(
@@ -3672,7 +3735,7 @@ mod tests {
         });
         tctx.tmon.commit_tx(log).await.unwrap();
 
-        let mut stale = tm.begin(scan);
+        let mut stale = begin_data(&tm, scan);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
@@ -3685,7 +3748,7 @@ mod tests {
         let (mut data, _) = scan_data(&tctx).await;
         data.writes.push(wa(&key_path, b"updated"));
 
-        let mut handle = tm.begin(data);
+        let mut handle = begin_data(&tm, data);
         tm.commit(&mut handle).await.unwrap();
         let log = tctx
             .tlogger
@@ -3720,7 +3783,7 @@ mod tests {
         // Removing the old frontier means the refreshed two-key page reaches
         // into S1. The first locked validation only owns S0 and must retry.
         commit_writes(&tm, vec![wdel(&key_ref(b"b"))]).await;
-        let mut handle = tm.begin(stale);
+        let mut handle = begin_data(&tm, stale);
         let err = tm.commit(&mut handle).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
 
@@ -3761,7 +3824,7 @@ mod tests {
 
         commit_writes(&tm, vec![wdel(&bp)]).await;
 
-        let mut stale = tm.begin(data);
+        let mut stale = begin_data(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
@@ -3780,7 +3843,7 @@ mod tests {
         // produces), so the covered leaf set is no longer just `_i`.
         split_root_in_place(&tctx).await;
 
-        let mut stable = tm.begin(data);
+        let mut stable = begin_data(&tm, data);
         tm.commit(&mut stable).await.unwrap();
         tm.end(&mut stable).await.unwrap();
     }
@@ -3866,7 +3929,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stale = tm.begin(data);
+        let mut stale = begin_data(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
