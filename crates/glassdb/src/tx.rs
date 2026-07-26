@@ -513,7 +513,7 @@ impl Transaction {
         Transaction {
             reader: Reader::new(resolver.clone(), db.timeline.clone(), db.retry),
             resolver,
-            catalog: CollectionCatalog::new(db.shards.clone(), db.tmon.clone(), db.retry),
+            catalog: db.collection_catalog.clone(),
             db,
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }

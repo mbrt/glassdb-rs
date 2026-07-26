@@ -496,6 +496,7 @@ impl Algo {
         locker: Locker,
         coord: ShardCoordinator,
         mon: Monitor,
+        collection_catalog: CollectionCatalog,
         clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
@@ -503,8 +504,6 @@ impl Algo {
         split_policy: SplitPolicy,
         splitter: Splitter,
     ) -> Self {
-        let collection_catalog =
-            CollectionCatalog::new(shards.clone(), mon.clone(), RetryConfig::default());
         let collection_lifecycle =
             CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
         Algo {
@@ -1740,6 +1739,12 @@ mod tests {
             locker.clone(),
             coord.clone(),
             tmon.clone(),
+            CollectionCatalog::new(
+                shards.clone(),
+                tlogger.clone(),
+                tmon.clone(),
+                RetryConfig::default(),
+            ),
             Clock::real(),
             gc,
             None,

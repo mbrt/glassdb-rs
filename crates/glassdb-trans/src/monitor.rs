@@ -455,19 +455,6 @@ impl Monitor {
         Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
     }
 
-    /// Loads the complete persisted transaction log for lifecycle help.
-    pub(crate) async fn transaction_log_at(
-        &self,
-        tid: &TxId,
-        requirement: Requirement,
-    ) -> Result<TxLog, TransError> {
-        let observed = self.inner.tl.get_at(tid, requirement).await?;
-        observed
-            .value()
-            .map(|log| log.as_ref().clone())
-            .ok_or_else(|| TransError::other("transaction log disappeared during resolution"))
-    }
-
     /// Returns status at the requested bound and whether resolving it reused
     /// cached transaction state.
     pub(crate) async fn tx_status_at_with_cache(

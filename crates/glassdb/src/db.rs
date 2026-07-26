@@ -13,7 +13,8 @@ use glassdb_storage::{
     Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
-    Algo, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator, Splitter, TransError,
+    Algo, CollectionCatalog, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator,
+    Splitter, TransError,
 };
 use tokio::sync::Notify;
 
@@ -182,6 +183,8 @@ impl DatabaseBuilder {
             retry,
             protocol_timing,
         );
+        let collection_catalog =
+            CollectionCatalog::new(shards.clone(), tl.clone(), tmon.clone(), retry);
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         // Build the coordinator and splitter as a co-wired pair over one shared
@@ -215,6 +218,7 @@ impl DatabaseBuilder {
             locker.clone(),
             coord.clone(),
             tmon.clone(),
+            collection_catalog.clone(),
             clock,
             gc,
             Some(bg_weak),
@@ -230,6 +234,7 @@ impl DatabaseBuilder {
             objects,
             shards,
             timeline,
+            collection_catalog,
             tmon,
             algo,
             coord,
@@ -274,6 +279,7 @@ pub(crate) struct DbInner {
     pub(crate) objects: CachedStore,
     pub(crate) shards: ShardStore,
     pub(crate) timeline: Timeline,
+    pub(crate) collection_catalog: CollectionCatalog,
     pub(crate) tmon: Monitor,
     pub(crate) algo: Algo,
     pub(crate) coord: ShardCoordinator,

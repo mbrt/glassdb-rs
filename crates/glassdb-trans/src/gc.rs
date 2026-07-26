@@ -132,8 +132,12 @@ impl Gc {
         clock: Clock,
     ) -> Self {
         let dir = Directory::new(shards.clone());
-        let collection_catalog =
-            CollectionCatalog::new(shards.clone(), mon.clone(), RetryConfig::default());
+        let collection_catalog = CollectionCatalog::new(
+            shards.clone(),
+            tl.clone(),
+            mon.clone(),
+            RetryConfig::default(),
+        );
         let collection_lifecycle =
             CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
         Gc {
@@ -309,7 +313,7 @@ impl Gc {
         // collection forever merely because this same log stores a live value
         // in another collection.
         self.collection_catalog
-            .recover_write_back(tid, &log.locks)
+            .recover_write_back(tid, &log.collection_changes, &log.locks)
             .await?;
         let dropped = log
             .collection_changes

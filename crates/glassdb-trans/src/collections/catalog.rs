@@ -6,7 +6,7 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::{
     CollectionRoot, IndexNode, LeafObservation, LockType, Node, Requirement, ShardStore,
-    SplitPolicy, StorageError, TxCollectionOp, TxLock,
+    SplitPolicy, StorageError, TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock,
 };
 
 use super::{CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind, DirectorySnapshot};
@@ -18,6 +18,7 @@ use crate::wound_wait::resolve_tx_conflict;
 #[derive(Clone)]
 pub struct CollectionCatalog {
     shards: ShardStore,
+    transactions: TLogger,
     monitor: Monitor,
     retry: RetryConfig,
 }
@@ -40,9 +41,15 @@ fn directory_fits(root: &CollectionRoot, policy: &SplitPolicy) -> bool {
 
 impl CollectionCatalog {
     /// Creates access to transactional collection directories.
-    pub fn new(shards: ShardStore, monitor: Monitor, retry: RetryConfig) -> Self {
+    pub fn new(
+        shards: ShardStore,
+        transactions: TLogger,
+        monitor: Monitor,
+        retry: RetryConfig,
+    ) -> Self {
         Self {
             shards,
+            transactions,
             monitor,
             retry,
         }
@@ -165,22 +172,24 @@ impl CollectionCatalog {
             TxLock::Directory { collection, .. } => Some(collection),
             _ => None,
         }) {
-            self.write_back_one(parent, id, Some(changes)).await?;
+            self.write_back_one(parent, id, changes).await?;
         }
         Ok(())
     }
 
-    /// Finishes committed directory effects from their durable transaction log.
+    /// Finishes committed directory effects from durable transaction metadata.
     pub(crate) async fn recover_write_back(
         &self,
         id: &TxId,
+        changes: &[TxCollectionChange],
         locks: &[TxLock],
     ) -> Result<(), TransError> {
+        let changes = recover_collection_changes(changes);
         for parent in locks.iter().filter_map(|lock| match lock {
             TxLock::Directory { collection, .. } => Some(collection),
             _ => None,
         }) {
-            self.write_back_one(parent, id, None).await?;
+            self.write_back_one(parent, id, &changes).await?;
         }
         Ok(())
     }
@@ -251,7 +260,7 @@ impl CollectionCatalog {
             };
             match self.monitor.await_tx_final(&holder).await? {
                 TxFinalStatus::Committed => {
-                    self.write_back_one(parent, &holder, None).await?;
+                    self.help_committed_write_back(parent, &holder).await?;
                 }
                 TxFinalStatus::Aborted => {
                     root.remove_directory_holder(&holder);
@@ -315,7 +324,7 @@ impl CollectionCatalog {
         &self,
         parent: &CollectionAddress,
         id: &TxId,
-        local_changes: Option<&[CollectionChange]>,
+        changes: &[CollectionChange],
     ) -> Result<(), TransError> {
         let prefix = parent.physical_prefix();
         let mut backoff = self.retry.backoff();
@@ -331,32 +340,6 @@ impl CollectionCatalog {
             if !root.directory_lock().contains(id) {
                 return Ok(());
             }
-            let owned_changes;
-            let changes = match local_changes {
-                Some(changes) => changes,
-                None => {
-                    let log = self
-                        .monitor
-                        .transaction_log_at(id, Requirement::Any)
-                        .await?;
-                    owned_changes = log
-                        .collection_changes
-                        .into_iter()
-                        .filter(|change| &change.parent == parent)
-                        .map(|change| CollectionChange {
-                            parent: change.parent,
-                            name: change.name,
-                            collection: change.collection,
-                            expected: None,
-                            op: match change.op {
-                                TxCollectionOp::Create => CollectionOp::Create,
-                                TxCollectionOp::Drop => CollectionOp::Drop,
-                            },
-                        })
-                        .collect::<Vec<_>>();
-                    &owned_changes
-                }
-            };
             let mut changed = false;
             for change in changes.iter().filter(|change| &change.parent == parent) {
                 match change.op {
@@ -396,6 +379,48 @@ impl CollectionCatalog {
             rt::sleep(backoff.next_delay()).await;
         }
     }
+
+    /// Finishes a committed peer's directory effects from its durable log.
+    async fn help_committed_write_back(
+        &self,
+        parent: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError> {
+        let observed = self
+            .transactions
+            .get_at(id, Requirement::Any)
+            .await
+            .map_err(|error| {
+                TransError::Storage(error.context(format!("loading committed transaction {id}")))
+            })?;
+        let log = observed.value().ok_or_else(|| {
+            TransError::other(format!("committed transaction log disappeared for {id}"))
+        })?;
+        if log.status != TxCommitStatus::Ok {
+            return Err(TransError::other(format!(
+                "transaction {id} finalized as committed but its log has status {:?}",
+                log.status
+            )));
+        }
+        let changes = recover_collection_changes(&log.collection_changes);
+        self.write_back_one(parent, id, &changes).await
+    }
+}
+
+fn recover_collection_changes(changes: &[TxCollectionChange]) -> Vec<CollectionChange> {
+    changes
+        .iter()
+        .map(|change| CollectionChange {
+            parent: change.parent.clone(),
+            name: change.name.clone(),
+            collection: change.collection.clone(),
+            expected: None,
+            op: match change.op {
+                TxCollectionOp::Create => CollectionOp::Create,
+                TxCollectionOp::Drop => CollectionOp::Drop,
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -404,12 +429,12 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::Background;
-    use glassdb_storage::{CachedStore, TLogger, Timeline};
+    use glassdb_data::CollectionId;
+    use glassdb_storage::{CachedStore, TLogger, Timeline, TxLog};
 
     use super::*;
 
-    #[tokio::test]
-    async fn sole_directory_reader_can_upgrade_to_writer() {
+    fn new_catalog() -> (CollectionCatalog, ShardStore, Monitor, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(
             Arc::new(MemoryBackend::new()),
@@ -419,12 +444,20 @@ mod tests {
         );
         let shards = ShardStore::new(objects.clone());
         let background = Arc::new(Background::new());
-        let monitor = Monitor::new(
-            TLogger::new(objects, "db"),
-            timeline,
-            Arc::downgrade(&background),
+        let transactions = TLogger::new(objects, "db");
+        let monitor = Monitor::new(transactions.clone(), timeline, Arc::downgrade(&background));
+        let catalog = CollectionCatalog::new(
+            shards.clone(),
+            transactions,
+            monitor.clone(),
+            RetryConfig::default(),
         );
-        let catalog = CollectionCatalog::new(shards.clone(), monitor, RetryConfig::default());
+        (catalog, shards, monitor, background)
+    }
+
+    #[tokio::test]
+    async fn sole_directory_reader_can_upgrade_to_writer() {
+        let (catalog, shards, _monitor, _background) = new_catalog();
         let parent = CollectionAddress::root("db");
         let prefix = parent.physical_prefix();
         assert!(
@@ -447,5 +480,46 @@ mod tests {
         let (root, _) = shards.load_root(&prefix, Requirement::Any).await.unwrap();
         assert_eq!(root.directory_lock().lock_type(), LockType::Write);
         assert_eq!(root.directory_lock().holders(), std::slice::from_ref(&id));
+    }
+
+    #[tokio::test]
+    async fn snapshot_helps_a_committed_directory_holder() {
+        let (catalog, shards, monitor, _background) = new_catalog();
+        let parent = CollectionAddress::root("db");
+        let child = CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
+        );
+        let id = TxId::from_bytes(vec![1]);
+        let mut root = CollectionRoot::new();
+        root.set_directory_writer(id.clone());
+        assert!(
+            shards
+                .create_root(&parent.physical_prefix(), &root)
+                .await
+                .unwrap()
+        );
+        monitor.begin_tx(&id);
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks.push(TxLock::Directory {
+            collection: parent.clone(),
+            typ: LockType::Write,
+        });
+        log.collection_changes.push(TxCollectionChange {
+            parent: parent.clone(),
+            name: b"child".to_vec(),
+            collection: child.clone(),
+            op: TxCollectionOp::Create,
+        });
+        monitor.commit_tx(log).await.unwrap();
+
+        let snapshot = catalog.snapshot(&parent).await.unwrap();
+
+        assert_eq!(snapshot.children, vec![(b"child".to_vec(), child.id())]);
+        let (root, _) = shards
+            .load_root(&parent.physical_prefix(), Requirement::Any)
+            .await
+            .unwrap();
+        assert!(!root.directory_lock().contains(&id));
     }
 }
