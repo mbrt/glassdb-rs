@@ -319,19 +319,46 @@ pub fn structural_log_dir(db_root: &str) -> String {
     format!("{db_root}/_s/")
 }
 
-/// Returns the path of one structural-log record (`{db}/_s/<record_id>`).
-pub fn structural_log_record(db_root: &str, record_id: &str) -> String {
-    format!("{db_root}/_s/{record_id}")
+/// Returns one topology participant's structural-log directory
+/// (`{db}/_s/<participant_id>/`).
+pub fn structural_log_participant_dir(db_root: &str, participant: &TxId) -> String {
+    format!("{db_root}/_s/{}/", base64::encode(participant.as_bytes()))
+}
+
+/// Returns the path of one participant-owned structural-log record
+/// (`{db}/_s/<participant_id>/<record_id>`).
+pub fn structural_log_record(db_root: &str, participant: &TxId, record_id: &str) -> String {
+    format!(
+        "{}{record_id}",
+        structural_log_participant_dir(db_root, participant)
+    )
+}
+
+/// Decodes the participant and record id from a structural-log record path.
+pub fn structural_log_parts_of(path: &str) -> Result<(TxId, String), PathError> {
+    let Some((db_root, suffix)) = path.split_once("/_s/") else {
+        return Err(PathError::Parse(path.to_string()));
+    };
+    let Some((encoded_participant, record_id)) = suffix.split_once('/') else {
+        return Err(PathError::Parse(path.to_string()));
+    };
+    if db_root.is_empty()
+        || encoded_participant.is_empty()
+        || record_id.is_empty()
+        || record_id.contains('/')
+    {
+        return Err(PathError::Parse(path.to_string()));
+    }
+    let participant = TxId::from_bytes(base64::decode(encoded_participant)?);
+    if participant.is_unset() {
+        return Err(PathError::Parse(path.to_string()));
+    }
+    Ok((participant, record_id.to_string()))
 }
 
 /// Decodes the record id from a structural-log record path.
 pub fn structural_log_id_of(path: &str) -> Result<String, PathError> {
-    match path.rsplit('/').next() {
-        Some(id) if !id.is_empty() => Ok(id.to_string()),
-        _ => Err(PathError::Parse(format!(
-            "structural-log path has no record id: {path:?}"
-        ))),
-    }
+    structural_log_parts_of(path).map(|(_, record_id)| record_id)
 }
 
 /// Returns the database name at the start of a collection prefix.
@@ -538,12 +565,22 @@ mod tests {
 
     #[test]
     fn structural_log_record_round_trip() {
+        let participant = TxId::from_bytes(b"participant".to_vec());
         let record_id = "record";
-        let path = structural_log_record("db", record_id);
+        let path = structural_log_record("db", &participant, record_id);
         assert!(path.starts_with(&structural_log_dir("db")));
+        assert!(path.starts_with(&structural_log_participant_dir("db", &participant)));
+        assert_eq!(
+            structural_log_parts_of(&path).unwrap(),
+            (participant, record_id.to_string())
+        );
         assert_eq!(structural_log_id_of(&path).unwrap(), record_id);
         assert_eq!(structural_log_dir("db"), "db/_s/");
         assert_eq!(db_root_of("db/root/child"), "db");
+        assert!(structural_log_parts_of("db/_s/record").is_err());
+        assert!(structural_log_parts_of("db/_s//record").is_err());
+        assert!(structural_log_parts_of("db/_s/participant/").is_err());
+        assert!(structural_log_parts_of("db/_s/participant/record/extra").is_err());
     }
 
     #[test]

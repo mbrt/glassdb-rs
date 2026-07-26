@@ -272,8 +272,9 @@ pub mod node {
         Index(super::IndexNode),
     }
 }
-/// A split write-ahead record. It lives at `{db}/_s/<record_id>` until the
-/// created nodes are either reachable or reclaimed.
+/// A split write-ahead record. It lives at
+/// `{db}/_s/<participant_id>/<record_id>` until the created nodes are either
+/// reachable or reclaimed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StructuralLog {
     #[prost(string, tag = "1")]
@@ -291,6 +292,37 @@ pub struct StructuralLog {
     /// The lifecycle-topology participant that owns this record.
     #[prost(bytes = "vec", tag = "7")]
     pub participant_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "structural_log::Phase", tag = "8")]
+    pub phase: i32,
+}
+/// Nested message and enum types in `StructuralLog`.
+pub mod structural_log {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Phase {
+        Preparing = 0,
+        Ready = 1,
+    }
+    impl Phase {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Preparing => "PREPARING",
+                Self::Ready => "READY",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "PREPARING" => Some(Self::Preparing),
+                "READY" => Some(Self::Ready),
+                _ => None,
+            }
+        }
+    }
 }
 /// An index node body: an ordered list of separator entries. The child owning a
 /// key is the last entry whose separator_key is <= the key.

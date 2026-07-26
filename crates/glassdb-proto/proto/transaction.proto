@@ -135,9 +135,15 @@ message Node {
     bytes collection_delete_intent = 8;
 }
 
-// A split write-ahead record. It lives at `{db}/_s/<record_id>` until the
-// created nodes are either reachable or reclaimed.
+// A split write-ahead record. It lives at
+// `{db}/_s/<participant_id>/<record_id>` until the created nodes are either
+// reachable or reclaimed.
 message StructuralLog {
+    enum Phase {
+        PREPARING = 0;
+        READY = 1;
+    }
+
     string prefix = 1;
     string source_token = 2;
     string source_version = 3;
@@ -146,6 +152,7 @@ message StructuralLog {
     bool is_root = 6;
     // The lifecycle-topology participant that owns this record.
     bytes participant_id = 7;
+    Phase phase = 8;
 }
 
 // An index node body: an ordered list of separator entries. The child owning a

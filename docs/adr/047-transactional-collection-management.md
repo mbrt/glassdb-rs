@@ -5,6 +5,8 @@
 Accepted — implemented (`glassdb::Transaction` collection APIs,
 transaction-log collection manifests, root directory coordination, topology
 freeze participation, per-node delete intents, and asynchronous recovery/GC).
+Topology participation and settlement are refined by
+[ADR-049](049-participant-owned-topology-intents.md).
 
 Constituent decision of the
 [dynamic-range-sharding design](../designs/dynamic-range-sharding.md). Depends

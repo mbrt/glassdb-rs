@@ -47,7 +47,7 @@ pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitP
 pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
 pub use shardstore::{LeafKind, LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
-pub use structlog::StructuralLog;
+pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use timeline::{SequencePoint, Timeline};
 pub use tlogger::{
     TLogger, TValue, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxLog,

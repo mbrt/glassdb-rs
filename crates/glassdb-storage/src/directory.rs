@@ -12,7 +12,7 @@
 //! the decoded object store, so interior nodes stay cached and off the hot path) and
 //! never mutates the tree. Splitting and locking live above it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use glassdb_data::KeyRef;
 use glassdb_data::paths;
@@ -348,39 +348,53 @@ impl Directory {
         Ok(groups.into_values().collect())
     }
 
-    /// Collects every `_n` node token reachable from the collection root
-    /// (ADR-031): all index child pointers and every right-sibling link, walked
-    /// transitively. Structural split recovery uses this set to decide whether
-    /// its recorded created nodes became reachable. Empty when the collection
-    /// does not exist.
+    /// Reports whether descent for `key` reaches the node named `target`.
     ///
-    /// Reads freshly so a just-linked sibling is observed. A
-    /// missing child reference is skipped because there is no node to traverse.
-    pub async fn reachable_tokens(
+    /// A split's new right sibling owns its recorded split key, so recovery can
+    /// prove publication by following one B-link path instead of walking the
+    /// collection's whole tree.
+    pub async fn token_reachable_at_key(
         &self,
         prefix: &str,
+        key: &[u8],
+        target: &str,
         requirement: Requirement,
-    ) -> Result<BTreeSet<String>, StorageError> {
-        let mut reachable: BTreeSet<String> = BTreeSet::new();
-        let Some((root, _)) = self.shards.load_root_node(prefix, requirement).await? else {
-            return Ok(reachable);
-        };
-        // Seed the frontier with the root's direct references; the root itself
-        // has no token (it lives at `_i`).
-        let mut frontier: Vec<String> = referenced_tokens(&root);
-        while let Some(token) = frontier.pop() {
-            if !reachable.insert(token.clone()) {
-                continue;
-            }
-            match self.shards.load_node(prefix, &token, requirement).await {
-                Ok((node, _)) => frontier.extend(referenced_tokens(&node)),
-                // A dangling reference (already reclaimed, or a crashed create):
-                // it points at nothing, so there is nothing further to reach.
-                Err(StorageError::NotFound) => {}
-                Err(e) => return Err(e),
-            }
+    ) -> Result<bool, StorageError> {
+        let observation = self.shards.load_root_state(prefix, requirement).await?;
+        if observation.is_absent() {
+            return Ok(false);
         }
-        Ok(reachable)
+        let target_path = paths::from_node(prefix, target);
+        let mut cur = Located {
+            path: paths::collection_info(prefix),
+            cache_hit: observation.cache_hit(),
+            observation,
+        };
+        loop {
+            cur = match self
+                .step_right_until_owns(prefix, cur, key, requirement)
+                .await
+            {
+                Ok(cur) => cur,
+                Err(StorageError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if cur.path == target_path {
+                return Ok(true);
+            }
+            let token = match cur.node().body() {
+                NodeBody::Leaf(_) => return Ok(false),
+                NodeBody::Index(index) => index
+                    .child_for(key)
+                    .ok_or_else(|| StorageError::other("descent reached an empty index node"))?
+                    .to_string(),
+            };
+            cur = match self.load_child(prefix, &token, requirement).await {
+                Ok(child) => child.after(cur.cache_hit),
+                Err(StorageError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+        }
     }
 
     /// Finds the deepest index node that owns `key` — the parent of the leaf
@@ -529,19 +543,6 @@ impl Directory {
             self.load_child(prefix, &token, requirement).await
         }
     }
-}
-
-/// The `_n` tokens a node points at: its index children (if any) and its
-/// right-sibling link. The reachability walk follows these to find live nodes.
-fn referenced_tokens(node: &Node) -> Vec<String> {
-    let mut tokens: Vec<String> = match node.body() {
-        NodeBody::Index(index) => index.children().map(|(_, c)| c.to_string()).collect(),
-        NodeBody::Leaf(_) => Vec::new(),
-    };
-    if let Some(right) = node.right_sibling() {
-        tokens.push(right.to_string());
-    }
-    tokens
 }
 
 #[cfg(test)]

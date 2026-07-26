@@ -7,6 +7,15 @@ use glassdb_data::TxId;
 
 use crate::error::StorageError;
 
+/// Whether a split intent has captured the source version needed by recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralLogPhase {
+    /// Tokens are reserved, but no structural node may have been created yet.
+    Preparing,
+    /// The source is gated and node creation may have started.
+    Ready,
+}
+
 /// The structural state needed to resolve a crash-interrupted split.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralLog {
@@ -16,7 +25,8 @@ pub struct StructuralLog {
     pub created_tokens: Vec<String>,
     pub split_key: Vec<u8>,
     pub is_root: bool,
-    pub participant_id: Option<TxId>,
+    pub participant_id: TxId,
+    pub phase: StructuralLogPhase,
 }
 
 impl StructuralLog {
@@ -29,7 +39,7 @@ impl StructuralLog {
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
         let raw = pb::StructuralLog::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling structural log", e))?;
-        Ok(Self::from_proto(raw))
+        Self::from_proto(raw)
     }
 
     fn to_proto(&self) -> pb::StructuralLog {
@@ -40,25 +50,36 @@ impl StructuralLog {
             created_tokens: self.created_tokens.clone(),
             split_key: self.split_key.clone(),
             is_root: self.is_root,
-            participant_id: self
-                .participant_id
-                .as_ref()
-                .map(|id| id.as_bytes().to_vec())
-                .unwrap_or_default(),
+            participant_id: self.participant_id.as_bytes().to_vec(),
+            phase: match self.phase {
+                StructuralLogPhase::Preparing => pb::structural_log::Phase::Preparing.into(),
+                StructuralLogPhase::Ready => pb::structural_log::Phase::Ready.into(),
+            },
         }
     }
 
-    fn from_proto(raw: pb::StructuralLog) -> Self {
-        StructuralLog {
+    fn from_proto(raw: pb::StructuralLog) -> Result<Self, StorageError> {
+        let participant_id = TxId::from_bytes(raw.participant_id);
+        if participant_id.is_unset() {
+            return Err(StorageError::other(
+                "structural log has no topology participant",
+            ));
+        }
+        let phase = match pb::structural_log::Phase::try_from(raw.phase) {
+            Ok(pb::structural_log::Phase::Preparing) => StructuralLogPhase::Preparing,
+            Ok(pb::structural_log::Phase::Ready) => StructuralLogPhase::Ready,
+            Err(_) => return Err(StorageError::other("structural log has an invalid phase")),
+        };
+        Ok(StructuralLog {
             prefix: raw.prefix,
             source_token: raw.source_token,
             source_version: raw.source_version,
             created_tokens: raw.created_tokens,
             split_key: raw.split_key,
             is_root: raw.is_root,
-            participant_id: (!raw.participant_id.is_empty())
-                .then(|| TxId::from_bytes(raw.participant_id)),
-        }
+            participant_id,
+            phase,
+        })
     }
 }
 
@@ -75,7 +96,8 @@ mod tests {
             created_tokens: vec!["right".to_string()],
             split_key: b"m".to_vec(),
             is_root: false,
-            participant_id: Some(TxId::from_bytes(b"participant".to_vec())),
+            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            phase: StructuralLogPhase::Ready,
         };
         assert_eq!(StructuralLog::decode(&record.encode()).unwrap(), record);
     }
@@ -89,7 +111,8 @@ mod tests {
             created_tokens: vec!["left".to_string(), "right".to_string()],
             split_key: Vec::new(),
             is_root: true,
-            participant_id: None,
+            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            phase: StructuralLogPhase::Preparing,
         };
         assert_eq!(StructuralLog::decode(&record.encode()).unwrap(), record);
     }

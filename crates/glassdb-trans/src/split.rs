@@ -8,11 +8,15 @@
 //! enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
-//! a one-node structure-write lock. A database-wide `_s` record is written
-//! before any node object is created, so recovery can keep or delete created
-//! nodes from tree reachability after a crash:
+//! a one-node structure-write lock. Before joining the collection root, it
+//! writes a `Preparing` intent below its topology participant's `_s` prefix.
+//! After taking the source gate it conditionally advances that intent to
+//! `Ready`; only then may it create nodes. A lifecycle freeze can therefore
+//! find exactly one participant's work and cancel an unadvanced intent without
+//! racing late node creation:
 //!
-//! 0. Write the structural record with the source version and created tokens.
+//! 0. Advance the structural intent with the source version and split key; its
+//!    created-node tokens were reserved while `Preparing`.
 //! 1. Create the right sibling (`write_if_not_exists`) holding the upper half
 //!    and inheriting the source's former high-key and right-sibling.
 //! 2. **Shrink the source in one CAS** — drop the upper half, set high-key to the
@@ -35,7 +39,7 @@
 //! rewritten into a two-entry index over them, growing the tree's height while
 //! preserving the collection metadata.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -44,7 +48,8 @@ use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
     Directory, IndexNode, LeafObservation, LockType, Node, Observation, Requirement, Shard,
-    ShardStore, SplitPolicy, StorageError, StructuralLog, Timeline, TxCommitStatus, TxLock, TxLog,
+    ShardStore, SplitPolicy, StorageError, StructuralLog, StructuralLogPhase, Timeline,
+    TxCommitStatus, TxLock, TxLog,
 };
 use tokio::sync::Notify;
 
@@ -289,20 +294,31 @@ impl Splitter {
         if !self.mon.tx_status(id).await?.is_final() {
             return Err(TransError::Retry);
         }
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        let records = self
-            .shards
-            .list_structural_logs(collection.db_root(), requirement)
-            .await?;
-        for (_, observed) in records {
-            if observed.value().is_some_and(|record| {
-                record.prefix == collection.physical_prefix()
-                    && record.participant_id.as_ref() == Some(id)
-            }) {
+        let prefix = collection.physical_prefix();
+        loop {
+            let records = self
+                .shards
+                .list_structural_logs_for_participant(
+                    collection.db_root(),
+                    id,
+                    Requirement::AtLeast(self.timeline.now()),
+                )
+                .await?;
+            if records.is_empty() {
+                return self.leave_topology(&prefix, id).await;
+            }
+            for (_, observed) in records {
+                let record = observed.value().ok_or_else(|| {
+                    TransError::other("structural record disappeared after listing")
+                })?;
+                if record.prefix != prefix {
+                    return Err(TransError::other(
+                        "topology participant owns records for multiple collections",
+                    ));
+                }
                 self.recover_record(&observed).await?;
             }
         }
-        self.leave_topology(&collection.physical_prefix(), id).await
     }
 
     /// Creates a splitter over an explicitly co-wired coordinator and feed.
@@ -438,6 +454,56 @@ impl Splitter {
         }
     }
 
+    async fn begin_topology_tx(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
+        let collection = CollectionAddress::from_physical_prefix(prefix)
+            .map_err(|error| TransError::with_source("parsing collection prefix", error))?;
+        self.mon
+            .begin_persisted_tx(
+                id,
+                TxRecoveryManifest {
+                    locks: vec![TxLock::Topology { collection }],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+    }
+
+    /// Persists the participant-owned intent that makes a future root join
+    /// recoverable before any source gate or node creation can happen.
+    async fn prepare_structural_intent(
+        &self,
+        prefix: &str,
+        source_token: Option<&str>,
+        participant: &TxId,
+    ) -> Result<Observation<StructuralLog>, TransError> {
+        let is_root = source_token.is_none();
+        let created_tokens = if is_root {
+            vec![paths::random_node_token(), paths::random_node_token()]
+        } else {
+            vec![paths::random_node_token()]
+        };
+        let record_id = created_tokens
+            .last()
+            .expect("a split always reserves at least one token")
+            .clone();
+        Ok(self
+            .shards
+            .write_structural_log(
+                &record_id,
+                &StructuralLog {
+                    prefix: prefix.to_string(),
+                    source_token: source_token.unwrap_or_default().to_string(),
+                    source_version: String::new(),
+                    created_tokens,
+                    split_key: Vec::new(),
+                    is_root,
+                    participant_id: participant.clone(),
+                    phase: StructuralLogPhase::Preparing,
+                },
+            )
+            .await?)
+    }
+
     /// Splits `path` beneath an existing topology participant.
     async fn split_path_joined(
         &self,
@@ -452,23 +518,42 @@ impl Splitter {
         let worker = self.candidates.new_id();
         self.mon.begin_tx(&worker);
         let mut recovery_pending = false;
-        let result = if paths::is_collection_info(path) {
-            self.coordinate_root_split(
-                &parsed.prefix,
-                &worker,
-                topology_participant,
-                &mut recovery_pending,
-            )
+        let source_token = (!paths::is_collection_info(path)).then_some(parsed.suffix.as_str());
+        let result = match self
+            .prepare_structural_intent(&parsed.prefix, source_token, topology_participant)
             .await
-        } else {
-            self.coordinate_nonroot_split(
-                &parsed.prefix,
-                &parsed.suffix,
-                &worker,
-                topology_participant,
-                &mut recovery_pending,
-            )
-            .await
+        {
+            Ok(mut intent) => {
+                let coordinated = if paths::is_collection_info(path) {
+                    self.coordinate_root_split(
+                        &parsed.prefix,
+                        &worker,
+                        &mut intent,
+                        &mut recovery_pending,
+                    )
+                    .await
+                } else {
+                    self.coordinate_nonroot_split(
+                        &parsed.prefix,
+                        &parsed.suffix,
+                        &worker,
+                        &mut intent,
+                        &mut recovery_pending,
+                    )
+                    .await
+                };
+                if recovery_pending {
+                    coordinated
+                } else {
+                    coordinated.and(
+                        self.shards
+                            .delete_structural_log(&intent)
+                            .await
+                            .map_err(TransError::from),
+                    )
+                }
+            }
+            Err(error) => Err(error),
         };
         self.finalize_split(&worker).await;
         if result.is_err() {
@@ -723,17 +808,38 @@ impl Splitter {
     /// Halves a standalone node and finalizes its wound-wait participant.
     async fn split_nonroot(&self, prefix: &str, token: &str, id: TxId) -> Result<(), TransError> {
         let mut recovery_pending = false;
-        let result = match self.join_topology(prefix, &id).await {
-            Ok(()) => {
-                let result = self
-                    .coordinate_nonroot_split(prefix, token, &id, &id, &mut recovery_pending)
-                    .await;
-                if result.is_ok() || !recovery_pending {
-                    result.and(self.leave_topology(prefix, &id).await)
-                } else {
-                    result
+        let result = match self.begin_topology_tx(prefix, &id).await {
+            Ok(()) => match self
+                .prepare_structural_intent(prefix, Some(token), &id)
+                .await
+            {
+                Ok(mut intent) => {
+                    let result = match self.join_topology(prefix, &id).await {
+                        Ok(()) => {
+                            self.coordinate_nonroot_split(
+                                prefix,
+                                token,
+                                &id,
+                                &mut intent,
+                                &mut recovery_pending,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if result.is_ok() {
+                        result.and(self.leave_topology(prefix, &id).await)
+                    } else if recovery_pending {
+                        result
+                    } else {
+                        match self.shards.delete_structural_log(&intent).await {
+                            Ok(()) => result.and(self.leave_topology(prefix, &id).await),
+                            Err(error) => result.and(Err(error.into())),
+                        }
+                    }
                 }
-            }
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         self.finalize_topology_split(prefix, &id).await;
@@ -749,9 +855,22 @@ impl Splitter {
         prefix: &str,
         token: &str,
         worker: &TxId,
-        topology_participant: &TxId,
+        intent: &mut Observation<StructuralLog>,
         recovery_pending: &mut bool,
     ) -> Result<(), TransError> {
+        let prepared = intent
+            .value()
+            .filter(|record| {
+                record.phase == StructuralLogPhase::Preparing
+                    && !record.is_root
+                    && record.prefix == prefix
+                    && record.source_token == token
+                    && record.created_tokens.len() == 1
+            })
+            .ok_or_else(|| TransError::other("invalid prepared non-root split intent"))?
+            .as_ref()
+            .clone();
+        let right_token = prepared.created_tokens[0].clone();
         let Some((mut node, version)) = self
             .acquire_structural_gate(prefix, Some(token), worker)
             .await?
@@ -764,7 +883,6 @@ impl Splitter {
                 .await;
         }
 
-        let right_token = paths::random_node_token();
         let Some((right, split_key)) = node.split(&right_token) else {
             return self
                 .release_structural_gate(prefix, Some(token), worker)
@@ -772,27 +890,22 @@ impl Splitter {
         };
         node.remove_structural_gate(worker);
 
-        let record_id = right_token.clone();
-        let structural_record = self
-            .shards
-            .write_structural_log(
-                &record_id,
-                &StructuralLog {
-                    prefix: prefix.to_string(),
-                    source_token: token.to_string(),
-                    source_version: version
-                        .revision()
-                        .ok_or_else(|| TransError::other("split source is absent"))?
-                        .serialize()
-                        .to_string(),
-                    created_tokens: vec![right_token.clone()],
-                    split_key: split_key.clone(),
-                    is_root: false,
-                    participant_id: Some(topology_participant.clone()),
-                },
-            )
-            .await?;
+        let mut ready = prepared;
+        ready.source_version = version
+            .revision()
+            .ok_or_else(|| TransError::other("split source is absent"))?
+            .serialize()
+            .to_string();
+        ready.split_key = split_key.clone();
+        ready.phase = StructuralLogPhase::Ready;
         *recovery_pending = true;
+        let Some(ready_intent) = self.shards.update_structural_log(intent, &ready).await? else {
+            *recovery_pending = false;
+            self.release_structural_gate(prefix, Some(token), worker)
+                .await?;
+            return Err(TransError::Retry);
+        };
+        *intent = ready_intent;
 
         if !self
             .shards
@@ -809,28 +922,48 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        self.publish_separators(prefix, &split_key, &right_token, Some(topology_participant))
-            .await?;
-        self.shards
-            .delete_structural_log(&structural_record)
-            .await?;
+        self.publish_separators(
+            prefix,
+            &split_key,
+            &right_token,
+            Some(&ready.participant_id),
+        )
+        .await?;
+        self.shards.delete_structural_log(intent).await?;
         Ok(())
     }
 
     /// Grows an overflowing collection root into a two-child index.
     async fn split_root(&self, prefix: &str, id: TxId) -> Result<(), TransError> {
         let mut recovery_pending = false;
-        let result = match self.join_topology(prefix, &id).await {
-            Ok(()) => {
-                let result = self
-                    .coordinate_root_split(prefix, &id, &id, &mut recovery_pending)
-                    .await;
-                if result.is_ok() || !recovery_pending {
-                    result.and(self.leave_topology(prefix, &id).await)
-                } else {
-                    result
+        let result = match self.begin_topology_tx(prefix, &id).await {
+            Ok(()) => match self.prepare_structural_intent(prefix, None, &id).await {
+                Ok(mut intent) => {
+                    let result = match self.join_topology(prefix, &id).await {
+                        Ok(()) => {
+                            self.coordinate_root_split(
+                                prefix,
+                                &id,
+                                &mut intent,
+                                &mut recovery_pending,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if result.is_ok() {
+                        result.and(self.leave_topology(prefix, &id).await)
+                    } else if recovery_pending {
+                        result
+                    } else {
+                        match self.shards.delete_structural_log(&intent).await {
+                            Ok(()) => result.and(self.leave_topology(prefix, &id).await),
+                            Err(error) => result.and(Err(error.into())),
+                        }
+                    }
                 }
-            }
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         self.finalize_topology_split(prefix, &id).await;
@@ -841,17 +974,6 @@ impl Splitter {
     }
 
     async fn join_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
-        let collection = CollectionAddress::from_physical_prefix(prefix)
-            .map_err(|error| TransError::with_source("parsing collection prefix", error))?;
-        self.mon
-            .begin_persisted_tx(
-                id,
-                TxRecoveryManifest {
-                    locks: vec![TxLock::Topology { collection }],
-                    ..TxRecoveryManifest::default()
-                },
-            )
-            .await?;
         let mut backoff = self.retry.backoff();
         loop {
             let (mut root, observed) = match self.shards.load_root(prefix, Requirement::Any).await {
@@ -916,9 +1038,21 @@ impl Splitter {
         &self,
         prefix: &str,
         worker: &TxId,
-        topology_participant: &TxId,
+        intent: &mut Observation<StructuralLog>,
         recovery_pending: &mut bool,
     ) -> Result<(), TransError> {
+        let prepared = intent
+            .value()
+            .filter(|record| {
+                record.phase == StructuralLogPhase::Preparing
+                    && record.is_root
+                    && record.prefix == prefix
+                    && record.source_token.is_empty()
+                    && record.created_tokens.len() == 2
+            })
+            .ok_or_else(|| TransError::other("invalid prepared root split intent"))?
+            .as_ref()
+            .clone();
         let Some((node, version)) = self.acquire_structural_gate(prefix, None, worker).await?
         else {
             return Err(TransError::Retry);
@@ -927,11 +1061,13 @@ impl Splitter {
             return self.release_structural_gate(prefix, None, worker).await;
         }
 
-        let l_token = paths::random_node_token();
-        let r_token = paths::random_node_token();
+        let l_token = prepared.created_tokens[0].clone();
+        let r_token = prepared.created_tokens[1].clone();
         let (left, right, split_key) = split_into_children(&node, &r_token, worker);
-        let root_index =
-            IndexNode::from_children([(Vec::new(), l_token.clone()), (split_key, r_token.clone())]);
+        let root_index = IndexNode::from_children([
+            (Vec::new(), l_token.clone()),
+            (split_key.clone(), r_token.clone()),
+        ]);
         let index = Node::index(root_index);
         let mut sized_root = self.shards.load_root(prefix, Requirement::Any).await?.0;
         sized_root.set_node(index.clone());
@@ -949,27 +1085,21 @@ impl Splitter {
             ));
         }
 
-        let record_id = r_token.clone();
-        let structural_record = self
-            .shards
-            .write_structural_log(
-                &record_id,
-                &StructuralLog {
-                    prefix: prefix.to_string(),
-                    source_token: String::new(),
-                    source_version: version
-                        .revision()
-                        .ok_or_else(|| TransError::other("split source is absent"))?
-                        .serialize()
-                        .to_string(),
-                    created_tokens: vec![l_token.clone(), r_token.clone()],
-                    split_key: Vec::new(),
-                    is_root: true,
-                    participant_id: Some(topology_participant.clone()),
-                },
-            )
-            .await?;
+        let mut ready = prepared;
+        ready.source_version = version
+            .revision()
+            .ok_or_else(|| TransError::other("split source is absent"))?
+            .serialize()
+            .to_string();
+        ready.split_key = split_key;
+        ready.phase = StructuralLogPhase::Ready;
         *recovery_pending = true;
+        let Some(ready_intent) = self.shards.update_structural_log(intent, &ready).await? else {
+            *recovery_pending = false;
+            self.release_structural_gate(prefix, None, worker).await?;
+            return Err(TransError::Retry);
+        };
+        *intent = ready_intent;
 
         if !self
             .shards
@@ -989,9 +1119,7 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        self.shards
-            .delete_structural_log(&structural_record)
-            .await?;
+        self.shards.delete_structural_log(intent).await?;
         Ok(())
     }
 
@@ -1070,13 +1198,57 @@ impl Splitter {
             }
         };
         let active = !records.is_empty();
+        let mut participants = BTreeSet::new();
         for (record_id, record) in records {
+            if let Some(value) = record.value() {
+                participants.insert((value.prefix.clone(), value.participant_id.clone()));
+            }
             if let Err(e) = self.recover_record(&record).await {
                 tracing::debug!(
                     target: "glassdb::splitter",
                     record = %record_id,
                     error = %e,
                     "structural recovery deferred"
+                );
+            }
+        }
+        for (prefix, participant) in participants {
+            let status = match self.mon.tx_status(&participant).await {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "glassdb::splitter",
+                        error = %error,
+                        participant = %participant,
+                        "checking topology participant status failed"
+                    );
+                    continue;
+                }
+            };
+            if !status.is_final() {
+                continue;
+            }
+            let collection = match CollectionAddress::from_physical_prefix(&prefix) {
+                Ok(collection) => collection,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "glassdb::splitter",
+                        error = %error,
+                        participant = %participant,
+                        "parsing topology participant collection failed"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .settle_topology_participant(&collection, &participant)
+                .await
+            {
+                tracing::debug!(
+                    target: "glassdb::splitter",
+                    error = %error,
+                    participant = %participant,
+                    "settling topology participant failed"
                 );
             }
         }
@@ -1090,15 +1262,22 @@ impl Splitter {
     ) -> Result<(), TransError> {
         let record = observed
             .value()
-            .ok_or_else(|| TransError::other("structural record disappeared after listing"))?;
-        let participant = record.participant_id.clone();
-        let participant_prefix = record.prefix.clone();
+            .ok_or_else(|| TransError::other("structural record disappeared after listing"))?
+            .clone();
+        if record.phase == StructuralLogPhase::Preparing {
+            if self.mon.tx_status(&record.participant_id).await? == TxCommitStatus::Pending {
+                return Err(TransError::Retry);
+            }
+            // Unknown is cancellable too: the pending transaction is persisted
+            // before this intent, and cancellation only makes the worker's
+            // Ready CAS lose. This also reclaims an intent whose transaction
+            // tombstone was already collected before a late create appeared.
+            self.shards.delete_structural_log(observed).await?;
+            return Ok(());
+        }
         // Pin fencing and reachability to the record's own freshness rather than
-        // the listing epoch. A split acquires its source gate before writing this
-        // record, so the record's watermark is at least as fresh as that gate. An
-        // older listing epoch can otherwise be satisfied by a pre-split cached
-        // snapshot that shows neither the gate nor the created children, making an
-        // in-flight split look unapplied and reclaiming its now-live child.
+        // the listing epoch. The Ready transition follows source-gate
+        // acquisition, so its watermark is at least as fresh as that gate.
         let requirement = Requirement::AtLeast(observed.current_after());
         let source_token = (!record.is_root).then_some(record.source_token.as_str());
         if !self
@@ -1108,30 +1287,59 @@ impl Splitter {
             return Err(TransError::Retry);
         }
 
-        let reachable = self
-            .dir
-            .reachable_tokens(&record.prefix, requirement)
-            .await?;
-        let applied = !record.created_tokens.is_empty()
-            && record
-                .created_tokens
-                .iter()
-                .all(|token| reachable.contains(token));
+        let reachable = if record.is_root {
+            if record.created_tokens.len() != 2 {
+                return Err(TransError::InvalidInput(
+                    "root split record does not have two children".into(),
+                ));
+            }
+            vec![
+                self.dir
+                    .token_reachable_at_key(
+                        &record.prefix,
+                        &[],
+                        &record.created_tokens[0],
+                        requirement,
+                    )
+                    .await?,
+                self.dir
+                    .token_reachable_at_key(
+                        &record.prefix,
+                        &record.split_key,
+                        &record.created_tokens[1],
+                        requirement,
+                    )
+                    .await?,
+            ]
+        } else {
+            if record.created_tokens.len() != 1 {
+                return Err(TransError::InvalidInput(
+                    "non-root split record does not have one sibling".into(),
+                ));
+            }
+            vec![
+                self.dir
+                    .token_reachable_at_key(
+                        &record.prefix,
+                        &record.split_key,
+                        &record.created_tokens[0],
+                        requirement,
+                    )
+                    .await?,
+            ]
+        };
+        let applied = reachable.iter().all(|reachable| *reachable);
         if applied && !record.is_root {
-            let right_token = record
-                .created_tokens
-                .first()
-                .ok_or_else(|| TransError::InvalidInput("split record has no sibling".into()))?;
             self.publish_separators(
                 &record.prefix,
                 &record.split_key,
-                right_token,
-                participant.as_ref(),
+                &record.created_tokens[0],
+                Some(&record.participant_id),
             )
             .await?;
         } else if !applied {
-            for token in &record.created_tokens {
-                if !reachable.contains(token) {
+            for (token, reachable) in record.created_tokens.iter().zip(reachable) {
+                if !reachable {
                     match self
                         .shards
                         .load_node_state(&record.prefix, token, requirement)
@@ -1152,24 +1360,6 @@ impl Splitter {
             }
         }
         self.shards.delete_structural_log(observed).await?;
-        if let Some(participant) = participant {
-            let remaining = self
-                .shards
-                .list_structural_logs(
-                    paths::db_root_of(&participant_prefix),
-                    Requirement::AtLeast(self.timeline.now()),
-                )
-                .await?;
-            if !remaining.iter().any(|(_, observed)| {
-                observed.value().is_some_and(|record| {
-                    record.prefix == participant_prefix
-                        && record.participant_id.as_ref() == Some(&participant)
-                })
-            }) {
-                self.leave_topology(&participant_prefix, &participant)
-                    .await?;
-            }
-        }
         Ok(())
     }
 
@@ -1397,7 +1587,7 @@ mod tests {
     use crate::monitor::TxFinalStatus;
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_data::{KeyRef, TxId};
     use glassdb_storage::{CachedStore, CollectionRoot, LockType, ShardEntry, TLogger, TxWrite};
 
@@ -1546,7 +1736,8 @@ mod tests {
             created_tokens: vec![right.to_string()],
             split_key: split_key.to_vec(),
             is_root: false,
-            participant_id: None,
+            participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
+            phase: StructuralLogPhase::Ready,
         }
     }
 
@@ -1630,6 +1821,73 @@ mod tests {
             1,
             "the topology participant remains recoverable until GC"
         );
+    }
+
+    #[tokio::test]
+    async fn settlement_cancels_a_prepared_split_before_node_creation() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = recorder.log();
+        let s = store_with_backend(Arc::new(recorder));
+        let mut root = CollectionRoot::new();
+        root.set_node(Node::leaf(Shard::from_entries(
+            [b"a".as_slice(), b"b", b"c", b"d"]
+                .iter()
+                .map(|key| live(key)),
+        )));
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let sp = splitter(&s, &bg, tiny());
+        let participant = TxId::with_priority(1, b"participant");
+
+        sp.begin_topology_tx(COLL, &participant).await.unwrap();
+        let mut intent = sp
+            .prepare_structural_intent(COLL, None, &participant)
+            .await
+            .unwrap();
+        sp.join_topology(COLL, &participant).await.unwrap();
+        sp.mon.abort_tx(&participant).await.unwrap();
+
+        operations.lock().unwrap().clear();
+        sp.settle_topology_participant(&collection(), &participant)
+            .await
+            .unwrap();
+        let expected_listing = paths::structural_log_participant_dir("db", &participant);
+        let listings: Vec<_> = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.op == "list")
+            .map(|operation| operation.path.clone())
+            .collect();
+        assert!(!listings.is_empty());
+        assert!(
+            listings.iter().all(|path| path == &expected_listing),
+            "settlement must list only the participant-owned intent prefix"
+        );
+
+        let worker = TxId::with_priority(2, b"worker");
+        sp.mon.begin_tx(&worker);
+        let mut recovery_pending = false;
+        assert!(matches!(
+            sp.coordinate_root_split(COLL, &worker, &mut intent, &mut recovery_pending)
+                .await,
+            Err(TransError::Retry)
+        ));
+        sp.finalize_split(&worker).await;
+        assert!(!recovery_pending);
+        assert!(
+            s.list_nodes(COLL, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a cancelled Preparing intent cannot create its reserved nodes"
+        );
+        let (root, _) = s
+            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert!(root.node().as_leaf().is_some());
+        assert_eq!(root.topology_participants().count(), 0);
     }
 
     // A standalone leaf over the cap half-splits: the upper half moves to a fresh
@@ -2530,7 +2788,8 @@ mod tests {
             created_tokens: vec!["R".to_string()],
             split_key: b"m".to_vec(),
             is_root: false,
-            participant_id: None,
+            participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
+            phase: StructuralLogPhase::Ready,
         };
         let observed = s.write_structural_log("R", &record).await.unwrap();
 
@@ -2686,7 +2945,8 @@ mod tests {
             created_tokens: vec!["R".to_string()],
             split_key,
             is_root: false,
-            participant_id: None,
+            participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
+            phase: StructuralLogPhase::Ready,
         };
         let observed = s.write_structural_log("R", &record).await.unwrap();
         sp.mon.begin_tx(&id);

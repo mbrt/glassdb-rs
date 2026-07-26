@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_data::paths;
+use glassdb_data::{TxId, paths};
 
 use crate::cached_store::{
     CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
@@ -205,8 +205,16 @@ impl Codec for Node {
 impl Codec for StructuralLog {
     type Value = StructuralLog;
 
-    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
-        StructuralLog::decode(body)
+    fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+        let record = StructuralLog::decode(body)?;
+        let (participant, _) = paths::structural_log_parts_of(path)
+            .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+        if participant != record.participant_id {
+            return Err(StorageError::other(
+                "structural-log path does not match its participant",
+            ));
+        }
+        Ok(record)
     }
 
     fn encode(record: &Self::Value) -> Result<Vec<u8>, StorageError> {
@@ -218,7 +226,7 @@ impl Codec for StructuralLog {
     }
 
     fn valid_path(path: &str) -> bool {
-        paths::structural_log_id_of(path).is_ok()
+        paths::structural_log_parts_of(path).is_ok()
     }
 
     fn name() -> &'static str {
@@ -394,7 +402,11 @@ impl ShardStore {
         record_id: &str,
         record: &StructuralLog,
     ) -> Result<Observation<StructuralLog>, StorageError> {
-        let path = paths::structural_log_record(paths::db_root_of(&record.prefix), record_id);
+        let path = paths::structural_log_record(
+            paths::db_root_of(&record.prefix),
+            &record.participant_id,
+            record_id,
+        );
         match self
             .structural_logs
             .create(&path, None, Arc::new(record.clone()))
@@ -406,6 +418,30 @@ impl ShardStore {
         }
     }
 
+    /// Conditionally advances an exact split intent.
+    pub async fn update_structural_log(
+        &self,
+        expected: &Observation<StructuralLog>,
+        record: &StructuralLog,
+    ) -> Result<Option<Observation<StructuralLog>>, StorageError> {
+        let (participant, _) = paths::structural_log_parts_of(expected.path())
+            .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+        if participant != record.participant_id {
+            return Err(StorageError::other(
+                "structural-log update changes its participant",
+            ));
+        }
+        match self
+            .structural_logs
+            .compare_and_swap(expected, Arc::new(record.clone()))
+            .await
+        {
+            Ok(CasResult::Committed(observed)) => Ok(Some(observed)),
+            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Lists exact observations of every unresolved structural record.
     pub async fn list_structural_logs(
         &self,
@@ -413,27 +449,18 @@ impl ShardStore {
         requirement: Requirement,
     ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
         let prefix = paths::structural_log_dir(db_root);
-        let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
-        let mut cursor = None;
-        let mut records = Vec::new();
-        loop {
-            let page = self
-                .structural_logs
-                .list(&prefix, cursor.as_ref(), limit)
-                .await?;
-            for path in page.objects {
-                let record_id = paths::structural_log_id_of(&path)
-                    .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
-                let observed = self.structural_logs.read(&path, requirement).await?;
-                if observed.exists() {
-                    records.push((record_id, observed));
-                }
-            }
-            match page.next {
-                Some(next) => cursor = Some(next),
-                None => return Ok(records),
-            }
-        }
+        self.list_structural_logs_under(&prefix, requirement).await
+    }
+
+    /// Lists only the unresolved structural records owned by `participant`.
+    pub async fn list_structural_logs_for_participant(
+        &self,
+        db_root: &str,
+        participant: &TxId,
+        requirement: Requirement,
+    ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
+        let prefix = paths::structural_log_participant_dir(db_root, participant);
+        self.list_structural_logs_under(&prefix, requirement).await
     }
 
     /// Deletes the exact observed structural record, converging if it is missing.
@@ -635,12 +662,41 @@ impl ShardStore {
         self.roots.delete(expected).await?;
         Ok(())
     }
+
+    async fn list_structural_logs_under(
+        &self,
+        prefix: &str,
+        requirement: Requirement,
+    ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
+        let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let page = self
+                .structural_logs
+                .list(prefix, cursor.as_ref(), limit)
+                .await?;
+            for path in page.objects {
+                let (_, record_id) = paths::structural_log_parts_of(&path)
+                    .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+                let observed = self.structural_logs.read(&path, requirement).await?;
+                if observed.exists() {
+                    records.push((record_id, observed));
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(records),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Timeline;
+    use crate::structlog::StructuralLogPhase;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -819,6 +875,7 @@ mod tests {
     #[tokio::test]
     async fn structural_log_listing_drains_backend_pages() {
         let store = store_over(Arc::new(MemoryBackend::new()));
+        let participant = TxId::from_bytes(b"participant".to_vec());
         for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
             store
                 .write_structural_log(
@@ -830,7 +887,8 @@ mod tests {
                         created_tokens: vec![format!("node-{i:03}")],
                         split_key: vec![i as u8],
                         is_root: false,
-                        participant_id: None,
+                        participant_id: participant.clone(),
+                        phase: StructuralLogPhase::Ready,
                     },
                 )
                 .await
@@ -842,5 +900,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(records.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
+    }
+
+    #[tokio::test]
+    async fn structural_log_listing_is_scoped_to_one_participant() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let first = TxId::from_bytes(b"first".to_vec());
+        let second = TxId::from_bytes(b"second".to_vec());
+        for participant in [&first, &second] {
+            store
+                .write_structural_log(
+                    "record",
+                    &StructuralLog {
+                        prefix: "db/coll".to_string(),
+                        source_token: "source".to_string(),
+                        source_version: String::new(),
+                        created_tokens: vec!["node".to_string()],
+                        split_key: Vec::new(),
+                        is_root: false,
+                        participant_id: participant.clone(),
+                        phase: StructuralLogPhase::Preparing,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let records = store
+            .list_structural_logs_for_participant(
+                "db",
+                &first,
+                Requirement::AtLeast(store.timeline.now()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].1.value().unwrap().participant_id,
+            first,
+            "a participant listing must not discover another participant's work"
+        );
     }
 }

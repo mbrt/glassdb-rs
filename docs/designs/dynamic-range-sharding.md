@@ -60,9 +60,10 @@ CAS. Leaves are the shards; interior nodes are the range index.
   - _Transaction object_ (`_t/<ss>/<txid>`): unchanged contents (status +
     values + lease), stored in one of 4,096 deterministic listing shards
     ([ADR-035](../adr/035-paginated-listing-and-sharded-transaction-logs.md)).
-  - _Structural record_ (`{db}/_s/<record-id>`): a short-lived split
-    write-ahead note, recovered independently from transaction logs
-    ([ADR-034](../adr/034-separate-structural-log-namespace.md)).
+  - _Structural intent_ (`{db}/_s/<participant-id>/<intent-id>`): a short-lived,
+    participant-owned split write-ahead note, recovered independently from
+    transaction logs
+    ([ADR-049](../adr/049-participant-owned-topology-intents.md)).
 - **Ordering** — lexicographic over raw key bytes, matching the order-preserving
   path encoding.
 - **Mapping** — descend from the root object `_i`; each node self-describes its
@@ -118,10 +119,10 @@ CAS. Leaves are the shards; interior nodes are the range index.
   GC and recovery re-resolve a key's shard through the *current* topology, and a
   crash-orphaned split sibling is reclaimed from a **structural log entry**
   recording the split's created node tokens — recovery keeps or deletes them by
-  proving **tree-reachability** (right-link chain, or root-split index entries),
+  proving **key-directed reachability** through ordinary B-link descent,
   with ambiguity resolved by retry, not deletion
   ([ADR-032](../adr/032-node-locking-and-coordinated-splits.md),
-  [ADR-034](../adr/034-separate-structural-log-namespace.md)). Transaction and
+  [ADR-049](../adr/049-participant-owned-topology-intents.md)). Transaction and
   structural records use separate `_t/<ss>` and `_s` namespaces and recovery
   loops.
 
@@ -269,6 +270,11 @@ ADR — this overview and the diagrams above are the map into it.
   fences every reachable or publishable node through ADR-044's structural gate
   before a non-empty collection is dropped without adding a lifecycle lookup to
   the key hot path.
+- **[ADR-049](../adr/049-participant-owned-topology-intents.md) —
+  Participant-owned topology intents.** *Accepted — implemented.* Gives each
+  topology participant an exact structural-intent prefix, closes the
+  prepare/join race, and replaces collection-wide recovery walks with
+  key-directed reachability checks.
 
 Planned follow-on ADRs, as the open questions below resolve: merge/rebalance,
 split-point policy, and node fan-out/sizing.

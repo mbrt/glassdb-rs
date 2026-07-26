@@ -549,14 +549,9 @@ impl Gc {
         for collection in topology {
             let records = self
                 .shards
-                .list_structural_logs(collection.db_root(), requirement)
+                .list_structural_logs_for_participant(collection.db_root(), tid, requirement)
                 .await?;
-            if records.iter().any(|(_, observed)| {
-                observed.value().is_some_and(|record| {
-                    record.prefix == collection.physical_prefix()
-                        && record.participant_id.as_ref() == Some(tid)
-                })
-            }) {
+            if !records.is_empty() {
                 return Ok(false);
             }
             let prefix = collection.physical_prefix();

@@ -908,7 +908,7 @@ Only backend objects have type markers (`glassdb-data/src/paths.rs`):
 | `_i`        | Collection root                  | `mydb/_c/<collection-id>/_i`      |
 | `_n`        | Standalone B-link node           | `mydb/_c/<collection-id>/_n/<token>` |
 | `_t`        | Sharded transaction object       | `mydb/_t/<shard>/<transaction-id>`|
-| `_s`        | Structural recovery record       | `mydb/_s/<record-id>`             |
+| `_s`        | Participant-owned structural intent | `mydb/_s/<participant-id>/<intent-id>` |
 
 Collection IDs—not names—are encoded into physical collection namespaces with
 the custom **order-preserving** base64 alphabet
