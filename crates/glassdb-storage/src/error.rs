@@ -1,6 +1,7 @@
 //! Storage-layer error type.
 
 use glassdb_backend::{BackendError, Cause};
+use glassdb_data::CollectionAddress;
 
 /// Errors returned by the storage layer.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -55,6 +56,19 @@ impl StorageError {
         }
     }
 
+    /// Classifies physical absence while addressing a collection incarnation.
+    ///
+    /// Non-root collection identities are never reused, so a missing physical
+    /// tree means the bound handle is stale. The permanent database root keeps
+    /// the ordinary not-found classification.
+    #[must_use]
+    pub fn classify_collection_absence(self, collection: &CollectionAddress) -> Self {
+        match self {
+            StorageError::NotFound if !collection.id().is_root() => StorageError::StaleCollection,
+            other => other,
+        }
+    }
+
     /// Prepends human-readable context while preserving the error's
     /// classification and any underlying cause.
     #[must_use]
@@ -85,6 +99,7 @@ impl From<BackendError> for StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glassdb_data::CollectionId;
     use std::error::Error as _;
     use std::io;
 
@@ -129,6 +144,25 @@ mod tests {
         assert!(matches!(
             StorageError::InvalidCursor.context("x"),
             StorageError::InvalidCursor
+        ));
+    }
+
+    #[test]
+    fn collection_absence_distinguishes_root_from_bound_incarnations() {
+        let root = CollectionAddress::root("db");
+        let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
+
+        assert!(matches!(
+            StorageError::NotFound.classify_collection_absence(&root),
+            StorageError::NotFound
+        ));
+        assert!(matches!(
+            StorageError::NotFound.classify_collection_absence(&child),
+            StorageError::StaleCollection
+        ));
+        assert!(matches!(
+            StorageError::Unavailable("offline".into()).classify_collection_absence(&child),
+            StorageError::Unavailable(_)
         ));
     }
 

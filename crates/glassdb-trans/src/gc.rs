@@ -435,8 +435,8 @@ impl Gc {
             let groups = match self.dir.group_keys_by_leaf(items, requirement).await {
                 Ok(groups) => groups,
                 // Reclaiming a collection removes every reference it could
-                // contain; its absent root is therefore negative evidence.
-                Err(StorageError::NotFound) => continue,
+                // contain; its absent tree is therefore negative evidence.
+                Err(StorageError::NotFound | StorageError::StaleCollection) => continue,
                 Err(error) => return Err(error.into()),
             };
             for group in groups {
@@ -518,7 +518,7 @@ impl Gc {
                 Ok(groups) => {
                     leaf_paths.extend(groups.into_iter().map(|group| group.path));
                 }
-                Err(StorageError::NotFound) => {}
+                Err(StorageError::NotFound | StorageError::StaleCollection) => {}
                 Err(error) => return Err(error.into()),
             }
         }

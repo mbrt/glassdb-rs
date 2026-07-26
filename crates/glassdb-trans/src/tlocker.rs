@@ -194,10 +194,7 @@ async fn build_groups(
     let grouped = dir
         .group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any)
         .await
-        .map_err(|error| match error {
-            glassdb_storage::StorageError::NotFound => TransError::StaleCollection,
-            other => TransError::from(other).context("grouping keys by leaf"),
-        })?;
+        .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
 
     let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
     for group in grouped {
@@ -238,7 +235,8 @@ async fn build_groups(
                 scan.frontier.as_deref(),
                 scan_requirement,
             )
-            .await?
+            .await
+            .map_err(|error| error.classify_collection_absence(&scan.collection))?
         {
             let group = groups
                 .entry(leaf.path.clone())

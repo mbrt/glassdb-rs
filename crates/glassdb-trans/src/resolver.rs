@@ -147,9 +147,10 @@ impl Resolver {
         let Some(mut loc) = self
             .dir
             .first_leaf_at(&prefix, &range.start, requirement)
-            .await?
+            .await
+            .map_err(|error| error.classify_collection_absence(collection))?
         else {
-            return Err(StorageError::NotFound);
+            return Err(StorageError::NotFound.classify_collection_absence(collection));
         };
 
         if range.is_empty() {
@@ -232,7 +233,12 @@ impl Resolver {
             if target.is_some_and(|target| node.owns(target)) {
                 break;
             }
-            let Some(next) = self.dir.next_leaf(&prefix, &loc, requirement).await? else {
+            let Some(next) = self
+                .dir
+                .next_leaf(&prefix, &loc, requirement)
+                .await
+                .map_err(|error| error.classify_collection_absence(collection))?
+            else {
                 break;
             };
             loc = next;
@@ -260,10 +266,11 @@ impl Resolver {
             if self
                 .dir
                 .first_leaf_at(&prefix, &range.start, requirement)
-                .await?
+                .await
+                .map_err(|error| error.classify_collection_absence(collection))?
                 .is_none()
             {
-                return Err(StorageError::NotFound);
+                return Err(StorageError::NotFound.classify_collection_absence(collection));
             }
             return Ok(Vec::new());
         }
@@ -271,7 +278,8 @@ impl Resolver {
         let leaves = self
             .dir
             .leaves_through(&prefix, &range.start, frontier, requirement)
-            .await?;
+            .await
+            .map_err(|error| error.classify_collection_absence(collection))?;
         let mut covered = Vec::with_capacity(leaves.len());
         for leaf in leaves {
             covered.push(
@@ -379,7 +387,8 @@ impl Resolver {
         let loc = self
             .dir
             .leaf_for_fresh(&prefix, raw_key, Requirement::Any, requirement)
-            .await?;
+            .await
+            .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {
             self.ensure_collection_live(node)
                 .await
@@ -502,7 +511,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::paths;
+    use glassdb_data::{CollectionId, paths};
     use glassdb_storage::{CachedStore, CollectionRoot, Shard, TLogger, Timeline};
 
     const DB: &str = "db";
@@ -514,6 +523,10 @@ mod tests {
 
     fn key_ref(key: &[u8]) -> KeyRef {
         KeyRef::new(collection(), key)
+    }
+
+    fn missing_collection() -> CollectionAddress {
+        CollectionAddress::new(DB, CollectionId::from_slice(&[1; 16]).unwrap())
     }
 
     // A resolver over `backend` with its own fresh cache, so it starts cold,
@@ -673,6 +686,36 @@ mod tests {
                     && (r.path.contains("/_n/") || r.path.ends_with("/_i"))
             })
             .count()
+    }
+
+    #[tokio::test]
+    async fn missing_bound_collection_is_classified_during_routing() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (resolver, _monitor, _timeline, _background) = resolver_over(backend).await;
+        let collection = missing_collection();
+        let key = KeyRef::new(collection.clone(), b"k");
+        let range = ScanRange::all();
+
+        assert!(matches!(
+            resolver.resolve_key(&key, Requirement::Any).await,
+            Err(TransError::Storage(StorageError::StaleCollection))
+        ));
+        assert!(matches!(
+            resolver
+                .scan_keys(&collection, &range, &[], None, None)
+                .await,
+            Err(StorageError::StaleCollection)
+        ));
+        assert!(matches!(
+            resolver
+                .scan_coverage(&collection, &range, None, None, Requirement::Any)
+                .await,
+            Err(StorageError::StaleCollection)
+        ));
+        assert!(matches!(
+            resolver.effective_writers(&[key], Requirement::Any).await,
+            Err(StorageError::StaleCollection)
+        ));
     }
 
     // With split deferred every key lives in the collection's single leaf `_i`

@@ -303,6 +303,9 @@ impl Directory {
     ///
     /// Groups are keyed by leaf object path, so keys from different collections
     /// (distinct `_i`) never collide; input order is preserved within a group.
+    /// Missing non-root collection trees are reported as
+    /// [`StorageError::StaleCollection`] while the failing key still identifies
+    /// its collection.
     pub async fn group_keys_by_leaf<T>(
         &self,
         items: impl IntoIterator<Item = (KeyRef, T)>,
@@ -330,7 +333,8 @@ impl Directory {
             let raw_key = key.key().to_vec();
             let loc = self
                 .leaf_for_fresh(&prefix, &raw_key, interior, leaf)
-                .await?;
+                .await
+                .map_err(|error| error.classify_collection_absence(key.collection()))?;
             groups
                 .entry(loc.path.clone())
                 .or_insert_with(|| LeafGroup {
@@ -549,7 +553,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_data::CollectionAddress;
+    use glassdb_data::{CollectionAddress, CollectionId};
 
     use crate::Timeline;
     use crate::cached_store::CachedStore;
@@ -931,5 +935,36 @@ mod tests {
         );
         let l1 = groups.iter().find(|g| g.path.ends_with("_n/L1")).unwrap();
         assert_eq!(l1.keys, vec![(b"mango".to_vec(), 'm')]);
+    }
+
+    #[tokio::test]
+    async fn grouped_routing_classifies_the_collection_that_failed() {
+        let s = store();
+        let dir = Directory::new(s.shards.clone());
+        let root = CollectionAddress::root("db");
+        let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
+        let requirement = Requirement::AtLeast(s.timeline.now());
+
+        let root_error = dir
+            .group_keys_by_leaf(
+                [
+                    (KeyRef::new(root.clone(), b"root"), ()),
+                    (KeyRef::new(child.clone(), b"child"), ()),
+                ],
+                requirement,
+            )
+            .await;
+        assert!(matches!(root_error, Err(StorageError::NotFound)));
+
+        let child_error = dir
+            .group_keys_by_leaf(
+                [
+                    (KeyRef::new(child, b"child"), ()),
+                    (KeyRef::new(root, b"root"), ()),
+                ],
+                requirement,
+            )
+            .await;
+        assert!(matches!(child_error, Err(StorageError::StaleCollection)));
     }
 }

@@ -219,13 +219,11 @@ impl CollectionCatalog {
         let prefix = parent.physical_prefix();
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = match self.shards.load_root(&prefix, requirement).await {
-                Ok(root) => root,
-                Err(StorageError::NotFound) if !parent.id().is_root() => {
-                    return Err(TransError::StaleCollection);
-                }
-                Err(error) => return Err(error.into()),
-            };
+            let (mut root, observed) = self
+                .shards
+                .load_root(&prefix, requirement)
+                .await
+                .map_err(|error| error.classify_collection_absence(parent))?;
             if let Some(holder) = root.node().collection_delete_intent().cloned()
                 && Some(&holder) != own
             {

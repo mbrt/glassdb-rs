@@ -107,9 +107,6 @@ impl Collection {
         );
         match r.read(&key, max_staleness).await {
             Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),
-            Err(glassdb_storage::StorageError::NotFound) if !self.address.id().is_root() => {
-                Err(Error::StaleCollection)
-            }
             Err(e) => Err(Error::from_read(e)),
         }
     }

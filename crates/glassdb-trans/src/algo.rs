@@ -1047,14 +1047,7 @@ impl Algo {
         // version-conditional CAS misses, invalidates that seed, and re-folds
         // over the winner — finding the read superseded, the fast path renews
         // (`Wounded`).
-        let (_, locator) = self
-            .resolver
-            .resolve_key(&key, Requirement::Any)
-            .await
-            .map_err(|error| match error {
-                TransError::Storage(StorageError::NotFound) => TransError::StaleCollection,
-                other => other,
-            })?;
+        let (_, locator) = self.resolver.resolve_key(&key, Requirement::Any).await?;
         if locator
             .node()
             .is_some_and(|node| node.structural_gate().lock_type() == LockType::Write)
@@ -1501,11 +1494,7 @@ impl Algo {
             return Ok(true);
         }
         let keys: Vec<KeyRef> = data.reads.iter().map(|read| read.key.clone()).collect();
-        let current = self
-            .resolver
-            .effective_writers(&keys, requirement)
-            .await
-            .map_err(|error| map_missing_collection(keys.iter().map(KeyRef::collection), error))?;
+        let current = self.resolver.effective_writers(&keys, requirement).await?;
         for r in &data.reads {
             if current.get(&r.key).and_then(Option::as_ref) != r.last_writer.as_ref() {
                 return Ok(false);
@@ -1537,10 +1526,7 @@ impl Algo {
                     own_lock_holder,
                     requirement,
                 )
-                .await
-                .map_err(|error| {
-                    map_missing_collection(std::iter::once(&scan.collection), error)
-                })?;
+                .await?;
             let mut fast = current.len() == scan.covered.len()
                 && !current.iter().zip(&scan.covered).any(|(now, observed)| {
                     now.path != observed.path
@@ -1572,10 +1558,7 @@ impl Algo {
                     scan.frontier.as_deref(),
                     requirement,
                 )
-                .await
-                .map_err(|error| {
-                    map_missing_collection(std::iter::once(&scan.collection), error)
-                })?;
+                .await?;
             if resolved.keys != scan.keys {
                 return Ok(false);
             }
@@ -1628,21 +1611,6 @@ impl Algo {
             .commit_tx(tl)
             .await
             .map_err(|e| e.context("creating transaction object"))
-    }
-}
-
-fn map_missing_collection<'a>(
-    collections: impl IntoIterator<Item = &'a CollectionAddress>,
-    error: StorageError,
-) -> TransError {
-    if matches!(error, StorageError::NotFound)
-        && collections
-            .into_iter()
-            .any(|collection| !collection.id().is_root())
-    {
-        TransError::StaleCollection
-    } else {
-        error.into()
     }
 }
 

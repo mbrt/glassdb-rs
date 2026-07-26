@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionId, KeyRef, TxId};
-use glassdb_storage::{LeafObservation, StorageError};
+use glassdb_storage::LeafObservation;
 use glassdb_trans::{
     CollectionCatalog, CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead,
     DirectoryReadKind, ReadAccess, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess,
@@ -142,7 +142,7 @@ impl Transaction {
             // A read is side-effect-free; `from_read` centralizes the mapping
             // (notably a sustained outage becomes the retry-safe
             // `Error::Unavailable` rather than `InDoubt`).
-            Err(e) => Err(self.map_collection_read_error(c, e)),
+            Err(e) => Err(Error::from_read(e)),
         }
     }
 
@@ -195,7 +195,7 @@ impl Transaction {
             .resolver
             .scan_keys(c.address(), &range, &overlay, None, None)
             .await
-            .map_err(|error| self.map_collection_read_error(c, error))?;
+            .map_err(Error::from_read)?;
         let keys = result.keys;
         self.inner.lock().unwrap().scans.push(ScanAccess {
             collection: c.address().clone(),
@@ -702,14 +702,7 @@ impl Transaction {
             }
         }
 
-        let snapshot = self.catalog.snapshot(parent).await.map_err(|error| {
-            let mapped = Error::from(error);
-            if matches!(mapped, Error::NotFound) && !parent.id().is_root() {
-                Error::StaleCollection
-            } else {
-                mapped
-            }
-        })?;
+        let snapshot = self.catalog.snapshot(parent).await?;
         let children = snapshot.children.into_iter().collect::<BTreeMap<_, _>>();
         let version = snapshot.version;
         let mut inner = self.inner.lock().unwrap();
@@ -733,14 +726,6 @@ impl Transaction {
             ));
         }
         Ok(())
-    }
-
-    fn map_collection_read_error(&self, collection: &Collection, error: StorageError) -> Error {
-        if matches!(error, StorageError::NotFound) && !collection.address().id().is_root() {
-            Error::StaleCollection
-        } else {
-            Error::from_read(error)
-        }
     }
 }
 
