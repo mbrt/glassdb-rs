@@ -151,6 +151,39 @@ jobs:
           --output "$PERF_RESULTS/report.md"
         cat "$PERF_RESULTS/report.md" >> "$GITHUB_STEP_SUMMARY"
 
+    - name: Hide old performance comments
+      if: >-
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.actor != 'dependabot[bot]'
+      continue-on-error: true
+      uses: actions/github-script@v9
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const response = await github.rest.issues.listComments({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          })
+          const commentIds = response.data
+            .filter(comment =>
+              comment.user.login === 'github-actions[bot]' &&
+              comment.body.includes('# Performance comparison')
+            )
+            .map(comment => comment.node_id)
+
+          for (const id of commentIds) {
+            await github.graphql(`
+              mutation {
+                minimizeComment(input: {classifier: OUTDATED, subjectId: "${id}"}) {
+                  minimizedComment {
+                    isMinimized
+                  }
+                }
+              }
+            `)
+          }
+
     - name: Comment on pull request
       if: >-
         github.event.pull_request.head.repo.full_name == github.repository &&
