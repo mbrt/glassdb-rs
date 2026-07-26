@@ -49,7 +49,7 @@ use glassdb_storage::{
 use tokio::sync::Notify;
 
 use crate::error::TransError;
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{
     NodeLockReconciler, QuiescedEntries, StructuralGateResolver, quiesce_entries,
 };
@@ -722,7 +722,6 @@ impl Splitter {
 
     /// Halves a standalone node and finalizes its wound-wait participant.
     async fn split_nonroot(&self, prefix: &str, token: &str, id: TxId) -> Result<(), TransError> {
-        self.mon.begin_tx(&id);
         let mut recovery_pending = false;
         let result = match self.join_topology(prefix, &id).await {
             Ok(()) => {
@@ -820,7 +819,6 @@ impl Splitter {
 
     /// Grows an overflowing collection root into a two-child index.
     async fn split_root(&self, prefix: &str, id: TxId) -> Result<(), TransError> {
-        self.mon.begin_tx(&id);
         let mut recovery_pending = false;
         let result = match self.join_topology(prefix, &id).await {
             Ok(()) => {
@@ -845,13 +843,15 @@ impl Splitter {
     async fn join_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
         let collection = CollectionAddress::from_physical_prefix(prefix)
             .map_err(|error| TransError::with_source("parsing collection prefix", error))?;
-        self.mon.record_tx_locks(
-            id,
-            vec![TxLock::Topology {
-                collection: collection.clone(),
-            }],
-        );
-        self.mon.persist_pending(id).await?;
+        self.mon
+            .begin_persisted_tx(
+                id,
+                TxRecoveryManifest {
+                    locks: vec![TxLock::Topology { collection }],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await?;
         let mut backoff = self.retry.backoff();
         loop {
             let (mut root, observed) = match self.shards.load_root(prefix, Requirement::Any).await {

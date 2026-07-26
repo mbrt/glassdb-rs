@@ -39,7 +39,7 @@ use glassdb_storage::{
 use crate::collections::{CollectionCatalog, CollectionData, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::gc::Gc;
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{LockResolution, resolve_entry_locks, resolve_entry_locks_at};
 use crate::resolver::Resolver;
 use crate::shard_coord::{
@@ -735,8 +735,8 @@ impl Algo {
 
     /// Locked path for read-write transactions and escalated read-only retries.
     async fn commit_locked(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::New {
-            self.mon.begin_tx(&tx.id);
+        let is_new = tx.status == Status::New;
+        if is_new {
             tx.status = Status::Validating;
             tx.engaged = true;
         }
@@ -758,7 +758,11 @@ impl Algo {
             .await?;
         tx.fenced_drops.retain(|drop| active_drops.contains(drop));
 
-        if !tx.collection_data.changes.is_empty() {
+        if tx.collection_data.changes.is_empty() {
+            if is_new {
+                self.mon.begin_tx(&tx.id);
+            }
+        } else {
             let changes = tx
                 .collection_data
                 .changes
@@ -787,11 +791,22 @@ impl Algo {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            if let Err(error) = self
-                .mon
-                .prepare_collections(&tx.id, changes, prepared)
-                .await
-            {
+            let recovery = TxRecoveryManifest {
+                locks: Vec::new(),
+                collection_changes: changes,
+                prepared_collections: prepared,
+            };
+            let result = if is_new {
+                self.mon.begin_persisted_tx(&tx.id, recovery).await
+            } else {
+                self.mon
+                    .update_pending_tx(&tx.id, move |pending| {
+                        pending.collection_changes = recovery.collection_changes;
+                        pending.prepared_collections = recovery.prepared_collections;
+                    })
+                    .await
+            };
+            if let Err(error) = result {
                 if matches!(error, TransError::AlreadyFinalized) {
                     return self.restart(tx).await;
                 }

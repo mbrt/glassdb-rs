@@ -110,11 +110,7 @@ struct TxStatusEntry {
     status: TxCommitStatus,
     last_observation: Option<Observation<TxLog>>,
     refresh_state: RefreshState,
-    // The lock set this transaction holds, recorded by the engine once it has
-    // acquired its locks.
-    locks: Vec<TxLock>,
-    collection_changes: Vec<TxCollectionChange>,
-    prepared_collections: Vec<CollectionAddress>,
+    recovery: TxRecoveryManifest,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +192,15 @@ pub struct Monitor {
     inner: Arc<Inner>,
 }
 
+/// Durable backreferences needed to recover a pending transaction after its
+/// owner disappears.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TxRecoveryManifest {
+    pub(crate) locks: Vec<TxLock>,
+    pub(crate) collection_changes: Vec<TxCollectionChange>,
+    pub(crate) prepared_collections: Vec<CollectionAddress>,
+}
+
 /// A transaction status known to be durable and terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxFinalStatus {
@@ -257,18 +262,36 @@ impl Monitor {
 
     /// Registers a new pending local transaction.
     pub(crate) fn begin_tx(&self, tid: &TxId) {
-        let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.insert(
-            tid.clone(),
-            TxStatusEntry {
-                status: TxCommitStatus::Pending,
-                last_observation: None,
-                refresh_state: RefreshState::NotStarted,
-                locks: Vec::new(),
-                collection_changes: Vec::new(),
-                prepared_collections: Vec::new(),
-            },
-        );
+        self.register_tx(tid, TxRecoveryManifest::default());
+    }
+
+    /// Registers a transaction and makes its recovery manifest durable before
+    /// returning.
+    pub(crate) async fn begin_persisted_tx(
+        &self,
+        tid: &TxId,
+        recovery: TxRecoveryManifest,
+    ) -> Result<(), TransError> {
+        self.register_tx(tid, recovery);
+        self.persist_pending_tx(tid).await
+    }
+
+    /// Updates a pending transaction's recovery manifest and makes the result
+    /// durable before returning.
+    pub(crate) async fn update_pending_tx(
+        &self,
+        tid: &TxId,
+        update: impl FnOnce(&mut TxRecoveryManifest) + Send,
+    ) -> Result<(), TransError> {
+        {
+            let mut st = self.shard_for(tid).lock().unwrap();
+            let entry = st
+                .local_tx
+                .get_mut(tid)
+                .ok_or_else(|| TransError::other("pending transaction was not begun"))?;
+            update(&mut entry.recovery);
+        }
+        self.persist_pending_tx(tid).await
     }
 
     /// Records the lock set a transaction currently holds, so the refresher can
@@ -278,80 +301,7 @@ impl Monitor {
     pub(crate) fn record_tx_locks(&self, tid: &TxId, locks: Vec<TxLock>) {
         let mut st = self.shard_for(tid).lock().unwrap();
         if let Some(e) = st.local_tx.get_mut(tid) {
-            e.locks = locks;
-        }
-    }
-
-    /// Persists the recovery manifest before prepared collection roots exist.
-    pub(crate) async fn prepare_collections(
-        &self,
-        tid: &TxId,
-        collection_changes: Vec<TxCollectionChange>,
-        prepared_collections: Vec<CollectionAddress>,
-    ) -> Result<(), TransError> {
-        {
-            let mut st = self.shard_for(tid).lock().unwrap();
-            let entry = st
-                .local_tx
-                .get_mut(tid)
-                .ok_or_else(|| TransError::other("collection transaction was not begun"))?;
-            entry.collection_changes = collection_changes;
-            entry.prepared_collections = prepared_collections;
-        }
-        self.persist_pending(tid).await
-    }
-
-    /// Persists the pending transaction's current recovery backreferences.
-    pub(crate) async fn persist_pending(&self, tid: &TxId) -> Result<(), TransError> {
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            let (last_observation, locks, collection_changes, prepared_collections) = {
-                let st = self.shard_for(tid).lock().unwrap();
-                let entry = st
-                    .local_tx
-                    .get(tid)
-                    .ok_or_else(|| TransError::other("pending transaction disappeared"))?;
-                (
-                    entry.last_observation.clone(),
-                    entry.locks.clone(),
-                    entry.collection_changes.clone(),
-                    entry.prepared_collections.clone(),
-                )
-            };
-            let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
-            log.timestamp = Some(self.inner.clock.now());
-            log.locks = locks;
-            log.collection_changes = collection_changes;
-            log.prepared_collections = prepared_collections;
-            let result = match last_observation.as_ref() {
-                Some(observed) => self.inner.tl.set_if(&log, observed).await,
-                None => self.inner.tl.set(&log).await,
-            };
-            match result {
-                Ok(observed) => {
-                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
-                        entry.last_observation = Some(observed);
-                    }
-                    self.start_refresh_tx(tid);
-                    return Ok(());
-                }
-                Err(StorageError::Precondition) => {
-                    let status = self
-                        .inner
-                        .tl
-                        .commit_status_at(tid, self.current_requirement())
-                        .await?;
-                    if status.status.is_final() {
-                        return Err(TransError::AlreadyFinalized);
-                    }
-                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
-                        entry.last_observation = Some(status.observation);
-                    }
-                }
-                Err(StorageError::Unavailable(_)) => {}
-                Err(error) => return Err(error.into()),
-            }
-            rt::sleep(backoff.next_delay()).await;
+            e.recovery.locks = locks;
         }
     }
 
@@ -428,9 +378,9 @@ impl Monitor {
 
         let mut log = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
-            log.locks = entry.locks.clone();
-            log.collection_changes = entry.collection_changes.clone();
-            log.prepared_collections = entry.prepared_collections.clone();
+            log.locks = entry.recovery.locks.clone();
+            log.collection_changes = entry.recovery.collection_changes.clone();
+            log.prepared_collections = entry.recovery.prepared_collections.clone();
         }
         let res = self.set_final_log(&log).await;
 
@@ -728,6 +678,67 @@ impl Monitor {
                     expected = st.observation;
                 }
                 Err(e) => return Err(e.into()),
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
+    }
+
+    fn register_tx(&self, tid: &TxId, recovery: TxRecoveryManifest) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        st.local_tx.insert(
+            tid.clone(),
+            TxStatusEntry {
+                status: TxCommitStatus::Pending,
+                last_observation: None,
+                refresh_state: RefreshState::NotStarted,
+                recovery,
+            },
+        );
+    }
+
+    async fn persist_pending_tx(&self, tid: &TxId) -> Result<(), TransError> {
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            let (last_observation, recovery) = {
+                let st = self.shard_for(tid).lock().unwrap();
+                let entry = st
+                    .local_tx
+                    .get(tid)
+                    .ok_or_else(|| TransError::other("pending transaction disappeared"))?;
+                (entry.last_observation.clone(), entry.recovery.clone())
+            };
+            let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
+            log.timestamp = Some(self.inner.clock.now());
+            log.locks = recovery.locks;
+            log.collection_changes = recovery.collection_changes;
+            log.prepared_collections = recovery.prepared_collections;
+            let result = match last_observation.as_ref() {
+                Some(observed) => self.inner.tl.set_if(&log, observed).await,
+                None => self.inner.tl.set(&log).await,
+            };
+            match result {
+                Ok(observed) => {
+                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
+                        entry.last_observation = Some(observed);
+                    }
+                    self.start_refresh_tx(tid);
+                    return Ok(());
+                }
+                Err(StorageError::Precondition) => {
+                    let status = self
+                        .inner
+                        .tl
+                        .commit_status_at(tid, self.current_requirement())
+                        .await?;
+                    if status.status.is_final() {
+                        return Err(TransError::AlreadyFinalized);
+                    }
+                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
+                        entry.last_observation = Some(status.observation);
+                    }
+                }
+                Err(StorageError::Unavailable(_)) => {}
+                Err(error) => return Err(error.into()),
             }
             rt::sleep(backoff.next_delay()).await;
         }
@@ -1173,9 +1184,9 @@ impl Monitor {
             // write) so the materialized pending object records its own
             // back-references for GC (ADR-022).
             if let Some(entry) = self.shard_for(&tid).lock().unwrap().local_tx.get(&tid) {
-                tl.locks = entry.locks.clone();
-                tl.collection_changes = entry.collection_changes.clone();
-                tl.prepared_collections = entry.prepared_collections.clone();
+                tl.locks = entry.recovery.locks.clone();
+                tl.collection_changes = entry.recovery.collection_changes.clone();
+                tl.prepared_collections = entry.recovery.prepared_collections.clone();
             }
             let r = if let Some(observed) = &last_observation {
                 self.inner.tl.set_if(&tl, observed).await
@@ -1236,8 +1247,8 @@ mod tests {
     use super::*;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-    use glassdb_data::CollectionAddress;
-    use glassdb_storage::{CachedStore, LockType, Timeline, TxWrite};
+    use glassdb_data::{CollectionAddress, CollectionId};
+    use glassdb_storage::{CachedStore, LockType, Timeline, TxCollectionOp, TxWrite};
 
     #[test]
     fn protocol_timing_profiles_preserve_liveness_boundaries() {
@@ -1259,6 +1270,13 @@ mod tests {
 
     fn key_ref(key: &[u8]) -> KeyRef {
         KeyRef::new(CollectionAddress::root("test"), key)
+    }
+
+    fn collection_address(id: u8) -> CollectionAddress {
+        CollectionAddress::new(
+            "test",
+            CollectionId::from_slice(&[id; 16]).expect("fixed ID has the required width"),
+        )
     }
 
     struct TestCtx {
@@ -1330,6 +1348,84 @@ mod tests {
         assert!(cache.get(&second).is_none());
         assert!(cache.get(&first).is_some());
         assert!(cache.get(&third).is_some());
+    }
+
+    #[tokio::test]
+    async fn begin_persisted_tx_durably_records_manifest() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, t) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"persisted".to_vec());
+        let parent = CollectionAddress::root("test");
+        let created = collection_address(1);
+        let recovery = TxRecoveryManifest {
+            locks: vec![TxLock::Topology {
+                collection: parent.clone(),
+            }],
+            collection_changes: vec![TxCollectionChange {
+                parent,
+                name: b"created".to_vec(),
+                collection: created.clone(),
+                op: TxCollectionOp::Create,
+            }],
+            prepared_collections: vec![created],
+        };
+
+        mon.begin_persisted_tx(&tx, recovery.clone()).await.unwrap();
+
+        let log = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let log = log.value().unwrap();
+        assert_eq!(log.status, TxCommitStatus::Pending);
+        assert_eq!(log.locks, recovery.locks);
+        assert_eq!(log.collection_changes, recovery.collection_changes);
+        assert_eq!(log.prepared_collections, recovery.prepared_collections);
+
+        mon.abort_tx(&tx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_pending_tx_preserves_unmodified_backreferences() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, t) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"updated".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+        mon.begin_persisted_tx(
+            &tx,
+            TxRecoveryManifest {
+                locks: vec![lock.clone()],
+                ..TxRecoveryManifest::default()
+            },
+        )
+        .await
+        .unwrap();
+        let created = collection_address(2);
+        let change = TxCollectionChange {
+            parent: CollectionAddress::root("test"),
+            name: b"created".to_vec(),
+            collection: created.clone(),
+            op: TxCollectionOp::Create,
+        };
+
+        mon.update_pending_tx(&tx, {
+            let change = change.clone();
+            let created = created.clone();
+            move |recovery| {
+                recovery.collection_changes = vec![change];
+                recovery.prepared_collections = vec![created];
+            }
+        })
+        .await
+        .unwrap();
+
+        let log = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let log = log.value().unwrap();
+        assert_eq!(log.status, TxCommitStatus::Pending);
+        assert_eq!(log.locks, vec![lock]);
+        assert_eq!(log.collection_changes, vec![change]);
+        assert_eq!(log.prepared_collections, vec![created]);
+
+        mon.abort_tx(&tx).await.unwrap();
     }
 
     #[tokio::test]
