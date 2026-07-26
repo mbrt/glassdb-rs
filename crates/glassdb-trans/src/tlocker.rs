@@ -41,11 +41,12 @@ use glassdb_storage::{
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{NodeLockReconciler, Reclaim, resolve_entry_locks, try_reclaim};
+use crate::node_locking::{NodeLockReconciler, resolve_entry_locks};
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
     Step,
 };
+use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// One independent partition of the per-transaction held-lock bookkeeping: the
 /// shard/root paths each transaction holds and their lock type.

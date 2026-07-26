@@ -12,12 +12,13 @@ mod resolver;
 mod shard_coord;
 mod split;
 mod tlocker;
+mod wound_wait;
 
 pub use algo::{
     Algo, Data, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
 pub use collections::{
-    CollectionChange, CollectionData, CollectionManager, CollectionOp, DirectoryRead,
+    CollectionCatalog, CollectionChange, CollectionData, CollectionOp, DirectoryRead,
     DirectoryReadKind, DirectorySnapshot,
 };
 pub use error::TransError;

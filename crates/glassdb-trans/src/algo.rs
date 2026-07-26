@@ -36,7 +36,7 @@ use glassdb_storage::{
     TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 
-use crate::collections::{CollectionData, CollectionManager, CollectionOp};
+use crate::collections::{CollectionCatalog, CollectionData, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::Monitor;
@@ -477,7 +477,8 @@ pub struct Algo {
     clock: Clock,
     timeline: Timeline,
     split_policy: SplitPolicy,
-    collections: CollectionManager,
+    collection_catalog: CollectionCatalog,
+    collection_lifecycle: CollectionLifecycle,
     splitter: Splitter,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
@@ -502,8 +503,10 @@ impl Algo {
         split_policy: SplitPolicy,
         splitter: Splitter,
     ) -> Self {
-        let collections =
-            CollectionManager::new(shards.clone(), mon.clone(), RetryConfig::default());
+        let collection_catalog =
+            CollectionCatalog::new(shards.clone(), mon.clone(), RetryConfig::default());
+        let collection_lifecycle =
+            CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
         Algo {
             shards,
             resolver,
@@ -514,7 +517,8 @@ impl Algo {
             clock,
             timeline,
             split_policy,
-            collections,
+            collection_catalog,
+            collection_lifecycle,
             splitter,
             background,
         }
@@ -613,7 +617,7 @@ impl Algo {
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
             && self
-                .collections
+                .collection_catalog
                 .validate(
                     None,
                     &tx.collection_data.reads,
@@ -659,9 +663,12 @@ impl Algo {
         }
         let result = self.mon.abort_tx(&tx.id).await;
         let drops = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
-        let drop_cleanup = self.collections.clear_aborted_drops(&tx.id, &drops).await;
+        let drop_cleanup = self
+            .collection_lifecycle
+            .clear_aborted_drops(&tx.id, &drops)
+            .await;
         let prepared = tx.prepared_collections.iter().cloned().collect::<Vec<_>>();
-        let prepared_cleanup = self.collections.reclaim(&prepared).await;
+        let prepared_cleanup = self.collection_lifecycle.reclaim(&prepared).await;
         result?;
         drop_cleanup?;
         prepared_cleanup
@@ -716,7 +723,7 @@ impl Algo {
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
             && self
-                .collections
+                .collection_catalog
                 .validate(
                     None,
                     &tx.collection_data.reads,
@@ -753,7 +760,7 @@ impl Algo {
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
-        self.collections
+        self.collection_lifecycle
             .clear_aborted_drops(&tx.id, &abandoned_drops)
             .await?;
         tx.fenced_drops.retain(|drop| active_drops.contains(drop));
@@ -806,11 +813,11 @@ impl Algo {
                 .filter(|change| change.op == CollectionOp::Create)
                 .map(|change| change.collection.clone()),
         );
-        self.collections
+        self.collection_lifecycle
             .prepare_roots(&tx.collection_data.changes)
             .await?;
         let directory_locks = self
-            .collections
+            .collection_catalog
             .lock_directories(
                 &tx.id,
                 &tx.collection_data.reads,
@@ -851,7 +858,7 @@ impl Algo {
             )
             .await?
             || !self
-                .collections
+                .collection_catalog
                 .validate(
                     Some(&tx.id),
                     &tx.collection_data.reads,
@@ -861,14 +868,14 @@ impl Algo {
                 )
                 .await?
         {
-            self.collections.release_locks(&tx.id, &locks).await;
+            self.collection_catalog.release_locks(&tx.id, &locks).await;
             return self.revalidate(tx).await;
         }
 
         // Record the target before preparation begins so a partial fencing
         // attempt is cleared if this same transaction reruns a different body.
         tx.fenced_drops.extend(active_drops);
-        self.collections
+        self.collection_lifecycle
             .fence_drops(&tx.id, &tx.collection_data.changes, &self.splitter)
             .await?;
 
@@ -893,7 +900,7 @@ impl Algo {
         tx.status = Status::Committed;
 
         if let Err(error) = self
-            .collections
+            .collection_catalog
             .write_back(&tx.id, &tx.collection_data.changes, &locks)
             .await
         {
@@ -913,11 +920,11 @@ impl Algo {
             .difference(&active_prepared)
             .cloned()
             .collect::<Vec<_>>();
-        if let Err(error) = self.collections.reclaim(&unused).await {
+        if let Err(error) = self.collection_lifecycle.reclaim(&unused).await {
             tracing::debug!(%error, "prepared-collection cleanup deferred");
         }
         let dropped = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
-        if let Err(error) = self.collections.reclaim(&dropped).await {
+        if let Err(error) = self.collection_lifecycle.reclaim(&dropped).await {
             tracing::debug!(%error, "dropped-collection cleanup deferred");
         }
         Ok(())
@@ -937,7 +944,7 @@ impl Algo {
         // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
         let directory_locks = self
-            .collections
+            .collection_catalog
             .lock_directories(&tx.id, &tx.collection_data.reads, &[])
             .await?;
         let locked = match self.acquire_locks(tx, validation_start).await? {
@@ -958,7 +965,7 @@ impl Algo {
             )
             .await?
             && self
-                .collections
+                .collection_catalog
                 .validate(
                     Some(&tx.id),
                     &tx.collection_data.reads,
@@ -970,7 +977,7 @@ impl Algo {
         {
             return Ok(());
         }
-        self.collections.release_locks(&tx.id, &locks).await;
+        self.collection_catalog.release_locks(&tx.id, &locks).await;
         self.revalidate(tx).await
     }
 

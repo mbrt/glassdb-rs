@@ -14,12 +14,7 @@ use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::resolver::Resolver;
 use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
-
-/// Result of applying wound-wait to one live holder.
-pub(crate) enum Reclaim {
-    Wounded,
-    Wait,
-}
+use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// Entry state needed by lock coordination after writer resolution and holder
 /// liveness classification.
@@ -105,23 +100,6 @@ pub(crate) async fn resolve_entry_locks(
         ctx.requirement,
     )
     .await
-}
-
-/// Applies the transaction priority rule to one pending lock holder.
-pub(crate) async fn try_reclaim(
-    monitor: &Monitor,
-    id: &TxId,
-    holder: &TxId,
-) -> Result<Reclaim, TransError> {
-    if !id.older(holder) {
-        return Ok(Reclaim::Wait);
-    }
-    monitor.wound_tx(holder).await?;
-    if monitor.tx_status(holder).await? == TxCommitStatus::Aborted {
-        Ok(Reclaim::Wounded)
-    } else {
-        Ok(Reclaim::Wait)
-    }
 }
 
 /// Wound-wait policy over one node's structural gate and membership lock.

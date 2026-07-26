@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use glassdb_data::{CollectionAddress, CollectionId, KeyRef, TxId};
 use glassdb_storage::{LeafObservation, StorageError};
 use glassdb_trans::{
-    CollectionChange, CollectionData, CollectionManager, CollectionOp, Data, DirectoryRead,
+    CollectionCatalog, CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead,
     DirectoryReadKind, ReadAccess, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess,
 };
 
@@ -39,7 +39,7 @@ pub struct Transaction {
     db: Arc<DbInner>,
     reader: Reader,
     resolver: Resolver,
-    collections: CollectionManager,
+    catalog: CollectionCatalog,
     inner: Arc<Mutex<TransactionInner>>,
 }
 
@@ -522,7 +522,7 @@ impl Transaction {
         Transaction {
             reader: Reader::new(resolver.clone(), db.timeline.clone(), db.retry),
             resolver,
-            collections: CollectionManager::new(db.shards.clone(), db.tmon.clone(), db.retry),
+            catalog: CollectionCatalog::new(db.shards.clone(), db.tmon.clone(), db.retry),
             db,
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }
@@ -536,7 +536,7 @@ impl Transaction {
             db: self.db.clone(),
             reader: self.reader.clone(),
             resolver: self.resolver.clone(),
-            collections: self.collections.clone(),
+            catalog: self.catalog.clone(),
             inner: self.inner.clone(),
         }
     }
@@ -710,7 +710,7 @@ impl Transaction {
             }
         }
 
-        let snapshot = self.collections.snapshot(parent).await.map_err(|error| {
+        let snapshot = self.catalog.snapshot(parent).await.map_err(|error| {
             let mapped = Error::from(error);
             if matches!(mapped, Error::NotFound) && !parent.id().is_root() {
                 Error::StaleCollection

@@ -46,7 +46,7 @@ use glassdb_storage::{
     TxCommitStatus, TxLock, TxLog,
 };
 
-use crate::CollectionManager;
+use crate::collections::{CollectionCatalog, CollectionLifecycle};
 use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::tlocker::Locker;
@@ -76,7 +76,8 @@ pub struct Gc {
     bg: Weak<Background>,
     tl: TLogger,
     shards: ShardStore,
-    collections: CollectionManager,
+    collection_catalog: CollectionCatalog,
+    collection_lifecycle: CollectionLifecycle,
     dir: Directory,
     locker: Locker,
     mon: Monitor,
@@ -131,13 +132,16 @@ impl Gc {
         clock: Clock,
     ) -> Self {
         let dir = Directory::new(shards.clone());
-        let collections =
-            CollectionManager::new(shards.clone(), mon.clone(), RetryConfig::default());
+        let collection_catalog =
+            CollectionCatalog::new(shards.clone(), mon.clone(), RetryConfig::default());
+        let collection_lifecycle =
+            CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
         Gc {
             bg,
             tl,
             shards,
-            collections,
+            collection_catalog,
+            collection_lifecycle,
             dir,
             locker,
             mon,
@@ -304,7 +308,9 @@ impl Gc {
         // reachability. A crash after the commit point must not leave a dropped
         // collection forever merely because this same log stores a live value
         // in another collection.
-        self.collections.recover_write_back(tid, &log.locks).await?;
+        self.collection_catalog
+            .recover_write_back(tid, &log.locks)
+            .await?;
         let dropped = log
             .collection_changes
             .iter()
@@ -323,8 +329,8 @@ impl Gc {
             .filter(|collection| !active_created.contains(*collection))
             .cloned()
             .collect::<Vec<_>>();
-        self.collections.reclaim(&dropped).await?;
-        self.collections.reclaim(&unused_prepared).await?;
+        self.collection_lifecycle.reclaim(&dropped).await?;
+        self.collection_lifecycle.reclaim(&unused_prepared).await?;
         if self.still_referenced(tid, log, requirement).await? {
             return Ok(());
         }
@@ -356,8 +362,12 @@ impl Gc {
             .filter(|change| change.op == glassdb_storage::TxCollectionOp::Drop)
             .map(|change| change.collection.clone())
             .collect::<Vec<_>>();
-        self.collections.clear_aborted_drops(tid, &drops).await?;
-        self.collections.reclaim(&log.prepared_collections).await?;
+        self.collection_lifecycle
+            .clear_aborted_drops(tid, &drops)
+            .await?;
+        self.collection_lifecycle
+            .reclaim(&log.prepared_collections)
+            .await?;
         self.tl.delete(observation).await?;
         Ok(())
     }
