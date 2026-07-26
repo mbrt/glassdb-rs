@@ -390,17 +390,17 @@ impl Monitor {
         res
     }
 
-    /// Forces the given transaction into the aborted state so that a
+    /// Attempts to force the given transaction into the aborted state so that a
     /// higher-priority transaction can take over its locks under the wound-wait
-    /// rule. It is idempotent and safe on transactions that already finished: a
-    /// committed transaction is left untouched (its locks are released through
-    /// the normal flow), and an already-aborted one is a no-op.
+    /// rule, returning the durable status that won. It is idempotent and safe on
+    /// transactions that already finished: a committed transaction is left
+    /// untouched (its locks are released through the normal flow), and an
+    /// already-aborted one is a no-op.
     ///
     /// The abort is made durable via a conditional write on the transaction log,
     /// so it is observed both by the local victim (its commit will fail) and by
     /// other clients holding the same lock.
-    pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<(), TransError> {
-        // TODO: this smells of TOCTOU
+    pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
         let cs = self
             .inner
             .tl
@@ -412,14 +412,17 @@ impl Monitor {
         if cs.status.is_final() {
             // Already committed or aborted: nothing left to wound.
             self.mark_local_aborted(tid, cs.status);
-            return Ok(());
+            return Ok(cs.status);
         }
 
         // Force the transaction to aborted, CAS-ing over its current log version
         // (or creating an aborted log if it has none yet).
         let status = self.force_abort(tid, &cs.observation).await?;
+        // TODO: Retry the wound when a pending refresh wins the CAS. Lease-based
+        // reclaim must leave a refreshed owner alive, but wound-wait should not
+        // let a younger transaction's refresh make an older requester wait.
         self.mark_local_aborted(tid, status);
-        Ok(())
+        Ok(status)
     }
 
     /// Returns the commit status, checking locally first then remote storage.
@@ -1441,6 +1444,28 @@ mod tests {
         mon1.commit_tx(tl).await.unwrap();
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn wound_tx_returns_the_status_that_won() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, _t) = new_test_monitor(b);
+        let pending = TxId::from_bytes(b"pending".to_vec());
+        mon.begin_tx(&pending);
+        assert_eq!(
+            mon.wound_tx(&pending).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
+
+        let committed = TxId::from_bytes(b"committed".to_vec());
+        mon.begin_tx(&committed);
+        let mut log = TxLog::new(committed.clone(), TxCommitStatus::Ok);
+        log.locks.push(TxLock::Entry {
+            key: key_ref(b"key"),
+            typ: LockType::Write,
+        });
+        mon.commit_tx(log).await.unwrap();
+        assert_eq!(mon.wound_tx(&committed).await.unwrap(), TxCommitStatus::Ok);
     }
 
     #[tokio::test]

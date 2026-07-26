@@ -2689,7 +2689,7 @@ mod tests {
         };
         let observed = s.write_structural_log("R", &record).await.unwrap();
         sp.mon.begin_tx(&id);
-        sp.mon.wound_tx(&id).await.unwrap();
+        assert_eq!(sp.mon.wound_tx(&id).await.unwrap(), TxCommitStatus::Aborted);
 
         gate.arm();
         let recovering = {
