@@ -39,13 +39,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
-use glassdb_concurr::{Background, Clock, rt};
+use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId, paths, shuffle};
 use glassdb_storage::{
     Directory, Observation, Requirement, ShardStore, StorageError, TLogger, Timeline,
     TxCommitStatus, TxLock, TxLog,
 };
 
+use crate::collections::{CollectionCatalog, CollectionLifecycle};
 use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::tlocker::Locker;
@@ -74,6 +75,9 @@ pub struct Gc {
     // `DbInner::background`.
     bg: Weak<Background>,
     tl: TLogger,
+    shards: ShardStore,
+    collection_catalog: CollectionCatalog,
+    collection_lifecycle: CollectionLifecycle,
     dir: Directory,
     locker: Locker,
     mon: Monitor,
@@ -128,9 +132,20 @@ impl Gc {
         clock: Clock,
     ) -> Self {
         let dir = Directory::new(shards.clone());
+        let collection_catalog = CollectionCatalog::new(
+            shards.clone(),
+            tl.clone(),
+            mon.clone(),
+            RetryConfig::default(),
+        );
+        let collection_lifecycle =
+            CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
         Gc {
             bg,
             tl,
+            shards,
+            collection_catalog,
+            collection_lifecycle,
             dir,
             locker,
             mon,
@@ -270,7 +285,7 @@ impl Gc {
                     .await
             }
             TxCommitStatus::Aborted => {
-                self.reclaim_aborted(tid, &log.locks, &observed, candidate_check)
+                self.reclaim_aborted(tid, log, &observed, candidate_check)
                     .await
             }
             TxCommitStatus::Pending => {
@@ -293,10 +308,39 @@ impl Gc {
         observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
+        // Collection effects are independent of the transaction object's value
+        // reachability. A crash after the commit point must not leave a dropped
+        // collection forever merely because this same log stores a live value
+        // in another collection.
+        self.collection_catalog
+            .recover_write_back(tid, &log.collection_changes, &log.locks)
+            .await?;
+        let dropped = log
+            .collection_changes
+            .iter()
+            .filter(|change| change.op == glassdb_storage::TxCollectionOp::Drop)
+            .map(|change| change.collection.clone())
+            .collect::<Vec<_>>();
+        let active_created = log
+            .collection_changes
+            .iter()
+            .filter(|change| change.op == glassdb_storage::TxCollectionOp::Create)
+            .map(|change| change.collection.clone())
+            .collect::<BTreeSet<_>>();
+        let unused_prepared = log
+            .prepared_collections
+            .iter()
+            .filter(|collection| !active_created.contains(*collection))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.collection_lifecycle.reclaim(&dropped).await?;
+        self.collection_lifecycle.reclaim(&unused_prepared).await?;
         if self.still_referenced(tid, log, requirement).await? {
             return Ok(());
         }
-        self.release_locks(tid, &log.locks, requirement).await?;
+        if !self.release_locks(tid, &log.locks, requirement).await? {
+            return Ok(());
+        }
         self.tl.delete(observation).await?;
         Ok(())
     }
@@ -309,11 +353,25 @@ impl Gc {
     async fn reclaim_aborted(
         &self,
         tid: &TxId,
-        locks: &[TxLock],
+        log: &TxLog,
         observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        self.release_locks(tid, locks, requirement).await?;
+        if !self.release_locks(tid, &log.locks, requirement).await? {
+            return Ok(());
+        }
+        let drops = log
+            .collection_changes
+            .iter()
+            .filter(|change| change.op == glassdb_storage::TxCollectionOp::Drop)
+            .map(|change| change.collection.clone())
+            .collect::<Vec<_>>();
+        self.collection_lifecycle
+            .clear_aborted_drops(tid, &drops)
+            .await?;
+        self.collection_lifecycle
+            .reclaim(&log.prepared_collections)
+            .await?;
         self.tl.delete(observation).await?;
         Ok(())
     }
@@ -332,8 +390,11 @@ impl Gc {
         observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        match self.mon.force_abort(tid, observation).await? {
-            TxCommitStatus::Aborted => self.release_locks(tid, &log.locks, requirement).await,
+        match self.mon.try_abort_observed(tid, observation).await?.status {
+            TxCommitStatus::Aborted => self
+                .release_locks(tid, &log.locks, requirement)
+                .await
+                .map(|_| ()),
             // Committed or refreshed first: it was alive. Leave it.
             _ => Ok(()),
         }
@@ -367,22 +428,52 @@ impl Gc {
             }
         }
 
-        for group in self.dir.group_keys_by_leaf(items, requirement).await? {
-            let Some(leaf) = group.node().and_then(|node| node.as_leaf()) else {
-                continue;
+        let mut by_collection = std::collections::BTreeMap::new();
+        for (key, kind) in items {
+            by_collection
+                .entry(key.collection().clone())
+                .or_insert_with(Vec::new)
+                .push((key, kind));
+        }
+        for items in by_collection.into_values() {
+            let groups = match self.dir.group_keys_by_leaf(items, requirement).await {
+                Ok(groups) => groups,
+                // Reclaiming a collection removes every reference it could
+                // contain; its absent tree is therefore negative evidence.
+                Err(StorageError::NotFound | StorageError::StaleCollection) => continue,
+                Err(error) => return Err(error.into()),
             };
-            for (raw_key, kind) in &group.keys {
-                let referenced = match kind {
-                    CheckKind::Writer => {
-                        leaf.lookup(raw_key).and_then(|e| e.current_writer.as_ref()) == Some(tid)
-                    }
-                    CheckKind::Holder => leaf
-                        .lookup(raw_key)
-                        .is_some_and(|e| e.locked_by.contains(tid)),
+            for group in groups {
+                let Some(leaf) = group.node().and_then(|node| node.as_leaf()) else {
+                    continue;
                 };
-                if referenced {
-                    return Ok(true);
+                for (raw_key, kind) in &group.keys {
+                    let referenced = match kind {
+                        CheckKind::Writer => {
+                            leaf.lookup(raw_key).and_then(|e| e.current_writer.as_ref())
+                                == Some(tid)
+                        }
+                        CheckKind::Holder => leaf
+                            .lookup(raw_key)
+                            .is_some_and(|e| e.locked_by.contains(tid)),
+                    };
+                    if referenced {
+                        return Ok(true);
+                    }
                 }
+            }
+        }
+        for collection in log.locks.iter().filter_map(|lock| match lock {
+            TxLock::Directory { collection, .. } => Some(collection),
+            _ => None,
+        }) {
+            if let Ok((root, _)) = self
+                .shards
+                .load_root(&collection.physical_prefix(), requirement)
+                .await
+                && root.directory_lock().contains(tid)
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -400,24 +491,86 @@ impl Gc {
         tid: &TxId,
         locks: &[TxLock],
         requirement: Requirement,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         let mut key_locks: Vec<(KeyRef, ())> = Vec::new();
         let mut leaf_paths = BTreeSet::new();
+        let mut directories = BTreeSet::new();
+        let mut topology = BTreeSet::new();
         for lock in locks {
             match lock {
                 TxLock::Entry { key, .. } => key_locks.push((key.clone(), ())),
                 TxLock::Membership { leaf, .. } => {
                     leaf_paths.insert(leaf.physical_path());
                 }
+                TxLock::Directory { collection, .. } => {
+                    directories.insert(collection.clone());
+                }
+                TxLock::Topology { collection } => {
+                    topology.insert(collection.clone());
+                }
             }
         }
-        for group in self.dir.group_keys_by_leaf(key_locks, requirement).await? {
-            leaf_paths.insert(group.path);
+        let mut by_collection = std::collections::BTreeMap::new();
+        for (key, ()) in key_locks {
+            by_collection
+                .entry(key.collection().clone())
+                .or_insert_with(Vec::new)
+                .push((key, ()));
+        }
+        for items in by_collection.into_values() {
+            match self.dir.group_keys_by_leaf(items, requirement).await {
+                Ok(groups) => {
+                    leaf_paths.extend(groups.into_iter().map(|group| group.path));
+                }
+                Err(StorageError::NotFound | StorageError::StaleCollection) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         for path in leaf_paths {
             self.locker.release_leaf(tid, &path).await?;
         }
-        Ok(())
+        for collection in directories {
+            let prefix = collection.physical_prefix();
+            loop {
+                let (mut root, observed) =
+                    match self.shards.load_root(&prefix, Requirement::Any).await {
+                        Ok(root) => root,
+                        Err(StorageError::NotFound) => break,
+                        Err(error) => return Err(error.into()),
+                    };
+                if !root.remove_directory_holder(tid) {
+                    break;
+                }
+                if self.shards.store_root(&prefix, &root, &observed).await? {
+                    break;
+                }
+            }
+        }
+        for collection in topology {
+            let records = self
+                .shards
+                .list_structural_logs_for_participant(collection.db_root(), tid, requirement)
+                .await?;
+            if !records.is_empty() {
+                return Ok(false);
+            }
+            let prefix = collection.physical_prefix();
+            loop {
+                let (mut root, observed) =
+                    match self.shards.load_root(&prefix, Requirement::Any).await {
+                        Ok(root) => root,
+                        Err(StorageError::NotFound) => break,
+                        Err(error) => return Err(error.into()),
+                    };
+                if !root.remove_topology_participant(tid) {
+                    break;
+                }
+                if self.shards.store_root(&prefix, &root, &observed).await? {
+                    break;
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -437,12 +590,15 @@ mod tests {
     use crate::shard_coord::ShardCoordinator;
     use crate::tlocker::LockOutcome;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
-    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
+    use glassdb_data::{CollectionAddress, CollectionId};
     use glassdb_storage::{
-        CachedStore, CollectionRoot, Directory, LockType, Shard, ShardEntry, Timeline, TxWrite,
+        CachedStore, CollectionRoot, Directory, LockType, Shard, ShardEntry, Timeline,
+        TxCollectionChange, TxCollectionOp, TxWrite,
     };
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
 
     const COLL: &str = "db/_c/0000000000000000000000";
@@ -593,6 +749,8 @@ mod tests {
                 })
                 .collect(),
             locks: locks.iter().map(|k| write_lock(k)).collect(),
+            collection_changes: Vec::new(),
+            prepared_collections: Vec::new(),
         }
     }
 
@@ -654,6 +812,207 @@ mod tests {
         ctx.gc.run_once(&mut scan).await;
 
         assert!(is_gone(&ctx.tl, &old).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
+        let ctx = new_ctx().await;
+        let id = tx(1);
+        let prepared = CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+        );
+        ctx.shards
+            .create_root(&prepared.physical_prefix(), &CollectionRoot::new())
+            .await
+            .unwrap();
+        let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
+        log.prepared_collections.push(prepared.clone());
+        ctx.tl.set(&log).await.unwrap();
+        let mut scan = test_scan(vec![paths::transaction_shard(&id)], None);
+
+        ctx.gc.run_once(&mut scan).await;
+
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert!(matches!(
+            ctx.shards
+                .load_root(&prepared.physical_prefix(), Requirement::Any)
+                .await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let ctx = new_ctx_with(backend.clone()).await;
+        let id = tx(1);
+        let prepared = CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+        );
+        ctx.shards
+            .create_root(&prepared.physical_prefix(), &CollectionRoot::new())
+            .await
+            .unwrap();
+        let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
+        log.prepared_collections.push(prepared.clone());
+        ctx.tl.set(&log).await.unwrap();
+
+        let root_path = paths::collection_info(&prepared.physical_prefix());
+        let fail_once = Arc::new(AtomicBool::new(true));
+        backend.set_before({
+            let fail_once = fail_once.clone();
+            move |operation| {
+                let fail = matches!(
+                    operation,
+                    BackendOp::DeleteIf { path, .. }
+                        if *path == root_path && fail_once.swap(false, Ordering::SeqCst)
+                );
+                let future: HookFuture = Box::pin(async move {
+                    if fail {
+                        Err(BackendError::Precondition)
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            }
+        });
+        ctx.gc.schedule_tx_cleanup(id.clone());
+
+        run_once(&ctx.gc).await;
+
+        assert!(
+            !is_gone(&ctx.tl, &id).await,
+            "cleanup conflicts must retain the only durable orphan manifest"
+        );
+        assert!(
+            ctx.shards
+                .load_root(&prepared.physical_prefix(), Requirement::Any)
+                .await
+                .is_ok()
+        );
+
+        backend.clear_before();
+        ctx.gc.schedule_tx_cleanup(id.clone());
+        run_once(&ctx.gc).await;
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert!(matches!(
+            ctx.shards
+                .load_root(&prepared.physical_prefix(), Requirement::Any)
+                .await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
+        let ctx = new_ctx().await;
+        let id = tx(1);
+        let child = CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[8; 16]).expect("fixed ID has the required width"),
+        );
+
+        store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
+        let (mut parent_root, parent_observed) = ctx
+            .shards
+            .load_root(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .await
+            .unwrap();
+        assert!(
+            parent_root
+                .add_child(b"child".to_vec(), child.id())
+                .unwrap()
+        );
+        parent_root.set_directory_writer(id.clone());
+        assert!(
+            ctx.shards
+                .store_root(COLL, &parent_root, &parent_observed)
+                .await
+                .unwrap()
+        );
+
+        let mut child_root = CollectionRoot::new();
+        child_root.add_directory_reader(id.clone());
+        child_root.node_locks_mut().set_delete_intent(id.clone());
+        assert!(child_root.set_topology_freeze(id.clone()));
+        assert!(
+            ctx.shards
+                .create_root(&child.physical_prefix(), &child_root)
+                .await
+                .unwrap()
+        );
+
+        let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
+        log.locks.extend([
+            TxLock::Directory {
+                collection: collection(),
+                typ: LockType::Write,
+            },
+            TxLock::Directory {
+                collection: child.clone(),
+                typ: LockType::Read,
+            },
+        ]);
+        log.collection_changes.push(TxCollectionChange {
+            parent: collection(),
+            name: b"child".to_vec(),
+            collection: child.clone(),
+            op: TxCollectionOp::Drop,
+        });
+        ctx.tl.set(&log).await.unwrap();
+        ctx.gc.schedule_tx_cleanup(id.clone());
+
+        run_once(&ctx.gc).await;
+
+        assert!(
+            !is_gone(&ctx.tl, &id).await,
+            "the live root value still needs its transaction object"
+        );
+        let (parent_root, _) = ctx
+            .shards
+            .load_root(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(parent_root.child(b"child"), None);
+        assert!(!parent_root.directory_lock().contains(&id));
+        assert!(matches!(
+            ctx.shards
+                .load_root(&child.physical_prefix(), Requirement::Any)
+                .await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_references_in_a_reclaimed_collection_are_absent() {
+        let ctx = new_ctx().await;
+        let id = tx(1);
+        let missing = CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
+        );
+        let key = KeyRef::new(missing, b"k");
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.timestamp = Some(base() - PAST_HORIZON);
+        log.writes.push(TxWrite {
+            key: key.clone(),
+            value: Arc::from(&b"v"[..]),
+            deleted: false,
+            prev_writer: TxId::default(),
+        });
+        log.locks.push(TxLock::Entry {
+            key,
+            typ: LockType::Write,
+        });
+        ctx.tl.set(&log).await.unwrap();
+        ctx.gc.schedule_tx_cleanup(id.clone());
+
+        run_once(&ctx.gc).await;
+
+        assert!(is_gone(&ctx.tl, &id).await);
     }
 
     // A committed object still named by its key's `current_writer` is the live

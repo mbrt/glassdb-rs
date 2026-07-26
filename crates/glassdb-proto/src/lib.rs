@@ -43,8 +43,12 @@ mod tests {
                         target: Some(membership_lock::Target::Root(true)),
                         lock_type: lock::LockType::Read as i32,
                     }],
+                    directory_lock: 0,
+                    topology_lock: false,
                 }),
             }],
+            collection_changes: vec![],
+            prepared_collection_ids: vec![],
         };
 
         let bytes = log.encode_to_vec();

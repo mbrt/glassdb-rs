@@ -10,7 +10,9 @@ use glassdb_concurr::rt;
 use crate::{Collection, CollectionPath, Database, Error};
 
 use super::harness::SimWorkload;
-use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, key_name, read_int, write_int};
+use super::{
+    MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, key_name, read_int, try_read_int, write_int,
+};
 // ===========================================================================
 // Cycle workload (ported from FoundationDB's `Cycle.cpp`).
 //
@@ -90,13 +92,50 @@ impl<'a> Arbitrary<'a> for CycleWorkload {
     }
 }
 
-/// Reads node `idx`'s next-pointer within `tx`.
-async fn read_next(tx: &crate::Transaction, coll: &Collection, idx: usize) -> Result<usize, Error> {
-    let v = tx
-        .read(coll, &key_name(idx))
-        .await?
-        .ok_or(Error::NotFound)?;
-    Ok(read_int(&v) as usize)
+/// Reads node `idx`'s encoded next-pointer within `tx`.
+async fn read_next_value(
+    tx: &crate::Transaction,
+    coll: &Collection,
+    idx: usize,
+) -> Result<Vec<u8>, Error> {
+    tx.read(coll, &key_name(idx)).await?.ok_or(Error::NotFound)
+}
+
+#[derive(Debug)]
+struct InvalidPointer {
+    node: usize,
+    value: Vec<u8>,
+}
+
+impl InvalidPointer {
+    fn fail(self) -> ! {
+        panic!(
+            "ring node {} has invalid next-pointer {:?}",
+            self.node, self.value
+        )
+    }
+}
+
+fn decode_pointer(node: usize, value: Vec<u8>) -> Result<usize, InvalidPointer> {
+    try_read_int(&value)
+        .and_then(|pointer| usize::try_from(pointer).ok())
+        .ok_or(InvalidPointer { node, value })
+}
+
+// Invalid cached bytes may be stale until OCC validates the attempt, so carry
+// them out of the transaction before failing the workload oracle.
+#[derive(Debug)]
+enum CycleSwapObservation {
+    Applied,
+    InvalidPointer(InvalidPointer),
+}
+
+impl CycleSwapObservation {
+    fn verify(self) {
+        if let CycleSwapObservation::InvalidPointer(invalid) = self {
+            invalid.fail();
+        }
+    }
 }
 
 /// Sets node `idx`'s next-pointer to `next` within `tx`.
@@ -141,15 +180,28 @@ fn assert_ring(next: &[usize]) {
 /// single N-cycle with N >= 4 the four nodes are distinct, so the three writes
 /// target distinct keys and map the ring to another single N-cycle.
 async fn cycle_swap(db: &Database, coll: &Collection, r: usize) -> Result<(), Error> {
-    db.tx(|tx| async move {
-        let r2 = read_next(&tx, coll, r).await?;
-        let r3 = read_next(&tx, coll, r2).await?;
-        let r4 = read_next(&tx, coll, r3).await?;
-        write_next(&tx, coll, r, r3)?;
-        write_next(&tx, coll, r2, r4)?;
-        write_next(&tx, coll, r3, r2)
-    })
-    .await
+    let observation = db
+        .tx(|tx| async move {
+            let r2 = match decode_pointer(r, read_next_value(&tx, coll, r).await?) {
+                Ok(pointer) => pointer,
+                Err(invalid) => return Ok(CycleSwapObservation::InvalidPointer(invalid)),
+            };
+            let r3 = match decode_pointer(r2, read_next_value(&tx, coll, r2).await?) {
+                Ok(pointer) => pointer,
+                Err(invalid) => return Ok(CycleSwapObservation::InvalidPointer(invalid)),
+            };
+            let r4 = match decode_pointer(r3, read_next_value(&tx, coll, r3).await?) {
+                Ok(pointer) => pointer,
+                Err(invalid) => return Ok(CycleSwapObservation::InvalidPointer(invalid)),
+            };
+            write_next(&tx, coll, r, r3)?;
+            write_next(&tx, coll, r2, r4)?;
+            write_next(&tx, coll, r3, r2)?;
+            Ok(CycleSwapObservation::Applied)
+        })
+        .await?;
+    observation.verify();
+    Ok(())
 }
 
 /// Snapshots the whole ring within a single transaction, reading all `N`
@@ -165,10 +217,20 @@ async fn read_ring_snapshot(
     coll: &Collection,
     node_count: usize,
 ) -> Result<Vec<usize>, Error> {
-    db.tx(|tx| async move {
-        futures::future::try_join_all((0..node_count).map(|k| read_next(&tx, coll, k))).await
-    })
-    .await
+    let values = db
+        .tx(|tx| async move {
+            futures::future::try_join_all((0..node_count).map(|k| read_next_value(&tx, coll, k)))
+                .await
+        })
+        .await?;
+    Ok(values
+        .into_iter()
+        .enumerate()
+        .map(|(node, value)| match decode_pointer(node, value) {
+            Ok(pointer) => pointer,
+            Err(invalid) => invalid.fail(),
+        })
+        .collect())
 }
 
 impl SimWorkload for CycleWorkload {

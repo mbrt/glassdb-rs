@@ -4,13 +4,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_data::{CollectionAddress, KeyRef, MAX_COLLECTION_NAME_BYTES};
-use glassdb_storage::Requirement;
+use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, MAX_COLLECTION_NAME_BYTES};
 use glassdb_trans::{Reader, Resolver};
 
-use crate::db::{CreateMode, DbInner};
+use crate::db::DbInner;
 use crate::error::Error;
-use crate::iter::{CollectionEntry, CollectionsIter, KeysIter};
+use crate::iter::{CollectionsIter, KeysIter};
 use crate::scan::{KeyPage, KeyScan};
 
 /// An unresolved sequence of logical collection names.
@@ -78,8 +77,7 @@ impl TryFrom<&String> for CollectionPath {
 #[derive(Clone)]
 pub struct Collection {
     address: CollectionAddress,
-    // TODO(ADR-047): Extend the handle with its direct parent address when
-    // lifecycle operations need exact parent/name binding checks.
+    parent: Option<CollectionAddress>,
     name: Option<Arc<[u8]>>,
     db: Arc<DbInner>,
 }
@@ -153,21 +151,27 @@ impl Collection {
     pub async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
         let name = name.as_ref();
         validate_collection_name(name)?;
-        self.db.open_child(self, name).await
+        self.db
+            .tx(|tx| async move { tx.open_collection(self, name).await })
+            .await
     }
 
     /// Reports whether a direct child is currently bound to `name`.
     pub async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
         let name = name.as_ref();
         validate_collection_name(name)?;
-        self.db.child_exists(self, name).await
+        self.db
+            .tx(|tx| async move { tx.collection_exists(self, name).await })
+            .await
     }
 
     /// Strictly creates and binds a new direct child.
     pub async fn create_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
         let name = name.as_ref();
         validate_collection_name(name)?;
-        self.db.create_child(self, name, CreateMode::Strict).await
+        self.db
+            .tx(|tx| async move { tx.create_collection(self, name).await })
+            .await
     }
 
     /// Returns the direct child bound to `name`, creating it when absent.
@@ -177,7 +181,9 @@ impl Collection {
     ) -> Result<Collection, Error> {
         let name = name.as_ref();
         validate_collection_name(name)?;
-        self.db.create_child(self, name, CreateMode::IfAbsent).await
+        self.db
+            .tx(|tx| async move { Ok(tx.create_collection_if_absent(self, name).await?.0) })
+            .await
     }
 
     /// Returns an iterator over the keys in the collection.
@@ -202,28 +208,16 @@ impl Collection {
     /// The returned handles remain bound to the listed incarnations even if a
     /// later lifecycle operation changes the logical names.
     pub async fn collections(&self) -> Result<CollectionsIter, Error> {
-        let _guard = self.db.admit_operation()?;
-        let requirement = Requirement::AtLeast(self.db.timeline.now());
-        let (root, _) = self
-            .db
-            .shards
-            .load_root(&self.address.physical_prefix(), requirement)
+        self.db
+            .tx(|tx| async move { tx.collections(self).await })
             .await
-            .map_err(Error::from_read)?;
-        let entries = root
-            .children()
-            .map(|(name, id)| {
-                CollectionEntry::new(
-                    name.to_vec(),
-                    Collection::new_child(
-                        CollectionAddress::new(self.db.name.as_str(), id),
-                        name,
-                        self.db.clone(),
-                    ),
-                )
-            })
-            .collect();
-        Ok(CollectionsIter::new(entries))
+    }
+
+    /// Non-recursively drops this exact collection incarnation.
+    pub async fn drop_collection(&self) -> Result<(), Error> {
+        self.db
+            .tx(|tx| async move { tx.drop_collection(self).await })
+            .await
     }
 
     /// Returns this handle's direct logical name, or `None` for the database root.
@@ -234,14 +228,21 @@ impl Collection {
     pub(crate) fn new_root(db: Arc<DbInner>) -> Self {
         Self {
             address: CollectionAddress::root(db.name.as_str()),
+            parent: None,
             name: None,
             db,
         }
     }
 
-    pub(crate) fn new_child(address: CollectionAddress, name: &[u8], db: Arc<DbInner>) -> Self {
+    pub(crate) fn new_child(
+        address: CollectionAddress,
+        parent: CollectionAddress,
+        name: &[u8],
+        db: Arc<DbInner>,
+    ) -> Self {
         Self {
             address,
+            parent: Some(parent),
             name: Some(Arc::from(name)),
             db,
         }
@@ -249,6 +250,14 @@ impl Collection {
 
     pub(crate) fn address(&self) -> &CollectionAddress {
         &self.address
+    }
+
+    pub(crate) fn parent_address(&self) -> Option<&CollectionAddress> {
+        self.parent.as_ref()
+    }
+
+    pub(crate) fn database_id(&self) -> DatabaseId {
+        self.db.database_id
     }
 }
 

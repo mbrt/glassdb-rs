@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::RecordingBackend;
 use glassdb::backend::{Backend, ListLimit};
-use glassdb::{CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES};
+use glassdb::{CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES, SplitPolicy};
 
 #[tokio::test]
 async fn root_collection_is_permanent_and_key_bearing() {
@@ -144,6 +145,41 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
 }
 
 #[tokio::test]
+async fn child_listing_retries_after_the_directory_changes() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let peer = Database::open("example", backend).await.unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let names = db
+        .tx({
+            let attempts = attempts.clone();
+            move |tx| {
+                let peer = peer.clone();
+                let attempts = attempts.clone();
+                async move {
+                    let root = tx.root_collection();
+                    let names = tx
+                        .collections(&root)
+                        .await?
+                        .map(|entry| entry.map(|entry| entry.name))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        peer.create_collection("appeared").await?;
+                    }
+                    tx.write(&root, b"marker", b"committed")?;
+                    Ok(names)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(names, vec![b"appeared".to_vec()]);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn bound_handle_data_access_does_not_revalidate_its_logical_path() {
     let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
     let log = recorder.log();
@@ -197,6 +233,26 @@ async fn collection_names_are_validated_before_io() {
         db.root_collection().create_collection(b"").await,
         Err(Error::InvalidInput(_))
     ));
+}
+
+#[tokio::test]
+async fn collection_directories_respect_the_root_size_limit() {
+    let db = Database::builder("example", MemoryBackend::new())
+        .split_policy(SplitPolicy {
+            node_max_bytes: 256,
+            split_headroom_bytes: 64,
+            ..SplitPolicy::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let name = [b'x'; MAX_COLLECTION_NAME_BYTES];
+
+    assert!(matches!(
+        db.root_collection().create_collection(name).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(!db.root_collection().collection_exists(name).await.unwrap());
 }
 
 #[tokio::test]
@@ -287,14 +343,275 @@ async fn missing_bound_root_is_not_empty_or_recreated_by_data_operations() {
         .await
         .unwrap();
 
-    assert!(matches!(child.read(b"k").await, Err(Error::NotFound)));
     assert!(matches!(
-        child.write(b"k", b"v").await,
-        Err(Error::NotFound)
+        child.read(b"k").await,
+        Err(Error::StaleCollection)
     ));
-    assert!(matches!(child.keys().await, Err(Error::NotFound)));
+    let write = child.write(b"k", b"v").await;
+    assert!(
+        matches!(write, Err(Error::StaleCollection)),
+        "unexpected write result: {write:?}"
+    );
+    assert!(matches!(child.keys().await, Err(Error::StaleCollection)));
     assert!(matches!(
         backend.read(&child_root).await,
         Err(glassdb::backend::BackendError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn collection_changes_compose_with_data_and_nested_changes() {
+    let db = Database::open("example", MemoryBackend::new())
+        .await
+        .unwrap();
+
+    let (users, active) = db
+        .tx(|tx| async move {
+            let root = tx.root_collection();
+            let (users, created) = tx.create_collection_if_absent(&root, b"users").await?;
+            assert!(created);
+            let (same_users, created) = tx.create_collection_if_absent(&root, b"users").await?;
+            assert!(created, "the transaction owns the staged incarnation");
+            tx.write(&same_users, b"second-handle", b"ready")?;
+            let active = tx.create_collection(&users, b"active").await?;
+            tx.write(&users, b"seed", b"ready")?;
+            tx.write(&active, b"alice", b"1")?;
+
+            let listed = tx
+                .collections(&users)
+                .await?
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].name, b"active");
+            Ok((users, active))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(users.read(b"seed").await.unwrap().unwrap(), b"ready");
+    assert_eq!(
+        users.read(b"second-handle").await.unwrap().unwrap(),
+        b"ready"
+    );
+    assert_eq!(active.read(b"alice").await.unwrap().unwrap(), b"1");
+    let (_, created) = db
+        .tx(|tx| async move {
+            let root = tx.root_collection();
+            tx.create_collection_if_absent(&root, b"users").await
+        })
+        .await
+        .unwrap();
+    assert!(!created);
+}
+
+#[tokio::test]
+async fn failed_transaction_does_not_publish_a_prepared_collection() {
+    let db = Database::open("example", MemoryBackend::new())
+        .await
+        .unwrap();
+
+    let result = db
+        .tx(|tx| async move {
+            let root = tx.root_collection();
+            let collection = tx.create_collection(&root, b"temporary").await?;
+            tx.write(&collection, b"k", b"v")?;
+            Err::<(), _>(Error::InvalidInput("stop".into()))
+        })
+        .await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))));
+    assert!(!db.collection_exists("temporary").await.unwrap());
+}
+
+#[tokio::test]
+async fn create_then_drop_without_data_collapses_to_noop() {
+    let db = Database::open("example", MemoryBackend::new())
+        .await
+        .unwrap();
+
+    db.tx(|tx| async move {
+        let root = tx.root_collection();
+        let temporary = tx.create_collection(&root, b"temporary").await?;
+        tx.drop_collection(&temporary).await?;
+        assert!(!tx.collection_exists(&root, b"temporary").await?);
+        assert!(matches!(
+            tx.write(&temporary, b"k", b"v"),
+            Err(Error::InvalidInput(_))
+        ));
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    assert!(!db.collection_exists("temporary").await.unwrap());
+}
+
+#[tokio::test]
+async fn not_empty_is_revalidated_before_it_is_returned() {
+    let db = Database::open("example", MemoryBackend::new())
+        .await
+        .unwrap();
+    let parent = db.create_collection("parent").await.unwrap();
+    let child = parent.create_collection("child").await.unwrap();
+    let first_attempt = Arc::new(AtomicBool::new(true));
+
+    db.tx({
+        let parent = parent.clone();
+        let child = child.clone();
+        let first_attempt = first_attempt.clone();
+        move |tx| {
+            let parent = parent.clone();
+            let child = child.clone();
+            let first_attempt = first_attempt.clone();
+            async move {
+                match tx.drop_collection(&parent).await {
+                    Ok(()) => Ok(()),
+                    Err(Error::NotEmpty) => {
+                        if first_attempt.swap(false, Ordering::SeqCst) {
+                            child.drop_collection().await?;
+                        }
+                        Err(Error::NotEmpty)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !first_attempt.load(Ordering::SeqCst),
+        "the first attempt must observe the child"
+    );
+    assert!(matches!(
+        parent.read(b"k").await,
+        Err(Error::StaleCollection)
+    ));
+}
+
+#[tokio::test]
+async fn drop_is_non_recursive_and_fences_obsolete_handles() {
+    let db = Database::open("example", MemoryBackend::new())
+        .await
+        .unwrap();
+    let parent = db.create_collection("parent").await.unwrap();
+    let child = parent.create_collection("child").await.unwrap();
+    child.write(b"k", b"old").await.unwrap();
+
+    assert!(matches!(
+        parent.drop_collection().await,
+        Err(Error::NotEmpty)
+    ));
+    child.drop_collection().await.unwrap();
+    let replacement = parent.create_collection("child").await.unwrap();
+    replacement.write(b"k", b"new").await.unwrap();
+
+    assert!(matches!(
+        child.read(b"k").await,
+        Err(Error::StaleCollection)
+    ));
+    assert_eq!(replacement.read(b"k").await.unwrap().unwrap(), b"new");
+}
+
+#[tokio::test]
+async fn children_can_be_dropped_before_their_parent_in_one_transaction() {
+    let db = Database::open("example", MemoryBackend::new())
+        .await
+        .unwrap();
+    let parent = db.create_collection("parent").await.unwrap();
+    let child = parent.create_collection("child").await.unwrap();
+    child.write(b"k", b"old").await.unwrap();
+
+    db.tx({
+        let parent = parent.clone();
+        let child = child.clone();
+        move |tx| {
+            let parent = parent.clone();
+            let child = child.clone();
+            async move {
+                tx.drop_collection(&child).await?;
+                tx.drop_collection(&parent).await?;
+                tx.write(&tx.root_collection(), b"drop-marker", b"committed")?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(!db.collection_exists("parent").await.unwrap());
+    assert_eq!(
+        db.root_collection()
+            .read(b"drop-marker")
+            .await
+            .unwrap()
+            .unwrap(),
+        b"committed"
+    );
+    assert!(matches!(
+        child.read(b"k").await,
+        Err(Error::StaleCollection)
+    ));
+}
+
+#[tokio::test]
+async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
+    let backend = Arc::new(MemoryBackend::new());
+    let first = Database::open("example", backend.clone()).await.unwrap();
+    let second = Database::open("example", backend).await.unwrap();
+    let old = first.create_collection("child").await.unwrap();
+    old.write(b"k", b"old").await.unwrap();
+    assert_eq!(old.read(b"k").await.unwrap().unwrap(), b"old");
+
+    second
+        .open_collection("child")
+        .await
+        .unwrap()
+        .drop_collection()
+        .await
+        .unwrap();
+
+    let stale = old.read(b"k").await;
+    assert!(
+        matches!(stale, Err(Error::StaleCollection)),
+        "unexpected stale-handle result: {stale:?}"
+    );
+    assert!(matches!(
+        old.collection_exists(b"nested").await,
+        Err(Error::StaleCollection)
+    ));
+    assert!(matches!(old.keys().await, Err(Error::StaleCollection)));
+}
+
+#[tokio::test]
+async fn drop_rejects_invalid_targets_and_staged_data_writes() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let other = Database::open("other", backend).await.unwrap();
+    let collection = db.create_collection("collection").await.unwrap();
+
+    assert!(matches!(
+        db.root_collection().drop_collection().await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        other
+            .tx(|tx| {
+                let collection = collection.clone();
+                async move { tx.drop_collection(&collection).await }
+            })
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        db.tx(|tx| {
+            let collection = collection.clone();
+            async move {
+                tx.write(&collection, b"k", b"v")?;
+                tx.drop_collection(&collection).await
+            }
+        })
+        .await,
+        Err(Error::InvalidInput(_))
     ));
 }

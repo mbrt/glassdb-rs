@@ -33,6 +33,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 criterion = "0.8.2"
+rayon = "1.12.0"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
 

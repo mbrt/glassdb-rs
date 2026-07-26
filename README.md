@@ -70,6 +70,17 @@ async fn main() -> Result<(), glassdb::Error> {
     })
     .await?;
 
+    // Collection lifecycle changes compose with data in the same transaction.
+    let active = db
+        .tx(|tx| async move {
+            let root = tx.root_collection();
+            let active = tx.create_collection(&root, b"active").await?;
+            tx.write(&active, b"alice", b"enabled")?;
+            Ok(active)
+        })
+        .await?;
+    active.drop_collection().await?;
+
     db.shutdown().await;
     Ok(())
 }

@@ -23,6 +23,7 @@
 //! contended shard guarantees one contender makes progress. Only a genuine wound
 //! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -31,19 +32,21 @@ use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     LeafObservation, LeafObservationCheck, LockType, NodeLocks, Requirement, SequencePoint,
-    ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus, TxLock, TxLog,
-    TxWrite,
+    ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCollectionChange,
+    TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 
+use crate::collections::{CollectionCatalog, CollectionData, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::gc::Gc;
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{LockResolution, resolve_entry_locks, resolve_entry_locks_at};
 use crate::resolver::Resolver;
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
 };
+use crate::split::Splitter;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -164,7 +167,8 @@ impl ScanRange {
                 .is_some_and(|end| self.start.as_slice() >= end)
     }
 
-    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+    /// Reports whether `key` lies in this normalized range.
+    pub fn contains(&self, key: &[u8]) -> bool {
         let above_start = if self.start_exclusive {
             key > self.start.as_slice()
         } else {
@@ -213,6 +217,7 @@ pub struct Data {
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
 pub struct Handle {
     data: Data,
+    collection_data: CollectionData,
     status: Status,
     id: TxId,
     /// Number of restarts so far; drives the serial-locking escalation.
@@ -230,6 +235,8 @@ pub struct Handle {
     /// The lock-holding restart paths (`restart`, `revalidate`) and the read-only
     /// validation paths deliberately do not back off.
     backoff: Backoff,
+    prepared_collections: BTreeSet<CollectionAddress>,
+    fenced_drops: BTreeSet<CollectionAddress>,
 }
 
 impl Handle {
@@ -470,6 +477,9 @@ pub struct Algo {
     clock: Clock,
     timeline: Timeline,
     split_policy: SplitPolicy,
+    collection_catalog: CollectionCatalog,
+    collection_lifecycle: CollectionLifecycle,
+    splitter: Splitter,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -486,12 +496,16 @@ impl Algo {
         locker: Locker,
         coord: ShardCoordinator,
         mon: Monitor,
+        collection_catalog: CollectionCatalog,
         clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
         resolver: Resolver,
         split_policy: SplitPolicy,
+        splitter: Splitter,
     ) -> Self {
+        let collection_lifecycle =
+            CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
         Algo {
             shards,
             resolver,
@@ -502,22 +516,28 @@ impl Algo {
             clock,
             timeline,
             split_policy,
+            collection_catalog,
+            collection_lifecycle,
+            splitter,
             background,
         }
     }
 
-    /// Starts a new transaction with the given data. The id's random prefix and
-    /// timestamp are deterministic under `--cfg sim`.
-    pub fn begin(&self, d: Data) -> Handle {
+    /// Starts a new transaction with its key and collection-management data.
+    /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
+    pub fn begin(&self, data: Data, collection_data: CollectionData) -> Handle {
         let id = TxId::new_at(self.clock.now());
         Handle {
-            data: d,
+            data,
+            collection_data,
             status: Status::New,
             id,
             attempts: 0,
             engaged: false,
             lock_reads_on_retry: false,
             backoff: RetryConfig::default().backoff(),
+            prepared_collections: BTreeSet::new(),
+            fenced_drops: BTreeSet::new(),
         }
     }
 
@@ -529,11 +549,14 @@ impl Algo {
         Handle {
             id: old.id.renew(),
             data: old.data,
+            collection_data: old.collection_data,
             status: Status::New,
             attempts: old.attempts + 1,
             engaged: false,
             lock_reads_on_retry: old.lock_reads_on_retry,
             backoff: old.backoff,
+            prepared_collections: BTreeSet::new(),
+            fenced_drops: BTreeSet::new(),
         }
     }
 
@@ -545,7 +568,7 @@ impl Algo {
     /// the key (re-run holding its locks, ADR-024). CAS contention and suspected
     /// deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.data.writes.is_empty() {
+        if tx.data.writes.is_empty() && !tx.collection_data.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.data)?;
                 return self.commit_locked(tx).await;
@@ -557,7 +580,10 @@ impl Algo {
         // of an existing key commits with one object write + one shard CAS. On
         // ineligibility nothing has been written, so the full locked path takes
         // over under the same id.
-        if self.try_commit_single_rw(tx).await?.is_some() {
+        if tx.collection_data.reads.is_empty()
+            && tx.collection_data.changes.is_empty()
+            && self.try_commit_single_rw(tx).await?.is_some()
+        {
             return Ok(());
         }
         self.commit_locked(tx).await
@@ -568,7 +594,7 @@ impl Algo {
     /// if any was invalidated. The first attempt is optimistic; after a failure,
     /// the next attempt validates with point and predicate read locks.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if !tx.data.writes.is_empty() {
+        if !tx.data.writes.is_empty() || tx.collection_data.has_writes() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
             ));
@@ -582,6 +608,16 @@ impl Algo {
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
+            && self
+                .collection_catalog
+                .validate(
+                    None,
+                    &tx.collection_data.reads,
+                    &[],
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
             return Ok(());
         }
@@ -599,6 +635,17 @@ impl Algo {
         tx.data = data;
     }
 
+    /// Replaces both key and collection-management accesses before commit.
+    pub fn reset_with_collections(
+        &self,
+        tx: &mut Handle,
+        data: Data,
+        collection_data: CollectionData,
+    ) {
+        self.reset(tx, data);
+        tx.collection_data = collection_data;
+    }
+
     /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
     /// by marking its transaction object aborted). An optimistic read-only
     /// attempt never engaged, so there is nothing to abort.
@@ -606,7 +653,17 @@ impl Algo {
         if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
         }
-        self.mon.abort_tx(&tx.id).await
+        let result = self.mon.abort_tx(&tx.id).await;
+        let drops = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        let drop_cleanup = self
+            .collection_lifecycle
+            .clear_aborted_drops(&tx.id, &drops)
+            .await;
+        let prepared = tx.prepared_collections.iter().cloned().collect::<Vec<_>>();
+        let prepared_cleanup = self.collection_lifecycle.reclaim(&prepared).await;
+        result?;
+        drop_cleanup?;
+        prepared_cleanup
     }
 
     /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
@@ -657,6 +714,16 @@ impl Algo {
         if self
             .validate(&tx.data, ValidationContext::Optimistic, validation_start)
             .await?
+            && self
+                .collection_catalog
+                .validate(
+                    None,
+                    &tx.collection_data.reads,
+                    &[],
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
             tx.status = Status::Committed;
             return Ok(());
@@ -667,11 +734,103 @@ impl Algo {
 
     /// Locked path for read-write transactions and escalated read-only retries.
     async fn commit_locked(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::New {
-            self.mon.begin_tx(&tx.id);
+        let is_new = tx.status == Status::New;
+        if is_new {
             tx.status = Status::Validating;
             tx.engaged = true;
         }
+
+        let active_drops = tx
+            .collection_data
+            .changes
+            .iter()
+            .filter(|change| change.op == CollectionOp::Drop)
+            .map(|change| change.collection.clone())
+            .collect::<BTreeSet<_>>();
+        let abandoned_drops = tx
+            .fenced_drops
+            .difference(&active_drops)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.collection_lifecycle
+            .clear_aborted_drops(&tx.id, &abandoned_drops)
+            .await?;
+        tx.fenced_drops.retain(|drop| active_drops.contains(drop));
+
+        if tx.collection_data.changes.is_empty() {
+            if is_new {
+                self.mon.begin_tx(&tx.id);
+            }
+        } else {
+            let changes = tx
+                .collection_data
+                .changes
+                .iter()
+                .map(|change| TxCollectionChange {
+                    parent: change.parent.clone(),
+                    name: change.name.clone(),
+                    collection: change.collection.clone(),
+                    op: match change.op {
+                        CollectionOp::Create => TxCollectionOp::Create,
+                        CollectionOp::Drop => TxCollectionOp::Drop,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let prepared = tx
+                .prepared_collections
+                .iter()
+                .cloned()
+                .chain(
+                    tx.collection_data
+                        .changes
+                        .iter()
+                        .filter(|change| change.op == CollectionOp::Create)
+                        .map(|change| change.collection.clone()),
+                )
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let recovery = TxRecoveryManifest {
+                locks: Vec::new(),
+                collection_changes: changes,
+                prepared_collections: prepared,
+            };
+            let result = if is_new {
+                self.mon.begin_persisted_tx(&tx.id, recovery).await
+            } else {
+                self.mon
+                    .update_pending_tx(&tx.id, move |pending| {
+                        pending.collection_changes = recovery.collection_changes;
+                        pending.prepared_collections = recovery.prepared_collections;
+                    })
+                    .await
+            };
+            if let Err(error) = result {
+                if matches!(error, TransError::AlreadyFinalized) {
+                    return self.restart(tx).await;
+                }
+                return Err(error);
+            }
+        }
+
+        tx.prepared_collections.extend(
+            tx.collection_data
+                .changes
+                .iter()
+                .filter(|change| change.op == CollectionOp::Create)
+                .map(|change| change.collection.clone()),
+        );
+        self.collection_lifecycle
+            .prepare_roots(&tx.collection_data.changes)
+            .await?;
+        let directory_locks = self
+            .collection_catalog
+            .lock_directories(
+                &tx.id,
+                &tx.collection_data.reads,
+                &tx.collection_data.changes,
+            )
+            .await?;
 
         // Capture before lock acquisition so every successful lock CAS is
         // eligible to certify the reads it protects against this same bound.
@@ -688,7 +847,8 @@ impl Algo {
         // (ADR-022). This tracks the latest acquire; a `revalidate` re-run that
         // drops keys may under-record, which only defers those stale locks to
         // lazy reclaim, never a correctness loss.
-        let locks = locked.locked_paths();
+        let mut locks = locked.locked_paths();
+        locks.extend(directory_locks);
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
         // Validate point reads and scans after their entry/predicate locks are
@@ -704,12 +864,39 @@ impl Algo {
                 validation_start,
             )
             .await?
+            || !self
+                .collection_catalog
+                .validate(
+                    Some(&tx.id),
+                    &tx.collection_data.reads,
+                    &tx.collection_data.changes,
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
+            self.collection_catalog.release_locks(&tx.id, &locks).await;
             return self.revalidate(tx).await;
         }
 
+        // Record the target before preparation begins so a partial fencing
+        // attempt is cleared if this same transaction reruns a different body.
+        tx.fenced_drops.extend(active_drops);
+        self.collection_lifecycle
+            .fence_drops(&tx.id, &tx.collection_data.changes, &self.splitter)
+            .await?;
+
         // Commit point: create-or-flip the transaction object to committed.
-        if let Err(e) = self.commit_writes(&tx.data.writes, locks, &tx.id).await {
+        if let Err(e) = self
+            .commit_writes(
+                &tx.data,
+                &tx.collection_data,
+                &tx.prepared_collections,
+                locks.clone(),
+                &tx.id,
+            )
+            .await
+        {
             if matches!(e, TransError::AlreadyFinalized) {
                 // The log was finalized as `aborted` out from under us: a wound
                 // landed between locking and commit.
@@ -719,7 +906,34 @@ impl Algo {
         }
         tx.status = Status::Committed;
 
+        if let Err(error) = self
+            .collection_catalog
+            .write_back(&tx.id, &tx.collection_data.changes, &locks)
+            .await
+        {
+            tracing::debug!(%error, "collection-directory write-back deferred");
+        }
         self.write_back(&tx.id, locked).await;
+
+        let active_prepared = tx
+            .collection_data
+            .changes
+            .iter()
+            .filter(|change| change.op == CollectionOp::Create)
+            .map(|change| change.collection.clone())
+            .collect::<BTreeSet<_>>();
+        let unused = tx
+            .prepared_collections
+            .difference(&active_prepared)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = self.collection_lifecycle.reclaim(&unused).await {
+            tracing::debug!(%error, "prepared-collection cleanup deferred");
+        }
+        let dropped = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        if let Err(error) = self.collection_lifecycle.reclaim(&dropped).await {
+            tracing::debug!(%error, "dropped-collection cleanup deferred");
+        }
         Ok(())
     }
 
@@ -736,11 +950,17 @@ impl Algo {
         // The escalated read-only path uses lock CASes as validation evidence,
         // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
+        let directory_locks = self
+            .collection_catalog
+            .lock_directories(&tx.id, &tx.collection_data.reads, &[])
+            .await?;
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return self.restart(tx).await,
         };
-        self.mon.record_tx_locks(&tx.id, locked.locked_paths());
+        let mut locks = locked.locked_paths();
+        locks.extend(directory_locks);
+        self.mon.record_tx_locks(&tx.id, locks.clone());
         if self
             .validate(
                 &tx.data,
@@ -751,9 +971,20 @@ impl Algo {
                 validation_start,
             )
             .await?
+            && self
+                .collection_catalog
+                .validate(
+                    Some(&tx.id),
+                    &tx.collection_data.reads,
+                    &[],
+                    Requirement::AtLeast(validation_start),
+                    &self.split_policy,
+                )
+                .await?
         {
             return Ok(());
         }
+        self.collection_catalog.release_locks(&tx.id, &locks).await;
         self.revalidate(tx).await
     }
 
@@ -1354,13 +1585,15 @@ impl Algo {
     /// carries its full back-reference set for GC's reverse check (ADR-022).
     async fn commit_writes(
         &self,
-        writes: &[WriteAccess],
+        data: &Data,
+        collection_data: &CollectionData,
+        prepared_collections: &BTreeSet<CollectionAddress>,
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
         let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
         tl.locks = locks;
-        for w in writes {
+        for w in &data.writes {
             let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
                 WriteOp::Put(value) => (value.clone(), false),
                 WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
@@ -1372,6 +1605,20 @@ impl Algo {
                 prev_writer: TxId::default(),
             });
         }
+        tl.collection_changes = collection_data
+            .changes
+            .iter()
+            .map(|change| TxCollectionChange {
+                parent: change.parent.clone(),
+                name: change.name.clone(),
+                collection: change.collection.clone(),
+                op: match change.op {
+                    CollectionOp::Create => TxCollectionOp::Create,
+                    CollectionOp::Drop => TxCollectionOp::Drop,
+                },
+            })
+            .collect();
+        tl.prepared_collections = prepared_collections.iter().cloned().collect();
         // `context` preserves the `AlreadyFinalized` sentinel and any in-doubt
         // outcome instead of collapsing them into a generic error.
         self.mon
@@ -1402,7 +1649,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{LeafRef, paths};
+    use glassdb_data::{CollectionId, LeafRef, paths};
     use glassdb_storage::{
         CachedStore, CollectionRoot, Directory, Shard, ShardEntry, ShardStore, TLogger,
         TxCommitStatus,
@@ -1459,7 +1706,7 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
-        let (coord, _splitter) = crate::split::Splitter::with_coordinator(
+        let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             shards.clone(),
             timeline.clone(),
@@ -1492,11 +1739,18 @@ mod tests {
             locker.clone(),
             coord.clone(),
             tmon.clone(),
+            CollectionCatalog::new(
+                shards.clone(),
+                tlogger.clone(),
+                tmon.clone(),
+                RetryConfig::default(),
+            ),
             Clock::real(),
             gc,
             None,
             resolver,
             glassdb_storage::SplitPolicy::default(),
+            splitter,
         );
         (
             algo,
@@ -1535,8 +1789,12 @@ mod tests {
         }
     }
 
+    fn begin_data(tm: &Algo, data: Data) -> Handle {
+        tm.begin(data, CollectionData::default())
+    }
+
     async fn commit_access(tm: &Algo, d: Data) -> Handle {
-        let mut h = tm.begin(d);
+        let mut h = begin_data(tm, d);
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         h
@@ -1572,11 +1830,14 @@ mod tests {
         let keyp = key_ref(b"k");
         let val = b"v";
 
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, val)],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, val)],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
@@ -1614,11 +1875,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
 
         let r = do_read(&tctx, &readp).await;
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&writep, b"v")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&writep, b"v")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
@@ -1641,6 +1905,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_manifest_preserves_prepared_roots_from_earlier_attempts() {
+        let (tm, tctx) = new_algo().await;
+        let earlier = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
+        );
+        let active = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[2; 16]).expect("fixed ID has the required width"),
+        );
+        let prepared = BTreeSet::from([earlier.clone(), active.clone()]);
+        let collection_data = CollectionData {
+            reads: Vec::new(),
+            changes: vec![crate::collections::CollectionChange {
+                parent: test_collection(),
+                name: b"active".to_vec(),
+                collection: active.clone(),
+                expected: None,
+                op: CollectionOp::Create,
+            }],
+        };
+        let handle = begin_data(&tm, Data::default());
+        let id = handle.id().clone();
+        tm.mon.begin_tx(&id);
+
+        tm.commit_writes(
+            &Data::default(),
+            &collection_data,
+            &prepared,
+            Vec::new(),
+            &id,
+        )
+        .await
+        .unwrap();
+
+        let log = tctx.tlogger.get_at(&id, Requirement::Any).await.unwrap();
+        let log = log.value().unwrap();
+        assert_eq!(log.prepared_collections, vec![earlier, active.clone()]);
+        assert_eq!(log.collection_changes.len(), 1);
+        assert_eq!(log.collection_changes[0].collection, active);
+    }
+
+    #[tokio::test]
+    async fn a_retried_body_clears_an_abandoned_partial_drop() {
+        let (tm, tctx) = new_algo().await;
+        let dropped = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
+        );
+        let mut handle = begin_data(&tm, Data::default());
+        let id = handle.id().clone();
+        tm.mon.begin_tx(&id);
+        handle.status = Status::Validating;
+        handle.engaged = true;
+        handle.fenced_drops.insert(dropped.clone());
+
+        let mut root = CollectionRoot::new();
+        root.node_locks_mut().set_delete_intent(id.clone());
+        assert!(root.set_topology_freeze(id.clone()));
+        assert!(
+            tctx.shards
+                .create_root(&dropped.physical_prefix(), &root)
+                .await
+                .unwrap()
+        );
+
+        tm.commit(&mut handle).await.unwrap();
+
+        let (root, _) = tctx
+            .shards
+            .load_root(
+                &dropped.physical_prefix(),
+                Requirement::AtLeast(tctx.timeline.now()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(root.node().collection_delete_intent(), None);
+        assert_eq!(root.topology_freeze(), None);
+        tm.end(&mut handle).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_then_write_round_trips() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
@@ -1649,11 +1995,14 @@ mod tests {
         let _ = h;
 
         let r = do_read(&tctx, &keyp).await;
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -1683,11 +2032,14 @@ mod tests {
         // Another client overwrites `k`, making `ra` stale.
         commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra],
+                writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
+                scans: Vec::new(),
+            },
+        );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
 
@@ -1719,11 +2071,14 @@ mod tests {
         // Another client overwrites the key, making `ra` stale.
         let h2 = commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra],
+                writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
+            },
+        );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(
             matches!(err, TransError::Wounded | TransError::Retry),
@@ -1794,11 +2149,14 @@ mod tests {
 
         // A younger transaction wants the same key; it cannot wound the holder.
         // Drive its commit concurrently so we can observe it parked waiting.
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"a")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"a")],
+                scans: Vec::new(),
+            },
+        );
         let id_before = h.id().clone();
         let tm2 = tm.clone();
         let committing = tokio::spawn(async move {
@@ -2172,11 +2530,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")]).await;
 
         flaky.arm();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let id_before = h.id().clone();
         tm.commit(&mut h)
             .await
@@ -2284,11 +2645,14 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2338,11 +2702,14 @@ mod tests {
         );
 
         tctx.locker.lock_calls_and_reset();
-        let mut handle = tm.begin(Data {
-            reads: vec![read],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut handle = begin_data(
+            &tm,
+            Data {
+                reads: vec![read],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let committing_tm = tm.clone();
         let committing = tokio::spawn(async move {
             let result = committing_tm.commit(&mut handle).await;
@@ -2386,11 +2753,14 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2411,11 +2781,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2522,11 +2895,14 @@ mod tests {
 
         // End to end: the writer commits over H1 (help-forwarding it into the
         // chain, not orphaning it), and its value reads back.
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
+            },
+        );
         let h2 = h.id().clone();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2559,11 +2935,14 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         flaky.arm();
-        let mut h = tm.begin(Data {
-            reads: vec![r.clone()],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r.clone()],
+                writes: vec![wa(&keyp, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         let orphan = h.id().clone();
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(
@@ -2608,11 +2987,14 @@ mod tests {
 
         log.lock().unwrap().clear();
         tctx.locker.lock_calls_and_reset();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2642,11 +3024,14 @@ mod tests {
 
         log.lock().unwrap().clear();
         tctx.locker.lock_calls_and_reset();
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wdel(&keyp)],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wdel(&keyp)],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2673,11 +3058,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&ka, b"v2"), wa(&kb, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&ka, b"v2"), wa(&kb, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2697,11 +3085,14 @@ mod tests {
         let ra = do_read(&tctx, &ka).await;
 
         log.lock().unwrap().clear();
-        let mut h = tm.begin(Data {
-            reads: vec![ra],
-            writes: vec![wa(&kb, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra],
+                writes: vec![wa(&kb, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -2720,11 +3111,14 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: Vec::new(),
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
     }
@@ -3050,11 +3444,14 @@ mod tests {
         let rb = do_read(&tctx, &kb).await;
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
-        let mut h = tm.begin(Data {
-            reads: vec![ra, rb],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![ra, rb],
+                writes: Vec::new(),
+                scans: Vec::new(),
+            },
+        );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
         assert!(h.should_lock_reads());
@@ -3100,11 +3497,14 @@ mod tests {
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
         assert_eq!(r.last_writer.as_ref(), Some(&deleted_by));
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: Vec::new(),
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
     }
 
@@ -3115,11 +3515,14 @@ mod tests {
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
-        let mut h = tm.begin(Data {
-            reads: vec![r],
-            writes: vec![wdel(&keyp)],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![r],
+                writes: vec![wdel(&keyp)],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3135,11 +3538,14 @@ mod tests {
         let k1 = key_ref(b"k1");
         let k2 = key_ref(b"k2");
 
-        let mut h = tm.begin(Data {
-            reads: Vec::new(),
-            writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
-            scans: Vec::new(),
-        });
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
+                scans: Vec::new(),
+            },
+        );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -3234,7 +3640,7 @@ mod tests {
 
         // No concurrent change: the listing validates and commits.
         tctx.locker.lock_calls_and_reset();
-        let mut h = tm.begin(data.clone());
+        let mut h = begin_data(&tm, data.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         assert_eq!(tctx.locker.lock_calls_and_reset(), 0);
@@ -3242,7 +3648,7 @@ mod tests {
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
 
-        let mut stale = tm.begin(data);
+        let mut stale = begin_data(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
         assert!(
@@ -3317,7 +3723,7 @@ mod tests {
         });
         tctx.tmon.commit_tx(log).await.unwrap();
 
-        let mut stale = tm.begin(scan);
+        let mut stale = begin_data(&tm, scan);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
@@ -3330,7 +3736,7 @@ mod tests {
         let (mut data, _) = scan_data(&tctx).await;
         data.writes.push(wa(&key_path, b"updated"));
 
-        let mut handle = tm.begin(data);
+        let mut handle = begin_data(&tm, data);
         tm.commit(&mut handle).await.unwrap();
         let log = tctx
             .tlogger
@@ -3365,7 +3771,7 @@ mod tests {
         // Removing the old frontier means the refreshed two-key page reaches
         // into S1. The first locked validation only owns S0 and must retry.
         commit_writes(&tm, vec![wdel(&key_ref(b"b"))]).await;
-        let mut handle = tm.begin(stale);
+        let mut handle = begin_data(&tm, stale);
         let err = tm.commit(&mut handle).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
 
@@ -3406,7 +3812,7 @@ mod tests {
 
         commit_writes(&tm, vec![wdel(&bp)]).await;
 
-        let mut stale = tm.begin(data);
+        let mut stale = begin_data(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
@@ -3425,7 +3831,7 @@ mod tests {
         // produces), so the covered leaf set is no longer just `_i`.
         split_root_in_place(&tctx).await;
 
-        let mut stable = tm.begin(data);
+        let mut stable = begin_data(&tm, data);
         tm.commit(&mut stable).await.unwrap();
         tm.end(&mut stable).await.unwrap();
     }
@@ -3511,7 +3917,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stale = tm.begin(data);
+        let mut stale = begin_data(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }

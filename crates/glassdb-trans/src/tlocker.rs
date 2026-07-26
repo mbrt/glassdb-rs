@@ -41,11 +41,12 @@ use glassdb_storage::{
 use crate::algo::{Data, WriteOp};
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{NodeLockReconciler, Reclaim, resolve_entry_locks, try_reclaim};
+use crate::node_locking::{NodeLockReconciler, resolve_entry_locks};
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
     Step,
 };
+use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// One independent partition of the per-transaction held-lock bookkeeping: the
 /// shard/root paths each transaction holds and their lock type.
@@ -193,7 +194,7 @@ async fn build_groups(
     let grouped = dir
         .group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any)
         .await
-        .map_err(|e| TransError::from(e).context("grouping keys by leaf"))?;
+        .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
 
     let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
     for group in grouped {
@@ -234,7 +235,8 @@ async fn build_groups(
                 scan.frontier.as_deref(),
                 scan_requirement,
             )
-            .await?
+            .await
+            .map_err(|error| error.classify_collection_absence(&scan.collection))?
         {
             let group = groups
                 .entry(leaf.path.clone())
@@ -698,7 +700,7 @@ enum ShardOutcome {
 /// holder *finalizing* is real progress, while a poll timeout saw no event and
 /// only re-checks for a lock released without finalizing.
 enum Woke {
-    /// `wait_for_tx` fired: the holder committed or aborted.
+    /// The holder's committed or aborted status was durably verified.
     Finalized,
     /// The backed-off poll timer elapsed with no finalize event.
     PollTimeout,
@@ -1073,7 +1075,7 @@ impl Locker {
                     ..
                 }) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1123,7 +1125,7 @@ impl Locker {
                     ..
                 }) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1178,7 +1180,7 @@ impl Locker {
                 // cannot-deadlock serial order.
                 FoldOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await {
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1201,11 +1203,14 @@ impl Locker {
     /// Parks until the conflicting `holder` finalizes **or** `timeout` elapses,
     /// whichever comes first, then lets the caller re-resolve, reporting which
     /// woke it.
-    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Woke {
-        let wait = self.tmon.wait_for_tx(holder);
+    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Result<Woke, TransError> {
+        let wait = self.tmon.await_tx_final(holder);
         tokio::select! {
-            _ = wait => Woke::Finalized,
-            _ = rt::sleep(timeout) => Woke::PollTimeout,
+            status = wait => {
+                status?;
+                Ok(Woke::Finalized)
+            },
+            _ = rt::sleep(timeout) => Ok(Woke::PollTimeout),
         }
     }
 

@@ -15,6 +15,8 @@ message TransactionLog {
     google.protobuf.Timestamp timestamp = 1;
     Status status = 2;
     repeated CollectionWrites writes = 3;
+    repeated CollectionChange collection_changes = 4;
+    repeated bytes prepared_collection_ids = 5;
 }
 
 message CollectionWrites {
@@ -39,6 +41,21 @@ message Write {
 message CollectionLocks {
     repeated EntryLock entry_locks = 1;
     repeated MembershipLock membership_locks = 2;
+    Lock.LockType directory_lock = 3;
+    bool topology_lock = 4;
+}
+
+message CollectionChange {
+    enum Operation {
+        UNKNOWN = 0;
+        CREATE = 1;
+        DROP = 2;
+    }
+
+    bytes parent_collection_id = 1;
+    bytes name = 2;
+    bytes collection_id = 3;
+    Operation operation = 4;
 }
 
 message EntryLock {
@@ -112,17 +129,30 @@ message Node {
     NodeLock structure_lock = 5;
     NodeLock membership_lock = 6;
     uint64 membership_version = 7;
+    // A transaction preparing collection deletion. Its final status determines
+    // whether this is an ignorable abandoned intent or a durable stale-handle
+    // fence.
+    bytes collection_delete_intent = 8;
 }
 
-// A split write-ahead record. It lives at `{db}/_s/<record_id>` until the
-// created nodes are either reachable or reclaimed.
+// A split write-ahead record. It lives at
+// `{db}/_s/<participant_id>/<record_id>` until the created nodes are either
+// reachable or reclaimed.
 message StructuralLog {
+    enum Phase {
+        PREPARING = 0;
+        READY = 1;
+    }
+
     string prefix = 1;
     string source_token = 2;
     string source_version = 3;
     repeated string created_tokens = 4;
     bytes split_key = 5;
     bool is_root = 6;
+    // The lifecycle-topology participant that owns this record.
+    bytes participant_id = 7;
+    Phase phase = 8;
 }
 
 // An index node body: an ordered list of separator entries. The child owning a
@@ -162,6 +192,13 @@ message CollectionRoot {
     Node node = 1;
     // Direct child bindings, sorted by raw name so the encoding is canonical.
     repeated CollectionDirectoryEntry children = 2;
+    // Root-wide transactional coordination for the bounded child directory.
+    NodeLock directory_lock = 3;
+    uint64 directory_version = 4;
+    // Collection topology is frozen while this transaction prepares a drop.
+    bytes topology_freeze = 5;
+    // Structural operations that joined before the freeze was installed.
+    repeated bytes topology_participants = 6;
 }
 
 message CollectionDirectoryEntry {

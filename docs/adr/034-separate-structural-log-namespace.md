@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted — implemented.
+Accepted — implemented. Structural-record placement is superseded by
+[ADR-049](049-participant-owned-topology-intents.md).
 
 Refines only the structural-record placement in
 [ADR-032](032-node-locking-and-coordinated-splits.md).

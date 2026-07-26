@@ -7,7 +7,8 @@
 //! - [`RmwWorkload`] stresses shared-key serializability and in-doubt increments.
 //! - [`CycleWorkload`] detects isolation failures with non-commuting ring updates.
 //! - [`MembershipWorkload`] exercises key membership, splits, and listing.
-//! - [`ApiWorkload`] checks transaction-local reads, writes, deletes, and aborts.
+//! - [`ApiWorkload`] checks transaction-local key operations, collection
+//!   lifecycle, nested paths, and aborts.
 
 mod api;
 mod cycle;
@@ -53,10 +54,12 @@ pub(super) fn write_int(value: i64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+pub(super) fn try_read_int(value: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(value.try_into().ok()?))
+}
+
 pub(super) fn read_int(value: &[u8]) -> i64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(value);
-    i64::from_le_bytes(bytes)
+    try_read_int(value).expect("integer value has the wrong width")
 }
 
 pub(super) fn key_name(key: usize) -> Vec<u8> {

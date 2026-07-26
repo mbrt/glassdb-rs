@@ -2,6 +2,7 @@
 //! algorithm, distributed locking, lifecycle monitor, read path, and GC.
 
 mod algo;
+mod collections;
 mod error;
 mod gc;
 mod monitor;
@@ -11,9 +12,14 @@ mod resolver;
 mod shard_coord;
 mod split;
 mod tlocker;
+mod wound_wait;
 
 pub use algo::{
     Algo, Data, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
+};
+pub use collections::{
+    CollectionCatalog, CollectionChange, CollectionData, CollectionOp, DirectoryRead,
+    DirectoryReadKind, DirectorySnapshot,
 };
 pub use error::TransError;
 pub use gc::Gc;
@@ -21,7 +27,7 @@ pub use monitor::{Monitor, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue, Reader};
 pub use resolver::{Resolver, ScanResult};
 pub use shard_coord::{ShardCoordinator, ShardCoordinatorStats, SplitHinter};
-pub use split::{CollectionPublish, Splitter, SplitterStats};
+pub use split::{Splitter, SplitterStats};
 pub use tlocker::{HeldLeafSnapshot, Locker, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface does not force callers to pull

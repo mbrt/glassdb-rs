@@ -2,14 +2,18 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented (`glassdb::Transaction` collection APIs,
+transaction-log collection manifests, root directory coordination, topology
+freeze participation, per-node delete intents, and asynchronous recovery/GC).
+Topology participation and settlement are refined by
+[ADR-049](049-participant-owned-topology-intents.md).
 
 Constituent decision of the
 [dynamic-range-sharding design](../designs/dynamic-range-sharding.md). Depends
 on [ADR-046](046-incarnation-addressed-collections.md) for collection identity,
 physical layout, and path resolution.
 
-On acceptance, this supersedes standalone collection creation and
+This supersedes standalone collection creation and
 non-transactional child listing in ADR-018 and completes its deferred collection
 teardown. It adds transactional coordination to ADR-046 without changing its
 IDs or physical addressing.
