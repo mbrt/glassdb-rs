@@ -1394,6 +1394,7 @@ fn split_into_children(
 mod tests {
     use super::*;
 
+    use crate::monitor::TxFinalStatus;
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
@@ -2689,7 +2690,7 @@ mod tests {
         };
         let observed = s.write_structural_log("R", &record).await.unwrap();
         sp.mon.begin_tx(&id);
-        assert_eq!(sp.mon.wound_tx(&id).await.unwrap(), TxCommitStatus::Aborted);
+        assert_eq!(sp.mon.wound_tx(&id).await.unwrap(), TxFinalStatus::Aborted);
 
         gate.arm();
         let recovering = {

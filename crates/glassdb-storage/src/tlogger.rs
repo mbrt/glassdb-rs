@@ -107,6 +107,21 @@ pub struct TxStatus {
     pub observation: Observation<TxLog>,
 }
 
+impl TxStatus {
+    /// Creates a transaction status view from an observed log object.
+    pub fn from_observation(observation: Observation<TxLog>) -> Self {
+        let (status, last_update) = match observation.value() {
+            Some(log) => (log.status, log.timestamp.unwrap_or(UNIX_EPOCH)),
+            None => (TxCommitStatus::Unknown, UNIX_EPOCH),
+        };
+        Self {
+            status,
+            last_update,
+            observation,
+        }
+    }
+}
+
 /// One backend page of transaction IDs from a deterministic log shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxListPage {
@@ -223,15 +238,7 @@ impl TLogger {
             Some(observation) => observation,
             None => self.logs.read(&path, requirement).await?,
         };
-        let (status, last_update) = match observation.value() {
-            Some(log) => (log.status, log.timestamp.unwrap_or(UNIX_EPOCH)),
-            None => (TxCommitStatus::Unknown, UNIX_EPOCH),
-        };
-        Ok(TxStatus {
-            status,
-            last_update,
-            observation,
-        })
+        Ok(TxStatus::from_observation(observation))
     }
 
     /// Reads the full transaction object with an explicit requirement bound.

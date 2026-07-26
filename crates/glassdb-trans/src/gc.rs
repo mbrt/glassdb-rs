@@ -390,7 +390,7 @@ impl Gc {
         observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        match self.mon.force_abort(tid, observation).await? {
+        match self.mon.try_abort_observed(tid, observation).await?.status {
             TxCommitStatus::Aborted => self
                 .release_locks(tid, &log.locks, requirement)
                 .await

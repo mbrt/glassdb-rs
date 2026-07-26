@@ -21,7 +21,7 @@ pub(crate) async fn try_reclaim(
     if !requester.older(holder) {
         return Ok(Reclaim::Wait);
     }
-    if monitor.wound_tx(holder).await? == TxCommitStatus::Aborted {
+    if monitor.wound_tx(holder).await? == TxFinalStatus::Aborted {
         Ok(Reclaim::Wounded)
     } else {
         Ok(Reclaim::Wait)

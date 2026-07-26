@@ -208,6 +208,17 @@ pub(crate) enum TxFinalStatus {
     Aborted,
 }
 
+impl TxFinalStatus {
+    /// Converts a storage status when it represents a terminal transaction.
+    fn from_commit_status(status: TxCommitStatus) -> Option<Self> {
+        match status {
+            TxCommitStatus::Ok => Some(Self::Committed),
+            TxCommitStatus::Aborted => Some(Self::Aborted),
+            TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
+        }
+    }
+}
+
 /// A transaction's commit status for a specific key, plus the value written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyCommitStatus {
@@ -390,18 +401,14 @@ impl Monitor {
         res
     }
 
-    /// Attempts to force the given transaction into the aborted state so that a
-    /// higher-priority transaction can take over its locks under the wound-wait
-    /// rule, returning the durable status that won. It is idempotent and safe on
-    /// transactions that already finished: a committed transaction is left
-    /// untouched (its locks are released through the normal flow), and an
-    /// already-aborted one is a no-op.
+    /// Forces a transaction toward abort under wound-wait, returning the durable
+    /// terminal status that wins.
     ///
-    /// The abort is made durable via a conditional write on the transaction log,
-    /// so it is observed both by the local victim (its commit will fail) and by
-    /// other clients holding the same lock.
-    pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let cs = self
+    /// A committed transaction is left untouched. A pending refresh does not
+    /// defeat a wound: the refreshed observation is retried until either the
+    /// abort lands or the owner commits.
+    pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
+        let mut status = self
             .inner
             .tl
             .commit_status_at(tid, self.current_requirement())
@@ -409,20 +416,18 @@ impl Monitor {
             .map_err(|e| {
                 TransError::Storage(e.context(format!("reading status of wound target {tid}")))
             })?;
-        if cs.status.is_final() {
-            // Already committed or aborted: nothing left to wound.
-            self.mark_local_aborted(tid, cs.status);
-            return Ok(cs.status);
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            status = self.try_abort_observed(tid, &status.observation).await?;
+            if let Some(final_status) = TxFinalStatus::from_commit_status(status.status) {
+                self.mark_local_aborted(tid, status.status);
+                return Ok(final_status);
+            }
+            // Lease expiry must stop here because the refresh proves liveness.
+            // Wound-wait is authorized by priority instead, so a refresh only
+            // supplies the next CAS observation.
+            rt::sleep(backoff.next_delay()).await;
         }
-
-        // Force the transaction to aborted, CAS-ing over its current log version
-        // (or creating an aborted log if it has none yet).
-        let status = self.force_abort(tid, &cs.observation).await?;
-        // TODO: Retry the wound when a pending refresh wins the CAS. Lease-based
-        // reclaim must leave a refreshed owner alive, but wound-wait should not
-        // let a younger transaction's refresh make an older requester wait.
-        self.mark_local_aborted(tid, status);
-        Ok(status)
     }
 
     /// Returns the commit status, checking locally first then remote storage.
@@ -586,23 +591,18 @@ impl Monitor {
         }
     }
 
-    /// Force-aborts a specific pending version of a transaction, the ADR-022 GC
-    /// reclaim of a dead pending object. It is the *same* official sequence a
-    /// contended lease expiry uses ([`Monitor::force_abort`]): CAS `pending →
-    /// aborted` over `expected`. If a live owner committed or refreshed first
-    /// the CAS loses and the now-durable status is reported instead, so GC
-    /// never drops a lock out from under a still-live owner. A final expected
-    /// observation is returned unchanged without issuing a mutation.
-    pub(crate) async fn force_abort(
+    /// Conditionally aborts an exact transaction-log observation and returns
+    /// the durable status observed after the attempt.
+    pub(crate) async fn try_abort_observed(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,
-    ) -> Result<TxCommitStatus, TransError> {
+    ) -> Result<TxStatus, TransError> {
         if let Some(current) = expected.value() {
             match current.status {
-                status @ (TxCommitStatus::Ok | TxCommitStatus::Aborted) => {
+                TxCommitStatus::Ok | TxCommitStatus::Aborted => {
                     self.remember_final(tid, expected);
-                    return Ok(status);
+                    return Ok(TxStatus::from_observation(expected.clone()));
                 }
                 TxCommitStatus::Pending => {}
                 TxCommitStatus::Unknown => {
@@ -613,16 +613,16 @@ impl Monitor {
             }
         }
 
-        let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
-        if let Some(current) = expected.value() {
-            tlog.writes = current.writes.clone();
-            tlog.locks = current.locks.clone();
-            tlog.collection_changes = current.collection_changes.clone();
-            tlog.prepared_collections = current.prepared_collections.clone();
-        }
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
+            let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+            if let Some(current) = expected.value() {
+                tlog.writes = current.writes.clone();
+                tlog.locks = current.locks.clone();
+                tlog.collection_changes = current.collection_changes.clone();
+                tlog.prepared_collections = current.prepared_collections.clone();
+            }
             let r = if expected.is_absent() {
                 self.inner.tl.set(&tlog).await
             } else {
@@ -631,19 +631,21 @@ impl Monitor {
             match r {
                 Ok(observed) => {
                     self.remember_final(tid, &observed);
-                    return Ok(TxCommitStatus::Aborted);
+                    return Ok(TxStatus::from_observation(observed));
                 }
                 Err(StorageError::Precondition) => {
                     // The version moved under us (a commit, a pending-log
-                    // refresh, or another wounder). Report whatever status is
-                    // now durable.
+                    // refresh, or another abort). A clean conflict is not
+                    // retried here: lease-based callers must treat a refresh as
+                    // proof of liveness, while wound-wait decides separately to
+                    // retry it.
                     let st = self
                         .inner
                         .tl
                         .commit_status_at(tid, self.current_requirement())
                         .await?;
                     self.remember_final(tid, &st.observation);
-                    return Ok(st.status);
+                    return Ok(st);
                 }
                 // In-doubt: the abort write may or may not have landed. Just
                 // like `set_final_log`, forcing a not-yet-final log to
@@ -663,7 +665,7 @@ impl Monitor {
                         .await?;
                     if st.status.is_final() {
                         self.remember_final(tid, &st.observation);
-                        return Ok(st.status);
+                        return Ok(st);
                     }
                     expected = st.observation;
                 }
@@ -982,7 +984,10 @@ impl Monitor {
                     || self.pending_no_progress(tid, status.last_update, now)
                 {
                     self.clear_pending_progress(tid);
-                    self.force_abort(tid, &status.observation).await
+                    Ok(self
+                        .try_abort_observed(tid, &status.observation)
+                        .await?
+                        .status)
                 } else {
                     Ok(TxCommitStatus::Pending)
                 }
@@ -1062,7 +1067,10 @@ impl Monitor {
                 .commit_status_at(tid, self.current_requirement())
                 .await?;
             let res = match status.status {
-                TxCommitStatus::Unknown => self.force_abort(tid, &status.observation).await,
+                TxCommitStatus::Unknown => Ok(self
+                    .try_abort_observed(tid, &status.observation)
+                    .await?
+                    .status),
                 // Appearance is progress. Re-enter ordinary status resolution
                 // so a fresh pending lease remains live and a final object can
                 // never be used as the expected side of an abort CAS.
@@ -1235,6 +1243,8 @@ fn notify_waiters(st: &mut State, tid: &TxId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_data::{CollectionAddress, CollectionId};
@@ -1454,7 +1464,7 @@ mod tests {
         mon.begin_tx(&pending);
         assert_eq!(
             mon.wound_tx(&pending).await.unwrap(),
-            TxCommitStatus::Aborted
+            TxFinalStatus::Aborted
         );
 
         let committed = TxId::from_bytes(b"committed".to_vec());
@@ -1465,7 +1475,70 @@ mod tests {
             typ: LockType::Write,
         });
         mon.commit_tx(log).await.unwrap();
-        assert_eq!(mon.wound_tx(&committed).await.unwrap(), TxCommitStatus::Ok);
+        assert_eq!(
+            mon.wound_tx(&committed).await.unwrap(),
+            TxFinalStatus::Committed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wound_tx_retries_a_pending_refresh() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let b: Arc<dyn Backend> = backend.clone();
+        let (mon, _wounder) = new_test_monitor(b.clone());
+        let (_owner_mon, owner) = new_test_monitor(b.clone());
+        let tx = TxId::from_bytes(b"refresh-before-wound".to_vec());
+        let pending = owner
+            .tl
+            .set(&TxLog::new(tx.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+
+        let mut refreshed = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        refreshed.locks.push(TxLock::Entry {
+            key: key_ref(b"new-lock"),
+            typ: LockType::Write,
+        });
+        let refresh = Arc::new(Mutex::new(Some((
+            owner.tl.clone(),
+            refreshed.clone(),
+            pending,
+        ))));
+        let abort_writes = Arc::new(AtomicUsize::new(0));
+        backend.set_before({
+            let refresh = refresh.clone();
+            let abort_writes = abort_writes.clone();
+            move |operation| {
+                let is_abort = matches!(
+                    operation,
+                    BackendOp::WriteIf { value, .. }
+                        if glassdb_storage::txobject::status(value)
+                            .map(|status| status == TxCommitStatus::Aborted)
+                            .unwrap_or(false)
+                );
+                let refresh = if is_abort {
+                    abort_writes.fetch_add(1, Ordering::SeqCst);
+                    refresh.lock().unwrap().take()
+                } else {
+                    None
+                };
+                let future: HookFuture = Box::pin(async move {
+                    if let Some((tl, pending, expected)) = refresh {
+                        tl.set_if(&pending, &expected)
+                            .await
+                            .expect("the competing pending refresh should win");
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+
+        assert_eq!(mon.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(abort_writes.load(Ordering::SeqCst), 2);
+        let (_verify_mon, verify) = new_test_monitor(b);
+        let final_log = verify.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        assert_eq!(final_log.value().unwrap().locks, refreshed.locks);
     }
 
     #[tokio::test]
@@ -1589,7 +1662,7 @@ mod tests {
             .unwrap()
             .observation;
         assert_eq!(
-            mon.force_abort(&tx, &observed).await.unwrap(),
+            mon.try_abort_observed(&tx, &observed).await.unwrap().status,
             TxCommitStatus::Aborted
         );
         assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
@@ -1804,7 +1877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_abort_preserves_a_final_observation() {
+    async fn try_abort_observed_preserves_a_final_observation() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let b: Arc<dyn Backend> = Arc::new(backend);
@@ -1817,7 +1890,10 @@ mod tests {
         operations.lock().unwrap().clear();
 
         assert_eq!(
-            mon.force_abort(&tx, &committed).await.unwrap(),
+            mon.try_abort_observed(&tx, &committed)
+                .await
+                .unwrap()
+                .status,
             TxCommitStatus::Ok
         );
         assert!(
