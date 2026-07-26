@@ -23,7 +23,7 @@ pub enum DirectoryReadKind {
         collection: Option<CollectionId>,
     },
     Listing {
-        children: Vec<(Vec<u8>, CollectionId)>,
+        version: u64,
     },
 }
 
@@ -68,4 +68,5 @@ impl CollectionData {
 #[derive(Debug, Clone)]
 pub struct DirectorySnapshot {
     pub children: Vec<(Vec<u8>, CollectionId)>,
+    pub version: u64,
 }

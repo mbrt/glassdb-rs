@@ -191,6 +191,10 @@ impl CollectionLifecycle {
                 self.resolve_pending_holder(&holder, id).await?;
                 continue;
             }
+            // The topology freeze has drained structural participants. This
+            // exact-revision rewrite fuses the remaining one-shot structural
+            // exclusion with intent installation: a late node CAS either lands
+            // first and makes us retry, or loses and then observes the intent.
             node.set_collection_delete_intent(id.clone());
             if self
                 .shards
@@ -223,6 +227,8 @@ impl CollectionLifecycle {
                 self.resolve_pending_holder(&holder, id).await?;
                 continue;
             }
+            // As for standalone nodes, the exact-revision rewrite closes the
+            // final race without leaving a separate gate to recover on abort.
             root.node_locks_mut().set_delete_intent(id.clone());
             if self.shards.store_root(&prefix, &root, &observed).await? {
                 return Ok(());
@@ -316,5 +322,210 @@ impl CollectionLifecycle {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
+    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_concurr::Background;
+    use glassdb_data::paths;
+    use glassdb_storage::{CachedStore, LockType, Shard, ShardEntry, TLogger, Timeline};
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    const COLLECTION: &str = "db/_c/0000000000000000000000";
+    const SOURCE_TOKEN: &str = "L";
+
+    struct FirstSourceWriteGate {
+        armed: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl FirstSourceWriteGate {
+        fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+            let source_path = paths::from_node(COLLECTION, SOURCE_TOKEN);
+            let gate = Arc::new(Self {
+                armed: AtomicBool::new(false),
+                entered: Notify::new(),
+                release: Notify::new(),
+            });
+            let backend = HookBackend::new(inner);
+            backend.set_before({
+                let gate = gate.clone();
+                move |op| {
+                    let wait = matches!(
+                        op,
+                        BackendOp::WriteIf { path, .. }
+                            if path == &source_path
+                                && gate.armed.swap(false, Ordering::SeqCst)
+                    );
+                    let gate = gate.clone();
+                    let future: HookFuture = Box::pin(async move {
+                        if wait {
+                            gate.entered.notify_one();
+                            gate.release.notified().await;
+                        }
+                        Ok(())
+                    });
+                    future
+                }
+            });
+            (backend, gate)
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    struct TestStore {
+        shards: ShardStore,
+        objects: CachedStore,
+        timeline: Timeline,
+    }
+
+    fn store(backend: Arc<dyn Backend>) -> TestStore {
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
+        TestStore {
+            shards: ShardStore::new(objects.clone()),
+            objects,
+            timeline,
+        }
+    }
+
+    fn live_entry(key: &[u8]) -> ShardEntry {
+        ShardEntry {
+            key: key.to_vec(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current_writer: Some(TxId::from_bytes(vec![9])),
+            deleted: false,
+        }
+    }
+
+    async fn run_fence_shrink_race(fence_waits: bool) {
+        let (backend, gate) = FirstSourceWriteGate::wrap(Arc::new(MemoryBackend::new()));
+        let backend: Arc<dyn Backend> = backend;
+        let primary = store(backend.clone());
+        let peer = store(backend.clone());
+        let background = Arc::new(Background::new());
+        let monitor = Monitor::new(
+            TLogger::new(primary.objects.clone(), "db"),
+            primary.timeline.clone(),
+            Arc::downgrade(&background),
+        );
+        let retry = RetryConfig {
+            initial_interval: Duration::ZERO,
+            max_interval: Duration::ZERO,
+        };
+        let primary_lifecycle =
+            CollectionLifecycle::new(primary.shards.clone(), monitor.clone(), retry);
+        let peer_lifecycle = CollectionLifecycle::new(peer.shards.clone(), monitor.clone(), retry);
+        let split_id = TxId::from_bytes(vec![2]);
+        let drop_id = TxId::from_bytes(vec![1]);
+
+        let mut source = Node::leaf(Shard::from_entries([live_entry(b"a"), live_entry(b"z")]));
+        source.set_structural_gate(split_id.clone());
+        assert!(
+            primary
+                .shards
+                .store_node(COLLECTION, SOURCE_TOKEN, &source, None)
+                .await
+                .unwrap()
+        );
+        let (mut shrunk, source_version) = primary
+            .shards
+            .load_node(COLLECTION, SOURCE_TOKEN, Requirement::Any)
+            .await
+            .unwrap();
+        let (right, _) = shrunk.split("R").unwrap();
+        shrunk.remove_structural_gate(&split_id);
+        assert!(
+            primary
+                .shards
+                .store_node(COLLECTION, "R", &right, None)
+                .await
+                .unwrap()
+        );
+        monitor.begin_tx(&split_id);
+        monitor.abort_tx(&split_id).await.unwrap();
+
+        gate.arm();
+        let shrink_landed = if fence_waits {
+            let fencing = tokio::spawn({
+                let lifecycle = primary_lifecycle.clone();
+                let drop_id = drop_id.clone();
+                async move {
+                    lifecycle
+                        .fence_node(COLLECTION, SOURCE_TOKEN, &drop_id)
+                        .await
+                }
+            });
+            gate.wait_until_entered().await;
+            let shrink_landed = peer
+                .shards
+                .store_node(COLLECTION, SOURCE_TOKEN, &shrunk, Some(&source_version))
+                .await
+                .unwrap();
+            gate.release();
+            fencing.await.unwrap().unwrap();
+            shrink_landed
+        } else {
+            let shrinking = tokio::spawn({
+                let shards = primary.shards.clone();
+                let shrunk = shrunk.clone();
+                let source_version = source_version.clone();
+                async move {
+                    shards
+                        .store_node(COLLECTION, SOURCE_TOKEN, &shrunk, Some(&source_version))
+                        .await
+                }
+            });
+            gate.wait_until_entered().await;
+            let fence_result = peer_lifecycle
+                .fence_node(COLLECTION, SOURCE_TOKEN, &drop_id)
+                .await;
+            gate.release();
+            let shrink_landed = shrinking.await.unwrap().unwrap();
+            fence_result.unwrap();
+            shrink_landed
+        };
+        assert_eq!(shrink_landed, fence_waits);
+
+        let verifier = store(backend);
+        let (final_source, _) = verifier
+            .shards
+            .load_node(COLLECTION, SOURCE_TOKEN, Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(final_source.collection_delete_intent(), Some(&drop_id));
+        assert_eq!(final_source.right_sibling(), shrink_landed.then_some("R"));
+    }
+
+    #[tokio::test]
+    async fn collection_fence_retries_after_an_in_flight_shrink_lands() {
+        run_fence_shrink_race(true).await;
+    }
+
+    #[tokio::test]
+    async fn collection_fence_prevents_a_late_in_flight_shrink() {
+        run_fence_shrink_race(false).await;
     }
 }

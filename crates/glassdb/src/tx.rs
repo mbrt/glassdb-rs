@@ -61,6 +61,7 @@ struct TransactionInner {
 struct DirectoryState {
     base: BTreeMap<Vec<u8>, CollectionId>,
     current: BTreeMap<Vec<u8>, CollectionId>,
+    version: u64,
 }
 
 pub(crate) struct TransactionMetrics {
@@ -378,11 +379,7 @@ impl Transaction {
                 .directories
                 .get(parent.address())
                 .expect("directory was loaded above");
-            let base = state
-                .base
-                .iter()
-                .map(|(name, id)| (name.clone(), *id))
-                .collect::<Vec<_>>();
+            let version = state.version;
             let current = state
                 .current
                 .iter()
@@ -390,9 +387,7 @@ impl Transaction {
                 .collect::<Vec<_>>();
             inner.directory_reads.push(DirectoryRead {
                 parent: parent.address().clone(),
-                kind: DirectoryReadKind::Listing {
-                    children: base.clone(),
-                },
+                kind: DirectoryReadKind::Listing { version },
             });
             current
         };
@@ -459,16 +454,12 @@ impl Transaction {
             .directories
             .get(collection.address())
             .expect("target directory was loaded above");
-        let target_base = target
-            .base
-            .iter()
-            .map(|(name, id)| (name.clone(), *id))
-            .collect::<Vec<_>>();
+        let target_version = target.version;
         let target_not_empty = !target.current.is_empty();
         inner.directory_reads.push(DirectoryRead {
             parent: collection.address().clone(),
             kind: DirectoryReadKind::Listing {
-                children: target_base,
+                version: target_version,
             },
         });
         if target_not_empty {
@@ -704,6 +695,7 @@ impl Transaction {
                     DirectoryState {
                         base: BTreeMap::new(),
                         current: BTreeMap::new(),
+                        version: 0,
                     },
                 );
                 return Ok(());
@@ -719,6 +711,7 @@ impl Transaction {
             }
         })?;
         let children = snapshot.children.into_iter().collect::<BTreeMap<_, _>>();
+        let version = snapshot.version;
         let mut inner = self.inner.lock().unwrap();
         inner
             .directories
@@ -726,6 +719,7 @@ impl Transaction {
             .or_insert_with(|| DirectoryState {
                 base: children.clone(),
                 current: children,
+                version,
             });
         Ok(())
     }

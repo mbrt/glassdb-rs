@@ -61,6 +61,7 @@ impl CollectionCatalog {
                 .children()
                 .map(|(name, id)| (name.to_vec(), id))
                 .collect(),
+            version: root.directory_version(),
         })
     }
 
@@ -115,10 +116,7 @@ impl CollectionCatalog {
             let root = &roots[&read.parent];
             let valid = match &read.kind {
                 DirectoryReadKind::Entry { name, collection } => root.child(name) == *collection,
-                DirectoryReadKind::Listing { children } => root
-                    .children()
-                    .map(|(name, id)| (name.to_vec(), id))
-                    .eq(children.iter().cloned()),
+                DirectoryReadKind::Listing { version } => root.directory_version() == *version,
             };
             if !valid {
                 return Ok(false);
@@ -290,17 +288,15 @@ impl CollectionCatalog {
                 LockType::Write => !lock.holders().is_empty(),
                 _ => false,
             };
-            if conflicts {
-                let holder = lock
-                    .holders()
-                    .iter()
-                    .find(|holder| *holder != id)
-                    .cloned()
-                    .ok_or_else(|| TransError::other("directory lock cannot be upgraded"))?;
+            if conflicts
+                && let Some(holder) = lock.holders().iter().find(|holder| *holder != id).cloned()
+            {
                 resolve_tx_conflict(&self.monitor, id, &holder).await?;
                 rt::sleep(backoff.next_delay()).await;
                 continue;
             }
+            // If the request still conflicts here, wound-wait has removed every
+            // foreign reader, so our shared lock can be replaced atomically.
             match desired {
                 LockType::Read => root.add_directory_reader(id.clone()),
                 LockType::Write => root.set_directory_writer(id.clone()),
@@ -401,5 +397,57 @@ impl CollectionCatalog {
             }
             rt::sleep(backoff.next_delay()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use glassdb_backend::memory::MemoryBackend;
+    use glassdb_concurr::Background;
+    use glassdb_storage::{CachedStore, TLogger, Timeline};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn sole_directory_reader_can_upgrade_to_writer() {
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            timeline.clone(),
+            None,
+        );
+        let shards = ShardStore::new(objects.clone());
+        let background = Arc::new(Background::new());
+        let monitor = Monitor::new(
+            TLogger::new(objects, "db"),
+            timeline,
+            Arc::downgrade(&background),
+        );
+        let catalog = CollectionCatalog::new(shards.clone(), monitor, RetryConfig::default());
+        let parent = CollectionAddress::root("db");
+        let prefix = parent.physical_prefix();
+        assert!(
+            shards
+                .create_root(&prefix, &CollectionRoot::new())
+                .await
+                .unwrap()
+        );
+        let id = TxId::from_bytes(vec![1]);
+
+        catalog
+            .acquire_directory_lock(&parent, &id, LockType::Read)
+            .await
+            .unwrap();
+        catalog
+            .acquire_directory_lock(&parent, &id, LockType::Write)
+            .await
+            .unwrap();
+
+        let (root, _) = shards.load_root(&prefix, Requirement::Any).await.unwrap();
+        assert_eq!(root.directory_lock().lock_type(), LockType::Write);
+        assert_eq!(root.directory_lock().holders(), std::slice::from_ref(&id));
     }
 }

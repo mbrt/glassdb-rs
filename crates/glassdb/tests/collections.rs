@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::RecordingBackend;
@@ -142,6 +142,41 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
         entries[1].collection.read(b"k").await.unwrap().unwrap(),
         b"last"
     );
+}
+
+#[tokio::test]
+async fn child_listing_retries_after_the_directory_changes() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let peer = Database::open("example", backend).await.unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let names = db
+        .tx({
+            let attempts = attempts.clone();
+            move |tx| {
+                let peer = peer.clone();
+                let attempts = attempts.clone();
+                async move {
+                    let root = tx.root_collection();
+                    let names = tx
+                        .collections(&root)
+                        .await?
+                        .map(|entry| entry.map(|entry| entry.name))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        peer.create_collection("appeared").await?;
+                    }
+                    tx.write(&root, b"marker", b"committed")?;
+                    Ok(names)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(names, vec![b"appeared".to_vec()]);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
