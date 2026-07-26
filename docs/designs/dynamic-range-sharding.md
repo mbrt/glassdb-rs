@@ -275,6 +275,12 @@ ADR — this overview and the diagrams above are the map into it.
   topology participant an exact structural-intent prefix, closes the
   prepare/join race, and replaces collection-wide recovery walks with
   key-directed reachability checks.
+- **[ADR-050](../adr/050-separate-collection-record-and-tree-root.md) —
+  Separate the collection record from the B-link tree root.** *Proposed.*
+  Separates the fixed `_i` collection record from a fixed `_r` tree root,
+  removing their shared CAS and size domains while preserving direct descent,
+  the one-node small-collection tree, and in-place root splits. On acceptance,
+  it supersedes the combined `_i` layout described above.
 
 Planned follow-on ADRs, as the open questions below resolve: merge/rebalance,
 split-point policy, and node fan-out/sizing.
