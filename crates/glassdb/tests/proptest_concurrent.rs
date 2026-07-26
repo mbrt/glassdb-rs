@@ -20,10 +20,12 @@ fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
 
+fn try_read_int(b: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(b.try_into().ok()?))
+}
+
 fn read_int(b: &[u8]) -> i64 {
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(b);
-    i64::from_le_bytes(arr)
+    try_read_int(b).expect("integer value has the wrong width")
 }
 
 async fn read_int_from_tx(
@@ -32,7 +34,8 @@ async fn read_int_from_tx(
     k: &[u8],
 ) -> Result<i64, Error> {
     match tx.read(c, k).await {
-        Ok(Some(v)) => Ok(read_int(&v)),
+        Ok(Some(v)) => try_read_int(&v)
+            .ok_or_else(|| Error::internal(format!("key {k:?} has non-integer value {v:?}"))),
         Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
@@ -42,7 +45,10 @@ async fn rmw(db: &Database, coll: &Collection, key: &[u8], n: u32) -> Result<(),
     for _ in 0..n {
         db.tx(|tx| async move {
             let cur = read_int_from_tx(&tx, coll, key).await?;
-            tx.write(coll, key, &write_int(cur + 1))
+            let next = cur
+                .checked_add(1)
+                .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))?;
+            tx.write(coll, key, &write_int(next))
         })
         .await?;
     }
@@ -60,8 +66,14 @@ async fn multi_rmw(
         db.tx(|tx| async move {
             let va = read_int_from_tx(&tx, coll, a).await?;
             let vb = read_int_from_tx(&tx, coll, b).await?;
-            tx.write(coll, a, &write_int(va + 1))?;
-            tx.write(coll, b, &write_int(vb + 1))
+            let next_a = va
+                .checked_add(1)
+                .ok_or_else(|| Error::internal(format!("integer overflow for key {a:?}")))?;
+            let next_b = vb
+                .checked_add(1)
+                .ok_or_else(|| Error::internal(format!("integer overflow for key {b:?}")))?;
+            tx.write(coll, a, &write_int(next_a))?;
+            tx.write(coll, b, &write_int(next_b))
         })
         .await?;
     }
@@ -69,17 +81,26 @@ async fn multi_rmw(
 }
 
 async fn read_only(db: &Database, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
-    db.tx(|tx| async move {
-        for k in keys {
-            match tx.read(coll, k).await {
-                Ok(Some(v)) => assert!(read_int(&v) >= 0, "negative value for {k:?}"),
-                Ok(None) => {}
-                Err(e) => return Err(e),
+    let values = db
+        .tx(|tx| async move {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(tx.read(coll, key).await?);
             }
+            Ok(values)
+        })
+        .await?;
+    for (key, value) in keys.iter().zip(values) {
+        if let Some(value) = value {
+            assert_eq!(
+                value.len(),
+                std::mem::size_of::<i64>(),
+                "key {key:?} has non-integer value {value:?}"
+            );
+            assert!(read_int(&value) >= 0, "negative value for {key:?}");
         }
-        Ok(())
-    })
-    .await
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
