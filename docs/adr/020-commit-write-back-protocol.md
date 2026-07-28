@@ -25,6 +25,11 @@ publishes a write lock instead of the pointer so the two writes issue in
 parallel, followed by an asynchronous write-back. The rest of this ADR is
 unchanged.
 
+Proposed [ADR-051](051-inline-latest-values.md) would further supersede that fast
+path for an inline-eligible value with one authoritative leaf CAS and no
+transaction object. The logged commit and write-back protocol remains the
+fallback.
+
 ## Context
 
 [ADR-017](017-shard-object.md), [ADR-018](018-collection-root-membership.md), and

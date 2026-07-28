@@ -13,6 +13,11 @@ the shared shard coordinator as a `CommitInstall` resolver. The parallel-commit
 decision here (two concurrent writes, the commit point, the one irreducible
 in-doubt) is retained.
 
+Proposed [ADR-051](051-inline-latest-values.md) would supersede this path when
+the value is eligible for authoritative leaf inlining: that case commits with
+one direct leaf CAS and no transaction object. This parallel logged path remains
+the fallback for non-inline values.
+
 ## Context
 
 ADR-020's single read-write fast path commits a lone overwrite of an existing
