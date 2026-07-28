@@ -14,6 +14,10 @@ was rejected before acceptance; see
 comparison. Unlike that proposal, this decision leaves ADR-020's commit
 sequence and [ADR-027](027-single-rw-parallel-lock-publish.md)'s parallel
 single read-write path unchanged.
+[ADR-051](051-inline-latest-values.md)'s logless one-CAS commit is the one
+exception, and it is lost to
+[ADR-039](039-timestamp-versioned-key-history.md)'s mandatory history rather
+than to anything decided here.
 
 ## Context
 
@@ -42,9 +46,11 @@ timestamp it observed on the versions and holder records it touched, plus one.
 The value is recorded in its holder records as a lower bound while it runs and
 frozen into its commit certificate.
 
-Because a server-time observation is generated at or after its operation
-applied, the timestamp lands at or after the moment the transaction's intents
-became durable. Assignment adds no round trip and no object.
+The timestamp need not land at or after the moment the intents became durable,
+and on a message-anchored backend it may precede it. Nothing here depends on
+that: monotonicity per key and the propagation below come from the locks, and an
+early timestamp only brings the commit-age bound forward. Readers absorb the
+difference in their margin. Assignment adds no round trip and no object.
 
 ### Propagate across lock conflicts
 
@@ -62,8 +68,12 @@ because every writer of a key holds its write lock.
 ### Select a cut from an observation, never from a local clock
 
 A reader takes its cut strictly below a server-time observation it actually
-received, discounted by a margin that covers skew within the backend's fleet
-and the granularity of its reported time. Any write installing after that
+received, discounted by a margin. The margin covers skew within the backend's
+fleet, the granularity of its reported time, and, when ADR-052's declaration
+says the backend is message-anchored, how far a stamp may precede its apply.
+That last term needs no provider guarantee, because a stamp and its apply fall
+inside one request and the client's own request timeout bounds its duration.
+Any write installing after that
 observation carries a strictly greater timestamp and is invisible to the cut;
 any write installing before it is visible as a holder on the keys the reader
 touches. Local clocks may decide when to resample but must never extrapolate a
@@ -103,11 +113,13 @@ own age, so it cannot abort a writer because an unrelated transaction is slow.
   structure, no fence, no control record, no sealing, and no global frontier.
 - No object is written by every commit or read by every acquisition, so
   transactions on disjoint keys never interact through the snapshot mechanism.
-- The commit critical path is unchanged, so ADR-027 remains in force and the
-  performance question narrows to writing and retaining history.
+- The logged commit critical path is unchanged, so ADR-027 remains in force.
+  What a writer loses is ADR-051's logless path, which ADR-039 rules out
+  independently of this decision, so the performance question narrows to that
+  loss plus writing and retaining history.
 - Cut safety rests on the backend's clock rather than on a conditional write. A
   sealed frontier could not be corrupted by any clock; this can, if the
-  backend's fleet skew exceeds the margin.
+  backend's clock behaves outside the margin's allowances.
 - Freshness is asserted from an observation rather than proved by a fence, and
   a cut is no longer an exact set of transactions fixed by CAS ordering. Precise
   incremental change capture between two cuts becomes harder.

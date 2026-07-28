@@ -55,7 +55,8 @@ databases need not be upgraded or backfilled.
 | **Commit timestamp** | The position a committed transaction occupies in the cut order, assigned from server-time observations once every lock is held. |
 | **Cut** | The complete logical database state at one timestamp: a downward-closed prefix of the strict-serializable order, not a copied database. |
 | **Cut grid / slot** | The fixed-period partition of the timestamp domain that every client computes identically; admissible cuts are grid points, and a slot is the interval between adjacent ones. |
-| **Margin** | How far a cut trails the reader's server-time observation. It must cover skew within the backend's fleet plus the granularity of its reported time. |
+| **Anchoring** | Whether a backend's reported time is known to be at or after the operation applied (apply-anchored) or only to fall inside the request (message-anchored). Declared per backend by ADR-052. |
+| **Margin** | How far a cut trails the reader's server-time observation. It sums three allowances: skew within the backend's fleet, the granularity of its reported time, and, for a message-anchored backend, the request timeout. |
 | **Commit-age bound** | The maximum age a transaction's commit timestamp may reach before it must abort or be durably aborted by a peer. |
 | **History head / floor version** | A leaf entry's pointer into one key's retained history / the first certified version at or before the oldest still-readable cut. |
 
@@ -161,7 +162,10 @@ is no strict-only capability or creation-time opt-out.
 | Setting | Proposed default | Purpose |
 |---|---:|---|
 | Cut grid period | 5 seconds | Spacing of admissible cuts; also the retention-coalescing and change-log unit |
-| Cut margin | 5 seconds | Covers backend fleet skew and reported-time granularity; the safety term |
+| Fleet-skew allowance | 1 second | Skew between servers within the backend's fleet |
+| Reported-granularity allowance | 1 second | Truncation in the backend's reported time; one second for an HTTP `Date` |
+| Apply-anchoring allowance | backend request timeout | Bound on the gap between stamp and apply for a message-anchored backend; zero when apply-anchored |
+| Cut margin | sum of the three allowances | The safety term subtracted from the observation |
 | Maximum snapshot staleness | 30 seconds | Total distance a cut may trail the present |
 | Maximum read lifetime | 1 hour | Supports cold object-store scans and analytics |
 | Commit-age bound | 30 seconds | Age at which a still-pending transaction's timestamp forces abort |
@@ -170,12 +174,21 @@ is no strict-only capability or creation-time opt-out.
 | Minimum history retention | 65 minutes | Derived safety floor; see ADR-040 |
 
 Maximum staleness decomposes into the age of the observation a bind uses, the
-margin, and the grid period. Only the margin is a safety term: it must exceed
-skew within the backend's fleet plus the granularity of its reported time, and
-five seconds is generous against providers that keep front-end clocks within
-milliseconds. The rest is a freshness preference, and a caller may ask for less
-at the cost of refreshing its observation more often. Under healthy operation a
-cut should trail by roughly the margin plus the grid period.
+margin, and the grid period. Only the margin is a safety term, and it is a sum
+of three separately sized allowances rather than one number, because they come
+from unrelated sources and differ per backend.
+
+Fleet skew is the smallest of the three: providers keep server clocks within
+milliseconds, so a second is already three orders of magnitude of headroom.
+Granularity is fixed by the format of the reported time. The apply-anchoring
+allowance dominates on a message-anchored backend and is zero on an
+apply-anchored one, so the margin is a property of the deployment's backend
+rather than a universal constant. Against S3 with a three-second request
+timeout the margin is five seconds; against Cloud Storage it is two.
+
+The rest of the staleness budget is a freshness preference, and a caller may ask
+for less at the cost of refreshing its observation more often. Under healthy
+operation a cut should trail by roughly the margin plus the grid period.
 
 With a one-hour lifetime, the 65-minute retention floor leaves a 4.5-minute
 guard beyond maximum staleness plus lifetime for the reader-versus-GC rate
@@ -303,16 +316,21 @@ server-time observation it already holds, with no dedicated coordination step.
 
 **Assignment.** Timestamps come from the backend's clock rather than from
 client clocks. Every client already contacts one shared party on every
-operation, and S3 and GCS both report a server time on every response, so that
-clock is available at no cost. Once every lock is held, a transaction sets its
-commit timestamp to the maximum of the server time reported by its own
-lock-install responses and every timestamp it observed on the versions and
-holder records it touched, plus one. A response's server time is generated at
-or after its CAS was applied, so the timestamp provably lands at or after the
-moment the intent became durable. The value is recorded in holder records as a
-lower bound while the transaction runs and frozen into its commit certificate.
-Assigning it costs no round trip: the reading is a header on a response the
-protocol already waits for.
+operation, and both S3 and Cloud Storage report a server time on every
+response, so that clock is available at no cost. Once every lock is held, a
+transaction sets its commit timestamp to the maximum of the server time
+reported by its own lock-install responses and every timestamp it observed on
+the versions and holder records it touched, plus one. The value is recorded in
+holder records as a lower bound while the transaction runs and frozen into its
+commit certificate. Assigning it costs no round trip: the reading rides on a
+response the protocol already waits for.
+
+A timestamp does not have to land at or after the moment its intents became
+durable. Per-key monotonicity and edge propagation both come from the locks and
+the maximum rule, and a timestamp that is slightly early only makes the
+commit-age bound fire sooner. Readers absorb the difference in their margin
+instead, which is why ADR-052 has a backend declare whether its reported time is
+apply-anchored rather than requiring that it be.
 
 **Propagation.** Every serialization edge in this system passes through a lock,
 which is what makes the maximum rule sufficient:
@@ -332,10 +350,16 @@ takes the maximum with the current version.
 
 **Read timestamp and the margin.** A reader derives its cut from an actual
 response it received, never from its own clock. Let `D` be the server time on a
-response received before it starts reading, and let `E` bound the skew within
-the backend's fleet plus the granularity of its reported time. Any write whose
-intent installs after that response was generated does so against a fleet clock
-reading at least `D - E`, so its commit timestamp is at least `D - E`. Choosing
+response received before it starts reading, and let `E` be the margin, the sum
+of three allowances:
+
+- skew within the backend's fleet;
+- the granularity of its reported time; and
+- for a message-anchored backend, how far a stamp may precede its apply.
+
+Any write whose intent installs after that response was generated was stamped
+at a fleet clock reading of at least `D - E`, so its commit timestamp is at
+least `D - E`. Choosing
 
 ```text
 T_read < D - E
@@ -345,11 +369,18 @@ therefore makes every such write invisible to the cut. Writes whose intents
 installed earlier are visible as holders on the keys the reader touches and are
 resolved there. No client clock appears anywhere in that argument.
 
+The third allowance is the only one that looks unbounded, and it is not. A
+stamp and its apply both fall inside a single request, so they differ by at most
+that request's duration, and a response the client actually received arrived
+within the client's own request timeout. The term is therefore bounded by a
+value the deployment already configures, with no provider guarantee involved. On
+an apply-anchored backend it is zero.
+
 In practice a reader takes the greatest cut point at or below `D - margin`,
-where the policy's staleness margin is at least `E`. The margin exists to
-absorb `E`, to leave in-flight transactions time to settle so that readers
-rarely have to resolve holders, and to give the grid room; it is a policy value
-rather than a safety requirement beyond `E`.
+where the policy's staleness margin is at least `E`. Beyond absorbing `E` the
+margin also lets in-flight transactions settle, so that readers rarely have to
+resolve holders, and gives the grid room; that part is a policy preference
+rather than a safety requirement.
 
 The local clock may decide *when* to take a fresh sample, but it never
 contributes to `T_read`. Extrapolating a cut forward from the last observation
@@ -410,7 +441,10 @@ correctness. Every response additionally offers a free comparison between the
 local clock and the backend's, so a client that has drifted in either direction
 detects it with no external reference and marks itself unhealthy. A client with
 a bad clock can still commit, because its timestamps come from the backend and
-not from itself.
+not from itself. The allowance on that comparison has to exceed the excursion of
+a leap smear, because both providers smear a leap second over 24 hours while the
+client's own clock may step instead, putting the two half a second apart for a
+day through no fault of either.
 
 A backend that reports no server time cannot support this argument. The default
 is to fail closed and refuse snapshot execution. A deployment may instead
@@ -421,25 +455,65 @@ input. That is a documented mode, not the baseline.
 **Obtaining server time.** One monotone cell per `Database` holding the maximum
 server time seen on any response is sufficient for both roles, so no
 per-request attribution is needed. A writer reads the cell after its lock
-installs complete, which puts it at or above the server time at which those
-installs applied; a larger value is always safe because it only delays
+installs complete; a larger value is always safe because it only delays
 visibility. A reader may use any genuine past observation, because writes
 installing after it are excluded by the margin and writes installing before it
-are visible as holders on the keys it touches. GCS responses expose the header
-directly. The AWS SDK exposes it through a client-level interceptor, the same
-mechanism the S3 client already uses for its own `Expires` handling. The
+are visible as holders on the keys it touches.
+
+The two backends differ in what they can report, which is what ADR-052's
+anchoring declaration exists to express. Cloud Storage returns the object
+resource on the write itself, including a server-assigned modification time, so
+it is apply-anchored and pays no third allowance. S3 returns an `ETag` and no
+modification time on `PutObject`, so reading one back would cost an extra round
+trip per mutation; it uses the `Date` response header instead and is
+message-anchored. The AWS SDK exposes response headers through a client-level
+interceptor, the same mechanism the S3 client already uses for its own `Expires`
+handling.
+
+Either reading counts only when it provably came from the origin. A cached or
+proxied response carries an unrelated clock, so a backend must discard a
+reported time it cannot attribute, rather than fold it into the cell. The
 simulated and in-process backends must model server time with injectable fleet
 skew so the margin can be exercised deterministically.
+
+### Assumptions about backend time
+
+Neither provider documents the accuracy of the time it reports, and neither
+publishes a bound on skew within its own fleet. This section records what the
+assumption actually rests on, so that it is not mistaken for a guarantee.
+
+The strongest artifact is an AWS statement that they hold a SOC control keeping
+clocks under a millisecond, which is externally audited but describes AWS
+infrastructure generally rather than the S3 API. Amazon Time Sync documents a
+typical error bound under 100µs over NTP and under 40µs with a hardware clock,
+and Google states that all its services, including all APIs, run on one smeared
+time base from their atomic clocks. Both providers reject requests signed more
+than about fifteen minutes from their own time, which shows each treats its own
+clock as authoritative, though the tolerance is far too loose to be a fleet
+bound. AWS ships `correctClockSkew` in its own SDKs, deriving the client offset
+from precisely the response header used here.
+
+Against a one-second allowance, evidence of millisecond-scale agreement leaves
+three orders of magnitude of headroom. It remains an environmental assumption of
+the same kind as trusting that the backend implements conditional writes
+correctly, and a strictly weaker one than either the client-clock alternative or
+what comparable systems assume: YugabyteDB ships with half a second of assumed
+skew across customer-operated machines.
+
+Leap seconds do not enter the argument. Both providers smear one over 24 hours,
+drifting up to half a second from UTC, but the design compares backend times
+only against each other and never against UTC, so a smear cancels. It reaches
+only the local-clock drift detector, whose allowance is sized for it above.
 
 ### Costs accepted
 
 - **Cut safety rests on the backend's clock.** A sealed epoch's boundary cannot
-  be corrupted by any clock at all. This boundary depends on `E`: skew within
-  the provider's fleet plus the granularity of its reported time. Providers run
-  dedicated time infrastructure but publish no contractual bound, so this stays
-  an environmental assumption. It is a far narrower one than arbitrary client
-  clocks on arbitrary machines, the margin is sized to absorb it with room to
-  spare, and drift is detected on every response. A durable reader-validated
+  be corrupted by any clock at all. This boundary depends on `E`, and no
+  provider documents any part of it, as
+  [the assumptions above](#assumptions-about-backend-time) set out. It is a far
+  narrower assumption than arbitrary client clocks on arbitrary machines, the
+  margin is sized to absorb it with room to spare, and drift is detected on
+  every response. A durable reader-validated
   history floor is planned as the detection backstop for reader-versus-GC
   disagreement so that a violation surfaces as an error rather than a wrong
   answer; that decision is not yet written.
@@ -468,7 +542,9 @@ once and `read_tx` takes `FnOnce`.
 ADR-020's commit sequence and ADR-027's parallel single read-write path also
 survive intact, which is what narrows the
 [performance gate](#performance-acceptance-gate) to history rather than commit
-latency.
+latency. ADR-051's logless one-CAS commit does not survive, but that is
+mandatory history rather than cut selection, so no choice about cuts would have
+saved it; see [Mandatory cost](#mandatory-cost).
 
 ## Design at a glance
 
@@ -478,6 +554,12 @@ Snapshot support adds two things to the commit sequence: a commit timestamp,
 carried in records the protocol already writes, and per-key history
 certification after the commit point. Nothing else about ADR-020 or ADR-027
 changes.
+
+The sequence below is therefore the only write path. ADR-051's logless direct
+commit has no place in it, because a single leaf CAS produces neither an
+immutable payload nor a certificate, so an inline-eligible overwrite takes this
+path like any other write. Its inline representation survives: step 7 may leave
+the committed bytes in the leaf for strict latest reads.
 
 The full sequence, counting execution of the user body:
 
@@ -860,6 +942,14 @@ boundaries. At minimum, the test plan must cover:
 - injected fleet skew at and beyond the margin, proving that a cut stays intact
   within the margin and that the failure outside it is reproducible rather than
   incidental;
+- a message-anchored backend that stamps its reported time before the write
+  applies, at and beyond the request timeout, proving that the apply-anchoring
+  allowance is what covers the gap and that an apply-anchored backend needs
+  none of it;
+- a reported time arriving from something other than the origin, proving the
+  backend discards it rather than admitting a foreign clock;
+- local clock and backend diverging by a leap smear's excursion, proving the
+  drift detector tolerates it;
 - a client that never refreshes its observation, proving its cuts grow staler
   and never become inconsistent, plus the cache-served execution that must
   refresh or expire;
@@ -879,6 +969,9 @@ boundaries. At minimum, the test plan must cover:
   operations occur between pages, proving the final keys have no gaps or
   duplicates and all point-read values match `T`; a separate `read_tx` is
   explicitly allowed to bind a later cut;
+- an inline-eligible small overwrite, proving it takes the logged path and
+  emits history, that its inline bytes still serve strict latest reads, and that
+  those bytes are never mistaken for a historical version at any cut;
 - create/delete/recreate history, committed holders awaiting write-back,
   malformed predecessor chains, and exact GC floor-version boundaries; after a
   delete and pruning at each boundary, point lookup plus forward `KeyScan`
@@ -934,6 +1027,11 @@ not prove cut selection or freshness.
   conservative default proposed here.
 - Choose history-chunk and sparse-index sizing from hot-key and range-scan
   benchmarks while preserving a bounded lookup.
+- Investigate restoring a certified single-CAS commit for inline-eligible
+  overwrites, recovering what ADR-051 loses here without weakening history or
+  abort fencing. This is the largest identified regression, so its feasibility
+  should be settled before the format is considered final even though it is not
+  a prerequisite for acceptance.
 - Add safe online `SnapshotPolicy` enlargement/shrinkage if operational demand
   justifies its transition protocol.
 - Define collection drop and physical topology reclamation using the reserved

@@ -12,6 +12,13 @@ for committed values and its deletion of outcome evidence needed to fence
 delayed artifacts. Pending-lock reclamation remains, extended by
 [ADR-038](038-hlc-snapshot-cuts.md)'s commit-age bound.
 
+Because [ADR-039](039-timestamp-versioned-key-history.md) requires certified
+history from every writer, a writer ID again implies durable outcome evidence.
+[ADR-051](051-inline-latest-values.md)'s logless IDs, which have no such
+evidence, do not occur in this format. Inline current bytes still do, and they
+are part of the leaf rather than a reclaimable object, so they neither act as a
+GC root nor satisfy a retention obligation.
+
 ## Context
 
 Reader pins would require ephemeral clients to refresh leases and would let a

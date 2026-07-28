@@ -67,8 +67,9 @@ that bound, so ordering a bind against an operational disable requires no
 strongly consistent read at bind time.
 
 Store one immutable `SnapshotPolicy` in database metadata. It defines maximum
-staleness, the cut-grid period, maximum lifetime, the fleet-skew and reported-
-granularity allowance, the commit-age bound, the control-staleness bound, the
+staleness, the cut-grid period, maximum lifetime, the fleet-skew,
+reported-granularity, and apply-anchoring allowances whose sum is the cut
+margin, the commit-age bound, the control-staleness bound, the
 elapsed-time rate uncertainty between a reader and GC, and the minimum derived
 retention guarantee. Per-call requests may be stricter but never exceed the
 database policy. Online policy reconfiguration is deferred. Every database in
