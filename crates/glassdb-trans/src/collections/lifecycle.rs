@@ -368,7 +368,7 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::Background;
     use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, LockType, Shard, ShardEntry, TLogger, Timeline};
+    use glassdb_storage::{CachedStore, CurrentState, Shard, ShardEntry, TLogger, Timeline};
     use tokio::sync::Notify;
 
     use super::*;
@@ -447,11 +447,10 @@ mod tests {
 
     fn live_entry(key: &[u8]) -> ShardEntry {
         ShardEntry {
-            key: key.to_vec(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: Some(TxId::from_bytes(vec![9])),
-            deleted: false,
+            current: CurrentState::External {
+                writer: TxId::from_bytes(vec![9]),
+            },
+            ..ShardEntry::new(key)
         }
     }
 

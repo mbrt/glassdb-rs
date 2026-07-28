@@ -15,7 +15,7 @@ tombstone retention — is unchanged.
 flat `_t/` candidate walk into a paginated traversal over deterministic shards.
 The safety policy below remains unchanged.
 
-Proposed [ADR-051](051-inline-latest-values.md) would refine the liveness graph:
+[ADR-051](051-inline-latest-values.md) refines the liveness graph:
 an inline writer ID may have no transaction object, while an existing ordinary
 transaction object remains live whenever current or locked state names it.
 Candidate-driven listing and reverse reference checks remain unchanged.

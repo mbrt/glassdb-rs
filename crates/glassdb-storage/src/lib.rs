@@ -8,6 +8,7 @@ mod collection_store;
 mod directory;
 mod disk_cache;
 mod error;
+mod inline;
 mod lock;
 mod node;
 mod shard;
@@ -43,9 +44,10 @@ pub use disk_cache::{
     OpenedPersistentCache, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
 };
 pub use error::StorageError;
+pub use inline::InlinePolicy;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};
-pub use shard::{Shard, ShardEntry};
+pub use shard::{CurrentState, Shard, ShardEntry};
 pub use shard_store::{LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use timeline::{SequencePoint, Timeline};

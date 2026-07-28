@@ -9,7 +9,7 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DatabaseId, TxId};
 use glassdb_storage::{
-    CachedStore, CollectionStore, Directory, PersistentCache, PersistentCacheConfig,
+    CachedStore, CollectionStore, Directory, InlinePolicy, PersistentCache, PersistentCacheConfig,
     PersistentCacheMedia, Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
@@ -53,6 +53,7 @@ pub struct DatabaseBuilder {
     deterministic_time: bool,
     retry: RetryConfig,
     split_policy: SplitPolicy,
+    inline_policy: InlinePolicy,
     protocol_timing: ProtocolTiming,
 }
 
@@ -106,6 +107,14 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Overrides the budgets bounding how much committed value data leaf
+    /// entries carry inline (ADR-051). Inlining trades a larger leaf write for
+    /// a saved transaction-object read on the next latest-value read.
+    pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
+        self.inline_policy = policy;
+        self
+    }
+
     /// Overrides transaction-liveness timing, including the pending lease and
     /// cross-client clock-skew allowance. The configured skew must bound every
     /// client using this database so a live transaction is never reclaimed.
@@ -125,6 +134,7 @@ impl DatabaseBuilder {
             deterministic_time,
             retry,
             split_policy,
+            inline_policy,
             protocol_timing,
         } = self;
 
@@ -194,6 +204,7 @@ impl DatabaseBuilder {
             retry,
             &name,
             split_policy,
+            inline_policy,
         );
         let locker = Locker::new(
             coord.clone(),
@@ -270,6 +281,7 @@ impl DatabaseBuilder {
             deterministic_time: false,
             retry: RetryConfig::default(),
             split_policy: SplitPolicy::default(),
+            inline_policy: InlinePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
         }
     }
@@ -772,6 +784,10 @@ impl DbInner {
 /// [`Algo::async_abort`] for the currently-armed transaction id, so peer
 /// transactions see the abort marker quickly instead of waiting for the
 /// lock-lease timeout.
+///
+/// Whether the armed id actually needs an abort is [`Algo::async_abort`]'s
+/// decision, not the guard's: an attempt that never took a logged identity is
+/// invisible to peers and must not be given an aborted object it never had.
 struct TransactionAbortGuard<'a> {
     algo: &'a Algo,
     armed: Option<TxId>,

@@ -7,6 +7,83 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-051: Inline latest values in leaf entries
+
+[ADR-051](../adr/051-inline-latest-values.md) makes a small committed value part
+of the leaf entry that names its writer, so a latest read can be served from the
+node alone, and an eligible single read-write transaction commits in one
+conditional leaf CAS with no lock, no transaction object, and no write-back.
+
+### Setup
+
+- base: `d2878227` (the ADR commit, code-identical to the pre-implementation
+  tree); target: this worktree
+- ratio = target / base (throughput >1 good; latency/ops/cost <1 good)
+- inline budgets at their defaults: 1 KiB per value, 64 KiB aggregate per leaf
+- the full `compare-refs.sh` harness was not used; these are the three
+  benchmarks named in the plan, run locally on the memory and simulated
+  backends: `autoresearch --count 3`, `cargo bench -p glassdb`, and `mixbench
+  --duration 3s --max-duration 20s`
+
+### Deterministic efficiency (autoresearch, most trustworthy)
+
+- autoresearch-score (cost/tx geomean, lower=better): `122.31` to `98.17`
+  (ratio `0.803`) => better
+- cost/tx[singleRMW]: `182.4` to `70.6` (ratio `0.387`) => better
+- cost/tx[batchWrite100]: `178.9` to `151.6` (ratio `0.847`) => better
+- cost/tx[multiRMW10]: `254.9` to `258.9` (ratio `1.016`) => ~same
+- cost/tx[batchRead10] and cost/tx[readRepeat]: `57.4` unchanged => ~same
+- ns/tx geomean: `79690` to `61259` (ratio `0.769`); cpu ns/tx `98931` to
+  `69309` (ratio `0.700`); allocs/tx `1024.0` to `824.2` => better
+- ns/tx[batchWrite100] rises from `6.21 ms` to `7.96 ms` (ratio `1.283`): the
+  cost of encoding and CAS-ing leaves that now carry value bytes
+
+### Microbenchmarks (criterion, mean, sample_size 10)
+
+- single_rmw backend writes/op: `2.47` (memory), `2.80` (gcs), `2.90` (s3) all
+  to `1.03`; reads/op stays `0.03`. This is the direct measurement of the
+  one-CAS commit: three writes become one
+- single_rmw: memory `26.4 µs` to `10.9 µs` (`0.41`), gcs `2.33 ms` to
+  `1.20 ms` (`0.51`), s3 `2.30 ms` to `1.19 ms` (`0.52`) => better
+- multi_read_10: memory `20.2 µs` to `14.2 µs` (`0.70`) => better; gcs and s3
+  unchanged within noise
+- multi_rmw_10: gcs `0.98`, s3 `0.97`, memory `1.09` => ~same
+- write_100 and shared_read are within their own (wide) noise bands: write_100
+  memory `16.8 ms` to `22.5 ms` against a base 95% interval of `13.2–20.5 ms`
+
+The read short-circuit does not move the read-only workloads here because their
+transaction objects are already served by the decoded cache
+([ADR-036](../adr/036-decoded-object-cache-with-bounded-freshness.md)) in steady
+state; it converts an already-cheap cached read into no read at all, which shows
+up as CPU and allocation savings rather than fewer backend operations. The
+saved backend read matters on a cold or evicted cache.
+
+### Contention sweep (mixbench, short cells, indicative)
+
+- zero transaction failures in all four cells
+- lo/shared aggregate backend operations/tx: `0.367` to `0.238` (`0.65`);
+  retries/tx `0.0109` to `0.0073` => better
+- hi/shared aggregate backend operations/tx: `0.618` to `0.567` (`0.92`);
+  retries/tx `0.310` to `0.277` => better
+- hi/per-shape mix-tps[rwSingle]: `3.00` to `5.82` with p50 `217 ms` to
+  `113 ms` => better
+- lo/shared mix-tps[rwSingle]: `4.62` to `2.24` => WORSE, while its read shapes
+  commit 14–30% more transactions in the same window
+
+The lo/shared write regression is not a protocol regression: that cell is
+saturated (p50 above one second for a single-key RMW on both sides), performs
+35% fewer backend operations per transaction, and retries less; the read shapes
+absorb the freed capacity. Short saturated cells redistribute throughput between
+concurrently running shapes, so these cells are indicative only.
+
+### Budgets
+
+The 1 KiB / 64 KiB defaults are the tunable outcome, not a measured optimum.
+The trade-off they price is visible above: every leaf CAS carries the inline
+bytes of its whole leaf, which costs encode/CAS work on write-heavy multi-key
+workloads (`batchWrite100`), and buys the transaction-object read plus, for a
+single read-write transaction, two of its three object writes.
+
 ## ADR-044: CAS-fenced structural gate
 
 [ADR-044](../adr/044-cas-fenced-structural-gate.md) removes shared structure

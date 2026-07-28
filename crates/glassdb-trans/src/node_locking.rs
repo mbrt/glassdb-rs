@@ -8,11 +8,13 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, KeyRef, LeafRef, TxId};
-use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
+use glassdb_storage::{
+    CurrentState, InlinePolicy, LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus,
+};
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::resolver::Resolver;
+use crate::resolver::{ResolvedValue, Resolver};
 use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -20,8 +22,17 @@ use crate::wound_wait::{Reclaim, try_reclaim};
 /// liveness classification.
 pub(crate) struct LockResolution {
     pub(crate) writer: Option<TxId>,
-    pub(crate) deleted: bool,
+    /// The effective writer's value, resolved as far as the round's evidence
+    /// allows. Publishers reuse it to republish the state without re-reading.
+    pub(crate) value: ResolvedValue,
     pub(crate) pending: Vec<TxId>,
+}
+
+impl LockResolution {
+    /// Reports whether the effective writer deleted the key.
+    pub(crate) fn deleted(&self) -> bool {
+        matches!(self.value, ResolvedValue::Tombstone)
+    }
 }
 
 /// Resolves an entry's writer and classifies the foreign holders that remain
@@ -37,7 +48,7 @@ pub(crate) async fn resolve_entry_locks_at(
     let Some(entry) = entry else {
         return Ok(LockResolution {
             writer: None,
-            deleted: false,
+            value: ResolvedValue::Unresolved,
             pending: Vec::new(),
         });
     };
@@ -49,22 +60,32 @@ pub(crate) async fn resolve_entry_locks_at(
     }
     let own_exclusive = exclusive
         && own_lock_holder.is_some_and(|id| entry.locked_by.iter().any(|holder| holder == id));
-    let writer = if own_exclusive {
-        entry.current_writer.clone()
+    let (writer, mut value) = if own_exclusive {
+        // Our own exclusive hold means no foreign holder can be ahead of the
+        // recorded state, so the entry alone answers.
+        (
+            entry.current.writer().cloned(),
+            ResolvedValue::from_current(&entry.current),
+        )
     } else {
-        resolver
+        let res = resolver
             .resolve_writer_at(key, Some(entry), requirement)
-            .await?
-            .writer
+            .await?;
+        (res.writer, res.value)
     };
-    let deleted = match &writer {
-        None => false,
-        Some(writer) if entry.current_writer.as_ref() == Some(writer) => entry.deleted,
-        Some(writer) => {
-            let value = monitor.committed_value_at(key, writer, requirement).await?;
-            value.status == TxCommitStatus::Ok && !value.value.not_written && value.value.deleted
+    // A help-forwarded writer is only described by its own transaction object.
+    if let Some(writer) = &writer
+        && value == ResolvedValue::Unresolved
+    {
+        let cv = monitor.committed_value_at(key, writer, requirement).await?;
+        if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
+            value = if cv.value.deleted {
+                ResolvedValue::Tombstone
+            } else {
+                ResolvedValue::Inline(cv.value.value)
+            };
         }
-    };
+    }
     let mut pending = Vec::new();
     for holder in &entry.locked_by {
         if Some(holder) == own_lock_holder {
@@ -79,9 +100,59 @@ pub(crate) async fn resolve_entry_locks_at(
     }
     Ok(LockResolution {
         writer,
-        deleted,
+        value,
         pending,
     })
+}
+
+/// The inline budgets (ADR-051) applied against one leaf as currently staged.
+#[derive(Clone, Copy)]
+pub(crate) struct InlineAdmission<'a> {
+    policy: InlinePolicy,
+    leaf: &'a BTreeMap<Vec<u8>, ShardEntry>,
+}
+
+impl<'a> InlineAdmission<'a> {
+    pub(crate) fn new(policy: InlinePolicy, leaf: &'a BTreeMap<Vec<u8>, ShardEntry>) -> Self {
+        InlineAdmission { policy, leaf }
+    }
+
+    /// Reports whether `value` may be published inline for `key`.
+    pub(crate) fn admits(&self, key: &[u8], value: &[u8]) -> bool {
+        self.policy.admits(self.leaf.values(), key, value.len())
+    }
+}
+
+/// The current state to publish for a resolved effective writer.
+///
+/// A resolution that merely confirms the state already recorded returns it
+/// unchanged: rewriting it as `External` would drop authoritative inline bytes
+/// that a logless writer has no transaction object to restore them from
+/// (ADR-051). Help-forwarding a different writer installs the state matching
+/// *that* writer, never the predecessor's bytes — inline when the resolution
+/// carries the holder's exact committed value and the budgets admit it.
+pub(crate) fn resolved_current(
+    key: &[u8],
+    entry: Option<&ShardEntry>,
+    res: &LockResolution,
+    admission: &InlineAdmission<'_>,
+) -> CurrentState {
+    let Some(writer) = res.writer.clone() else {
+        return CurrentState::Absent;
+    };
+    if let Some(entry) = entry
+        && entry.current.writer() == Some(&writer)
+    {
+        return entry.current.clone();
+    }
+    match &res.value {
+        ResolvedValue::Tombstone => CurrentState::Tombstone { writer },
+        ResolvedValue::Inline(value) if admission.admits(key, value) => CurrentState::Inline {
+            writer,
+            value: value.clone(),
+        },
+        _ => CurrentState::External { writer },
+    }
 }
 
 /// Resolves entry lock state using the coordination round's evidence bound.
@@ -316,6 +387,7 @@ impl ShardResolver for StructuralGateResolver {
             &self.id,
             staged,
             ctx.requirement,
+            ctx.inline,
         )
         .await?
         {
@@ -372,7 +444,9 @@ pub(crate) async fn quiesce_entries(
     id: &TxId,
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
     requirement: Requirement,
+    inline: InlinePolicy,
 ) -> Result<QuiescedEntries, TransError> {
+    let admission = InlineAdmission::new(inline, entries);
     let mut resolved_entries = BTreeMap::new();
     for (key, entry) in entries {
         let resolved = resolve_entry_locks_at(
@@ -392,14 +466,13 @@ pub(crate) async fn quiesce_entries(
                 return Ok(QuiescedEntries::Wait(holder.clone()));
             }
         }
-        let mut entry = entry.clone();
-        entry.current_writer = resolved.writer;
-        entry.deleted = resolved.deleted;
-        entry.locked_by.retain(|holder| holder == id);
-        if entry.locked_by.is_empty() {
-            entry.lock_type = LockType::None;
+        let mut quiesced = entry.clone();
+        quiesced.current = resolved_current(key, Some(entry), &resolved, &admission);
+        quiesced.locked_by.retain(|holder| holder == id);
+        if quiesced.locked_by.is_empty() {
+            quiesced.lock_type = LockType::None;
         }
-        resolved_entries.insert(key.clone(), entry);
+        resolved_entries.insert(key.clone(), quiesced);
     }
     Ok(QuiescedEntries::Ready(resolved_entries))
 }

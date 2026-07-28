@@ -223,13 +223,39 @@ pub struct ShardEntry {
     /// Transactions holding the lock (more than one only for read locks).
     #[prost(bytes = "vec", repeated, tag = "3")]
     pub locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
-    /// Transaction object holding the committed value (the MVCC pointer); empty
-    /// if the key has no committed value yet.
-    #[prost(bytes = "vec", tag = "4")]
-    pub current_writer: ::prost::alloc::vec::Vec<u8>,
-    /// Tombstone flag.
-    #[prost(bool, tag = "5")]
-    pub deleted: bool,
+    /// The key's current committed value state, separate from the lock state.
+    /// Absent when the key has no committed value yet.
+    #[prost(message, optional, tag = "4")]
+    pub current: ::core::option::Option<CurrentState>,
+}
+/// A key's committed current value (ADR-051): its optimistic-validation writer
+/// token plus a tag saying where the value itself lives. `state` is mandatory; a
+/// `CurrentState` without one is corrupt.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CurrentState {
+    /// The transaction that produced this version. Always set. It is not
+    /// universally a pointer to a transaction object: a logless commit inlines
+    /// its value without ever writing one.
+    #[prost(bytes = "vec", tag = "1")]
+    pub writer: ::prost::alloc::vec::Vec<u8>,
+    #[prost(oneof = "current_state::State", tags = "2, 3, 4")]
+    pub state: ::core::option::Option<current_state::State>,
+}
+/// Nested message and enum types in `CurrentState`.
+pub mod current_state {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum State {
+        /// The value lives in the writer's transaction object. Always true.
+        #[prost(bool, tag = "2")]
+        External(bool),
+        /// The value is authoritative here. Distinguishable from an unset
+        /// `state` even when empty.
+        #[prost(bytes, tag = "3")]
+        Inline(::prost::alloc::vec::Vec<u8>),
+        /// The writer deleted the key. Always true; carries no payload.
+        #[prost(bool, tag = "4")]
+        Tombstone(bool),
+    }
 }
 /// A B-link tree node: the unit of the dynamic, range-partitioned coordination
 /// directory (ADR-031). It is either a leaf (the per-key coordination entries of

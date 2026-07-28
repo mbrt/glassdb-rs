@@ -2,9 +2,11 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented (`glassdb-storage::CurrentState` + `InlinePolicy`, the
+resolver's inline read short-circuit, and the transaction engine's direct-commit
+resolver).
 
-On acceptance, this supersedes:
+This supersedes:
 
 - [ADR-017](017-shard-object.md)'s `current_writer` / `deleted` current-value
   representation;
@@ -15,7 +17,7 @@ On acceptance, this supersedes:
   read-write path when the new value is eligible for inlining. ADR-027 remains
   the fallback for values that are not eligible.
 
-On acceptance, this also refines
+This also refines
 [ADR-022](022-garbage-collection-mark-sweep.md)'s transaction-object liveness
 model and extends [ADR-028](028-shard-mutation-coordinator.md)'s shard-mutation
 coordinator. Existing transaction objects retain their current reachability

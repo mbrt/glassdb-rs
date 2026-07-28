@@ -442,8 +442,7 @@ impl Gc {
                 for (raw_key, kind) in &group.keys {
                     let referenced = match kind {
                         CheckKind::Writer => {
-                            leaf.lookup(raw_key).and_then(|e| e.current_writer.as_ref())
-                                == Some(tid)
+                            leaf.lookup(raw_key).and_then(|e| e.current.writer()) == Some(tid)
                         }
                         CheckKind::Holder => leaf
                             .lookup(raw_key)
@@ -551,8 +550,8 @@ mod tests {
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{CollectionAddress, CollectionId};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, Directory, LockType, Node, Shard,
-        ShardEntry, Timeline, TxCollectionChange, TxCollectionOp, TxWrite,
+        CachedStore, CollectionRecord, CollectionStore, CurrentState, Directory, LockType, Node,
+        Shard, ShardEntry, Timeline, TxCollectionChange, TxCollectionOp, TxWrite,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -723,21 +722,18 @@ mod tests {
 
     fn writer_entry(key: &[u8], writer: &TxId) -> ShardEntry {
         ShardEntry {
-            key: key.to_vec(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: Some(writer.clone()),
-            deleted: false,
+            current: CurrentState::External {
+                writer: writer.clone(),
+            },
+            ..ShardEntry::new(key)
         }
     }
 
     fn locked_entry(key: &[u8], holder: &TxId) -> ShardEntry {
         ShardEntry {
-            key: key.to_vec(),
             lock_type: LockType::Write,
             locked_by: vec![holder.clone()],
-            current_writer: None,
-            deleted: false,
+            ..ShardEntry::new(key)
         }
     }
 
@@ -779,6 +775,41 @@ mod tests {
         ctx.gc.run_once(&mut scan).await;
 
         assert!(is_gone(&ctx.tl, &old).await);
+    }
+
+    // ADR-051: the successor that superseded a committed writer may be a logless
+    // commit with no transaction object of its own. Liveness is decided by the
+    // entry's writer id, not by that successor's existence, so the predecessor is
+    // still swept.
+    #[tokio::test(start_paused = true)]
+    async fn committed_superseded_by_a_logless_writer_is_collected() {
+        let ctx = new_ctx().await;
+        let (old, logless) = (tx(1), tx(2));
+        ctx.tl
+            .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
+            .await
+            .unwrap();
+        store_entry(
+            &ctx,
+            b"k",
+            ShardEntry {
+                current: CurrentState::Inline {
+                    writer: logless.clone(),
+                    value: Arc::from(&b"v2"[..]),
+                },
+                ..ShardEntry::new(b"k")
+            },
+        )
+        .await;
+        let mut scan = test_scan(vec![paths::transaction_shard(&old)], None);
+
+        ctx.gc.run_once(&mut scan).await;
+
+        assert!(is_gone(&ctx.tl, &old).await);
+        assert!(
+            is_gone(&ctx.tl, &logless).await,
+            "the logless successor never had an object to collect"
+        );
     }
 
     #[tokio::test(start_paused = true)]

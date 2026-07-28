@@ -11,16 +11,26 @@
 //! state disambiguates the outcome, so the engine recovers most in-doubt
 //! outcomes by reading that object back:
 //!
-//! - The single read-write fast path (ADR-027) inserts itself into the version
-//!   chain with one shard CAS that installs a **write lock**
-//!   (`locked_by = [txid]`), issued in parallel with its committed `_t/` object
-//!   (a later asynchronous write-back converts the lock to a `current_writer`
-//!   pointer). A lost ack on that lock CAS is resolved by reloading the shard: if
-//!   our lock (or a help-forwarded `current_writer == txid`) is present the write
-//!   landed (commit), if the entry is unchanged the write did not land (retry the
-//!   idempotent CAS). Only a *fast follow-on writer* that moves the entry before
-//!   we can read it back is irreducibly in-doubt — surfaced as [`Error::InDoubt`]
-//!   rather than risking a double-apply on a renewed re-run.
+//! - The logless single read-write path (ADR-051) commits an eligible small
+//!   overwrite with one leaf CAS that publishes the value itself. A lost ack is
+//!   resolved by reloading the leaf: our exact inline state proves the commit, an
+//!   unchanged entry proves it did not land (retry the idempotent CAS).
+//! - The single read-write fast path (ADR-027, the fallback for a value the
+//!   inline budgets reject) inserts itself into the version chain with one shard
+//!   CAS that installs a **write lock** (`locked_by = [txid]`), issued in
+//!   parallel with its committed `_t/` object (a later asynchronous write-back
+//!   converts the lock to a `current_writer` pointer). A lost ack on that lock
+//!   CAS is resolved the same way: if our lock (or a help-forwarded
+//!   `current_writer == txid`) is present the write landed.
+//!
+//!   For both, an uncertain CAS is irreducibly in-doubt exactly when the
+//!   read-back cannot prove that state either way — surfaced as
+//!   [`Error::InDoubt`] rather than risking a double-apply on a renewed re-run.
+//!   A *fast follow-on writer* that moves the entry first is the reachable case
+//!   and is covered below; anything else that blocks the re-fold from proving it
+//!   (a structural gate or a collection-delete fence arriving in the same
+//!   window) is classified the same way, pinned by unit tests next to the
+//!   resolvers because no interleaving reproduces it reliably.
 //! - The logged path's commit point (the `_t/` flip) and its leaf lock CAS
 //!   (a node `_n/` or the root `_r`) are recovered in place the same way (they
 //!   are idempotent under their own preconditions).
@@ -154,8 +164,16 @@ fn write_int(n: i64) -> Vec<u8> {
 
 fn read_int(b: &[u8]) -> i64 {
     let mut arr = [0u8; 8];
-    arr.copy_from_slice(b);
+    arr.copy_from_slice(&b[..8]);
     i64::from_le_bytes(arr)
+}
+
+/// Encodes `n` padded past the inline per-value budget (ADR-051), so its commit
+/// takes ADR-027's logged single read-write path rather than the logless one.
+fn write_padded_int(n: i64) -> Vec<u8> {
+    let mut v = write_int(n);
+    v.resize(4096, 0);
+    v
 }
 
 async fn seed(coll: &Collection, key: &[u8], v: i64) {
@@ -171,10 +189,29 @@ async fn settle_writebacks() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
-/// A single-key read-modify-write over an existing key: its commit takes the
-/// single read-write fast path (ADR-027), which installs a write lock and its
-/// committed object in parallel, then writes back the pointer.
+/// A single-key read-modify-write over an existing key whose small value the
+/// inline budgets admit: its commit takes the logless one-CAS path (ADR-051).
 async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
+    increment_with(db, coll, key, write_int).await
+}
+
+/// The same read-modify-write with a value the inline budgets reject, so its
+/// commit takes ADR-027's logged single read-write path: a write lock and its
+/// committed object in parallel, then a write-back that publishes the pointer.
+async fn increment_padded(
+    db: &Database,
+    coll: &Collection,
+    key: &'static [u8],
+) -> Result<(), Error> {
+    increment_with(db, coll, key, write_padded_int).await
+}
+
+async fn increment_with(
+    db: &Database,
+    coll: &Collection,
+    key: &'static [u8],
+    encode: fn(i64) -> Vec<u8>,
+) -> Result<(), Error> {
     // `coll` is already a reference, so `async move` copies it (references are
     // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
     db.tx(|tx| async move {
@@ -183,17 +220,17 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
             Ok(None) => 0,
             Err(e) => return Err(e),
         };
-        tx.write(coll, key, &write_int(cur + 1))
+        tx.write(coll, key, &encode(cur + 1))
     })
     .await
 }
 
-/// The single read-write fast path: a lost ack on the lock CAS is *resolved to
-/// committed* by reading the shard back — the entry is now locked by this
-/// transaction (and its committed object exists), so the write demonstrably
-/// landed. The engine returns success (not in-doubt) and the value is applied
-/// exactly once. This is the v2 improvement over the old logless path, whose
-/// value write had no durable coordination state to disambiguate a lost ack.
+/// The logless one-CAS path (ADR-051): a lost ack on the commit CAS is
+/// *resolved to committed* by reading the leaf back — the entry now holds this
+/// transaction's exact inline value, so the write demonstrably landed. The
+/// engine returns success (not in-doubt) and the value is applied exactly once.
+/// Unlike v1's logless path, the published state itself is the disambiguating
+/// coordination evidence.
 #[tokio::test(start_paused = true)]
 async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -211,27 +248,52 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
 
     settle_writebacks().await;
 
-    // Trap the fast path's lock CAS (the first `write_if` on the coordination
-    // leaf — the root `/_r` here, which installs `locked_by`): let it land, then
-    // lose the ack.
+    // Trap the commit CAS (the first `write_if` on the coordination leaf — the
+    // root `/_r` here): let it land, then lose the ack.
     let _ = arm_after(&backend, lost_ack_after(shard_cas));
 
     increment(&db, &coll, b"k")
         .await
-        .expect("a landed-but-lost-ack lock CAS resolves to committed via read-back");
+        .expect("a landed-but-lost-ack commit CAS resolves to committed via read-back");
 
     // The write landed exactly once: 11, never 12 (double-apply) nor unchanged.
     let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
     assert_eq!(got, 11, "value must be applied exactly once");
 }
 
-/// The single read-write fast path's one irreducible in-doubt (retained under
-/// ADR-027): our lock CAS lands but loses its ack *and*, in the window before we
-/// read the shard back, a **genuine competing transaction** takes the key and
-/// moves the entry past us — help-forwarding our committed value into the chain
-/// and then overwriting it. The read-back shows another writer, so the engine can
-/// no longer tell whether our lock landed first (and was help-forwarded away) or
-/// never landed; it surfaces [`Error::InDoubt`] rather than risking a
+/// The same recovery for ADR-027's logged fallback, which a value over the
+/// inline budget still takes: the lost-ack CAS installed our write lock, so
+/// reading the leaf back proves the commit through the lock rather than through
+/// a published value.
+#[tokio::test(start_paused = true)]
+async fn logged_single_rw_lost_ack_on_lock_cas_resolves_committed() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = HookBackend::new(mem);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
+    seed(&coll, b"k", 10).await;
+    settle_writebacks().await;
+
+    let _ = arm_after(&backend, lost_ack_after(shard_cas));
+
+    increment_padded(&db, &coll, b"k")
+        .await
+        .expect("a landed-but-lost-ack lock CAS resolves to committed via read-back");
+
+    let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
+    assert_eq!(got, 11, "value must be applied exactly once");
+}
+
+/// The single read-write paths' one irreducible in-doubt (ADR-027, retained by
+/// ADR-051): our commit CAS lands but loses its ack *and*, in the window before
+/// we read the leaf back, a **genuine competing transaction** takes the key and
+/// moves the entry past us. The read-back shows another writer, so the engine can
+/// no longer tell whether our write landed first and was then superseded, or
+/// never landed at all; it surfaces [`Error::InDoubt`] rather than risking a
 /// double-apply.
 #[tokio::test(start_paused = true)]
 async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
@@ -282,12 +344,12 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     assert_eq!(read_int(&coll.read(b"k").await.unwrap().unwrap()), 99);
 }
 
-/// The single read-write fast path: an in-doubt outcome on the lock CAS that did
-/// *not* land (e.g. the backend exhausted its retry budget on transient errors)
-/// is recovered transparently. Reading the shard back shows the entry unchanged
-/// and still committable, so the engine re-issues the idempotent lock CAS; the
-/// one-shot fault is spent, the retry lands, and the value commits exactly once —
-/// no `Error::InDoubt`, no double-apply.
+/// A single read-write in-doubt outcome on a commit CAS that did *not* land
+/// (e.g. the backend exhausted its retry budget on transient errors) is recovered
+/// transparently. Reading the leaf back shows the entry unchanged and still
+/// committable, so the engine re-issues the idempotent CAS; the one-shot fault is
+/// spent, the retry lands, and the value commits exactly once — no
+/// `Error::InDoubt`, no double-apply.
 #[tokio::test(start_paused = true)]
 async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -304,8 +366,8 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 
     settle_writebacks().await;
 
-    // Trap the fast path's lock CAS (the first `write_if` on the leaf `_r`):
-    // report it as in-doubt *without* applying it, modelling a write that never landed. The
+    // Trap the commit CAS (the first `write_if` on the leaf `_r`): report it as
+    // in-doubt *without* applying it, modelling a write that never landed. The
     // hook is one-shot, so the engine's idempotent re-issue lands.
     arm_before(&backend, fail_before(shard_cas, || not_applied("write_if")));
 
@@ -422,9 +484,9 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 1);
 }
 
-/// A *clean* precondition (no lost ack) on the fast path's lock CAS is a genuine
-/// lost race, and the engine still resolves it transparently: reading the shard
-/// back shows the entry unchanged and committable, so the lock CAS is re-issued
+/// A *clean* precondition (no lost ack) on a single read-write commit CAS is a
+/// genuine lost race, and the engine still resolves it transparently: reading the
+/// leaf back shows the entry unchanged and committable, so the CAS is re-issued
 /// and commits, applying the increment exactly once. This guards against
 /// over-eagerly treating every precondition as in-doubt, which would break
 /// liveness (and the fault-free exact invariant) under normal contention.
@@ -442,9 +504,9 @@ async fn clean_conflict_on_single_rw_still_commits() {
 
     settle_writebacks().await;
 
-    // Inject one clean precondition on the fast path's lock CAS, without applying
-    // it: a genuine lost race that never landed. The fast path should reload and
-    // retry, and the second attempt (hook consumed) commits.
+    // Inject one clean precondition on the commit CAS, without applying it: a
+    // genuine lost race that never landed. The fast path should reload and retry,
+    // and the second attempt (hook consumed) commits.
     arm_before(
         &backend,
         fail_before(shard_cas, || BackendError::Precondition),

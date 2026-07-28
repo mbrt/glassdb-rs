@@ -101,11 +101,29 @@ message ShardEntry {
     Lock.LockType lock_type = 2;
     // Transactions holding the lock (more than one only for read locks).
     repeated bytes locked_by = 3;
-    // Transaction object holding the committed value (the MVCC pointer); empty
-    // if the key has no committed value yet.
-    bytes current_writer = 4;
-    // Tombstone flag.
-    bool deleted = 5;
+    // The key's current committed value state, separate from the lock state.
+    // Absent when the key has no committed value yet.
+    CurrentState current = 4;
+}
+
+// A key's committed current value (ADR-051): its optimistic-validation writer
+// token plus a tag saying where the value itself lives. `state` is mandatory; a
+// `CurrentState` without one is corrupt.
+message CurrentState {
+    // The transaction that produced this version. Always set. It is not
+    // universally a pointer to a transaction object: a logless commit inlines
+    // its value without ever writing one.
+    bytes writer = 1;
+
+    oneof state {
+        // The value lives in the writer's transaction object. Always true.
+        bool external = 2;
+        // The value is authoritative here. Distinguishable from an unset
+        // `state` even when empty.
+        bytes inline = 3;
+        // The writer deleted the key. Always true; carries no payload.
+        bool tombstone = 4;
+    }
 }
 
 // A B-link tree node: the unit of the dynamic, range-partitioned coordination

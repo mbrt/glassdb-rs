@@ -19,11 +19,12 @@
 //! resolution.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
-    Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore, StorageError,
-    TxCommitStatus,
+    CurrentState, Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore,
+    StorageError, TxCommitStatus,
 };
 
 use crate::algo::{LeafCoverage, ScanMutation, ScanRange};
@@ -40,6 +41,48 @@ pub struct ScanResult {
     pub frontier: Option<Vec<u8>>,
 }
 
+/// What is known about the effective writer's value alongside its identity.
+///
+/// A leaf entry that names the effective writer is authoritative about its own
+/// value (ADR-051), so resolution can answer "what did this writer write?"
+/// without touching a transaction object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum ResolvedValue {
+    /// The leaf names a writer behind the effective one — a help-forwarded
+    /// committed holder — so only that holder's transaction object says what it
+    /// wrote. A predecessor's bytes are never its value.
+    #[default]
+    Unresolved,
+    /// The effective writer's value lives in its transaction object.
+    External,
+    /// The effective writer's authoritative value bytes.
+    Inline(Arc<[u8]>),
+    /// The effective writer deleted the key.
+    Tombstone,
+}
+
+impl ResolvedValue {
+    /// What `current` proves about its own writer's value.
+    pub(crate) fn from_current(current: &CurrentState) -> Self {
+        match current {
+            CurrentState::Absent => ResolvedValue::Unresolved,
+            CurrentState::External { .. } => ResolvedValue::External,
+            CurrentState::Inline { value, .. } => ResolvedValue::Inline(value.clone()),
+            CurrentState::Tombstone { .. } => ResolvedValue::Tombstone,
+        }
+    }
+
+    /// Reports whether the key exists, or `None` when the value is unresolved
+    /// and only the writer's transaction object can say.
+    pub(crate) fn exists(&self) -> Option<bool> {
+        match self {
+            ResolvedValue::Unresolved => None,
+            ResolvedValue::External | ResolvedValue::Inline(_) => Some(true),
+            ResolvedValue::Tombstone => Some(false),
+        }
+    }
+}
+
 /// The effective writer resolved using transaction-state evidence satisfying a
 /// requested freshness requirement.
 #[derive(Debug, Clone)]
@@ -47,6 +90,8 @@ pub(crate) struct WriterResolution {
     /// The effective committed writer holding the key's value (the MVCC
     /// pointer), or `None` if the key has no committed value.
     pub writer: Option<TxId>,
+    /// What the leaf proved about that writer's value.
+    pub value: ResolvedValue,
     pub cache_hit: bool,
 }
 
@@ -54,6 +99,7 @@ impl Default for WriterResolution {
     fn default() -> Self {
         Self {
             writer: None,
+            value: ResolvedValue::Unresolved,
             cache_hit: true,
         }
     }
@@ -437,7 +483,8 @@ impl Resolver {
             return Ok(WriterResolution::default());
         };
         let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
-        let mut writer = entry.current_writer.clone();
+        let mut writer = entry.current.writer().cloned();
+        let mut value = ResolvedValue::from_current(&entry.current);
         let mut cache_hit = true;
         if exclusive && entry.locked_by.len() > 1 {
             return Err(TransError::other(
@@ -458,10 +505,17 @@ impl Resolver {
                 cache_hit &= cv.cache_hit;
                 if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
                     writer = Some(holder.clone());
+                    // The leaf still records the predecessor, so its state says
+                    // nothing about the holder we just moved ahead to.
+                    value = ResolvedValue::Unresolved;
                 }
             }
         }
-        Ok(WriterResolution { writer, cache_hit })
+        Ok(WriterResolution {
+            writer,
+            value,
+            cache_hit,
+        })
     }
 
     /// Reports whether `entry` names a live key at `requirement`.
@@ -472,21 +526,26 @@ impl Resolver {
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let writer = if own_lock_holder.is_some_and(|id| {
+        let resolved = if own_lock_holder.is_some_and(|id| {
             matches!(entry.lock_type, LockType::Write | LockType::Create)
                 && entry.locked_by.iter().any(|holder| holder == id)
         }) {
-            entry.current_writer.clone()
+            // Our own exclusive hold means no foreign holder can be ahead of
+            // the recorded state, so the entry alone answers.
+            WriterResolution {
+                writer: entry.current.writer().cloned(),
+                value: ResolvedValue::from_current(&entry.current),
+                cache_hit: true,
+            }
         } else {
             self.resolve_writer_at(key, Some(entry), requirement)
                 .await?
-                .writer
         };
-        let Some(writer) = writer else {
+        let Some(writer) = resolved.writer else {
             return Ok(false);
         };
-        if entry.current_writer.as_ref() == Some(&writer) {
-            return Ok(!entry.deleted);
+        if let Some(exists) = resolved.value.exists() {
+            return Ok(exists);
         }
         let value = self
             .tmon
@@ -506,13 +565,16 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_concurr::Background;
+    use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, paths};
-    use glassdb_storage::{CachedStore, Node, Shard, TLogger, Timeline};
+    use glassdb_storage::{CachedStore, CurrentState, Node, Shard, TLogger, Timeline};
+
+    use crate::reader::Reader;
 
     const DB: &str = "db";
     const COLL: &str = "db/_c/0000000000000000000000";
@@ -596,20 +658,82 @@ mod tests {
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
+        let current = if deleted {
+            CurrentState::Tombstone {
+                writer: writer.clone(),
+            }
+        } else {
+            CurrentState::External {
+                writer: writer.clone(),
+            }
+        };
         entries.insert(
             key.to_vec(),
             ShardEntry {
-                key: key.to_vec(),
-                lock_type: LockType::None,
-                locked_by: Vec::new(),
-                current_writer: Some(writer.clone()),
-                deleted,
+                current,
+                ..ShardEntry::new(key)
             },
         );
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
                 .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation,)
+                .await
+                .unwrap()
+        );
+    }
+
+    // Installs an inline committed value for `key` directly in the leaf (no lock
+    // holders): the ADR-051 state a reader must serve without any other object.
+    async fn seed_inline(store: &TestStore, key: &[u8], writer: &TxId, value: &[u8]) {
+        seed_entry(
+            store,
+            key,
+            ShardEntry {
+                current: CurrentState::Inline {
+                    writer: writer.clone(),
+                    value: Arc::from(value),
+                },
+                ..ShardEntry::new(key)
+            },
+        )
+        .await;
+    }
+
+    // Adds `holder` as the entry's exclusive lock holder, keeping whatever
+    // current value the entry already records.
+    async fn seed_hold(store: &TestStore, key: &[u8], holder: &TxId) {
+        let existing = store
+            .load_leaf(
+                &paths::tree_root(COLL),
+                Requirement::AtLeast(store.timeline.now()),
+            )
+            .await
+            .unwrap();
+        let mut entry = existing.entries.lookup(key).cloned().unwrap();
+        entry.lock_type = LockType::Write;
+        entry.locked_by = vec![holder.clone()];
+        seed_entry(store, key, entry).await;
+    }
+
+    // Replaces `key`'s entry in the collection's leaf `_r` with `entry`.
+    async fn seed_entry(store: &TestStore, key: &[u8], entry: ShardEntry) {
+        let path = paths::tree_root(COLL);
+        let loaded = store
+            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
+            .await
+            .unwrap();
+        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+            .entries
+            .entries()
+            .cloned()
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        entries.insert(key.to_vec(), entry);
+        let new_shard = Shard::from_entries(entries.into_values());
+        assert!(
+            store
+                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation)
                 .await
                 .unwrap()
         );
@@ -649,11 +773,9 @@ mod tests {
         entries.insert(
             key.to_vec(),
             ShardEntry {
-                key: key.to_vec(),
                 lock_type: LockType::Write,
                 locked_by: vec![holder.clone()],
-                current_writer: None,
-                deleted: false,
+                ..ShardEntry::new(key)
             },
         );
         let new_shard = Shard::from_entries(entries.into_values());
@@ -663,6 +785,14 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    fn count_tx_reads(log: &OpLog) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| (r.op == "read" || r.op == "read_if_modified") && r.path.contains("/_t/"))
+            .count()
     }
 
     fn count_shard_reads(log: &OpLog) -> usize {
@@ -852,6 +982,110 @@ mod tests {
             effective_writer(&resolver, &key_ref(b"dead-key")).await,
             Some(tomb),
             "a help-forwarded tombstone still resolves its writer"
+        );
+    }
+
+    // ADR-051: an inline value in the leaf is the writer's own authoritative
+    // evidence, so the read serves it without opening a transaction object.
+    #[tokio::test]
+    async fn inline_value_reads_without_a_transaction_object() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+
+        let seed_store = store_over(backend.clone()).await;
+        let writer = TxId::with_priority(1, b"inline");
+        seed_inline(&seed_store, b"k", &writer, b"hello").await;
+
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        log.lock().unwrap().clear();
+
+        let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        let value = out.value.expect("inline value is present");
+        assert_eq!(value.value.as_ref(), b"hello");
+        assert_eq!(value.version.writer, writer);
+        assert_eq!(out.last_writer, Some(writer));
+        assert_eq!(
+            count_tx_reads(&log),
+            0,
+            "an inline value needs no transaction object"
+        );
+    }
+
+    // A tombstone is equally authoritative: absence is decided from the leaf.
+    #[tokio::test]
+    async fn tombstone_reads_absent_without_a_transaction_object() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+
+        let seed_store = store_over(backend.clone()).await;
+        let writer = TxId::with_priority(1, b"tomb");
+        seed_writer(&seed_store, b"k", &writer, true).await;
+
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        log.lock().unwrap().clear();
+
+        let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        assert!(out.value.is_none());
+        assert_eq!(out.last_writer, Some(writer));
+        assert_eq!(
+            count_tx_reads(&log),
+            0,
+            "a tombstone needs no transaction object"
+        );
+    }
+
+    // A committed exclusive holder is ahead of the recorded inline predecessor,
+    // so the predecessor's bytes must never be served as the holder's value.
+    #[tokio::test]
+    async fn help_forwarded_holder_over_an_inline_predecessor_serves_its_own_value() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed_store = store_over(backend.clone()).await;
+        let (resolver, mon, timeline, _bg) = resolver_over(backend).await;
+
+        let old = TxId::with_priority(1, b"old");
+        seed_inline(&seed_store, b"k", &old, b"old-value").await;
+        let new = TxId::with_priority(2, b"new");
+        commit_value(&mon, b"k", &new, false).await;
+        seed_hold(&seed_store, b"k", &new).await;
+
+        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        let value = out.value.expect("the holder committed a live value");
+        // `commit_value` writes b"v"; the stale inline b"old-value" must not win.
+        assert_eq!(value.value.as_ref(), b"v");
+        assert_eq!(value.version.writer, new);
+    }
+
+    // Read validation is a writer-identity comparison, not a value comparison:
+    // two versions holding identical bytes are still distinct versions.
+    #[tokio::test]
+    async fn equal_inline_bytes_from_different_writers_are_distinct_versions() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed_store = store_over(backend.clone()).await;
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+
+        let first = TxId::with_priority(1, b"first");
+        seed_inline(&seed_store, b"k", &first, b"same").await;
+        let before = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+
+        let second = TxId::with_priority(2, b"second");
+        seed_inline(&seed_store, b"k", &second, b"same").await;
+        let after = reader
+            .read(&key_ref(b"k"), Duration::from_secs(0))
+            .await
+            .unwrap();
+
+        assert_eq!(before.value.as_ref().unwrap().value.as_ref(), b"same");
+        assert_eq!(after.value.as_ref().unwrap().value.as_ref(), b"same");
+        assert_ne!(
+            before.value.unwrap().version,
+            after.value.unwrap().version,
+            "equal bytes under different writers are different versions"
         );
     }
 }

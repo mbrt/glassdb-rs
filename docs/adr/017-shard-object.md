@@ -7,9 +7,9 @@ Accepted. The **key→shard mapping** (FNV-1a `key & (C-1)`, the fixed
 [ADR-031](031-dynamic-range-sharding.md), which makes sharding dynamic and
 range-partitioned (leaves addressed by descending a B-link tree, not by a hash
 formula). The shard entry's **lock** model remains the leaf's per-key lock state.
-Proposed [ADR-051](051-inline-latest-values.md) would supersede its
-`current_writer` / `deleted` current-value representation with tagged external,
-inline, and tombstone states.
+[ADR-051](051-inline-latest-values.md) supersedes its `current_writer` /
+`deleted` current-value representation with tagged external, inline, and
+tombstone states.
 
 ## Context
 

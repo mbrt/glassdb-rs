@@ -305,6 +305,19 @@ impl Monitor {
         self.persist_pending_tx(tid).await
     }
 
+    /// Whether this client still tracks `tid` as one of its own pending
+    /// transactions: it registered a logged identity and has not been finalized
+    /// yet. False for a transaction that never took an identity (an optimistic
+    /// read-only validation, or a logless one-CAS commit) and for one that
+    /// already committed or aborted.
+    pub(crate) fn is_pending_local(&self, tid: &TxId) -> bool {
+        self.shard_for(tid)
+            .lock()
+            .unwrap()
+            .local_tx
+            .contains_key(tid)
+    }
+
     /// Records the lock set a transaction currently holds, so the refresher can
     /// stamp it onto the pending transaction object (ADR-022). Overwrites any
     /// previously recorded set with the latest acquire; a no-op if the

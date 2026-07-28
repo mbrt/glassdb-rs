@@ -11,6 +11,7 @@
 //! transitions, the protocol, and GC are added by later ADRs.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use glassdb_data::TxId;
 use glassdb_proto as pb;
@@ -18,6 +19,70 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::LockType;
+
+/// A key's committed current value (ADR-051): the writer that produced it plus
+/// where the value itself lives.
+///
+/// `writer` is the optimistic-validation token the commit path compares. It
+/// identifies the transaction that produced the version, but it is not
+/// universally a pointer to a transaction object: a logless commit publishes
+/// [`CurrentState::Inline`] without ever writing one.
+///
+/// An inline value is authoritative latest-value evidence. Readers return it
+/// directly, without consulting the writer's transaction status.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CurrentState {
+    /// The key has no committed value yet.
+    #[default]
+    Absent,
+    /// The value lives in the writer's transaction object.
+    External { writer: TxId },
+    /// The value is authoritative here in the leaf entry.
+    Inline { writer: TxId, value: Arc<[u8]> },
+    /// The writer deleted the key.
+    Tombstone { writer: TxId },
+}
+
+impl CurrentState {
+    /// The transaction that produced this version, or `None` when the key has
+    /// no committed value.
+    pub fn writer(&self) -> Option<&TxId> {
+        match self {
+            CurrentState::Absent => None,
+            CurrentState::External { writer }
+            | CurrentState::Inline { writer, .. }
+            | CurrentState::Tombstone { writer } => Some(writer),
+        }
+    }
+
+    /// The authoritative inline bytes, or `None` when the value is not inline.
+    pub fn inline(&self) -> Option<&Arc<[u8]>> {
+        match self {
+            CurrentState::Inline { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The inline payload's size, or zero when the value is not inline. The
+    /// unit of the per-leaf inline budget.
+    pub fn inline_len(&self) -> usize {
+        self.inline().map_or(0, |value| value.len())
+    }
+
+    /// Reports whether the current state is a tombstone.
+    pub fn is_tombstone(&self) -> bool {
+        matches!(self, CurrentState::Tombstone { .. })
+    }
+
+    /// Reports whether the key currently exists: it has a committed value that
+    /// is not a tombstone.
+    pub fn exists(&self) -> bool {
+        matches!(
+            self,
+            CurrentState::External { .. } | CurrentState::Inline { .. }
+        )
+    }
+}
 
 /// One key's coordination state within a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,27 +93,33 @@ pub struct ShardEntry {
     pub lock_type: LockType,
     /// Transactions holding the lock (more than one only for read locks).
     pub locked_by: Vec<TxId>,
-    /// Transaction object holding the committed value (the MVCC pointer), or
-    /// `None` if the key has no committed value yet.
-    pub current_writer: Option<TxId>,
-    /// Tombstone flag.
-    pub deleted: bool,
+    /// The key's committed current value, separate from the lock state above.
+    pub current: CurrentState,
 }
 
 impl ShardEntry {
+    /// Creates an unlocked entry for `key` with no committed value.
+    pub fn new(key: impl Into<Vec<u8>>) -> Self {
+        ShardEntry {
+            key: key.into(),
+            lock_type: LockType::None,
+            locked_by: Vec::new(),
+            current: CurrentState::Absent,
+        }
+    }
+
     /// Reports whether the key exists: it has a committed value and is not
     /// tombstoned.
     pub fn exists(&self) -> bool {
-        self.current_writer.is_some() && !self.deleted
+        self.current.exists()
     }
 
     /// Reports whether the entry records nothing worth keeping: no lock holder
-    /// and no committed writer (not even a tombstone, which always keeps a
-    /// `current_writer`). Such an entry names no transaction and is
-    /// indistinguishable from an absent one, so a mutation that leaves it this
-    /// way may drop it.
+    /// and no committed value (not even a tombstone, which always names a
+    /// writer). Such an entry names no transaction and is indistinguishable
+    /// from an absent one, so a mutation that leaves it this way may drop it.
     pub fn is_vestigial(&self) -> bool {
-        self.locked_by.is_empty() && self.current_writer.is_none()
+        self.locked_by.is_empty() && matches!(self.current, CurrentState::Absent)
     }
 }
 
@@ -138,7 +209,7 @@ impl Shard {
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
         let raw = pb::Shard::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling shard", e))?;
-        Ok(Shard::from_pb(raw))
+        Shard::from_pb(raw)
     }
 
     /// Builds the canonical protobuf message for the shard's entries. Shared with
@@ -152,16 +223,13 @@ impl Shard {
     /// Rebuilds a shard from its protobuf message, the inverse of [`to_pb`].
     ///
     /// [`to_pb`]: Self::to_pb
-    pub(crate) fn from_pb(raw: pb::Shard) -> Self {
-        let entries = raw
-            .entries
-            .into_iter()
-            .map(|e| {
-                let entry = entry_from_proto(e);
-                (entry.key.clone(), entry)
-            })
-            .collect();
-        Shard { entries }
+    pub(crate) fn from_pb(raw: pb::Shard) -> Result<Self, StorageError> {
+        let mut entries = BTreeMap::new();
+        for e in raw.entries {
+            let entry = entry_from_proto(e)?;
+            entries.insert(entry.key.clone(), entry);
+        }
+        Ok(Shard { entries })
     }
 }
 
@@ -173,23 +241,59 @@ fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
         key: e.key.clone(),
         lock_type: lock_type_to_proto(e.lock_type) as i32,
         locked_by,
-        current_writer: e
-            .current_writer
-            .as_ref()
-            .map(|t| t.as_bytes().to_vec())
-            .unwrap_or_default(),
-        deleted: e.deleted,
+        current: current_to_proto(&e.current),
     }
 }
 
-fn entry_from_proto(e: pb::ShardEntry) -> ShardEntry {
-    let current_writer = (!e.current_writer.is_empty()).then(|| TxId::from_bytes(e.current_writer));
-    ShardEntry {
+fn entry_from_proto(e: pb::ShardEntry) -> Result<ShardEntry, StorageError> {
+    Ok(ShardEntry {
         key: e.key,
         lock_type: lock_type_from_proto(e.lock_type),
         locked_by: e.locked_by.into_iter().map(TxId::from_bytes).collect(),
-        current_writer,
-        deleted: e.deleted,
+        current: current_from_proto(e.current)?,
+    })
+}
+
+fn current_to_proto(current: &CurrentState) -> Option<pb::CurrentState> {
+    use pb::current_state::State;
+
+    let (writer, state) = match current {
+        CurrentState::Absent => return None,
+        CurrentState::External { writer } => (writer, State::External(true)),
+        CurrentState::Inline { writer, value } => (writer, State::Inline(value.to_vec())),
+        CurrentState::Tombstone { writer } => (writer, State::Tombstone(true)),
+    };
+    Some(pb::CurrentState {
+        writer: writer.as_bytes().to_vec(),
+        state: Some(state),
+    })
+}
+
+fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, StorageError> {
+    use pb::current_state::State;
+
+    let Some(raw) = raw else {
+        return Ok(CurrentState::Absent);
+    };
+    // A current value without a writer or without a state tag is not a state
+    // any mutation can produce: reject it rather than guess which half is
+    // authoritative.
+    if raw.writer.is_empty() {
+        return Err(StorageError::other(
+            "shard entry current value has no writer",
+        ));
+    }
+    let writer = TxId::from_bytes(raw.writer);
+    match raw.state {
+        Some(State::External(_)) => Ok(CurrentState::External { writer }),
+        Some(State::Inline(value)) => Ok(CurrentState::Inline {
+            writer,
+            value: Arc::from(value),
+        }),
+        Some(State::Tombstone(_)) => Ok(CurrentState::Tombstone { writer }),
+        None => Err(StorageError::other(
+            "shard entry current value has no state tag",
+        )),
     }
 }
 
@@ -218,43 +322,94 @@ mod tests {
     use super::*;
 
     fn entry(key: &[u8]) -> ShardEntry {
-        ShardEntry {
-            key: key.to_vec(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: None,
-            deleted: false,
-        }
+        ShardEntry::new(key)
+    }
+
+    fn tx(bytes: &[u8]) -> TxId {
+        TxId::from_bytes(bytes.to_vec())
     }
 
     #[test]
     fn round_trip() {
         let shard = Shard::from_entries([
             ShardEntry {
-                key: b"alpha".to_vec(),
                 lock_type: LockType::Write,
-                locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
-                current_writer: Some(TxId::from_bytes(vec![9, 9])),
-                deleted: false,
+                locked_by: vec![tx(&[1, 2, 3, 4])],
+                current: CurrentState::External {
+                    writer: tx(&[9, 9]),
+                },
+                ..ShardEntry::new(b"alpha")
             },
             ShardEntry {
-                key: b"beta".to_vec(),
                 lock_type: LockType::Read,
-                locked_by: vec![TxId::from_bytes(vec![5]), TxId::from_bytes(vec![6])],
-                current_writer: None,
-                deleted: false,
+                locked_by: vec![tx(&[5]), tx(&[6])],
+                ..ShardEntry::new(b"beta")
             },
             ShardEntry {
-                key: b"gamma".to_vec(),
-                lock_type: LockType::None,
-                locked_by: Vec::new(),
-                current_writer: Some(TxId::from_bytes(vec![7])),
-                deleted: true,
+                current: CurrentState::Tombstone { writer: tx(&[7]) },
+                ..ShardEntry::new(b"gamma")
+            },
+            ShardEntry {
+                current: CurrentState::Inline {
+                    writer: tx(&[8]),
+                    value: Arc::from(b"hello".as_slice()),
+                },
+                ..ShardEntry::new(b"delta")
             },
         ]);
 
         let decoded = Shard::decode(&shard.encode()).unwrap();
         assert_eq!(decoded, shard);
+    }
+
+    // An empty inline value is a real value, not an absent one: the `state` tag
+    // carries the distinction even though the payload has no bytes.
+    #[test]
+    fn empty_inline_value_is_distinct_from_external() {
+        let inline = Shard::from_entries([ShardEntry {
+            current: CurrentState::Inline {
+                writer: tx(&[1]),
+                value: Arc::from(b"".as_slice()),
+            },
+            ..ShardEntry::new(b"k")
+        }]);
+        let external = Shard::from_entries([ShardEntry {
+            current: CurrentState::External { writer: tx(&[1]) },
+            ..ShardEntry::new(b"k")
+        }]);
+
+        assert_ne!(inline.encode(), external.encode());
+        assert_eq!(Shard::decode(&inline.encode()).unwrap(), inline);
+        assert_eq!(Shard::decode(&external.encode()).unwrap(), external);
+    }
+
+    // No mutation can publish a current value without a writer or without a
+    // state tag, so decoding one is corrupt state rather than a default.
+    #[test]
+    fn decoding_rejects_incomplete_current_values() {
+        let no_state = pb::Shard {
+            entries: vec![pb::ShardEntry {
+                key: b"k".to_vec(),
+                current: Some(pb::CurrentState {
+                    writer: vec![1],
+                    state: None,
+                }),
+                ..Default::default()
+            }],
+        };
+        let no_writer = pb::Shard {
+            entries: vec![pb::ShardEntry {
+                key: b"k".to_vec(),
+                current: Some(pb::CurrentState {
+                    writer: Vec::new(),
+                    state: Some(pb::current_state::State::External(true)),
+                }),
+                ..Default::default()
+            }],
+        };
+
+        assert!(Shard::decode(&no_state.encode_to_vec()).is_err());
+        assert!(Shard::decode(&no_writer.encode_to_vec()).is_err());
     }
 
     #[test]
@@ -277,11 +432,9 @@ mod tests {
     fn encoding_is_canonical_regardless_of_holder_order() {
         let mk = |holders: Vec<TxId>| {
             Shard::from_entries([ShardEntry {
-                key: b"k".to_vec(),
                 lock_type: LockType::Read,
                 locked_by: holders,
-                current_writer: None,
-                deleted: false,
+                ..ShardEntry::new(b"k")
             }])
         };
         let a = mk(vec![TxId::from_bytes(vec![3]), TxId::from_bytes(vec![1])]);
@@ -293,29 +446,29 @@ mod tests {
     fn lookup_and_exists() {
         let shard = Shard::from_entries([
             ShardEntry {
-                key: b"live".to_vec(),
-                lock_type: LockType::None,
-                locked_by: Vec::new(),
-                current_writer: Some(TxId::from_bytes(vec![1])),
-                deleted: false,
+                current: CurrentState::External { writer: tx(&[1]) },
+                ..ShardEntry::new(b"live")
             },
             ShardEntry {
-                key: b"tombstone".to_vec(),
-                lock_type: LockType::None,
-                locked_by: Vec::new(),
-                current_writer: Some(TxId::from_bytes(vec![2])),
-                deleted: true,
+                current: CurrentState::Inline {
+                    writer: tx(&[4]),
+                    value: Arc::from(b"v".as_slice()),
+                },
+                ..ShardEntry::new(b"live-inline")
             },
             ShardEntry {
-                key: b"locked-only".to_vec(),
+                current: CurrentState::Tombstone { writer: tx(&[2]) },
+                ..ShardEntry::new(b"tombstone")
+            },
+            ShardEntry {
                 lock_type: LockType::Create,
-                locked_by: vec![TxId::from_bytes(vec![3])],
-                current_writer: None,
-                deleted: false,
+                locked_by: vec![tx(&[3])],
+                ..ShardEntry::new(b"locked-only")
             },
         ]);
 
         assert!(shard.exists(b"live"));
+        assert!(shard.exists(b"live-inline"));
         // Tombstoned and not-yet-committed keys do not exist.
         assert!(!shard.exists(b"tombstone"));
         assert!(!shard.exists(b"locked-only"));
@@ -324,7 +477,26 @@ mod tests {
         assert!(!shard.exists(b"missing"));
 
         let live = shard.lookup(b"live").unwrap();
-        assert_eq!(live.current_writer, Some(TxId::from_bytes(vec![1])));
+        assert_eq!(live.current.writer(), Some(&tx(&[1])));
+        assert_eq!(live.current.inline(), None);
+
+        let inline = shard.lookup(b"live-inline").unwrap();
+        assert_eq!(inline.current.writer(), Some(&tx(&[4])));
+        assert_eq!(
+            inline.current.inline().map(AsRef::as_ref),
+            Some(b"v" as &[u8])
+        );
+        assert_eq!(inline.current.inline_len(), 1);
+
+        assert!(shard.lookup(b"tombstone").unwrap().current.is_tombstone());
+        assert!(
+            shard
+                .lookup(b"locked-only")
+                .unwrap()
+                .current
+                .writer()
+                .is_none()
+        );
     }
 
     #[test]
@@ -380,17 +552,38 @@ mod tests {
     #[test]
     fn golden_encoding() {
         let shard = Shard::from_entries([ShardEntry {
-            key: b"Hello".to_vec(),
             lock_type: LockType::Write,
-            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
-            current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
-            deleted: false,
+            locked_by: vec![tx(&[1, 2, 3, 4])],
+            current: CurrentState::External {
+                writer: tx(&[0xaa, 0xbb]),
+            },
+            ..ShardEntry::new(b"Hello")
         }]);
         let got = shard.encode();
         let want = [
-            0x0a, 0x13, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
-            0x02, 0x03, 0x04, 0x22, 0x02, 0xaa, 0xbb,
+            0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
+            0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
         ];
         assert_eq!(got, want, "shard encoding drifted: {got:02x?}");
+    }
+
+    // Golden vector for the inline current state (ADR-051).
+    #[test]
+    fn golden_inline_encoding() {
+        let shard = Shard::from_entries([ShardEntry {
+            lock_type: LockType::Write,
+            locked_by: vec![tx(&[1, 2, 3, 4])],
+            current: CurrentState::Inline {
+                writer: tx(&[0xaa, 0xbb]),
+                value: Arc::from(b"hi".as_slice()),
+            },
+            ..ShardEntry::new(b"Hello")
+        }]);
+        let got = shard.encode();
+        let want = [
+            0x0a, 0x19, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
+            0x02, 0x03, 0x04, 0x22, 0x08, 0x0a, 0x02, 0xaa, 0xbb, 0x1a, 0x02, 0x68, 0x69,
+        ];
+        assert_eq!(got, want, "inline shard encoding drifted: {got:02x?}");
     }
 }

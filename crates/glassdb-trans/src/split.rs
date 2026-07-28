@@ -48,9 +48,9 @@ use std::time::Duration;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
-    CollectionStore, Directory, IndexNode, LeafObservation, LockType, Node, Observation,
-    Requirement, Shard, ShardStore, SplitPolicy, StorageError, StructuralLog, StructuralLogPhase,
-    Timeline, TxCommitStatus, TxLock, TxLog,
+    CollectionStore, Directory, IndexNode, InlinePolicy, LeafObservation, LockType, Node,
+    Observation, Requirement, Shard, ShardStore, SplitPolicy, StorageError, StructuralLog,
+    StructuralLogPhase, Timeline, TxCommitStatus, TxLock, TxLog,
 };
 use tokio::sync::Notify;
 
@@ -234,6 +234,9 @@ pub struct Splitter {
     // Only leaf structure-write acquisition uses it; root and interior nodes
     // remain direct structural CASes.
     coord: ShardCoordinator,
+    // Inline budgets applied when quiescing help-forwards a committed holder
+    // into an entry it is about to freeze (ADR-051).
+    inline: InlinePolicy,
     // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
@@ -254,6 +257,7 @@ impl Splitter {
         retry: RetryConfig,
         db_root: &str,
         policy: SplitPolicy,
+        inline: InlinePolicy,
     ) -> (ShardCoordinator, Self) {
         let candidates = SplitCandidates::with_clock(policy, clock);
         let resolver = Resolver::new(shards.clone(), mon.clone());
@@ -263,6 +267,7 @@ impl Splitter {
             mon.clone(),
             retry,
             policy,
+            inline,
             Arc::new(candidates.clone()),
         );
         let splitter = Splitter::with_candidates(
@@ -275,6 +280,7 @@ impl Splitter {
             db_root,
             coord.clone(),
             candidates,
+            inline,
             retry,
         );
         (coord, splitter)
@@ -337,6 +343,7 @@ impl Splitter {
         db_root: &str,
         coord: ShardCoordinator,
         candidates: SplitCandidates,
+        inline: InlinePolicy,
         retry: RetryConfig,
     ) -> Self {
         let dir = Directory::new(shards.clone());
@@ -350,6 +357,7 @@ impl Splitter {
             timeline,
             db_root: db_root.to_string(),
             candidates,
+            inline,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             recovery_wake: Arc::new(Notify::new()),
             coord,
@@ -675,6 +683,7 @@ impl Splitter {
                 id,
                 &entries,
                 Requirement::Any,
+                self.inline,
             )
             .await?
             {
@@ -1580,7 +1589,8 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_data::{KeyRef, TxId};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, LockType, ShardEntry, TLogger, TxWrite,
+        CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, ShardEntry,
+        TLogger, TxWrite,
     };
 
     const COLL: &str = "db/_c/0000000000000000000000";
@@ -1644,11 +1654,10 @@ mod tests {
     // A committed live key, so it counts as existing under a descent lookup.
     fn live(key: &[u8]) -> ShardEntry {
         ShardEntry {
-            key: key.to_vec(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: Some(TxId::from_bytes(vec![1])),
-            deleted: false,
+            current: CurrentState::External {
+                writer: TxId::from_bytes(vec![1]),
+            },
+            ..ShardEntry::new(key)
         }
     }
 
@@ -1689,6 +1698,7 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             *candidates.policy(),
+            InlinePolicy::default(),
             Arc::new(candidates.clone()),
         );
         Splitter::with_candidates(
@@ -1701,6 +1711,7 @@ mod tests {
             "db",
             coord,
             candidates,
+            InlinePolicy::default(),
             RetryConfig::default(),
         )
     }
@@ -1742,6 +1753,48 @@ mod tests {
             is_root: false,
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
             phase: StructuralLogPhase::Ready,
+        }
+    }
+
+    // ADR-051: an inline value may be a key's only copy, so a split has to move
+    // it to the new leaf verbatim.
+    #[tokio::test]
+    async fn a_split_carries_inline_values_to_the_new_leaf() {
+        let s = store();
+        let keys: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
+        let inlined = |key: &[u8]| ShardEntry {
+            current: CurrentState::Inline {
+                writer: TxId::from_bytes(vec![1]),
+                value: Arc::from(key),
+            },
+            ..ShardEntry::new(key)
+        };
+        s.create_root(COLL, &Node::leaf(Shard::from_entries(keys.map(inlined))))
+            .await
+            .unwrap();
+        let bg = Arc::new(Background::new());
+
+        splitter(&s, &bg, tiny())
+            .split_path(&paths::tree_root(COLL))
+            .await
+            .unwrap();
+
+        let dir = Directory::new(s.shards.clone());
+        assert_eq!(
+            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "one leaf became two"
+        );
+        for key in keys {
+            let loc = dir
+                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap();
+            let entry = loc.node().unwrap().as_leaf().unwrap().lookup(key).cloned();
+            assert_eq!(entry, Some(inlined(key)), "key {key:?} lost its value");
         }
     }
 
@@ -2248,7 +2301,7 @@ mod tests {
             .entries()
             .find(|entry| entry.key == b"d")
             .unwrap();
-        assert_eq!(entry.current_writer.as_ref(), Some(&holder));
+        assert_eq!(entry.current.writer(), Some(&holder));
         assert!(entry.locked_by.is_empty());
         assert_eq!(entry.lock_type, LockType::None);
 
@@ -2268,6 +2321,7 @@ mod tests {
             other_mon.clone(),
             RetryConfig::default(),
             SplitPolicy::default(),
+            InlinePolicy::default(),
             Arc::new(crate::shard_coord::NoSplitHints),
         );
         let other_locker = crate::tlocker::Locker::new(
@@ -2285,6 +2339,7 @@ mod tests {
                 &paths::from_node(COLL, "L"),
                 b"d",
                 &KeyRef::new(collection(), b"d"),
+                &Arc::from(b"new-d".as_slice()),
                 None,
             )
             .await;
@@ -2299,7 +2354,7 @@ mod tests {
             .unwrap()
             .lookup(b"d")
             .unwrap();
-        assert_eq!(current.current_writer.as_ref(), Some(&holder));
+        assert_eq!(current.current.writer(), Some(&holder));
         assert!(current.locked_by.is_empty());
     }
 

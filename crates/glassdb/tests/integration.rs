@@ -1200,6 +1200,91 @@ async fn cancelled_tx_future_does_not_block_followups() {
     assert_eq!(read_int(&val), 2);
 }
 
+/// A dropped attempt on the logless one-CAS path (ADR-051) must not write an
+/// aborted transaction object. That id never took a logged identity: it is
+/// invisible to peers, holds no lock, and — once its CAS is dispatched — may in
+/// fact have committed, so an abort marker would be both pointless and a lie.
+#[tokio::test(start_paused = true)]
+async fn cancelled_logless_commit_writes_no_aborted_object() {
+    use std::time::Duration;
+
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let backend = HookBackend::new(mem);
+    let aborted_writes = Arc::new(AtomicUsize::new(0));
+    type LeafCasGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    let gate: Arc<Mutex<Option<LeafCasGate>>> = Arc::new(Mutex::new(None));
+    backend.set_before({
+        let aborted_writes = aborted_writes.clone();
+        let gate = gate.clone();
+        move |op| {
+            let mut parked = None;
+            match op {
+                // The commit point of the logless path: one conditional leaf
+                // write, parked once armed so the transaction's future is dropped
+                // mid-commit — the window the abort guard exists for.
+                BackendOp::WriteIf { path, .. } if path.ends_with("/_r") => {
+                    parked = gate.lock().unwrap().take();
+                }
+                BackendOp::WriteIf { path, value, .. }
+                | BackendOp::WriteIfNotExists { path, value }
+                    if path.contains("/_t/") && is_aborted_tx_log(value) =>
+                {
+                    aborted_writes.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            let future: HookFuture = Box::pin(async move {
+                if let Some((arrived, released)) = parked {
+                    let _ = arrived.send(());
+                    let _ = released.await;
+                }
+                Ok(())
+            });
+            future
+        }
+    });
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
+    coll.write(b"k", &write_int(1)).await.unwrap();
+    // Let the seed's background write-back finish so the gate traps the commit
+    // under test rather than a lingering leaf CAS.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let (arrived_tx, arrived) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    *gate.lock().unwrap() = Some((arrived_tx, released));
+
+    // A lone small overwrite of an existing key: eligible for the logless path,
+    // whose commit is the parked leaf CAS.
+    let stalled = tokio::spawn({
+        let db = db.clone();
+        let coll = coll.clone();
+        async move {
+            let coll_ref = &coll;
+            db.tx(|tx| async move { tx.write(coll_ref, b"k", &write_int(42)) })
+                .await
+        }
+    });
+    arrived.await.unwrap();
+    stalled.abort();
+    let _ = stalled.await;
+
+    // Let the parked CAS finish and any scheduled cleanup run.
+    let _ = release.send(());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    db.shutdown().await;
+
+    assert_eq!(
+        aborted_writes.load(Ordering::SeqCst),
+        0,
+        "a cancelled logless attempt must not invent an aborted transaction"
+    );
+}
+
 /// Controls hooks that pause writes at known points in the commit pipeline.
 struct PauseControl {
     trap: Mutex<Option<Trap>>,

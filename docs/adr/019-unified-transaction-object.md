@@ -10,9 +10,9 @@ The flat `_t/<txid>` path is refined by
 deterministically sharded transaction-log layout. The unified object and
 lifecycle decided here are unchanged.
 
-Proposed [ADR-051](051-inline-latest-values.md) would supersede the
-value-placement clauses that make transaction objects the only durable home for
-values and make write-back pointer-only. Transaction status, logged multi-key
+[ADR-051](051-inline-latest-values.md) supersedes the value-placement clauses
+that make transaction objects the only durable home for values and make
+write-back pointer-only. Transaction status, logged multi-key
 atomicity, and the pending → committed → aborted lifecycle remain unchanged.
 
 ## Context

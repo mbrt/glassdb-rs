@@ -35,9 +35,10 @@ pub use stats::Stats;
 pub use tx::Transaction;
 
 // The split soft-cap policy, so callers can tune when a collection's B-link
-// tree splits (see [`DatabaseBuilder::split_policy`]).
+// tree splits (see [`DatabaseBuilder::split_policy`]), and the inline-value
+// budgets (see [`DatabaseBuilder::inline_policy`]).
 pub use glassdb_data::MAX_COLLECTION_NAME_BYTES;
-pub use glassdb_storage::{CacheStats, PersistentCacheConfig, SplitPolicy};
+pub use glassdb_storage::{CacheStats, InlinePolicy, PersistentCacheConfig, SplitPolicy};
 pub use glassdb_trans::ProtocolTiming;
 
 // Re-export the backend abstraction so callers can construct a Database without

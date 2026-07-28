@@ -17,7 +17,7 @@ use glassdb_storage::{
 };
 
 use crate::error::trans_to_storage;
-use crate::resolver::Resolver;
+use crate::resolver::{ResolvedValue, Resolver};
 
 /// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
 /// outcome before the error is surfaced. Reads are idempotent (ADR-009), so
@@ -137,6 +137,31 @@ impl Reader {
                 });
             };
             let last_writer = Some(writer.clone());
+            // An inline value or tombstone in the leaf is the writer's own
+            // authoritative evidence, so the transaction object adds nothing
+            // (ADR-051).
+            match resolved.value {
+                ResolvedValue::Inline(value) => {
+                    return Ok(ReadOutcome {
+                        value: Some(ReadValue {
+                            value,
+                            version: Version { writer },
+                        }),
+                        last_writer,
+                        cache_hit,
+                        leaf,
+                    });
+                }
+                ResolvedValue::Tombstone => {
+                    return Ok(ReadOutcome {
+                        value: None,
+                        last_writer,
+                        cache_hit,
+                        leaf,
+                    });
+                }
+                ResolvedValue::External | ResolvedValue::Unresolved => {}
+            }
             let cv = self
                 .resolver
                 .committed_value(key, &writer)
