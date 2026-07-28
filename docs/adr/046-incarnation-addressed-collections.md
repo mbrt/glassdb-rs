@@ -26,9 +26,8 @@ Physical creation and reclamation follow
 boundary and [ADR-043](043-causally-coordinated-backend-operations.md)'s
 same-path coordination and fresh-identity rules.
 
-[ADR-041](041-epoch-versioned-collection-catalog.md) is a snapshot-read
-proposal based on the superseded collection model. It must be revised to
-version the ID-based directories introduced here before acceptance; snapshot
+[ADR-041](041-timestamp-versioned-collection-catalog.md) is a snapshot-read
+proposal that versions the ID-based directories introduced here; snapshot
 semantics are otherwise outside this ADR.
 
 ## Context
