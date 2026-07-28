@@ -319,11 +319,11 @@ impl ShardResolver for AcquireResolver {
         }
         let mut membership = self.membership;
         let mut admission = StageAdmission::ExistingKeys;
-        let inline = InlineAdmission::new(ctx.inline, staged);
+        let mut inline = InlineAdmission::new(ctx.inline, staged);
         let mut entries = Vec::with_capacity(self.intents.len());
         for intent in self.intents.iter() {
             let cur = staged.get(&intent.raw_key).cloned();
-            match resolve_and_lock(ctx, &self.id, intent, cur, &inline).await? {
+            match resolve_and_lock(ctx, &self.id, intent, cur, &mut inline).await? {
                 EntryResolution::Locked(entry, changes_membership) => {
                     if changes_membership {
                         membership = LockType::Write;
@@ -440,7 +440,7 @@ impl ShardResolver for WriteBackResolver {
             &self.id,
             &self.intents,
             staged,
-            &InlineAdmission::new(ctx.inline, staged),
+            &mut InlineAdmission::new(ctx.inline, staged),
         );
         let outcome = FoldOutcome::Released { superseded };
         let locks_changed = locks.release_membership(&self.id);
@@ -575,7 +575,7 @@ async fn resolve_and_lock(
     id: &TxId,
     intent: &KeyIntent,
     entry: Option<ShardEntry>,
-    admission: &InlineAdmission<'_>,
+    admission: &mut InlineAdmission,
 ) -> Result<EntryResolution, TransError> {
     let mut e = entry.unwrap_or_else(|| ShardEntry::new(intent.raw_key.clone()));
 
@@ -644,7 +644,7 @@ fn writeback_changes(
     id: &TxId,
     intents: &[KeyIntent],
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
-    admission: &InlineAdmission<'_>,
+    admission: &mut InlineAdmission,
 ) -> WritebackStaged {
     let mut changes = Vec::new();
     let mut superseded = Vec::new();
@@ -670,7 +670,7 @@ fn writeback_changes(
                     }
                     // The value is also durable in our transaction object, so
                     // missing the budget costs only the reader's extra load.
-                    Some(value) if admission.admits(&intent.raw_key, value) => {
+                    Some(value) if admission.admit(&intent.raw_key, value) => {
                         CurrentState::Inline {
                             writer,
                             value: value.clone(),
@@ -1543,6 +1543,11 @@ mod tests {
     // deferred, every key coordinates on the root leaf). The `key` is carried by
     // the intent itself, so it is only used for readability at call sites.
     fn group_of(_key: &[u8], intent: KeyIntent) -> BTreeMap<String, ShardGroup> {
+        group_of_intents(vec![intent])
+    }
+
+    // Several intents held by one transaction on that same leaf.
+    fn group_of_intents(intents: Vec<KeyIntent>) -> BTreeMap<String, ShardGroup> {
         let path = paths::tree_root(COLL);
         let mut g = BTreeMap::new();
         g.insert(
@@ -1550,7 +1555,7 @@ mod tests {
             ShardGroup {
                 path,
                 leaf: LeafRef::root(collection()),
-                intents: vec![intent],
+                intents,
                 membership: LockType::None,
             },
         );
@@ -2158,6 +2163,120 @@ mod tests {
             e.current,
             CurrentState::External { writer: tx2 },
             "the second write still lands, just not inline"
+        );
+    }
+
+    // One write-back publishing several keys spends a single leaf budget: each
+    // admitted payload is charged before the next key is weighed, so the keys
+    // cannot each be admitted against the leaf as it was loaded.
+    #[tokio::test]
+    async fn keys_written_back_together_share_one_leaf_budget() {
+        let inline = InlinePolicy {
+            max_value_bytes: 64,
+            max_leaf_bytes: 5,
+        };
+        let (locker, ctx) = new_test_locker_with_policies(
+            Arc::new(MemoryBackend::new()),
+            SplitPolicy::default(),
+            inline,
+        )
+        .await;
+        let first = b"key-a".to_vec();
+        let second = same_shard_sibling(&first);
+
+        let tx = mk_tid(1, "writer");
+        ctx.monitor.begin_tx(&tx);
+        let groups = group_of_intents(vec![
+            inline_put_intent(&first, b"aaaaa"),
+            inline_put_intent(&second, b"bbbbb"),
+        ]);
+        lock_ok(&locker, &tx, &groups).await;
+        locker
+            .data()
+            .write_back(
+                &tx,
+                &LockedTx {
+                    groups,
+                    validations: BTreeMap::new(),
+                },
+            )
+            .await;
+
+        let first = entry_of(&ctx, &first).await.unwrap();
+        let second = entry_of(&ctx, &second).await.unwrap();
+        assert_eq!(
+            first.current.inline_len() + second.current.inline_len(),
+            5,
+            "the two writes together must not exceed the leaf's inline budget"
+        );
+        assert_eq!(first.current.writer(), Some(&tx));
+        assert_eq!(
+            second.current.writer(),
+            Some(&tx),
+            "the write that missed the budget still publishes a pointer"
+        );
+    }
+
+    // Help-forwarding several committed holders in one acquisition spends that
+    // same single budget.
+    #[tokio::test]
+    async fn keys_help_forwarded_together_share_one_leaf_budget() {
+        use glassdb_storage::{TxLog, TxWrite};
+        let (locker, ctx) = new_test_locker_with_policies(
+            Arc::new(MemoryBackend::new()),
+            SplitPolicy::default(),
+            InlinePolicy {
+                max_value_bytes: 64,
+                max_leaf_bytes: 5,
+            },
+        )
+        .await;
+        let first = b"key-a".to_vec();
+        let second = same_shard_sibling(&first);
+
+        // A committed writer whose write-back never ran, so the next acquisition
+        // must help-forward both of its keys.
+        let writer = mk_tid(1, "writer");
+        ctx.monitor.begin_tx(&writer);
+        lock_ok(
+            &locker,
+            &writer,
+            &group_of_intents(vec![put_intent(&first), put_intent(&second)]),
+        )
+        .await;
+        let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
+        tl.writes = [(&first, b"aaaaa"), (&second, b"bbbbb")]
+            .into_iter()
+            .map(|(key, value)| TxWrite {
+                key: key_ref(key),
+                value: Arc::from(&value[..]),
+                deleted: false,
+                prev_writer: TxId::default(),
+            })
+            .collect();
+        ctx.monitor.commit_tx(tl).await.unwrap();
+
+        let reader = mk_tid(2, "reader");
+        ctx.monitor.begin_tx(&reader);
+        lock_ok(
+            &locker,
+            &reader,
+            &group_of_intents(vec![read_intent(&first), read_intent(&second)]),
+        )
+        .await;
+
+        let first = entry_of(&ctx, &first).await.unwrap();
+        let second = entry_of(&ctx, &second).await.unwrap();
+        assert_eq!(
+            first.current.inline_len() + second.current.inline_len(),
+            5,
+            "the two help-forwarded values must not exceed the leaf's budget"
+        );
+        assert_eq!(first.current.writer(), Some(&writer));
+        assert_eq!(
+            second.current.writer(),
+            Some(&writer),
+            "the value that missed the budget is still help-forwarded"
         );
     }
 

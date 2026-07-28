@@ -105,21 +105,46 @@ pub(crate) async fn resolve_entry_locks_at(
     })
 }
 
-/// The inline budgets (ADR-051) applied against one leaf as currently staged.
-#[derive(Clone, Copy)]
-pub(crate) struct InlineAdmission<'a> {
+/// The inline budgets (ADR-051) applied against one leaf as a fold stages it.
+///
+/// A member may publish several keys, and the leaf budget bounds their sum, so
+/// each admitted payload is charged to the leaf before the next key is weighed.
+/// Weighing them all against the leaf as loaded would admit every one of them
+/// and overshoot the budget by however many keys the member holds.
+pub(crate) struct InlineAdmission {
     policy: InlinePolicy,
-    leaf: &'a BTreeMap<Vec<u8>, ShardEntry>,
+    /// Inline bytes per key: seeded from the leaf as loaded, so payloads already
+    /// there are counted (they are grandfathered, never re-admitted), then
+    /// updated by each payload admitted since.
+    inline_len: BTreeMap<Vec<u8>, usize>,
 }
 
-impl<'a> InlineAdmission<'a> {
-    pub(crate) fn new(policy: InlinePolicy, leaf: &'a BTreeMap<Vec<u8>, ShardEntry>) -> Self {
-        InlineAdmission { policy, leaf }
+impl InlineAdmission {
+    pub(crate) fn new(policy: InlinePolicy, leaf: &BTreeMap<Vec<u8>, ShardEntry>) -> Self {
+        InlineAdmission {
+            policy,
+            inline_len: leaf
+                .iter()
+                .filter(|(_, entry)| entry.current.inline_len() > 0)
+                .map(|(key, entry)| (key.clone(), entry.current.inline_len()))
+                .collect(),
+        }
     }
 
-    /// Reports whether `value` may be published inline for `key`.
-    pub(crate) fn admits(&self, key: &[u8], value: &[u8]) -> bool {
-        self.policy.admits(self.leaf.values(), key, value.len())
+    /// Reports whether `value` may be published inline for `key`, charging it to
+    /// the leaf when it may.
+    pub(crate) fn admit(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let others = self
+            .inline_len
+            .iter()
+            .filter(|(other, _)| other.as_slice() != key)
+            .map(|(_, len)| len)
+            .sum();
+        if !self.policy.admits(others, value.len()) {
+            return false;
+        }
+        self.inline_len.insert(key.to_vec(), value.len());
+        true
     }
 }
 
@@ -135,7 +160,7 @@ pub(crate) fn resolved_current(
     key: &[u8],
     entry: Option<&ShardEntry>,
     res: &LockResolution,
-    admission: &InlineAdmission<'_>,
+    admission: &mut InlineAdmission,
 ) -> CurrentState {
     let Some(writer) = res.writer.clone() else {
         return CurrentState::Absent;
@@ -147,7 +172,7 @@ pub(crate) fn resolved_current(
     }
     match &res.value {
         ResolvedValue::Tombstone => CurrentState::Tombstone { writer },
-        ResolvedValue::Inline(value) if admission.admits(key, value) => CurrentState::Inline {
+        ResolvedValue::Inline(value) if admission.admit(key, value) => CurrentState::Inline {
             writer,
             value: value.clone(),
         },
@@ -446,7 +471,7 @@ pub(crate) async fn quiesce_entries(
     requirement: Requirement,
     inline: InlinePolicy,
 ) -> Result<QuiescedEntries, TransError> {
-    let admission = InlineAdmission::new(inline, entries);
+    let mut admission = InlineAdmission::new(inline, entries);
     let mut resolved_entries = BTreeMap::new();
     for (key, entry) in entries {
         let resolved = resolve_entry_locks_at(
@@ -467,7 +492,7 @@ pub(crate) async fn quiesce_entries(
             }
         }
         let mut quiesced = entry.clone();
-        quiesced.current = resolved_current(key, Some(entry), &resolved, &admission);
+        quiesced.current = resolved_current(key, Some(entry), &resolved, &mut admission);
         quiesced.locked_by.retain(|holder| holder == id);
         if quiesced.locked_by.is_empty() {
             quiesced.lock_type = LockType::None;

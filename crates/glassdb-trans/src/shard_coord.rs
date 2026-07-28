@@ -114,12 +114,14 @@ pub(crate) struct CoordinatedOutcome {
     pub(crate) cas_precondition: Option<LeafObservation>,
 }
 
-/// Why the fold engine is (re-)running the resolvers this attempt: a `Fresh`
+/// Why the fold engine is (re-)running one resolver this attempt: a `Fresh`
 /// first pass, or a re-fold after a CAS that failed precondition
 /// (`Reloaded { in_doubt: false }`) or came back in-doubt
-/// (`Reloaded { in_doubt: true }`). Only the commit-install resolver consults
-/// it — to distinguish a definitive `Moved` from an irreducible `InDoubt` — so
-/// every other resolver ignores it and stays idempotent across re-folds.
+/// (`Reloaded { in_doubt: true }`). The in-doubt bit is the member's own: it is
+/// set only for the members whose stage rode the uncertain CAS. Only the
+/// commit-install resolver consults it — to distinguish a definitive `Moved`
+/// from an irreducible `InDoubt` — so every other resolver ignores it and stays
+/// idempotent across re-folds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReloadCause {
     Fresh,
@@ -198,9 +200,9 @@ pub(crate) trait ShardResolver: Send + Sync {
     fn reorderable(&self) -> bool;
 
     /// The outcome delivered when this round cannot produce a definitive
-    /// result. `in_doubt` reports whether an earlier CAS may have landed, so a
-    /// non-idempotent resolver cannot downgrade uncertainty while abandoning
-    /// the round.
+    /// result. `in_doubt` reports whether a CAS carrying *this member's* stage
+    /// may have landed, so a non-idempotent resolver cannot downgrade
+    /// uncertainty while abandoning the round.
     fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome;
 
     /// The outcome delivered when a structural change invalidated routing.
@@ -374,16 +376,22 @@ impl CasWorker {
             rt::yield_now().await;
         }
         let mut backoff = self.core.retry.backoff();
-        // Why the current fold is running: `Fresh` first, then re-folds carry
-        // whether the prior CAS was in-doubt so commit-install can classify.
-        let mut cause = ReloadCause::Fresh;
-        // In-doubt is *sticky* across re-folds: once any CAS this round came back
-        // in-doubt, its write may have landed durably (and been help-forwarded to
-        // a peer), so a later precondition-miss must not downgrade the ambiguity
-        // to a definitive loss. Commit-install would otherwise misclassify a
-        // landed-but-unacked lock as `Moved` and unsafely abandon-and-rerun a
-        // committed object a peer already observed.
-        let mut saw_in_doubt = false;
+        // Whether the current fold is a re-fold, so a resolver can tell its first
+        // pass from a retry after a CAS that did not land.
+        let mut reloaded = false;
+        // The members whose changes rode a CAS that came back in-doubt. For them
+        // in-doubt is *sticky* across re-folds: that write may have landed
+        // durably (and been help-forwarded to a peer), so a later
+        // precondition-miss must not downgrade the ambiguity to a definitive
+        // loss. Commit-install would otherwise misclassify a landed-but-unacked
+        // lock as `Moved` and unsafely abandon-and-rerun a committed object a
+        // peer already observed.
+        //
+        // It is per member rather than per round: a member the uncertain CAS did
+        // not carry — one skipped for a same-key logless claim, or merged into
+        // the batch afterwards — definitively did not land, and inheriting the
+        // batch's ambiguity would strand it in-doubt over a write it never made.
+        let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         // The first fold attempt may reuse a cached shard the submitter just
         // loaded (a lone single read-write round; `Any` serves it without
         // a revalidation round-trip, ADR-030). A failed or in-doubt CAS
@@ -401,16 +409,6 @@ impl CasWorker {
             } else {
                 Requirement::Any
             };
-            let ctx = ResolveCtx {
-                resolver: &self.core.resolver,
-                tmon: &self.core.tmon,
-                // Resolver dependencies belong to the logical round, not the
-                // cache seed used after a failed CAS. Preserve the submitters'
-                // bound even when the leaf reload itself may use `Any`.
-                requirement: first_requirement,
-                cause,
-                inline: self.core.inline,
-            };
             let loaded = match self.core.shards.load_leaf(path, requirement).await {
                 Ok(loaded) => loaded,
                 // A root split can turn the routed root leaf into an index
@@ -418,9 +416,9 @@ impl CasWorker {
                 // reroute outcome so its caller rebuilds the current leaf set.
                 Err(StorageError::Precondition) => {
                     let members = shard_members(batch);
-                    for member in members.values() {
+                    for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                            outcome: member.resolver.reroute_outcome(saw_in_doubt),
+                            outcome: member.resolver.reroute_outcome(in_doubt.contains(tx)),
                             cas_precondition: None,
                         });
                     }
@@ -457,6 +455,22 @@ impl CasWorker {
             // (ADR-051). Reset per attempt: a re-fold re-runs every member.
             let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
             for (tx, m) in ordered {
+                let ctx = ResolveCtx {
+                    resolver: &self.core.resolver,
+                    tmon: &self.core.tmon,
+                    // Resolver dependencies belong to the logical round, not the
+                    // cache seed used after a failed CAS. Preserve the submitters'
+                    // bound even when the leaf reload itself may use `Any`.
+                    requirement: first_requirement,
+                    cause: if reloaded {
+                        ReloadCause::Reloaded {
+                            in_doubt: in_doubt.contains(tx),
+                        }
+                    } else {
+                        ReloadCause::Fresh
+                    },
+                    inline: self.core.inline,
+                };
                 // Ownership re-check (ADR-031): a split may have moved one of this
                 // member's keys to a right sibling after it was routed here.
                 // Mutating this leaf would strand the key, so deliver the
@@ -466,7 +480,8 @@ impl CasWorker {
                 // and fold nothing for it. Its caller re-resolves through the
                 // directory and re-submits on the leaf that now owns the key.
                 if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
-                    results.push((tx.clone(), m.resolver.reroute_outcome(saw_in_doubt), false));
+                    let outcome = m.resolver.reroute_outcome(in_doubt.contains(tx));
+                    results.push((tx.clone(), outcome, false));
                     continue;
                 }
                 // A logless commit's staged entry is the only evidence it ever
@@ -478,11 +493,8 @@ impl CasWorker {
                     .iter()
                     .any(|&k| logless.contains(k))
                 {
-                    results.push((
-                        tx.clone(),
-                        m.resolver.exhausted_outcome(saw_in_doubt),
-                        false,
-                    ));
+                    let outcome = m.resolver.exhausted_outcome(in_doubt.contains(tx));
+                    results.push((tx.clone(), outcome, false));
                     continue;
                 }
                 let folded = self
@@ -542,21 +554,25 @@ impl CasWorker {
                     Ok(true) => self.core.hinter.observe_leaf(path, &new_shard),
                     // Precondition: the shard changed under us; reload and
                     // re-fold. This CAS definitely did not land, but an *earlier*
-                    // in-doubt CAS this round might have, so carry the sticky
-                    // in-doubt flag rather than clearing it.
+                    // in-doubt CAS this round might have, so leave the members it
+                    // carried marked rather than clearing them.
                     Ok(false) => {
-                        cause = ReloadCause::Reloaded {
-                            in_doubt: saw_in_doubt,
-                        };
+                        reloaded = true;
                         continue;
                     }
                     // In-doubt lock CAS (ADR-009): re-folding our own resolvers
                     // over a freshly-read shard is idempotent, so recover in place
                     // by reloading and re-folding. Commit-install must treat a
-                    // subsequent move as irreducibly in-doubt (ADR-027).
+                    // subsequent move as irreducibly in-doubt (ADR-027) — but only
+                    // the members this CAS actually carried.
                     Err(StorageError::Unavailable(_)) => {
-                        saw_in_doubt = true;
-                        cause = ReloadCause::Reloaded { in_doubt: true };
+                        in_doubt.extend(
+                            results
+                                .iter()
+                                .filter(|(_, _, member_staged)| *member_staged)
+                                .map(|(tx, _, _)| tx.clone()),
+                        );
+                        reloaded = true;
                         continue;
                     }
                     Err(e) => return Err(e.into()),
@@ -581,9 +597,9 @@ impl CasWorker {
         // Bounded CAS budget exhausted under churn: each member gets its
         // resolver's exhaustion outcome. Acquirers conflict and release/re-lock;
         // write-backs re-descend because exhaustion does not prove convergence.
-        for m in shard_members(batch).values() {
+        for (tx, m) in &shard_members(batch) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                outcome: m.resolver.exhausted_outcome(saw_in_doubt),
+                outcome: m.resolver.exhausted_outcome(in_doubt.contains(tx)),
                 cas_precondition: None,
             });
         }
@@ -1647,6 +1663,158 @@ mod tests {
         );
     }
 
+    // A logless direct-commit-shaped resolver (ADR-051): the entry it stages is
+    // the only record of its commit, so it claims its key for the round and
+    // classifies an abandoned round the way `DirectCommitResolver` does — the
+    // ambiguity is irreducible only if its own stage rode a CAS that may have
+    // landed.
+    struct LoglessCommitProbe {
+        key: Vec<u8>,
+        tx: TxId,
+        value: Arc<[u8]>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShardResolver for LoglessCommitProbe {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            let e = ShardEntry {
+                current: CurrentState::Inline {
+                    writer: self.tx.clone(),
+                    value: self.value.clone(),
+                },
+                ..ShardEntry::new(self.key.clone())
+            };
+            Ok(Step::Stage {
+                entries: vec![(self.key.clone(), e)],
+                locks: staged_locks.clone(),
+                admission: StageAdmission::ExistingKeys,
+                outcome: FoldOutcome::Landed,
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt {
+                return FoldOutcome::InDoubt("logless commit after an uncertain CAS".into());
+            }
+            FoldOutcome::Moved
+        }
+
+        fn owned_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+
+        fn logless_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+    }
+
+    // Faults the first leaf CAS as in-doubt and lets every later one through.
+    fn in_doubt_then_ok(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
+        let backend = HookBackend::new(inner);
+        let leaf_cas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        backend.set_before(move |op| {
+            let result = match op {
+                BackendOp::WriteIf { path, .. }
+                    if path.contains("/_n/") || path.ends_with("/_r") =>
+                {
+                    match leaf_cas.fetch_add(1, Ordering::SeqCst) {
+                        0 => Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt leaf CAS".into(),
+                        )),
+                        _ => Ok(()),
+                    }
+                }
+                _ => Ok(()),
+            };
+            let future: HookFuture = Box::pin(async move { result });
+            future
+        });
+        backend
+    }
+
+    // Regression: an uncertain CAS clouds the members it carried, not the whole
+    // batch. Two logless commits on one key share a round, where the second is
+    // deliberately skipped; when the first's CAS comes back in-doubt and the
+    // round retries, that skipped member must still learn it definitively did
+    // not land. Inheriting the batch's ambiguity would surface an unresolvable
+    // in-doubt for a write it never issued.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_member_does_not_inherit_the_rounds_in_doubt() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (gated, gate) = Gate::wrap(mem);
+        let backend = in_doubt_then_ok(gated as Arc<dyn Backend>) as Arc<dyn Backend>;
+        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+
+        // The older member drives the round and parks in the gated load; the
+        // younger one queues into that still-open batch, where its key is
+        // already claimed.
+        gate.arm();
+        let (c1, t1) = (coord.clone(), first.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(LoglessCommitProbe {
+                    key: b"k".to_vec(),
+                    tx: t1.clone(),
+                    value: Arc::from(b"first".as_slice()),
+                }),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (c2, t2) = (coord.clone(), second.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(LoglessCommitProbe {
+                    key: b"k".to_vec(),
+                    tx: t2.clone(),
+                    value: Arc::from(b"second".as_slice()),
+                }),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(
+            matches!(
+                driver.await.unwrap().unwrap(),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Landed,
+                    ..
+                })
+            ),
+            "the member whose CAS was retried lands on the second attempt"
+        );
+        assert!(
+            matches!(
+                joiner.await.unwrap().unwrap(),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Moved,
+                    cas_precondition: None,
+                })
+            ),
+            "the skipped member never staged, so its loss stays definitive"
+        );
+        coord.close().await;
+    }
+
     // Regression (fuzz `concurrent_tx`,
     // corpus/cd4e97be8a631c59fe32bc49de539f38056bcb40): one transaction can have
     // two operations in flight on the same leaf at once — GC releasing a
@@ -1856,7 +2024,7 @@ mod tests {
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let writer = self.tx.clone();
-            let current = if InlineAdmission::new(ctx.inline, staged).admits(&self.key, &self.value)
+            let current = if InlineAdmission::new(ctx.inline, staged).admit(&self.key, &self.value)
             {
                 CurrentState::Inline {
                     writer,

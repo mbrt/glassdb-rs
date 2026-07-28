@@ -1,8 +1,6 @@
 //! Budgets bounding how much committed value data leaf entries carry inline
 //! (ADR-051).
 
-use crate::shard::ShardEntry;
-
 /// Default largest value that may be inlined. Small enough that the extra bytes
 /// on every leaf CAS stay cheap next to the transaction-object read they save.
 const DEFAULT_MAX_VALUE_BYTES: usize = 1024;
@@ -44,49 +42,25 @@ impl InlinePolicy {
         }
     }
 
-    /// Reports whether `value_len` bytes may be inlined for `key` in a leaf
-    /// holding `leaf`.
+    /// Reports whether `value_len` bytes may be inlined in a leaf whose other
+    /// keys already carry `others_len` inline bytes.
     ///
-    /// The key's own inline payload is replaced rather than added to, so
-    /// overwriting an inline value with one of the same size always readmits.
-    pub fn admits<'a>(
-        &self,
-        leaf: impl IntoIterator<Item = &'a ShardEntry>,
-        key: &[u8],
-        value_len: usize,
-    ) -> bool {
+    /// The bytes a key currently carries are its own to spend, so they belong in
+    /// neither figure: overwriting an inline value with one of the same size
+    /// always readmits.
+    pub fn admits(&self, others_len: usize, value_len: usize) -> bool {
         // A zero per-value budget disables inlining outright, so an empty value
         // is rejected too rather than slipping through as zero bytes.
         if self.max_value_bytes == 0 || value_len > self.max_value_bytes {
             return false;
         }
-        let others: usize = leaf
-            .into_iter()
-            .filter(|entry| entry.key != key)
-            .map(|entry| entry.current.inline_len())
-            .sum();
-        others + value_len <= self.max_leaf_bytes
+        others_len + value_len <= self.max_leaf_bytes
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use glassdb_data::TxId;
-
     use super::*;
-    use crate::shard::CurrentState;
-
-    fn inline_entry(key: &[u8], len: usize) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::Inline {
-                writer: TxId::with_priority(1, key),
-                value: Arc::from(vec![0u8; len]),
-            },
-            ..ShardEntry::new(key)
-        }
-    }
 
     #[test]
     fn a_value_over_the_per_value_budget_is_never_admitted() {
@@ -94,20 +68,19 @@ mod tests {
             max_value_bytes: 8,
             max_leaf_bytes: 1024,
         };
-        assert!(policy.admits([].iter(), b"k", 8));
-        assert!(!policy.admits([].iter(), b"k", 9));
+        assert!(policy.admits(0, 8));
+        assert!(!policy.admits(0, 9));
     }
 
     #[test]
-    fn the_leaf_budget_counts_every_other_entry() {
+    fn the_leaf_budget_bounds_the_whole_leaf() {
         let policy = InlinePolicy {
             max_value_bytes: 100,
             max_leaf_bytes: 30,
         };
-        let leaf = [inline_entry(b"a", 10), inline_entry(b"b", 10)];
 
-        assert!(policy.admits(leaf.iter(), b"c", 10));
-        assert!(!policy.admits(leaf.iter(), b"c", 11));
+        assert!(policy.admits(20, 10));
+        assert!(!policy.admits(20, 11));
     }
 
     // The budget a resolver is re-asked with when its inline stage does not
@@ -116,21 +89,7 @@ mod tests {
     fn the_empty_policy_admits_nothing() {
         let policy = InlinePolicy::none();
 
-        assert!(!policy.admits([].iter(), b"k", 0));
-        assert!(!policy.admits([].iter(), b"k", 1));
-    }
-
-    // Overwriting a key's own inline value replaces it, so a leaf sitting
-    // exactly at its budget still readmits the same-sized value.
-    #[test]
-    fn a_keys_own_inline_payload_is_replaced_not_added() {
-        let policy = InlinePolicy {
-            max_value_bytes: 100,
-            max_leaf_bytes: 20,
-        };
-        let leaf = [inline_entry(b"a", 10), inline_entry(b"b", 10)];
-
-        assert!(policy.admits(leaf.iter(), b"b", 10));
-        assert!(!policy.admits(leaf.iter(), b"b", 11));
+        assert!(!policy.admits(0, 0));
+        assert!(!policy.admits(0, 1));
     }
 }

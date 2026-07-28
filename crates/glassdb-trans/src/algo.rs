@@ -380,7 +380,7 @@ impl ShardResolver for CommitInstallResolver {
             &self.raw_key,
             cur,
             &res,
-            &InlineAdmission::new(ctx.inline, staged),
+            &mut InlineAdmission::new(ctx.inline, staged),
         );
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
@@ -482,9 +482,9 @@ impl ShardResolver for DirectCommitResolver {
         }
 
         let res = resolve_entry_locks(ctx, &self.key, cur, None).await?;
-        let admission = InlineAdmission::new(ctx.inline, staged);
+        let mut admission = InlineAdmission::new(ctx.inline, staged);
         if eligible_writer(&res, self.read_version.as_ref()).is_none()
-            || !admission.admits(&self.raw_key, &self.value)
+            || !admission.admit(&self.raw_key, &self.value)
         {
             return Ok(Step::Skip {
                 outcome: self.unlanded(ctx),
@@ -1389,13 +1389,28 @@ impl Algo {
             prev_writer: recorded_prev,
         });
 
+        // Take the logged identity before either write. From here the lock can
+        // land without its object, so a dropped future must be able to finalize
+        // the id: registration is what lets the cancellation guard
+        // ([`Algo::async_abort`]) and [`Algo::end`] mark it aborted instead of
+        // leaving peers to wait out the unknown-holder grace period. It is
+        // in-memory and refreshed by nobody, so the path still writes twice.
+        if tx.status == Status::New {
+            self.mon.begin_tx(&tx.id);
+        }
+        tx.engaged = true;
+
         // Issue both commit-critical writes concurrently (ADR-027): the committed
         // object (its existence is the unambiguous, idempotent commit signal) and
         // the shard lock install (which inserts us into the version chain). The
         // install goes through the shard coordinator (ADR-028), so it merges with
         // any disjoint-key acquire/write-back on the same shard into one CAS
         // round instead of racing its own.
-        let object = self.mon.set_final_log(&tl);
+        //
+        // Committing through the monitor (rather than writing the object
+        // directly) retires the registration on success, so a commit leaves no
+        // pending identity for cleanup to trip over.
+        let object = self.mon.commit_tx(tl);
         let install = self.commit_install(
             &tx.id,
             &leaf_path,
