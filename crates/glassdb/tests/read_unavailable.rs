@@ -9,7 +9,7 @@
 //!
 //! A normal in-memory backend never produces `Unavailable`, so a decorator
 //! injects it on reads of the coordination leaf objects (a node `/_n/` or the
-//! collection root `/_i`) a configurable number of times. In v2 a value read
+//! collection root `/_r`) a configurable number of times. In v2 a value read
 //! resolves a key by descending to its leaf (the lock table + MVCC index,
 //! ADR-031), so faulting the leaf read is the read-path outage under test. The
 //! key is seeded through a separate database over the same store so the reading
@@ -71,7 +71,7 @@ impl ReadFaults {
     /// For a coordination leaf object, records the read and, if the fault budget
     /// is not exhausted, consumes one unit and returns an injected `Unavailable`.
     fn maybe_fault(&self, path: &str) -> Option<BackendError> {
-        if !(path.contains("/_n/") || path.ends_with("/_i")) {
+        if !(path.contains("/_n/") || path.ends_with("/_r")) {
             return None;
         }
         self.key_reads.fetch_add(1, Ordering::SeqCst);

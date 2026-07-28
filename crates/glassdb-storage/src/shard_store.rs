@@ -1,7 +1,7 @@
-//! Compare-and-swap I/O for the v2 coordination objects (ADR-031).
+//! Compare-and-swap storage for the v2 coordination objects (ADR-031).
 //!
-//! B-link nodes (`{prefix}/_n/<token>`) and collection roots (`{prefix}/_i`)
-//! are the coordination units. Each mutation is a create-if-absent, a
+//! B-link nodes (`{prefix}/_r` and `{prefix}/_n/<token>`) are the coordination
+//! units. Each mutation is a create-if-absent, a
 //! version-conditional compare-and-swap, or an exact-revision delete
 //! (ADR-023/ADR-042).
 //!
@@ -17,7 +17,6 @@ use crate::cached_store::{
 };
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
-use crate::root::CollectionRoot;
 use crate::shard::Shard;
 use crate::structlog::StructuralLog;
 use crate::timeline::SequencePoint;
@@ -25,156 +24,39 @@ use crate::timeline::SequencePoint;
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
-/// Reads and compare-and-swaps B-link node and collection-root objects.
+/// Reads and compare-and-swaps B-link nodes.
 #[derive(Clone)]
 pub struct ShardStore {
-    roots: crate::cached_store::TypedCachedStore<CollectionRoot>,
     nodes: crate::cached_store::TypedCachedStore<Node>,
     structural_logs: crate::cached_store::TypedCachedStore<StructuralLog>,
 }
 
-/// A B-link leaf loaded for one coordination round (ADR-031): its per-key
-/// `entries`, the backing object's observation, and the private [`LeafKind`]
-/// context needed to write the entries back into the right object kind. The leaf is the CAS unit for its keys; it
-/// lives either in the collection root `_i` (a small collection's single leaf)
-/// or in a standalone node `_n`.
+/// A B-link leaf loaded for one coordination round.
 pub struct LoadedLeaf {
     pub entries: Shard,
     /// Node-level coordination staged independently from topology.
     pub locks: NodeLocks,
     pub observation: LeafObservation,
-    kind: LeafKind,
+    node: Node,
 }
 
-/// The exact root or node state from which a loaded leaf was decoded.
-#[derive(Clone, Debug)]
-pub enum LeafObservation {
-    Root(Observation<CollectionRoot>),
-    Node(Observation<Node>),
-}
+/// The exact node state from which a leaf was decoded.
+pub type LeafObservation = Observation<Node>;
 
-/// The outcome of checking whether a retained leaf observation is still current.
-pub enum LeafObservationCheck {
-    /// The retained leaf observation remains current after the required bound.
-    Current,
-    /// The backing root or node changed; here is its current observation.
-    Changed(LeafObservation),
-}
-
-impl LeafObservation {
-    /// Returns the decoded node when the backing object exists.
-    pub fn node(&self) -> Option<&Node> {
-        match self {
-            LeafObservation::Root(observed) => observed.value().map(|root| root.node()),
-            LeafObservation::Node(observed) => observed.value().map(Arc::as_ref),
-        }
-    }
-
-    /// Reports whether the backing object was absent.
-    pub fn is_absent(&self) -> bool {
-        match self {
-            LeafObservation::Root(observed) => observed.is_absent(),
-            LeafObservation::Node(observed) => observed.is_absent(),
-        }
-    }
-
-    /// Returns the backing object's portable revision token when present.
-    pub fn revision(&self) -> Option<&crate::cached_store::Revision> {
-        match self {
-            LeafObservation::Root(observed) => observed.revision(),
-            LeafObservation::Node(observed) => observed.revision(),
-        }
-    }
-
-    /// Reports whether all physical state for this leaf came from cache.
-    pub fn cache_hit(&self) -> bool {
-        match self {
-            LeafObservation::Root(observed) => observed.cache_hit(),
-            LeafObservation::Node(observed) => observed.cache_hit(),
-        }
-    }
-
-    /// Reports whether two observations describe the same exact leaf state.
-    pub fn same_state(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LeafObservation::Root(left), LeafObservation::Root(right)) => left.same_state(right),
-            (LeafObservation::Node(left), LeafObservation::Node(right)) => left.same_state(right),
-            _ => false,
-        }
-    }
-
-    /// The watermark after which this exact leaf state was known to be current.
-    pub fn current_after(&self) -> SequencePoint {
-        match self {
-            LeafObservation::Root(observed) => observed.current_after(),
-            LeafObservation::Node(observed) => observed.current_after(),
-        }
-    }
-}
+/// The outcome of checking a retained leaf observation.
+pub type LeafObservationCheck = ObservationCheck<Node>;
 
 impl LoadedLeaf {
-    /// The reconstruction context handed back to [`ShardStore::store_leaf`].
-    pub fn kind(&self) -> &LeafKind {
-        &self.kind
-    }
-
     /// Returns the complete node carrying this leaf's entries and coordination.
     pub fn node(&self) -> &Node {
-        match &self.kind {
-            LeafKind::Root(root) => root.node(),
-            LeafKind::Node(node) => node,
-        }
+        &self.node
     }
 
     /// Reports whether this loaded leaf still owns `key` — i.e. `key` is below
     /// its high-key. A `false` result means a split moved `key` to a right
-    /// sibling after the key was routed here, so a caller must re-descend rather
-    /// than mutate this (now wrong) leaf (ADR-031). The collection root leaf
-    /// `_i` spans the whole key space until it splits into an index, so it
-    /// always owns `key`.
+    /// sibling after the key was routed here, so a caller must re-descend.
     pub fn owns(&self, key: &[u8]) -> bool {
-        match &self.kind {
-            LeafKind::Root(_) => true,
-            LeafKind::Node(node) => node.owns(key),
-        }
-    }
-}
-
-/// How a leaf's entries are written back to storage, preserving everything the
-/// entries do not own: the collection metadata when the leaf is the root `_i`,
-/// or the high-key/right-sibling when it is a standalone node `_n`. Opaque:
-/// produced by [`ShardStore::load_leaf`] and consumed by
-/// [`ShardStore::store_leaf`].
-pub enum LeafKind {
-    /// The leaf is the root node carried in the collection root `_i`; the stored
-    /// [`CollectionRoot`] is preserved (child directory and node metadata) with
-    /// only its node replaced.
-    Root(CollectionRoot),
-    /// The leaf is a standalone node `_n`; its bounds are preserved.
-    Node(Node),
-}
-
-impl Codec for CollectionRoot {
-    type Value = CollectionRoot;
-
-    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
-        CollectionRoot::decode(body)
-    }
-
-    fn encode(root: &Self::Value) -> Result<Vec<u8>, StorageError> {
-        Ok(root.encode())
-    }
-
-    fn size(root: &Self::Value) -> usize {
-        root.encode().len()
-    }
-
-    fn valid_path(path: &str) -> bool {
-        paths::is_collection_info(path)
-    }
-
-    fn name() -> &'static str {
-        "collection root"
+        self.node.owns(key)
     }
 }
 
@@ -190,11 +72,12 @@ impl Codec for Node {
     }
 
     fn size(node: &Self::Value) -> usize {
-        node.encode().len()
+        node.encoded_len()
     }
 
     fn valid_path(path: &str) -> bool {
-        paths::parse(path).is_ok_and(|parsed| parsed.typ == paths::Type::Node)
+        paths::parse(path)
+            .is_ok_and(|parsed| matches!(parsed.typ, paths::Type::TreeRoot | paths::Type::Node))
     }
 
     fn name() -> &'static str {
@@ -238,7 +121,6 @@ impl ShardStore {
     /// Creates a shard store that reads and compare-and-swaps through `objects`.
     pub fn new(objects: CachedStore) -> Self {
         ShardStore {
-            roots: objects.typed(),
             nodes: objects.typed(),
             structural_logs: objects.typed(),
         }
@@ -250,47 +132,51 @@ impl ShardStore {
         observed: &LeafObservation,
         bound: SequencePoint,
     ) -> Result<LeafObservationCheck, StorageError> {
-        match observed {
-            LeafObservation::Root(root) => match self.roots.check_current(root, bound).await? {
-                ObservationCheck::Current => Ok(LeafObservationCheck::Current),
-                ObservationCheck::Changed(changed) => Ok(LeafObservationCheck::Changed(
-                    LeafObservation::Root(changed),
-                )),
-            },
-            LeafObservation::Node(node) => match self.nodes.check_current(node, bound).await? {
-                ObservationCheck::Current => Ok(LeafObservationCheck::Current),
-                ObservationCheck::Changed(changed) => Ok(LeafObservationCheck::Changed(
-                    LeafObservation::Node(changed),
-                )),
-            },
-        }
+        self.nodes.check_current(observed, bound).await
     }
 
-    /// Loads the B-link root node from the collection root `_i` under `prefix`,
-    /// or `None` if the collection does not exist yet (ADR-031). The root object
-    /// carries both the node and the collection metadata; this returns just the
-    /// node (a leaf while small, an index once grown) and its exact observation.
+    /// Loads the fixed B-link tree root under `prefix`.
     pub async fn load_root_node(
         &self,
         prefix: &str,
         requirement: Requirement,
     ) -> Result<Option<(Node, LeafObservation)>, StorageError> {
         let observation = self.load_root_state(prefix, requirement).await?;
-        let node = observation.node().cloned();
+        let node = observation.value().map(|node| node.as_ref().clone());
         Ok(node.map(|node| (node, observation)))
     }
 
-    /// Loads the root object's exact observation, including observed absence.
+    /// Loads the fixed tree root's exact observation, including absence.
     pub async fn load_root_state(
         &self,
         prefix: &str,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        let observed = self
-            .roots
-            .read(&paths::collection_info(prefix), requirement)
-            .await?;
-        Ok(LeafObservation::Root(observed))
+        self.load_node_at_state(&paths::tree_root(prefix), requirement)
+            .await
+    }
+
+    /// Loads an exact `_r` or `_n/<token>` node observation, including absence.
+    pub async fn load_node_at_state(
+        &self,
+        path: &str,
+        requirement: Requirement,
+    ) -> Result<LeafObservation, StorageError> {
+        self.nodes.read(path, requirement).await
+    }
+
+    /// Loads an existing node at an exact `_r` or `_n/<token>` path.
+    pub async fn load_node_at(
+        &self,
+        path: &str,
+        requirement: Requirement,
+    ) -> Result<(Node, LeafObservation), StorageError> {
+        let observed = self.load_node_at_state(path, requirement).await?;
+        let node = observed
+            .value()
+            .map(|node| node.as_ref().clone())
+            .ok_or(StorageError::NotFound)?;
+        Ok((node, observed))
     }
 
     /// Loads the non-root node's exact observation.
@@ -307,7 +193,7 @@ impl ShardStore {
         if observed.is_absent() {
             return Err(StorageError::NotFound);
         }
-        Ok(LeafObservation::Node(observed))
+        Ok(observed)
     }
 
     /// Loads the non-root node named `token` (`{prefix}/_n/<token>`, ADR-031). A
@@ -322,8 +208,9 @@ impl ShardStore {
     ) -> Result<(Node, LeafObservation), StorageError> {
         let observation = self.load_node_state(prefix, token, requirement).await?;
         let node = observation
-            .node()
+            .value()
             .expect("load_node_state rejects absence")
+            .as_ref()
             .clone();
         Ok((node, observation))
     }
@@ -340,22 +227,39 @@ impl ShardStore {
     ) -> Result<bool, StorageError> {
         let path = paths::from_node(prefix, token);
         let res = match expected {
-            Some(LeafObservation::Node(observed)) => {
+            Some(observed) if observed.path() == path => {
                 self.nodes
                     .compare_and_swap(observed, Arc::new(node.clone()))
                     .await
             }
-            Some(LeafObservation::Root(_)) => {
-                return Err(StorageError::other(
-                    "node write received a root observation",
-                ));
-            }
+            Some(_) => return Err(StorageError::other("node observation path changed")),
             None => self.nodes.create(&path, None, Arc::new(node.clone())).await,
         };
         match res {
             Ok(CasResult::Committed(_)) => Ok(true),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Compare-and-swaps an exact `_r` or `_n/<token>` node path.
+    pub async fn store_node_at(
+        &self,
+        path: &str,
+        node: &Node,
+        expected: &LeafObservation,
+    ) -> Result<bool, StorageError> {
+        if expected.path() != path {
+            return Err(StorageError::other("node observation path changed"));
+        }
+        match self
+            .nodes
+            .compare_and_swap(expected, Arc::new(node.clone()))
+            .await
+        {
+            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -472,96 +376,51 @@ impl ShardStore {
         Ok(())
     }
 
-    /// Loads the leaf that lives at object `path` (ADR-031): the root leaf when
-    /// `path` is a collection root `_i`, else a standalone node `_n`. Returns the
-    /// [`StorageError::NotFound`] when the object is missing. Returns
-    /// [`StorageError::Precondition`] if a concurrent split turned the routed
-    /// path into an index, so the caller can re-descend.
+    /// Loads the leaf node at `_r` or `_n/<token>`.
     pub async fn load_leaf(
         &self,
         path: &str,
         requirement: Requirement,
     ) -> Result<LoadedLeaf, StorageError> {
-        if paths::is_collection_info(path) {
-            let observed = self.roots.read(path, requirement).await?;
-            match observed.value() {
-                Some(root) => {
-                    let root = root.as_ref().clone();
-                    let entries = root
-                        .node()
-                        .as_leaf()
-                        .cloned()
-                        .ok_or(StorageError::Precondition)?;
-                    Ok(LoadedLeaf {
-                        entries,
-                        locks: root.node().locks().clone(),
-                        observation: LeafObservation::Root(observed),
-                        kind: LeafKind::Root(root),
-                    })
-                }
-                None => Err(StorageError::NotFound),
+        let observed = self.nodes.read(path, requirement).await?;
+        match observed.value() {
+            Some(node) => {
+                let node = node.as_ref().clone();
+                let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
+                Ok(LoadedLeaf {
+                    entries,
+                    locks: node.locks().clone(),
+                    observation: observed,
+                    node,
+                })
             }
-        } else {
-            let observed = self.nodes.read(path, requirement).await?;
-            match observed.value() {
-                Some(node) => {
-                    let node = node.as_ref().clone();
-                    let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
-                    Ok(LoadedLeaf {
-                        entries,
-                        locks: node.locks().clone(),
-                        observation: LeafObservation::Node(observed),
-                        kind: LeafKind::Node(node),
-                    })
-                }
-                None => Err(StorageError::NotFound),
-            }
+            None => Err(StorageError::NotFound),
         }
     }
 
-    /// Compare-and-swaps the leaf at object `path`, writing `entries` and node
-    /// locks back while preserving root metadata and node topology.
+    /// Compare-and-swaps a leaf while preserving its topology fields.
     pub async fn store_leaf(
         &self,
         path: &str,
         entries: &Shard,
         locks: &NodeLocks,
-        kind: &LeafKind,
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
-        let res = match (kind, expected) {
-            (LeafKind::Root(root), LeafObservation::Root(observed)) => {
-                let mut root = root.clone();
-                let mut node = root.node().clone();
-                node.set_leaf(entries.clone())?;
-                node.set_locks(locks.clone());
-                root.set_node(node);
-                if observed.is_absent() {
-                    return Err(StorageError::NotFound);
-                }
-                self.roots
-                    .compare_and_swap(observed, Arc::new(root))
-                    .await
-                    .map(|result| result.committed())
-            }
-            (LeafKind::Node(node), LeafObservation::Node(observed)) => {
-                let mut node = node.clone();
-                node.set_leaf(entries.clone())?;
-                node.set_locks(locks.clone());
-                if observed.is_absent() {
-                    return Err(StorageError::NotFound);
-                }
-                self.nodes
-                    .compare_and_swap(observed, Arc::new(node))
-                    .await
-                    .map(|result| result.committed())
-            }
-            _ => {
-                return Err(StorageError::other(format!(
-                    "leaf kind does not match observation for {path:?}"
-                )));
-            }
-        };
+        let mut node = expected
+            .value()
+            .ok_or(StorageError::NotFound)?
+            .as_ref()
+            .clone();
+        if expected.path() != path {
+            return Err(StorageError::other("leaf observation path changed"));
+        }
+        node.set_leaf(entries.clone())?;
+        node.set_locks(locks.clone());
+        let res = self
+            .nodes
+            .compare_and_swap(expected, Arc::new(node))
+            .await
+            .map(|result| result.committed());
         match res {
             Ok(committed) => Ok(committed),
             Err(StorageError::NotFound) => Ok(false),
@@ -569,62 +428,32 @@ impl ShardStore {
         }
     }
 
-    /// Loads the collection root under `prefix`, or [`StorageError::NotFound`] if
-    /// the collection does not exist.
+    /// Loads the fixed tree root under `prefix`.
     pub async fn load_root(
         &self,
         prefix: &str,
         requirement: Requirement,
-    ) -> Result<(CollectionRoot, LeafObservation), StorageError> {
-        let observed = self
-            .roots
-            .read(&paths::collection_info(prefix), requirement)
-            .await?;
-        let root = observed
-            .value()
-            .map(|root| root.as_ref().clone())
-            .ok_or(StorageError::NotFound)?;
-        Ok((root, LeafObservation::Root(observed)))
+    ) -> Result<(Node, LeafObservation), StorageError> {
+        self.load_node_at(&paths::tree_root(prefix), requirement)
+            .await
     }
 
-    /// Compare-and-swaps the collection root. Returns `false` on a precondition
-    /// miss, `true` on success.
+    /// Compare-and-swaps the fixed tree root.
     pub async fn store_root(
         &self,
-        _prefix: &str,
-        root: &CollectionRoot,
+        prefix: &str,
+        root: &Node,
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
-        let LeafObservation::Root(expected) = expected else {
-            return Err(StorageError::other(
-                "root write received a node observation",
-            ));
-        };
-        let res = self
-            .roots
-            .compare_and_swap(expected, Arc::new(root.clone()))
-            .await;
-        match res {
-            Ok(CasResult::Committed(_)) => Ok(true),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
-            Err(e) => Err(e),
-        }
+        self.store_node_at(&paths::tree_root(prefix), root, expected)
+            .await
     }
 
-    /// Creates the collection root if absent, reporting whether this call won the
-    /// create (`true`) or found it already present (`false`).
-    pub async fn create_root(
-        &self,
-        prefix: &str,
-        root: &CollectionRoot,
-    ) -> Result<bool, StorageError> {
+    /// Creates the fixed tree root if absent.
+    pub async fn create_root(&self, prefix: &str, root: &Node) -> Result<bool, StorageError> {
         match self
-            .roots
-            .create(
-                &paths::collection_info(prefix),
-                None,
-                Arc::new(root.clone()),
-            )
+            .nodes
+            .create(&paths::tree_root(prefix), None, Arc::new(root.clone()))
             .await
         {
             Ok(CasResult::Committed(_)) => Ok(true),
@@ -633,20 +462,16 @@ impl ShardStore {
         }
     }
 
-    /// Creates a collection root if absent and returns its exact installed
+    /// Creates a fixed tree root if absent and returns its exact installed
     /// observation. `None` means another object already occupies the path.
     pub async fn create_root_observed(
         &self,
         prefix: &str,
-        root: &CollectionRoot,
-    ) -> Result<Option<Observation<CollectionRoot>>, StorageError> {
+        root: &Node,
+    ) -> Result<Option<Observation<Node>>, StorageError> {
         match self
-            .roots
-            .create(
-                &paths::collection_info(prefix),
-                None,
-                Arc::new(root.clone()),
-            )
+            .nodes
+            .create(&paths::tree_root(prefix), None, Arc::new(root.clone()))
             .await?
         {
             CasResult::Committed(observed) => Ok(Some(observed)),
@@ -654,13 +479,9 @@ impl ShardStore {
         }
     }
 
-    /// Deletes the exact observed collection root, converging if it is missing.
-    pub async fn delete_root(
-        &self,
-        expected: &Observation<CollectionRoot>,
-    ) -> Result<(), StorageError> {
-        self.roots.delete(expected).await?;
-        Ok(())
+    /// Deletes the exact observed fixed tree root.
+    pub async fn delete_root(&self, expected: &Observation<Node>) -> Result<(), StorageError> {
+        self.delete_node(expected).await
     }
 
     async fn list_structural_logs_under(
@@ -836,13 +657,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .store_leaf(
-                    &path,
-                    &Shard::new(),
-                    &loaded.locks,
-                    loaded.kind(),
-                    &loaded.observation,
-                )
+                .store_leaf(&path, &Shard::new(), &loaded.locks, &loaded.observation,)
                 .await
                 .unwrap()
         );
@@ -856,7 +671,7 @@ mod tests {
         // load reflects it.
         assert!(
             store
-                .store_leaf(&path, &Shard::new(), &loaded.locks, loaded.kind(), &v1,)
+                .store_leaf(&path, &Shard::new(), &loaded.locks, &v1)
                 .await
                 .unwrap()
         );

@@ -21,6 +21,10 @@ proposes transactional management and all-node deletion fencing on top, using
 ADR-044's structural gate for per-node quiescence. The B-link topology and key
 hot-path decisions here are unchanged.
 
+[ADR-050](050-separate-collection-record-and-tree-root.md) supersedes this
+ADR's combined `_i` collection-record/tree-root representation. The tree now
+starts at fixed `_r`; its topology and split protocol are unchanged.
+
 [ADR-047]: 047-transactional-collection-management.md
 
 ## Context

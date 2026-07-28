@@ -9,8 +9,8 @@ use glassdb_backend::{Backend, StatsBackend};
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DatabaseId, TxId};
 use glassdb_storage::{
-    CachedStore, Directory, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
-    Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
+    CachedStore, CollectionStore, Directory, PersistentCache, PersistentCacheConfig,
+    PersistentCacheMedia, Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
     Algo, CollectionCatalog, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator,
@@ -149,20 +149,16 @@ impl DatabaseBuilder {
             None => (None, Timeline::new()),
         };
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
+        let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects.clone());
         let root_prefix = CollectionAddress::root(name.as_str()).physical_prefix();
-        match shards
-            .load_root(&root_prefix, Requirement::AtLeast(timeline.now()))
-            .await
-        {
-            Ok(_) => {}
-            Err(StorageError::NotFound) => {
-                return Err(Error::internal(
-                    "initialized database is missing its permanent root collection",
-                ));
-            }
-            Err(error) => return Err(Error::from_read(error)),
-        }
+        check_permanent_collection_objects(
+            &records,
+            &shards,
+            &root_prefix,
+            Requirement::AtLeast(timeline.now()),
+        )
+        .await?;
         let tl = TLogger::new(objects.clone(), &name);
         let bg = Arc::new(Background::new());
         let clock = if deterministic_time {
@@ -183,8 +179,6 @@ impl DatabaseBuilder {
             retry,
             protocol_timing,
         );
-        let collection_catalog =
-            CollectionCatalog::new(shards.clone(), tl.clone(), tmon.clone(), retry);
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         // Build the coordinator and splitter as a co-wired pair over one shared
@@ -192,6 +186,7 @@ impl DatabaseBuilder {
         // while leaf splits acquire through the same coordinator.
         let (coord, splitter) = Splitter::with_coordinator(
             bg_weak.clone(),
+            records.clone(),
             shards.clone(),
             timeline.clone(),
             tmon.clone(),
@@ -200,7 +195,15 @@ impl DatabaseBuilder {
             &name,
             split_policy,
         );
-        let locker = Locker::new(coord.clone(), dir, tmon.clone(), retry);
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
+            records.clone(),
+            tl.clone(),
+            tmon.clone(),
+            retry,
+        );
+        let collection_catalog = CollectionCatalog::new(locker.clone());
         let gc = Gc::new(
             bg_weak.clone(),
             tl,
@@ -269,6 +272,31 @@ impl DatabaseBuilder {
             split_policy: SplitPolicy::default(),
             protocol_timing: ProtocolTiming::default(),
         }
+    }
+}
+
+/// Verifies that both physical objects of the permanent collection are present.
+async fn check_permanent_collection_objects(
+    records: &CollectionStore,
+    shards: &ShardStore,
+    prefix: &str,
+    requirement: Requirement,
+) -> Result<(), Error> {
+    match records.load_record(prefix, requirement).await {
+        Ok(_) => {}
+        Err(StorageError::NotFound) => {
+            return Err(Error::internal(
+                "initialized database is missing its permanent collection record",
+            ));
+        }
+        Err(error) => return Err(Error::from_read(error)),
+    }
+    match shards.load_root(prefix, requirement).await {
+        Ok(_) => Ok(()),
+        Err(StorageError::NotFound) => Err(Error::internal(
+            "initialized database is missing its permanent tree root",
+        )),
+        Err(error) => Err(Error::from_read(error)),
     }
 }
 

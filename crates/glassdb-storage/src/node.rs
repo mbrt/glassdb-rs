@@ -29,7 +29,7 @@ use crate::shard::{Shard, ShardEntry};
 use glassdb_data::TxId;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
-/// root has no token; it lives at the fixed `_i` path.
+/// root has no token; it lives at the fixed `_r` path.
 pub type NodeToken = String;
 
 /// An index node body: the separator keys of an interior node, each mapping the
@@ -503,10 +503,6 @@ impl Node {
     }
 
     /// Returns the mutable node-level coordination state.
-    pub(crate) fn locks_mut(&mut self) -> &mut NodeLocks {
-        &mut self.locks
-    }
-
     /// Replaces the node-level coordination state.
     pub fn set_locks(&mut self, locks: NodeLocks) {
         self.locks = locks;

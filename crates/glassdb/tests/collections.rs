@@ -92,7 +92,12 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
     assert_eq!(
         objects.iter().filter(|path| path.ends_with("/_i")).count(),
         2,
-        "the clean race loser must reclaim its unpublished root"
+        "the clean race loser must reclaim its unpublished record"
+    );
+    assert_eq!(
+        objects.iter().filter(|path| path.ends_with("/_r")).count(),
+        2,
+        "the clean race loser must reclaim its unpublished tree root"
     );
 }
 
@@ -209,8 +214,8 @@ async fn bound_handle_data_access_does_not_revalidate_its_logical_path() {
     assert!(
         operations
             .iter()
-            .all(|operation| operation.path != "example/_c/0000000000000000000000/_i"),
-        "bound data access must route by collection ID without rereading its parent directory"
+            .all(|operation| !operation.path.ends_with("/_i")),
+        "bound data access must not read collection records"
     );
 }
 
@@ -236,7 +241,7 @@ async fn collection_names_are_validated_before_io() {
 }
 
 #[tokio::test]
-async fn collection_directories_respect_the_root_size_limit() {
+async fn collection_directories_respect_the_record_size_limit() {
     let db = Database::builder("example", MemoryBackend::new())
         .split_policy(SplitPolicy {
             node_max_bytes: 256,
@@ -291,19 +296,43 @@ async fn string_names_are_converted_to_collection_paths() {
 }
 
 #[tokio::test]
-async fn initialized_database_never_recreates_a_missing_permanent_root() {
+async fn initialized_database_never_recreates_a_missing_permanent_record() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
     db.shutdown().await;
 
-    let root_path = "example/_c/0000000000000000000000/_i";
+    let record_path = "example/_c/0000000000000000000000/_i";
+    let record = backend.read(record_path).await.unwrap();
+    backend
+        .delete_if(record_path, &record.version)
+        .await
+        .unwrap();
+
+    let reopened = Database::open("example", backend.clone()).await;
+    assert!(
+        matches!(reopened, Err(Error::Internal { .. })),
+        "a missing permanent record must be reported as corruption"
+    );
+    assert!(matches!(
+        backend.read(record_path).await,
+        Err(glassdb::backend::BackendError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn initialized_database_never_recreates_a_missing_permanent_tree_root() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    db.shutdown().await;
+
+    let root_path = "example/_c/0000000000000000000000/_r";
     let root = backend.read(root_path).await.unwrap();
     backend.delete_if(root_path, &root.version).await.unwrap();
 
     let reopened = Database::open("example", backend.clone()).await;
     assert!(
         matches!(reopened, Err(Error::Internal { .. })),
-        "a missing permanent root must be reported as corruption"
+        "a missing permanent tree root must be reported as corruption"
     );
     assert!(matches!(
         backend.read(root_path).await,
@@ -312,7 +341,7 @@ async fn initialized_database_never_recreates_a_missing_permanent_root() {
 }
 
 #[tokio::test]
-async fn missing_bound_root_is_not_empty_or_recreated_by_data_operations() {
+async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() {
     let backend = Arc::new(MemoryBackend::new());
     let creator = Database::open("example", backend.clone()).await.unwrap();
     creator
@@ -322,14 +351,14 @@ async fn missing_bound_root_is_not_empty_or_recreated_by_data_operations() {
         .unwrap();
     creator.shutdown().await;
 
-    let permanent_root = "example/_c/0000000000000000000000/_i";
+    let permanent_root = "example/_c/0000000000000000000000/_r";
     let child_root = backend
         .list("example/_c/", None, ListLimit::new(100).unwrap())
         .await
         .unwrap()
         .objects
         .into_iter()
-        .find(|path| path.ends_with("/_i") && path != permanent_root)
+        .find(|path| path.ends_with("/_r") && path != permanent_root)
         .unwrap();
     let observed = backend.read(&child_root).await.unwrap();
     backend

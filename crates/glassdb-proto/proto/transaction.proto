@@ -65,7 +65,7 @@ message EntryLock {
 
 message MembershipLock {
     oneof target {
-        // The collection root object (`_i`). Always encoded as true.
+        // The fixed tree root object (`_r`). Always encoded as true.
         bool root = 1;
         // The opaque token of a standalone node object (`_n/<token>`).
         string node = 2;
@@ -181,24 +181,18 @@ message DatabaseMetadata {
     bytes database_id = 2;
 }
 
-// The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
-// root node - a leaf while the collection is small, an index once it grows - and
-// also carries the collection metadata: the subcollection directory. Membership
-// (create/delete) is coordinated per-key in the owning leaf, so the root holds
-// no membership lock. Supersedes ADR-018's fixed-shard_count root.
-message CollectionRoot {
-    // The B-link tree root node. Its high-key is +infinity and its right-sibling
-    // is empty (the root has no siblings).
-    Node node = 1;
+// Collection metadata stored at `{prefix}/_i` (ADR-050). The B-link tree begins
+// independently at `{prefix}/_r`; data-path operations do not read this record.
+message CollectionRecord {
     // Direct child bindings, sorted by raw name so the encoding is canonical.
-    repeated CollectionDirectoryEntry children = 2;
-    // Root-wide transactional coordination for the bounded child directory.
-    NodeLock directory_lock = 3;
-    uint64 directory_version = 4;
+    repeated CollectionDirectoryEntry children = 1;
+    // Transactional coordination for the bounded child directory.
+    NodeLock directory_lock = 2;
+    uint64 directory_version = 3;
     // Collection topology is frozen while this transaction prepares a drop.
-    bytes topology_freeze = 5;
+    bytes topology_freeze = 4;
     // Structural operations that joined before the freeze was installed.
-    repeated bytes topology_participants = 6;
+    repeated bytes topology_participants = 5;
 }
 
 message CollectionDirectoryEntry {

@@ -47,7 +47,7 @@ native metadata PATCH (`ifMetagenerationMatch`) and encodes both `generation` an
 The v2 layout ([ADR-017](017-shard-object.md)–[ADR-021](021-wound-wait-leases-shard.md))
 keeps **all** coordination state in object **content** and mutates it **only by
 content CAS**. The shard/root I/O
-([`crates/glassdb-storage/src/shardstore.rs`](../../crates/glassdb-storage/src/shardstore.rs))
+([`crates/glassdb-storage/src/shard_store.rs`](../../crates/glassdb-storage/src/shard_store.rs))
 uses just `read` / `write_if` / `write_if_not_exists`, always with `Tags::new()`.
 So `set_tags_if`, `get_metadata`, `delete_if`, the S3 nonce, and all
 tags / `WriterId` are dead weight once v1 is gone — **with one exception**.

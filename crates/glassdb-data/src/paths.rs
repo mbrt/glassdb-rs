@@ -125,14 +125,14 @@ impl LeafRef {
     /// Renders the exact physical backend object path of this leaf.
     pub fn physical_path(&self) -> String {
         match self {
-            LeafRef::Root(collection) => collection_info(&collection.physical_prefix()),
+            LeafRef::Root(collection) => tree_root(&collection.physical_prefix()),
             LeafRef::Node { collection, token } => from_node(&collection.physical_prefix(), token),
         }
     }
 
     /// Parses a physical collection-root or node path.
     pub fn from_physical_path(path: &str) -> Result<Self, PathError> {
-        if let Some(prefix) = path.strip_suffix("/_i") {
+        if let Some(prefix) = path.strip_suffix("/_r") {
             return Ok(LeafRef::root(CollectionAddress::from_physical_prefix(
                 prefix,
             )?));
@@ -158,18 +158,21 @@ pub const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
 pub enum Type {
     Unknown,
     Transaction,
-    CollectionInfo,
+    CollectionRecord,
+    /// The fixed B-link tree root object (`_r`, ADR-050).
+    TreeRoot,
     /// A B-link tree node object (`_n/<token>`, ADR-031).
     Node,
 }
 
 impl Type {
-    /// Returns the physical object marker (`_t`, `_i`, `_n`, or `""`).
+    /// Returns the physical object marker (`_t`, `_i`, `_r`, `_n`, or `""`).
     pub fn as_str(self) -> &'static str {
         match self {
             Type::Unknown => "",
             Type::Transaction => "_t",
-            Type::CollectionInfo => "_i",
+            Type::CollectionRecord => "_i",
+            Type::TreeRoot => "_r",
             Type::Node => "_n",
         }
     }
@@ -214,14 +217,24 @@ pub struct ParseResult {
     pub typ: Type,
 }
 
-/// Returns the storage path for the collection-info object under `prefix`.
-pub fn collection_info(prefix: &str) -> String {
+/// Returns the storage path for the collection record under `prefix`.
+pub fn collection_record(prefix: &str) -> String {
     format!("{prefix}/_i")
 }
 
-/// Reports whether `p` refers to a collection-info object.
-pub fn is_collection_info(p: &str) -> bool {
+/// Reports whether `p` refers to a collection record.
+pub fn is_collection_record(p: &str) -> bool {
     p.ends_with("/_i")
+}
+
+/// Returns the storage path for the fixed B-link tree root under `prefix`.
+pub fn tree_root(prefix: &str) -> String {
+    format!("{prefix}/_r")
+}
+
+/// Reports whether `p` refers to a fixed B-link tree root object.
+pub fn is_tree_root(p: &str) -> bool {
+    p.ends_with("/_r")
 }
 
 /// Encodes a transaction ID into a storage path under `prefix`.
@@ -402,11 +415,18 @@ pub fn random_node_token() -> String {
 
 /// Splits a storage path into its prefix, type, and suffix components.
 pub fn parse(p: &str) -> Result<ParseResult, PathError> {
-    if is_collection_info(p) {
+    if is_collection_record(p) {
         return Ok(ParseResult {
             prefix: p[..p.len() - 3].to_string(),
             suffix: String::new(),
-            typ: Type::CollectionInfo,
+            typ: Type::CollectionRecord,
+        });
+    }
+    if is_tree_root(p) {
+        return Ok(ParseResult {
+            prefix: p[..p.len() - 3].to_string(),
+            suffix: String::new(),
+            typ: Type::TreeRoot,
         });
     }
     if let Some((prefix, shard, suffix)) = sharded_transaction_parts(p)
@@ -497,12 +517,21 @@ mod tests {
     }
 
     #[test]
-    fn collection_info_paths() {
-        assert_eq!(collection_info("foo/bar"), "foo/bar/_i");
-        assert!(is_collection_info("foo/bar/_i"));
+    fn collection_record_paths() {
+        assert_eq!(collection_record("foo/bar"), "foo/bar/_i");
+        assert!(is_collection_record("foo/bar/_i"));
         let r = parse("foo/bar/_i").unwrap();
         assert_eq!(r.prefix, "foo/bar");
-        assert_eq!(r.typ, Type::CollectionInfo);
+        assert_eq!(r.typ, Type::CollectionRecord);
+    }
+
+    #[test]
+    fn tree_root_paths() {
+        assert_eq!(tree_root("foo/bar"), "foo/bar/_r");
+        assert!(is_tree_root("foo/bar/_r"));
+        let parsed = parse("foo/bar/_r").unwrap();
+        assert_eq!(parsed.prefix, "foo/bar");
+        assert_eq!(parsed.typ, Type::TreeRoot);
     }
 
     #[test]
@@ -607,6 +636,7 @@ mod tests {
             from_transaction("db", &TxId::from_bytes(vec![1, 2, 3, 4])),
             "db/_t/0F/0F8310"
         );
-        assert_eq!(collection_info("db/root"), "db/root/_i");
+        assert_eq!(collection_record("db/root"), "db/root/_i");
+        assert_eq!(tree_root("db/root"), "db/root/_r");
     }
 }

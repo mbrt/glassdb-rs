@@ -17,6 +17,10 @@ unchanged.
 collection management on this identity and resolution model. This ADR is
 deliberately implementable without ADR-047.
 
+[ADR-050](050-separate-collection-record-and-tree-root.md) supersedes the
+combined `_i` record/root layout. Incarnation addressing and direct
+`name → ID` directories are unchanged.
+
 Physical creation and reclamation follow
 [ADR-042](042-conditional-only-backend-mutations.md)'s conditional-only backend
 boundary and [ADR-043](043-causally-coordinated-backend-operations.md)'s

@@ -4,14 +4,14 @@
 pub mod cache;
 mod cache_stats;
 mod cached_store;
+mod collection_store;
 mod directory;
 mod disk_cache;
 mod error;
 mod lock;
 mod node;
-mod root;
 mod shard;
-mod shardstore;
+mod shard_store;
 mod structlog;
 mod timeline;
 mod tlogger;
@@ -37,6 +37,7 @@ pub use cache_stats::CacheStats;
 pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
+pub use collection_store::{CollectionRecord, CollectionStore};
 pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use disk_cache::{
     OpenedPersistentCache, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
@@ -44,9 +45,8 @@ pub use disk_cache::{
 pub use error::StorageError;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};
-pub use root::CollectionRoot;
 pub use shard::{Shard, ShardEntry};
-pub use shardstore::{LeafKind, LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
+pub use shard_store::{LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use timeline::{SequencePoint, Timeline};
 pub use tlogger::{

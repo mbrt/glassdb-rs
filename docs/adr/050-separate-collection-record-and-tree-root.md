@@ -2,14 +2,15 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
-On acceptance, this supersedes the ADR-031 and ADR-046 clauses that make `_i`
+This supersedes the ADR-031 and ADR-046 clauses that make `_i`
 both the collection record and the B-link tree root. The B-link topology,
 fixed-address root split, transactional collection semantics, and all-node
 deletion fencing remain unchanged.
 
-Implementation, format compatibility, and rollout are deferred.
+This changes the unreleased v2 layout in place. Development databases use the
+new format directly; there is no migration or compatibility fallback.
 
 ## Context
 
@@ -57,6 +58,13 @@ directory binding. A visible binding therefore implies that the collection
 record and tree root have both been prepared. Partial preparation remains
 undiscoverable and recoverable under the collection lifecycle protocol.
 
+Collection topology changes join and leave lifecycle coordination in `_i`, then
+mutate `_r` and `_n` through the ordinary node protocol. Collection drop freezes
+topology in `_i`, fences `_r` and all `_n` nodes, commits the parent-directory
+removal, and later reclaims the data nodes, `_r`, and `_i`. Thus collection
+directory locking and data-node locking have separate physical domains while
+remaining part of one transaction.
+
 ## Consequences
 
 - Collection metadata and root-leaf data no longer share a CAS revision or
@@ -69,8 +77,7 @@ undiscoverable and recoverable under the collection lifecycle protocol.
   access; separation adds no root-pointer lookup or mandatory index level.
 - Each collection uses one additional physical object. Creation, bootstrap,
   recovery, and reclamation must handle the two-object preparation invariant.
-- The physical format changes. Compatibility and migration policy must be
-  decided before implementation.
+- Existing development databases in the earlier v2 format must be recreated.
 
 ## Alternatives considered
 
