@@ -652,17 +652,23 @@ impl Algo {
         if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
         }
-        let result = self.mon.abort_tx(&tx.id).await;
+        match self.mon.abort_tx(&tx.id).await {
+            Ok(()) => {}
+            // The commit point won before cleanup observed its result. Its
+            // collection objects and delete fences now belong to the committed
+            // log and must be left for write-back/recovery.
+            Err(TransError::AlreadyFinalized) => {
+                tx.status = Status::Committed;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let drops = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
-        let drop_cleanup = self
-            .collection_lifecycle
+        self.collection_lifecycle
             .clear_aborted_drops(&tx.id, &drops)
-            .await;
+            .await?;
         let prepared = tx.prepared_collections.iter().cloned().collect::<Vec<_>>();
-        let prepared_cleanup = self.collection_lifecycle.reclaim(&prepared).await;
-        result?;
-        drop_cleanup?;
-        prepared_cleanup
+        self.collection_lifecycle.reclaim(&prepared).await
     }
 
     /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
@@ -1962,6 +1968,54 @@ mod tests {
         assert_eq!(log.prepared_collections, vec![earlier, active.clone()]);
         assert_eq!(log.collection_changes.len(), 1);
         assert_eq!(log.collection_changes[0].collection, active);
+    }
+
+    #[tokio::test]
+    async fn end_preserves_prepared_collection_when_commit_won() {
+        let (tm, tctx) = new_algo().await;
+        let prepared = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
+        );
+        assert!(
+            tctx.records
+                .create_record(&prepared.physical_prefix(), &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            tctx.shards
+                .create_root(&prepared.physical_prefix(), &Node::leaf(Shard::new()))
+                .await
+                .unwrap()
+        );
+
+        let mut handle = begin_data(&tm, Data::default());
+        let id = handle.id().clone();
+        tm.mon.begin_tx(&id);
+        handle.status = Status::Validating;
+        handle.engaged = true;
+        handle.prepared_collections.insert(prepared.clone());
+        tm.commit_writes(
+            &Data::default(),
+            &CollectionData::default(),
+            &handle.prepared_collections,
+            Vec::new(),
+            &id,
+        )
+        .await
+        .unwrap();
+
+        tm.end(&mut handle).await.unwrap();
+
+        tctx.records
+            .load_record(&prepared.physical_prefix(), Requirement::Any)
+            .await
+            .expect("committed collection record must survive cleanup");
+        tctx.shards
+            .load_root(&prepared.physical_prefix(), Requirement::Any)
+            .await
+            .expect("committed collection tree root must survive cleanup");
     }
 
     #[tokio::test]
