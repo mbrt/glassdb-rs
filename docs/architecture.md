@@ -476,14 +476,24 @@ When transactions _do_ conflict:
 
 Lock state lives in the **content** of the shard objects (`_s/<i>`), not in object
 tags. Each shard holds a directory of per-key entries; a locked key's entry
-records its lock type, the set of holding transactions, and the current writer
-(`glassdb-storage/src/shard.rs`, `lock.rs`):
+records its lock type, the set of holding transactions, and the key's current
+value state (`glassdb-storage/src/shard.rs`, `lock.rs`):
 
-| Field            | Values             | Purpose                                        |
-| ---------------- | ------------------ | ---------------------------------------------- |
-| `lock-type`      | `r`, `w`, `c`, `-` | Current lock type (read, write, create, none)  |
-| `locked-by`      | tx IDs             | Which transactions hold the lock               |
-| `current-writer` | tx ID              | Transaction that last wrote this key           |
+| Field        | Values                                        | Purpose                                       |
+| ------------ | --------------------------------------------- | --------------------------------------------- |
+| `lock-type`  | `r`, `w`, `c`, `-`                            | Current lock type (read, write, create, none) |
+| `locked-by`  | tx IDs                                        | Which transactions hold the lock              |
+| `current`    | absent, external, inline, tombstone (+ writer) | Who last wrote this key, and where its value is |
+
+The `current` state is tagged (`CurrentState`,
+[ADR-051](adr/051-inline-latest-values.md)): `External` names a writer whose
+value lives in its transaction object, `Inline` carries the committed bytes
+authoritatively in the entry itself, and `Tombstone` records a committed delete.
+A latest read of an inline or tombstoned entry needs no transaction-object read
+at all. Inlining is bounded by an `InlinePolicy` (per-value and per-leaf byte
+budgets, `DatabaseBuilder::inline_policy`); a value that misses either budget is
+published as `External`, and an existing inline value is never demoted to make
+room for a new one.
 
 Lock acquisition is a compare-and-swap on the shard *object*: read the current
 shard and its version, compute the new lock state for every requested key that
@@ -560,11 +570,14 @@ The validate-and-commit sequence:
 3. **Write transaction log.** Write the log object atomically. After this point,
    the transaction is considered committed.
 
-4. **Async write-back.** Write the new values to each modified key and release
-   locks. This can happen asynchronously because the transaction log is the
-   source of truth. If the client crashes, another transaction can read the log
-   and complete the write-back (or just observe the committed values from the
-   log).
+4. **Async write-back.** Publish the new current state for each modified key and
+   release locks. A committed value small enough for the inline budgets is
+   written into the leaf entry itself, so later readers skip the transaction
+   object; a larger one is published as an `External` pointer, and a delete as a
+   `Tombstone`. This can happen asynchronously because the transaction log is
+   the source of truth. If the client crashes, another transaction can read the
+   log and complete the write-back (or just observe the committed values from
+   the log).
 
 ### Optimizations
 
@@ -588,12 +601,35 @@ mutation can produce), which the caller may safely retry. See
 [ADR-015](adr/015-read-unavailability.md).
 
 This makes read-heavy workloads very efficient — the happy path requires only
-one value read plus one metadata read per key, with zero writes.
+one metadata read per key, with zero writes, plus one value read for keys whose
+current value is not inline.
 
-#### Single read-modify-write
+#### Single read-modify-write, logless
+
+A transaction that overwrites exactly one existing key with an inline-eligible
+value commits in **one** conditional leaf CAS — no lock, no transaction object,
+no write-back ([ADR-051](adr/051-inline-latest-values.md)). The CAS installs
+`Inline { writer: txid, value }` with no lock holder, which is simultaneously the
+commit point and the published value: a reader that sees it needs nothing else,
+and a reader that does not see it observes the predecessor. Eligibility is
+decided before anything is written — a live pending or unknown holder, an
+exclusive structural gate, a collection-delete intent, a moved read version, or a
+value over either inline budget makes the transaction fall through to the logged
+path below under the same id.
+
+Because the commit is invisible until the CAS lands, a retry is proved
+idempotent by the entry already naming this transaction as its inline writer, and
+a cancelled attempt writes no aborted object (the abort guard fires only for a
+transaction that took a logged identity). The coordinator reserves the key for at
+most one logless member per round, so a batched blind writer cannot erase another
+direct commit's recovery evidence. An uncertain CAS followed by a moved entry
+surfaces `Error::InDoubt` as usual.
+
+#### Single read-modify-write, logged
 
 A transaction that overwrites exactly one existing key commits with two
-**parallel** writes instead of the full sequence (ADR-027):
+**parallel** writes instead of the full sequence (ADR-027). This is the fallback
+when the logless path above does not apply:
 
 1. Load the shard and resolve the key's holders. A committed-but-not-written-back
    holder is help-forwarded to its effective writer; a *live pending* holder, a
@@ -602,10 +638,10 @@ A transaction that overwrites exactly one existing key commits with two
    full locked path under the same id.
 2. Issue in parallel: the committed transaction object (`_t/<ss>/<txid>`,
    recording its held lock so GC can prune it) **and** one shard CAS that
-   installs a write lock and help-forwards the resolved predecessor into
-   `current_writer`.
-3. Asynchronously, write-back converts the lock into `current_writer = txid` and
-   releases it (through the same deduplicated coordinator path).
+   installs a write lock and help-forwards the resolved predecessor into the
+   entry's current state.
+3. Asynchronously, write-back publishes this transaction as the current writer
+   and releases the lock (through the same deduplicated coordinator path).
 
 The transaction is committed iff both writes land (the committed object exists
 and the lock is in the shard's chain). Because it holds a lock during the short
@@ -727,8 +763,9 @@ All typed physical objects share one byte-weighted, path-keyed LRU under a
 single `cache_size` budget. Codecs provide encoding, decoding, and decoded-size
 accounting. A physical path has one decoded type; accessing the same path
 through another codec is an internal error. Key values are not cached
-separately: the reader derives a value from its leaf's effective writer and that
-writer's decoded transaction object.
+separately: the reader derives a value from its leaf's effective writer — either
+from the inline bytes the leaf already carries, or from that writer's decoded
+transaction object.
 
 The LRU (`glassdb-storage/src/cache.rs`) has a 512 MiB default budget,
 configurable through `DatabaseBuilder::cache_size`, and evicts least-recently
@@ -967,7 +1004,9 @@ token for the conditional write that takes the lock.
 A transaction object is **live** exactly while some data node or collection
 record still references its txid (entry, membership, directory, or topology
 coordination), so garbage collection is a reachability problem rather than a
-timer. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
+timer. A logless direct commit ([ADR-051](adr/051-inline-latest-values.md)) names
+a writer that never had an object, which is not a dangling reference: only
+existing objects are candidates, and one is dead once nothing names it. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
 candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 
 - **Reverse liveness check.** A forward mark (list every shard, union the
@@ -975,8 +1014,8 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   candidate `_t/` object records its own back-references (its `locks ∪ writes`),
   so GC reads a batch of candidates and confirms each one dead by GET-ing only
   the handful of nodes/records it names — never a database-wide scan.
-- **Candidate feed.** Candidates come from the write-back hint queue (the
-  `current-writer` a fresh commit just superseded, capped at `HINT_QUEUE_CAP`)
+- **Candidate feed.** Candidates come from the write-back hint queue (the writer
+  a fresh commit just superseded, capped at `HINT_QUEUE_CAP`)
   and shuffled passes over the 4,096 `{db}/_t/<ss>/` prefixes, which make the
   candidate set complete regardless of lost hints. Each cycle stops after one
   non-empty page or a bounded number of listing requests; an invalid provider
@@ -990,7 +1029,7 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
   so the release batches through the same shard-mutation coordinator as live
   traffic (ADR-029); the entry left behind is pruned as a fold property when it
-  becomes vestigial (no holder, no `current-writer`). It retains the candidate
+  becomes vestigial (no holder and an absent current state). It retains the candidate
   log observation and conditionally deletes only that exact revision.
 - **Background execution.** Sweeps run every `GC_INTERVAL` on the `Background`
   task manager and do not block transaction processing. Background loops are torn

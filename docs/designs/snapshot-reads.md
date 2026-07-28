@@ -334,8 +334,8 @@ Helpers and sealers reverify immutable payload digests. A root is mutable after
 visibility, so its immutable witness proves the initial body while its current
 body is checked only for the same stable incarnation binding. Thus observing a
 committed certificate still implies that every value and prepared routing root
-exists, preserving the invariant that the current unified transaction object
-provides. The commit certificate and epoch admission may later be co-issued
+exists, preserving the durability invariant of the current latest-value
+protocol. The commit certificate and epoch admission may later be co-issued
 behind a small two-part candidate certificate because all intents and payloads
 are already visible. The baseline proof does not rely on that latency
 optimization.
@@ -420,8 +420,10 @@ The greenfield format separates:
 
 Every write, including full commits, records the actual effective predecessor
 observed while its install lock is held. The leaf entry names the current history
-head. Indexed history lookup finds the newest certified version at or before the
-snapshot epoch without work linear in the number of retained overwrites.
+head and may also carry ADR-051's inline current bytes for strict latest reads.
+Those bytes never replace the immutable history payload or certificate. Indexed
+history lookup finds the newest certified version at or before the snapshot
+epoch without work linear in the number of retained overwrites.
 
 A tombstone is a normal version. Following the same chain therefore handles
 create, delete, and recreate without treating an absent current key as proof that
@@ -438,9 +440,9 @@ Only after GC proves every such cut observes absence may it prune the directory
 entry, tombstone, and obsolete history. Point lookup and forward `KeyScan`
 traversal depend on this enumeration invariant.
 
-The value cache is keyed by `(logical path, writer)`. A separate latest-value
-alias may accelerate strict reads, but a historical value can never populate or
-poison that alias.
+The value cache is keyed by `(logical path, writer)`. ADR-051's inline leaf state
+is the latest-value shortcut for strict reads, but a historical value can never
+populate or poison that current state.
 
 ### Catalog
 
@@ -531,21 +533,24 @@ deletes promised history early. During the operational `disabled` state it
 retains latest-state roots and compact epoch fences; rebuilding a new history
 floor is required before snapshot admission resumes.
 
-## Mandatory write path and optional single read-write optimization
+## Mandatory write path and future single read-write optimization
 
-ADR-027's exact one-wave fast path deliberately publishes its transaction object
-and its first write intent in parallel. That is the opposite of the baseline's
-intent-before-admission ordering. Running epoch admission beside those two writes
-is not sufficient: a later-epoch transaction can read the old value while the
-older install is delayed, creating a serialization edge that crosses epochs in
-the wrong direction.
+ADR-051's inline fast path commits with one leaf CAS and emits no external
+history or transaction object. ADR-027's non-inline fallback publishes its
+transaction object and first write intent in parallel. Neither satisfies the
+baseline's intent-before-admission and mandatory-history ordering. Running epoch
+admission beside either path is not sufficient: a later-epoch transaction can
+read the old value while the older install is delayed, creating a serialization
+edge that crosses epochs in the wrong direction.
 
-The current fast path therefore falls back to the intention-first protocol under
-this design. Epoch admission remains part of the write protocol even while the
-operational switch rejects new snapshots. The proposal does not require the same
-storage-wave shape as ADR-027 or any particular replacement fast path. It is
-acceptable only if the resulting user-visible latency and throughput pass the
-workload gate below.
+Every writer therefore uses the intention-first, history-emitting protocol under
+this design. There is no runtime latest-only database mode, and epoch admission
+and history emission remain part of the write protocol even while the
+operational switch rejects new snapshots. Inline current values remain available
+as a strict-read optimization after certification. Preserving ADR-051-like
+single read-write latency while emitting mandatory history is a research goal,
+not a requirement on the baseline. Any replacement is acceptable only if its
+user-visible latency and throughput pass the workload gate below.
 
 An epoch-aware single-write optimization remains possible future work. Any such
 optimization needs its own ADR and must preserve the epoch-edge, durability, and
@@ -560,10 +565,11 @@ mandatory format/protocol across the primary workloads below. An operationally
 `disabled` snapshot state is not an escape hatch: it changes retention and
 admission, not write format or commit work.
 
-The benchmark plan compares the proposed format with the current ADR-020/027
-format under the same backend latency, concurrency, logical work, value sizes,
-and fault profile. It is explicitly outcome-based: storage-wave count, lane
-layout, and use of a specialized fast path are not pass criteria.
+The benchmark plan compares the proposed format with the current
+ADR-020/027/051 latest-value format under the same backend latency, concurrency,
+logical work, value sizes, and fault profile. It is explicitly outcome-based:
+storage-wave count, lane layout, and use of a specialized fast path are not pass
+criteria.
 
 For every primary workload cell below, the initial reasonableness budget is p95
 and p99 latency at most `1.25x` baseline and statistically converged throughput
@@ -769,8 +775,9 @@ This design extends the object-storage-native transaction protocol and the
 dynamic range-sharding B-link topology. On acceptance:
 
 - ADR-038 inserts epoch admission into ADR-020's commit sequence.
-- ADR-039 supersedes ADR-019's unified value placement and adds retained per-key
-  history to the current-writer model.
+- ADR-039 supersedes ADR-019's unified value placement and ADR-051's logless
+  direct-commit guarantee, adds retained per-key history, and keeps inline
+  current values as a strict-read optimization.
 - ADR-040 supersedes ADR-022's current-reference-only liveness for committed
   values and its cleanup of outcome evidence needed as an epoch fence, while
   retaining its pending-lock recovery machinery and ADR-035's paginated,
@@ -788,6 +795,7 @@ dynamic range-sharding B-link topology. On acceptance:
 - ADR-035's opaque backend-list cursor is independent of key-based
   `KeyScan::after`; neither carries a snapshot between `read_tx` calls.
 
-On acceptance, ADR-038 partially supersedes ADR-027 by replacing its current
-parallel first-intent path with the intention-first baseline. A future certified
-fast-path ADR may optimize that baseline without changing snapshot semantics.
+On acceptance, ADR-038/039 supersede ADR-051's logless direct path and partially
+supersede ADR-027's parallel first-intent fallback with the intention-first,
+history-emitting baseline. A future certified fast-path ADR may optimize that
+baseline without changing snapshot semantics.

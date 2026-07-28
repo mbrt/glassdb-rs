@@ -25,7 +25,7 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::LockType;
-use crate::shard::{Shard, ShardEntry};
+use crate::shard::{CurrentState, Shard, ShardEntry};
 use glassdb_data::TxId;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
@@ -152,20 +152,24 @@ pub struct SplitPolicy {
 }
 
 impl SplitPolicy {
+    /// The encoded content size a node's entries must stay under, reserving
+    /// headroom for transient locks and the split's shrink CAS.
+    pub fn content_limit(&self) -> usize {
+        self.node_max_bytes
+            .saturating_sub(self.split_headroom_bytes)
+    }
+
     /// Reports whether `key` can fit in both a splittable leaf entry and its
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
         let id = TxId::with_priority(0, &[]);
         let entry = ShardEntry {
-            key: key.to_vec(),
             lock_type: LockType::Write,
             locked_by: vec![id.clone()],
-            current_writer: Some(id),
-            deleted: false,
+            current: CurrentState::External { writer: id },
+            ..ShardEntry::new(key)
         };
-        let content_limit = self
-            .node_max_bytes
-            .saturating_sub(self.split_headroom_bytes);
+        let content_limit = self.content_limit();
         let leaf_len = Node::leaf(Shard::from_entries([entry])).content_encoded_len();
         let token = "x".repeat(24);
         let index_len = Node::index(IndexNode::from_children([
@@ -690,7 +694,7 @@ impl Node {
     pub(crate) fn from_pb(raw: pb::Node) -> Result<Self, StorageError> {
         let body = match raw.body {
             Some(pb::node::Body::Index(index)) => NodeBody::Index(IndexNode::from_pb(index)),
-            Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)),
+            Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)?),
             None => NodeBody::Leaf(Shard::new()),
         };
         let structure = NodeLock::from_pb(raw.structure_lock);
@@ -762,11 +766,21 @@ mod tests {
 
     fn entry(key: &[u8], writer: u8) -> ShardEntry {
         ShardEntry {
-            key: key.to_vec(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: Some(TxId::from_bytes(vec![writer])),
-            deleted: false,
+            current: CurrentState::External {
+                writer: TxId::from_bytes(vec![writer]),
+            },
+            ..ShardEntry::new(key)
+        }
+    }
+
+    fn golden_entry() -> ShardEntry {
+        ShardEntry {
+            lock_type: LockType::Write,
+            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
+            current: CurrentState::External {
+                writer: TxId::from_bytes(vec![0xaa, 0xbb]),
+            },
+            ..ShardEntry::new(b"Hello")
         }
     }
 
@@ -1013,20 +1027,14 @@ mod tests {
     // Changing the on-disk format must break these tests.
     #[test]
     fn golden_leaf_encoding() {
-        let node = Node::leaf(Shard::from_entries([ShardEntry {
-            key: b"Hello".to_vec(),
-            lock_type: LockType::Write,
-            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
-            current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
-            deleted: false,
-        }]))
-        .with_high_key(Some(b"m".to_vec()))
-        .with_right_sibling(Some("sib".to_string()));
+        let node = Node::leaf(Shard::from_entries([golden_entry()]))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some("sib".to_string()));
         let got = node.encode();
         let want = [
-            0x0a, 0x01, 0x6d, 0x12, 0x03, 0x73, 0x69, 0x62, 0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05,
+            0x0a, 0x01, 0x6d, 0x12, 0x03, 0x73, 0x69, 0x62, 0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05,
             0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04, 0x22,
-            0x02, 0xaa, 0xbb,
+            0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
         ];
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "leaf node encoding drifted: {got:02x?}");
@@ -1047,21 +1055,16 @@ mod tests {
     // break this test.
     #[test]
     fn golden_node_locks_encoding() {
-        let mut node = Node::leaf(Shard::from_entries([ShardEntry {
-            key: b"Hello".to_vec(),
-            lock_type: LockType::Write,
-            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
-            current_writer: Some(TxId::from_bytes(vec![0xaa, 0xbb])),
-            deleted: false,
-        }]));
+        let mut node = Node::leaf(Shard::from_entries([golden_entry()]));
         node.set_structural_gate(TxId::from_bytes(vec![0x11]));
         node.set_membership_writer(TxId::from_bytes(vec![0x22]));
 
         let got = node.encode();
         let want = [
-            0x1a, 0x15, 0x0a, 0x13, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
-            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x02, 0xaa, 0xbb, 0x2a, 0x05, 0x08, 0x03, 0x12,
-            0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38, 0x01,
+            0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
+            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01, 0x2a,
+            0x05, 0x08, 0x03, 0x12, 0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38,
+            0x01,
         ];
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "node-lock encoding drifted: {got:02x?}");

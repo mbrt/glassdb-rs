@@ -543,7 +543,6 @@ mod tests {
 
     use crate::Timeline;
     use crate::cached_store::CachedStore;
-    use crate::lock::LockType;
     use crate::node::{IndexNode, Node};
     use crate::shard::Shard;
     use crate::shard::ShardEntry;
@@ -578,11 +577,10 @@ mod tests {
 
     fn live(key: &[u8]) -> ShardEntry {
         ShardEntry {
-            key: key.to_vec(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
-            current_writer: Some(glassdb_data::TxId::from_bytes(vec![1])),
-            deleted: false,
+            current: crate::CurrentState::External {
+                writer: glassdb_data::TxId::from_bytes(vec![1]),
+            },
+            ..ShardEntry::new(key)
         }
     }
 

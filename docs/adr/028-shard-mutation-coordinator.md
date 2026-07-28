@@ -15,6 +15,11 @@ shard a second time (the fast path's eligibility pre-check already loaded it).
 [ADR-030](030-seed-shard-loads.md) restores the single-load commit by letting a
 round reuse the shard the transaction already cached for its first fold attempt.
 
+[ADR-051](051-inline-latest-values.md) extends the installed policy with a
+commit-critical direct inline publish. The coordinator invariant remains;
+a same-key round reservation prevents one batched direct commit from erasing
+another's in-doubt recovery evidence.
+
 Generalizes the deduplication **mechanism** of
 [ADR-025](025-dedup-shard-lock-acquisition.md) and
 [ADR-026](026-dedup-shard-release-write-back.md), and **supersedes the bespoke
