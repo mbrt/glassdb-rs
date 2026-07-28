@@ -3,6 +3,7 @@
 
 mod algo;
 mod collections;
+mod directory_locker;
 mod error;
 mod gc;
 mod monitor;

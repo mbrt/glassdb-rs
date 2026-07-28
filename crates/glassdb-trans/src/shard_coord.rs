@@ -2,7 +2,7 @@
 //! through which every shard/leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
-//! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_i`,
+//! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_r`,
 //! the root leaf while the collection is small, ADR-031). Concurrent
 //! transactions contending one object are **deduplicated** (ADR-025/026): each
 //! per-object mutation is submitted to a [`Dedup`] keyed on the object path, so
@@ -35,8 +35,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    LeafKind, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
-    SplitPolicy, StorageError,
+    LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError,
 };
 
 use crate::error::TransError;
@@ -226,7 +226,7 @@ struct ShardMember {
 /// carries one transaction; a merged request accumulates several compatible
 /// ones.
 ///
-/// The leaf is identified by its object `path` — the collection root `_i` for a
+/// The leaf is identified by its object `path` — the collection root `_r` for a
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
 /// resolver and outcome slot. `first_requirement` is the cache requirement for the
@@ -472,17 +472,8 @@ impl CasWorker {
                             .policy
                             .node_max_bytes
                             .saturating_sub(self.core.policy.split_headroom_bytes);
-                        let (content_len, encoded_len) = match loaded.kind() {
-                            LeafKind::Root(root) => {
-                                let mut root = root.clone();
-                                root.set_node(candidate_node.clone());
-                                (root.content_encoded_len(), root.encoded_len())
-                            }
-                            LeafKind::Node(_) => (
-                                candidate_node.content_encoded_len(),
-                                candidate_node.encoded_len(),
-                            ),
-                        };
+                        let content_len = candidate_node.content_encoded_len();
+                        let encoded_len = candidate_node.encoded_len();
                         let object_full = encoded_len > self.core.policy.node_max_bytes;
                         let create_full =
                             admission == StageAdmission::AddsKey && content_len > content_limit;
@@ -520,7 +511,7 @@ impl CasWorker {
                 match self
                     .core
                     .shards
-                    .store_leaf(path, &new_shard, &locks, loaded.kind(), &loaded.observation)
+                    .store_leaf(path, &new_shard, &locks, &loaded.observation)
                     .await
                 {
                     // Hint the background splitter if this write left the leaf
@@ -681,7 +672,7 @@ impl ShardCoordinator {
     /// resolvers pass their phase's captured lower bound because their outcome
     /// may not be followed by a CAS.
     ///
-    /// `path` is the leaf's object path — the collection root `_i` for a small
+    /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
     /// ([`Directory`](glassdb_storage::Directory)).
     pub(crate) async fn submit_shard(
@@ -857,13 +848,7 @@ mod tests {
         let shard = Shard::from_entries(entries);
         assert!(
             store
-                .store_leaf(
-                    path,
-                    &shard,
-                    &loaded.locks,
-                    loaded.kind(),
-                    &loaded.observation,
-                )
+                .store_leaf(path, &shard, &loaded.locks, &loaded.observation,)
                 .await
                 .unwrap()
         );
@@ -1615,7 +1600,7 @@ mod tests {
         backend.set_before(move |op| {
             let result = match op {
                 BackendOp::WriteIf { path, .. }
-                    if path.contains("/_n/") || path.ends_with("/_i") =>
+                    if path.contains("/_n/") || path.ends_with("/_r") =>
                 {
                     match leaf_cas.fetch_add(1, Ordering::SeqCst) {
                         0 => Err(glassdb_backend::BackendError::Unavailable(
@@ -1811,7 +1796,7 @@ mod tests {
         backend.set_before(move |op| {
             let result = match op {
                 BackendOp::WriteIf { path, .. }
-                    if path.contains("/_n/") || path.ends_with("/_i") =>
+                    if path.contains("/_n/") || path.ends_with("/_r") =>
                 {
                     match leaf_cas.fetch_add(1, Ordering::SeqCst) {
                         0 => Err(glassdb_backend::BackendError::Unavailable(

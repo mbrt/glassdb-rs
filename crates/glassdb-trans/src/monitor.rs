@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use glassdb_concurr::{Background, Clock, RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt, shard::Sharded};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     Observation, Requirement, SequencePoint, StorageError, TLogger, TValue, Timeline,
@@ -371,9 +371,15 @@ impl Monitor {
             // under us), as well as any classification of an escaping error.
             // In-doubt outcomes are normally retried inside `set_final_log`
             // because the log is keyed by tx id and the write is idempotent.
-            self.set_final_log(&tl)
-                .await
-                .map_err(|e| e.context("writing tx log"))?;
+            if let Err(error) = self.set_final_log(&tl).await {
+                if matches!(error, TransError::AlreadyFinalized) {
+                    // The only mismatched final status for a commit is an abort.
+                    // Clear the local pending entry so it cannot mask that
+                    // durable winner and strand local waiters.
+                    self.mark_local_aborted(&tl.id, TxCommitStatus::Aborted);
+                }
+                return Err(error.context("writing tx log"));
+            }
         }
 
         let mut st = self.shard_for(&tl.id).lock().unwrap();
@@ -564,16 +570,19 @@ impl Monitor {
                     //     found `aborted`): a wound landed first -> surface as
                     //     `AlreadyFinalized` so the commit path treats it as a
                     //     wound.
+                    // The CAS conflict established that our observation is
+                    // stale, but a failed read says nothing about which
+                    // terminal outcome won. Keep reconciling instead of
+                    // stranding the local transaction as pending.
                     let st = self
-                        .inner
-                        .tl
-                        .commit_status_at(tid, self.current_requirement())
+                        .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
                     if st.status == tlog.status {
                         self.remember_final(tid, &st.observation);
                         return Ok(());
                     }
                     if st.status.is_final() {
+                        self.remember_final(tid, &st.observation);
                         return Err(TransError::AlreadyFinalized);
                     }
                     last_observation = Some(st.observation);
@@ -640,9 +649,7 @@ impl Monitor {
                     // proof of liveness, while wound-wait decides separately to
                     // retry it.
                     let st = self
-                        .inner
-                        .tl
-                        .commit_status_at(tid, self.current_requirement())
+                        .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
                     self.remember_final(tid, &st.observation);
                     return Ok(st);
@@ -659,9 +666,7 @@ impl Monitor {
                 // status means retry the CAS over the refreshed version.
                 Err(StorageError::Unavailable(_)) => {
                     let st = self
-                        .inner
-                        .tl
-                        .commit_status_at(tid, self.current_requirement())
+                        .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
                     if st.status.is_final() {
                         self.remember_final(tid, &st.observation);
@@ -672,6 +677,27 @@ impl Monitor {
                 Err(e) => return Err(e.into()),
             }
             rt::sleep(backoff.next_delay()).await;
+        }
+    }
+
+    async fn read_tx_status_retrying_unavailable(
+        &self,
+        tid: &TxId,
+        backoff: &mut Backoff,
+    ) -> Result<TxStatus, TransError> {
+        loop {
+            match self
+                .inner
+                .tl
+                .commit_status_at(tid, self.current_requirement())
+                .await
+            {
+                Ok(status) => return Ok(status),
+                Err(StorageError::Unavailable(_)) => {
+                    rt::sleep(backoff.next_delay()).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     }
 
@@ -1243,7 +1269,7 @@ fn notify_waiters(st: &mut State, tid: &TxId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
@@ -1457,6 +1483,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn losing_commit_reconciles_local_status_with_durable_abort() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (owner, _owner_ctx) = new_test_monitor(b.clone());
+        let (wounder, _wounder_ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"commit-loser".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+        let recovery = TxRecoveryManifest {
+            locks: vec![lock.clone()],
+            ..TxRecoveryManifest::default()
+        };
+        owner.begin_persisted_tx(&tx, recovery).await.unwrap();
+
+        assert_eq!(wounder.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        log.locks.push(lock);
+        assert!(matches!(
+            owner.commit_tx(log).await,
+            Err(TransError::AlreadyFinalized)
+        ));
+        assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
+        assert_eq!(
+            owner.await_tx_final(&tx).await.unwrap(),
+            TxFinalStatus::Aborted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_retries_status_read_after_cas_conflict() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let b: Arc<dyn Backend> = backend.clone();
+        let (owner, _owner_ctx) = new_test_monitor(b.clone());
+        let (_racer, racer_ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"commit-read-retry".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let pending = racer_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let mut refreshed = pending.value().unwrap().as_ref().clone();
+        refreshed.timestamp = Some(racer_ctx.clock.now());
+
+        let refresh = Arc::new(Mutex::new(Some((racer_ctx.tl.clone(), refreshed, pending))));
+        let fail_next_read = Arc::new(AtomicBool::new(false));
+        let failed_reads = Arc::new(AtomicUsize::new(0));
+        backend.set_before({
+            let refresh = refresh.clone();
+            let fail_next_read = fail_next_read.clone();
+            let failed_reads = failed_reads.clone();
+            move |operation| {
+                let is_commit = matches!(
+                    operation,
+                    BackendOp::WriteIf { value, .. }
+                        if glassdb_storage::txobject::status(value)
+                            .map(|status| status == TxCommitStatus::Ok)
+                            .unwrap_or(false)
+                );
+                let refresh = is_commit.then(|| refresh.lock().unwrap().take()).flatten();
+                let fail_read = matches!(
+                    operation,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && fail_next_read.swap(false, Ordering::SeqCst);
+                let fail_next_read = fail_next_read.clone();
+                let failed_reads = failed_reads.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if let Some((tl, pending, expected)) = refresh {
+                        tl.set_if(&pending, &expected)
+                            .await
+                            .expect("the competing pending refresh should win");
+                        fail_next_read.store(true, Ordering::SeqCst);
+                    }
+                    if fail_read {
+                        failed_reads.fetch_add(1, Ordering::SeqCst);
+                        return Err(BackendError::Unavailable(
+                            "injected status read failure".into(),
+                        ));
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        log.locks.push(lock);
+        owner.commit_tx(log).await.unwrap();
+
+        assert_eq!(failed_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
+    }
+
+    #[tokio::test]
     async fn wound_tx_returns_the_status_that_won() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b);
@@ -1505,9 +1634,13 @@ mod tests {
             pending,
         ))));
         let abort_writes = Arc::new(AtomicUsize::new(0));
+        let fail_next_read = Arc::new(AtomicBool::new(false));
+        let failed_reads = Arc::new(AtomicUsize::new(0));
         backend.set_before({
             let refresh = refresh.clone();
             let abort_writes = abort_writes.clone();
+            let fail_next_read = fail_next_read.clone();
+            let failed_reads = failed_reads.clone();
             move |operation| {
                 let is_abort = matches!(
                     operation,
@@ -1522,11 +1655,24 @@ mod tests {
                 } else {
                     None
                 };
+                let fail_read = matches!(
+                    operation,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && fail_next_read.swap(false, Ordering::SeqCst);
+                let fail_next_read = fail_next_read.clone();
+                let failed_reads = failed_reads.clone();
                 let future: HookFuture = Box::pin(async move {
                     if let Some((tl, pending, expected)) = refresh {
                         tl.set_if(&pending, &expected)
                             .await
                             .expect("the competing pending refresh should win");
+                        fail_next_read.store(true, Ordering::SeqCst);
+                    }
+                    if fail_read {
+                        failed_reads.fetch_add(1, Ordering::SeqCst);
+                        return Err(BackendError::Unavailable(
+                            "injected status read failure".into(),
+                        ));
                     }
                     Ok(())
                 });
@@ -1536,6 +1682,7 @@ mod tests {
 
         assert_eq!(mon.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(abort_writes.load(Ordering::SeqCst), 2);
+        assert_eq!(failed_reads.load(Ordering::SeqCst), 1);
         let (_verify_mon, verify) = new_test_monitor(b);
         let final_log = verify.tl.get_at(&tx, Requirement::Any).await.unwrap();
         assert_eq!(final_log.value().unwrap().locks, refreshed.locks);

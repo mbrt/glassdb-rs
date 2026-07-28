@@ -39,21 +39,22 @@ CAS. Leaves are the shards; interior nodes are the range index.
 - **Collection identity** — every collection has an opaque, never-reused ID and
   lives below `<db>/_c/<collection-id>/`. A reserved ID names the permanent,
   regular root collection returned by `Database::root_collection()`. Each
-  collection root stores its bounded direct `child-name → collection-id`
+  collection record stores its bounded direct `child-name → collection-id`
   directory; there is no database-wide path catalog
   ([ADR-046](../adr/046-incarnation-addressed-collections.md)).
 - **Objects**
-  - _Root object_ (`<db>/_c/<collection-id>/_i`): **is** the tree's current root
-    node — a leaf while the collection is small, an index node once it grows —
-    and also carries the direct child directory. Logical existence comes from
-    the exact ID stored in the parent's directory rather than physical-root
-    presence. There is no separate anchor: the root keeps a fixed address within
-    its incarnation, so height grows by **splitting the root in place** and every
-    descent starts at `_i`.
-  - _Index node_ (interior, incl. the root at height ≥ 2): ordered separator keys
+  - _Collection record_ (`<db>/_c/<collection-id>/_i`): the direct child
+    directory, its transactional lock/version, and collection-wide
+    topology/lifecycle coordination. It contains no key or B-link node state.
+  - _Tree root_ (`<db>/_c/<collection-id>/_r`): an ordinary node at a fixed
+    address — a leaf while the collection is small and an index once it grows.
+    There is no root pointer in `_i`; height grows by **splitting `_r` in place**
+    and every descent starts directly there
+    ([ADR-050](../adr/050-separate-collection-record-and-tree-root.md)).
+  - _Index node_ (interior, including `_r` at height ≥ 2): ordered separator keys
     → child pointers, a **high-key**, and a **right-sibling** link. Maps a key
     range to its child.
-  - _Leaf shard_ (incl. the root at height 1): owns a contiguous key range; holds
+  - _Leaf shard_ (including `_r` at height 1): owns a contiguous key range; holds
     the ADR-017 per-key entries (lock type · `locked_by` · `current_writer` ·
     tombstone) sorted by key; also a **high-key** and **right-sibling** link. The
     CAS unit for its keys.
@@ -66,14 +67,15 @@ CAS. Leaves are the shards; interior nodes are the range index.
     ([ADR-049](../adr/049-participant-owned-topology-intents.md)).
 - **Ordering** — lexicographic over raw key bytes, matching the order-preserving
   path encoding.
-- **Mapping** — descend from the root object `_i`; each node self-describes its
+- **Mapping** — descend from the tree root `_r`; each node self-describes its
   range (high-key), so descent is **cached and self-correcting**.
-- **Reads/writes (hot path)** — descend via cached interior nodes (incl. `_i`) to
-  the leaf, read the leaf. If a node's high-key shows the key moved (a split raced
-  the cache), **follow the right-sibling link** or re-descend from a refreshed
-  `_i`. An open handle routes by collection ID, without revalidating its logical
-  path. No central read on a cache hit.
-- **Split (grow)** — background; a root split grows height **in place** at `_i`.
+- **Reads/writes (hot path)** — descend via cached interior nodes (including
+  `_r`) to the leaf, then read the leaf. If a node's high-key shows the key
+  moved (a split raced the cache), **follow the right-sibling link** or
+  re-descend from a refreshed `_r`. An open handle routes by collection ID,
+  without reading `_i` or revalidating its logical path. No central read on a
+  cache hit.
+- **Split (grow)** — background; a root split grows height **in place** at `_r`.
   A split closes the node's exclusive **structural gate** for priority and mutual
   exclusion (wound-wait) but keeps ADR-031's **shrink-CAS linearization** and
   right-link tolerance — it is coordinated, not atomically committed across its
@@ -130,26 +132,29 @@ CAS. Leaves are the shards; interior nodes are the range index.
 
 ### Minimal case — a single key (or a small collection)
 
-The whole collection is a **single object**: `_i` is the root *and* the only
-leaf. There are no index nodes and no siblings. Reading or writing the key is a
-single GET/CAS on `_i`.
+The data tree is a **single node**: `_r` is the root and the only leaf. The
+separate `_i` record holds collection control state. There are no index nodes or
+siblings, and reading or writing a key is a single GET/CAS on `_r`.
 
 ```mermaid
 graph TD
-    Root["_i — root (leaf)<br/>range (-∞, +∞) · high-key +∞<br/>right-sibling → nil<br/>entries: user:42 → {lock, writer, …}<br/>+ child directory (name → ID)"]
+    Record["_i — collection record<br/>children · directory lock/version<br/>topology/lifecycle"]
+    Root["_r — root (leaf)<br/>range (-∞, +∞) · high-key +∞<br/>right-sibling → nil<br/>entries: user:42 → {lock, writer, …}"]
 
+    classDef record fill:#f2e8ff,stroke:#775599,color:#111
     classDef root fill:#e8ecff,stroke:#5566aa,color:#111
+    class Record record
     class Root root
 ```
 
-As keys are added, `_i` eventually crosses its soft cap. Because the root cannot
+As keys are added, `_r` eventually crosses its soft cap. Because the root cannot
 move, the **first** split grows height *in place*: two new leaves take the two
-halves, and `_i` is rewritten from a leaf into a two-entry index root pointing at
+halves, and `_r` is rewritten from a leaf into a two-entry index root pointing at
 them (height 1 → 2):
 
 ```mermaid
 graph TD
-    Root["_i — root (index) · high-key +∞<br/>(-∞, m) → L0<br/>[m, +∞) → L1<br/>+ child directory (name → ID)"]
+    Root["_r — root (index) · high-key +∞<br/>(-∞, m) → L0<br/>[m, +∞) → L1"]
     Root --> L0["Leaf L0<br/>(-∞, m) · hi m<br/>apple, cat"]
     Root --> L1["Leaf L1<br/>[m, +∞) · hi +∞<br/>mango, pear"]
 
@@ -178,7 +183,7 @@ height 3). Only leaves hold key entries; interior nodes map ranges to children.
 
 ```mermaid
 graph TD
-    Root["_i — root (index) · hi +∞<br/>(-∞, m) → I1<br/>[m, +∞) → I2<br/>+ child directory (name → ID)"]
+    Root["_r — root (index) · hi +∞<br/>(-∞, m) → I1<br/>[m, +∞) → I2"]
 
     Root --> I1["Index I1 · hi m<br/>(-∞, f) → L0<br/>[f, m) → L1"]
     Root --> I2["Index I2 · hi +∞<br/>[m, t) → L2<br/>[t, +∞) → L3"]
@@ -215,7 +220,7 @@ graph LR
 
 Notes:
 
-- **Descent** for `"kiwi"`: root `_i` (`"kiwi" < "m"` → I1) → I1 (`"f" ≤ "kiwi" <
+- **Descent** for `"kiwi"`: root `_r` (`"kiwi" < "m"` → I1) → I1 (`"f" ≤ "kiwi" <
   "m"` → L1) → read L1. On a cache hit only L1 is fetched.
 - **Right-links cross parent boundaries** (e.g. I1 → I2): a lookup that lands too
   far left after a concurrent split follows the right-link without going back up
@@ -223,8 +228,8 @@ Notes:
 - **Sorted listing** is the leaf chain `L0 → L1 → L2 → L3`; a range scan enters at
   the range's start leaf and stops when a leaf's low bound passes the range end.
 - Only leaves hold key entries (lock/MVCC state); index nodes hold separator keys
-  → child pointers. The root is the `_i` object itself — once the tree has grown
-  it holds separators (plus the child directory), not keys.
+  → child pointers. Once `_r` has grown into an index, it holds separators rather
+  than keys. `_i` remains an independent collection record at every tree height.
 
 ## Constituent ADRs
 
@@ -275,6 +280,12 @@ ADR — this overview and the diagrams above are the map into it.
   topology participant an exact structural-intent prefix, closes the
   prepare/join race, and replaces collection-wide recovery walks with
   key-directed reachability checks.
+- **[ADR-050](../adr/050-separate-collection-record-and-tree-root.md) —
+  Separate the collection record from the B-link tree root.** *Accepted —
+  implemented.*
+  Separates the fixed `_i` collection record from a fixed `_r` tree root,
+  removing their shared CAS and size domains while preserving direct descent,
+  the one-node small-collection tree, and in-place root splits.
 
 Planned follow-on ADRs, as the open questions below resolve: merge/rebalance,
 split-point policy, and node fan-out/sizing.
@@ -288,7 +299,7 @@ split-point policy, and node fan-out/sizing.
 - **Hard object-size cap tuning.** The implemented defaults cap a node at 1 MiB
   and reserve 64 KiB for transient lock metadata. Content growth stops at the
   remaining 960 KiB; an individually unsplittable key and an overflowing
-  child directory are permanent invalid-input errors. Future tuning may still
+  collection record are permanent invalid-input errors. Future tuning may still
   adjust those configurable defaults and their foreground-latency trade-off.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030

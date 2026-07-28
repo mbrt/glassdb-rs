@@ -82,8 +82,8 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend`     | `lib.rs`, `memory.rs`, `stats.rs`, `middleware/`                             | The `Backend` trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger, fault, recording)                          |
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
-| `glassdb-trans`       | `algo.rs`, `collections.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: commit algorithm, transactional collection lifecycle, distributed locker, shard-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
-| `glassdb-storage`     | `cached_store.rs`, `shardstore.rs`, `shard.rs`, `root.rs`, `txobject.rs`, `lock.rs`, `tlogger.rs`, `version.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, shard/root CAS store, shard & collection-root codecs, unified transaction-object codec, lock-state value type, transaction-log persistence, version tracking, generic LRU |
+| `glassdb-trans`       | `algo.rs`, `collections/`, `directory_locker.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: commit algorithm, transactional collection lifecycle, data/directory locking, node-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
+| `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `shard_store.rs`, `node.rs`, `shard.rs`, `txobject.rs`, `tlogger.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record and B-link-node CAS stores/codecs, transaction-log persistence, and generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
@@ -110,10 +110,9 @@ Every shard/root entry mutation — lock acquire, single read-write commit-insta
 write-back, release, and GC reclamation — flows through **one shard-mutation
 coordinator** that loads the object once, folds the round's operations in
 wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
- the
-  policy as *resolvers*; the coordinator is the shared mechanism and knows
-  nothing of locks or transaction ids. For the full design see
-  [designs/object-storage-native.md](designs/object-storage-native.md).
+the policy as *resolvers*; the coordinator is the shared mechanism and knows
+nothing of locks or transaction ids. For the full design see
+[designs/object-storage-native.md](designs/object-storage-native.md).
 
 ```
                          glassdb  (public API)
@@ -152,7 +151,8 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
       │       └───────────────┬───────────────┘                │
       ▼                       ▼            ▼ (tx logs)          ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
-  ShardStore (_s shards · _i roots) · TLogger (_t logs)
+  CollectionStore (_i records) · ShardStore (_r/_n B-link nodes)
+  TLogger (_t logs)
   CachedStore (decoded, path-keyed, bounded-freshness LRU)
                                 │
                                 ▼
@@ -162,17 +162,18 @@ wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
 Collection management travels beside key access as `CollectionData`: logical
 directory reads plus exact create/drop binding changes. `Transaction` overlays
 those changes for read-your-writes behavior. At commit, `Algo` persists the
-prepared-root manifest (including roots left by an earlier body retry), locks
-and validates the affected parent directories, then uses the same
+prepared-collection manifest (including incarnations left by an earlier body
+retry), prepares each incarnation's `_i` record and `_r` tree root, locks and
+validates the affected parent directories, then uses the same
 transaction-log status flip as key writes. Directory write-back materializes
 committed `name → CollectionId` changes.
 
 Drop additionally freezes the target collection's split topology and installs
 the transaction ID as a delete intent on every root, index, and leaf object.
 Each structural split records a transaction-log topology backreference and
-remains registered in the root until its structural log is published or
-recovered, so a freeze can finish every pre-existing participant before node
-enumeration.
+remains registered in the collection record until its structural log is
+published or recovered, so a freeze can finish every pre-existing participant
+before node enumeration.
 
 Normal point operations inspect only the terminal node they already access:
 an aborted intent is removable, a pending intent participates in wound-wait,
@@ -182,15 +183,16 @@ committed directory write-back and collection cleanup independently of whether
 the same transaction object still stores a live value; a conditional-delete
 conflict retains the durable manifest for a later retry.
 
-`Algo` is shard-agnostic by construction: in non-test code it never imports
-`ShardStore`, calls `shard_index`, or sees a `ShardEntry`. It hands the `Locker`
-a `Data` value plus a `serial: bool`, and receives a logical `LockOutcome` plus
-an opaque `LockedTx` it only passes back to `write_back`. Everything
-shard-shaped — `{prefix}/_s/<i>` objects, `ShardEntry`, `CollectionRoot`, the
-per-shard read-modify-write CAS — lives below the locker boundary.
+Lock ownership is centralized behind two views of `Locker`. The data view takes
+logical key accesses and owns node-lock acquisition, write-back, and release.
+The directory view takes collection addresses and owns directory/topology locks
+in collection records. `CollectionCatalog` only constructs logical snapshots
+and validates collection preconditions; it performs no lock CAS or recovery
+write-back itself. This keeps `CollectionRecord` coordination out of both the
+B-link `ShardStore` and the semantic catalog.
 
 Beneath the locker boundary, one further split separates **policy from
-mechanism**: every shard/root entry mutation flows through a single
+mechanism**: every data-node entry mutation flows through a single
 `ShardCoordinator`, which owns the *mechanism* (one single-flight round per
 object: load once, fold the round's operations, CAS once, recover
 precondition/in-doubt by reload) while the callers supply *policy* as installed
@@ -203,31 +205,40 @@ wound-wait; the fold visits members oldest-first so it never has to backtrack.
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | closures, `Error`            | user body, retry loop, cancel-safety                                                                                  | locks, shards, tx logs              |
 | `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall` | **shards**, CAS details, caching    |
-| `Locker`              | lock **policy** | `Data`, `TxId`, shard objects | key→shard grouping, parallel & serial acquisition strategy, hold-and-wait, installs acquire / write-back / release resolvers | retry *policy*, **read validation** (reports `Conflict` only) |
-| `ShardCoordinator`    | shard/root **mechanism** | object path, resolvers | one round per object: single-flight, load-once, monotonic fold, single CAS, reload-recover, vestigial-entry pruning | locks, `TxId`, wound-wait, commit |
+| `Locker::data`        | data-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
+| `Locker::directories` | directory-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, status resolution, recovery write-back and release | key routing, B-link topology |
+| `CollectionCatalog`   | collection semantics | directory reads and binding changes | logical snapshots, read-your-writes validation, capacity/precondition checks | CAS, wound-wait, transaction logs |
+| `ShardCoordinator`    | data-node **mechanism** | object path, resolvers | one round per object: single-flight, load-once, monotonic fold, single CAS, reload-recover, vestigial-entry pruning | locks, `TxId`, wound-wait, commit |
 | `Reader`              | read mechanism   | paths                        | effective-writer resolution                                                                                            | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
 | `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
 
 ### The lock boundary
 
-The single call across the policy/mechanism seam carries no shard vocabulary:
+The two calls across the semantic/locking seam carry no physical-node
+representation:
 
 ```rust
-// Algo → Locker: acquire every lock the access set needs.
-async fn lock(&self, id: &TxId, data: &Data, serial: bool)
+// Algo → Locker data view.
+async fn lock_at(&self, id: &TxId, data: &Data, serial: bool, at: Requirement)
     -> Result<LockOutcome, TransError>;
+
+// Algo → Locker directory view.
+async fn lock(
+    &self,
+    id: &TxId,
+    reads: &[DirectoryRead],
+    changes: &[CollectionChange],
+) -> Result<LockedDirectories, TransError>;
 ```
 
-- **Down**: `Data` (the transaction's reads and its staged writes), plus
-  `serial` — the *only* policy signal the locker needs. The locker reads each
-  access's *path* to decide which lock to install (a read lock for a read-only
-  key, write/create/delete for a written one); it does **not** look at the
-  version token — that is validation, which is `Algo`'s job. It groups keys by
-  shard and locks them in parallel by default, or one shard at a time in sorted
-  path order when `Algo` decides contention warrants the serial fallback.
+- **Down**: the data view receives `Data`, `serial`, and the validation bound; it
+  groups keys by current leaf and locks leaves in parallel or sorted order. The
+  directory view receives logical directory reads and binding changes; it
+  derives a stable collection-address lock order. Neither interface exposes
+  encoded record or node state.
 - **Up**: `LockOutcome::Locked(LockedTx)` on success, or `LockOutcome::Conflict`
-  when a CAS race was lost — both logical, never shards. `Algo` maps `Conflict`
+  when a CAS race was lost — both logical, never nodes. `Algo` maps `Conflict`
   onto its policy: release and re-acquire under the same id, escalating to serial
   and backing off.
 
@@ -236,15 +247,14 @@ touched key is locked and its value frozen, so `Algo` re-resolves each read's
 effective writer (via `Reader`, path-based) and compares it to the token the body
 observed. A mismatch means the value moved before the lock landed: `Algo` re-runs
 the body **holding its locks** (`Retry`). This is optimistic-concurrency policy
-over the shard-agnostic read set, and it reuses the same routine as the read-only
+over the logical read set, and it reuses the same routine as the read-only
 fast path — so validation lives in exactly one place, never in the locker.
 
 Because the deadlock timeout, serial-escalation decision, and backoff are
 *policy*, they live in `Algo`; the locker is bounded only by an internal
 CAS-retry budget and reports sustained contention back as `Conflict` rather than
-looping forever. This keeps efficient batch acquisition — which is inherently
-shard-shaped (many keys collapse into one shard CAS) — in the one component that
-understands shards, without ever surfacing shards to the commit algorithm.
+looping forever. This keeps efficient batch acquisition — many keys collapse
+into one leaf CAS — behind the data-lock interface.
 
 ## Backend Abstraction
 
@@ -896,7 +906,7 @@ count-bounded status cache for finalized transactions.
 ### Path Encoding
 
 `CollectionPath` values are unresolved sequences of raw names. Resolving one
-walks the direct-child directory in each parent root and returns a `Collection`
+walks the direct-child directory in each parent record and returns a `Collection`
 bound to an opaque 16-byte incarnation ID. Logical keys pair that bound address
 with raw key bytes; point operations route by ID without revalidating ancestors.
 
@@ -905,7 +915,8 @@ Only backend objects have type markers (`glassdb-data/src/paths.rs`):
 | Type Marker | Meaning                         | Example                           |
 | ----------- | ------------------------------- | --------------------------------- |
 | `_c`        | Physical collection namespace   | `mydb/_c/<collection-id>`         |
-| `_i`        | Collection root                  | `mydb/_c/<collection-id>/_i`      |
+| `_i`        | Collection record                | `mydb/_c/<collection-id>/_i`      |
+| `_r`        | Fixed B-link tree root           | `mydb/_c/<collection-id>/_r`      |
 | `_n`        | Standalone B-link node           | `mydb/_c/<collection-id>/_n/<token>` |
 | `_t`        | Sharded transaction object       | `mydb/_t/<shard>/<transaction-id>`|
 | `_s`        | Participant-owned structural intent | `mydb/_s/<participant-id>/<intent-id>` |
@@ -921,16 +932,17 @@ invalidate its logs.
 
 A `Collection` is a scoped namespace for keys, similar to a table. The database
 has a permanent, key-bearing root collection whose reserved ID is outside the
-generated-ID domain. Every collection root `_i` is both the B-link tree root and
-a bounded, sorted directory from direct child name to child ID. That parent
-entry—not physical `_i` presence—is authoritative for logical existence.
+generated-ID domain. Every collection has an `_i` record containing a bounded,
+sorted directory from direct child name to child ID and an independent `_r`
+B-link root containing only node state. The parent entry—not physical-object
+presence—is authoritative for logical existence.
 
-Standalone creation first installs an unreachable empty root at a fresh ID,
-then publishes `name → ID` with a conditional rewrite of the parent. The
-`Collection` data helpers (`read`, `read_stale`, `write`, `delete`, `update`)
-run through the same transaction machinery as `Database::tx`; collection open,
-existence, create, and immediate-child listing are fallible asynchronous
-operations outside transactions.
+Transactional creation prepares an unreachable record/root pair at a fresh ID,
+then publishes `name → ID` through the ordinary commit protocol. A bound
+`Collection` routes data directly to `_r` and `_n` without re-reading `_i`.
+Collection open, existence, create, drop, and immediate-child listing use the
+same transaction machinery as key changes and are exposed as fallible
+asynchronous operations.
 
 ### Versioning
 
@@ -952,17 +964,17 @@ token for the conditional write that takes the lock.
 
 ## Garbage Collection
 
-A transaction object is **live** exactly while some shard or root still
-references its txid (`current-writer`, `locked-by`, or the root's
-`membership-locked-by`), so garbage collection is a reachability problem rather
-than a timer. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
+A transaction object is **live** exactly while some data node or collection
+record still references its txid (entry, membership, directory, or topology
+coordination), so garbage collection is a reachability problem rather than a
+timer. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
 candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 
 - **Reverse liveness check.** A forward mark (list every shard, union the
   referenced txids) would cost the whole database per cycle. Instead each
   candidate `_t/` object records its own back-references (its `locks ∪ writes`),
   so GC reads a batch of candidates and confirms each one dead by GET-ing only
-  the handful of shards/root it names — never a database-wide scan.
+  the handful of nodes/records it names — never a database-wide scan.
 - **Candidate feed.** Candidates come from the write-back hint queue (the
   `current-writer` a fresh commit just superseded, capped at `HINT_QUEUE_CAP`)
   and shuffled passes over the 4,096 `{db}/_t/<ss>/` prefixes, which make the

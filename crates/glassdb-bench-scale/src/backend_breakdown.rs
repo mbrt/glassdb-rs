@@ -37,7 +37,7 @@ impl Sub for OperationCounts {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackendBreakdown {
     pub database_metadata: OperationCounts,
-    pub collection_root: OperationCounts,
+    pub collection_record: OperationCounts,
     pub node: OperationCounts,
     pub transaction_log: OperationCounts,
     pub structural_log: OperationCounts,
@@ -48,7 +48,7 @@ impl BackendBreakdown {
     pub fn rows(self) -> [(&'static str, OperationCounts); 6] {
         [
             ("backend.database_metadata", self.database_metadata),
-            ("backend.collection_root", self.collection_root),
+            ("backend.collection_record", self.collection_record),
             ("backend.node", self.node),
             ("backend.transaction_log", self.transaction_log),
             ("backend.structural_log", self.structural_log),
@@ -67,7 +67,7 @@ impl Sub for BackendBreakdown {
     fn sub(self, other: Self) -> Self {
         Self {
             database_metadata: self.database_metadata - other.database_metadata,
-            collection_root: self.collection_root - other.collection_root,
+            collection_record: self.collection_record - other.collection_record,
             node: self.node - other.node,
             transaction_log: self.transaction_log - other.transaction_log,
             structural_log: self.structural_log - other.structural_log,
@@ -79,7 +79,7 @@ impl Sub for BackendBreakdown {
 #[derive(Clone, Copy)]
 enum ObjectRole {
     DatabaseMetadata,
-    CollectionRoot,
+    CollectionRecord,
     Node,
     TransactionLog,
     StructuralLog,
@@ -106,7 +106,7 @@ impl AtomicCounts {
 #[derive(Default)]
 struct Counters {
     database_metadata: AtomicCounts,
-    collection_root: AtomicCounts,
+    collection_record: AtomicCounts,
     node: AtomicCounts,
     transaction_log: AtomicCounts,
     structural_log: AtomicCounts,
@@ -117,7 +117,7 @@ impl Counters {
     fn role(&self, role: ObjectRole) -> &AtomicCounts {
         match role {
             ObjectRole::DatabaseMetadata => &self.database_metadata,
-            ObjectRole::CollectionRoot => &self.collection_root,
+            ObjectRole::CollectionRecord => &self.collection_record,
             ObjectRole::Node => &self.node,
             ObjectRole::TransactionLog => &self.transaction_log,
             ObjectRole::StructuralLog => &self.structural_log,
@@ -128,7 +128,7 @@ impl Counters {
     fn snapshot(&self) -> BackendBreakdown {
         BackendBreakdown {
             database_metadata: self.database_metadata.snapshot(),
-            collection_root: self.collection_root.snapshot(),
+            collection_record: self.collection_record.snapshot(),
             node: self.node.snapshot(),
             transaction_log: self.transaction_log.snapshot(),
             structural_log: self.structural_log.snapshot(),
@@ -204,8 +204,8 @@ fn classify(path: &str) -> ObjectRole {
     }
     match part {
         "glassdb" => ObjectRole::DatabaseMetadata,
-        "_i" => ObjectRole::CollectionRoot,
-        "_n" => ObjectRole::Node,
+        "_i" => ObjectRole::CollectionRecord,
+        "_r" | "_n" => ObjectRole::Node,
         "_t" => ObjectRole::TransactionLog,
         "_s" => ObjectRole::StructuralLog,
         _ => ObjectRole::Other,
@@ -279,16 +279,17 @@ mod tests {
         ));
         assert!(matches!(
             classify("db/_c/Y29sbA/_i"),
-            ObjectRole::CollectionRoot
+            ObjectRole::CollectionRecord
         ));
         assert!(matches!(
             classify("db/_c/_t/_i"),
-            ObjectRole::CollectionRoot
+            ObjectRole::CollectionRecord
         ));
         assert!(matches!(
             classify("db/_c/Y29sbA/_n/token"),
             ObjectRole::Node
         ));
+        assert!(matches!(classify("db/_c/Y29sbA/_r"), ObjectRole::Node));
         assert!(matches!(
             classify("db/_t/0F/encoded"),
             ObjectRole::TransactionLog
@@ -338,7 +339,7 @@ mod tests {
 
         let got = handle.snapshot();
         assert_eq!(
-            got.collection_root,
+            got.collection_record,
             OperationCounts {
                 reads: 3,
                 writes: 3,

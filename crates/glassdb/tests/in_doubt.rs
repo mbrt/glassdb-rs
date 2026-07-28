@@ -22,7 +22,7 @@
 //!   we can read it back is irreducibly in-doubt — surfaced as [`Error::InDoubt`]
 //!   rather than risking a double-apply on a renewed re-run.
 //! - The logged path's commit point (the `_t/` flip) and its leaf lock CAS
-//!   (a node `_n/` or the root `_i`) are recovered in place the same way (they
+//!   (a node `_n/` or the root `_r`) are recovered in place the same way (they
 //!   are idempotent under their own preconditions).
 //!
 //! The engine never retries a transaction *transparently* across an in-doubt
@@ -66,7 +66,7 @@ fn is_committed_tx_log(body: &[u8]) -> bool {
 
 fn shard_cas(op: &BackendOp<'_>) -> bool {
     matches!(op, BackendOp::WriteIf { path, .. }
-        if path.contains("/_n/") || path.ends_with("/_i"))
+        if path.contains("/_n/") || path.ends_with("/_r"))
 }
 
 fn committed_log(op: &BackendOp<'_>) -> bool {
@@ -212,7 +212,7 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
     settle_writebacks().await;
 
     // Trap the fast path's lock CAS (the first `write_if` on the coordination
-    // leaf — the root `/_i` here, which installs `locked_by`): let it land, then
+    // leaf — the root `/_r` here, which installs `locked_by`): let it land, then
     // lose the ack.
     let _ = arm_after(&backend, lost_ack_after(shard_cas));
 
@@ -304,7 +304,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 
     settle_writebacks().await;
 
-    // Trap the fast path's lock CAS (the first `write_if` on the leaf `_i`):
+    // Trap the fast path's lock CAS (the first `write_if` on the leaf `_r`):
     // report it as in-doubt *without* applying it, modelling a write that never landed. The
     // hook is one-shot, so the engine's idempotent re-issue lands.
     arm_before(&backend, fail_before(shard_cas, || not_applied("write_if")));
@@ -399,7 +399,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     seed(&coll, b"a", 0).await;
     seed(&coll, b"b", 0).await;
 
-    // Trap the first leaf lock CAS (a `write_if` on the leaf `_i` — how a
+    // Trap the first leaf lock CAS (a `write_if` on the leaf `_r` — how a
     // lock is installed in v2). Let it land, then lose the ack: the lock is
     // actually applied but the locker observes `Unavailable`.
     let _ = arm_after(&backend, lost_ack_after(shard_cas));

@@ -9,7 +9,7 @@ use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{
     Backend, Collection, CollectionPath, Database, Error, ProtocolTiming, SplitPolicy, Transaction,
 };
-use glassdb_storage::{CollectionRoot, TxCommitStatus};
+use glassdb_storage::{Node, TxCommitStatus};
 use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
@@ -1027,9 +1027,9 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let parent_writes = Arc::new(AtomicUsize::new(0));
-    let parent_root = Arc::new(Mutex::new(None::<String>));
+    let parent_record = Arc::new(Mutex::new(None::<String>));
     backend.set_before({
-        let parent_root = parent_root.clone();
+        let parent_record = parent_record.clone();
         let entered = entered.clone();
         let release = release.clone();
         let parent_writes = parent_writes.clone();
@@ -1038,7 +1038,7 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
             if let BackendOp::WriteIf { path, .. } = op
                 && parent_cas
             {
-                parent_root
+                parent_record
                     .lock()
                     .unwrap()
                     .get_or_insert_with(|| (*path).to_owned());
@@ -1080,15 +1080,21 @@ async fn concurrent_subcollection_registration_is_serialized_and_converges() {
         list_collections_of(&parent).await,
         vec![b"left".to_vec(), b"right".to_vec()]
     );
-    let parent_root = parent_root
+    let parent_record = parent_record
         .lock()
         .unwrap()
         .clone()
         .expect("parent CAS path was recorded");
+    let parent_root = format!(
+        "{}_r",
+        parent_record
+            .strip_suffix("_i")
+            .expect("collection record path ends in _i")
+    );
     let stored = mem.read(&parent_root).await.unwrap();
-    let root = CollectionRoot::decode(&stored.contents).unwrap();
+    let root = Node::decode(&stored.contents).unwrap();
     assert!(
-        root.node().structural_gate().holders().is_empty(),
+        root.structural_gate().holders().is_empty(),
         "registration must not introduce a structural holder"
     );
 }

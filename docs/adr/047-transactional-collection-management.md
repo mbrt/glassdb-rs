@@ -7,6 +7,9 @@ transaction-log collection manifests, root directory coordination, topology
 freeze participation, per-node delete intents, and asynchronous recovery/GC).
 Topology participation and settlement are refined by
 [ADR-049](049-participant-owned-topology-intents.md).
+[ADR-050](050-separate-collection-record-and-tree-root.md) separates the
+collection record at `_i` from the data-tree root at `_r`; this ADR's lifecycle
+protocol otherwise remains unchanged.
 
 Constituent decision of the
 [dynamic-range-sharding design](../designs/dynamic-range-sharding.md). Depends

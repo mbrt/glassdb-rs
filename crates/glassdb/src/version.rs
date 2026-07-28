@@ -1,9 +1,9 @@
 //! Database metadata version check. Ported from the Go `version.go`.
 
 use glassdb_backend::{Backend, BackendError};
-use glassdb_data::{CollectionAddress, DATABASE_ID_BYTES, DatabaseId};
+use glassdb_data::{CollectionAddress, DATABASE_ID_BYTES, DatabaseId, paths};
 use glassdb_proto as pb;
-use glassdb_storage::CollectionRoot;
+use glassdb_storage::{CollectionRecord, Node, Shard};
 use prost::Message;
 
 use crate::error::Error;
@@ -38,14 +38,35 @@ pub(crate) async fn check_or_create_db_meta(
 }
 
 async fn ensure_root_for_initialization(b: &impl Backend, name: &str) -> Result<(), Error> {
-    let path =
-        glassdb_data::paths::collection_info(&CollectionAddress::root(name).physical_prefix());
-    let body = CollectionRoot::new().encode();
-    match b.write_if_not_exists(&path, body).await {
+    let prefix = CollectionAddress::root(name).physical_prefix();
+    ensure_collection_record(b, &paths::collection_record(&prefix)).await?;
+    ensure_tree_root(b, &paths::tree_root(&prefix)).await
+}
+
+async fn ensure_collection_record(b: &impl Backend, path: &str) -> Result<(), Error> {
+    match b
+        .write_if_not_exists(path, CollectionRecord::new().encode())
+        .await
+    {
         Ok(_) => Ok(()),
         Err(BackendError::Precondition) => {
-            let stored = b.read(&path).await?;
-            CollectionRoot::decode(&stored.contents)?;
+            let stored = b.read(path).await?;
+            CollectionRecord::decode(&stored.contents)?;
+            Ok(())
+        }
+        Err(error) => Err(Error::from(error)),
+    }
+}
+
+async fn ensure_tree_root(b: &impl Backend, path: &str) -> Result<(), Error> {
+    match b
+        .write_if_not_exists(path, Node::leaf(Shard::new()).encode())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(BackendError::Precondition) => {
+            let stored = b.read(path).await?;
+            Node::decode(&stored.contents)?;
             Ok(())
         }
         Err(error) => Err(Error::from(error)),

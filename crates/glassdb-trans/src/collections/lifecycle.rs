@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::{
-    CollectionRoot, LeafObservation, Node, Requirement, ShardStore, StorageError, TxCommitStatus,
+    CollectionRecord, CollectionStore, Node, Requirement, Shard, ShardStore, StorageError,
+    TxCommitStatus,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -17,6 +18,7 @@ use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 /// Drives collection incarnations through preparation, deletion, and cleanup.
 #[derive(Clone)]
 pub(crate) struct CollectionLifecycle {
+    records: CollectionStore,
     shards: ShardStore,
     monitor: Monitor,
     retry: RetryConfig,
@@ -24,16 +26,22 @@ pub(crate) struct CollectionLifecycle {
 
 impl CollectionLifecycle {
     /// Creates collection lifecycle access over the shared stores.
-    pub(crate) fn new(shards: ShardStore, monitor: Monitor, retry: RetryConfig) -> Self {
+    pub(crate) fn new(
+        records: CollectionStore,
+        shards: ShardStore,
+        monitor: Monitor,
+        retry: RetryConfig,
+    ) -> Self {
         Self {
+            records,
             shards,
             monitor,
             retry,
         }
     }
 
-    /// Creates every fresh, still-undiscoverable collection root.
-    pub(crate) async fn prepare_roots(
+    /// Creates both objects of every fresh, still-undiscoverable collection.
+    pub(crate) async fn prepare_collections(
         &self,
         changes: &[CollectionChange],
     ) -> Result<(), TransError> {
@@ -43,8 +51,18 @@ impl CollectionLifecycle {
         {
             let prefix = change.collection.physical_prefix();
             if !self
+                .records
+                .create_record(&prefix, &CollectionRecord::new())
+                .await?
+            {
+                self.records
+                    .load_record(&prefix, Requirement::Any)
+                    .await
+                    .map_err(TransError::from)?;
+            }
+            if !self
                 .shards
-                .create_root(&prefix, &CollectionRoot::new())
+                .create_root(&prefix, &Node::leaf(Shard::new()))
                 .await?
             {
                 self.shards
@@ -107,17 +125,19 @@ impl CollectionLifecycle {
             for (_, observed) in nodes {
                 self.shards.delete_node(&observed).await?;
             }
-            let LeafObservation::Root(observed) = self
+            let observed = self
                 .shards
                 .load_root_state(&prefix, Requirement::Any)
-                .await?
-            else {
-                return Err(TransError::other(
-                    "collection root lookup returned a standalone node",
-                ));
-            };
+                .await?;
             if observed.exists() {
                 self.shards.delete_root(&observed).await?;
+            }
+            let observed = self
+                .records
+                .load_record_state(&prefix, Requirement::Any)
+                .await?;
+            if observed.exists() {
+                self.records.delete_record(&observed).await?;
             }
         }
         Ok(())
@@ -132,33 +152,34 @@ impl CollectionLifecycle {
         let prefix = collection.physical_prefix();
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = self.shards.load_root(&prefix, Requirement::Any).await?;
-            if root.topology_freeze() != Some(id)
-                && let Some(holder) = root.topology_freeze().cloned()
+            let (mut record, observed) =
+                self.records.load_record(&prefix, Requirement::Any).await?;
+            if record.topology_freeze() != Some(id)
+                && let Some(holder) = record.topology_freeze().cloned()
             {
                 match resolve_tx_conflict(&self.monitor, id, &holder).await? {
                     TxFinalStatus::Committed => return Err(TransError::StaleCollection),
                     TxFinalStatus::Aborted => {
-                        root.remove_topology_freeze(&holder);
+                        record.remove_topology_freeze(&holder);
                     }
                 }
             }
-            if root.topology_freeze().is_none() {
-                assert!(root.set_topology_freeze(id.clone()));
-                if self.shards.store_root(&prefix, &root, &observed).await? {
+            if record.topology_freeze().is_none() {
+                assert!(record.set_topology_freeze(id.clone()));
+                if self.records.store_record(&record, &observed).await? {
                     continue;
                 }
                 rt::sleep(backoff.next_delay()).await;
                 continue;
             }
-            if root.topology_freeze() != Some(id) {
+            if record.topology_freeze() != Some(id) {
                 continue;
             }
-            if root.topology_participants().next().is_none() {
+            if record.topology_participants().next().is_none() {
                 return Ok(());
             }
 
-            let participant = root
+            let participant = record
                 .topology_participants()
                 .next()
                 .cloned()
@@ -216,20 +237,20 @@ impl CollectionLifecycle {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut root, observed) = self.shards.load_root(&prefix, Requirement::Any).await?;
-            if root.node().collection_delete_intent() == Some(id) {
+            if root.collection_delete_intent() == Some(id) {
                 return Ok(());
             }
-            if let Some(holder) = root.node().collection_delete_intent().cloned() {
+            if let Some(holder) = root.collection_delete_intent().cloned() {
                 self.resolve_delete_holder(&holder, id).await?;
                 continue;
             }
-            if let Some(holder) = self.pending_node_holder(root.node(), id).await? {
+            if let Some(holder) = self.pending_node_holder(&root, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
                 continue;
             }
             // As for standalone nodes, the exact-revision rewrite closes the
             // final race without leaving a separate gate to recover on abort.
-            root.node_locks_mut().set_delete_intent(id.clone());
+            root.set_collection_delete_intent(id.clone());
             if self.shards.store_root(&prefix, &root, &observed).await? {
                 return Ok(());
             }
@@ -313,12 +334,24 @@ impl CollectionLifecycle {
                 Err(StorageError::NotFound) => return Ok(()),
                 Err(error) => return Err(error.into()),
             };
-            let changed =
-                root.node_locks_mut().remove_delete_intent(id) | root.remove_topology_freeze(id);
-            if !changed {
-                return Ok(());
+            if !root.remove_collection_delete_intent(id) {
+                break;
             }
             if self.shards.store_root(&prefix, &root, &observed).await? {
+                break;
+            }
+        }
+        loop {
+            let (mut record, observed) =
+                match self.records.load_record(&prefix, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+            if !record.remove_topology_freeze(id) {
+                return Ok(());
+            }
+            if self.records.store_record(&record, &observed).await? {
                 return Ok(());
             }
         }
@@ -395,6 +428,7 @@ mod tests {
     }
 
     struct TestStore {
+        records: CollectionStore,
         shards: ShardStore,
         objects: CachedStore,
         timeline: Timeline,
@@ -404,6 +438,7 @@ mod tests {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TestStore {
+            records: CollectionStore::new(objects.clone()),
             shards: ShardStore::new(objects.clone()),
             objects,
             timeline,
@@ -435,9 +470,18 @@ mod tests {
             initial_interval: Duration::ZERO,
             max_interval: Duration::ZERO,
         };
-        let primary_lifecycle =
-            CollectionLifecycle::new(primary.shards.clone(), monitor.clone(), retry);
-        let peer_lifecycle = CollectionLifecycle::new(peer.shards.clone(), monitor.clone(), retry);
+        let primary_lifecycle = CollectionLifecycle::new(
+            primary.records.clone(),
+            primary.shards.clone(),
+            monitor.clone(),
+            retry,
+        );
+        let peer_lifecycle = CollectionLifecycle::new(
+            peer.records.clone(),
+            peer.shards.clone(),
+            monitor.clone(),
+            retry,
+        );
         let split_id = TxId::from_bytes(vec![2]);
         let drop_id = TxId::from_bytes(vec![1]);
 

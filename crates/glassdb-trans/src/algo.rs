@@ -451,7 +451,7 @@ fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Option<
 /// state can change the effective writer without rewriting the leaf.
 fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
     let raw_key = read.key.key();
-    let Some(node) = read.leaf.node() else {
+    let Some(node) = read.leaf.value().map(AsRef::as_ref) else {
         return Ok(false);
     };
     let leaf = node
@@ -504,8 +504,7 @@ impl Algo {
         split_policy: SplitPolicy,
         splitter: Splitter,
     ) -> Self {
-        let collection_lifecycle =
-            CollectionLifecycle::new(shards.clone(), mon.clone(), RetryConfig::default());
+        let collection_lifecycle = locker.collection_lifecycle(shards.clone());
         Algo {
             shards,
             resolver,
@@ -653,17 +652,23 @@ impl Algo {
         if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
         }
-        let result = self.mon.abort_tx(&tx.id).await;
+        match self.mon.abort_tx(&tx.id).await {
+            Ok(()) => {}
+            // The commit point won before cleanup observed its result. Its
+            // collection objects and delete fences now belong to the committed
+            // log and must be left for write-back/recovery.
+            Err(TransError::AlreadyFinalized) => {
+                tx.status = Status::Committed;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let drops = tx.fenced_drops.iter().cloned().collect::<Vec<_>>();
-        let drop_cleanup = self
-            .collection_lifecycle
+        self.collection_lifecycle
             .clear_aborted_drops(&tx.id, &drops)
-            .await;
+            .await?;
         let prepared = tx.prepared_collections.iter().cloned().collect::<Vec<_>>();
-        let prepared_cleanup = self.collection_lifecycle.reclaim(&prepared).await;
-        result?;
-        drop_cleanup?;
-        prepared_cleanup
+        self.collection_lifecycle.reclaim(&prepared).await
     }
 
     /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
@@ -821,11 +826,12 @@ impl Algo {
                 .map(|change| change.collection.clone()),
         );
         self.collection_lifecycle
-            .prepare_roots(&tx.collection_data.changes)
+            .prepare_collections(&tx.collection_data.changes)
             .await?;
         let directory_locks = self
-            .collection_catalog
-            .lock_directories(
+            .locker
+            .directories()
+            .lock(
                 &tx.id,
                 &tx.collection_data.reads,
                 &tx.collection_data.changes,
@@ -848,7 +854,7 @@ impl Algo {
         // drops keys may under-record, which only defers those stale locks to
         // lazy reclaim, never a correctness loss.
         let mut locks = locked.locked_paths();
-        locks.extend(directory_locks);
+        locks.extend(directory_locks.into_durable_locks());
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
         // Validate point reads and scans after their entry/predicate locks are
@@ -875,7 +881,7 @@ impl Algo {
                 )
                 .await?
         {
-            self.collection_catalog.release_locks(&tx.id, &locks).await;
+            self.locker.directories().release(&tx.id, &locks).await?;
             return self.revalidate(tx).await;
         }
 
@@ -907,7 +913,8 @@ impl Algo {
         tx.status = Status::Committed;
 
         if let Err(error) = self
-            .collection_catalog
+            .locker
+            .directories()
             .write_back(&tx.id, &tx.collection_data.changes, &locks)
             .await
         {
@@ -951,15 +958,16 @@ impl Algo {
         // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
         let directory_locks = self
-            .collection_catalog
-            .lock_directories(&tx.id, &tx.collection_data.reads, &[])
+            .locker
+            .directories()
+            .lock(&tx.id, &tx.collection_data.reads, &[])
             .await?;
         let locked = match self.acquire_locks(tx, validation_start).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return self.restart(tx).await,
         };
         let mut locks = locked.locked_paths();
-        locks.extend(directory_locks);
+        locks.extend(directory_locks.into_durable_locks());
         self.mon.record_tx_locks(&tx.id, locks.clone());
         if self
             .validate(
@@ -984,7 +992,7 @@ impl Algo {
         {
             return Ok(());
         }
-        self.collection_catalog.release_locks(&tx.id, &locks).await;
+        self.locker.directories().release(&tx.id, &locks).await?;
         self.revalidate(tx).await
     }
 
@@ -1231,6 +1239,7 @@ impl Algo {
                 let installed_from = installed_from.clone();
                 bg.spawn_waited(async move {
                     let superseded = locker
+                        .data()
                         .write_back_single_put(
                             &id,
                             &leaf_path,
@@ -1245,6 +1254,7 @@ impl Algo {
             None => {
                 let superseded = self
                     .locker
+                    .data()
                     .write_back_single_put(id, leaf_path, raw_key, key, installed_from.as_ref())
                     .await;
                 feed_gc_hints(&self.gc, superseded);
@@ -1276,12 +1286,12 @@ impl Algo {
                 let gc = self.gc.clone();
                 let id = id.clone();
                 bg.spawn_waited(async move {
-                    let superseded = locker.write_back(&id, &locked).await;
+                    let superseded = locker.data().write_back(&id, &locked).await;
                     feed_gc_hints(&gc, superseded);
                 });
             }
             None => {
-                let superseded = self.locker.write_back(id, &locked).await;
+                let superseded = self.locker.data().write_back(id, &locked).await;
                 feed_gc_hints(&self.gc, superseded);
             }
         }
@@ -1336,11 +1346,13 @@ impl Algo {
             let scan_requirement = Requirement::AtLeast(validation_start);
             let outcome = if serial {
                 self.locker
+                    .data()
                     .lock_at(&tx.id, &tx.data, true, scan_requirement)
                     .await
             } else {
+                let data_locker = self.locker.data();
                 tokio::select! {
-                    res = self.locker.lock_at(&tx.id, &tx.data, false, scan_requirement) => res,
+                    res = data_locker.lock_at(&tx.id, &tx.data, false, scan_requirement) => res,
                     _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
                 }
             };
@@ -1378,6 +1390,7 @@ impl Algo {
     /// transaction object stays pending; only the shard/root lock entries clear.
     async fn release_for_retry(&self, tx: &Handle) -> Result<(), TransError> {
         self.locker
+            .data()
             .release_locks(&tx.id)
             .await
             .map_err(|e| e.context(format!("releasing locks before re-lock for tx {}", tx.id)))
@@ -1651,8 +1664,8 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, LeafRef, paths};
     use glassdb_storage::{
-        CachedStore, CollectionRoot, Directory, Shard, ShardEntry, ShardStore, TLogger,
-        TxCommitStatus,
+        CachedStore, CollectionRecord, CollectionStore, Directory, Node, Shard, ShardEntry,
+        ShardStore, TLogger, TxCommitStatus,
     };
 
     const TEST_DB: &str = "testp";
@@ -1670,6 +1683,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         tlogger: TLogger,
         tmon: Monitor,
+        records: CollectionStore,
         shards: ShardStore,
         timeline: Timeline,
         locker: Locker,
@@ -1703,11 +1717,13 @@ mod tests {
             RetryConfig::default(),
             ProtocolTiming::simulation(),
         );
+        let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects.clone());
         let resolver = Resolver::new(shards.clone(), tmon.clone());
         let dir = Directory::new(shards.clone());
         let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
+            records.clone(),
             shards.clone(),
             timeline.clone(),
             tmon.clone(),
@@ -1716,7 +1732,14 @@ mod tests {
             TEST_COLL,
             glassdb_storage::SplitPolicy::default(),
         );
-        let locker = Locker::new(coord.clone(), dir, tmon.clone(), RetryConfig::default());
+        let locker = Locker::new(
+            coord.clone(),
+            dir,
+            records.clone(),
+            tlogger.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+        );
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
@@ -1728,8 +1751,12 @@ mod tests {
         );
 
         // Create the collection root so the test collection exists up front.
+        records
+            .create_record(TEST_COLL, &CollectionRecord::new())
+            .await
+            .unwrap();
         shards
-            .create_root(TEST_COLL, &CollectionRoot::new())
+            .create_root(TEST_COLL, &Node::leaf(Shard::new()))
             .await
             .unwrap();
 
@@ -1739,12 +1766,7 @@ mod tests {
             locker.clone(),
             coord.clone(),
             tmon.clone(),
-            CollectionCatalog::new(
-                shards.clone(),
-                tlogger.clone(),
-                tmon.clone(),
-                RetryConfig::default(),
-            ),
+            CollectionCatalog::new(locker.clone()),
             Clock::real(),
             gc,
             None,
@@ -1758,6 +1780,7 @@ mod tests {
                 backend: b,
                 tlogger,
                 tmon,
+                records,
                 shards,
                 timeline,
                 locker,
@@ -1816,7 +1839,7 @@ mod tests {
         let loaded = tctx
             .shards
             .load_leaf(
-                &paths::collection_info(TEST_COLL),
+                &paths::tree_root(TEST_COLL),
                 Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
@@ -1948,6 +1971,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_preserves_prepared_collection_when_commit_won() {
+        let (tm, tctx) = new_algo().await;
+        let prepared = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
+        );
+        assert!(
+            tctx.records
+                .create_record(&prepared.physical_prefix(), &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            tctx.shards
+                .create_root(&prepared.physical_prefix(), &Node::leaf(Shard::new()))
+                .await
+                .unwrap()
+        );
+
+        let mut handle = begin_data(&tm, Data::default());
+        let id = handle.id().clone();
+        tm.mon.begin_tx(&id);
+        handle.status = Status::Validating;
+        handle.engaged = true;
+        handle.prepared_collections.insert(prepared.clone());
+        tm.commit_writes(
+            &Data::default(),
+            &CollectionData::default(),
+            &handle.prepared_collections,
+            Vec::new(),
+            &id,
+        )
+        .await
+        .unwrap();
+
+        tm.end(&mut handle).await.unwrap();
+
+        tctx.records
+            .load_record(&prepared.physical_prefix(), Requirement::Any)
+            .await
+            .expect("committed collection record must survive cleanup");
+        tctx.shards
+            .load_root(&prepared.physical_prefix(), Requirement::Any)
+            .await
+            .expect("committed collection tree root must survive cleanup");
+    }
+
+    #[tokio::test]
     async fn a_retried_body_clears_an_abandoned_partial_drop() {
         let (tm, tctx) = new_algo().await;
         let dropped = CollectionAddress::new(
@@ -1961,9 +2032,16 @@ mod tests {
         handle.engaged = true;
         handle.fenced_drops.insert(dropped.clone());
 
-        let mut root = CollectionRoot::new();
-        root.node_locks_mut().set_delete_intent(id.clone());
-        assert!(root.set_topology_freeze(id.clone()));
+        let mut record = CollectionRecord::new();
+        assert!(record.set_topology_freeze(id.clone()));
+        assert!(
+            tctx.records
+                .create_record(&dropped.physical_prefix(), &record)
+                .await
+                .unwrap()
+        );
+        let mut root = Node::leaf(Shard::new());
+        root.set_collection_delete_intent(id.clone());
         assert!(
             tctx.shards
                 .create_root(&dropped.physical_prefix(), &root)
@@ -1981,8 +2059,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(root.node().collection_delete_intent(), None);
-        assert_eq!(root.topology_freeze(), None);
+        assert_eq!(root.collection_delete_intent(), None);
+        let (record, _) = tctx
+            .records
+            .load_record(&dropped.physical_prefix(), Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(record.topology_freeze(), None);
         tm.end(&mut handle).await.unwrap();
     }
 
@@ -2130,6 +2213,7 @@ mod tests {
         tctx.tmon.begin_tx(&holder);
         let held = tctx
             .locker
+            .data()
             .lock_at(
                 &holder,
                 &Data {
@@ -2204,7 +2288,7 @@ mod tests {
                 move |op| {
                     use std::sync::atomic::Ordering::SeqCst;
                     let fail = matches!(op, BackendOp::WriteIf { path, .. }
-                        if path.contains("/_n/") || path.ends_with("/_i"))
+                        if path.contains("/_n/") || path.ends_with("/_r"))
                         && flaky.armed.load(SeqCst)
                         && flaky
                             .remaining
@@ -2303,7 +2387,7 @@ mod tests {
                     use std::sync::atomic::Ordering::SeqCst;
                     let fail = outcome.is_success()
                         && matches!(op, BackendOp::WriteIf { path, .. }
-                            if path.contains("/_n/") || path.ends_with("/_i"))
+                            if path.contains("/_n/") || path.ends_with("/_r"))
                         && in_doubt
                             .armed
                             .compare_exchange(true, false, SeqCst, SeqCst)
@@ -2329,7 +2413,7 @@ mod tests {
 
     /// A distinct key that shares the same leaf as `base`, for exercising
     /// disjoint-key contention within one leaf object. With split deferred, every
-    /// key lives in the collection's single leaf `_i` (ADR-031), so any distinct
+    /// key lives in the collection's single leaf `_r` (ADR-031), so any distinct
     /// key qualifies.
     fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
         let sib = b"sibling".to_vec();
@@ -2374,7 +2458,7 @@ mod tests {
         tctx.tmon.begin_tx(&txa);
         tctx.tmon.begin_tx(&txb);
 
-        let shard_path = paths::collection_info(TEST_COLL);
+        let shard_path = paths::tree_root(TEST_COLL);
         log.lock().unwrap().clear();
         gate.arm();
 
@@ -2392,15 +2476,18 @@ mod tests {
         };
         let tb = txb.clone();
         let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
-        let acquire =
-            tokio::spawn(async move { cb.lock_at(&tb, &data_b, false, lock_requirement).await });
+        let acquire = tokio::spawn(async move {
+            cb.data()
+                .lock_at(&tb, &data_b, false, lock_requirement)
+                .await
+        });
 
         // Let the driver park in the gated load before the install joins.
         rt::sleep(Duration::from_secs(1)).await;
 
         let (ta, pa, ka2, kap2) = (
             txa.clone(),
-            paths::collection_info(TEST_COLL),
+            paths::tree_root(TEST_COLL),
             ka.clone(),
             kap.clone(),
         );
@@ -2470,7 +2557,7 @@ mod tests {
         let (ca, cb) = (tm.clone(), tctx.locker.clone());
         let (ta, pa, ka2, kap2) = (
             txa.clone(),
-            paths::collection_info(TEST_COLL),
+            paths::tree_root(TEST_COLL),
             ka.clone(),
             kap.clone(),
         );
@@ -2483,8 +2570,11 @@ mod tests {
         };
         let tb = txb.clone();
         let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
-        let acquire =
-            tokio::spawn(async move { cb.lock_at(&tb, &data_b, false, lock_requirement).await });
+        let acquire = tokio::spawn(async move {
+            cb.data()
+                .lock_at(&tb, &data_b, false, lock_requirement)
+                .await
+        });
 
         rt::sleep(Duration::from_secs(1)).await;
         gate.release();
@@ -2582,7 +2672,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
-        // `/_n/` or the collection root `/_i`, which holds the small collection's
+        // `/_n/` or the collection root `/_r`, which holds the small collection's
         // single leaf entries. Entry-lock and write-back CAS both land here and
         // cannot be told apart by path alone.
         leaf: usize,
@@ -2595,7 +2685,7 @@ mod tests {
             if o.op != "write_if" && o.op != "write_if_not_exists" {
                 continue;
             }
-            if o.path.contains("/_n/") || o.path.ends_with("/_i") {
+            if o.path.contains("/_n/") || o.path.ends_with("/_r") {
                 c.leaf += 1;
             } else if o.path.contains("/_t/") {
                 c.tx += 1;
@@ -2609,7 +2699,7 @@ mod tests {
     fn shard_reads(log: &OpLog) -> (usize, usize) {
         let (mut full, mut revalidate) = (0, 0);
         for o in log.lock().unwrap().iter() {
-            if !(o.path.contains("/_n/") || o.path.ends_with("/_i")) {
+            if !(o.path.contains("/_n/") || o.path.ends_with("/_r")) {
                 continue;
             }
             if o.op == "read" {
@@ -2635,7 +2725,7 @@ mod tests {
     // one committed `_t/` object write, one leaf lock CAS, one leaf write-back
     // CAS (inline here, no background executor), and no separate membership
     // write — and the new value is durable and readable. With split deferred the
-    // leaf is the collection root `_i`, so both leaf CAS's land there (ADR-031).
+    // leaf is the collection root `_r`, so both leaf CAS's land there (ADR-031).
     #[tokio::test]
     async fn single_rw_overwrite_takes_fast_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -2693,7 +2783,7 @@ mod tests {
             .load_root(TEST_COLL, Requirement::Any)
             .await
             .unwrap();
-        root.node_locks_mut().set_structural_gate(gate.clone());
+        root.set_structural_gate(gate.clone());
         assert!(
             tctx.shards
                 .store_root(TEST_COLL, &root, &version)
@@ -2813,7 +2903,7 @@ mod tests {
     async fn single_rw_committed_holder_stays_on_fast_path() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
-        let leaf_path = paths::collection_info(TEST_COLL);
+        let leaf_path = paths::tree_root(TEST_COLL);
         let raw = b"k".to_vec();
 
         // H0 publishes v1; H1 overwrites with v2 through the fast path, leaving
@@ -2845,13 +2935,7 @@ mod tests {
         }));
         assert!(
             tctx.shards
-                .store_leaf(
-                    &leaf_path,
-                    &windowed,
-                    &loaded.locks,
-                    loaded.kind(),
-                    &loaded.observation
-                )
+                .store_leaf(&leaf_path, &windowed, &loaded.locks, &loaded.observation)
                 .await
                 .unwrap()
         );
@@ -3141,6 +3225,7 @@ mod tests {
         };
         let locked = match tctx
             .locker
+            .data()
             .lock_at(
                 &holder,
                 &holder_data,
@@ -3208,6 +3293,7 @@ mod tests {
         };
         match tctx
             .locker
+            .data()
             .lock_at(
                 &holder,
                 &holder_data,
@@ -3285,6 +3371,7 @@ mod tests {
         };
         let other_locked = match tctx
             .locker
+            .data()
             .lock_at(
                 &other,
                 &other_data,
@@ -3310,6 +3397,7 @@ mod tests {
         };
         let current_locked = match tctx
             .locker
+            .data()
             .lock_at(
                 &current,
                 &current_data,
@@ -3329,8 +3417,8 @@ mod tests {
                 .unwrap()
         );
 
-        tctx.locker.release_locks(&current).await.unwrap();
-        tctx.locker.release_locks(&other).await.unwrap();
+        tctx.locker.data().release_locks(&current).await.unwrap();
+        tctx.locker.data().release_locks(&other).await.unwrap();
     }
 
     #[tokio::test]
@@ -3353,7 +3441,7 @@ mod tests {
             external_timeline.clone(),
             None,
         ));
-        let leaf_path = paths::collection_info(TEST_COLL);
+        let leaf_path = paths::tree_root(TEST_COLL);
         let loaded = external
             .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
             .await
@@ -3372,7 +3460,6 @@ mod tests {
                     &leaf_path,
                     &Shard::from_entries(entries.into_values()),
                     &loaded.locks,
-                    loaded.kind(),
                     &loaded.observation,
                 )
                 .await
@@ -3391,6 +3478,7 @@ mod tests {
         };
         let other_locked = match tctx
             .locker
+            .data()
             .lock_at(
                 &other,
                 &other_data,
@@ -3428,7 +3516,7 @@ mod tests {
             "post-bound current evidence satisfies both validation steps locally"
         );
 
-        tctx.locker.release_locks(&other).await.unwrap();
+        tctx.locker.data().release_locks(&other).await.unwrap();
         drop(other_locked);
     }
 
@@ -3554,10 +3642,10 @@ mod tests {
     }
 
     // Installs live committed pointers for `keys` directly in the collection's
-    // root leaf `_i` (no lock holders or pending write-back), giving scan tests a
+    // root leaf `_r` (no lock holders or pending write-back), giving scan tests a
     // stable membership baseline.
     async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
-        let path = paths::collection_info(TEST_COLL);
+        let path = paths::tree_root(TEST_COLL);
         let loaded = tctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
@@ -3585,13 +3673,7 @@ mod tests {
         let shard = Shard::from_entries(entries.into_values());
         assert!(
             tctx.shards
-                .store_leaf(
-                    &path,
-                    &shard,
-                    &loaded.locks,
-                    loaded.kind(),
-                    &loaded.observation,
-                )
+                .store_leaf(&path, &shard, &loaded.locks, &loaded.observation,)
                 .await
                 .unwrap()
         );
@@ -3692,6 +3774,7 @@ mod tests {
         };
         let locked = match tctx
             .locker
+            .data()
             .lock_at(
                 &holder,
                 &holder_data,
@@ -3826,9 +3909,9 @@ mod tests {
 
         let (data, _keys) = scan_data(&tctx).await;
 
-        // Grow the tree in place: rewrite `_i` from its single leaf into an index
+        // Grow the tree in place: rewrite `_r` from its single leaf into an index
         // root pointing at two fresh leaves (the shape the background splitter
-        // produces), so the covered leaf set is no longer just `_i`.
+        // produces), so the covered leaf set is no longer just `_r`.
         split_root_in_place(&tctx).await;
 
         let mut stable = begin_data(&tm, data);
@@ -3869,15 +3952,14 @@ mod tests {
             .store_node(TEST_COLL, "S1", &leaf(&[b"m", b"p"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([
+        let root = Node::index(IndexNode::from_children([
             (b"".to_vec(), "S0".to_string()),
             (b"m".to_vec(), "S1".to_string()),
-        ])));
+        ]));
         let cur = tctx
             .shards
             .load_leaf(
-                &paths::collection_info(TEST_COLL),
+                &paths::tree_root(TEST_COLL),
                 Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
@@ -3922,9 +4004,9 @@ mod tests {
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
 
-    // Rewrites the test collection's root `_i` (a single leaf holding `a`,`m`)
+    // Rewrites the test collection's root `_r` (a single leaf holding `a`,`m`)
     // into a two-level tree: an index root over leaf `S0` (a) and `S1` (m),
-    // chained by right-sibling. A CAS on `_i` makes this the topology-growth
+    // chained by right-sibling. A CAS on `_r` makes this the topology-growth
     // linearization point, mirroring the in-place root split (ADR-031).
     async fn split_root_in_place(tctx: &Tctx) {
         use glassdb_storage::{IndexNode, Node};
@@ -3932,7 +4014,7 @@ mod tests {
         let loaded = tctx
             .shards
             .load_leaf(
-                &paths::collection_info(TEST_COLL),
+                &paths::tree_root(TEST_COLL),
                 Requirement::AtLeast(tctx.timeline.now()),
             )
             .await
@@ -3955,11 +4037,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([
+        let root = Node::index(IndexNode::from_children([
             (b"".to_vec(), "S0".to_string()),
             (b"m".to_vec(), "S1".to_string()),
-        ])));
+        ]));
         assert!(
             tctx.shards
                 .store_root(TEST_COLL, &root, &loaded.observation)

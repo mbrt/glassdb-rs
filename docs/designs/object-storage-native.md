@@ -2,8 +2,12 @@
 
 ## Status
 
-**Shipped.** The object-storage-native layout is the current on-disk format and
-commit protocol. This document is its design overview and decision index: the
+**Shipped foundation.** The object-storage-native commit protocol remains
+current. Its fixed-hash collection layout below is retained as the historical
+design overview and decision index; dynamic B-link sharding and the separate
+`_i` collection record / `_r` tree root supersede it in
+[the dynamic-range design](dynamic-range-sharding.md) and
+[ADR-050](../adr/050-separate-collection-record-and-tree-root.md). The
 umbrella decision is [ADR-016](../adr/016-object-storage-native-layout.md) and each
 sub-decision has its own ADR (see [Decision records](#decision-records)). It is
 the living, mutable companion to the frozen ADRs and to the user-facing
@@ -514,5 +518,6 @@ rather than a follow-on version:
 - **Hot-shard S3 PUT ceiling.** Decide whether a hot shard hitting S3's
   per-prefix PUT rate limit is an accepted, documented limit or whether shard
   paths should be spread to mitigate it.
-- **Atomic root + shard creation.** Decide whether the collection root and its
-  shards should share a fate (created atomically on `collection.create`).
+- **Collection preparation.** Resolved by ADR-046/047/050: creation prepares an
+  unreachable collection record and fixed tree root before publishing its
+  parent binding; recovery reclaims incomplete preparations.

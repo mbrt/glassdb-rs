@@ -150,7 +150,7 @@ pub struct MembershipLock {
 pub mod membership_lock {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Target {
-        /// The collection root object (`_i`). Always encoded as true.
+        /// The fixed tree root object (`_r`). Always encoded as true.
         #[prost(bool, tag = "1")]
         Root(bool),
         /// The opaque token of a standalone node object (`_n/<token>`).
@@ -355,30 +355,23 @@ pub struct DatabaseMetadata {
     #[prost(bytes = "vec", tag = "2")]
     pub database_id: ::prost::alloc::vec::Vec<u8>,
 }
-/// The collection root object `{prefix}/_i` (ADR-031). It *is* the B-link tree's
-/// root node - a leaf while the collection is small, an index once it grows - and
-/// also carries the collection metadata: the subcollection directory. Membership
-/// (create/delete) is coordinated per-key in the owning leaf, so the root holds
-/// no membership lock. Supersedes ADR-018's fixed-shard_count root.
+/// Collection metadata stored at `{prefix}/_i` (ADR-050). The B-link tree begins
+/// independently at `{prefix}/_r`; data-path operations do not read this record.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CollectionRoot {
-    /// The B-link tree root node. Its high-key is +infinity and its right-sibling
-    /// is empty (the root has no siblings).
-    #[prost(message, optional, tag = "1")]
-    pub node: ::core::option::Option<Node>,
+pub struct CollectionRecord {
     /// Direct child bindings, sorted by raw name so the encoding is canonical.
-    #[prost(message, repeated, tag = "2")]
+    #[prost(message, repeated, tag = "1")]
     pub children: ::prost::alloc::vec::Vec<CollectionDirectoryEntry>,
-    /// Root-wide transactional coordination for the bounded child directory.
-    #[prost(message, optional, tag = "3")]
+    /// Transactional coordination for the bounded child directory.
+    #[prost(message, optional, tag = "2")]
     pub directory_lock: ::core::option::Option<NodeLock>,
-    #[prost(uint64, tag = "4")]
+    #[prost(uint64, tag = "3")]
     pub directory_version: u64,
     /// Collection topology is frozen while this transaction prepares a drop.
-    #[prost(bytes = "vec", tag = "5")]
+    #[prost(bytes = "vec", tag = "4")]
     pub topology_freeze: ::prost::alloc::vec::Vec<u8>,
     /// Structural operations that joined before the freeze was installed.
-    #[prost(bytes = "vec", repeated, tag = "6")]
+    #[prost(bytes = "vec", repeated, tag = "5")]
     pub topology_participants: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

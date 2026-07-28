@@ -1,7 +1,7 @@
 //! Tree descent over the B-link coordination directory (ADR-031).
 //!
 //! The [`Directory`] resolves a key to the leaf that owns it by descending from
-//! the collection root `_i` through index nodes, and it enumerates the leaves
+//! the collection root `_r` through index nodes, and it enumerates the leaves
 //! in key order for listing. Descent is **self-correcting**: every node carries
 //! a high-key and a right-sibling, so a lookup that lands too far left —
 //! because a split moved the key rightward after the cache was taken — steps
@@ -20,7 +20,7 @@ use glassdb_data::paths;
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
-use crate::shardstore::{LeafObservation, ShardStore};
+use crate::shard_store::{LeafObservation, ShardStore};
 
 /// The leaf that owns a key (or range endpoint), with everything needed to read
 /// or compare-and-swap it: its object `path` and retained physical observation.
@@ -35,7 +35,7 @@ pub struct LeafLocator {
 impl LeafLocator {
     /// Returns the observed node.
     pub fn node(&self) -> Option<&Node> {
-        self.observation.node()
+        self.observation.value().map(AsRef::as_ref)
     }
 }
 
@@ -50,7 +50,7 @@ pub struct LeafGroup<T> {
 impl<T> LeafGroup<T> {
     /// Returns the observed node.
     pub fn node(&self) -> Option<&Node> {
-        self.observation.node()
+        self.observation.value().map(AsRef::as_ref)
     }
 }
 
@@ -65,7 +65,8 @@ struct Located {
 impl Located {
     fn node(&self) -> &Node {
         self.observation
-            .node()
+            .value()
+            .map(AsRef::as_ref)
             .expect("Located is only constructed for present objects")
     }
 
@@ -95,7 +96,7 @@ impl Directory {
         Directory { shards }
     }
 
-    /// Resolves the leaf that owns `key`, descending from the root `_i` and
+    /// Resolves the leaf that owns `key`, descending from the root `_r` and
     /// following right-sibling links to self-correct past in-progress splits.
     ///
     /// A missing collection root is reported as [`StorageError::NotFound`].
@@ -105,7 +106,7 @@ impl Directory {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<LeafLocator, StorageError> {
-        let path = paths::collection_info(prefix);
+        let path = paths::tree_root(prefix);
         let observation = self.shards.load_root_state(prefix, requirement).await?;
         let cache_hit = observation.cache_hit();
         if observation.is_absent() {
@@ -130,7 +131,7 @@ impl Directory {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let path = paths::collection_info(prefix);
+        let path = paths::tree_root(prefix);
         let observation = self.shards.load_root_state(prefix, requirement).await?;
         if observation.is_absent() {
             return Ok(None);
@@ -197,7 +198,7 @@ impl Directory {
     /// off the hot path (ADR-031): descends the index spine at `interior` requirement
     /// (served from cache — a stale misroute self-corrects via right-links) and
     /// checks only the terminal leaf — the coordination/CAS unit — at `leaf`
-    /// requirement. A grown tree thus never checks the root `_i` on every key
+    /// requirement. A grown tree thus never checks the root `_r` on every key
     /// coordination; a current lower bound stays where a CAS depends on it.
     ///
     /// When both freshnesses match this is exactly [`leaf_for`](Self::leaf_for).
@@ -214,14 +215,11 @@ impl Directory {
             return Ok(loc);
         }
         // Check the terminal node at the stricter requirement and resume the
-        // descent from it: the cached interior read may have routed us to `_i`
-        // as a leaf while a concurrent split has since rewritten `_i` into an
+        // descent from it: the cached interior read may have routed us to `_r`
+        // as a leaf while a concurrent split has since rewritten `_r` into an
         // index (or split the leaf), so we must keep descending — never hand
         // back an index masquerading as a leaf.
-        let located = self
-            .reload(prefix, &loc.path, leaf)
-            .await?
-            .after(loc.cache_hit);
+        let located = self.reload(&loc.path, leaf).await?.after(loc.cache_hit);
         Ok(self
             .descend_to_leaf(prefix, located, key, leaf)
             .await?
@@ -235,7 +233,7 @@ impl Directory {
         prefix: &str,
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let path = paths::collection_info(prefix);
+        let path = paths::tree_root(prefix);
         let observation = self.shards.load_root_state(prefix, requirement).await?;
         if observation.is_absent() {
             return Ok(None);
@@ -302,7 +300,7 @@ impl Directory {
     /// from the collection root, not by any fixed hash (ADR-031).
     ///
     /// Groups are keyed by leaf object path, so keys from different collections
-    /// (distinct `_i`) never collide; input order is preserved within a group.
+    /// (distinct `_r`) never collide; input order is preserved within a group.
     /// Missing non-root collection trees are reported as
     /// [`StorageError::StaleCollection`] while the failing key still identifies
     /// its collection.
@@ -317,7 +315,7 @@ impl Directory {
 
     /// [`group_keys_by_leaf`] with the interior-vs-leaf requirement split of
     /// [`leaf_for_fresh`], so the coordination hot path routes keys without
-    /// checking the root `_i` (ADR-031).
+    /// checking the root `_r` (ADR-031).
     ///
     /// [`group_keys_by_leaf`]: Self::group_keys_by_leaf
     /// [`leaf_for_fresh`]: Self::leaf_for_fresh
@@ -366,7 +364,7 @@ impl Directory {
         }
         let target_path = paths::from_node(prefix, target);
         let mut cur = Located {
-            path: paths::collection_info(prefix),
+            path: paths::tree_root(prefix),
             cache_hit: observation.cache_hit(),
             observation,
         };
@@ -414,7 +412,7 @@ impl Directory {
             return Ok(None);
         }
         let mut cur = Located {
-            path: paths::collection_info(prefix),
+            path: paths::tree_root(prefix),
             cache_hit: observation.cache_hit(),
             observation,
         };
@@ -443,7 +441,7 @@ impl Directory {
     /// to the owning node, then follow the index child pointer, until a leaf is
     /// reached. Self-correcting through right-links, so a stale interior read
     /// never traps the descent at the wrong node — and, crucially, a node that
-    /// turns out to be an index (e.g. a freshly checked `_i` that split into one) is
+    /// turns out to be an index (e.g. a freshly checked `_r` that split into one) is
     /// resolved to its child rather than returned as a leaf.
     async fn descend_to_leaf(
         &self,
@@ -516,32 +514,19 @@ impl Directory {
         })
     }
 
-    /// Re-reads the node at `path` (the root `_i` or a standalone `_n`) at
+    /// Re-reads the node at `path` (the root `_r` or a standalone `_n`) at
     /// `requirement`, for checking a terminal leaf reached through a cached
     /// interior descent.
-    async fn reload(
-        &self,
-        prefix: &str,
-        path: &str,
-        requirement: Requirement,
-    ) -> Result<Located, StorageError> {
-        if paths::is_collection_info(path) {
-            let observation = self.shards.load_root_state(prefix, requirement).await?;
-            if observation.is_absent() {
-                return Err(StorageError::other(
-                    "collection root vanished during descent",
-                ));
-            }
-            Ok(Located {
-                path: path.to_string(),
-                cache_hit: observation.cache_hit(),
-                observation,
-            })
-        } else {
-            let token = paths::node_token_of(path)
-                .map_err(|e| StorageError::with_source("parsing node path", e))?;
-            self.load_child(prefix, &token, requirement).await
+    async fn reload(&self, path: &str, requirement: Requirement) -> Result<Located, StorageError> {
+        let observation = self.shards.load_node_at_state(path, requirement).await?;
+        if observation.is_absent() {
+            return Err(StorageError::other("tree node vanished during descent"));
         }
+        Ok(Located {
+            path: path.to_string(),
+            cache_hit: observation.cache_hit(),
+            observation,
+        })
     }
 }
 
@@ -560,10 +545,9 @@ mod tests {
     use crate::cached_store::CachedStore;
     use crate::lock::LockType;
     use crate::node::{IndexNode, Node};
-    use crate::root::CollectionRoot;
     use crate::shard::Shard;
     use crate::shard::ShardEntry;
-    use crate::shardstore::ShardStore;
+    use crate::shard_store::ShardStore;
 
     const COLL: &str = "db/_c/0000000000000000000000";
 
@@ -622,19 +606,17 @@ mod tests {
         s.store_node(COLL, "L1", &leaf(&[b"mango", b"pear"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([
+        let root = Node::index(IndexNode::from_children([
             (b"".to_vec(), "L0".to_string()),
             (b"m".to_vec(), "L1".to_string()),
-        ])));
+        ]));
         s.create_root(COLL, &root).await.unwrap();
     }
 
     #[tokio::test]
     async fn single_leaf_collection_resolves_to_root() {
         let s = store();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries([live(b"only")])));
+        let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(COLL, &root).await.unwrap();
 
         let dir = Directory::new(s.shards.clone());
@@ -642,7 +624,7 @@ mod tests {
             .leaf_for(COLL, b"only", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
-        assert_eq!(loc.path, paths::collection_info(COLL));
+        assert_eq!(loc.path, paths::tree_root(COLL));
         assert!(!loc.observation.is_absent());
         assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"only"));
     }
@@ -707,11 +689,7 @@ mod tests {
         s.store_node(COLL, "L1", &leaf(&[b"mango", b"pear"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            b"".to_vec(),
-            "L0".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
         let dir = Directory::new(s.shards.clone());
@@ -753,7 +731,7 @@ mod tests {
     }
 
     // ADR-031 hot-path invariant: with interior-vs-leaf requirement split, repeated
-    // coordination on a non-root leaf serves the root index `_i` from cache
+    // coordination on a non-root leaf serves the root index `_r` from cache
     // (never checking it) while still checking the terminal leaf.
     #[tokio::test]
     async fn interior_descent_does_not_check_root() {
@@ -798,7 +776,7 @@ mod tests {
                 .count()
         };
         assert_eq!(
-            reads("/_i"),
+            reads("/_r"),
             0,
             "root index is served from cache, never checked"
         );
@@ -808,8 +786,8 @@ mod tests {
         );
     }
 
-    // ADR-031 P0 regression: a process that cached the root `_i` as a *leaf*
-    // must still resolve to a real leaf after another process splits `_i` into
+    // ADR-031 P0 regression: a process that cached the root `_r` as a *leaf*
+    // must still resolve to a real leaf after another process splits `_r` into
     // an index. Two independent cache views over one backend model the two
     // processes: the first warms its cache with the root-as-leaf at stale
     // requirement; the second splits the root in place; the first then resolves a
@@ -821,9 +799,8 @@ mod tests {
         let s_a = store_over(backend.clone());
         let s_b = store_over(backend);
 
-        // A single-leaf collection: the root `_i` holds the leaf directly.
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries([live(b"a"), live(b"b")])));
+        // A single-leaf collection: the root `_r` holds the leaf directly.
+        let root = Node::leaf(Shard::from_entries([live(b"a"), live(b"b")]));
         s_b.create_root(COLL, &root).await.unwrap();
 
         // Process A warms its cache with the root-as-leaf (stale requirement).
@@ -837,7 +814,7 @@ mod tests {
             "warm read sees a leaf"
         );
 
-        // Process B splits the root in place: `_i` becomes a two-child index
+        // Process B splits the root in place: `_r` becomes a two-child index
         // over fresh leaves L (<"b") and R (>="b").
         s_b.store_node(COLL, "L", &leaf(&[b"a"], Some(b"b"), Some("R")), None)
             .await
@@ -845,14 +822,14 @@ mod tests {
         s_b.store_node(COLL, "R", &leaf(&[b"b"], None, None), None)
             .await
             .unwrap();
-        let (mut root2, ver) = s_b
+        let (_, ver) = s_b
             .load_root(COLL, Requirement::AtLeast(s_b.timeline.now()))
             .await
             .unwrap();
-        root2.set_node(Node::index(IndexNode::from_children([
+        let root2 = Node::index(IndexNode::from_children([
             (b"".to_vec(), "L".to_string()),
             (b"b".to_vec(), "R".to_string()),
-        ])));
+        ]));
         assert!(s_b.store_root(COLL, &root2, &ver).await.unwrap());
 
         // Process A, still holding the stale root-as-leaf, resolves `a` with a
@@ -884,19 +861,18 @@ mod tests {
         seed_two_level(&s).await;
         let dir = Directory::new(s.shards.clone());
 
-        // The parent of any key's leaf is the root index `_i`.
+        // The parent of any key's leaf is the root index `_r`.
         let parent = dir
             .parent_index_for(COLL, b"mango", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap()
             .expect("a two-level tree has an index parent");
-        assert!(parent.path.ends_with("/_i"));
+        assert!(parent.path.ends_with("/_r"));
         assert!(parent.node().unwrap().as_index().is_some());
 
         // A single-leaf collection has no index level, hence no parent.
         let single = store();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries([live(b"only")])));
+        let root = Node::leaf(Shard::from_entries([live(b"only")]));
         single.create_root(COLL, &root).await.unwrap();
         let single_dir = Directory::new(single.shards.clone());
         assert!(

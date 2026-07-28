@@ -8,8 +8,9 @@
 //! enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
-//! a one-node structure-write lock. Before joining the collection root, it
-//! writes a `Preparing` intent below its topology participant's `_s` prefix.
+//! a one-node structure-write lock. Before joining collection topology in
+//! `_i`, it writes a `Preparing` intent below its topology participant's `_s`
+//! prefix.
 //! After taking the source gate it conditionally advances that intent to
 //! `Ready`; only then may it create nodes. A lifecycle freeze can therefore
 //! find exactly one participant's work and cancel an unadvanced intent without
@@ -34,10 +35,10 @@
 //! The source shrink (or root rewrite) releases structure-write inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.
 //!
-//! The collection root `_i` cannot move (its address is fixed), so when it
+//! The collection root `_r` cannot move (its address is fixed), so when it
 //! overflows it splits **in place**: two children are created and the root is
 //! rewritten into a two-entry index over them, growing the tree's height while
-//! preserving the collection metadata.
+//! leaving the independent collection record untouched.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,9 +48,9 @@ use std::time::Duration;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
-    Directory, IndexNode, LeafObservation, LockType, Node, Observation, Requirement, Shard,
-    ShardStore, SplitPolicy, StorageError, StructuralLog, StructuralLogPhase, Timeline,
-    TxCommitStatus, TxLock, TxLog,
+    CollectionStore, Directory, IndexNode, LeafObservation, LockType, Node, Observation,
+    Requirement, Shard, ShardStore, SplitPolicy, StorageError, StructuralLog, StructuralLogPhase,
+    Timeline, TxCommitStatus, TxLock, TxLog,
 };
 use tokio::sync::Notify;
 
@@ -213,6 +214,7 @@ pub struct Splitter {
     // Weak so a clone captured in the spawned loop does not keep the executor
     // alive across shutdown; the single strong owner is `DbInner::background`.
     bg: Weak<Background>,
+    records: CollectionStore,
     shards: ShardStore,
     dir: Directory,
     mon: Monitor,
@@ -232,7 +234,7 @@ pub struct Splitter {
     // Only leaf structure-write acquisition uses it; root and interior nodes
     // remain direct structural CASes.
     coord: ShardCoordinator,
-    // Paces root-metadata CAS retries. Transaction-status polling remains
+    // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
     stats: Arc<Stats>,
@@ -244,6 +246,7 @@ impl Splitter {
     #[allow(clippy::too_many_arguments)]
     pub fn with_coordinator(
         bg: Weak<Background>,
+        records: CollectionStore,
         shards: ShardStore,
         timeline: Timeline,
         mon: Monitor,
@@ -264,6 +267,7 @@ impl Splitter {
         );
         let splitter = Splitter::with_candidates(
             bg,
+            records,
             shards,
             timeline,
             mon,
@@ -325,6 +329,7 @@ impl Splitter {
     #[allow(clippy::too_many_arguments)]
     fn with_candidates(
         bg: Weak<Background>,
+        records: CollectionStore,
         shards: ShardStore,
         timeline: Timeline,
         mon: Monitor,
@@ -337,6 +342,7 @@ impl Splitter {
         let dir = Directory::new(shards.clone());
         Splitter {
             bg,
+            records,
             shards,
             dir,
             mon,
@@ -436,7 +442,7 @@ impl Splitter {
     }
 
     /// Splits the leaf at object `path` if it is still over the soft cap: an
-    /// in-place root split when `path` is the collection root `_i`, else a
+    /// in-place root split when `path` is the collection root `_r`, else a
     /// standalone node half-split.
     async fn split_path(&self, path: &str) -> Result<(), TransError> {
         self.split_path_with_id(path, self.candidates.new_id())
@@ -447,7 +453,7 @@ impl Splitter {
     async fn split_path_with_id(&self, path: &str, id: TxId) -> Result<(), TransError> {
         let pr = paths::parse(path)
             .map_err(|e| StorageError::with_source("parsing candidate path", e))?;
-        if paths::is_collection_info(path) {
+        if paths::is_tree_root(path) {
             self.split_root(&pr.prefix, id).await
         } else {
             self.split_nonroot(&pr.prefix, &pr.suffix, id).await
@@ -518,13 +524,13 @@ impl Splitter {
         let worker = self.candidates.new_id();
         self.mon.begin_tx(&worker);
         let mut recovery_pending = false;
-        let source_token = (!paths::is_collection_info(path)).then_some(parsed.suffix.as_str());
+        let source_token = (!paths::is_tree_root(path)).then_some(parsed.suffix.as_str());
         let result = match self
             .prepare_structural_intent(&parsed.prefix, source_token, topology_participant)
             .await
         {
             Ok(mut intent) => {
-                let coordinated = if paths::is_collection_info(path) {
+                let coordinated = if paths::is_tree_root(path) {
                     self.coordinate_root_split(
                         &parsed.prefix,
                         &worker,
@@ -642,7 +648,7 @@ impl Splitter {
                         .await?
                 }
                 None => match self.shards.load_root(prefix, Requirement::Any).await {
-                    Ok((root, version)) => (root.node().clone(), version),
+                    Ok((root, version)) => (root, version),
                     Err(StorageError::NotFound) => return Ok(None),
                     Err(e) => return Err(e.into()),
                 },
@@ -704,7 +710,7 @@ impl Splitter {
                             .shards
                             .load_root(prefix, Requirement::AtLeast(version.current_after()))
                             .await?;
-                        (root.node().clone(), version)
+                        (root, version)
                     }
                 };
                 return Ok(Some((node, locked_version)));
@@ -729,7 +735,7 @@ impl Splitter {
                 }
                 None => {
                     let (root, version) = self.shards.load_root(prefix, Requirement::Any).await?;
-                    (root.node().clone(), version)
+                    (root, version)
                 }
             };
             if !node.remove_structural_gate(id) {
@@ -758,14 +764,7 @@ impl Splitter {
                 .shards
                 .store_node(prefix, token, node, Some(observation))
                 .await?),
-            None => {
-                let (mut root, current) = self.shards.load_root(prefix, Requirement::Any).await?;
-                if current.revision() != observation.revision() {
-                    return Ok(false);
-                }
-                root.set_node(node.clone());
-                Ok(self.shards.store_root(prefix, &root, observation).await?)
-            }
+            None => Ok(self.shards.store_root(prefix, node, observation).await?),
         }
     }
 
@@ -976,23 +975,24 @@ impl Splitter {
     async fn join_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = match self.shards.load_root(prefix, Requirement::Any).await {
-                Ok(root) => root,
-                Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
-                Err(error) => return Err(error.into()),
-            };
-            if root
+            let (mut record, observed) =
+                match self.records.load_record(prefix, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
+                    Err(error) => return Err(error.into()),
+                };
+            if record
                 .topology_participants()
                 .any(|participant| participant == id)
             {
                 return Ok(());
             }
-            if let Some(holder) = root.topology_freeze() {
+            if let Some(holder) = record.topology_freeze() {
                 return match self.mon.tx_status(holder).await? {
                     TxCommitStatus::Aborted => {
                         let holder = holder.clone();
-                        root.remove_topology_freeze(&holder);
-                        if self.shards.store_root(prefix, &root, &observed).await? {
+                        record.remove_topology_freeze(&holder);
+                        if self.records.store_record(&record, &observed).await? {
                             continue;
                         }
                         rt::sleep(backoff.next_delay()).await;
@@ -1002,13 +1002,10 @@ impl Splitter {
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
                 };
             }
-            if root.node().collection_delete_intent().is_some() {
+            if !record.add_topology_participant(id.clone()) {
                 return Err(TransError::Retry);
             }
-            if !root.add_topology_participant(id.clone()) {
-                return Err(TransError::Retry);
-            }
-            if self.shards.store_root(prefix, &root, &observed).await? {
+            if self.records.store_record(&record, &observed).await? {
                 return Ok(());
             }
             rt::sleep(backoff.next_delay()).await;
@@ -1018,15 +1015,16 @@ impl Splitter {
     async fn leave_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = match self.shards.load_root(prefix, Requirement::Any).await {
-                Ok(root) => root,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(error) => return Err(error.into()),
-            };
-            if !root.remove_topology_participant(id) {
+            let (mut record, observed) =
+                match self.records.load_record(prefix, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+            if !record.remove_topology_participant(id) {
                 return Ok(());
             }
-            if self.shards.store_root(prefix, &root, &observed).await? {
+            if self.records.store_record(&record, &observed).await? {
                 return Ok(());
             }
             rt::sleep(backoff.next_delay()).await;
@@ -1069,8 +1067,7 @@ impl Splitter {
             (split_key.clone(), r_token.clone()),
         ]);
         let index = Node::index(root_index);
-        let mut sized_root = self.shards.load_root(prefix, Requirement::Any).await?.0;
-        sized_root.set_node(index.clone());
+        let sized_root = index.clone();
         let content_limit = self
             .candidates
             .policy()
@@ -1081,7 +1078,7 @@ impl Splitter {
         {
             self.release_structural_gate(prefix, None, worker).await?;
             return Err(TransError::InvalidInput(
-                "root metadata exceeds the coordination node size limit".into(),
+                "root index exceeds the coordination node size limit".into(),
             ));
         }
 
@@ -1345,14 +1342,7 @@ impl Splitter {
                         .load_node_state(&record.prefix, token, requirement)
                         .await
                     {
-                        Ok(LeafObservation::Node(node)) => {
-                            self.shards.delete_node(&node).await?;
-                        }
-                        Ok(LeafObservation::Root(_)) => {
-                            return Err(TransError::other(
-                                "orphan-node cleanup loaded a collection root",
-                            ));
-                        }
+                        Ok(node) => self.shards.delete_node(&node).await?,
                         Err(StorageError::NotFound) => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -1395,7 +1385,7 @@ impl Splitter {
                 // No index level (a single-leaf collection): nothing to publish.
                 return Ok(());
             };
-            let parent_token = if paths::is_collection_info(&parent.path) {
+            let parent_token = if paths::is_tree_root(&parent.path) {
                 None
             } else {
                 Some(
@@ -1589,7 +1579,9 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_data::{KeyRef, TxId};
-    use glassdb_storage::{CachedStore, CollectionRoot, LockType, ShardEntry, TLogger, TxWrite};
+    use glassdb_storage::{
+        CachedStore, CollectionRecord, CollectionStore, LockType, ShardEntry, TLogger, TxWrite,
+    };
 
     const COLL: &str = "db/_c/0000000000000000000000";
 
@@ -1611,6 +1603,7 @@ mod tests {
 
     #[derive(Clone)]
     struct TestStore {
+        records: CollectionStore,
         shards: ShardStore,
         objects: CachedStore,
         timeline: Timeline,
@@ -1624,6 +1617,15 @@ mod tests {
         }
     }
 
+    impl TestStore {
+        async fn create_root(&self, prefix: &str, node: &Node) -> Result<bool, StorageError> {
+            self.records
+                .create_record(prefix, &CollectionRecord::new())
+                .await?;
+            self.shards.create_root(prefix, node).await
+        }
+    }
+
     fn store() -> TestStore {
         store_with_backend(Arc::new(MemoryBackend::new()))
     }
@@ -1632,6 +1634,7 @@ mod tests {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TestStore {
+            records: CollectionStore::new(objects.clone()),
             shards: ShardStore::new(objects.clone()),
             objects,
             timeline,
@@ -1690,6 +1693,7 @@ mod tests {
         );
         Splitter::with_candidates(
             Arc::downgrade(bg),
+            shards.records.clone(),
             shards.shards.clone(),
             shards.timeline.clone(),
             mon,
@@ -1741,21 +1745,20 @@ mod tests {
         }
     }
 
-    // A small collection whose single leaf lives in the root `_i`; when it grows
+    // A small collection whose single leaf lives in the root `_r`; when it grows
     // past the cap the root splits in place into a two-child index, raising the
     // height, and every key stays reachable in key order.
     #[tokio::test]
     async fn root_leaf_splits_in_place_into_an_index() {
         let s = store();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries(
+        let root = Node::leaf(Shard::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
-        )));
+        ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::collection_info(COLL))
+            .split_path(&paths::tree_root(COLL))
             .await
             .unwrap();
 
@@ -1828,12 +1831,11 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = recorder.log();
         let s = store_with_backend(Arc::new(recorder));
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries(
+        let root = Node::leaf(Shard::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"]
                 .iter()
                 .map(|key| live(key)),
-        )));
+        ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
@@ -1886,8 +1888,13 @@ mod tests {
             .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
-        assert!(root.node().as_leaf().is_some());
-        assert_eq!(root.topology_participants().count(), 0);
+        assert!(root.as_leaf().is_some());
+        let (record, _) = s
+            .records
+            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(record.topology_participants().count(), 0);
     }
 
     // A standalone leaf over the cap half-splits: the upper half moves to a fresh
@@ -1904,11 +1911,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
@@ -1976,17 +1979,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([
+        let root = Node::index(IndexNode::from_children([
             (Vec::new(), "L0".to_string()),
             (b"m".to_vec(), "L1".to_string()),
             (b"t".to_vec(), "L2".to_string()),
-        ])));
+        ]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::collection_info(COLL))
+            .split_path(&paths::tree_root(COLL))
             .await
             .unwrap();
 
@@ -2019,15 +2021,14 @@ mod tests {
     #[tokio::test]
     async fn re_split_of_a_settled_node_is_a_noop() {
         let s = store();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries(
+        let root = Node::leaf(Shard::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
-        )));
+        ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
 
-        sp.split_path(&paths::collection_info(COLL)).await.unwrap();
+        sp.split_path(&paths::tree_root(COLL)).await.unwrap();
         let after_first = Directory::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
@@ -2037,7 +2038,7 @@ mod tests {
         for leaf in &after_first {
             sp.split_path(&leaf.path).await.unwrap();
         }
-        sp.split_path(&paths::collection_info(COLL)).await.unwrap();
+        sp.split_path(&paths::tree_root(COLL)).await.unwrap();
 
         let after_second = Directory::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
@@ -2055,17 +2056,16 @@ mod tests {
     #[tokio::test]
     async fn feed_drives_run_once() {
         let s = store();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries(
+        let root = Node::leaf(Shard::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
-        )));
+        ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
         let candidates = SplitCandidates::with_clock(tiny(), Clock::real());
         // Under the cap: not enqueued.
         candidates.observe_leaf(
-            &paths::collection_info(COLL),
+            &paths::tree_root(COLL),
             &Shard::from_entries([live(b"a"), live(b"b")]),
         );
         assert!(
@@ -2074,7 +2074,7 @@ mod tests {
         );
         // Over the cap: enqueued and split by a sweep.
         candidates.observe_leaf(
-            &paths::collection_info(COLL),
+            &paths::tree_root(COLL),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
         let sp = splitter_with_candidates(&s, &bg, candidates);
@@ -2104,13 +2104,12 @@ mod tests {
             [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
         ));
         node.add_membership_reader(holder.clone());
-        let mut root = CollectionRoot::new();
-        root.set_node(node);
+        let root = node;
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_clock(tiny(), Clock::real());
         candidates.observe_leaf(
-            &paths::collection_info(COLL),
+            &paths::tree_root(COLL),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
         let sp = splitter_with_candidates(&s, &bg, candidates);
@@ -2139,7 +2138,7 @@ mod tests {
             .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
-        root.node_locks_mut().remove_membership_holder(&holder);
+        root.remove_membership_holder(&holder);
         assert!(s.store_root(COLL, &root, &version).await.unwrap());
 
         sp.run_once().await;
@@ -2178,11 +2177,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
         sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
@@ -2235,11 +2230,7 @@ mod tests {
         upper.locked_by.push(holder.clone());
         let node = Node::leaf(Shard::from_entries(entries));
         s.store_node(COLL, "L", &node, None).await.unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
         sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
@@ -2264,8 +2255,9 @@ mod tests {
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
         let other_bg = Arc::new(Background::new());
+        let other_transactions = TLogger::new(other.objects.clone(), "db");
         let other_mon = Monitor::new(
-            TLogger::new(other.objects.clone(), "db"),
+            other_transactions.clone(),
             other.timeline.clone(),
             Arc::downgrade(&other_bg),
         );
@@ -2281,10 +2273,13 @@ mod tests {
         let other_locker = crate::tlocker::Locker::new(
             other_coord,
             Directory::new(other.shards.clone()),
+            other.records.clone(),
+            other_transactions,
             other_mon,
             RetryConfig::default(),
         );
         other_locker
+            .data()
             .write_back_single_put(
                 &holder,
                 &paths::from_node(COLL, "L"),
@@ -2323,11 +2318,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
         sp.candidates.observe_leaf(
@@ -2362,10 +2353,9 @@ mod tests {
     #[tokio::test]
     async fn byte_cap_enqueues_and_splits_below_entry_cap() {
         let s = store();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::leaf(Shard::from_entries(
+        let root = Node::leaf(Shard::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
-        )));
+        ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
@@ -2379,7 +2369,7 @@ mod tests {
         };
         let candidates = SplitCandidates::with_clock(policy, Clock::real());
         candidates.observe_leaf(
-            &paths::collection_info(COLL),
+            &paths::tree_root(COLL),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
 
@@ -2416,11 +2406,7 @@ mod tests {
         s.store_node(COLL, "S", &leaf_node(&[b"m", b"n", b"o"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "P0".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "P0".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
@@ -2472,7 +2458,7 @@ mod tests {
 
     // ADR-032 retry path: a separator whose parent CAS keeps losing leaves its
     // structural record in progress and is re-queued for a later sweep. A backend that blocks writes to
-    // the root `_i` forces the publication to give up; healing it lets the
+    // the root `_r` forces the publication to give up; healing it lets the
     // re-driven publication land.
     #[tokio::test]
     async fn lost_parent_cas_is_republished_by_a_later_sweep() {
@@ -2483,16 +2469,12 @@ mod tests {
         s.store_node(COLL, "L", &leaf_node(&[b"a", b"b", b"c"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
 
-        // Block the parent `_i` CAS: the split lands (L shrinks, a sibling is
+        // Block the parent `_r` CAS: the split lands (L shrinks, a sibling is
         // created) but the separator publication cannot, so it is re-queued.
         blocker.block(true);
         assert!(matches!(
@@ -2510,7 +2492,8 @@ mod tests {
             "separator is not published while the parent CAS is blocked"
         );
         let (blocked_coordination, _) = s
-            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .records
+            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -2549,7 +2532,8 @@ mod tests {
                 .is_empty()
         );
         let (recovered_coordination, _) = s
-            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .records
+            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(recovered_coordination.topology_participants().count(), 0);
@@ -2567,11 +2551,7 @@ mod tests {
             .store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         first.create_root(COLL, &root).await.unwrap();
         first
             .write_structural_log("R", &nonroot_record("L", "R", b"m"))
@@ -2630,11 +2610,7 @@ mod tests {
         s.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
         let record = nonroot_record("L", "R", b"m");
         let observed = s.write_structural_log("R", &record).await.unwrap();
@@ -2704,11 +2680,7 @@ mod tests {
         peer.store_node(COLL, "L", &leaf_node(&[b"a", b"b"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         peer.create_root(COLL, &root).await.unwrap();
 
         // Recovery reads L first, caching the pre-gate snapshot (no gate). A weak
@@ -2772,11 +2744,7 @@ mod tests {
         s.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
             .await
             .unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
@@ -2827,13 +2795,11 @@ mod tests {
                         && match op {
                             BackendOp::WriteIf { path, value, .. }
                             | BackendOp::WriteIfNotExists { path, value }
-                                if path.ends_with("/_i") =>
+                                if path.ends_with("/_r") =>
                             {
-                                CollectionRoot::decode(value)
+                                Node::decode(value)
                                     .ok()
-                                    .and_then(|root| {
-                                        root.node().as_index().map(|index| index.len() > 1)
-                                    })
+                                    .and_then(|root| root.as_index().map(|index| index.len() > 1))
                                     .unwrap_or(false)
                             }
                             _ => false,
@@ -2931,11 +2897,7 @@ mod tests {
         let (right, split_key) = shrunk.split("R").unwrap();
         shrunk.remove_structural_gate(&id);
         s.store_node(COLL, "R", &right, None).await.unwrap();
-        let mut root = CollectionRoot::new();
-        root.set_node(Node::index(IndexNode::from_children([(
-            Vec::new(),
-            "L".to_string(),
-        )])));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
         let record = StructuralLog {

@@ -382,7 +382,7 @@ impl Resolver {
         let raw_key = key.key();
         // Interior index nodes are served from cache (ADR-031 hot-path
         // invariant); only the terminal leaf honors the caller's `requirement`
-        // (the fast path's `Any` reuse, else a current lower bound), so the root `_i`
+        // (the fast path's `Any` reuse, else a current lower bound), so the root `_r`
         // is not revalidated on every commit.
         let loc = self
             .dir
@@ -512,7 +512,7 @@ mod tests {
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::Background;
     use glassdb_data::{CollectionId, paths};
-    use glassdb_storage::{CachedStore, CollectionRoot, Shard, TLogger, Timeline};
+    use glassdb_storage::{CachedStore, Node, Shard, TLogger, Timeline};
 
     const DB: &str = "db";
     const COLL: &str = "db/_c/0000000000000000000000";
@@ -543,7 +543,7 @@ mod tests {
         let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
         shards
-            .create_root(COLL, &CollectionRoot::new())
+            .create_root(COLL, &Node::leaf(Shard::new()))
             .await
             .unwrap();
         (Resolver::new(shards, mon.clone()), mon, timeline, bg)
@@ -566,7 +566,7 @@ mod tests {
         let timeline = Timeline::new();
         let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
         shards
-            .create_root(COLL, &CollectionRoot::new())
+            .create_root(COLL, &Node::leaf(Shard::new()))
             .await
             .unwrap();
         TestStore { shards, timeline }
@@ -582,10 +582,10 @@ mod tests {
     }
 
     // Installs a committed pointer for `key` directly in the collection's leaf
-    // `_i` (no lock holders), so the entry resolves to `writer` regardless of
+    // `_r` (no lock holders), so the entry resolves to `writer` regardless of
     // whether that writer recorded a live value or tombstone.
     async fn seed_writer(store: &TestStore, key: &[u8], writer: &TxId, deleted: bool) {
-        let path = paths::collection_info(COLL);
+        let path = paths::tree_root(COLL);
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
@@ -609,13 +609,7 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_leaf(
-                    &path,
-                    &new_shard,
-                    &loaded.locks,
-                    loaded.kind(),
-                    &loaded.observation,
-                )
+                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation,)
                 .await
                 .unwrap()
         );
@@ -641,7 +635,7 @@ mod tests {
     // case: the effective writer must be discovered from the committed holder,
     // not the (stale, empty) pointer.
     async fn seed_locked(store: &TestStore, key: &[u8], holder: &TxId) {
-        let path = paths::collection_info(COLL);
+        let path = paths::tree_root(COLL);
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
@@ -665,13 +659,7 @@ mod tests {
         let new_shard = Shard::from_entries(entries.into_values());
         assert!(
             store
-                .store_leaf(
-                    &path,
-                    &new_shard,
-                    &loaded.locks,
-                    loaded.kind(),
-                    &loaded.observation,
-                )
+                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation,)
                 .await
                 .unwrap()
         );
@@ -683,7 +671,7 @@ mod tests {
             .iter()
             .filter(|r| {
                 (r.op == "read" || r.op == "read_if_modified")
-                    && (r.path.contains("/_n/") || r.path.ends_with("/_i"))
+                    && (r.path.contains("/_n/") || r.path.ends_with("/_r"))
             })
             .count()
     }
@@ -718,7 +706,7 @@ mod tests {
         ));
     }
 
-    // With split deferred every key lives in the collection's single leaf `_i`
+    // With split deferred every key lives in the collection's single leaf `_r`
     // (ADR-031), so a batch of keys resolves against that one leaf: a live
     // pointer, a tombstone, and an absent key each resolve to the right writer.
     #[tokio::test]
