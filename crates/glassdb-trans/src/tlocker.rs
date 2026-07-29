@@ -35,8 +35,8 @@ use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{KeyRef, LeafRef, TxId, paths};
 use glassdb_storage::{
-    CollectionStore, CurrentState, Directory, InlinePolicy, LeafObservation, LockType, NodeLocks,
-    Requirement, ShardEntry, ShardStore, TLogger, TxLock,
+    CollectionStore, CurrentState, Directory, LeafObservation, LockType, NodeLocks, Requirement,
+    ShardEntry, ShardStore, TLogger, TxLock,
 };
 
 use crate::algo::{Data, WriteOp};
@@ -44,9 +44,7 @@ use crate::collections::CollectionLifecycle;
 use crate::directory_locker::DirectoryLocker;
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{
-    InlineAdmission, NodeLockReconciler, resolve_entry_locks, resolved_current,
-};
+use crate::node_locking::{NodeLockReconciler, resolve_entry_locks, resolved_current};
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
     Step,
@@ -99,21 +97,6 @@ struct KeyIntent {
     pub key: KeyRef,
     /// The lock to install.
     pub desired: Desired,
-    /// The value to publish inline at write-back (ADR-051), retained only when
-    /// it is under the per-value budget. `None` publishes an external pointer.
-    pub inline: Option<Arc<[u8]>>,
-}
-
-/// The value a write-back may publish inline: a put whose value is under the
-/// per-value budget. Larger values are dropped here rather than held in memory
-/// until write-back for nothing.
-fn inline_candidate(
-    desired: Desired,
-    value: Option<&Arc<[u8]>>,
-    policy: &InlinePolicy,
-) -> Option<Arc<[u8]>> {
-    let value = value?;
-    (desired == Desired::Put && value.len() <= policy.max_value_bytes).then(|| value.clone())
 }
 
 /// The keys a transaction touches in one leaf, plus the leaf's location
@@ -185,42 +168,27 @@ async fn build_groups(
     dir: &Directory,
     data: &Data,
     scan_requirement: Requirement,
-    inline: &InlinePolicy,
 ) -> Result<BTreeMap<String, ShardGroup>, TransError> {
-    struct Intent {
-        desired: Desired,
-        inline: Option<Arc<[u8]>>,
-    }
-
-    let mut by_key: BTreeMap<KeyRef, Intent> = BTreeMap::new();
+    let mut by_key: BTreeMap<KeyRef, Desired> = BTreeMap::new();
     for w in &data.writes {
-        let (desired, value) = match &w.op {
-            WriteOp::Delete => (Desired::Delete, None),
-            WriteOp::Put(value) => (Desired::Put, Some(value)),
+        let desired = match &w.op {
+            WriteOp::Delete => Desired::Delete,
+            WriteOp::Put(_) => Desired::Put,
         };
         // A later write to the same key wins (e.g. put-then-delete).
-        by_key.insert(
-            w.key.clone(),
-            Intent {
-                desired,
-                inline: inline_candidate(desired, value, inline),
-            },
-        );
+        by_key.insert(w.key.clone(), desired);
     }
     for r in &data.reads {
         // A key that is also written keeps its exclusive intent.
-        by_key.entry(r.key.clone()).or_insert(Intent {
-            desired: Desired::Read,
-            inline: None,
-        });
+        by_key.entry(r.key.clone()).or_insert(Desired::Read);
     }
 
     // Collect before descending so the returned future does not close over a
     // borrowing iterator (which would not be higher-ranked / `Send` when a
     // caller spawns the lock).
-    let items: Vec<(KeyRef, (KeyRef, Intent))> = by_key
+    let items: Vec<(KeyRef, (KeyRef, Desired))> = by_key
         .into_iter()
-        .map(|(key, intent)| (key.clone(), (key, intent)))
+        .map(|(key, desired)| (key.clone(), (key, desired)))
         .collect();
     // Route with interior nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
@@ -239,11 +207,10 @@ async fn build_groups(
         let mut intents: Vec<KeyIntent> = group
             .keys
             .into_iter()
-            .map(|(raw_key, (key, intent))| KeyIntent {
+            .map(|(raw_key, (key, desired))| KeyIntent {
                 key,
                 raw_key,
-                desired: intent.desired,
-                inline: intent.inline,
+                desired,
             })
             .collect();
         intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
@@ -319,11 +286,10 @@ impl ShardResolver for AcquireResolver {
         }
         let mut membership = self.membership;
         let mut admission = StageAdmission::ExistingKeys;
-        let mut inline = InlineAdmission::new(ctx.inline, staged);
         let mut entries = Vec::with_capacity(self.intents.len());
         for intent in self.intents.iter() {
             let cur = staged.get(&intent.raw_key).cloned();
-            match resolve_and_lock(ctx, &self.id, intent, cur, &mut inline).await? {
+            match resolve_and_lock(ctx, &self.id, intent, cur).await? {
                 EntryResolution::Locked(entry, changes_membership) => {
                     if changes_membership {
                         membership = LockType::Write;
@@ -436,12 +402,7 @@ impl ShardResolver for WriteBackResolver {
         let WritebackStaged {
             changes,
             superseded,
-        } = writeback_changes(
-            &self.id,
-            &self.intents,
-            staged,
-            &mut InlineAdmission::new(ctx.inline, staged),
-        );
+        } = writeback_changes(&self.id, &self.intents, staged);
         let outcome = FoldOutcome::Released { superseded };
         let locks_changed = locks.release_membership(&self.id);
         if changes.is_empty() && !locks_changed {
@@ -575,7 +536,6 @@ async fn resolve_and_lock(
     id: &TxId,
     intent: &KeyIntent,
     entry: Option<ShardEntry>,
-    admission: &mut InlineAdmission,
 ) -> Result<EntryResolution, TransError> {
     let mut e = entry.unwrap_or_else(|| ShardEntry::new(intent.raw_key.clone()));
 
@@ -586,7 +546,7 @@ async fn resolve_and_lock(
     // and the unknown-tx grace period into `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
     let resolved = resolve_entry_locks(ctx, &intent.key, Some(&e), Some(id)).await?;
-    e.current = resolved_current(&intent.raw_key, Some(&e), &resolved, admission);
+    e.current = resolved_current(Some(&e), &resolved);
     let mut pending = resolved.pending;
 
     let exists_before = e.current.exists();
@@ -644,7 +604,6 @@ fn writeback_changes(
     id: &TxId,
     intents: &[KeyIntent],
     entries: &BTreeMap<Vec<u8>, ShardEntry>,
-    admission: &mut InlineAdmission,
 ) -> WritebackStaged {
     let mut changes = Vec::new();
     let mut superseded = Vec::new();
@@ -663,21 +622,16 @@ fn writeback_changes(
                 {
                     superseded.push(prev.clone());
                 }
-                let writer = id.clone();
-                e.current = match &intent.inline {
-                    _ if matches!(intent.desired, Desired::Delete) => {
-                        CurrentState::Tombstone { writer }
-                    }
-                    // The value is also durable in our transaction object, so
-                    // missing the budget costs only the reader's extra load.
-                    Some(value) if admission.admit(&intent.raw_key, value) => {
-                        CurrentState::Inline {
-                            writer,
-                            value: value.clone(),
-                        }
-                    }
-                    _ => CurrentState::External { writer },
-                };
+                // Replaying a write-back must not demote an authoritative
+                // direct-commit value. A newly published logged write points
+                // to its transaction object instead (ADR-054).
+                if e.current.writer() != Some(id) {
+                    e.current = if matches!(intent.desired, Desired::Delete) {
+                        CurrentState::Tombstone { writer: id.clone() }
+                    } else {
+                        CurrentState::External { writer: id.clone() }
+                    };
+                }
             }
             Desired::Read => {}
         }
@@ -860,13 +814,7 @@ impl DataLocker {
         serial: bool,
         scan_requirement: Requirement,
     ) -> Result<LockOutcome, TransError> {
-        let mut groups = build_groups(
-            &self.dir,
-            data,
-            scan_requirement,
-            &self.coord.inline_policy(),
-        )
-        .await?;
+        let mut groups = build_groups(&self.dir, data, scan_requirement).await?;
         let validations = match self
             .lock_shards_at(id, &groups, serial, scan_requirement)
             .await?
@@ -967,13 +915,11 @@ impl DataLocker {
         leaf_path: &str,
         raw_key: &[u8],
         key: &KeyRef,
-        value: &Arc<[u8]>,
     ) -> Vec<TxId> {
         let intents = Arc::new(vec![KeyIntent {
             raw_key: raw_key.to_vec(),
             key: key.clone(),
             desired: Desired::Put,
-            inline: inline_candidate(Desired::Put, Some(value), &self.coord.inline_policy()),
         }]);
         self.write_back_routed(id, leaf_path, intents, Requirement::Any)
             .await
@@ -1398,14 +1344,6 @@ mod tests {
         b: Arc<dyn Backend>,
         policy: SplitPolicy,
     ) -> (Locker, TlCtx) {
-        new_test_locker_with_policies(b, policy, InlinePolicy::default()).await
-    }
-
-    async fn new_test_locker_with_policies(
-        b: Arc<dyn Backend>,
-        policy: SplitPolicy,
-        inline: InlinePolicy,
-    ) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "test");
@@ -1440,7 +1378,7 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             policy,
-            inline,
+            glassdb_storage::InlinePolicy::default(),
             Arc::new(crate::shard_coord::NoSplitHints),
         );
         let locker = Locker::new(
@@ -1488,7 +1426,6 @@ mod tests {
             raw_key: key.to_vec(),
             key: key_ref(key),
             desired: Desired::Read,
-            inline: None,
         }
     }
 
@@ -1497,15 +1434,6 @@ mod tests {
             raw_key: key.to_vec(),
             key: key_ref(key),
             desired: Desired::Put,
-            inline: None,
-        }
-    }
-
-    // A put that carries its value for inline publication (ADR-051).
-    fn inline_put_intent(key: &[u8], value: &[u8]) -> KeyIntent {
-        KeyIntent {
-            inline: Some(Arc::from(value)),
-            ..put_intent(key)
         }
     }
 
@@ -1981,7 +1909,7 @@ mod tests {
         let e = entry_of(&ctx, key).await.unwrap();
         assert_eq!(e.lock_type, LockType::None);
         assert!(e.locked_by.is_empty());
-        assert_eq!(e.current.writer(), Some(&tx));
+        assert_eq!(e.current, CurrentState::External { writer: tx });
         let loaded = ctx
             .shards
             .load_leaf(
@@ -2023,200 +1951,12 @@ mod tests {
         );
     }
 
-    // ADR-051: a small value is published into the leaf entry itself, so the
-    // next read needs no transaction object.
+    // A later acquisition help-forwards committed holders as transaction-object
+    // pointers. Logged values are not copied into leaf entries (ADR-054).
     #[tokio::test]
-    async fn write_back_inlines_a_small_value() {
-        let (locker, ctx) = init_tl_test().await;
-        let key = b"key";
-        let tx = mk_tid(1, "tx");
-        ctx.monitor.begin_tx(&tx);
-
-        let groups = group_of(key, inline_put_intent(key, b"small"));
-        lock_ok(&locker, &tx, &groups).await;
-        locker
-            .data()
-            .write_back(
-                &tx,
-                &LockedTx {
-                    groups,
-                    validations: BTreeMap::new(),
-                },
-            )
-            .await;
-
-        let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(
-            e.current,
-            CurrentState::Inline {
-                writer: tx,
-                value: Arc::from(b"small".as_slice()),
-            }
-        );
-    }
-
-    // A value over the per-value budget is never inlined: it is dropped from the
-    // intent before write-back, which publishes an external pointer.
-    #[tokio::test]
-    async fn a_value_over_the_per_value_budget_stays_external() {
-        let inline = InlinePolicy {
-            max_value_bytes: 4,
-            ..InlinePolicy::default()
-        };
-        let (locker, ctx) = new_test_locker_with_policies(
-            Arc::new(MemoryBackend::new()),
-            SplitPolicy::default(),
-            inline,
-        )
-        .await;
-        let key = b"key";
-        let tx = mk_tid(1, "tx");
-        ctx.monitor.begin_tx(&tx);
-
-        // The write-back derives the intent's inline payload from the policy, so
-        // it exercises the drop rather than relying on the caller to have done it.
-        let groups = group_of(key, put_intent(key));
-        lock_ok(&locker, &tx, &groups).await;
-        locker
-            .data()
-            .write_back_one_put(
-                &tx,
-                &paths::tree_root(COLL),
-                key,
-                &key_ref(key),
-                &Arc::from(b"too-long".as_slice()),
-            )
-            .await;
-
-        let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.current, CurrentState::External { writer: tx });
-    }
-
-    // The aggregate budget is admission-only: a leaf already at it keeps taking
-    // writes, they just publish external pointers.
-    #[tokio::test]
-    async fn a_leaf_at_its_aggregate_budget_keeps_admitting_external_writes() {
-        let inline = InlinePolicy {
-            max_value_bytes: 64,
-            max_leaf_bytes: 5,
-        };
-        let (locker, ctx) = new_test_locker_with_policies(
-            Arc::new(MemoryBackend::new()),
-            SplitPolicy::default(),
-            inline,
-        )
-        .await;
-        let first = b"key-a".to_vec();
-        let second = same_shard_sibling(&first);
-
-        let tx1 = mk_tid(1, "first");
-        ctx.monitor.begin_tx(&tx1);
-        let groups = group_of(&first, inline_put_intent(&first, b"aaaaa"));
-        lock_ok(&locker, &tx1, &groups).await;
-        locker
-            .data()
-            .write_back(
-                &tx1,
-                &LockedTx {
-                    groups,
-                    validations: BTreeMap::new(),
-                },
-            )
-            .await;
-
-        let tx2 = mk_tid(2, "second");
-        ctx.monitor.begin_tx(&tx2);
-        let groups = group_of(&second, inline_put_intent(&second, b"bbbbb"));
-        lock_ok(&locker, &tx2, &groups).await;
-        locker
-            .data()
-            .write_back(
-                &tx2,
-                &LockedTx {
-                    groups,
-                    validations: BTreeMap::new(),
-                },
-            )
-            .await;
-
-        assert_eq!(
-            entry_of(&ctx, &first).await.unwrap().current.inline_len(),
-            5,
-            "the leaf's whole budget went to the first value"
-        );
-        let e = entry_of(&ctx, &second).await.unwrap();
-        assert_eq!(
-            e.current,
-            CurrentState::External { writer: tx2 },
-            "the second write still lands, just not inline"
-        );
-    }
-
-    // One write-back publishing several keys spends a single leaf budget: each
-    // admitted payload is charged before the next key is weighed, so the keys
-    // cannot each be admitted against the leaf as it was loaded.
-    #[tokio::test]
-    async fn keys_written_back_together_share_one_leaf_budget() {
-        let inline = InlinePolicy {
-            max_value_bytes: 64,
-            max_leaf_bytes: 5,
-        };
-        let (locker, ctx) = new_test_locker_with_policies(
-            Arc::new(MemoryBackend::new()),
-            SplitPolicy::default(),
-            inline,
-        )
-        .await;
-        let first = b"key-a".to_vec();
-        let second = same_shard_sibling(&first);
-
-        let tx = mk_tid(1, "writer");
-        ctx.monitor.begin_tx(&tx);
-        let groups = group_of_intents(vec![
-            inline_put_intent(&first, b"aaaaa"),
-            inline_put_intent(&second, b"bbbbb"),
-        ]);
-        lock_ok(&locker, &tx, &groups).await;
-        locker
-            .data()
-            .write_back(
-                &tx,
-                &LockedTx {
-                    groups,
-                    validations: BTreeMap::new(),
-                },
-            )
-            .await;
-
-        let first = entry_of(&ctx, &first).await.unwrap();
-        let second = entry_of(&ctx, &second).await.unwrap();
-        assert_eq!(
-            first.current.inline_len() + second.current.inline_len(),
-            5,
-            "the two writes together must not exceed the leaf's inline budget"
-        );
-        assert_eq!(first.current.writer(), Some(&tx));
-        assert_eq!(
-            second.current.writer(),
-            Some(&tx),
-            "the write that missed the budget still publishes a pointer"
-        );
-    }
-
-    // Help-forwarding several committed holders in one acquisition spends that
-    // same single budget.
-    #[tokio::test]
-    async fn keys_help_forwarded_together_share_one_leaf_budget() {
+    async fn committed_logged_values_are_help_forwarded_as_external() {
         use glassdb_storage::{TxLog, TxWrite};
-        let (locker, ctx) = new_test_locker_with_policies(
-            Arc::new(MemoryBackend::new()),
-            SplitPolicy::default(),
-            InlinePolicy {
-                max_value_bytes: 64,
-                max_leaf_bytes: 5,
-            },
-        )
-        .await;
+        let (locker, ctx) = init_tl_test().await;
         let first = b"key-a".to_vec();
         let second = same_shard_sibling(&first);
 
@@ -2251,37 +1991,24 @@ mod tests {
         )
         .await;
 
-        let first = entry_of(&ctx, &first).await.unwrap();
-        let second = entry_of(&ctx, &second).await.unwrap();
         assert_eq!(
-            first.current.inline_len() + second.current.inline_len(),
-            5,
-            "the two help-forwarded values must not exceed the leaf's budget"
+            entry_of(&ctx, &first).await.unwrap().current,
+            CurrentState::External {
+                writer: writer.clone()
+            }
         );
-        assert_eq!(first.current.writer(), Some(&writer));
         assert_eq!(
-            second.current.writer(),
-            Some(&writer),
-            "the value that missed the budget is still help-forwarded"
+            entry_of(&ctx, &second).await.unwrap().current,
+            CurrentState::External { writer }
         );
     }
 
-    // Existing inline values are grandfathered: a later lock acquisition under
-    // a budget that would no longer admit them republishes the entry's own
-    // state rather than demoting it. An inline value may be its key's only copy.
+    // Existing inline values are grandfathered: a later lock acquisition
+    // republishes the entry's own state rather than demoting it. An inline value
+    // may be its key's only copy.
     #[tokio::test]
-    async fn a_lowered_budget_leaves_an_existing_inline_value_intact() {
-        // A budget that admits nothing at all, over a leaf that already holds an
-        // inline value from a more generous one.
-        let (locker, ctx) = new_test_locker_with_policies(
-            Arc::new(MemoryBackend::new()),
-            SplitPolicy::default(),
-            InlinePolicy {
-                max_value_bytes: 0,
-                max_leaf_bytes: 0,
-            },
-        )
-        .await;
+    async fn an_acquisition_preserves_an_existing_inline_value() {
+        let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         let inlined = CurrentState::Inline {
             writer: mk_tid(1, "writer"),
@@ -2303,8 +2030,47 @@ mod tests {
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current,
             inlined,
-            "the existing inline value survives a budget that would reject it"
+            "the existing inline value survives lock reconciliation"
         );
+    }
+
+    // A replayed cleanup for the same writer must likewise preserve an inline
+    // value: it may be the only durable copy.
+    #[tokio::test]
+    async fn replayed_write_back_preserves_its_existing_inline_value() {
+        let (locker, ctx) = init_tl_test().await;
+        let key = b"key";
+        let tx = mk_tid(1, "writer");
+        let inlined = CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(b"kept".as_slice()),
+        };
+        replace_root(
+            &ctx,
+            &Node::leaf(Shard::from_entries([ShardEntry {
+                lock_type: LockType::Write,
+                locked_by: vec![tx.clone()],
+                current: inlined.clone(),
+                ..ShardEntry::new(key)
+            }])),
+        )
+        .await;
+
+        let groups = group_of(key, put_intent(key));
+        locker
+            .data()
+            .write_back(
+                &tx,
+                &LockedTx {
+                    groups,
+                    validations: BTreeMap::new(),
+                },
+            )
+            .await;
+
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(entry.current, inlined);
+        assert!(entry.locked_by.is_empty());
     }
 
     // The node's hard cap is no licence to demote either: an acquisition whose
@@ -2343,12 +2109,8 @@ mod tests {
                 <= policy.node_max_bytes,
             "the seeded leaf must fit, so only the acquisition can overflow it"
         );
-        let (locker, ctx) = new_test_locker_with_policies(
-            Arc::new(MemoryBackend::new()),
-            policy,
-            InlinePolicy::default(),
-        )
-        .await;
+        let (locker, ctx) =
+            new_test_locker_with_policy(Arc::new(MemoryBackend::new()), policy).await;
         replace_root(&ctx, &Node::leaf(Shard::from_entries([seeded]))).await;
 
         ctx.monitor.begin_tx(&reader);

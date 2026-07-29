@@ -1,8 +1,7 @@
 //! Budgets bounding how much committed value data leaf entries carry inline
 //! (ADR-051).
 
-/// Default largest value that may be inlined. Small enough that the extra bytes
-/// on every leaf CAS stay cheap next to the transaction-object read they save.
+/// Default largest value eligible for a logless direct commit.
 const DEFAULT_MAX_VALUE_BYTES: usize = 1024;
 
 /// Default largest aggregate inline payload one leaf may carry.
@@ -10,11 +9,12 @@ const DEFAULT_MAX_LEAF_BYTES: usize = 64 * 1024;
 
 /// How much committed value data a leaf may carry inline.
 ///
-/// Both budgets are *admission-only*: a value that misses either is published
-/// as an external pointer, so inlining never blocks a lock release or delays
-/// convergence. The budgets are a runtime tuning knob, never persisted, and
-/// values already inline are grandfathered — lowering a budget leaves them
-/// alone, because an inline value may be a key's only copy.
+/// The budgets govern new authoritative inline values published by logless
+/// direct commits (ADR-051, ADR-054). A value that misses either takes the
+/// regular logged protocol and is eventually published as an external pointer.
+/// The budgets are a runtime tuning knob, never persisted, and values already
+/// inline are grandfathered — lowering a budget leaves them alone, because an
+/// inline value may be a key's only copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlinePolicy {
     /// Largest value that may be inlined at all.
@@ -33,8 +33,7 @@ impl Default for InlinePolicy {
 }
 
 impl InlinePolicy {
-    /// The policy that admits nothing, so every value is published as an
-    /// external pointer.
+    /// The policy that disables logless direct publication.
     pub fn none() -> Self {
         InlinePolicy {
             max_value_bytes: 0,
@@ -83,8 +82,6 @@ mod tests {
         assert!(!policy.admits(20, 11));
     }
 
-    // The budget a resolver is re-asked with when its inline stage does not
-    // fit: nothing is admitted, not even an empty value.
     #[test]
     fn the_empty_policy_admits_nothing() {
         let policy = InlinePolicy::none();

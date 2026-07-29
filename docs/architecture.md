@@ -491,9 +491,11 @@ value lives in its transaction object, `Inline` carries the committed bytes
 authoritatively in the entry itself, and `Tombstone` records a committed delete.
 A latest read of an inline or tombstoned entry needs no transaction-object read
 at all. Inlining is bounded by an `InlinePolicy` (per-value and per-leaf byte
-budgets, `DatabaseBuilder::inline_policy`); a value that misses either budget is
-published as `External`, and an existing inline value is never demoted to make
-room for a new one.
+budgets, `DatabaseBuilder::inline_policy`). New inline states are reserved for
+logless direct commits, where the leaf is the value's only durable authority
+([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). Logged
+write-back and help-forwarding publish `External`; an existing inline value is
+never demoted because it may have no transaction object.
 
 Lock acquisition is a compare-and-swap on the shard *object*: read the current
 shard and its version, compute the new lock state for every requested key that
@@ -571,13 +573,12 @@ The validate-and-commit sequence:
    the transaction is considered committed.
 
 4. **Async write-back.** Publish the new current state for each modified key and
-   release locks. A committed value small enough for the inline budgets is
-   written into the leaf entry itself, so later readers skip the transaction
-   object; a larger one is published as an `External` pointer, and a delete as a
-   `Tombstone`. This can happen asynchronously because the transaction log is
-   the source of truth. If the client crashes, another transaction can read the
-   log and complete the write-back (or just observe the committed values from
-   the log).
+   release locks. A committed value is published as an `External` pointer to the
+   transaction object, and a delete as a `Tombstone`
+   ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
+   can happen asynchronously because the transaction log is the source of
+   truth. If the client crashes, another transaction can read the log and
+   complete the write-back (or just observe the committed values from the log).
 
 ### Optimizations
 
