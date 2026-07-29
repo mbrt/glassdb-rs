@@ -14,7 +14,9 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-07-29: Inline admission and structural amplification
 
-Status: open; no default or protocol change selected.
+Status: logged-publication simplification implemented by
+[ADR-054](../../docs/adr/054-reserve-inline-publication-for-logless-commits.md);
+inline-pressure splitting and budget tuning remain open.
 
 Reference: `5c3e5ac6`, after ADR-053. The goal is to isolate ADR-051's
 provisional inline budgets from the later contention fix.
@@ -119,6 +121,19 @@ overall score ranges overlap. Three short paired 128 B `lo/shared` mixbench
 runs remain at parity: aggregate-throughput median ratio `0.99`, total backend
 operations/transaction ratio `0.99`, and zero failures.
 
+The implemented ADR-054 comparison against `ed590a8c` confirms the deterministic
+write benefit: `batchWrite100` cost and operations/transaction both fall to
+`0.941`, with the overall score at `0.987`. Its broader adaptive mixbench sweep
+also exposes a workload not covered by the original `lo/shared` guardrail. In
+`hi/per-shape`, `rwMany` throughput falls to `0.377` and p90 rises from
+`0.988 s` to `13.762 s`, while object reads/transaction rise from `1.327` to
+`1.764`. The same cell's read-only shapes become over `6x` faster and the other
+mixed cells are mostly flat or better, so this is not a uniform slowdown.
+The result is consistent with smaller leaf transfers helping cached reads while
+cross-client logged-value resolution adds transaction-object lookups and a long
+tail to contended multi-key mutations. That attribution needs a repeated,
+phase-level run before changing policy.
+
 ### Current conclusion
 
 Complete write-back suppression is a useful byte-amplification simplification,
@@ -126,7 +141,7 @@ but it is not the inline-capacity fix. A global 64-entry split threshold would
 solve the focused case by widening every tree, including ones that never need
 direct capacity.
 
-The logged-publication decision is recorded in proposed
+The logged-publication simplification is implemented by
 [ADR-054](../../docs/adr/054-reserve-inline-publication-for-logless-commits.md).
 The next design candidate should instead preserve the suppression and hint a
 background split only when direct publication encounters aggregate inline

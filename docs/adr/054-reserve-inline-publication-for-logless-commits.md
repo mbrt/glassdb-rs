@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
-If accepted, this supersedes
+This supersedes
 [ADR-051](051-inline-latest-values.md)'s decision to copy logged values into leaf
 entries during write-back and help-forwarding. ADR-051's authoritative inline
 representation, bounded admission, logless direct commit, and in-doubt contract

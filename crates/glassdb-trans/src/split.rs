@@ -234,9 +234,6 @@ pub struct Splitter {
     // Only leaf structure-write acquisition uses it; root and interior nodes
     // remain direct structural CASes.
     coord: ShardCoordinator,
-    // Inline budgets applied when quiescing help-forwards a committed holder
-    // into an entry it is about to freeze (ADR-051).
-    inline: InlinePolicy,
     // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
@@ -280,7 +277,6 @@ impl Splitter {
             db_root,
             coord.clone(),
             candidates,
-            inline,
             retry,
         );
         (coord, splitter)
@@ -343,7 +339,6 @@ impl Splitter {
         db_root: &str,
         coord: ShardCoordinator,
         candidates: SplitCandidates,
-        inline: InlinePolicy,
         retry: RetryConfig,
     ) -> Self {
         let dir = Directory::new(shards.clone());
@@ -357,7 +352,6 @@ impl Splitter {
             timeline,
             db_root: db_root.to_string(),
             candidates,
-            inline,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             recovery_wake: Arc::new(Notify::new()),
             coord,
@@ -683,7 +677,6 @@ impl Splitter {
                 id,
                 &entries,
                 Requirement::Any,
-                self.inline,
             )
             .await?
             {
@@ -1711,7 +1704,6 @@ mod tests {
             "db",
             coord,
             candidates,
-            InlinePolicy::default(),
             RetryConfig::default(),
         )
     }
@@ -2301,7 +2293,12 @@ mod tests {
             .entries()
             .find(|entry| entry.key == b"d")
             .unwrap();
-        assert_eq!(entry.current.writer(), Some(&holder));
+        assert_eq!(
+            entry.current,
+            CurrentState::External {
+                writer: holder.clone()
+            }
+        );
         assert!(entry.locked_by.is_empty());
         assert_eq!(entry.lock_type, LockType::None);
 
@@ -2339,7 +2336,6 @@ mod tests {
                 &paths::from_node(COLL, "L"),
                 b"d",
                 &KeyRef::new(collection(), b"d"),
-                &Arc::from(b"new-d".as_slice()),
             )
             .await;
         let current = Directory::new(other.shards.clone())
@@ -2353,7 +2349,7 @@ mod tests {
             .unwrap()
             .lookup(b"d")
             .unwrap();
-        assert_eq!(current.current.writer(), Some(&holder));
+        assert_eq!(current.current, CurrentState::External { writer: holder });
         assert!(current.locked_by.is_empty());
     }
 

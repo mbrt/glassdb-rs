@@ -21,9 +21,9 @@ policy: ADR-027 is removed entirely, so an ineligible attempt either replays its
 body or takes the regular locked protocol. The direct-commit decisions here,
 including its in-doubt contract, are unchanged.
 
-[ADR-054](054-reserve-inline-publication-for-logless-commits.md) proposes
-superseding this ADR's ordinary write-back and help-forward inlining while
-retaining authoritative inline values and logless direct commit.
+[ADR-054](054-reserve-inline-publication-for-logless-commits.md) supersedes this
+ADR's ordinary write-back and help-forward inlining while retaining
+authoritative inline values and logless direct commit.
 
 This also refines
 [ADR-022](022-garbage-collection-mark-sweep.md)'s transaction-object liveness

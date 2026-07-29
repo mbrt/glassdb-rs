@@ -107,9 +107,9 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Overrides the budgets bounding how much committed value data leaf
-    /// entries carry inline (ADR-051). Inlining trades a larger leaf write for
-    /// a saved transaction-object read on the next latest-value read.
+    /// Overrides the budgets for logless direct commits whose authoritative
+    /// value is stored in the leaf (ADR-051, ADR-054). Values outside the
+    /// budgets take the regular logged protocol.
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.inline_policy = policy;
         self

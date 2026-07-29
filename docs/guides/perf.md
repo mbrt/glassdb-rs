@@ -7,6 +7,52 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-054: reserve inline publication for logless commits
+
+[ADR-054](../adr/054-reserve-inline-publication-for-logless-commits.md) stops
+logged write-back and help-forwarding from copying values into leaf entries.
+Logless direct commits retain authoritative inline values.
+
+### Setup
+
+- base: `ed590a8c` (accepted ADR, before implementation); target: this worktree
+- ratio = target / base (throughput >1 good; latency/ops/cost <1 good)
+- command: `BASE=ed590a8c LABEL_A=before LABEL_B=adr054
+  DRAIN_TIMEOUT=90s hack/aws-bench/compare-refs.sh --summary`
+- summary defaults: 5,000 keys, two paired 3-second rw9010 and deadlock runs,
+  three deterministic efficiency repeats, and adaptive mixbench cells with a
+  20% relative-CI target and 20-second cap
+- every workload completed with zero transaction failures; every mixbench
+  shape reached its CI target
+
+### Deterministic efficiency
+
+- autoresearch score: `98.76` to `97.52` (ratio `0.987`)
+- `batchWrite100`: cost/transaction `166.34` to `156.54` and
+  operations/transaction `2.38` to `2.24` (both `0.941`)
+- `multiRMW10`: cost ratio `0.995`, operations ratio `1.000`
+- `singleRMW`: cost ratio `1.002`, operations ratio `1.005`
+- `batchRead10` and `readRepeat`: cost and operations ratios `1.000`
+
+### Contention workloads
+
+- rw9010 aggregate-throughput geomeans: balanced `0.89`, read-heavy `1.07`,
+  write-heavy `1.25`. Per-cell ratios span `0.43–1.24`, `1.01–1.17`, and
+  `0.72–2.09`, respectively
+- deadlock sweep: p50 and p90 geomeans `0.97`, throughput `1.03`, and
+  retries/transaction `0.95`
+- mixbench throughput geomeans: `roMulti 1.72`, `roSingle 1.72`,
+  `rwMany 0.77`, and `rwSingle 1.19`
+- shared-Database aggregate operations/transaction: high contention `0.90`,
+  low contention `0.84`
+- the low-contention mixbench cells are near parity or better for every shape:
+  throughput ratios range from `0.93` to `1.67`
+- high-contention/per-shape `rwMany` is the outlier: throughput `1.896` to
+  `0.716 tx/s` (`0.377`), p50 ratio `0.987`, p90 `0.988 s` to `13.762 s`
+  (`13.93`), object reads/transaction `1.327` to `1.764`, object
+  writes/transaction `3.156` to `3.309`, and total operations/transaction
+  `4.482` to `5.073`
+
 ## ADR-053: replay definitive logless RMW losses
 
 [ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md) replays an

@@ -35,8 +35,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    InlinePolicy, LeafObservation, LoadedLeaf, LockType, NodeLocks, Requirement, Shard, ShardEntry,
-    ShardStore, SplitPolicy, StorageError,
+    InlinePolicy, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
+    SplitPolicy, StorageError,
 };
 
 use crate::error::TransError;
@@ -168,17 +168,11 @@ pub(crate) enum Step {
 /// The shared handles a resolver may consult mid-fold: the effective-writer
 /// [`Resolver`] (help-forwarding), the [`Monitor`] (wound-wait status), and why
 /// this fold is running ([`ReloadCause`], for commit-install in-doubt).
-#[derive(Clone, Copy)]
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) resolver: &'a Resolver,
     pub(crate) tmon: &'a Monitor,
     pub(crate) requirement: Requirement,
     pub(crate) cause: ReloadCause,
-    /// The inline-value budgets a publishing resolver admits against (ADR-051).
-    /// A resolver may be folded a second time with these closed
-    /// ([`InlinePolicy::none`]) when what it staged does not fit, so it must
-    /// either publish the version without inline payloads or decline.
-    pub(crate) inline: InlinePolicy,
 }
 
 /// One operation's policy decision over a shard, folded by the coordinator. The
@@ -484,7 +478,6 @@ impl CasWorker {
                     } else {
                         ReloadCause::Fresh
                     },
-                    inline: self.core.inline,
                 };
                 // Ownership re-check (ADR-031): a split may have moved one of this
                 // member's keys to a right sibling after it was routed here.
@@ -513,38 +506,55 @@ impl CasWorker {
                     results.push((tx.clone(), outcome, false));
                     continue;
                 }
-                let folded = self
-                    .fold_member(m.resolver.as_ref(), &ctx, &loaded, &entries, &locks)
-                    .await?;
-                match folded {
-                    FoldedStage::Measured {
-                        changes,
+                match m.resolver.resolve(&ctx, &entries, &locks).await? {
+                    Step::Stage {
+                        entries: changes,
                         locks: changed_locks,
                         admission,
                         outcome,
-                        measured,
                     } => {
+                        let mut candidate_entries = entries.clone();
+                        for (key, entry) in &changes {
+                            candidate_entries.insert(key.clone(), entry.clone());
+                        }
+                        let candidate_shard = Shard::from_entries(
+                            candidate_entries
+                                .values()
+                                .filter(|entry| !entry.is_vestigial())
+                                .cloned(),
+                        );
+                        let mut candidate_node = loaded.node().clone();
+                        candidate_node.set_leaf(candidate_shard.clone())?;
+                        candidate_node.set_locks(changed_locks.clone());
                         let create_full = admission == StageAdmission::AddsKey
-                            && measured.content_len > self.core.policy.content_limit();
-                        if measured.object_full(&self.core.policy) || create_full {
-                            self.core.hinter.observe_leaf(path, &measured.shard);
+                            && candidate_node.content_encoded_len()
+                                > self.core.policy.content_limit();
+                        if candidate_node.encoded_len() > self.core.policy.node_max_bytes
+                            || create_full
+                        {
+                            self.core.hinter.observe_leaf(path, &candidate_shard);
                             let outcome = if admission == StageAdmission::AddsKey {
                                 FoldOutcome::LeafFull
+                            } else if in_doubt.contains(tx) {
+                                // Capacity can become the first visible reason
+                                // to abandon a member after its earlier CAS was
+                                // uncertain. Preserve that member's ambiguity.
+                                m.resolver.exhausted_outcome(true)
                             } else {
                                 FoldOutcome::Conflict
                             };
                             results.push((tx.clone(), outcome, false));
                             continue;
                         }
-                        for (k, e) in changes {
-                            entries.insert(k, e);
+                        for (key, entry) in changes {
+                            entries.insert(key, entry);
                         }
                         logless.extend(m.resolver.logless_keys().into_iter().map(<[u8]>::to_vec));
                         locks = changed_locks;
                         staged = true;
                         results.push((tx.clone(), outcome, true));
                     }
-                    FoldedStage::Skipped(outcome) => results.push((tx.clone(), outcome, false)),
+                    Step::Skip { outcome } => results.push((tx.clone(), outcome, false)),
                 }
             }
 
@@ -621,139 +631,6 @@ impl CasWorker {
         }
         Ok(())
     }
-
-    /// Folds one member over the round's staged state and measures what it
-    /// staged.
-    ///
-    /// Inlining is opportunistic and must never stall a lock release, so a stage
-    /// that misses the node's hard cap while carrying inline payloads is folded
-    /// once more with the inline budgets closed (ADR-051). Only the resolver
-    /// knows what dropping a payload costs — a write-back republishes the version
-    /// as a pointer its transaction object still backs, while a commit whose
-    /// leaf entry is the value's only copy declines and classifies its own fate
-    /// — so the engine re-asks rather than rewriting staged entries. A payload
-    /// the leaf already carried therefore survives: only the resolver that
-    /// produced one can drop it.
-    async fn fold_member(
-        &self,
-        resolver: &dyn ShardResolver,
-        ctx: &ResolveCtx<'_>,
-        loaded: &LoadedLeaf,
-        entries: &BTreeMap<Vec<u8>, ShardEntry>,
-        locks: &NodeLocks,
-    ) -> Result<FoldedStage, TransError> {
-        let step = resolver.resolve(ctx, entries, locks).await?;
-        let folded = self.measure_step(loaded, entries, step)?;
-        if !folded.overflows_with_inline(&self.core.policy) {
-            return Ok(folded);
-        }
-        let bare = ResolveCtx {
-            inline: InlinePolicy::none(),
-            ..*ctx
-        };
-        let step = resolver.resolve(&bare, entries, locks).await?;
-        self.measure_step(loaded, entries, step)
-    }
-
-    /// Measures what a resolver's step staged, so capacity admission can act on
-    /// it.
-    fn measure_step(
-        &self,
-        loaded: &LoadedLeaf,
-        entries: &BTreeMap<Vec<u8>, ShardEntry>,
-        step: Step,
-    ) -> Result<FoldedStage, TransError> {
-        match step {
-            Step::Stage {
-                entries: changes,
-                locks,
-                admission,
-                outcome,
-            } => {
-                let measured = self.measure_stage(loaded, entries, &changes, &locks)?;
-                Ok(FoldedStage::Measured {
-                    changes,
-                    locks,
-                    admission,
-                    outcome,
-                    measured,
-                })
-            }
-            Step::Skip { outcome } => Ok(FoldedStage::Skipped(outcome)),
-        }
-    }
-
-    /// Builds the node a stage would produce and measures it against the
-    /// capacity limits.
-    fn measure_stage(
-        &self,
-        loaded: &LoadedLeaf,
-        staged: &BTreeMap<Vec<u8>, ShardEntry>,
-        changes: &[(Vec<u8>, ShardEntry)],
-        locks: &NodeLocks,
-    ) -> Result<MeasuredStage, TransError> {
-        let mut candidate_entries = staged.clone();
-        for (key, entry) in changes {
-            candidate_entries.insert(key.clone(), entry.clone());
-        }
-        let shard = Shard::from_entries(
-            candidate_entries
-                .values()
-                .filter(|e| !e.is_vestigial())
-                .cloned(),
-        );
-        let mut node = loaded.node().clone();
-        node.set_leaf(shard.clone())?;
-        node.set_locks(locks.clone());
-        Ok(MeasuredStage {
-            shard,
-            content_len: node.content_encoded_len(),
-            encoded_len: node.encoded_len(),
-        })
-    }
-}
-
-/// One member folded into a decision the coordinator can act on: a measured
-/// stage to admit, or the outcome of a member that staged nothing.
-enum FoldedStage {
-    Measured {
-        changes: Vec<(Vec<u8>, ShardEntry)>,
-        locks: NodeLocks,
-        admission: StageAdmission,
-        outcome: FoldOutcome,
-        measured: MeasuredStage,
-    },
-    Skipped(FoldOutcome),
-}
-
-impl FoldedStage {
-    /// Reports whether the stage misses the node's hard cap while carrying
-    /// inline payloads (ADR-051), so folding it again without them may fit.
-    fn overflows_with_inline(&self, policy: &SplitPolicy) -> bool {
-        let FoldedStage::Measured {
-            changes, measured, ..
-        } = self
-        else {
-            return false;
-        };
-        measured.object_full(policy)
-            && changes
-                .iter()
-                .any(|(_, entry)| entry.current.inline().is_some())
-    }
-}
-
-/// The node a candidate stage would produce, sized for capacity admission.
-struct MeasuredStage {
-    shard: Shard,
-    content_len: usize,
-    encoded_len: usize,
-}
-
-impl MeasuredStage {
-    fn object_full(&self, policy: &SplitPolicy) -> bool {
-        self.encoded_len > policy.node_max_bytes
-    }
 }
 
 #[async_trait]
@@ -797,9 +674,10 @@ impl ShardCoordinator {
 
     /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
     /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `policy`
-    /// governs the coordinator's hard node-size limit and `inline` the budgets
-    /// its publishing resolvers admit values against; the hinting seam carries
-    /// only leaf-write observations and never exposes splitter configuration.
+    /// governs the coordinator's hard node-size limit and `inline` configures
+    /// the direct-commit admission policy exposed to [`Algo`](crate::Algo); the
+    /// hinting seam carries only leaf-write observations and never exposes
+    /// splitter configuration.
     pub fn with_hinter(
         shards: ShardStore,
         resolver: Resolver,
@@ -846,9 +724,8 @@ impl ShardCoordinator {
         self.inner.dedup.snapshot()
     }
 
-    /// The inline-value budgets this coordinator's publishing resolvers apply
-    /// (ADR-051), so a submitter can drop an ineligible value before it builds
-    /// the resolver.
+    /// The inline-value budgets used by logless direct commits (ADR-051,
+    /// ADR-054).
     pub(crate) fn inline_policy(&self) -> InlinePolicy {
         self.inner.core.inline
     }
@@ -938,8 +815,6 @@ mod tests {
     use glassdb_concurr::Background;
     use glassdb_data::paths;
     use glassdb_storage::{CachedStore, CurrentState, LockType, Node, Shard, TLogger, Timeline};
-
-    use crate::node_locking::InlineAdmission;
 
     const COLL: &str = "coordp";
 
@@ -2145,32 +2020,19 @@ mod tests {
         );
     }
 
-    // Publishes `key`'s current value inline while the round's budgets admit it
-    // (ADR-051). `logless` says what it does when they do not: a logged writer
-    // republishes the version as an external pointer (its transaction object
-    // holds the value), while a logless one declines, because the entry it
-    // stages is the only copy of both the value and the commit.
+    // Publishes `key`'s current value as a logless commit marker (ADR-051).
     struct StageInline {
         key: Vec<u8>,
         tx: TxId,
         value: Arc<[u8]>,
-        logless: bool,
     }
 
     impl StageInline {
-        fn logged(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
+        fn logless(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
             Self {
                 key: key.to_vec(),
                 tx: tx.clone(),
                 value: Arc::from(value),
-                logless: false,
-            }
-        }
-
-        fn logless(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
-            Self {
-                logless: true,
-                ..Self::logged(key, tx, value)
             }
         }
     }
@@ -2179,26 +2041,15 @@ mod tests {
     impl ShardResolver for StageInline {
         async fn resolve(
             &self,
-            ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let writer = self.tx.clone();
-            let current = if InlineAdmission::new(ctx.inline, staged).admit(&self.key, &self.value)
-            {
-                CurrentState::Inline {
-                    writer,
-                    value: self.value.clone(),
-                }
-            } else if self.logless {
-                return Ok(Step::Skip {
-                    outcome: FoldOutcome::Conflict,
-                });
-            } else {
-                CurrentState::External { writer }
-            };
             let e = ShardEntry {
-                current,
+                current: CurrentState::Inline {
+                    writer: self.tx.clone(),
+                    value: self.value.clone(),
+                },
                 ..ShardEntry::new(self.key.clone())
             };
             Ok(Step::Stage {
@@ -2218,10 +2069,7 @@ mod tests {
         }
 
         fn logless_keys(&self) -> Vec<&[u8]> {
-            if self.logless {
-                return vec![self.key.as_slice()];
-            }
-            Vec::new()
+            vec![self.key.as_slice()]
         }
     }
 
@@ -2250,44 +2098,6 @@ mod tests {
             split_headroom_bytes: 0,
             ..SplitPolicy::default()
         }
-    }
-
-    // ADR-051: inlining is opportunistic, so a stage that misses the hard cap is
-    // folded again with the budgets closed rather than failing the round. The
-    // resolver — not the engine — drops the payload.
-    #[tokio::test]
-    async fn an_oversized_inline_payload_is_refolded_without_inlining() {
-        let tx = TxId::with_priority(1, b"t");
-        let value = b"a-value-that-does-not-fit";
-        let policy = policy_rejecting_inline(b"k", &tx, value);
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _timeline, _bg) =
-            coord_over_with(backend.clone(), policy, Arc::new(NoSplitHints)).await;
-
-        let outcome = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(StageInline::logged(b"k", &tx, value)),
-                Requirement::Any,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
-                cas_precondition: Some(_),
-            })
-        ));
-        coord.close().await;
-
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        assert_eq!(
-            shard.lookup(b"k").unwrap().current,
-            CurrentState::External { writer: tx },
-            "the payload was dropped so the version still lands"
-        );
     }
 
     // A logless commit's leaf entry is the value's only copy, so an over-cap
@@ -2321,6 +2131,135 @@ mod tests {
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
         assert!(shard.lookup(b"k").is_none(), "nothing was written");
+    }
+
+    struct CapacityAfterInDoubt {
+        key: Vec<u8>,
+        tx: TxId,
+        folds: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ShardResolver for CapacityAfterInDoubt {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            let value: Arc<[u8]> = if self.folds.fetch_add(1, Ordering::SeqCst) == 0 {
+                Arc::from(b"x".as_slice())
+            } else {
+                Arc::from(vec![b'x'; 128])
+            };
+            let entry = ShardEntry {
+                current: CurrentState::Inline {
+                    writer: self.tx.clone(),
+                    value,
+                },
+                ..ShardEntry::new(self.key.clone())
+            };
+            Ok(Step::Stage {
+                entries: vec![(self.key.clone(), entry)],
+                locks: staged_locks.clone(),
+                admission: StageAdmission::ExistingKeys,
+                outcome: FoldOutcome::Landed,
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt {
+                FoldOutcome::InDoubt("capacity changed after in-doubt CAS".into())
+            } else {
+                FoldOutcome::Moved
+            }
+        }
+    }
+
+    // Removing the generic re-fold-without-inline path must not erase a direct
+    // commit's sticky uncertainty. If its first CAS is in-doubt and a later
+    // fold no longer fits, capacity admission abandons it through the
+    // resolver's in-doubt outcome rather than reporting an ordinary conflict.
+    #[tokio::test]
+    async fn capacity_rejection_after_in_doubt_preserves_uncertainty() {
+        let tx = TxId::with_priority(1, b"t");
+        let small = ShardEntry {
+            current: CurrentState::Inline {
+                writer: tx.clone(),
+                value: Arc::from(b"x".as_slice()),
+            },
+            ..ShardEntry::new(b"k")
+        };
+        let large = ShardEntry {
+            current: CurrentState::Inline {
+                writer: tx.clone(),
+                value: Arc::from(vec![b'x'; 128]),
+            },
+            ..ShardEntry::new(b"k")
+        };
+        let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
+        let large_len = Node::leaf(Shard::from_entries([large])).encoded_len();
+        assert!(large_len > small_len);
+        let policy = SplitPolicy {
+            node_max_bytes: small_len,
+            split_headroom_bytes: 0,
+            ..SplitPolicy::default()
+        };
+
+        let hooked = Arc::new(HookBackend::new(Arc::new(MemoryBackend::new())));
+        let backend: Arc<dyn Backend> = hooked.clone();
+        let (coord, _shards, _timeline, _bg) =
+            coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        hooked.set_before({
+            let calls = calls.clone();
+            move |op| {
+                let result = match op {
+                    BackendOp::WriteIf { path, .. }
+                        if (path.contains("/_n/") || path.ends_with("/_r"))
+                            && calls.fetch_add(1, Ordering::SeqCst) == 0 =>
+                    {
+                        Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt leaf CAS".into(),
+                        ))
+                    }
+                    _ => Ok(()),
+                };
+                let future: HookFuture = Box::pin(async move { result });
+                future
+            }
+        });
+
+        let outcome = coord
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(CapacityAfterInDoubt {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                    folds: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::InDoubt(_),
+                cas_precondition: None,
+            })
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the oversized retry did not CAS"
+        );
+        coord.close().await;
     }
 
     // A submit after shutdown is a cancelled no-op (`Ok(None)`), so best-effort

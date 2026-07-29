@@ -32,18 +32,16 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
-    CurrentState, LeafObservation, LeafObservationCheck, LockType, NodeLocks, Requirement,
-    SequencePoint, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCollectionChange,
-    TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
+    CurrentState, InlinePolicy, LeafObservation, LeafObservationCheck, LockType, NodeLocks,
+    Requirement, SequencePoint, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline,
+    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 
 use crate::collections::{CollectionCatalog, CollectionData, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::{Monitor, TxRecoveryManifest};
-use crate::node_locking::{
-    InlineAdmission, LockResolution, resolve_entry_locks, resolve_entry_locks_at,
-};
+use crate::node_locking::{LockResolution, resolve_entry_locks, resolve_entry_locks_at};
 use crate::resolver::Resolver;
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
@@ -333,6 +331,7 @@ struct DirectCommitResolver {
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
+    inline: InlinePolicy,
 }
 
 #[async_trait]
@@ -373,8 +372,12 @@ impl ShardResolver for DirectCommitResolver {
         }
         // A budget the folded leaf closes is a stable property of that leaf, not
         // a race a re-run of the body can win (ADR-053).
-        let mut admission = InlineAdmission::new(ctx.inline, staged);
-        if !admission.admit(&self.raw_key, &self.value) {
+        let other_inline_bytes = staged
+            .iter()
+            .filter(|(key, _)| key.as_slice() != self.raw_key.as_slice())
+            .map(|(_, entry)| entry.current.inline_len())
+            .sum();
+        if !self.inline.admits(other_inline_bytes, self.value.len()) {
             return Ok(Step::Skip {
                 outcome: self.unlanded(ctx, Ineligible::Locked),
             });
@@ -1238,9 +1241,10 @@ impl Algo {
         self.direct_commit_stats
             .candidates
             .fetch_add(1, Ordering::Relaxed);
+        let inline = self.coord.inline_policy();
         // The per-value budget is decidable here; the aggregate leaf budget
         // needs the folded leaf, so the resolver re-checks both.
-        if value.len() > self.coord.inline_policy().max_value_bytes {
+        if value.len() > inline.max_value_bytes {
             return Ok(DirectAttempt::Locked);
         }
         let raw_key = key.key().to_vec();
@@ -1261,6 +1265,7 @@ impl Algo {
             key,
             value,
             read_version,
+            inline,
         });
         let outcome = self
             .coord
@@ -1877,7 +1882,6 @@ mod tests {
             tmon: &tctx.tmon,
             requirement: Requirement::Any,
             cause,
-            inline: glassdb_storage::InlinePolicy::default(),
         };
         match resolver.resolve(&ctx, staged, locks).await.unwrap() {
             Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
@@ -2752,8 +2756,9 @@ mod tests {
     // CAS-write counts by object kind, the fingerprint of a commit path: a
     // logless direct commit (ADR-051) issues one shard write and no tx object at
     // all; the locked path issues one tx-object write and two shard writes (the
-    // lock CAS then the write-back CAS that publishes the pointer — here inline
-    // because tests build the algo with no background executor). Node-level
+    // lock CAS then the write-back CAS that publishes the pointer — run
+    // synchronously here because tests build the algo with no background
+    // executor). Node-level
     // locks fold into those writes rather than adding another CAS (ADR-032).
     #[derive(Debug, Default)]
     struct WriteCounts {
@@ -2810,10 +2815,10 @@ mod tests {
     // ADR-053: a single-key read-modify-write whose value misses the inline
     // budget has no logged fast path to fall to, so it commits through the
     // regular locked protocol: one committed `_t/` object write, one leaf lock
-    // CAS, one leaf write-back CAS (inline here, no background executor), and no
-    // separate membership write — and the new value is durable and readable. With
-    // split deferred the leaf is the collection root `_r`, so both leaf CAS's
-    // land there (ADR-031).
+    // CAS, one leaf write-back CAS (run synchronously here because there is no
+    // background executor), and no separate membership write — and the new
+    // value is durable and readable. With split deferred the leaf is the
+    // collection root `_r`, so both leaf CAS's land there (ADR-031).
     #[tokio::test]
     async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -3230,6 +3235,7 @@ mod tests {
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
+            inline: InlinePolicy::default(),
         };
         let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
@@ -3281,6 +3287,7 @@ mod tests {
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version,
+            inline: InlinePolicy::default(),
         };
 
         // A read the entry has moved past: nothing is staged and the loss is
@@ -3348,6 +3355,36 @@ mod tests {
         assert!(
             matches!(outcome, FoldOutcome::Moved),
             "a put over a tombstone is unsupported, not stale, got {outcome:?}"
+        );
+
+        // Aggregate inline admission is owned by the direct resolver. Existing
+        // inline values consume the leaf budget, while this key's prior state
+        // is replaced rather than double-counted.
+        let budgeted = DirectCommitResolver {
+            inline: InlinePolicy {
+                max_value_bytes: 64,
+                max_leaf_bytes: 5,
+            },
+            ..direct(Some(current.clone()))
+        };
+        let other_writer = TxId::with_priority(1, b"other");
+        let crowded = BTreeMap::from([
+            (b"k".to_vec(), seed),
+            (
+                b"other".to_vec(),
+                ShardEntry {
+                    current: CurrentState::Inline {
+                        writer: other_writer,
+                        value: Arc::from(b"four".as_slice()),
+                    },
+                    ..ShardEntry::new(b"other")
+                },
+            ),
+        ]);
+        let outcome = fold(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await;
+        assert!(
+            matches!(outcome, FoldOutcome::Moved),
+            "a closed aggregate budget takes the locked protocol, got {outcome:?}"
         );
 
         // The round-level classifications: a same-key claim proves this member
@@ -3645,11 +3682,12 @@ mod tests {
         assert!(entry(&tctx, b"k").await.unwrap().current.is_tombstone());
     }
 
-    // A two-key write is ineligible (the direct path publishes one value): full
-    // locked path.
+    // A two-key write is ineligible (the direct path publishes one value), so
+    // the logged path stores external pointers for both committed values
+    // (ADR-054).
     #[tokio::test]
     async fn single_rw_multi_key_uses_full_path() {
-        let (tm, _tctx, log) = new_recording_algo().await;
+        let (tm, tctx, log) = new_recording_algo().await;
         let ka = key_ref(b"a");
         let kb = key_ref(b"b");
 
@@ -3669,6 +3707,24 @@ mod tests {
 
         let c = write_counts(&log);
         assert!(c.leaf >= 2, "a multi-key write takes the full path: {c:?}");
+        let writer = h.id().clone();
+        for (key, key_ref) in [(b"a".as_slice(), &ka), (b"b".as_slice(), &kb)] {
+            assert_eq!(
+                entry(&tctx, key).await.unwrap().current,
+                CurrentState::External {
+                    writer: writer.clone()
+                }
+            );
+            assert_eq!(
+                read_outcome(&tctx, key_ref)
+                    .await
+                    .value
+                    .unwrap()
+                    .value
+                    .as_ref(),
+                b"v2"
+            );
+        }
     }
 
     // Reading a key other than the written one needs that key's shard validated,
