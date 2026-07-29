@@ -81,8 +81,8 @@ cut forward, which would readmit local clock rate into the safety argument.
 
 Admissible cuts are quantized to a fixed grid derived from the policy and
 computed identically by every client with no coordination. The grid restores
-discrete cuts, which retention coalescing and change logs both need, without
-restoring a global sequence.
+discrete cuts, which retention coalescing needs, without restoring a global
+sequence.
 
 ### Resolve pending holders rather than skipping them
 
@@ -103,8 +103,8 @@ window between lock completion and the commit CAS, not the user body.
 
 This is not required for cut correctness, which readers obtain by resolving
 holders. It exists so a grid slot can be declared closed, which retention
-coalescing and per-slot change logs require. Its trigger is the transaction's
-own age, so it cannot abort a writer because an unrelated transaction is slow.
+coalescing requires. Its trigger is the transaction's own age, so it cannot
+abort a writer because an unrelated transaction is slow.
 
 ## Consequences
 

@@ -411,11 +411,19 @@ staleness shrinks correspondingly; that cascade is not yet applied.
 if its own watermark is at or after `T_read + E`. Otherwise a write could have
 landed on that leaf below the cut after the observation was taken, and the
 reader would resolve that key at a different effective time from the rest of
-its cut. This is the entry-point freshness rule the value cache needs, and it
-is what makes a per-slot change log valuable: the log proves the absence of
-writes to a leaf over an interval without re-reading the leaf. A fully
+its cut. This is the entry-point freshness rule the value cache needs. A fully
 cache-served execution samples no server time of its own, so it must refresh a
 server-time observation at a bounded interval or expire.
+
+That rule is what would otherwise make a warm cache worthless. A scan that ran
+an hour ago holds leaves whose watermarks all precede today's cut, so every one
+fails the test and is re-read even if the collection never changed. ADR-036
+already revalidates a leaf without transferring its body, but one request per
+leaf is no better than reading it. ADR-055 batches that revalidation: a listing
+reports each object's revision, a revision matching the cached one advances the
+watermark exactly as an unchanged conditional read does, and a page settles as
+many leaves as it reports. Revalidation then costs one request per page, so a
+scan transfers bodies only for leaves that actually changed.
 
 **The cut grid.** Admissible read timestamps are quantized to a fixed grid
 derived from the policy, `origin + floor((t - origin) / period) * period`, with
@@ -424,8 +432,7 @@ coordination. Effective staleness is at most `margin + period`.
 
 The grid is what makes discrete cuts available again without a global sequence.
 Only the last version of a key within a slot is observable at any cut point, so
-retention can coalesce a slot to one version per key, and per-slot change logs
-become the natural unit for validating cached state.
+retention can coalesce a slot to one version per key.
 
 **Resolving pending holders.** A reader that encounters a holder whose
 timestamp lower bound is at or below its cut must resolve that holder's outcome
@@ -443,7 +450,7 @@ body, so a generous value well inside the margin costs healthy writers nothing.
 
 This bound is not needed for cut correctness, which readers get by resolving
 holders. It exists so that a slot can be declared closed, which is what
-retention coalescing and per-slot change logs require. The trigger is the
+retention coalescing requires. The trigger is the
 transaction's own age rather than an unrelated global event, so unlike the
 sealed-epoch grace it cannot abort a writer because someone else is slow.
 
@@ -629,9 +636,9 @@ without conservative evidence of the age waits a full bound from its own
 observation.
 
 Once no transaction can still commit into a grid slot, that slot is closed. Slot
-closure is what lets retention coalesce a slot to one version per key and lets a
-per-slot change log be treated as complete. It is not part of the
-cut-correctness argument, which readers obtain by resolving holders, and its
+closure is what lets retention coalesce a slot to one version per key. It is not
+part of the cut-correctness argument, which readers obtain by resolving holders,
+and its
 trigger is a transaction's own age, so no writer is ever aborted because an
 unrelated transaction is slow.
 
@@ -670,13 +677,33 @@ commit certificate and timestamp, preserving cross-key and cross-collection
 atomicity. A committed certificate with a missing or mismatched manifest payload
 is corruption, never a partial transaction.
 
-A leaf key-directory entry with a retained history head is not vestigial. After
-a delete, retain that entry and its history-head pointer while any admissible or
-still-live snapshot cut may resolve the key to a present version, including a
-floor version that may have committed long before the retention window began.
-Only after GC proves every such cut observes absence may it prune the directory
-entry, tombstone, and obsolete history. Point lookup and forward `KeyScan`
-traversal depend on this enumeration invariant.
+A deleted key stays resolvable while any admissible or still-live cut may see it
+as present, including through a floor version that committed long before the
+retention window began. Only after GC proves every such cut observes absence may
+it prune the residue, tombstone, and obsolete history. Point lookup and forward
+`KeyScan` traversal depend on this enumeration invariant.
+
+Where that residue lives matters, because the obligation is long and the object
+it would naturally sit in is hot. Two unrelated things keep a deleted key's entry
+alive: strict optimistic validation needs the tombstone as a validation token
+until no concurrent transaction can validate against it, which the lease already
+bounds at seconds; snapshot enumeration needs the key resolvable for the whole
+65-minute window. Only the first is on the strict path.
+
+So once a deletion's slot closes, ADR-039 migrates the residue out of the leaf
+into a side structure over the same key range, batched per slot. Leaves carry
+live keys only, strict traffic never loads the structure, and a snapshot scan
+reads it beside the leaf under the same watermark rule, merging two ordered
+streams. Split accounting counts live entries alone, so garbage cannot trigger a
+split.
+
+The workloads this protects are ordinary — queues, TTL expiry, log trimming,
+session keys — anything deleting distinct keys without reusing them. Churn that
+recreates the same key was never affected, because the entry is reused. Left in
+the leaf, a FIFO delete pattern concentrates residue at one end of the range,
+where leaves holding no live keys would split repeatedly on garbage. ADR-031
+defers merge, so those splits would be permanent long after the garbage went
+away.
 
 The value cache is keyed by `(logical path, writer)`. ADR-051's inline leaf state
 serves strict reads and, per ADR-039, any cut at or above its recorded commit
@@ -687,6 +714,15 @@ is at or after the cut plus the margin, as [Cut definition](#cut-definition)
 requires. Values, history chunks, manifests, and certificates are immutable and
 cache without further conditions; the entry point is the only part of a
 snapshot read that needs a freshness rule.
+
+Because the entry point is the only such part, making its watermark cheap to
+advance is what decides whether a warm cache is worth having. ADR-055 supplies
+that: a listing reports revisions, so a page of unchanged leaves is revalidated
+in one request and only genuinely changed leaves are re-read. Requests then
+track the change rather than the collection, which is the sense in which a
+snapshot read is served from cache. Listing itself still scales with the size of
+the prefix, so a very large collection with a very small change set remains the
+case that would justify an index by change instead.
 
 ### Catalog
 
@@ -742,10 +778,18 @@ cut, so ADR-051's inline bytes answer the read immediately and a tombstone
 answers absence. Only a current version above the cut sends the reader to
 history. Because a cold key's current version lies below almost every admissible
 cut, this is the common case rather than a special one: a snapshot scan over a
-leaf of cold inline keys resolves keys and values from that single leaf, which
-is what lets a snapshot execution run from cache. The reader needs no extra
+leaf of cold inline keys resolves keys and values from that leaf alone, which is
+what lets a snapshot execution run from cache. The reader needs no extra
 freshness rule for it, since the cached leaf already had to satisfy the cut-plus-
 margin watermark to be used at all.
+
+A key with no leaf entry at all is the one case that needs a second object. Its
+deletion may have migrated to the range's residue structure, so the reader
+consults that under the same watermark to distinguish a key deleted after its cut
+from one that never existed. A scan reads it once per leaf and merges; a point
+read reads it only on a miss. Both are cacheable on the same terms as the leaf,
+so this costs a snapshot execution one more cached object per leaf and costs
+strict traffic nothing.
 
 Pagination is repeated `scan_keys` calls inside the same `read_tx` closure,
 passing a page's `next_after()` key back through `KeyScan::after`. The resume key
@@ -891,7 +935,7 @@ and abort-fencing proofs while still emitting history.
 ## Performance acceptance gate
 
 Snapshot capability cannot be opted out, including by applications that never
-call `read_tx`. Consequently ADR-037 through ADR-041 and ADR-052 remain
+call `read_tx`. Consequently ADR-037 through ADR-041, ADR-052, and ADR-055 remain
 **Proposed** until a reviewed benchmark report shows reasonable cost for the
 mandatory format across the primary workloads below. An operationally `disabled`
 state is not an escape hatch: it changes retention, not write format.
@@ -943,9 +987,12 @@ The four primary workload families are:
   of the returned values, each in strict and snapshot mode; plus strict
   scan-then-write. The finite matrix includes small and large results, mid-leaf
   and cross-leaf bounds, stable membership and create/delete churn, and reports
-  both transactions and logical keys/bytes per second. `prefix` and `all` are
-  conformance cases over the same primitive rather than separate performance
-  families.
+  both transactions and logical keys/bytes per second. It also includes a cold
+  cache and a cache warmed by an earlier scan, over both an unchanged collection
+  and one with a small change set, because ADR-055 is what makes a warm cache
+  worth anything to a snapshot scan and a cold-cache-only matrix would never
+  exercise it. `prefix` and `all` are conformance cases over the same primitive
+  rather than separate performance families.
 
 Use representative fan-outs and values from 1 KiB through 1 MiB where the
 operation actually reads or writes values, including hot keys and concurrent
@@ -1083,6 +1130,27 @@ boundaries. At minimum, the test plan must cover:
 - a transaction committing at the very edge of the commit-age bound against a
   slot GC is closing, proving closure and coalescing cannot race a version into
   a cut that was already served;
+- a FIFO workload deleting distinct keys from one end of a range for longer than
+  the retention window, proving leaf size and split count track live keys rather
+  than the delete rate, and that a snapshot scan over the emptied range still
+  enumerates exactly the keys present at its cut;
+- a residue migration interleaved with a split of the same leaf, and with a
+  strict read, a strict write, and a snapshot scan over the migrating key,
+  proving the key is enumerated exactly once throughout and never disappears
+  between the two structures;
+- a scan binding a cut against a cache warmed an hour earlier over a collection
+  that did not change, proving bodies are transferred for no leaf and requests
+  scale with pages rather than leaves, and the same scan against a collection
+  where a few leaves changed, proving exactly those are re-read;
+- a leaf written between a cached observation and the listing that reports it,
+  proving the differing revision never advances a watermark, and a leaf omitted
+  from a page entirely, proving omission neither installs absence nor marks the
+  entry obsolete;
+- a listing whose `started-at` precedes the cached observation it reports,
+  proving a stale page cannot lower a watermark or invalidate newer evidence;
+- a leaf rewritten with byte-identical contents, proving the unchanged revision
+  is treated as no rewrite and that the cut still resolves correctly, which is
+  ADR-042's semantics rather than an exception to them;
 - a cut at, just above, and just below the history floor, proving the first two
   bind and the third returns `SnapshotTooOld`, plus a floor advancing past a
   running execution's cut, proving it is caught on the next observation refresh
@@ -1124,6 +1192,9 @@ not prove cut selection or freshness.
 - **[ADR-052](../adr/052-backend-server-time-observation.md) — Backend
   server-time observation.** *Proposed.* Supplies the comparable clock ADR-038
   requires, and is a prerequisite for it.
+- **[ADR-055](../adr/055-batched-cache-revalidation-by-listing.md) — Batched
+  cache revalidation by listing.** *Proposed.* Reports object revisions in
+  listings so a scan revalidates a warm cache per page rather than per object.
 
 ## Open questions / future work
 
@@ -1169,6 +1240,13 @@ not prove cut selection or freshness.
   eligibility, though not into cut selection itself. Whether that is an
   acceptable weakening is the question to answer first, because it decides
   whether the rest is worth designing.
+- Reconsider a per-slot change log if a collection grows large enough that
+  ADR-055's listing dominates. Listing costs one request per page of the prefix
+  regardless of how little changed, while a log indexed by change would cost
+  nothing for the unchanged remainder. The obstacles are recorded in ADR-055:
+  the log needs its own reclamation and a completeness proof, and keeping it off
+  the commit path forces a background build that has to repartition transactions
+  by object.
 - Add safe online `SnapshotPolicy` enlargement/shrinkage if operational demand
   justifies its transition protocol.
 - Define collection drop and physical topology reclamation using the reserved
@@ -1200,10 +1278,19 @@ dynamic range-sharding B-link topology. On acceptance:
   root authoritative for collection existence and parent-child membership.
 - ADR-031/032/044's copy-before-shrink topology and structural gate remain the
   physical routing proof; history retention adds the no-premature-teardown
-  constraint.
+  constraint. ADR-039 additionally refines ADR-031's soft split cap to count live
+  entries only, so that retention cannot reshape a tree ADR-031 has no merge to
+  reshape back; its split protocol, right-link traversal, and hard object cap are
+  untouched.
 - ADR-036's local validation watermarks remain process-local and separate from
   ADR-052's cross-client observation. A cached leaf may serve a cut only under
-  the rule in [Cut definition](#cut-definition).
+  the rule in [Cut definition](#cut-definition). ADR-055 changes how cheaply a
+  watermark is advanced, not what a watermark means or when one suffices.
+- ADR-055 extends ADR-035's `ListPage` alone. Pagination, the opaque cursor,
+  unspecified ordering, and the non-snapshot traversal are unchanged, and the
+  last of these is why a listing may only advance watermarks and never conclude
+  absence. It relies on ADR-042's revision-as-content-validator semantics, so an
+  identical rewrite is deliberately indistinguishable.
 - ADR-037 extends rather than supersedes ADR-033: `ReadTransaction` uses the same
   forward `KeyScan`/`KeyPage` surface. Calls inside one snapshot execution share
   a fixed cut, and separate `Collection::scan_keys` calls retain ADR-033's

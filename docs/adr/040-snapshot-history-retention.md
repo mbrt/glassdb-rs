@@ -117,9 +117,12 @@ and remains corruption.
 Count history and catalog predecessor references as GC roots. Retain transaction
 certification metadata while any data or catalog history entry needs it. Reclaim
 independent per-key values when their own history no longer needs them. A
-tombstoned leaf's key-directory entry and history head remain roots while any
-admissible or live cut may observe a present floor version; prune them only after
-all such cuts observe absence.
+deleted key's residue and the history head it names remain roots while any
+admissible or live cut may observe a present floor version; prune them only
+after all such cuts observe absence. ADR-039 moves that residue out of the leaf
+once the deletion's slot closes, so GC roots it in the side structure covering
+that key range and reclaims the structure as a whole once its newest entry
+leaves the window.
 
 ADR-035's paginated, sharded transaction-log walk remains the completeness
 mechanism for bulky transaction and preparation cleanup. Snapshot
