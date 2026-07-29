@@ -96,8 +96,10 @@ particular execution produces no writes.
   separate decisions in ADR-038 through ADR-041, and ADR-038 requires ADR-052.
 - Acceptance requires the living design's
   [performance gate](../designs/snapshot-reads.md#performance-acceptance-gate).
-  Because the commit critical path is unchanged, that gate covers the cost of
-  writing and retaining history rather than commit latency.
+  The logged commit paths are unchanged, so that gate mostly covers the cost of
+  writing and retaining history. The exception is the small single-key
+  overwrite, which loses [ADR-051](051-inline-latest-values.md)'s one-CAS commit
+  to mandatory history and is measured as its own cell.
 
 ## Alternatives considered
 
@@ -144,6 +146,13 @@ validate against concurrent writers, and would replay until its deadline.
 
 Two formats would let applications that never read snapshots skip the write-path
 cost entirely, at the price of doubling the protocol surface, the recovery
-matrix, and the test matrix. With the commit critical path unchanged, the
-remaining mandatory cost is writing history, which is small enough that a second
-format is not justified.
+matrix, and the test matrix.
+
+The mandatory cost is no longer only writing history. A small single-key
+overwrite also loses ADR-051's one-CAS commit, and that is the most common write
+in an OLTP workload, so the case for an opt-out is stronger than it was when
+this alternative was first rejected. It is still rejected: two formats would
+double the surface permanently to avoid a cost that a certified single-CAS path
+could remove for both, and committing to the fork now would remove the incentive
+to find that path. If the performance gate's inline-overwrite cell fails and no
+such path is found, this should be reconsidered rather than treated as settled.

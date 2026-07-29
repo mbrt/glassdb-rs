@@ -53,13 +53,24 @@ history.
 
 Index retained immutable history by commit timestamp so lookup finds the newest
 certified version at or before a cut with bounded work rather than a linear walk
-through every overwrite. The current leaf entry identifies the history head and
-may also retain ADR-051's inline bytes for strict latest reads. Inline bytes
-never replace the immutable historical payload or shared certificate. After a
-delete, retain that key-directory entry and head while any admissible or live
-cut can resolve the key to a present version; prune it only after all such cuts
-observe absence. Point lookup and forward `KeyScan` traversal use this
-invariant.
+through every overwrite. After a delete, retain that key-directory entry and
+head while any admissible or live cut can resolve the key to a present version;
+prune it only after all such cuts observe absence. Point lookup and forward
+`KeyScan` traversal use this invariant.
+
+The current leaf entry identifies the history head and additionally records that
+version's commit timestamp, so that a reader can tell whether the current
+version is the newest one at its cut without dereferencing anything. When it is,
+and ADR-051's inline bytes are present, the entry answers a read at that cut
+outright. This makes inline values a snapshot-read optimization and not only a
+strict-read one, which matters because a cold key's current version lies below
+almost every admissible cut. Recording the timestamp is what makes the test
+local; reading the head to learn it would cost the object the optimization
+exists to avoid.
+
+Inline bytes never replace the immutable historical payload or shared
+certificate. They are a redundant copy of the newest version, so a cut below it
+still resolves through history.
 
 Treat a committed certificate with a missing or mismatched manifest payload as
 corruption, never as absence or a partial transaction.
@@ -74,9 +85,15 @@ research goal.
 ## Consequences
 
 - Per-key values can be reclaimed independently and hot-key lookup is bounded.
-- Strict latest reads may still avoid a history-object lookup when the leaf
-  carries an inline current value.
+- A leaf entry carrying an inline current value answers both strict reads and
+  any cut at or above that value's commit timestamp without a second object.
+  For cold keys that is most cuts, so a snapshot scan over such a leaf can be
+  served from the leaf alone.
 - Preparing and verifying the manifest adds work before the commit point.
+- An inline value is stored twice, once in the leaf and once as its immutable
+  history payload, and the duplicate now persists for the whole retention window
+  rather than only until the transaction object is collected. ADR-051's per-value
+  and per-leaf budgets were tuned without that term and should be revisited.
 - The latest-value engine's one-CAS logless path is not available, so small
   single-key overwrites regress to the logged commit protocol. This is the
   largest single cost of the format and the design's performance gate measures

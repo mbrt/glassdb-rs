@@ -643,10 +643,12 @@ The greenfield format separates:
 
 Every write, including full commits, records the actual effective predecessor
 observed while its install lock is held. The leaf entry names the current history
-head and may also carry ADR-051's inline current bytes for strict latest reads.
-Those bytes never replace the immutable history payload or certificate. Indexed
-history lookup finds the newest certified version at or before the cut without
-work linear in the number of retained overwrites.
+head, that version's commit timestamp, and optionally ADR-051's inline current
+bytes. Those three together let the entry answer any cut at or above the current
+version without dereferencing anything; they never replace the immutable history
+payload or certificate, which a lower cut still resolves through. Indexed history
+lookup finds the newest certified version at or before the cut without work
+linear in the number of retained overwrites.
 
 A tombstone is a normal version. Following the same chain therefore handles
 create, delete, and recreate without treating an absent current key as proof that
@@ -664,8 +666,8 @@ entry, tombstone, and obsolete history. Point lookup and forward `KeyScan`
 traversal depend on this enumeration invariant.
 
 The value cache is keyed by `(logical path, writer)`. ADR-051's inline leaf state
-is the latest-value shortcut for strict reads, but a historical value can never
-populate or poison that current state.
+serves strict reads and, per ADR-039, any cut at or above its recorded commit
+timestamp; a historical value can never populate or poison that current state.
 
 A cached leaf observation may serve a cut only if its own server-time watermark
 is at or after the cut plus the margin, as [Cut definition](#cut-definition)
@@ -719,6 +721,18 @@ cut resolves that holder's outcome, exactly as a strict read already does; a
 lower bound above the cut proves the writer invisible. This is the only point at
 which a snapshot read can wait on a writer, it is per key, and a holder old
 enough to reach a cut is already past its lease.
+
+With no such holder, the entry's current version is the newest committed one,
+and ADR-039 has the entry record its commit timestamp. If that timestamp is at
+or below the cut, the current version is by definition the newest version at the
+cut, so ADR-051's inline bytes answer the read immediately and a tombstone
+answers absence. Only a current version above the cut sends the reader to
+history. Because a cold key's current version lies below almost every admissible
+cut, this is the common case rather than a special one: a snapshot scan over a
+leaf of cold inline keys resolves keys and values from that single leaf, which
+is what lets a snapshot execution run from cache. The reader needs no extra
+freshness rule for it, since the cached leaf already had to satisfy the cut-plus-
+margin watermark to be used at all.
 
 Pagination is repeated `scan_keys` calls inside the same `read_tx` closure,
 passing a page's `next_after()` key back through `KeyScan::after`. The resume key
@@ -788,13 +802,21 @@ parallel path. Small single-key overwrites are exactly the workload ADR-051 was
 built for, so the gate below must measure them against the inline baseline
 rather than against the logged one.
 
-What ADR-051 does keep is its representation. Inline current bytes remain
-authoritative for strict latest reads, so the read-side win is untouched and
-the cache story below is better for it; only the one-CAS commit is lost.
+What ADR-051 does keep is its representation, and it gets more useful here than
+it was. Inline current bytes remain authoritative for strict latest reads, and
+because ADR-039 records the current version's commit timestamp in the entry,
+they also answer any cut at or above it. Only the one-CAS commit is lost.
 
 On top of that sits ADR-039's history: an extra immutable payload per written
 key, predecessor capture, asynchronous certification, and the bytes all of that
-retains.
+retains. Inline values are paid for twice, since the leaf copy and the history
+payload both persist for the retention window, which is a reason to re-tune
+ADR-051's budgets rather than inherit them.
+
+One cost moves the other way. ADR-051's logless CAS introduced an in-doubt
+outcome of its own, because an attempt cancelled after dispatch may or may not
+have committed with no record to consult. Removing that path removes that case,
+so the in-doubt surface returns to what the logged protocol already had.
 
 Restoring a certified one-CAS commit is a research goal rather than a
 prerequisite. Any such path needs its own ADR and must preserve the durability
@@ -972,6 +994,9 @@ boundaries. At minimum, the test plan must cover:
 - an inline-eligible small overwrite, proving it takes the logged path and
   emits history, that its inline bytes still serve strict latest reads, and that
   those bytes are never mistaken for a historical version at any cut;
+- a snapshot read of a key whose current version sits at, just below, and just
+  above the cut, proving the first two are answered from the leaf with no
+  history object read and the third is not, including the tombstone case;
 - create/delete/recreate history, committed holders awaiting write-back,
   malformed predecessor chains, and exact GC floor-version boundaries; after a
   delete and pruning at each boundary, point lookup plus forward `KeyScan`
@@ -1028,10 +1053,35 @@ not prove cut selection or freshness.
 - Choose history-chunk and sparse-index sizing from hot-key and range-scan
   benchmarks while preserving a bounded lookup.
 - Investigate restoring a certified single-CAS commit for inline-eligible
-  overwrites, recovering what ADR-051 loses here without weakening history or
-  abort fencing. This is the largest identified regression, so its feasibility
-  should be settled before the format is considered final even though it is not
-  a prerequisite for acceptance.
+  overwrites, recovering what ADR-051 loses here. This is the largest identified
+  regression and the reason ADR-037 keeps rejecting a second format, so its
+  feasibility should be settled before the format is considered final even
+  though it is not a prerequisite for acceptance. Two obstacles define the
+  search, and they are of different difficulty.
+
+  The first looks harder than it is. A one-CAS commit writes only the leaf, and
+  mandatory history wants an immutable payload plus a certificate. But the
+  certificate exists to give a *multi-key* write set one atomic outcome, and an
+  eligible transaction touches exactly one key, so the CAS is already its
+  outcome. What remains is retaining the superseded version, and for a value
+  small enough to inline, that could stay in the leaf as a short in-node version
+  chain that spills to an external chunk only when it outgrows a budget. The
+  trade is leaf size, CAS bandwidth, and split rate against object count, which
+  is the same trade ADR-051's budgets already make.
+
+  The second is the real obstacle. A logged writer stamps from its own
+  lock-install responses, so the gap between stamp and apply is bounded by one
+  request, which is what the apply-anchoring allowance covers. A direct commit
+  installs nothing, so it must stamp from an observation it already holds, and
+  nothing bounds that observation's age except the client's local clock. Too old
+  an observation lets a write install after a reader's observation while
+  carrying a timestamp below the reader's cut, which is precisely the invisible
+  write the margin exists to prevent. Restricting the path to a healthy client
+  holding a recent observation, and adding the permitted age as a fourth margin
+  allowance, would close it — at the cost of readmitting local clock rate into
+  eligibility, though not into cut selection itself. Whether that is an
+  acceptable weakening is the question to answer first, because it decides
+  whether the rest is worth designing.
 - Add safe online `SnapshotPolicy` enlargement/shrinkage if operational demand
   justifies its transition protocol.
 - Define collection drop and physical topology reclamation using the reserved
@@ -1047,8 +1097,11 @@ dynamic range-sharding B-link topology. On acceptance:
 - ADR-038 adds a commit timestamp to ADR-020's existing sequence without adding
   an operation to it. ADR-027's parallel single read-write commit is unaffected.
 - ADR-039 supersedes ADR-019's unified value placement and ADR-051's logless
-  direct-commit guarantee, adds retained per-key history, and keeps ADR-051's
-  inline current values as a strict-read optimization.
+  direct-commit guarantee, adds retained per-key history, and extends ADR-051's
+  inline current values from a strict-read optimization to a cut-read one.
+- ADR-028's same-key round reservation exists only to protect a direct commit's
+  in-doubt recovery evidence. With no direct commits in this format it becomes
+  vestigial; the coordinator invariant it sits on is unaffected.
 - ADR-040 supersedes ADR-022's current-reference-only liveness for committed
   values and its cleanup of outcome evidence needed as a fence, while retaining
   its pending-lock recovery machinery and ADR-035's paginated, sharded discovery
