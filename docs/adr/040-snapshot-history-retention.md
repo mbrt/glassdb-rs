@@ -46,10 +46,33 @@ is a rate allowance over one bounded interval rather than an absolute-time
 budget. Policy validation rejects a retention setting below the derived minimum.
 
 Measure a version's retention from when it is superseded, not when it originally
-committed. For the oldest cut that may still be read, retain:
+committed. Retain, for each key, the newest certified version at or before each
+admissible grid point in the readable range. Stating the rule per grid point
+rather than per interval keeps it free of boundary cases, and it subsumes the
+floor version, which is simply the newest version at or before the oldest cut
+that may still be read.
 
-- every version newer than that cut; and
-- the first certified version at or before it, the floor version.
+Every other version is invisible to every reader that could exist, because
+[ADR-038](038-hlc-snapshot-cuts.md) admits cuts only at grid points. Retaining
+them buys nothing: a key written a hundred times per second against a five-second
+grid produces five hundred versions per slot of which one is observable.
+
+Reclaim those intermediate versions as soon as their slot closes, with no
+retention wait. A live reader is bound to a grid point like any other cut, so it
+cannot observe them either, and the commit-age bound is what makes closure
+durable enough to rely on. This is deliberately a different class of reclamation
+from the window above: it removes nothing any cut can observe, so it neither
+waits for nor advances the history floor. Hot-key garbage therefore survives for
+seconds rather than for the full window.
+
+Retained versions per key are consequently bounded by
+
+```text
+(maximum staleness + maximum read lifetime) / cut grid period
+```
+
+regardless of write rate, which makes the grid period the control over hot-key
+retention: a coarser grid retains proportionally less at the cost of staleness.
 
 Do not trust a writer's recorded time to prove supersession age. GC may start
 the full retention delay from its own observation; after recovery, a helper that
@@ -112,7 +135,13 @@ identities may use backend deletion.
 Retain or monotonically compact transaction outcome fences without losing the
 proof that a transaction was committed or aborted. Bulky transaction state may
 be reclaimed; every path still treats the compact fence as authoritative.
-Missing promised history is corruption, never logical absence.
+
+Missing promised history is corruption, never logical absence. History is
+promised when some admissible cut can observe it, not merely when something
+references it. A coalesced version is not promised, so a predecessor pointer
+into one is an expected dangling reference rather than corruption. Nothing
+depends on the chain being dense, because lookup goes through the timestamp
+index rather than a predecessor walk.
 
 Provide a persisted operational state machine that rejects new snapshot binds
 without affecting strict read-write traffic or its timestamp and certificate
@@ -142,6 +171,12 @@ history early.
 ## Consequences
 
 - Snapshot read availability does not depend on tracking live clients.
+- Retained history is bounded by the number of admissible cuts rather than by
+  write volume, so a hot key no longer scales retention with its write rate.
+  Choosing the grid period now trades staleness against storage.
+- Coalescing gives GC a second reclamation class with different rules: prompt,
+  triggered by slot closure, and independent of the floor. Conflating it with
+  window-based reclamation would either forfeit the win or reclaim early.
 - A clock-rate violation between a reader and GC surfaces as a clean error
   rather than as a missing version or a key that appears never to have existed.
 - GC gains an ordering obligation it did not have: the floor must be durable
@@ -187,6 +222,22 @@ promptly after recovery instead of restarting a conservative wait. It makes
 another client's recorded time authoritative over whether data still needed by a
 live reader may be deleted. GC uses its own observation, which can over-retain
 but cannot reclaim early.
+
+### Retain every version in the window
+
+Keeping every version newer than the oldest readable cut is the obvious rule and
+needs no notion of grid points in GC at all. It retains a multiple of what any
+reader can observe, and the multiple is the key's write rate times the grid
+period, so the cost is unbounded in exactly the workload that can least afford
+it. Coalescing coincidentally makes retention predictable, which is worth more
+than the simplicity.
+
+### Coalesce on the retention window rather than on slot closure
+
+Deferring coalescing until a version leaves the window would keep one uniform
+reclamation trigger. Intra-slot versions are unobservable from the moment their
+slot closes, so this retains known garbage for the whole window, which for a hot
+key is most of the storage the format uses.
 
 ### Rely on the retention window alone, with no published floor
 

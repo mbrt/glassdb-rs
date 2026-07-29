@@ -163,7 +163,7 @@ is no strict-only capability or creation-time opt-out.
 
 | Setting | Proposed default | Purpose |
 |---|---:|---|
-| Cut grid period | 5 seconds | Spacing of admissible cuts; also the retention-coalescing and change-log unit |
+| Cut grid period | 5 seconds | Spacing of admissible cuts; also the retention-coalescing and change-log unit. Bounds retained versions per key at `(staleness + lifetime) / period`, so a coarser grid trades staleness for storage |
 | Fleet-skew allowance | 1 second | Skew between servers within the backend's fleet |
 | Reported-granularity allowance | 1 second | Truncation in the backend's reported time; one second for an HTTP `Date` |
 | Apply-anchoring allowance | backend request timeout | Bound on the gap between stamp and apply for a message-anchored backend; zero when apply-anchored |
@@ -765,10 +765,23 @@ returning a partial result.
 ### Retention and GC
 
 Snapshot reads create no pins or heartbeats. GC instead retains the worst-case
-window implied by the persisted policy. For the oldest possibly readable cut it
-keeps every newer version plus the first version at or before that cut (the floor
-version). A transaction certificate remains while any data or catalog history
-references it.
+window implied by the persisted policy. Within that window it keeps, per key,
+the newest version at or before each admissible grid point; the floor version is
+just that rule applied to the oldest readable cut. A transaction certificate
+remains while any data or catalog history references it.
+
+Everything else is unobservable by construction, because cuts exist only at grid
+points, and it is reclaimed as soon as its slot closes rather than waiting out
+the window. A live reader is bound to a grid point too, so it cannot see these
+versions either. That makes coalescing a separate reclamation class from the
+window: it removes nothing any cut can observe, so it neither waits for the
+history floor nor advances it.
+
+The effect on a hot key is the point. A key written a hundred times a second
+produces five hundred versions per five-second slot, of which one survives, and
+the intermediate ones survive for seconds rather than 65 minutes. More usefully,
+retained versions per key become bounded by `(staleness + lifetime) / period`
+independent of write rate, so storage stops scaling with write volume.
 
 Retention is measured from supersession, not original commit. A value that was
 current for years and is replaced immediately after a snapshot begins must still
@@ -1060,6 +1073,16 @@ boundaries. At minimum, the test plan must cover:
 - local-clock drift in both directions against the backend's reported time,
   proving detection, that an unhealthy client stops binding but keeps
   committing, and that an unhealthy GC worker retains history;
+- a key overwritten many times inside one slot, proving that after closure only
+  the newest version at each grid point survives, that every cut still reads the
+  same value it read before coalescing, and that a predecessor reference into a
+  coalesced version is not reported as corruption;
+- a delete and recreate inside one slot, proving the intermediate tombstone
+  coalesces away while a slot-final tombstone is retained along with the
+  enumeration invariant it carries;
+- a transaction committing at the very edge of the commit-age bound against a
+  slot GC is closing, proving closure and coalescing cannot race a version into
+  a cut that was already served;
 - a cut at, just above, and just below the history floor, proving the first two
   bind and the third returns `SnapshotTooOld`, plus a floor advancing past a
   running execution's cut, proving it is caught on the next observation refresh

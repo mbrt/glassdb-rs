@@ -51,6 +51,13 @@ its install lock is held; transaction-body pre-checks are not authoritative.
 Tombstones are ordinary versions, preserving create, delete, and recreate
 history.
 
+That order is total over versions as written, not over versions as retained.
+ADR-040 coalesces away versions no admissible cut can observe, so a predecessor
+reference may point at a reclaimed version. Predecessor capture exists to record
+what was actually effective at install time, which is what makes the order
+trustworthy; it is not a claim that the referent survives. Lookup accordingly
+goes through the timestamp index rather than walking the chain.
+
 Index retained immutable history by commit timestamp so lookup finds the newest
 certified version at or before a cut with bounded work rather than a linear walk
 through every overwrite. After a delete, retain that key-directory entry and
