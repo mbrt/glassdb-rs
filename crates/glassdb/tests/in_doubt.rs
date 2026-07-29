@@ -11,29 +11,24 @@
 //! state disambiguates the outcome, so the engine recovers most in-doubt
 //! outcomes by reading that object back:
 //!
-//! - The logless single read-write path (ADR-051) commits an eligible small
+//! - The logless direct commit path (ADR-051) commits an eligible small
 //!   overwrite with one leaf CAS that publishes the value itself. A lost ack is
 //!   resolved by reloading the leaf: our exact inline state proves the commit, an
 //!   unchanged entry proves it did not land (retry the idempotent CAS).
-//! - The single read-write fast path (ADR-027, the fallback for a value the
-//!   inline budgets reject) inserts itself into the version chain with one shard
-//!   CAS that installs a **write lock** (`locked_by = [txid]`), issued in
-//!   parallel with its committed `_t/` object (a later asynchronous write-back
-//!   converts the lock to a `current_writer` pointer). A lost ack on that lock
-//!   CAS is resolved the same way: if our lock (or a help-forwarded
-//!   `current_writer == txid`) is present the write landed.
 //!
-//!   For both, an uncertain CAS is irreducibly in-doubt exactly when the
-//!   read-back cannot prove that state either way — surfaced as
-//!   [`Error::InDoubt`] rather than risking a double-apply on a renewed re-run.
-//!   A *fast follow-on writer* that moves the entry first is the reachable case
-//!   and is covered below; anything else that blocks the re-fold from proving it
-//!   (a structural gate or a collection-delete fence arriving in the same
-//!   window) is classified the same way, pinned by unit tests next to the
-//!   resolvers because no interleaving reproduces it reliably.
+//!   An uncertain CAS is irreducibly in-doubt exactly when the read-back cannot
+//!   prove that state either way — surfaced as [`Error::InDoubt`] rather than
+//!   risking a double-apply on a renewed re-run. A *fast follow-on writer* that
+//!   moves the entry first is the reachable case and is covered below; anything
+//!   else that blocks the re-fold from proving it (a structural gate or a
+//!   collection-delete fence arriving in the same window) is classified the same
+//!   way, pinned by unit tests next to the resolvers because no interleaving
+//!   reproduces it reliably.
 //! - The logged path's commit point (the `_t/` flip) and its leaf lock CAS
 //!   (a node `_n/` or the root `_r`) are recovered in place the same way (they
-//!   are idempotent under their own preconditions).
+//!   are idempotent under their own preconditions). A value the inline budgets
+//!   reject takes that path (ADR-053), so its lost-ack lock CAS is proved by the
+//!   lock this transaction already holds.
 //!
 //! The engine never retries a transaction *transparently* across an in-doubt
 //! commit point in a way that could double-apply a landed write. The caller
@@ -47,7 +42,7 @@
 //! write that never landed), while an `after` hook sees the *landed* result and
 //! may transform it (turn an `Ok` into `Unavailable`, modelling a lost ack) and
 //! run async side effects. A normal in-memory backend never produces
-//! `Unavailable`, so the harness injects it. To exercise the fast path's one
+//! `Unavailable`, so the harness injects it. To exercise the direct path's one
 //! irreducible in-doubt an `after` hook can interpose a genuine competing
 //! transaction at the instant a lost-ack write lands, rather than forging any
 //! protocol state.
@@ -184,7 +179,7 @@ fn incremented_value(key: &[u8], current: i64) -> Result<Vec<u8>, Error> {
 }
 
 /// Encodes `n` padded past the inline per-value budget (ADR-051), so its commit
-/// takes ADR-027's logged single read-write path rather than the logless one.
+/// takes the regular locked path rather than the logless one (ADR-053).
 fn write_padded_int(n: i64) -> Vec<u8> {
     let mut v = write_int(n);
     v.resize(4096, 0);
@@ -211,8 +206,8 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
 }
 
 /// The same read-modify-write with a value the inline budgets reject, so its
-/// commit takes ADR-027's logged single read-write path: a write lock and its
-/// committed object in parallel, then a write-back that publishes the pointer.
+/// commit takes the regular locked path: a write lock, a committed object, then a
+/// write-back that publishes the pointer.
 async fn increment_padded(
     db: &Database,
     coll: &Collection,
@@ -281,12 +276,11 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
     assert_eq!(got, 11, "value must be applied exactly once");
 }
 
-/// The same recovery for ADR-027's logged fallback, which a value over the
-/// inline budget still takes: the lost-ack CAS installed our write lock, so
-/// reading the leaf back proves the commit through the lock rather than through
-/// a published value.
+/// The same recovery for the locked fallback a value over the inline budget
+/// takes: the lost-ack CAS installed our write lock, so reading the leaf back
+/// proves the commit through the lock rather than through a published value.
 #[tokio::test(start_paused = true)]
-async fn logged_single_rw_lost_ack_on_lock_cas_resolves_committed() {
+async fn locked_single_rw_lost_ack_on_lock_cas_resolves_committed() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -308,8 +302,8 @@ async fn logged_single_rw_lost_ack_on_lock_cas_resolves_committed() {
     assert_eq!(got, 11, "value must be applied exactly once");
 }
 
-/// The single read-write paths' one irreducible in-doubt (ADR-027, retained by
-/// ADR-051): our commit CAS lands but loses its ack *and*, in the window before
+/// The direct commit path's one irreducible in-doubt (ADR-051): our commit CAS
+/// lands but loses its ack *and*, in the window before
 /// we read the leaf back, a **genuine competing transaction** takes the key and
 /// moves the entry past us. The read-back shows another writer, so the engine can
 /// no longer tell whether our write landed first and was then superseded, or

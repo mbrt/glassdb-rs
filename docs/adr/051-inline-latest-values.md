@@ -14,8 +14,12 @@ This supersedes:
   objects are the only durable home for values and that write-back never copies
   values; and
 - [ADR-027](027-single-rw-parallel-lock-publish.md)'s two-write single
-  read-write path when the new value is eligible for inlining. ADR-027 remains
-  the fallback for values that are not eligible.
+  read-write path when the new value is eligible for inlining.
+
+[ADR-053](053-replay-definitive-logless-rmw-losses.md) refines the fallback
+policy: ADR-027 is removed entirely, so an ineligible attempt either replays its
+body or takes the regular locked protocol. The direct-commit decisions here,
+including its in-doubt contract, are unchanged.
 
 This also refines
 [ADR-022](022-garbage-collection-mark-sweep.md)'s transaction-object liveness

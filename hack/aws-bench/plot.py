@@ -18,15 +18,17 @@ It reads the four CSV files produced by ``rtbench --test-name=rw9010`` and
 transparently. It renders the five README figures:
 
 * ``tx-throughput.png`` -- total transactions/sec per transaction type.
+* ``tx-fairness.png`` -- Jain fairness of per-Database completion rates.
 * ``retries.png``       -- transaction retries per committed transaction.
 * ``ops-latency.png``   -- per-operation (per-key) latency.
 * ``tx-latency.png``    -- per-transaction latency.
 * ``deadlock-latency.png`` -- latency under heavy single-key contention.
 
-Throughput aggregation: ``throughput.csv`` holds the rate each individual DB
-sustained. The total system throughput at a given concurrency level is the sum
-across DBs, estimated here as ``num_db * median(per-db rate)``; the 10th-90th
-percentile band comes from the spread between DBs (which widens with conflicts).
+Throughput aggregation: ``throughput.csv`` holds each DB's completed count and
+the common elapsed time for its run/cell. Total system throughput is the sum of
+completions divided by that shared clock. Repeated runs form the throughput
+uncertainty band; the per-Database spread is reported separately as Jain
+fairness rather than being mistaken for system-throughput variance.
 The four rw9010 figures share an x-axis of "concurrent transactions" =
 ``num_db * concurrency-per-db`` (10 by default), matching the README.
 """
@@ -73,13 +75,68 @@ def _save(fig: plt.Figure, out_dir: Path, name: str, extra_dirs: list[Path]) -> 
     plt.close(fig)
 
 
+def with_run_identity(df: pd.DataFrame, identity: list[str]) -> pd.DataFrame:
+    data = df.copy()
+    if "run" not in data.columns:
+        data["run"] = data.groupby(identity, sort=False).cumcount() + 1
+    return data
+
+
+def aggregate_throughput(df: pd.DataFrame, conc_per_db: int) -> pd.DataFrame:
+    data = with_run_identity(df, ["num-db", "db", "tx-type"])
+    duration_col = (
+        "cell-duration-ms" if "cell-duration-ms" in data.columns else "duration-ms"
+    )
+    data = data.groupby(["run", "num-db", "tx-type"], as_index=False).agg(
+        count=("count", "sum"),
+        cell_duration_ms=(duration_col, "max"),
+    )
+    data["total-tps"] = (
+        data["count"] * 1000.0 / data["cell_duration_ms"].where(
+            data["cell_duration_ms"] > 0
+        )
+    )
+    data["concurrent"] = data["num-db"] * conc_per_db
+    return data
+
+
+def aggregate_fairness(df: pd.DataFrame, conc_per_db: int) -> pd.DataFrame:
+    data = with_run_identity(df, ["num-db", "db", "tx-type"])
+    duration_col = (
+        "cell-duration-ms" if "cell-duration-ms" in data.columns else "duration-ms"
+    )
+    per_db = data.groupby(["run", "num-db", "db"], as_index=False).agg(
+        count=("count", "sum"),
+        cell_duration_ms=(duration_col, "max"),
+    )
+    per_db["db-tps"] = (
+        per_db["count"] * 1000.0 / per_db["cell_duration_ms"].where(
+            per_db["cell_duration_ms"] > 0
+        )
+    )
+    rows = []
+    for (run, num_db), group in per_db.groupby(["run", "num-db"]):
+        rates = group["db-tps"]
+        squared_sum = (rates * rates).sum()
+        rows.append(
+            {
+                "run": run,
+                "num-db": num_db,
+                "jain": (
+                    rates.sum() ** 2 / (len(rates) * squared_sum)
+                    if squared_sum > 0
+                    else float("nan")
+                ),
+                "concurrent": num_db * conc_per_db,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def plot_throughput(
     df: pd.DataFrame, conc_per_db: int, out_dir: Path, extra: list[Path]
 ) -> None:
-    data = df.copy()
-    data["concurrent"] = data["num-db"] * conc_per_db
-    # Per-DB rate scaled by the number of DBs estimates total system throughput.
-    data["total-tps"] = data["tx-per-sec"] * data["num-db"]
+    data = aggregate_throughput(df, conc_per_db)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     sns.lineplot(
@@ -96,6 +153,27 @@ def plot_throughput(
     ax.set_ylabel("Transactions / sec")
     ax.legend(title="Transaction type")
     _save(fig, out_dir, "tx-throughput.png", extra)
+
+
+def plot_fairness(
+    df: pd.DataFrame, conc_per_db: int, out_dir: Path, extra: list[Path]
+) -> None:
+    data = aggregate_fairness(df, conc_per_db)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.lineplot(
+        data=data,
+        x="concurrent",
+        y="jain",
+        estimator="median",
+        errorbar=ERRORBAR,
+        marker="o",
+        ax=ax,
+    )
+    ax.set_ylim(0, 1.02)
+    ax.set_title("Per-Database throughput fairness")
+    ax.set_xlabel(CONC_LABEL)
+    ax.set_ylabel("Jain fairness (1 = equal progress)")
+    _save(fig, out_dir, "tx-fairness.png", extra)
 
 
 def plot_tx_latency(
@@ -148,10 +226,15 @@ def plot_ops_latency(
 def plot_retries(
     df: pd.DataFrame, conc_per_db: int, out_dir: Path, extra: list[Path]
 ) -> None:
-    data = df.copy()
+    data = with_run_identity(df, ["num-db", "db"])
+    logical_col = "logical-tx" if "logical-tx" in data.columns else "num-tx"
+    data = data.groupby(["run", "num-db"], as_index=False).agg(
+        num_retries=("num-retries", "sum"),
+        logical_tx=(logical_col, "sum"),
+    )
     data["concurrent"] = data["num-db"] * conc_per_db
-    data["retries-per-tx"] = data["num-retries"] / data["num-tx"].where(
-        data["num-tx"] > 0
+    data["retries-per-tx"] = data["num_retries"] / data["logical_tx"].where(
+        data["logical_tx"] > 0
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -235,6 +318,7 @@ def main() -> int:
 
     if throughput is not None:
         plot_throughput(throughput, args.concurrency_per_db, args.out, extra)
+        plot_fairness(throughput, args.concurrency_per_db, args.out, extra)
     if samples is not None:
         plot_tx_latency(samples, args.concurrency_per_db, args.out, extra)
         plot_ops_latency(samples, args.concurrency_per_db, args.out, extra)

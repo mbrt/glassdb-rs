@@ -47,7 +47,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use clap::Parser;
@@ -123,6 +123,13 @@ struct Args {
     /// Output file with deadlock latency samples.
     #[arg(long, default_value = "deadlock.csv")]
     deadlock_out: String,
+    /// Output file with one aggregate row per deadlock cell.
+    #[arg(long, default_value = "deadlock-stats.csv")]
+    deadlock_stats_out: String,
+    /// Explicit key counts for the deadlock sweep, e.g. `--deadlock-keys=1`.
+    /// The default visits 1 through 6 keys.
+    #[arg(long, value_delimiter = ',')]
+    deadlock_keys: Vec<usize>,
     /// Max concurrent Databases for the rw9010 test.
     #[arg(long, default_value_t = 50)]
     max_dbs: usize,
@@ -413,6 +420,8 @@ struct Benchmarker {
     base_stats: Stats,
     delta_stats: Stats,
     deadline: Option<tokio::time::Instant>,
+    wall_start: Option<Instant>,
+    worker_wall: Duration,
 }
 
 impl Benchmarker {
@@ -425,6 +434,8 @@ impl Benchmarker {
             base_stats: Stats::default(),
             delta_stats: Stats::default(),
             deadline: None,
+            wall_start: None,
+            worker_wall: Duration::ZERO,
         }
     }
 
@@ -440,6 +451,7 @@ impl Benchmarker {
         self.num_workers = num_workers;
         self.num_keys_per_worker = num_keys_per_worker;
         self.base_stats = db.stats();
+        self.wall_start = Some(Instant::now());
         self.bench.start();
         self.deadline =
             Some(tokio::time::Instant::now() + self.bench.expected_duration() + drain_timeout);
@@ -447,6 +459,10 @@ impl Benchmarker {
 
     fn end(&mut self) {
         self.bench.end();
+        self.worker_wall = self
+            .wall_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
     }
 
     fn collect_stats(&mut self, db: &Database) {
@@ -456,6 +472,11 @@ impl Benchmarker {
     fn deadline(&self, fallback: Duration) -> tokio::time::Instant {
         self.deadline
             .unwrap_or_else(|| tokio::time::Instant::now() + fallback)
+    }
+
+    fn worker_drain(&self) -> Duration {
+        self.worker_wall
+            .saturating_sub(self.bench.expected_duration())
     }
 
     fn results_row(&self) -> String {
@@ -880,6 +901,13 @@ impl DbResults {
     }
 }
 
+struct RwCellResults {
+    databases: Vec<DbResults>,
+    reported_duration: Duration,
+    worker_wall: Duration,
+    worker_drain: Duration,
+}
+
 /// The concurrency points (number of Databases) the rw9010 sweep visits:
 /// the explicit `--db-list` when given, otherwise the default
 /// `1,5,10,..,max-dbs` ramp.
@@ -917,19 +945,20 @@ fn run_read_write_9010(
     let keys = init_keys(handle, backend.clone(), args.num_keys, args.drain_timeout)?;
     eprintln!("End of keys initialization");
 
-    let mut samples = create_csv(&args.samples_out, "num-db,db,tx-type,ops,latency\n")?;
+    let mut samples = create_csv(&args.samples_out, "run,num-db,db,tx-type,ops,latency\n")?;
     let mut stats = create_csv(
         &args.stats_out,
-        "num-db,db,num-tx,logical-tx,num-retries,\
+        "run,num-db,db,num-tx,logical-tx,num-retries,\
          obj-write,obj-read,obj-list,backend-ops\n",
     )?;
     let mut throughput = create_csv(
         &args.throughput_out,
-        "num-db,db,tx-type,count,duration-ms,tx-per-sec\n",
+        "run,num-db,db,tx-type,count,cell-duration-ms,tx-per-sec\n",
     )?;
     let mut client = create_csv(
         &args.client_stats_out,
-        "num-db,wall-ms,num-cpu,cpu-user-ms,cpu-sys-ms,cpu-util-pct,\
+        "run,num-db,wall-ms,worker-wall-ms,worker-drain-ms,num-cpu,\
+         cpu-user-ms,cpu-sys-ms,cpu-util-pct,\
          http-requests,http-throttle,http-5xx,http-2xx,new-conns,max-threads,\
          tx-failures\n",
     )?;
@@ -1025,13 +1054,22 @@ fn run_read_write_9010_step(
         http_delta.new_conns = c.load(Ordering::Relaxed).saturating_sub(conns_before) as i64;
     }
 
-    dump_samples(samples, &results, numdb)?;
-    dump_stats(stats, &results, numdb)?;
-    dump_throughput(throughput, &results, numdb)?;
+    dump_samples(samples, &results.databases, run, numdb)?;
+    dump_stats(stats, &results.databases, run, numdb)?;
+    dump_throughput(
+        throughput,
+        &results.databases,
+        run,
+        numdb,
+        results.reported_duration,
+    )?;
     dump_client_stats(
         client,
+        run,
         numdb,
         wall,
+        results.worker_wall,
+        results.worker_drain,
         user_after - user_before,
         sys_after - sys_before,
         http_delta,
@@ -1053,7 +1091,7 @@ fn read_write_9010_all_dbs(
     rnd: &mut StdRng,
     run_number: usize,
     mut diagnostics: Option<&mut DiagnosticSession>,
-) -> Result<Vec<DbResults>, Box<dyn Error>> {
+) -> Result<RwCellResults, Box<dyn Error>> {
     // One seed per Database, derived up front from the shared source.
     let seeds: Vec<u64> = (0..numdb).map(|_| rnd.random()).collect();
 
@@ -1068,6 +1106,7 @@ fn read_write_9010_all_dbs(
     let benches: Vec<Arc<DbBench>> = (0..numdb)
         .map(|_| Arc::new(DbBench::new(args.duration, time_scale)))
         .collect();
+    let worker_start = Instant::now();
     for db_bench in &benches {
         db_bench.start();
     }
@@ -1096,6 +1135,9 @@ fn read_write_9010_all_dbs(
     for db_bench in &benches {
         db_bench.end();
     }
+    let worker_wall = worker_start.elapsed();
+    let worker_drain = worker_wall.saturating_sub(benches[0].write.expected_duration());
+    let reported_duration = worker_wall.mul_f64(time_scale);
 
     if let Err(error) = &run
         && let Some(diagnostics) = diagnostics.as_deref_mut()
@@ -1140,7 +1182,12 @@ fn read_write_9010_all_dbs(
             backend_before,
         )?;
     }
-    Ok(results)
+    Ok(RwCellResults {
+        databases: results,
+        reported_duration,
+        worker_wall,
+        worker_drain,
+    })
 }
 
 async fn read_write_9010_worker(
@@ -1284,7 +1331,12 @@ fn run_deadlock(
 ) -> Result<(), Box<dyn Error>> {
     let mut out = create_csv(
         &args.deadlock_out,
-        "num-keys,overlap,overlap-pct,latency-ms\n",
+        "run,num-keys,overlap,overlap-pct,latency-ms\n",
+    )?;
+    let mut stats = create_csv(
+        &args.deadlock_stats_out,
+        "run,num-keys,overlap,overlap-pct,count,cell-duration-ms,num-retries,\
+         direct-candidates,direct-landed,worker-drain-ms\n",
     )?;
 
     let num_runs = args.num_runs.max(1);
@@ -1298,7 +1350,7 @@ fn run_deadlock(
             handle.block_on(async { tokio::time::sleep(args.run_cooldown).await });
         }
         eprintln!("Run {}/{num_runs}", run + 1);
-        for k in 1..=6usize {
+        for k in deadlock_key_steps(args)? {
             for overlap in 1..=k {
                 let db = open_db(handle, backend.clone());
                 let mut ben = Benchmarker::new(args.duration, time_scale);
@@ -1323,19 +1375,52 @@ fn run_deadlock(
                 let overlap_pct = 100 * overlap / k;
                 for s in &results.samples {
                     let lat_ms = s.as_secs_f64() * 1000.0;
-                    writeln!(out, "{k},{overlap},{overlap_pct},{lat_ms:.2}")?;
+                    writeln!(out, "{},{k},{overlap},{overlap_pct},{lat_ms:.2}", run + 1)?;
                 }
+                let count = results.samples.len();
+                let tx_per_sec = if results.tot_duration.is_zero() {
+                    0.0
+                } else {
+                    count as f64 / results.tot_duration.as_secs_f64()
+                };
+                let s = ben.delta_stats;
+                writeln!(
+                    stats,
+                    "{},{k},{overlap},{overlap_pct},{count},{:.2},{},{},{},{:.2}",
+                    run + 1,
+                    results.tot_duration.as_secs_f64() * 1000.0,
+                    s.tx_retries,
+                    s.direct_commit_candidates,
+                    s.direct_commit_landed,
+                    ben.worker_drain().as_secs_f64() * 1000.0,
+                )?;
                 eprintln!(
-                    "deadlock: keys={k} overlap={overlap} ({overlap_pct}%) samples={} \
-                     p50={:?} p90={:?}",
-                    results.samples.len(),
+                    "deadlock: run={} keys={k} overlap={overlap} ({overlap_pct}%) \
+                     samples={} tx/s={tx_per_sec:.2} p50={:?} p90={:?} \
+                     retries={} direct={}/{} drain={:?}",
+                    run + 1,
+                    count,
                     results.percentile(0.5),
                     results.percentile(0.9),
+                    s.tx_retries,
+                    s.direct_commit_landed,
+                    s.direct_commit_candidates,
+                    ben.worker_drain(),
                 );
             }
         }
     }
     Ok(())
+}
+
+fn deadlock_key_steps(args: &Args) -> Result<Vec<usize>, Box<dyn Error>> {
+    if args.deadlock_keys.is_empty() {
+        return Ok((1..=6).collect());
+    }
+    if args.deadlock_keys.contains(&0) {
+        return Err("--deadlock-keys values must be greater than zero".into());
+    }
+    Ok(args.deadlock_keys.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,17 +1436,18 @@ fn create_csv(path: &str, header: &str) -> Result<BufWriter<File>, Box<dyn Error
 fn dump_samples(
     out: &mut impl Write,
     results: &[DbResults],
+    run: usize,
     numdb: usize,
 ) -> Result<(), Box<dyn Error>> {
     for (i, res) in results.iter().enumerate() {
         for s in &res.strong.samples {
-            dump_sample_row(out, numdb, i, "strong-read", 2, *s)?;
+            dump_sample_row(out, run, numdb, i, "strong-read", 2, *s)?;
         }
         for s in &res.weak.samples {
-            dump_sample_row(out, numdb, i, "weak-read", 1, *s)?;
+            dump_sample_row(out, run, numdb, i, "weak-read", 1, *s)?;
         }
         for s in &res.write.samples {
-            dump_sample_row(out, numdb, i, "write", 2, *s)?;
+            dump_sample_row(out, run, numdb, i, "write", 2, *s)?;
         }
     }
     Ok(())
@@ -1369,6 +1455,7 @@ fn dump_samples(
 
 fn dump_sample_row(
     out: &mut impl Write,
+    run: usize,
     numdb: usize,
     db: usize,
     tp: &str,
@@ -1377,7 +1464,7 @@ fn dump_sample_row(
 ) -> Result<(), Box<dyn Error>> {
     writeln!(
         out,
-        "{numdb},{db},{tp},{ops},{:.2}",
+        "{run},{numdb},{db},{tp},{ops},{:.2}",
         lat.as_secs_f64() * 1000.0
     )?;
     Ok(())
@@ -1386,6 +1473,7 @@ fn dump_sample_row(
 fn dump_stats(
     out: &mut impl Write,
     results: &[DbResults],
+    run: usize,
     numdb: usize,
 ) -> Result<(), Box<dyn Error>> {
     for (i, res) in results.iter().enumerate() {
@@ -1397,7 +1485,7 @@ fn dump_stats(
         let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists;
         writeln!(
             out,
-            "{numdb},{i},{},{},{},{},{},{},{}",
+            "{run},{numdb},{i},{},{},{},{},{},{},{}",
             res.stats.tx_n,
             res.logical_tx(),
             res.stats.tx_retries,
@@ -1413,7 +1501,9 @@ fn dump_stats(
 fn dump_throughput(
     out: &mut impl Write,
     results: &[DbResults],
+    run: usize,
     numdb: usize,
+    cell_duration: Duration,
 ) -> Result<(), Box<dyn Error>> {
     for (i, res) in results.iter().enumerate() {
         for (name, r) in [
@@ -1422,13 +1512,13 @@ fn dump_throughput(
             ("write", &res.write),
         ] {
             let count = r.samples.len();
-            let dur_ms = r.tot_duration.as_secs_f64() * 1000.0;
-            let tps = if r.tot_duration.is_zero() {
+            let dur_ms = cell_duration.as_secs_f64() * 1000.0;
+            let tps = if cell_duration.is_zero() {
                 0.0
             } else {
-                count as f64 / r.tot_duration.as_secs_f64()
+                count as f64 / cell_duration.as_secs_f64()
             };
-            writeln!(out, "{numdb},{i},{name},{count},{dur_ms:.2},{tps:.4}")?;
+            writeln!(out, "{run},{numdb},{i},{name},{count},{dur_ms:.2},{tps:.4}")?;
         }
     }
     Ok(())
@@ -1437,8 +1527,11 @@ fn dump_throughput(
 #[allow(clippy::too_many_arguments)]
 fn dump_client_stats(
     out: &mut impl Write,
+    run: usize,
     numdb: usize,
     wall: Duration,
+    worker_wall: Duration,
+    worker_drain: Duration,
     cpu_user: Duration,
     cpu_sys: Duration,
     http: HttpSnapshot,
@@ -1459,9 +1552,11 @@ fn dump_client_stats(
     };
 
     eprintln!(
-        "clientmetrics num-db={numdb} cpu-util={util_pct:.0}% (user={cpu_user:?} sys={cpu_sys:?} \
-         wall={wall:?} cores={num_cpu}) http-req={} ({req_per_sec:.0}/s) throttle={} 5xx={} \
-         new-conns={} peak-threads={peak_threads} tx-fail={failures}",
+        "clientmetrics run={run} num-db={numdb} cpu-util={util_pct:.0}% \
+         (user={cpu_user:?} sys={cpu_sys:?} wall={wall:?} worker={worker_wall:?} \
+         drain={worker_drain:?} cores={num_cpu}) \
+         http-req={} ({req_per_sec:.0}/s) throttle={} 5xx={} new-conns={} \
+         peak-threads={peak_threads} tx-fail={failures}",
         http.requests, http.throttle, http.server_err, http.new_conns,
     );
 
@@ -1476,9 +1571,11 @@ fn dump_client_stats(
 
     writeln!(
         out,
-        "{numdb},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},{},{},{},{},{},{peak_threads},\
-         {failures}",
+        "{run},{numdb},{:.2},{:.2},{:.2},{num_cpu},{:.2},{:.2},{util_pct:.2},\
+         {},{},{},{},{},{peak_threads},{failures}",
         wall.as_secs_f64() * 1000.0,
+        worker_wall.as_secs_f64() * 1000.0,
+        worker_drain.as_secs_f64() * 1000.0,
         cpu_user.as_secs_f64() * 1000.0,
         cpu_sys.as_secs_f64() * 1000.0,
         http.requests,
@@ -1503,5 +1600,42 @@ fn fmt_float(f: f64) -> String {
         format!("{f:.2}")
     } else {
         format!("{f:.4}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_results(strong: usize, weak: usize, write: usize) -> DbResults {
+        let results = |count, duration| Results {
+            samples: vec![Duration::from_millis(1); count],
+            // Deliberately different per-DB timers: throughput must ignore
+            // these and use the shared cell clock supplied by the caller.
+            tot_duration: duration,
+        };
+        DbResults {
+            stats: Stats::default(),
+            strong: results(strong, Duration::from_secs(7)),
+            weak: results(weak, Duration::from_secs(8)),
+            write: results(write, Duration::from_secs(9)),
+        }
+    }
+
+    #[test]
+    fn throughput_rows_use_run_identity_and_one_cell_clock() {
+        let results = [db_results(8, 4, 2), db_results(2, 2, 2)];
+        let mut out = Vec::new();
+
+        dump_throughput(&mut out, &results, 3, 2, Duration::from_secs(2)).unwrap();
+
+        let rows = String::from_utf8(out).unwrap();
+        assert!(rows.contains("3,2,0,strong-read,8,2000.00,4.0000\n"));
+        assert!(rows.contains("3,2,1,strong-read,2,2000.00,1.0000\n"));
+        assert!(
+            rows.lines()
+                .all(|row| row.split(',').nth(5) == Some("2000.00")),
+            "every Database/type row must carry the same cell clock: {rows}"
+        );
     }
 }

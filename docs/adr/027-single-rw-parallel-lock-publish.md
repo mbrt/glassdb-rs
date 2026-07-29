@@ -2,21 +2,21 @@
 
 ## Status
 
-Accepted — implemented. Supersedes the **single read-write fast path** decision
-of [ADR-020](020-commit-write-back-protocol.md) (its "Fast paths →
-Single read-write" bullet); the rest of ADR-020 is unchanged.
+Superseded and removed by
+[ADR-053](053-replay-definitive-logless-rmw-losses.md). A single read-write
+transaction now either commits logless in one leaf CAS
+([ADR-051](051-inline-latest-values.md)) or uses the regular locked commit
+protocol of [ADR-020](020-commit-write-back-protocol.md). This parallel logged
+path no longer exists in the engine, and ADR-020's original two-sequential-write
+single read-write bullet — which this ADR superseded — is not revived.
 
-Its **bespoke shard-CAS install step** (step 2 "W2 — one shard CAS" and the
-private retry/reclassify loop) is superseded by
-[ADR-028](028-shard-mutation-coordinator.md): the lock install now flows through
-the shared shard coordinator as a `CommitInstall` resolver. The parallel-commit
-decision here (two concurrent writes, the commit point, the one irreducible
-in-doubt) is retained.
-
-[ADR-051](051-inline-latest-values.md) supersedes this path when the value is
-eligible for authoritative leaf inlining: that case commits with
-one direct leaf CAS and no transaction object. This parallel logged path remains
-the fallback for non-inline values.
+Previously: Accepted — implemented. Superseded the **single read-write fast
+path** decision of [ADR-020](020-commit-write-back-protocol.md) (its "Fast paths →
+Single read-write" bullet); the rest of ADR-020 was unchanged. Its bespoke
+shard-CAS install step was in turn superseded by
+[ADR-028](028-shard-mutation-coordinator.md)'s shared shard coordinator, and
+[ADR-051](051-inline-latest-values.md) took over every value eligible for
+authoritative leaf inlining, leaving this the fallback for the remainder.
 
 ## Context
 

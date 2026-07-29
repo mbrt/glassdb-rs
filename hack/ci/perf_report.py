@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import statistics
@@ -13,6 +14,7 @@ from typing import Any, Iterable
 
 SCORE_RUNS = 11
 MIX_RUNS = 3
+DEADLOCK_RUNS = 3
 WORKLOADS = (
     "singleRMW",
     "multiRMW10",
@@ -55,6 +57,18 @@ class MixRun:
     shapes: dict[str, MixShape]
     total_ops_per_tx: float
     retries_per_tx: float
+
+
+@dataclass(frozen=True)
+class DeadlockRun:
+    completed: int
+    tx_per_sec: float | None
+    p50_ms: float
+    p90_ms: float
+    retries_per_tx: float | None
+    direct_candidates_per_tx: float | None
+    direct_land_rate: float | None
+    worker_drain_ms: float | None
 
 
 def _number(value: Any, field: str) -> float:
@@ -203,6 +217,141 @@ def load_mix_runs(path: Path) -> list[MixRun]:
     return runs
 
 
+def _percentile_r8(values: list[float], percentile: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ReportError("cannot take a percentile of no samples")
+    n = 1.0 / 3.0 + percentile * (len(ordered) + 1.0 / 3.0)
+    k = math.floor(n)
+    fraction = n - k
+    if k <= 0:
+        return ordered[0]
+    if k >= len(ordered):
+        return ordered[-1]
+    return ordered[k - 1] + fraction * (ordered[k] - ordered[k - 1])
+
+
+def _csv_rows(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open(newline="") as source:
+            return list(csv.DictReader(source))
+    except OSError as error:
+        raise ReportError(f"cannot read {path}: {error}") from error
+
+
+def _csv_number(row: dict[str, str], field: str, path: Path) -> float:
+    raw = row.get(field)
+    try:
+        value = float(raw) if raw is not None else float("nan")
+    except ValueError as error:
+        raise ReportError(f"{path}: {field} must be a number") from error
+    return _nonnegative(value, f"{path}: {field}")
+
+
+def load_deadlock_runs(path: Path, *, require_stats: bool) -> list[DeadlockRun]:
+    raw_files = sorted(
+        result
+        for result in path.glob("*.csv")
+        if not result.name.endswith("-stats.csv")
+    )
+    expected_names = [f"{run:02d}.csv" for run in range(1, DEADLOCK_RUNS + 1)]
+    if [result.name for result in raw_files] != expected_names:
+        raise ReportError(
+            f"{path} must contain paired deadlock runs {expected_names}; "
+            f"found {[result.name for result in raw_files]}"
+        )
+    stats_files = [
+        result.with_name(f"{result.stem}-stats.csv") for result in raw_files
+    ]
+    stats_present = [result.exists() for result in stats_files]
+    if require_stats and not all(stats_present):
+        raise ReportError(f"{path}: focused deadlock stats are required for every run")
+    if any(stats_present) and not all(stats_present):
+        raise ReportError(f"{path}: focused deadlock stats are incomplete")
+
+    runs = []
+    for result_path in raw_files:
+        rows = [
+            row
+            for row in _csv_rows(result_path)
+            if _csv_number(row, "num-keys", result_path) == 1
+            and _csv_number(row, "overlap-pct", result_path) == 100
+        ]
+        latencies = [
+            _csv_number(row, "latency-ms", result_path)
+            for row in rows
+        ]
+        if not latencies:
+            raise ReportError(f"{result_path}: no one-key full-overlap samples")
+
+        stats_path = result_path.with_name(f"{result_path.stem}-stats.csv")
+        stats_rows = []
+        if stats_path.exists():
+            stats_rows = [
+                row
+                for row in _csv_rows(stats_path)
+                if _csv_number(row, "num-keys", stats_path) == 1
+                and _csv_number(row, "overlap-pct", stats_path) == 100
+            ]
+            if len(stats_rows) != 1:
+                raise ReportError(
+                    f"{stats_path}: expected one one-key full-overlap row"
+                )
+
+        tx_per_sec = retries_per_tx = direct_candidates_per_tx = None
+        direct_land_rate = worker_drain_ms = None
+        if stats_rows:
+            row = stats_rows[0]
+            completed = _count(
+                _csv_number(row, "count", stats_path), f"{stats_path}: count"
+            )
+            if completed != len(latencies):
+                raise ReportError(
+                    f"{stats_path}: count={completed} but {result_path} has "
+                    f"{len(latencies)} samples"
+                )
+            duration_ms = _csv_number(row, "cell-duration-ms", stats_path)
+            if duration_ms == 0:
+                raise ReportError(f"{stats_path}: cell-duration-ms must be positive")
+            candidates_field = (
+                "direct-candidates"
+                if "direct-candidates" in row
+                else "direct-attempts"
+            )
+            landed_field = (
+                "direct-landed" if "direct-landed" in row else "direct-commits"
+            )
+            candidates = _csv_number(row, candidates_field, stats_path)
+            landed = _csv_number(row, landed_field, stats_path)
+            if landed > candidates:
+                raise ReportError(
+                    f"{stats_path}: direct landed count exceeds candidates"
+                )
+            tx_per_sec = completed * 1000.0 / duration_ms
+            retries_per_tx = (
+                _csv_number(row, "num-retries", stats_path) / completed
+            )
+            direct_candidates_per_tx = candidates / completed
+            direct_land_rate = (
+                landed / candidates if candidates > 0 else None
+            )
+            worker_drain_ms = _csv_number(row, "worker-drain-ms", stats_path)
+
+        runs.append(
+            DeadlockRun(
+                completed=len(latencies),
+                tx_per_sec=tx_per_sec,
+                p50_ms=_percentile_r8(latencies, 0.5),
+                p90_ms=_percentile_r8(latencies, 0.9),
+                retries_per_tx=retries_per_tx,
+                direct_candidates_per_tx=direct_candidates_per_tx,
+                direct_land_rate=direct_land_rate,
+                worker_drain_ms=worker_drain_ms,
+            )
+        )
+    return runs
+
+
 def _values(items: Iterable[Any], field: str) -> list[float]:
     return [float(getattr(item, field)) for item in items]
 
@@ -224,6 +373,28 @@ def _change(base: Iterable[float], candidate: Iterable[float]) -> str:
     return f"{(candidate_median / base_median - 1.0) * 100:+.2f}%"
 
 
+def _available(items: Iterable[float | int | None]) -> list[float]:
+    return [float(item) for item in items if item is not None]
+
+
+def _optional_summary(
+    items: Iterable[float | int | None], digits: int = 2
+) -> str:
+    values = _available(items)
+    return _summary(values, digits) if values else "n/a"
+
+
+def _optional_change(
+    base: Iterable[float | int | None],
+    candidate: Iterable[float | int | None],
+) -> str:
+    base_values = _available(base)
+    candidate_values = _available(candidate)
+    if not base_values or not candidate_values:
+        return "n/a"
+    return _change(base_values, candidate_values)
+
+
 def _escape(value: str) -> str:
     return value.replace("|", "\\|")
 
@@ -233,6 +404,12 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
     candidate_scores = load_score_runs(input_dir / "score" / "pr")
     base_mix = load_mix_runs(input_dir / "mix" / "main")
     candidate_mix = load_mix_runs(input_dir / "mix" / "pr")
+    base_deadlock = load_deadlock_runs(
+        input_dir / "deadlock" / "main", require_stats=False
+    )
+    candidate_deadlock = load_deadlock_runs(
+        input_dir / "deadlock" / "pr", require_stats=True
+    )
 
     base_score_values = _values(base_scores, "score")
     candidate_score_values = _values(candidate_scores, "score")
@@ -347,6 +524,41 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
             "",
             "> Mixbench is scheduling-sensitive even after adaptive sampling; use it "
             "as a secondary concurrency signal, not a pass/fail verdict.",
+            "",
+            "## Focused one-key RMW contention",
+            "",
+            "Five writers repeatedly update one shared key. Values are medians with "
+            "min–max ranges from three interleaved runs. Missing baseline protocol "
+            "fields mean the baseline predates the focused summary schema; latency "
+            "and completion counts remain comparable.",
+            "",
+            "| Metric | Main | PR | Change |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    deadlock_metrics = [
+        ("Successful tx/run", "completed", 0),
+        ("Completion tx/s", "tx_per_sec", 2),
+        ("p50 latency ms", "p50_ms", 1),
+        ("p90 latency ms", "p90_ms", 1),
+        ("Retries/tx", "retries_per_tx", 3),
+        ("Direct candidates/tx", "direct_candidates_per_tx", 3),
+        ("Direct land rate", "direct_land_rate", 3),
+        ("Worker drain ms", "worker_drain_ms", 1),
+    ]
+    for label, field, digits in deadlock_metrics:
+        base = [getattr(run, field) for run in base_deadlock]
+        candidate = [getattr(run, field) for run in candidate_deadlock]
+        lines.append(
+            f"| {label} | {_optional_summary(base, digits)} | "
+            f"{_optional_summary(candidate, digits)} | "
+            f"{_optional_change(base, candidate)} |"
+        )
+    lines.extend(
+        [
+            "",
+            "> A missing cell, worker error, or incomplete drain fails the measurement "
+            "step instead of producing a comparison.",
             "",
         ]
     )

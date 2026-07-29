@@ -604,7 +604,7 @@ This makes read-heavy workloads very efficient — the happy path requires only
 one metadata read per key, with zero writes, plus one value read for keys whose
 current value is not inline.
 
-#### Single read-modify-write, logless
+#### Single read-modify-write
 
 A transaction that overwrites exactly one existing key with an inline-eligible
 value commits in **one** conditional leaf CAS — no lock, no transaction object,
@@ -612,10 +612,19 @@ no write-back ([ADR-051](adr/051-inline-latest-values.md)). The CAS installs
 `Inline { writer: txid, value }` with no lock holder, which is simultaneously the
 commit point and the published value: a reader that sees it needs nothing else,
 and a reader that does not see it observes the predecessor. Eligibility is
-decided before anything is written — a live pending or unknown holder, an
-exclusive structural gate, a collection-delete intent, a moved read version, or a
-value over either inline budget makes the transaction fall through to the logged
-path below under the same id.
+decided before anything is written, so an attempt that does not commit has staged
+nothing at all.
+
+That makes a non-landing attempt something to *classify* rather than fail
+([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A
+read-modify-write whose loss is certified — excluded from a coordinator round, or
+superseded before publication — replays its body under the same, still
+unengaged, id, so a local scheduling loss does not publish a holder that would
+push the key's next writer onto the locked protocol. Genuine ineligibility — a
+live pending or unknown holder, an exclusive structural gate, a collection-delete
+intent, a missing key, or a value over either inline budget — takes the regular
+[commit protocol](#commit-protocol) above under the same id. There is no third,
+single-key-only commit protocol between the two.
 
 Because the commit is invisible until the CAS lands, a retry is proved
 idempotent by the entry already naming this transaction as its inline writer, and
@@ -623,43 +632,7 @@ a cancelled attempt writes no aborted object (the abort guard fires only for a
 transaction that took a logged identity). The coordinator reserves the key for at
 most one logless member per round, so a batched blind writer cannot erase another
 direct commit's recovery evidence. An uncertain CAS followed by a moved entry
-surfaces `Error::InDoubt` as usual.
-
-#### Single read-modify-write, logged
-
-A transaction that overwrites exactly one existing key commits with two
-**parallel** writes instead of the full sequence (ADR-027). This is the fallback
-when the logless path above does not apply:
-
-1. Load the shard and resolve the key's holders. A committed-but-not-written-back
-   holder is help-forwarded to its effective writer; a *live pending* holder, a
-   create/delete, a missing key, or a read whose version has moved makes the
-   transaction ineligible — nothing has been written yet, so it falls back to the
-   full locked path under the same id.
-2. Issue in parallel: the committed transaction object (`_t/<ss>/<txid>`,
-   recording its held lock so GC can prune it) **and** one shard CAS that
-   installs a write lock and help-forwards the resolved predecessor into the
-   entry's current state.
-3. Asynchronously, write-back publishes this transaction as the current writer
-   and releases the lock (through the same deduplicated coordinator path).
-
-The transaction is committed iff both writes land (the committed object exists
-and the lock is in the shard's chain). Because it holds a lock during the short
-pre-commit window it is a full wound-wait participant — an older concurrent
-writer may wound it, and it renews (priority preserved) and re-runs. The install
-CAS routes through the shard-mutation coordinator as a `CommitInstall` resolver
-(ADR-028), and the shard it already cached during the read is reused for the
-first fold attempt with `Requirement::Any` (ADR-036), so a
-steady-state single read-write commits with its shard loaded only once. (The
-change-detection reasoning that keeps this path lost-update-safe is in
-[ADR-007](adr/007-single-rw-cache-lost-update.md).)
-
-One irreducible in-doubt remains: if the install CAS returns `Unavailable` and
-the shard has moved past the transaction by the time it reads back, whether the
-lock landed (committed, help-forwarded into the chain) or never landed (an
-orphan the transaction renews away from) is unknowable, so it surfaces as
-`Error::InDoubt` rather than risk a double-apply. See
-[ADR-009](adr/009-in-doubt-conditional-writes.md).
+surfaces `Error::InDoubt` as usual, and is never downgraded to a replay.
 
 #### Retry with locks held
 

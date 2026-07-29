@@ -16,7 +16,8 @@ mod tlocker;
 mod wound_wait;
 
 pub use algo::{
-    Algo, Data, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
+    Algo, Data, DirectCommitStats, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation,
+    ScanRange, WriteAccess,
 };
 pub use collections::{
     CollectionCatalog, CollectionChange, CollectionData, CollectionOp, DirectoryRead,

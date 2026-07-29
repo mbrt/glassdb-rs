@@ -1,18 +1,19 @@
 # Reproducing the performance graphs on real S3
 
 This directory runs the GlassDB benchmarks against a real Amazon S3 bucket on a
-throwaway EC2 instance and renders five figures from the result CSVs:
+throwaway EC2 instance and renders six figures from the result CSVs:
 
 | Figure                 | Benchmark              | Source CSV        |
 | ---------------------- | ---------------------- | ----------------- |
 | `tx-throughput.png`    | `rtbench` rw9010       | `throughput.csv`  |
+| `tx-fairness.png`      | `rtbench` rw9010       | `throughput.csv`  |
 | `tx-latency.png`       | `rtbench` rw9010       | `samples.csv`     |
 | `ops-latency.png`      | `rtbench` rw9010       | `samples.csv`     |
 | `retries.png`          | `rtbench` rw9010       | `stats.csv`       |
 | `deadlock-latency.png` | `rtbench` deadlock     | `deadlock.csv`    |
 
-Plus `client-stats.csv` (no figure): per-step client CPU / HTTP / connection
-diagnostics, described under [Client-side diagnostics](#client-side-diagnostics-client-statscsv).
+Plus `client-stats.csv` and `deadlock-stats.csv` (no figures): per-cell
+completion/drain and protocol diagnostics.
 
 `rtbench` and the shared sample-collection code live in the
 [`glassdb-bench-scale`](../../crates/glassdb-bench-scale) crate. The rw9010 workload: 50k
@@ -26,14 +27,22 @@ contending on 1..6 shared keys at up to 100% overlap.
 
 ### Client-side diagnostics (`client-stats.csv`)
 
-The rw9010 run also writes `client-stats.csv`: one row per concurrency step with
-the wall time, process CPU time and utilization (as a percentage of all cores),
-the number of S3 HTTP attempts (including retries), how many of those were
-throttling responses (503/429), the number of new connections opened, and the
-peak thread count. Because every DB in `rtbench` shares a single S3 client in
-one process, this is what tells a *client-side* ceiling (CPU saturation) apart
-from *backend* throttling. The same numbers are logged live per step
-(`clientmetrics num-db=...`), so they show up in `deploy.sh logs`.
+Every rw9010 CSV carries `run` plus the cell identity. `throughput.csv` records
+each Database's completed count against one common cell clock, so aggregate
+system throughput is `sum(count) / cell-duration` rather than
+`num_databases * median(per_database_rate)`. The per-Database spread is a
+separate Jain-fairness signal in `tx-fairness.png`.
+
+`client-stats.csv` has one row per run/concurrency cell with total wall time,
+the worker window, overrun after the requested measurement duration, graceful
+process CPU utilization, S3 HTTP attempts and responses, connections, peak
+threads, and transaction failures. Because every Database in `rtbench` shares
+one S3 client, this separates a client-side ceiling from backend throttling.
+The same numbers are logged live per cell.
+
+The deadlock workload also writes `deadlock-stats.csv`, with completion rate,
+retries, direct candidates and landed commits, and worker overrun.
+`deadlock.csv` remains the raw latency-sample source for p50/p90.
 
 ## How it works
 
@@ -203,7 +212,9 @@ cargo run --release -p glassdb-bench-scale --bin rtbench -- \
   --throughput-out=hack/aws-bench/out-fake/throughput.csv
 cargo run --release -p glassdb-bench-scale --bin rtbench -- \
   --backend=fakes3 --test-name=deadlock \
-  --duration=20s --deadlock-out=hack/aws-bench/out-fake/deadlock.csv
+  --duration=20s \
+  --deadlock-out=hack/aws-bench/out-fake/deadlock.csv \
+  --deadlock-stats-out=hack/aws-bench/out-fake/deadlock-stats.csv
 
 # Compare fake vs real: per-concurrency ratios for throughput, latency,
 # retries, backend round-trips and deadlock p50/p90, and overlay PNGs into the
@@ -309,7 +320,10 @@ artifact that is **not** gitignored, so it can be committed to track the numbers
 How it works: each ref compiles its own engine (the `Backend` trait differs
 across versions), so the script builds `rtbench` + `autoresearch` and, when
 present, `mixbench` from the baseline ref in a **reused detached git worktree**
-and from the target tree, runs `rw9010` (the `--rw-mix` presets
+and from the target tree. It alternates baseline/candidate order for paired
+rw9010 and deadlock repetitions, retains each raw run under `runs/<N>/`, and
+normalizes historical CSVs with an explicit run identity. It runs `rw9010` (the
+`--rw-mix` presets
 `balanced`/`readheavy`/`writeheavy`), `deadlock`, the `autoresearch` score, and
 the `mixbench` grid on both into `out-refs/`, then diffs them with `compare.py`
 (`ratio = target / base`: throughput > 1 is a win; latency / retries /
@@ -319,8 +333,11 @@ Modern benchmark binaries bound each cell's in-flight drain with
 `--drain-timeout`; the full comparison allows 90 seconds so it retains the
 current high-concurrency write tail, while `--summary` allows 30 seconds. Every
 workload command also runs under a 15-minute watchdog for historical refs that
-predate that flag. Missing cells and terminal transaction failures abort the
-comparison. An `InDoubt` returned by a measured mutation is different: the
+predate that flag. Missing or unpaired cells, incomplete drains, and terminal
+transaction failures abort the comparison. Aggregate throughput is paired by
+run and derived from completed transactions over the shared cell clock; the
+per-Database distribution is reported separately as fairness. An `InDoubt`
+returned by a measured mutation is different: the
 benchmark replays it as part of the same logical operation and includes every
 attempt in the sample's latency and backend-op cost.
 

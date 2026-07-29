@@ -73,6 +73,12 @@ impl DiagnosticSession {
             ("coordinator", "submissions", sum(|s| s.coord_submissions)),
             ("coordinator", "rounds", sum(|s| s.coord_rounds)),
             ("coordinator", "cas_retries", sum(|s| s.lock_retries)),
+            (
+                "direct_commit",
+                "candidates",
+                sum(|s| s.direct_commit_candidates),
+            ),
+            ("direct_commit", "landed", sum(|s| s.direct_commit_landed)),
             ("splitter", "candidates", sum(|s| s.split_candidates)),
             ("splitter", "completed", sum(|s| s.split_completed)),
             ("splitter", "deferred", sum(|s| s.split_deferred)),

@@ -7,6 +7,74 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-045–ADR-051: current-state reassessment
+
+This rerun reassesses the cumulative engine after the persistent cache,
+transactional collection management, the collection-record/tree split, and
+[ADR-051](../adr/051-inline-latest-values.md). It also establishes the first
+rw9010 result using aggregate completions over one shared cell clock. Older
+entries retain the historical `num_databases * median(per_database_rate)`
+estimator and should not be compared directly without reprocessing their CSVs.
+
+### Setup
+
+- base: `69663ddecc23c57ea40d9d0995d1d663797f251b` (post-ADR-044);
+  target: `3fccb3ba4f2b5dd154645cc6a42a7ead730d354a` plus the benchmark
+  accounting and direct candidate/landed counters in this worktree
+- ratio = target / base (throughput >1 good; latency/ops/cost <1 good)
+- command: `BASE=69663dde LABEL_A=adr044 LABEL_B=current DELAY_SCALE=0.02
+  DB_LIST=1,10,20 NUM_KEYS=5000 DURATION=8s NUM_RUNS=3
+  DEADLOCK_DURATION=500ms COUNT=3 RW_MIX="balanced readheavy writeheavy"
+  MIX_DURATION=1s MIX_MAX_DURATION=20s MIX_TARGET_CI=0.2 MIX_MODES=hi
+  MIX_TOPOLOGIES=shared MIX_WORKERS=8 MIX_CLIENTS=4
+  DRAIN_TIMEOUT=90s hack/aws-bench/compare-refs.sh --summary`
+- the three rw9010 and deadlock repetitions are paired and interleaved, with
+  execution order reversed on the second repetition
+- all cells complete with zero transaction failures
+
+### Corrected rw9010 results
+
+- aggregate-throughput geomeans: balanced `0.92`, read-heavy `1.00`,
+  write-heavy `1.01`. The corresponding Jain-fairness geomeans are `0.97`,
+  `0.96`, and `1.01`, with a median fairness ratio of `1.00` in every mix
+- write p50 geomeans are `2.14` in balanced and `1.51` in read-heavy, but
+  `0.99` in write-heavy. Strong reads improve slightly in the first two mixes;
+  the completion result does not support a broad throughput recovery or
+  regression
+- backend operations/transaction are `0.97`, `0.88`, and `1.05`; retries per
+  transaction are `1.05`, `1.05`, and `1.04`
+- current workers overrun the requested 8-second measurement window by
+  `12.0–26.9 s` at 10 and 20 Databases. The ADR-044 binary predates the split
+  drain field, but total cell wall time is similarly long on both sides
+  (`8.0–37.7 s`). Throughput uses the completed transaction count and common
+  worker elapsed time; drain is reported separately
+
+### Focused hot-key result
+
+The one-key, five-writer cell is the clear localized regression:
+
+- p50 ratio is `2.02–2.47`; p90 ratio is `1.85–2.79` across the three paired
+  runs. The target records 148 successful samples versus 326 in the reference
+- the target has 405 direct candidates: 14 land and 391 (`96.5%`) do not. That
+  is `2.74` candidates per completed transaction, alongside 257
+  logged-transaction retries
+- larger fully overlapping transactions are mixed around parity. Across all
+  key counts, the noisy p50 and p90 geomeans are `1.18` and `1.19`; the
+  one-key direct-path eligibility is what makes the outlier distinct
+
+The two durable counters prove that the direct path does not retain its
+uncontended advantage under same-key contention. Reason-specific instrumentation
+should remain temporary while the next P1 identifies whether batch exclusion,
+leaf-CAS loss, or renewed transaction re-entry dominates.
+
+### Secondary signals
+
+- deterministic efficiency improves from `122.01` to `98.46` (`0.807`).
+  Single-RMW cost is `0.35`, multi-RMW `0.82`, and batch-write `1.17`
+- the single short `hi/shared` mixbench cell is secondary: `roMulti` throughput
+  is `0.62`, `roSingle` `0.90`, `rwMany` `0.94`, and `rwSingle` `0.99`, with
+  aggregate backend operations/transaction at `1.06`
+
 ## ADR-051: Inline latest values in leaf entries
 
 [ADR-051](../adr/051-inline-latest-values.md) makes a small committed value part
