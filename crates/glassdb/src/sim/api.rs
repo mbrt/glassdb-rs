@@ -252,174 +252,23 @@ fn possible_values(models: &BTreeSet<ApiModel>, key: usize) -> BTreeSet<Option<u
     models.iter().map(|model| model.values[key]).collect()
 }
 
-#[derive(Debug)]
-enum ApiCheck {
-    EqualBool {
-        context: String,
-        actual: bool,
-        expected: bool,
-    },
-    EqualValue {
-        context: String,
-        actual: Option<u8>,
-        expected: Option<u8>,
-    },
-    EqualNames {
-        context: String,
-        actual: Vec<Vec<u8>>,
-        expected: Vec<Vec<u8>>,
-    },
-    SortedNames {
-        context: String,
-        names: Vec<Vec<u8>>,
-    },
-    ValueWidth {
-        context: String,
-        value: Vec<u8>,
-    },
-    StaleRead {
-        context: String,
-        observed: StaleReadObservation,
-    },
+/// Marks an oracle failure that must first pass transaction read validation.
+const API_INVARIANT_MARKER: &str = "api-invariant";
+
+fn api_invariant_error(detail: impl std::fmt::Display) -> Error {
+    Error::internal(format!("{API_INVARIANT_MARKER}: {detail}"))
 }
 
-impl ApiCheck {
-    fn verify(self) {
-        match self {
-            ApiCheck::EqualBool {
-                context,
-                actual,
-                expected,
-            } => assert_eq!(actual, expected, "{context}"),
-            ApiCheck::EqualValue {
-                context,
-                actual,
-                expected,
-            } => assert_eq!(actual, expected, "{context}"),
-            ApiCheck::EqualNames {
-                context,
-                actual,
-                expected,
-            } => assert_eq!(actual, expected, "{context}"),
-            ApiCheck::SortedNames { context, names } => assert!(
-                names.windows(2).all(|pair| pair[0] < pair[1]),
-                "{context}: {names:?}"
-            ),
-            ApiCheck::ValueWidth { context, value } => {
-                assert_eq!(value.len(), 1, "{context} has non-byte value {value:?}");
-            }
-            ApiCheck::StaleRead { context, observed } => match observed {
-                StaleReadObservation::Stale => {}
-                StaleReadObservation::Value(value) => {
-                    panic!("{context} read {value:?} instead of becoming stale")
-                }
-            },
-        }
+fn api_invariant_message(error: &Error) -> Option<&str> {
+    match error {
+        Error::Internal { msg, .. } if msg.starts_with(API_INVARIANT_MARKER) => Some(msg),
+        _ => None,
     }
 }
 
-#[derive(Debug)]
-enum StaleReadObservation {
-    Stale,
-    Value(Option<Vec<u8>>),
-}
-
-#[derive(Debug)]
-enum KeyReadExpectation {
-    Modeled,
-    Staged(Option<u8>),
-    Repeated(Option<Vec<u8>>),
-}
-
-#[derive(Debug)]
-struct KeyReadObservation {
-    key: usize,
-    actual: Option<Vec<u8>>,
-    expected: KeyReadExpectation,
-}
-
-impl KeyReadObservation {
-    fn verify(self, allowed: &[BTreeSet<Option<u8>>]) {
-        let actual = modeled_value(&self.actual, format!("API key k{}", self.key));
-        match self.expected {
-            KeyReadExpectation::Modeled => assert!(
-                allowed[self.key].contains(&actual),
-                "API key k{} read {actual:?} outside modeled states {:?}",
-                self.key,
-                allowed[self.key]
-            ),
-            KeyReadExpectation::Staged(expected) => assert_eq!(
-                actual, expected,
-                "API key k{} violated read-your-writes",
-                self.key
-            ),
-            KeyReadExpectation::Repeated(expected) => assert_eq!(
-                self.actual, expected,
-                "API key k{} violated repeatable reads",
-                self.key
-            ),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum CollectionStateObservation {
-    Slot {
-        slot: usize,
-        actual: Option<ApiCollectionModel>,
-    },
-    Catalog(Vec<Option<ApiCollectionModel>>),
-}
-
-#[derive(Debug, Default)]
-struct ApiAttempt {
-    checks: Vec<ApiCheck>,
-    reads: Vec<KeyReadObservation>,
-    collections: Vec<CollectionStateObservation>,
-}
-
-impl ApiAttempt {
-    fn verify(self, allowed: &[BTreeSet<Option<u8>>], after: &BTreeSet<ApiModel>) {
-        for check in self.checks {
-            check.verify();
-        }
-        for read in self.reads {
-            read.verify(allowed);
-        }
-        for collection in self.collections {
-            match collection {
-                CollectionStateObservation::Slot { slot, actual } => {
-                    let expected = expected_collection_states(after, slot);
-                    assert!(
-                        expected.contains(&actual),
-                        "collection slot {slot} observed {actual:?} outside modeled states \
-                         {expected:?}"
-                    );
-                }
-                CollectionStateObservation::Catalog(actual) => {
-                    let expected: BTreeSet<Vec<Option<ApiCollectionModel>>> = after
-                        .iter()
-                        .map(|model| model.collections.clone())
-                        .collect();
-                    assert!(
-                        expected.contains(&actual),
-                        "collection catalog observed {actual:?} outside modeled states {expected:?}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn modeled_value(value: &Option<Vec<u8>>, context: impl std::fmt::Display) -> Option<u8> {
-    value.as_ref().map(|value| {
-        assert_eq!(
-            value.len(),
-            1,
-            "{context} has non-byte modeled value {value:?}"
-        );
-        value[0]
-    })
+fn check_api_invariant(condition: bool, detail: impl std::fmt::Display) -> Result<(), Error> {
+    crate::ensure_tx!(condition, api_invariant_error(detail));
+    Ok(())
 }
 
 fn api_collection_name(client: usize, slot: usize) -> Vec<u8> {
@@ -466,24 +315,17 @@ async fn listed_collection_names(
 async fn read_collection_value(
     tx: &Transaction,
     collection: &Collection,
-    checks: &mut Vec<ApiCheck>,
-    context: String,
+    context: &str,
 ) -> Result<Option<u8>, Error> {
     match tx.read(collection, API_COLLECTION_VALUE_KEY).await? {
         Some(value) => {
-            let modeled = value.first().copied();
-            checks.push(ApiCheck::ValueWidth { context, value });
-            Ok(modeled)
+            check_api_invariant(
+                value.len() == 1,
+                format!("{context} has non-byte modeled value {value:?}"),
+            )?;
+            Ok(Some(value[0]))
         }
         None => Ok(None),
-    }
-}
-
-fn opened_collection(result: Result<Collection, Error>) -> Result<Option<Collection>, Error> {
-    match result {
-        Ok(collection) => Ok(Some(collection)),
-        Err(Error::NotFound) => Ok(None),
-        Err(error) => Err(error),
     }
 }
 
@@ -491,175 +333,143 @@ async fn inspect_collection(
     tx: &Transaction,
     client: usize,
     slot: usize,
-    checks: &mut Vec<ApiCheck>,
 ) -> Result<Option<ApiCollectionModel>, Error> {
     let root = tx.root_collection();
     let name = api_collection_name(client, slot);
     let path = api_collection_path(client, slot);
     let exists = tx.collection_exists(&root, &name).await?;
     let path_exists = tx.collection_path_exists(&path).await?;
-    checks.push(ApiCheck::EqualBool {
-        context: format!("direct and path existence disagree for {name:?}"),
-        actual: path_exists,
-        expected: exists,
-    });
+    check_api_invariant(
+        path_exists == exists,
+        format!("direct and path existence disagree for {name:?}"),
+    )?;
 
     let root_names = listed_collection_names(tx, &root).await?;
-    checks.push(ApiCheck::SortedNames {
-        context: "root collection listing is not strictly sorted".into(),
-        names: root_names.clone(),
-    });
-    checks.push(ApiCheck::EqualBool {
-        context: format!("root listing disagrees with existence for {name:?}"),
-        actual: root_names.iter().any(|candidate| candidate == &name),
-        expected: exists,
-    });
-
-    let direct_collection = opened_collection(tx.open_collection(&root, &name).await)?;
-    let path_collection = opened_collection(tx.open_collection_path(&path).await)?;
-    checks.push(ApiCheck::EqualBool {
-        context: format!("direct open disagrees with existence for {name:?}"),
-        actual: direct_collection.is_some(),
-        expected: exists,
-    });
-    checks.push(ApiCheck::EqualBool {
-        context: format!("path open disagrees with existence for {name:?}"),
-        actual: path_collection.is_some(),
-        expected: path_exists,
-    });
+    check_api_invariant(
+        root_names.windows(2).all(|pair| pair[0] < pair[1]),
+        format!("root collection listing is not strictly sorted: {root_names:?}"),
+    )?;
+    check_api_invariant(
+        root_names.iter().any(|candidate| candidate == &name) == exists,
+        format!("root listing disagrees with existence for {name:?}"),
+    )?;
 
     if !exists {
+        match tx.open_collection(&root, &name).await {
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(api_invariant_error(format!(
+                    "direct open found absent collection {name:?}"
+                )));
+            }
+        }
+        match tx.open_collection_path(&path).await {
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(api_invariant_error(format!(
+                    "path open found absent collection {name:?}"
+                )));
+            }
+        }
         return Ok(None);
     }
 
-    let Some(collection) = direct_collection.as_ref().or(path_collection.as_ref()) else {
-        return Ok(Some(ApiCollectionModel::default()));
-    };
-    let direct_value = match &direct_collection {
-        Some(collection) => Some(
-            read_collection_value(tx, collection, checks, "top-level collection".into()).await?,
-        ),
-        None => None,
-    };
-    let path_value = match &path_collection {
-        Some(collection) => Some(
-            read_collection_value(
-                tx,
-                collection,
-                checks,
-                "path-opened top-level collection".into(),
-            )
-            .await?,
-        ),
-        None => None,
-    };
-    if let (Some(direct_value), Some(path_value)) = (direct_value, path_value) {
-        checks.push(ApiCheck::EqualValue {
-            context: format!("direct and path opens disagree for {name:?}"),
-            actual: path_value,
-            expected: direct_value,
-        });
-    }
-    let value = direct_value.or(path_value).unwrap_or(None);
+    let collection = tx.open_collection(&root, &name).await?;
+    let path_collection = tx.open_collection_path(&path).await?;
+    let value = read_collection_value(tx, &collection, "top-level collection").await?;
+    let path_value =
+        read_collection_value(tx, &path_collection, "path-opened top-level collection").await?;
+    check_api_invariant(
+        path_value == value,
+        format!("direct and path opens disagree for {name:?}"),
+    )?;
 
     let nested_path = api_nested_collection_path(client, slot);
     let child_exists = tx
-        .collection_exists(collection, API_NESTED_COLLECTION)
+        .collection_exists(&collection, API_NESTED_COLLECTION)
         .await?;
     let path_child_exists = tx.collection_path_exists(&nested_path).await?;
-    checks.push(ApiCheck::EqualBool {
-        context: format!("direct and path existence disagree for nested child of {name:?}"),
-        actual: path_child_exists,
-        expected: child_exists,
-    });
-    let children = listed_collection_names(tx, collection).await?;
+    check_api_invariant(
+        path_child_exists == child_exists,
+        format!("direct and path existence disagree for nested child of {name:?}"),
+    )?;
+    let children = listed_collection_names(tx, &collection).await?;
     let expected_children = if child_exists {
         vec![API_NESTED_COLLECTION.to_vec()]
     } else {
         Vec::new()
     };
-    checks.push(ApiCheck::EqualNames {
-        context: format!("nested listing disagrees for {name:?}"),
-        actual: children,
-        expected: expected_children,
-    });
+    check_api_invariant(
+        children == expected_children,
+        format!("nested listing disagrees for {name:?}"),
+    )?;
 
-    let direct_child =
-        opened_collection(tx.open_collection(collection, API_NESTED_COLLECTION).await)?;
-    let path_child = opened_collection(tx.open_collection_path(&nested_path).await)?;
-    checks.push(ApiCheck::EqualBool {
-        context: format!("direct open disagrees with nested existence for {name:?}"),
-        actual: direct_child.is_some(),
-        expected: child_exists,
-    });
-    checks.push(ApiCheck::EqualBool {
-        context: format!("path open disagrees with nested existence for {name:?}"),
-        actual: path_child.is_some(),
-        expected: path_child_exists,
-    });
-
-    if !child_exists {
-        return Ok(Some(ApiCollectionModel { value, child: None }));
-    }
-
-    let direct_child_value = match &direct_child {
-        Some(child) => {
-            Some(read_collection_value(tx, child, checks, "nested collection".into()).await?)
+    let child = if child_exists {
+        let child = tx
+            .open_collection(&collection, API_NESTED_COLLECTION)
+            .await?;
+        let path_child = tx.open_collection_path(&nested_path).await?;
+        let value = read_collection_value(tx, &child, "nested collection").await?;
+        let path_value =
+            read_collection_value(tx, &path_child, "path-opened nested collection").await?;
+        check_api_invariant(
+            path_value == value,
+            format!("direct and path opens disagree for nested child of {name:?}"),
+        )?;
+        Some(ApiChildModel { value })
+    } else {
+        match tx.open_collection(&collection, API_NESTED_COLLECTION).await {
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(api_invariant_error(format!(
+                    "direct open found absent nested child of {name:?}"
+                )));
+            }
         }
-        None => None,
+        match tx.open_collection_path(&nested_path).await {
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(api_invariant_error(format!(
+                    "path open found absent nested child of {name:?}"
+                )));
+            }
+        }
+        None
     };
-    let path_child_value = match &path_child {
-        Some(child) => Some(
-            read_collection_value(tx, child, checks, "path-opened nested collection".into())
-                .await?,
-        ),
-        None => None,
-    };
-    if let (Some(direct_value), Some(path_value)) = (direct_child_value, path_child_value) {
-        checks.push(ApiCheck::EqualValue {
-            context: format!("direct and path opens disagree for nested child of {name:?}"),
-            actual: path_value,
-            expected: direct_value,
-        });
-    }
-    let child_value = direct_child_value.or(path_child_value).unwrap_or(None);
 
-    Ok(Some(ApiCollectionModel {
-        value,
-        child: Some(ApiChildModel { value: child_value }),
-    }))
+    Ok(Some(ApiCollectionModel { value, child }))
 }
 
-async fn observe_dropped_handle(
+async fn ensure_dropped_handle_is_stale(
     tx: &Transaction,
     collection: &Collection,
-    checks: &mut Vec<ApiCheck>,
-    context: String,
 ) -> Result<(), Error> {
-    let observed = match tx.read(collection, API_COLLECTION_VALUE_KEY).await {
-        Err(Error::StaleCollection) => StaleReadObservation::Stale,
-        Err(error) => return Err(error),
-        Ok(value) => StaleReadObservation::Value(value),
-    };
-    checks.push(ApiCheck::StaleRead { context, observed });
-    Ok(())
+    match tx.read(collection, API_COLLECTION_VALUE_KEY).await {
+        Err(Error::StaleCollection) => Ok(()),
+        Err(error) => Err(error),
+        Ok(value) => Err(api_invariant_error(format!(
+            "dropped collection handle read {value:?} instead of becoming stale"
+        ))),
+    }
 }
 
 async fn ensure_collection(
     tx: &Transaction,
     client: usize,
     slot: usize,
-    checks: &mut Vec<ApiCheck>,
 ) -> Result<Collection, Error> {
     let root = tx.root_collection();
     let name = api_collection_name(client, slot);
     let existed = tx.collection_exists(&root, &name).await?;
     let (collection, created) = tx.create_collection_if_absent(&root, &name).await?;
-    checks.push(ApiCheck::EqualBool {
-        context: format!("create-if-absent reported the wrong outcome for {name:?}"),
-        actual: created,
-        expected: !existed,
-    });
+    check_api_invariant(
+        created != existed,
+        format!("create-if-absent reported the wrong outcome for {name:?}"),
+    )?;
     Ok(collection)
 }
 
@@ -673,116 +483,90 @@ fn expected_collection_states(
         .collect()
 }
 
-async fn run_read_action(
-    tx: &Transaction,
-    collection: &Collection,
-    key: usize,
-    staged: Option<Option<u8>>,
-    observed: &mut Option<Option<Vec<u8>>>,
-) -> Result<KeyReadObservation, Error> {
-    let actual = tx.read(collection, &key_name(key)).await?;
-    let expected = if let Some(expected) = staged {
-        KeyReadExpectation::Staged(expected)
-    } else if let Some(expected) = observed {
-        KeyReadExpectation::Repeated(expected.clone())
-    } else {
-        *observed = Some(actual.clone());
-        KeyReadExpectation::Modeled
-    };
-    Ok(KeyReadObservation {
-        key,
-        actual,
-        expected,
-    })
-}
-
 async fn run_collection_action(
     tx: &Transaction,
     action: &ApiAction,
     client: usize,
-    attempt: &mut ApiAttempt,
+    after: &BTreeSet<ApiModel>,
 ) -> Result<(), Error> {
     let root = tx.root_collection();
     match action {
         ApiAction::CreateCollection(slot) => {
             let name = api_collection_name(client, *slot);
             let existed = tx.collection_exists(&root, &name).await?;
-            let created = match tx.create_collection(&root, &name).await {
-                Ok(_) => true,
-                Err(Error::AlreadyExists) => false,
-                Err(error) => return Err(error),
-            };
-            attempt.checks.push(ApiCheck::EqualBool {
-                context: format!("strict create reported the wrong outcome for {name:?}"),
-                actual: created,
-                expected: !existed,
-            });
+            let result = tx.create_collection(&root, &name).await;
+            match (existed, result) {
+                (false, Ok(_)) | (true, Err(Error::AlreadyExists)) => {}
+                (false, Err(Error::AlreadyExists)) => {
+                    return Err(api_invariant_error(format!(
+                        "strict create rejected absent collection {name:?}"
+                    )));
+                }
+                (true, Ok(_)) => {
+                    return Err(api_invariant_error(format!(
+                        "strict create replaced existing collection {name:?}"
+                    )));
+                }
+                (_, Err(error)) => return Err(error),
+            }
         }
         ApiAction::CreateCollectionIfAbsent(slot) => {
-            ensure_collection(tx, client, *slot, &mut attempt.checks).await?;
+            ensure_collection(tx, client, *slot).await?;
         }
         ApiAction::ReadCollection(_) | ApiAction::InspectCollections => {}
         ApiAction::WriteCollection(slot, value) => {
-            let collection = ensure_collection(tx, client, *slot, &mut attempt.checks).await?;
+            let collection = ensure_collection(tx, client, *slot).await?;
             tx.write(&collection, API_COLLECTION_VALUE_KEY, &[*value])?;
-            let actual = read_collection_value(
-                tx,
-                &collection,
-                &mut attempt.checks,
-                "newly written top-level collection".into(),
-            )
-            .await?;
-            attempt.checks.push(ApiCheck::EqualValue {
-                context: "top-level collection violated read-your-writes".into(),
-                actual,
-                expected: Some(*value),
-            });
+            let actual =
+                read_collection_value(tx, &collection, "newly written top-level collection")
+                    .await?;
+            check_api_invariant(
+                actual == Some(*value),
+                "top-level collection violated read-your-writes",
+            )?;
         }
         ApiAction::CreateNestedCollection(slot) => {
-            let collection = ensure_collection(tx, client, *slot, &mut attempt.checks).await?;
+            let collection = ensure_collection(tx, client, *slot).await?;
             let existed = tx
                 .collection_exists(&collection, API_NESTED_COLLECTION)
                 .await?;
-            let created = match tx
+            let result = tx
                 .create_collection(&collection, API_NESTED_COLLECTION)
-                .await
-            {
-                Ok(_) => true,
-                Err(Error::AlreadyExists) => false,
-                Err(error) => return Err(error),
-            };
-            attempt.checks.push(ApiCheck::EqualBool {
-                context: "strict nested create reported the wrong outcome".into(),
-                actual: created,
-                expected: !existed,
-            });
+                .await;
+            match (existed, result) {
+                (false, Ok(_)) | (true, Err(Error::AlreadyExists)) => {}
+                (false, Err(Error::AlreadyExists)) => {
+                    return Err(api_invariant_error(
+                        "strict create rejected an absent nested collection",
+                    ));
+                }
+                (true, Ok(_)) => {
+                    return Err(api_invariant_error(
+                        "strict create replaced an existing nested collection",
+                    ));
+                }
+                (_, Err(error)) => return Err(error),
+            }
         }
         ApiAction::WriteNestedCollection(slot, value) => {
-            let collection = ensure_collection(tx, client, *slot, &mut attempt.checks).await?;
+            let collection = ensure_collection(tx, client, *slot).await?;
             let existed = tx
                 .collection_exists(&collection, API_NESTED_COLLECTION)
                 .await?;
             let (child, created) = tx
                 .create_collection_if_absent(&collection, API_NESTED_COLLECTION)
                 .await?;
-            attempt.checks.push(ApiCheck::EqualBool {
-                context: "nested create-if-absent reported the wrong outcome".into(),
-                actual: created,
-                expected: !existed,
-            });
+            check_api_invariant(
+                created != existed,
+                "nested create-if-absent reported the wrong outcome",
+            )?;
             tx.write(&child, API_COLLECTION_VALUE_KEY, &[*value])?;
-            let actual = read_collection_value(
-                tx,
-                &child,
-                &mut attempt.checks,
-                "newly written nested collection".into(),
-            )
-            .await?;
-            attempt.checks.push(ApiCheck::EqualValue {
-                context: "nested collection violated read-your-writes".into(),
-                actual,
-                expected: Some(*value),
-            });
+            let actual =
+                read_collection_value(tx, &child, "newly written nested collection").await?;
+            check_api_invariant(
+                actual == Some(*value),
+                "nested collection violated read-your-writes",
+            )?;
         }
         ApiAction::DropNestedCollection(slot) => {
             let name = api_collection_name(client, *slot);
@@ -796,13 +580,7 @@ async fn run_collection_action(
                         .open_collection(&collection, API_NESTED_COLLECTION)
                         .await?;
                     tx.drop_collection(&child).await?;
-                    observe_dropped_handle(
-                        tx,
-                        &child,
-                        &mut attempt.checks,
-                        "dropped nested collection handle".into(),
-                    )
-                    .await?;
+                    ensure_dropped_handle_is_stale(tx, &child).await?;
                 }
             }
         }
@@ -813,24 +591,22 @@ async fn run_collection_action(
                 let child_exists = tx
                     .collection_exists(&collection, API_NESTED_COLLECTION)
                     .await?;
-                let not_empty = match tx.drop_collection(&collection).await {
-                    Ok(()) => false,
-                    Err(Error::NotEmpty) => true,
-                    Err(error) => return Err(error),
-                };
-                attempt.checks.push(ApiCheck::EqualBool {
-                    context: "drop outcome disagrees with nested collection existence".into(),
-                    actual: not_empty,
-                    expected: child_exists,
-                });
-                if !not_empty {
-                    observe_dropped_handle(
-                        tx,
-                        &collection,
-                        &mut attempt.checks,
-                        "dropped top-level collection handle".into(),
-                    )
-                    .await?;
+                match (child_exists, tx.drop_collection(&collection).await) {
+                    (true, Err(Error::NotEmpty)) => {}
+                    (false, Ok(())) => {
+                        ensure_dropped_handle_is_stale(tx, &collection).await?;
+                    }
+                    (true, Ok(())) => {
+                        return Err(api_invariant_error(
+                            "non-recursive drop removed a non-empty collection",
+                        ));
+                    }
+                    (false, Err(Error::NotEmpty)) => {
+                        return Err(api_invariant_error(
+                            "drop reported NotEmpty for a childless collection",
+                        ));
+                    }
+                    (_, Err(error)) => return Err(error),
                 }
             }
         }
@@ -842,18 +618,27 @@ async fn run_collection_action(
     }
 
     if let Some(slot) = collection_slot(action) {
-        let actual = inspect_collection(tx, client, slot, &mut attempt.checks).await?;
-        attempt
-            .collections
-            .push(CollectionStateObservation::Slot { slot, actual });
+        let actual = inspect_collection(tx, client, slot).await?;
+        let allowed = expected_collection_states(after, slot);
+        if !allowed.contains(&actual) {
+            return Err(api_invariant_error(format!(
+                "collection slot {slot} observed {actual:?} outside modeled states {allowed:?}"
+            )));
+        }
     } else {
         let mut actual = Vec::with_capacity(API_COLLECTION_SLOTS);
         for slot in 0..API_COLLECTION_SLOTS {
-            actual.push(inspect_collection(tx, client, slot, &mut attempt.checks).await?);
+            actual.push(inspect_collection(tx, client, slot).await?);
         }
-        attempt
-            .collections
-            .push(CollectionStateObservation::Catalog(actual));
+        let allowed: BTreeSet<Vec<Option<ApiCollectionModel>>> = after
+            .iter()
+            .map(|model| model.collections.clone())
+            .collect();
+        if !allowed.contains(&actual) {
+            return Err(api_invariant_error(format!(
+                "collection catalog observed {actual:?} outside modeled states {allowed:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -879,25 +664,44 @@ async fn run_api_program(
         .open_collection(&CollectionPath::new(API_COLLECTION)?)
         .await?;
     let collection = &collection;
-    let client = program.client;
+    let allowed = &allowed;
+    let expected_after = &after;
     let result = db
         .tx(|tx| async move {
             let mut staged = [None::<Option<u8>>; API_KEYS];
-            let mut observed: [Option<Option<Vec<u8>>>; API_KEYS] = std::array::from_fn(|_| None);
-            let mut attempt = ApiAttempt::default();
+            let mut observed = [None::<Option<u8>>; API_KEYS];
             for action in actions {
                 match action {
                     ApiAction::Read(key) => {
-                        attempt.reads.push(
-                            run_read_action(
-                                &tx,
-                                collection,
-                                *key,
-                                staged[*key],
-                                &mut observed[*key],
-                            )
-                            .await?,
-                        );
+                        let actual = match tx.read(collection, &key_name(*key)).await {
+                            Ok(Some(value)) => {
+                                check_api_invariant(
+                                    value.len() == 1,
+                                    format!("API key k{key} has non-byte value {value:?}"),
+                                )?;
+                                Some(value[0])
+                            }
+                            Ok(None) => None,
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(expected) = staged[*key] {
+                            check_api_invariant(
+                                actual == expected,
+                                format!("API key k{key} violated read-your-writes"),
+                            )?;
+                        } else if let Some(expected) = observed[*key] {
+                            check_api_invariant(
+                                actual == expected,
+                                format!("API key k{key} violated repeatable reads"),
+                            )?;
+                        } else if !allowed[*key].contains(&actual) {
+                            return Err(api_invariant_error(format!(
+                                "API key k{key} read {actual:?} outside modeled states {:?}",
+                                allowed[*key]
+                            )));
+                        } else {
+                            observed[*key] = Some(actual);
+                        }
                     }
                     ApiAction::Write(key, value) => {
                         tx.write(collection, &key_name(*key), &[*value])?;
@@ -916,25 +720,30 @@ async fn run_api_program(
                     | ApiAction::DropNestedCollection(_)
                     | ApiAction::DropCollection(_)
                     | ApiAction::InspectCollections => {
-                        run_collection_action(&tx, action, client, &mut attempt).await?;
+                        run_collection_action(&tx, action, program.client, expected_after).await?;
                     }
                 }
             }
-            if should_abort {
-                tx.abort()?;
-            }
-            Ok(attempt)
+            if should_abort { tx.abort() } else { Ok(()) }
         })
         .await;
+
+    // A stale observation retries before this error can escape. A stable one is
+    // a real workload invariant failure.
+    if let Err(error) = &result
+        && let Some(message) = api_invariant_message(error)
+    {
+        panic!("{message}");
+    }
 
     if program.abort {
         return match result {
             Err(Error::Aborted) => Ok(()),
-            Ok(_) => panic!("explicitly aborted API transaction committed"),
+            Ok(()) => panic!("explicitly aborted API transaction committed"),
             Err(error) => Err(error),
         };
     }
-    result?.verify(&allowed, &after);
+    result?;
     state.lock().unwrap().confirm(program.client, after);
     Ok(())
 }
@@ -1015,35 +824,31 @@ impl SimWorkload for ApiWorkload {
             actual[key % nclients].values[key] = value;
         }
 
-        let (root_names, catalogs, checks) = db
+        let catalogs = db
             .tx(|tx| async move {
                 let root = tx.root_collection();
                 let root_names = listed_collection_names(&tx, &root).await?;
-                let mut checks = Vec::new();
+                let mut known_names = BTreeSet::from([API_COLLECTION.to_vec()]);
+                for client in 0..nclients {
+                    for slot in 0..API_COLLECTION_SLOTS {
+                        known_names.insert(api_collection_name(client, slot));
+                    }
+                }
+                check_api_invariant(
+                    root_names.iter().all(|name| known_names.contains(name)),
+                    format!("root listing contains an unmodeled collection: {root_names:?}"),
+                )?;
+
                 let mut catalogs = vec![Vec::with_capacity(API_COLLECTION_SLOTS); nclients];
                 for (client, client_catalog) in catalogs.iter_mut().enumerate() {
                     for slot in 0..API_COLLECTION_SLOTS {
-                        client_catalog
-                            .push(inspect_collection(&tx, client, slot, &mut checks).await?);
+                        client_catalog.push(inspect_collection(&tx, client, slot).await?);
                     }
                 }
-                Ok((root_names, catalogs, checks))
+                Ok(catalogs)
             })
             .await
             .expect("verify final collection catalog");
-        let mut known_names = BTreeSet::from([API_COLLECTION.to_vec()]);
-        for client in 0..nclients {
-            for slot in 0..API_COLLECTION_SLOTS {
-                known_names.insert(api_collection_name(client, slot));
-            }
-        }
-        assert!(
-            root_names.iter().all(|name| known_names.contains(name)),
-            "root listing contains an unmodeled collection: {root_names:?}"
-        );
-        for check in checks {
-            check.verify();
-        }
         for (model, catalog) in actual.iter_mut().zip(catalogs) {
             model.collections = catalog;
         }

@@ -78,56 +78,21 @@ impl<'a> Arbitrary<'a> for RmwWorkload {
     }
 }
 
-async fn read_value_from_tx(
-    tx: &crate::Transaction,
-    c: &Collection,
-    k: &[u8],
-) -> Result<Vec<u8>, Error> {
-    tx.read(c, k).await?.ok_or(Error::NotFound)
-}
-
-#[derive(Debug)]
-struct InvalidRmwValue {
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
-
-// Invalid cached bytes may be stale until OCC validates the attempt, so carry
-// them out of the transaction before failing the workload oracle.
-#[derive(Debug)]
-enum RmwObservation {
-    Applied,
-    InvalidValue(InvalidRmwValue),
-}
-
-impl RmwObservation {
-    fn verify(self) {
-        if let RmwObservation::InvalidValue(invalid) = self {
-            panic!(
-                "key {:?} has invalid increment value {:?}",
-                invalid.key, invalid.value
-            );
-        }
+async fn read_int_from_tx(tx: &crate::Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
+    let value = tx.read(c, k).await?.ok_or(Error::NotFound)?;
+    match try_read_int(&value) {
+        Some(current) if current >= 0 => Ok(current),
+        _ => Err(Error::internal(format!(
+            "key {k:?} has invalid increment value {value:?}"
+        ))),
     }
 }
 
-fn incremented_value(key: &[u8], value: Vec<u8>) -> Result<Vec<u8>, InvalidRmwValue> {
-    let current = match try_read_int(&value) {
-        Some(current) if current >= 0 => current,
-        _ => {
-            return Err(InvalidRmwValue {
-                key: key.to_vec(),
-                value,
-            });
-        }
-    };
-    let Some(next) = current.checked_add(1) else {
-        return Err(InvalidRmwValue {
-            key: key.to_vec(),
-            value,
-        });
-    };
-    Ok(write_int(next))
+fn incremented_value(key: &[u8], current: i64) -> Result<Vec<u8>, Error> {
+    current
+        .checked_add(1)
+        .map(write_int)
+        .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))
 }
 
 /// Per-key accounting shared across client tasks. `started` counts increments
@@ -162,18 +127,11 @@ async fn run_one(
             // (`Copy`) instead of moving the key, keeping the closure
             // `FnMut` for retries.
             let kn = &key_name(*k);
-            let observation = db
-                .tx(|tx| async move {
-                    let value = read_value_from_tx(&tx, coll, kn).await?;
-                    let next = match incremented_value(kn, value) {
-                        Ok(next) => next,
-                        Err(invalid) => return Ok(RmwObservation::InvalidValue(invalid)),
-                    };
-                    tx.write(coll, kn, &next)?;
-                    Ok(RmwObservation::Applied)
-                })
-                .await?;
-            observation.verify();
+            db.tx(|tx| async move {
+                let cur = read_int_from_tx(&tx, coll, kn).await?;
+                tx.write(coll, kn, &incremented_value(kn, cur)?)
+            })
+            .await?;
             acct.lock().unwrap().acked[*k] += 1;
         }
         RmwOp::MultiRmw(a, b) => {
@@ -184,24 +142,13 @@ async fn run_one(
             }
             let ka = &key_name(*a);
             let kb = &key_name(*b);
-            let observation = db
-                .tx(|tx| async move {
-                    let value_a = read_value_from_tx(&tx, coll, ka).await?;
-                    let value_b = read_value_from_tx(&tx, coll, kb).await?;
-                    let next_a = match incremented_value(ka, value_a) {
-                        Ok(next) => next,
-                        Err(invalid) => return Ok(RmwObservation::InvalidValue(invalid)),
-                    };
-                    let next_b = match incremented_value(kb, value_b) {
-                        Ok(next) => next,
-                        Err(invalid) => return Ok(RmwObservation::InvalidValue(invalid)),
-                    };
-                    tx.write(coll, ka, &next_a)?;
-                    tx.write(coll, kb, &next_b)?;
-                    Ok(RmwObservation::Applied)
-                })
-                .await?;
-            observation.verify();
+            db.tx(|tx| async move {
+                let va = read_int_from_tx(&tx, coll, ka).await?;
+                let vb = read_int_from_tx(&tx, coll, kb).await?;
+                tx.write(coll, ka, &incremented_value(ka, va)?)?;
+                tx.write(coll, kb, &incremented_value(kb, vb)?)
+            })
+            .await?;
             {
                 let mut g = acct.lock().unwrap();
                 g.acked[*a] += 1;
@@ -211,24 +158,13 @@ async fn run_one(
         RmwOp::ReadOnly(keys) => {
             let names: Vec<Vec<u8>> = keys.iter().map(|k| key_name(*k)).collect();
             let names = &names;
-            let values = db
-                .tx(|tx| async move {
-                    let mut values = Vec::with_capacity(names.len());
-                    for kn in names {
-                        values.push(read_value_from_tx(&tx, coll, kn).await?);
-                    }
-                    Ok(values)
-                })
-                .await?;
-            for (kn, value) in names.iter().zip(values) {
-                assert_eq!(
-                    value.len(),
-                    std::mem::size_of::<i64>(),
-                    "key {kn:?} has non-integer value {value:?}"
-                );
-                let v = read_int(&value);
-                assert!(v >= 0, "observed negative value {v} for key {kn:?}");
-            }
+            db.tx(|tx| async move {
+                for kn in names {
+                    read_int_from_tx(&tx, coll, kn).await?;
+                }
+                Ok(())
+            })
+            .await?;
         }
     }
     Ok(())
@@ -358,7 +294,7 @@ mod tests {
 
         let result = db
             .tx(|tx| async move {
-                read_value_from_tx(&tx, collection, b"missing")
+                read_int_from_tx(&tx, collection, b"missing")
                     .await
                     .map(|_| ())
             })

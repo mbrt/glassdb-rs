@@ -398,9 +398,15 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
         .tx(|tx| async move {
             let root = tx.root_collection();
             let (users, created) = tx.create_collection_if_absent(&root, b"users").await?;
-            assert!(created);
+            glassdb::ensure_tx!(
+                created,
+                Error::internal("new users collection was reported as existing")
+            );
             let (same_users, created) = tx.create_collection_if_absent(&root, b"users").await?;
-            assert!(created, "the transaction owns the staged incarnation");
+            glassdb::ensure_tx!(
+                created,
+                Error::internal("transaction did not retain its staged collection incarnation")
+            );
             tx.write(&same_users, b"second-handle", b"ready")?;
             let active = tx.create_collection(&users, b"active").await?;
             tx.write(&users, b"seed", b"ready")?;
@@ -410,8 +416,23 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
                 .collections(&users)
                 .await?
                 .collect::<Result<Vec<_>, _>>()?;
-            assert_eq!(listed.len(), 1);
-            assert_eq!(listed[0].name, b"active");
+            glassdb::ensure_tx!(
+                listed.len() == 1,
+                Error::internal(format!(
+                    "staged users collection listed {} children instead of one",
+                    listed.len()
+                ))
+            );
+            let listed_name = listed
+                .first()
+                .map(|entry| entry.name.as_slice())
+                .ok_or_else(|| Error::internal("staged active collection was not listed"))?;
+            glassdb::ensure_tx!(
+                listed_name == b"active",
+                Error::internal(format!(
+                    "staged users collection listed unexpected child {listed_name:?}"
+                ))
+            );
             Ok((users, active))
         })
         .await
@@ -434,20 +455,39 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
 }
 
 #[tokio::test]
-async fn failed_transaction_does_not_publish_a_prepared_collection() {
-    let db = Database::open("example", MemoryBackend::new())
-        .await
-        .unwrap();
+async fn failed_transaction_retries_invalidated_reads_without_publishing_changes() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let peer = Database::open("example", backend).await.unwrap();
+    let root = db.root_collection();
+    let peer_root = peer.root_collection();
+    root.write(b"guard", b"old").await.unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
 
     let result = db
-        .tx(|tx| async move {
-            let root = tx.root_collection();
-            let collection = tx.create_collection(&root, b"temporary").await?;
-            tx.write(&collection, b"k", b"v")?;
-            Err::<(), _>(Error::InvalidInput("stop".into()))
+        .tx({
+            let root = root.clone();
+            let peer_root = peer_root.clone();
+            let attempts = attempts.clone();
+            move |tx| {
+                let root = root.clone();
+                let peer_root = peer_root.clone();
+                let attempts = attempts.clone();
+                async move {
+                    tx.read(&root, b"guard").await?.ok_or(Error::NotFound)?;
+                    let collection = tx.create_collection(&root, b"temporary").await?;
+                    tx.write(&collection, b"k", b"v")?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        peer_root.write(b"guard", b"new").await?;
+                    }
+                    Err::<(), _>(Error::InvalidInput("stop".into()))
+                }
+            }
         })
         .await;
+
     assert!(matches!(result, Err(Error::InvalidInput(_))));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert!(!db.collection_exists("temporary").await.unwrap());
 }
 
@@ -461,11 +501,18 @@ async fn create_then_drop_without_data_collapses_to_noop() {
         let root = tx.root_collection();
         let temporary = tx.create_collection(&root, b"temporary").await?;
         tx.drop_collection(&temporary).await?;
-        assert!(!tx.collection_exists(&root, b"temporary").await?);
-        assert!(matches!(
-            tx.write(&temporary, b"k", b"v"),
-            Err(Error::InvalidInput(_))
-        ));
+        let still_exists = tx.collection_exists(&root, b"temporary").await?;
+        glassdb::ensure_tx!(
+            !still_exists,
+            Error::internal("dropped staged collection remained visible")
+        );
+        let write = tx.write(&temporary, b"k", b"v");
+        glassdb::ensure_tx!(
+            matches!(write, Err(Error::InvalidInput(_))),
+            Error::internal(format!(
+                "write through a dropped staged collection returned {write:?}"
+            ))
+        );
         Ok(())
     })
     .await

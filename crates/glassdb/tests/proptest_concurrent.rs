@@ -34,8 +34,12 @@ async fn read_int_from_tx(
     k: &[u8],
 ) -> Result<i64, Error> {
     match tx.read(c, k).await {
-        Ok(Some(v)) => try_read_int(&v)
-            .ok_or_else(|| Error::internal(format!("key {k:?} has non-integer value {v:?}"))),
+        Ok(Some(v)) => match try_read_int(&v) {
+            Some(value) if value >= 0 => Ok(value),
+            _ => Err(Error::internal(format!(
+                "key {k:?} has invalid increment value {v:?}"
+            ))),
+        },
         Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
@@ -81,26 +85,13 @@ async fn multi_rmw(
 }
 
 async fn read_only(db: &Database, coll: &Collection, keys: &[&[u8]]) -> Result<(), Error> {
-    let values = db
-        .tx(|tx| async move {
-            let mut values = Vec::with_capacity(keys.len());
-            for key in keys {
-                values.push(tx.read(coll, key).await?);
-            }
-            Ok(values)
-        })
-        .await?;
-    for (key, value) in keys.iter().zip(values) {
-        if let Some(value) = value {
-            assert_eq!(
-                value.len(),
-                std::mem::size_of::<i64>(),
-                "key {key:?} has non-integer value {value:?}"
-            );
-            assert!(read_int(&value) >= 0, "negative value for {key:?}");
+    db.tx(|tx| async move {
+        for key in keys {
+            read_int_from_tx(&tx, coll, key).await?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

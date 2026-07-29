@@ -53,18 +53,24 @@ fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
 
-fn read_int(b: &[u8]) -> i64 {
-    if b.len() < 8 {
-        return 0;
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(&b[..8]);
-    i64::from_le_bytes(arr)
+fn read_int(key: &[u8], value: &[u8]) -> Result<i64, Error> {
+    value
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_le_bytes)
+        .ok_or_else(|| Error::internal(format!("key {key:?} has invalid integer value {value:?}")))
+}
+
+fn incremented_value(key: &[u8], current: i64) -> Result<Vec<u8>, Error> {
+    current
+        .checked_add(1)
+        .map(write_int)
+        .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))
 }
 
 async fn read_int_or_zero(tx: &Transaction, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
     match tx.read(coll, key).await {
-        Ok(Some(v)) => Ok(read_int(&v)),
+        Ok(Some(value)) => read_int(key, &value),
         Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
@@ -110,7 +116,7 @@ async fn report_stats<F: AsyncFnMut()>(label: &str, db: &Database, mut body: F) 
 async fn single_rmw(db: &Database, coll: &Collection) {
     db.tx(|tx| async move {
         let num = read_int_or_zero(&tx, coll, b"key").await?;
-        tx.write(coll, b"key", &write_int(num + 1))
+        tx.write(coll, b"key", &incremented_value(b"key", num)?)
     })
     .await
     .expect("single rmw");
@@ -122,11 +128,11 @@ async fn multi_rmw(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
         let vals = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
         for (k, rv) in keys.iter().zip(vals) {
             let val = match rv {
-                Ok(Some(v)) => read_int(&v),
+                Ok(Some(value)) => read_int(k, &value)?,
                 Ok(None) => 0,
                 Err(e) => return Err(e),
             };
-            tx.write(coll, k, &write_int(val + 1))?;
+            tx.write(coll, k, &incremented_value(k, val)?)?;
         }
         Ok(())
     })
@@ -158,9 +164,9 @@ async fn hundred_writes(db: &Database, coll: &Collection, base: usize) {
 async fn update_two_keys(db: &Database, coll: &Collection) -> Result<(), Error> {
     db.tx(|tx| async move {
         let n1 = read_int_or_zero(&tx, coll, b"key1").await?;
-        tx.write(coll, b"key1", &write_int(n1 + 1))?;
+        tx.write(coll, b"key1", &incremented_value(b"key1", n1)?)?;
         let n2 = read_int_or_zero(&tx, coll, b"key2").await?;
-        tx.write(coll, b"key2", &write_int(n2 + 1))
+        tx.write(coll, b"key2", &incremented_value(b"key2", n2)?)
     })
     .await
 }
@@ -168,7 +174,7 @@ async fn update_two_keys(db: &Database, coll: &Collection) -> Result<(), Error> 
 async fn update_shared(db: &Database, coll: &Collection, key_w: &[u8]) -> Result<(), Error> {
     db.tx(|tx| async move {
         let num = read_int_or_zero(&tx, coll, b"key-r").await?;
-        tx.write(coll, key_w, &write_int(num + 1))
+        tx.write(coll, key_w, &incremented_value(key_w, num)?)
     })
     .await
 }
