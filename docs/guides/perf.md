@@ -7,6 +7,75 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-053: replay definitive logless RMW losses
+
+[ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md) replays an
+eligible read-modify-write after a certified logless loss instead of publishing
+a holder, and removes ADR-027's separate logged single-RW fallback.
+
+### Setup
+
+- base: `b18b4b36` (the accepted ADR, before implementation); target:
+  `5c3e5ac6` (the implementation and removal of ADR-027)
+- ratio = target / base (throughput >1 good; latency/ops/cost <1 good)
+- command: `BASE=b18b4b36 LABEL_A=pre053 LABEL_B=adr053 DELAY_SCALE=0.02
+  DB_LIST=1 NUM_KEYS=500 DURATION=1s NUM_RUNS=3 DEADLOCK_DURATION=1s
+  COUNT=5 RW_MIX=balanced MIX_DURATION=1s MIX_MAX_DURATION=30s
+  MIX_TARGET_CI=0.1 MIX_MODES=lo,hi
+  MIX_TOPOLOGIES=shared,per-shape MIX_WORKERS=8 MIX_CLIENTS=4
+  MIX_NUM_KEYS=5000 MIX_HOT_KEYS=8 MIX_MULTI_KEYS=8 DRAIN_TIMEOUT=60s
+  COMMAND_TIMEOUT=10m hack/aws-bench/compare-refs.sh --summary`
+- rw9010 and the one-key workload use three paired, interleaved repetitions.
+  Autoresearch uses five internal repeats. The first mixbench sweep uses one
+  adaptive pair; the high-contention guardrails were then repeated as three
+  interleaved pairs with CI target `0.15`
+- every measured cell has zero transaction failures and completes its drain.
+  The target's first `lo/per-shape` sweep hit its 30-second cap, so it is not
+  used for an acceptance conclusion. All repeated guardrail cells converge
+
+### Focused one-key recovery
+
+The five-writer, one-key workload recovers on every paired run:
+
+- completion throughput rises from `1.65–1.84 tx/s` to `8.65–9.00 tx/s`;
+  the paired ratios are `4.90–5.28`
+- p50 falls from `2.50–2.82 s` to `0.55–0.57 s` (`0.20–0.22`), and p90
+  falls from `3.78–4.24 s` to `0.72–0.76 s` (`0.17–0.20`)
+- successful transactions/run rise from `87–97` to `437–455`. Worker drain
+  falls from `50.1–56.0 ms` to `10.0–10.9 ms`
+- retries/transaction rise from `2.03–2.40` to `3.32–3.50`, as expected when
+  certified losses replay the body. Direct land rate rises from `1.0–2.0%` to
+  `22.2–23.2%`, and the extra attempts now produce useful progress rather than
+  a persistent logged phase
+
+The balanced one-Database rw9010 guard remains flat: aggregate throughput
+ratios are `1.00`, `1.01`, and `1.01`; backend operations/transaction ratios
+are `1.01`, `0.99`, and `0.99`. Jain fairness is `1.00` by construction with
+one Database.
+
+### Guardrails and remaining signal
+
+- uncontended autoresearch `singleRMW` is unchanged at `70.79` weighted
+  cost/transaction, with exactly the same reads, writes, lists, and zero
+  retries. Wall time moves from `12.48` to `11.60 µs/transaction` (`0.93`);
+  this noisy secondary axis does not indicate a regression
+- across the three repeated `hi/shared` pairs, aggregate throughput ratios are
+  `0.98–1.12` (median `0.99`), while `rwSingle` is `0.97–1.21` (median
+  `1.03`). Aggregate backend operations/transaction have a median ratio of
+  `1.01`
+- `hi/per-shape` aggregate throughput improves by `1.37–1.45`; its
+  `rwSingle` throughput improves by `2.02–3.88` (median `2.16`) and
+  backend operations/transaction fall to a median ratio of `0.62`
+
+The repeated `lo/shared` cell is a separate warning: aggregate throughput is
+`0.78–0.87` of the base and `rwSingle` is `0.52–0.89`. This topology co-locates
+direct single-RMW and logged multi-key traffic, so it is not the uncontended
+direct-path guardrail. The result is consistent with ADR-053's accepted cost
+for falling back to regular locking, but these measurements do not attribute
+the cause. Backend-operation ratios are mixed (`0.66–1.38`) rather than showing
+a uniform amplification. Carry this signal into inline-admission and
+direct-commit-coverage measurement.
+
 ## ADR-045–ADR-051: current-state reassessment
 
 This rerun reassesses the cumulative engine after the persistent cache,

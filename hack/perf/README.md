@@ -6,6 +6,10 @@ part of the autoresearch correctness gate. Use it whenever you want to see where
 CPU time goes - guiding the autoresearch CPU/allocation work is one use, but it
 is not tied to that loop.
 
+Manual experiments that use this or other performance tooling are recorded in
+[`investigations.md`](investigations.md). The autonomous autoresearch loop keeps
+its separate, format-constrained log under [`hack/autoresearch`](../autoresearch/).
+
 ## Usage
 
 ```bash
