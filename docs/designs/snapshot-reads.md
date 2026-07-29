@@ -758,12 +758,41 @@ stateful cursors remain out of scope. Callers needing values issue ordinary
 point reads for the returned keys before the transaction ends.
 
 Every point read and `scan_keys` call resolves logical state at the
-transaction's one fixed cut. Scans enter the latest physical B-link topology at
-the lower bound and follow the forward right-sibling chain. Copy-before-shrink
-and current-topology revalidation absorb concurrent splits; history resolution
-supplies membership and values at the bound cut. Snapshot scans register no
-predicate read set, acquire no data locks, and perform no commit validation. A
-collection missing at that cut returns `NotFound`.
+transaction's one fixed cut. Scans enter the physical B-link topology at the
+lower bound and follow the forward right-sibling chain. The division of labour
+is what makes this work at a cut: topology supplies coverage and nothing else,
+while history supplies content. A scan is correct if it visits every leaf whose
+range meets the bounds, because each key it finds is then resolved at the cut
+independently.
+
+Routing may therefore be arbitrarily stale, and no freshness rule applies to it.
+ADR-031's descent is self-correcting: every node self-describes its high key, so
+a lookup that lands too far left follows the right-sibling link or re-descends.
+What makes that sufficient rather than merely convenient is that a split moves
+the upper half of a leaf to a new right sibling, so a key only ever moves right
+and a node is only ever added. A stale path can land at or to the left of the
+target but never past it, and walking right always converges.
+
+The freshness rule is about a node's role, not its level. A node consulted for
+routing needs none, and a node whose entries are consumed is subject to the
+cut-plus-margin rule in full. That distinction matters because a small
+collection's root is itself a leaf: a cached root must be treated as a leaf
+whenever its entries are read, and only as routing once the tree has grown.
+
+A cached leaf also cannot mix its range with newer sub-ranges, because
+revalidation is by revision and copy-before-shrink rewrites the source leaf when
+it splits. Any cached leaf that still revalidates has provably not split, so its
+high key, and the residue structure aligned to it, describe the same range they
+did when it was cached.
+
+Snapshot scans register no predicate read set, acquire no data locks, and
+perform no commit validation. They also skip the per-leaf version validation and
+the escalation to per-leaf read locks that ADR-031 requires of a strict range
+scan, because at a fixed cut a phantom is not a concept: a key created after the
+cut is invisible by timestamp, and one that existed at the cut resolves through
+history or through retained residue whatever the topology has since done with
+it. A snapshot scan therefore cannot be drawn into contention with writers on a
+hot range. A collection missing at that cut returns `NotFound`.
 
 A read that encounters a holder whose timestamp lower bound is at or below the
 cut resolves that holder's outcome, exactly as a strict read already does; a
@@ -802,8 +831,14 @@ ADR-033's scan-plus-write locking rules continue to apply unchanged to ordinary
 read-write transactions.
 
 History pointers and any routing needed by a live snapshot cannot be removed.
-Future merge or collection teardown must retain forwarding topology through the
-maximum lifetime. Expiry discards an in-flight materialized page rather than
+The scan argument above rests on two properties of splitting — a key only moves
+right, and a node is only added — and merge violates both, since it moves keys
+left and removes the node they came from. A reader holding a stale path would
+then need a left link it does not have, or would follow a right link into
+nothing. Adding merge is therefore not covered by ADR-031's strict-path proof:
+it must additionally preserve a right-converging path to every key for every
+still-live cut, through the maximum lifetime. Collection teardown carries the
+same obligation. Expiry discards an in-flight materialized page rather than
 returning a partial result.
 
 ### Retention and GC
@@ -1151,6 +1186,20 @@ boundaries. At minimum, the test plan must cover:
 - a leaf rewritten with byte-identical contents, proving the unchanged revision
   is treated as no rewrite and that the cut still resolves correctly, which is
   ADR-042's semantics rather than an exception to them;
+- a scan routed entirely through interior nodes cached before the cut, over a
+  tree that has since split at every level including the root, proving stale
+  routing reaches every leaf in the range and that no freshness rule is needed
+  above the leaf;
+- a small collection whose root is a leaf, split into a root and two children
+  mid-scan, proving a cached root is treated as a leaf while its entries are
+  read and the stale copy is never consumed as routing;
+- a scan holding a cached leaf that then splits, proving revalidation fails on
+  the rewritten source rather than pairing a stale range with a freshly split
+  residue structure, and the same scan crossing a chain of successive splits of
+  the same original range, proving right-link traversal covers it exactly once;
+- a snapshot scan and a strict scan over the same hot contended range, proving
+  the snapshot scan takes no per-leaf read lock and neither delays nor is
+  delayed by the writers;
 - a cut at, just above, and just below the history floor, proving the first two
   bind and the third returns `SnapshotTooOld`, plus a floor advancing past a
   running execution's cut, proving it is caught on the next observation refresh
@@ -1277,8 +1326,12 @@ dynamic range-sharding B-link topology. On acceptance:
   supersedes ADR-016, ADR-018, and ADR-031 where they make the physical `_i`
   root authoritative for collection existence and parent-child membership.
 - ADR-031/032/044's copy-before-shrink topology and structural gate remain the
-  physical routing proof; history retention adds the no-premature-teardown
-  constraint. ADR-039 additionally refines ADR-031's soft split cap to count live
+  physical routing proof, and snapshot scans need nothing added to it: stale
+  routing is already safe because splits only move keys right and only add
+  nodes. What history retention adds is the no-premature-teardown constraint,
+  and it now binds ADR-031's deferred merge specifically, as
+  [Point reads and transactional key scans](#point-reads-and-transactional-key-scans)
+  sets out. ADR-039 additionally refines ADR-031's soft split cap to count live
   entries only, so that retention cannot reshape a tree ADR-031 has no merge to
   reshape back; its split protocol, right-link traversal, and hard object cap are
   untouched.
