@@ -49,9 +49,10 @@ ADR-052 describes. That is a property of the open database rather than of a
 call, so it is reported when the database is opened and by any `read_tx` on it,
 not as a per-call acquisition failure.
 
-Because binding cannot fail and execution cannot be invalidated, the closure
-runs exactly once. The API accepts `FnOnce`. Bodies must still tolerate
-cancellation at the fixed deadline.
+Because binding cannot fail for lack of a cut and no concurrent writer can
+invalidate an execution, the closure runs at most once and is never replayed.
+The API accepts `FnOnce`. Bodies must still tolerate cancellation at the fixed
+deadline, and at the retention check below.
 
 One read-execution deadline starts immediately before the closure is invoked and
 never resets. Crossing it cancels the closure, discards any operation or page
@@ -61,10 +62,20 @@ advances through suspension. Under ADR-052 local clocks no longer contribute to
 cut selection, so an error here costs staleness or a spurious expiry rather than
 consistency.
 
-A bind validates the database's operational state from an observation no older
-than the policy's control-staleness bound. ADR-040's drain wait is extended by
-that bound, so ordering a bind against an operational disable requires no
-strongly consistent read at bind time.
+A bind validates the database's operational state and the history floor
+[ADR-040](040-snapshot-history-retention.md) publishes from one observation no
+older than the policy's control-staleness bound. ADR-040's drain wait and its pre-reclamation wait are
+both extended by that bound, so neither ordering requires a strongly consistent
+read at bind time.
+
+A cut below the floor returns `SnapshotTooOld`. Under healthy operation the
+freshest admissible cut sits far above the floor, so a bind fails this way only
+when the database genuinely retains no usable history, such as during a rebuild.
+The same check repeats whenever a running execution refreshes its server-time
+observation, and crossing it cancels the closure and discards results exactly as
+the deadline does. Its purpose is to make a reader-versus-GC clock violation
+surface as an error rather than as a missing version, so it is expected never to
+fire in a healthy database. Neither case replays, so `FnOnce` is unaffected.
 
 Store one immutable `SnapshotPolicy` in database metadata. It defines maximum
 staleness, the cut-grid period, maximum lifetime, the fleet-skew,
@@ -89,6 +100,9 @@ particular execution produces no writes.
   on exactly the long-running reads this feature targets.
 - The fixed deadline bounds storage retention and prevents abandoned readers
   from pinning history indefinitely.
+- Callers gain one error they cannot prevent by construction. `SnapshotTooOld`
+  reports that the database can no longer serve the cut, and retrying with a
+  fresher one is the correct response.
 - ADR-033 remains authoritative for scan bounds, ordering, page shape, and
   strict validation. Calls inside one snapshot execution additionally share its
   fixed cut; separate `Collection::scan_keys` transactions do not.

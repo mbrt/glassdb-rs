@@ -56,6 +56,41 @@ the full retention delay from its own observation; after recovery, a helper that
 cannot conservatively prove elapsed time waits again. This intentionally permits
 excess retention rather than early reclamation.
 
+### Make a retention violation detectable
+
+The guard above is an assumption about clock rates, and an assumption that is
+only asserted fails silently. If it is violated, GC reclaims history a live
+reader still needs, and for a pruned deleted key that reader observes a
+legitimately absent key. Absence is a valid answer at some cuts, so nothing
+distinguishes reclaimed history from history that never existed, and the
+retention rule above degrades into a wrong answer rather than an error.
+
+Publish a durable history floor: the oldest cut GC still guarantees to serve
+completely, quantized to the cut grid and advancing monotonically. GC must
+durably advance the floor **before** performing any reclamation that the new
+floor authorizes; reclaiming first and publishing after leaves exactly the
+window this exists to close. A bind requires its cut at or above the floor, and
+a reader whose cut falls below it fails with a distinct error instead of
+returning data.
+
+The floor lives in the same bounded-staleness metadata a bind already validates
+for operational state, so one cached read covers both and yields a server-time
+observation from its own response. A reader may therefore validate against a
+floor observation no older than the control-staleness bound, and GC waits that
+bound after publishing before it reclaims, exactly as the bind-disable fence
+already does. Readers re-validate on the observation refresh they already
+perform, which turns a violation that develops mid-execution into an error
+before any torn result is returned.
+
+This is the same value the rebuild transition below publishes; ordinary GC and
+rebuild are two writers advancing one monotone floor.
+
+Clocks now sit in liveness and retention rather than in correctness. GC
+advancing the floor too eagerly is detectable by every reader; advancing it too
+slowly only over-retains. The floor does not defend against GC reclaiming above
+its own published floor, which is a protocol violation rather than a clock one
+and remains corruption.
+
 Count history and catalog predecessor references as GC roots. Retain transaction
 certification metadata while any data or catalog history entry needs it. Reclaim
 independent per-key values when their own history no longer needs them. A
@@ -107,6 +142,14 @@ history early.
 ## Consequences
 
 - Snapshot read availability does not depend on tracking live clients.
+- A clock-rate violation between a reader and GC surfaces as a clean error
+  rather than as a missing version or a key that appears never to have existed.
+- GC gains an ordering obligation it did not have: the floor must be durable
+  before the deletions it authorizes begin, and a crash between the two is safe
+  only in that direction.
+- The floor is one small monotone object, but no writer touches it, GC writes it
+  at its own cadence rather than per transaction, and readers may use a stale
+  copy, so it is not a coordination point on any transaction path.
 - Storage use is bounded by policy and write volume rather than reader crashes,
   but the worst-case retained volume can still be large.
 - Disabling new binds is an operational pressure valve, not permission to
@@ -144,6 +187,30 @@ promptly after recovery instead of restarting a conservative wait. It makes
 another client's recorded time authoritative over whether data still needed by a
 live reader may be deleted. GC uses its own observation, which can over-retain
 but cannot reclaim early.
+
+### Rely on the retention window alone, with no published floor
+
+Sizing the window conservatively and trusting it is what this ADR did before,
+and it needs no extra object or ordering obligation. It makes a clock-rate
+assumption load-bearing for correctness with no way to notice when it breaks,
+and the specific failure — a pruned deleted key reading as absent — is
+indistinguishable from a correct answer. The floor costs one small cacheable
+object to convert that into an error.
+
+### Detect reclamation at the point of use instead
+
+A reader could treat a dangling history pointer as proof of early reclamation,
+which needs no floor and no bind check. It catches only the cases that leave a
+dangling reference; the dangerous case prunes the directory entry too, leaving
+nothing to dangle. Detection has to be based on the cut, not on what survives.
+
+### A per-key or per-collection floor
+
+Finer floors would let a heavily reclaimed region reject reads without
+penalizing the rest of the database. A reader's cut spans everything it may
+touch, so it would have to validate a floor per key it reads, and the error
+would then depend on access order rather than on the cut. One database-wide
+floor keeps the check at bind where the cut is chosen.
 
 ### Never reclaim, or reclaim to latest state only
 

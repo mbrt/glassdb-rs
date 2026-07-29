@@ -112,10 +112,12 @@ decides *when* to refresh an observation; it never contributes to the cut
 itself. Extrapolating would readmit local clock rate into the safety argument
 that [Cut definition](#cut-definition) sets out.
 
-A bind also validates the database's operational state against an observation
-no older than the policy's control-staleness bound. ADR-040's drain wait is
-extended by that bound, so ordering a bind against an operational disable needs
-no strongly consistent read.
+A bind also validates the database's operational state and its published
+[history floor](#the-history-floor) against one observation no older than the
+policy's control-staleness bound. ADR-040 extends both its drain wait and its
+pre-reclamation wait by that bound, so neither ordering needs a strongly
+consistent read. A running execution re-checks the floor whenever it refreshes
+that observation.
 
 A snapshot execution's lifetime starts immediately before the closure is
 invoked and ends at `started_at + lifetime`. The age of the cut affects nothing
@@ -169,7 +171,7 @@ is no strict-only capability or creation-time opt-out.
 | Maximum snapshot staleness | 30 seconds | Total distance a cut may trail the present |
 | Maximum read lifetime | 1 hour | Supports cold object-store scans and analytics |
 | Commit-age bound | 30 seconds | Age at which a still-pending transaction's timestamp forces abort |
-| Control-staleness bound | 60 seconds | Oldest operational-state observation a bind may use; added to the drain wait |
+| Control-staleness bound | 60 seconds | Oldest operational-state and history-floor observation a bind may use; added to the drain wait and to GC's pre-reclamation wait |
 | Reader-versus-GC elapsed-rate allowance | 5 seconds | Rate divergence over one retention interval |
 | Minimum history retention | 65 minutes | Derived safety floor; see ADR-040 |
 
@@ -193,7 +195,10 @@ operation a cut should trail by roughly the margin plus the grid period.
 With a one-hour lifetime, the 65-minute retention floor leaves a 4.5-minute
 guard beyond maximum staleness plus lifetime for the reader-versus-GC rate
 allowance, the control-staleness bound, history certification, GC cadence, and
-operation margin.
+operation margin. GC's wait between publishing a history floor and acting on it
+is that same control-staleness term rather than an additional one, because both
+exist for the same reason: a reader may be holding a metadata observation that
+old.
 
 A persisted operational state may stop new snapshot binds. Strict transactions
 continue to assign timestamps and emit durable certification, and existing
@@ -235,6 +240,11 @@ restart state, and required temporary storage headroom.
   operational state, not a transient acquisition failure.
 - `ReadTransactionExpired`: the execution crossed its fixed deadline. At or
   after the deadline this error wins over a simultaneous backend result.
+- `SnapshotTooOld`: the cut is below the published history floor, at bind or on
+  a later re-validation. It means the database can no longer serve the cut, so
+  retrying with a fresher one is correct. In a healthy database it fires only
+  during a rebuild; otherwise it is the reader-versus-GC clock violation being
+  reported instead of silently answered.
 - Missing, cyclic, non-monotonic, or uncertified history inside the promised
   window is a corruption/invariant error, never `NotFound`.
 - Backend unavailability makes a cut staler, never unsafe. A bind that needs a
@@ -250,6 +260,10 @@ commit-age aborts, history certification backlog, rebuild progress, historical
 objects traversed, and the fraction of snapshot reads served without a backend
 operation. These are operational outcomes, not changes to user-visible
 consistency.
+
+The margin between the history floor and the oldest admissible cut deserves its
+own gauge. It is the headroom protecting live readers, and it shrinking toward
+zero is the early warning that `SnapshotTooOld` is about to start firing.
 
 ## Cut definition
 
@@ -513,10 +527,9 @@ only the local-clock drift detector, whose allowance is sized for it above.
   [the assumptions above](#assumptions-about-backend-time) set out. It is a far
   narrower assumption than arbitrary client clocks on arbitrary machines, the
   margin is sized to absorb it with room to spare, and drift is detected on
-  every response. A durable reader-validated
-  history floor is planned as the detection backstop for reader-versus-GC
-  disagreement so that a violation surfaces as an error rather than a wrong
-  answer; that decision is not yet written.
+  every response. The separate question of reader-versus-GC clock disagreement
+  is answered by the [history floor](#the-history-floor), which turns a
+  violation into an error rather than a wrong answer.
 - **The backend trait grows.** Every response must carry a server-time
   observation, an additive amendment to ADR-023 that touches every backend
   implementation. Backends that cannot supply one lose snapshot capability
@@ -770,6 +783,46 @@ Only a rate divergence between a reader measuring its lifetime and GC measuring
 this wait can put the two out of step, and the policy guard covers it. Cut
 selection itself no longer depends on either clock.
 
+### The history floor
+
+The guard is an assumption, and an assumption that is only asserted fails
+silently. Its failure mode is the worst one available here. If GC reclaims a
+deleted key's directory entry while a reader still needs it, that reader sees an
+absent key, and absence is a legitimate answer at cuts before the key existed.
+There is nothing to distinguish reclaimed history from history that never was,
+so a clock problem becomes a wrong answer with no error raised anywhere.
+
+GC therefore publishes a history floor: the oldest cut it still guarantees to
+serve completely, quantized to the grid and advancing monotonically. The
+ordering is the whole mechanism — the floor must be durable **before** the
+deletions it authorizes begin. Reclaiming first and publishing after leaves
+precisely the window the floor exists to close.
+
+A bind requires its cut at or above the floor and otherwise fails with
+`SnapshotTooOld`. Under healthy operation the freshest admissible cut sits an
+entire retention window above the floor, so this fires only during a rebuild or
+when the guard has actually been violated.
+
+Checking it costs nothing. The floor lives in the same small bounded-staleness
+metadata a bind already reads for operational state, and that read's own
+response supplies a server-time observation, so one cached read serves three
+purposes. A reader may validate against a floor observation up to the
+control-staleness bound old, and GC waits that same bound after publishing
+before it reclaims — the identical trick the bind-disable fence already uses. A
+long execution re-checks on the observation refresh it must perform anyway,
+which catches a violation that develops mid-execution before any torn result
+reaches the caller.
+
+This does not make the floor a choke point. No writer touches it, GC writes it
+at its own cadence rather than per transaction, and every reader may use a stale
+copy.
+
+What it changes is where clocks sit. GC advancing the floor too eagerly is
+detectable by every reader; advancing it too slowly only over-retains. Clocks
+move out of the correctness argument into liveness and retention. The floor does
+not defend against GC reclaiming above its own published floor, which would be a
+protocol violation rather than a clock one and remains corruption.
+
 ADR-035's paginated, shuffled walk over deterministic `_t/<ss>/` shards remains
 the completeness mechanism for transaction and preparation cleanup. Snapshot
 history adds compact outcome fences and history indexes as GC roots and
@@ -1007,6 +1060,17 @@ boundaries. At minimum, the test plan must cover:
 - local-clock drift in both directions against the backend's reported time,
   proving detection, that an unhealthy client stops binding but keeps
   committing, and that an unhealthy GC worker retains history;
+- a cut at, just above, and just below the history floor, proving the first two
+  bind and the third returns `SnapshotTooOld`, plus a floor advancing past a
+  running execution's cut, proving it is caught on the next observation refresh
+  and discards its result rather than returning it;
+- GC crashing between publishing a floor and performing the reclamation it
+  authorizes, proving recovery is safe in that order and unsafe in the reverse
+  one, and that a reader validating against a floor observation at the
+  staleness bound still precedes the reclamation;
+- an injected reader-versus-GC clock-rate violation over a full retention
+  window, proving a pruned deleted key surfaces `SnapshotTooOld` rather than
+  reading as absent, which is the wrong answer this mechanism exists to prevent;
 - bind versus disable across the control-staleness bound, plus delayed GC
   operations across disable/drain/rebuild at exact retention boundaries, with
   crash/restart after every ownerless transition and rebuild step.
@@ -1105,7 +1169,9 @@ dynamic range-sharding B-link topology. On acceptance:
 - ADR-040 supersedes ADR-022's current-reference-only liveness for committed
   values and its cleanup of outcome evidence needed as a fence, while retaining
   its pending-lock recovery machinery and ADR-035's paginated, sharded discovery
-  of transaction and preparation garbage.
+  of transaction and preparation garbage. It also gives GC an ordering
+  obligation ADR-022 has no equivalent of: publish the history floor before
+  acting on it.
 - ADR-041 versions ADR-046 and ADR-047's ID-based collection directories, and
   supersedes ADR-016, ADR-018, and ADR-031 where they make the physical `_i`
   root authoritative for collection existence and parent-child membership.
