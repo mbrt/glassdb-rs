@@ -497,11 +497,12 @@ impl Database {
         let bstats = self.inner.backend.stats_and_reset();
         let lock_calls = self.inner.locker.lock_calls_and_reset() as u64;
         let coord = self.inner.coord.stats_and_reset();
+        let direct = self.inner.algo.direct_commit_stats_and_reset();
         let split = self.inner.splitter.stats_and_reset();
         let cache = self.inner.objects.cache_stats_and_reset();
         let mut s = self.inner.stats.lock().unwrap();
         s.add_backend(&bstats);
-        s.add_protocol(lock_calls, coord, split);
+        s.add_protocol(lock_calls, coord, direct, split);
         s.add_cache(cache);
         *s
     }

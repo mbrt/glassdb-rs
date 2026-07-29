@@ -32,7 +32,8 @@ jobs:
       run: |
         install -d "$PERF_BIN" \
           "$PERF_RESULTS/score/main" "$PERF_RESULTS/score/pr" \
-          "$PERF_RESULTS/mix/main" "$PERF_RESULTS/mix/pr"
+          "$PERF_RESULTS/mix/main" "$PERF_RESULTS/mix/pr" \
+          "$PERF_RESULTS/deadlock/main" "$PERF_RESULTS/deadlock/pr"
 
     - uses: actions/checkout@v4
 
@@ -45,12 +46,16 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - uses: astral-sh/setup-uv@v6
+
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: . -> target/performance
 
     - name: Test performance report generator
-      run: python3 -m unittest hack.ci.test_perf_report
+      run: |
+        python3 -m unittest hack.ci.test_perf_report
+        uv run hack/aws-bench/test_compare.py
 
     - name: Build baseline and candidate benchmarks
       env:
@@ -63,20 +68,24 @@ jobs:
         cargo build --release --manifest-path .perf-main/Cargo.toml \
           --target-dir "$CARGO_TARGET_DIR/main" \
           --package glassdb-bench-score --bin autoresearch \
-          --package glassdb-bench-scale --bin mixbench
+          --package glassdb-bench-scale --bin mixbench --bin rtbench
         install -m 755 "$CARGO_TARGET_DIR/main/release/autoresearch" \
           "$PERF_BIN/main-autoresearch"
         install -m 755 "$CARGO_TARGET_DIR/main/release/mixbench" \
           "$PERF_BIN/main-mixbench"
+        install -m 755 "$CARGO_TARGET_DIR/main/release/rtbench" \
+          "$PERF_BIN/main-rtbench"
 
         cargo build --release \
           --target-dir "$CARGO_TARGET_DIR/pr" \
           --package glassdb-bench-score --bin autoresearch \
-          --package glassdb-bench-scale --bin mixbench
+          --package glassdb-bench-scale --bin mixbench --bin rtbench
         install -m 755 "$CARGO_TARGET_DIR/pr/release/autoresearch" \
           "$PERF_BIN/pr-autoresearch"
         install -m 755 "$CARGO_TARGET_DIR/pr/release/mixbench" \
           "$PERF_BIN/pr-mixbench"
+        install -m 755 "$CARGO_TARGET_DIR/pr/release/rtbench" \
+          "$PERF_BIN/pr-rtbench"
 
     - name: Measure backend-operation score
       timeout-minutes: 3
@@ -135,6 +144,48 @@ jobs:
           else
             run_mix pr "$PERF_BIN/pr-mixbench" "$repetition_id"
             run_mix main "$PERF_BIN/main-mixbench" "$repetition_id"
+          fi
+        done
+
+    - name: Measure focused one-key RMW contention
+      timeout-minutes: 5
+      env:
+        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
+        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+      run: |
+        run_deadlock() {
+          local side="$1" binary="$2" repetition="$3"
+          local samples="$PERF_RESULTS/deadlock/$side/$repetition.csv"
+          local stats="$PERF_RESULTS/deadlock/$side/$repetition-stats.csv"
+          local optional=()
+
+          if "$binary" --help 2>&1 | grep -q -- "--deadlock-keys"; then
+            optional+=(--deadlock-keys=1)
+          fi
+          if "$binary" --help 2>&1 | grep -q -- "--deadlock-stats-out"; then
+            optional+=(--deadlock-stats-out="$stats")
+          fi
+
+          "$binary" \
+            --backend=memory \
+            --delays=s3 \
+            --delay-scale=0.02 \
+            --test-name=deadlock \
+            --duration=1s \
+            --drain-timeout=30s \
+            --num-runs=1 \
+            --deadlock-out="$samples" \
+            "${optional[@]}"
+        }
+
+        for repetition in 1 2 3; do
+          printf -v repetition_id '%02d' "$repetition"
+          if (( repetition % 2 == 1 )); then
+            run_deadlock main "$PERF_BIN/main-rtbench" "$repetition_id"
+            run_deadlock pr "$PERF_BIN/pr-rtbench" "$repetition_id"
+          else
+            run_deadlock pr "$PERF_BIN/pr-rtbench" "$repetition_id"
+            run_deadlock main "$PERF_BIN/main-rtbench" "$repetition_id"
           fi
         done
 

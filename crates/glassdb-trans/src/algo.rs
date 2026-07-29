@@ -24,6 +24,7 @@
 //! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -69,6 +70,21 @@ const SERIAL_FALLBACK_AFTER: usize = 3;
 /// re-acquires them in the global sorted order, where one contender always
 /// completes. Reuses v1's 5s budget (ADR-002 / architecture.md).
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct DirectCommitCounters {
+    candidates: AtomicU64,
+    landed: AtomicU64,
+}
+
+/// Cumulative coverage from ADR-051's direct single-key commit path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectCommitStats {
+    /// Mutation attempts shaped for the direct path.
+    pub candidates: u64,
+    /// Candidates that committed directly.
+    pub landed: u64,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -657,6 +673,7 @@ pub struct Algo {
     collection_catalog: CollectionCatalog,
     collection_lifecycle: CollectionLifecycle,
     splitter: Splitter,
+    direct_commit_stats: Arc<DirectCommitCounters>,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -695,7 +712,19 @@ impl Algo {
             collection_catalog,
             collection_lifecycle,
             splitter,
+            direct_commit_stats: Arc::new(DirectCommitCounters::default()),
             background,
+        }
+    }
+
+    /// Returns and resets direct single-key commit coverage counters.
+    pub fn direct_commit_stats_and_reset(&self) -> DirectCommitStats {
+        DirectCommitStats {
+            candidates: self
+                .direct_commit_stats
+                .candidates
+                .swap(0, Ordering::Relaxed),
+            landed: self.direct_commit_stats.landed.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -1264,6 +1293,9 @@ impl Algo {
         else {
             return Ok(None);
         };
+        self.direct_commit_stats
+            .candidates
+            .fetch_add(1, Ordering::Relaxed);
         // The per-value budget is decidable here; the aggregate leaf budget
         // needs the folded leaf, so the resolver re-checks both.
         if value.len() > self.coord.inline_policy().max_value_bytes {
@@ -1293,6 +1325,9 @@ impl Algo {
                 outcome: FoldOutcome::Landed,
                 ..
             }) => {
+                self.direct_commit_stats
+                    .landed
+                    .fetch_add(1, Ordering::Relaxed);
                 tx.status = Status::Committed;
                 // The predecessor lost its reference, so it may now be
                 // collectable. Only a hint: it was resolved before the CAS, and

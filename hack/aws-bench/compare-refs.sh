@@ -5,8 +5,8 @@
 #
 # It builds `rtbench` + `autoresearch` (+ `mixbench`, when present) from a base
 # ref (default `main`, built in a reused detached git worktree) and from the
-# target tree (the current worktree by default), runs the same workloads on both
-# into `out-refs/`, and diffs them with `compare.py`. Throughput and latency are
+# target tree (the current worktree by default), interleaves paired workload
+# repetitions into `out-refs/`, and diffs them with `compare.py`. Throughput and latency are
 # the primary axes; retries and backend round-trips per transaction
 # (object-storage efficiency) are secondary. `mixbench` adds a mixed-workload
 # contention grid (per-shape throughput and ops/tx across contention mode x
@@ -54,7 +54,7 @@
 #   DB_LIST=1,10,20,40 / 1,10   rw9010 concurrency points (number of Databases)
 #   NUM_KEYS=5000           rw9010 key count
 #   DURATION=15s / 3s       rw9010 duration per concurrency step
-#   NUM_RUNS=1 / 2          repeat each rw9010/deadlock sweep (tighter bands)
+#   NUM_RUNS=1 / 2          paired rw9010/deadlock repetitions (order alternates)
 #   DEADLOCK_DURATION=8s / 3s   deadlock duration per contention configuration
 #   COUNT=5 / 3             autoresearch suite repeats (reports the median)
 #   RW_MIX="balanced readheavy writeheavy"   rw9010 mixes to run
@@ -194,6 +194,19 @@ validate_rw_results() {
   ' "$path"
 }
 
+validate_csv_rows() {
+  local path="$1" expected="$2"
+  awk -v expected="$expected" '
+    NR > 1 { rows++ }
+    END {
+      if (rows != expected) {
+        printf("%s: expected %d rows, found %d\n", FILENAME, expected, rows) > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$path"
+}
+
 validate_mix_results() {
   local path="$1" expected="$2" cells
   cells="$(grep -c '"mode"' "$path" || true)"
@@ -270,48 +283,106 @@ supports_diagnostics() {
   "$1" --help 2>&1 | grep -q -- "--diagnostics-dir"
 }
 
-# Run every workload for one side into $OUT/<group>/<label>/.
-#   $1 = label (output subdir + report label)
-#   $2 = bin dir (… /target/release)
-#   $3 = whether this side supports --rw-mix (0/1)
-#   $4 = whether this side's rtbench supports --drain-timeout (0/1)
-run_side() {
-  local label="$1" bindir="$2" has_mix="$3" has_drain="$4"
+supports_deadlock_stats() {
+  "$1" --help 2>&1 | grep -q -- "--deadlock-stats-out"
+}
+
+append_csv_with_run() {
+  local src="$1" dst="$2" run="$3" header
+  header="$(head -n 1 "$src")"
+  mkdir -p "$(dirname "$dst")"
+  if [[ "$header" == run,* ]]; then
+    [ -f "$dst" ] || printf '%s\n' "$header" >"$dst"
+    awk -F, -v OFS=, -v run="$run" 'NR > 1 {$1 = run; print}' "$src" >>"$dst"
+  else
+    [ -f "$dst" ] || printf 'run,%s\n' "$header" >"$dst"
+    awk -v run="$run" 'NR > 1 {print run "," $0}' "$src" >>"$dst"
+  fi
+}
+
+validate_deadlock_results() {
+  local path="$1" expected="$2"
+  awk -F, -v expected="$expected" '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "num-keys") keys_col = i
+        if ($i == "overlap") overlap_col = i
+      }
+      next
+    }
+    {
+      key = $keys_col SUBSEP $overlap_col
+      if (!seen[key]++) cells++
+    }
+    END {
+      if (!keys_col || !overlap_col) {
+        printf("%s: missing deadlock identity columns\n", FILENAME) > "/dev/stderr"
+        bad = 1
+      }
+      if (cells != expected) {
+        printf("%s: expected %d deadlock cells, found %d\n", FILENAME, expected, cells) > "/dev/stderr"
+        bad = 1
+      }
+      exit bad
+    }
+  ' "$path"
+}
+
+# Run one paired rw9010 repetition. Raw per-run files remain available for
+# auditing; normalized top-level CSVs carry the external paired run identity
+# even when a historical binary predates rtbench's `run` column.
+run_rw_once() {
+  local label="$1" bindir="$2" has_mix="$3" has_drain="$4" mix="$5" repetition="$6"
   local common=(--backend=memory --delays=s3 --delay-scale="$DELAY_SCALE")
   local drain_args=()
   [ "$has_drain" = "1" ] && drain_args=(--drain-timeout="$DRAIN_TIMEOUT")
-  local expected_rw
-  expected_rw=$(( $(csv_items "$DB_LIST") * NUM_RUNS ))
-
-  for mix in $MIXES; do
-    local d="$OUT/$mix/$label"
-    mkdir -p "$d"
-    local mix_args=()
-    local diagnostic_args=()
-    if [ "$has_mix" = "1" ]; then
-      mix_args=(--rw-mix="$mix")
-    fi
-    if [ "$DIAGNOSTICS" = "1" ]; then
-      diagnostic_args=(--diagnostics-dir="$d/diagnostics")
-    fi
-    log "$label rw9010 mix=$mix"
-    run_bounded "$bindir/rtbench" "${common[@]}" "${drain_args[@]}" \
-      --test-name=rw9010 "${mix_args[@]}" \
-      "${diagnostic_args[@]}" \
-      --db-list="$DB_LIST" --num-keys="$NUM_KEYS" \
-      --duration="$DURATION" --num-runs="$NUM_RUNS" \
-      --samples-out="$d/samples.csv" --stats-out="$d/stats.csv" \
-      --throughput-out="$d/throughput.csv" --client-stats-out="$d/client-stats.csv" >&2
-    validate_rw_results "$d/client-stats.csv" "$expected_rw"
-  done
-
-  local dd="$OUT/contention/$label"
-  mkdir -p "$dd"
-  log "$label deadlock"
+  local d="$OUT/$mix/$label" raw="$OUT/$mix/$label/runs/$repetition"
+  local mix_args=() diagnostic_args=()
+  [ "$has_mix" = "1" ] && mix_args=(--rw-mix="$mix")
+  [ "$DIAGNOSTICS" = "1" ] && diagnostic_args=(--diagnostics-dir="$raw/diagnostics")
+  mkdir -p "$raw"
+  log "$label rw9010 mix=$mix paired-run=$repetition/$NUM_RUNS"
   run_bounded "$bindir/rtbench" "${common[@]}" "${drain_args[@]}" \
-    --test-name=deadlock --duration="$DEADLOCK_DURATION" --num-runs="$NUM_RUNS" \
-    --deadlock-out="$dd/deadlock.csv" >&2
+    --test-name=rw9010 "${mix_args[@]}" "${diagnostic_args[@]}" \
+    --db-list="$DB_LIST" --num-keys="$NUM_KEYS" \
+    --duration="$DURATION" --num-runs=1 \
+    --samples-out="$raw/samples.csv" --stats-out="$raw/stats.csv" \
+    --throughput-out="$raw/throughput.csv" \
+    --client-stats-out="$raw/client-stats.csv" >&2
+  validate_rw_results "$raw/client-stats.csv" "$(csv_items "$DB_LIST")"
+  for name in samples.csv stats.csv throughput.csv client-stats.csv; do
+    append_csv_with_run "$raw/$name" "$d/$name" "$repetition"
+  done
+  if [ "$DIAGNOSTICS" = "1" ]; then
+    append_csv_with_run \
+      "$raw/diagnostics/metrics.csv" "$d/diagnostics/metrics.csv" "$repetition"
+  fi
+}
 
+run_deadlock_once() {
+  local label="$1" bindir="$2" has_drain="$3" repetition="$4"
+  local common=(--backend=memory --delays=s3 --delay-scale="$DELAY_SCALE")
+  local drain_args=() stats_args=()
+  [ "$has_drain" = "1" ] && drain_args=(--drain-timeout="$DRAIN_TIMEOUT")
+  local d="$OUT/contention/$label" raw="$OUT/contention/$label/runs/$repetition"
+  mkdir -p "$raw"
+  supports_deadlock_stats "$bindir/rtbench" \
+    && stats_args=(--deadlock-stats-out="$raw/deadlock-stats.csv")
+  log "$label deadlock paired-run=$repetition/$NUM_RUNS"
+  run_bounded "$bindir/rtbench" "${common[@]}" "${drain_args[@]}" \
+    "${stats_args[@]}" --test-name=deadlock --duration="$DEADLOCK_DURATION" \
+    --num-runs=1 --deadlock-out="$raw/deadlock.csv" >&2
+  validate_deadlock_results "$raw/deadlock.csv" 21
+  append_csv_with_run "$raw/deadlock.csv" "$d/deadlock.csv" "$repetition"
+  if [ -f "$raw/deadlock-stats.csv" ]; then
+    validate_csv_rows "$raw/deadlock-stats.csv" 21
+    append_csv_with_run \
+      "$raw/deadlock-stats.csv" "$d/deadlock-stats.csv" "$repetition"
+  fi
+}
+
+run_aux_side() {
+  local label="$1" bindir="$2"
   # mixbench: all shapes together over the contention x topology grid. Only
   # when this side actually built the binary (older refs skip it); progress
   # goes to stderr, the JSON grid to the compared artifact. An available binary
@@ -393,10 +464,41 @@ mixes: $MIXES; diagnostics: $DIAGNOSTICS; drain-timeout: $DRAIN_TIMEOUT; \
 command-timeout: $COMMAND_TIMEOUT"
 rm -rf "$OUT"
 
-# --- Run both sides back-to-back -------------------------------------------
+# --- Run paired repetitions -------------------------------------------------
 
-run_side "$LABEL_A" "$BASE_BIN" "$A_MIX" "$A_DRAIN"
-run_side "$LABEL_B" "$TARGET_BIN" "$B_MIX" "$B_DRAIN"
+# Keep every measured pair adjacent and reverse its order on alternating
+# repetitions. This removes the systematic warm-host/time drift of running the
+# entire baseline suite before the entire target suite.
+for repetition in $(seq 1 "$NUM_RUNS"); do
+  for mix in $MIXES; do
+    if (( repetition % 2 == 1 )); then
+      run_rw_once "$LABEL_A" "$BASE_BIN" "$A_MIX" "$A_DRAIN" "$mix" "$repetition"
+      run_rw_once "$LABEL_B" "$TARGET_BIN" "$B_MIX" "$B_DRAIN" "$mix" "$repetition"
+    else
+      run_rw_once "$LABEL_B" "$TARGET_BIN" "$B_MIX" "$B_DRAIN" "$mix" "$repetition"
+      run_rw_once "$LABEL_A" "$BASE_BIN" "$A_MIX" "$A_DRAIN" "$mix" "$repetition"
+    fi
+  done
+
+  if (( repetition % 2 == 1 )); then
+    run_deadlock_once "$LABEL_A" "$BASE_BIN" "$A_DRAIN" "$repetition"
+    run_deadlock_once "$LABEL_B" "$TARGET_BIN" "$B_DRAIN" "$repetition"
+  else
+    run_deadlock_once "$LABEL_B" "$TARGET_BIN" "$B_DRAIN" "$repetition"
+    run_deadlock_once "$LABEL_A" "$BASE_BIN" "$A_DRAIN" "$repetition"
+  fi
+done
+
+expected_rw=$(( $(csv_items "$DB_LIST") * NUM_RUNS ))
+for mix in $MIXES; do
+  validate_rw_results "$OUT/$mix/$LABEL_A/client-stats.csv" "$expected_rw"
+  validate_rw_results "$OUT/$mix/$LABEL_B/client-stats.csv" "$expected_rw"
+done
+
+# These sections have their own internal statistical repetition/adaptive
+# sampling. Run them adjacently after the explicitly paired rtbench cells.
+run_aux_side "$LABEL_A" "$BASE_BIN"
+run_aux_side "$LABEL_B" "$TARGET_BIN"
 
 # --- Compare ---------------------------------------------------------------
 # Every comparison appends a section to $SUMMARY, leaving one small, trackable

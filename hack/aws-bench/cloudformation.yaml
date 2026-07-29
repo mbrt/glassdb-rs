@@ -287,7 +287,8 @@ Resources:
           ./rtbench --backend=s3 --test-name=deadlock \
             --duration=${DeadlockDuration} \
             --num-runs=1 --run-cooldown=60s \
-            --deadlock-out=out/deadlock.csv
+            --deadlock-out=out/deadlock.csv \
+            --deadlock-stats-out=out/deadlock-stats.csv
 
           aws s3 cp out/ "s3://$BUCKET/$OUT/" --recursive
           aws s3 cp /var/log/rtbench-bootstrap.log "s3://$BUCKET/$OUT/bootstrap.log" || true

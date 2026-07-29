@@ -178,6 +178,32 @@ async fn stats_report_locker_activity() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stats_report_direct_commit_coverage() {
+    let db = init_db(mem()).await;
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"direct-stats")
+        .await
+        .unwrap();
+    coll.write(b"key", b"before").await.unwrap();
+    let before = db.stats();
+
+    db.tx(|tx| {
+        let coll = coll.clone();
+        async move {
+            let value = tx.read(&coll, b"key").await?.unwrap();
+            tx.write(&coll, b"key", &value)
+        }
+    })
+    .await
+    .unwrap();
+
+    let delta = db.stats() - before;
+    assert_eq!(delta.direct_commit_candidates, 1);
+    assert_eq!(delta.direct_commit_landed, 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn stats_report_transactional_decoded_cache_hits() {
     let backend = mem();
     let writer_db = init_db(backend.clone()).await;

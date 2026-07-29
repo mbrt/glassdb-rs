@@ -18,6 +18,7 @@ produced by `rtbench` and (optionally) the `autoresearch` scoring harness:
 * `samples.csv`     -> per-transaction latency percentiles (p50/p90/p95);
 * `stats.csv`       -> retries/tx and backend-ops/tx (object-storage round-trips);
 * `deadlock.csv`    -> latency under contention (p50/p90 at 100% overlap);
+* `deadlock-stats.csv` -> completion/retry/direct-path/drain metrics per cell;
 * `score.json`      -> autoresearch primary score + per-workload cost/ops per tx;
 * `mixbench.json`   -> mixed-workload grid: per-shape throughput and ops/tx across
                        contention mode x Database topology (the contention /
@@ -156,25 +157,140 @@ def logical_tx_series(df: pd.DataFrame) -> pd.Series:
     return df["num-tx"]
 
 
+def with_run_identity(df: pd.DataFrame, legacy_identity: list[str]) -> pd.DataFrame:
+    """Return a copy with an explicit one-based run column.
+
+    Current rtbench output carries `run`. For a legacy aggregate, repeated rows
+    of the same identity are numbered in encounter order. Sample files cannot
+    be separated after pooling, so their legacy fallback is one run; the
+    interleaving driver adds the run before it appends those files.
+    """
+    d = df.copy()
+    if "run" in d.columns:
+        return d
+    if legacy_identity:
+        d["run"] = d.groupby(legacy_identity, sort=False).cumcount() + 1
+    else:
+        d["run"] = 1
+    return d
+
+
+def paired_merge(
+    a: pd.DataFrame, b: pd.DataFrame, keys: list[str], suffixes=("_a", "_b")
+) -> pd.DataFrame:
+    """Merge paired cells, rejecting missing runs instead of silently pooling."""
+    a_keys = set(a[keys].itertuples(index=False, name=None))
+    b_keys = set(b[keys].itertuples(index=False, name=None))
+    if a_keys != b_keys:
+        missing_a = sorted(b_keys - a_keys)
+        missing_b = sorted(a_keys - b_keys)
+        raise ValueError(
+            f"unpaired benchmark cells: missing from a={missing_a}, "
+            f"missing from b={missing_b}"
+        )
+    return a.merge(b, on=keys, suffixes=suffixes, validate="one_to_one")
+
+
+def throughput_duration_column(df: pd.DataFrame) -> str:
+    """Select the duration column and verify the modern shared-cell contract."""
+    if "cell-duration-ms" not in df.columns:
+        return "duration-ms"
+    durations = df["cell-duration-ms"]
+    if (~np.isfinite(durations) | (durations <= 0)).any():
+        raise ValueError("throughput cells must have a positive finite duration")
+    distinct = df.groupby(["run", "num-db"])["cell-duration-ms"].nunique(
+        dropna=False
+    )
+    if (distinct != 1).any():
+        cells = distinct[distinct != 1].index.tolist()
+        raise ValueError(f"throughput rows disagree on the common cell clock: {cells}")
+    return "cell-duration-ms"
+
+
+def aggregate_throughput(df: pd.DataFrame) -> pd.DataFrame:
+    """System throughput per run/cell/type from completions and one cell clock."""
+    d = with_run_identity(df, ["num-db", "db", "tx-type"])
+    duration_col = throughput_duration_column(d)
+    grouped = d.groupby(["run", "num-db", "tx-type"], as_index=False).agg(
+        count=("count", "sum"),
+        cell_duration_ms=(duration_col, "max"),
+    )
+    grouped["total-tps"] = (
+        grouped["count"] * 1000.0 / grouped["cell_duration_ms"].where(
+            grouped["cell_duration_ms"] > 0
+        )
+    )
+    return grouped
+
+
+def throughput_fairness(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-Database completion-rate distribution and Jain fairness per cell."""
+    d = with_run_identity(df, ["num-db", "db", "tx-type"])
+    duration_col = throughput_duration_column(d)
+    per_db = d.groupby(["run", "num-db", "db"], as_index=False).agg(
+        count=("count", "sum"),
+        cell_duration_ms=(duration_col, "max"),
+    )
+    per_db["db-tps"] = (
+        per_db["count"] * 1000.0 / per_db["cell_duration_ms"].where(
+            per_db["cell_duration_ms"] > 0
+        )
+    )
+    rows = []
+    for (run, num_db), group in per_db.groupby(["run", "num-db"]):
+        rates = group["db-tps"]
+        squared_sum = float((rates * rates).sum())
+        jain = (
+            float(rates.sum() ** 2 / (len(rates) * squared_sum))
+            if squared_sum > 0
+            else float("nan")
+        )
+        rows.append(
+            {
+                "run": run,
+                "num-db": num_db,
+                "db-tps-p10": rates.quantile(0.1),
+                "db-tps-p50": rates.quantile(0.5),
+                "db-tps-p90": rates.quantile(0.9),
+                "jain": jain,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Tables (each returns a merged frame with a `ratio` / `*-ratio` column)
 # ---------------------------------------------------------------------------
 
 
 def throughput_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
-    """Total tx/s per (concurrency, tx-type): num_db * median(per-db rate)."""
+    """Aggregate tx/s per paired run/cell/type using the common cell clock."""
 
     def agg(df: pd.DataFrame) -> pd.DataFrame:
-        g = df.groupby(["num-db", "tx-type"])["tx-per-sec"].median().reset_index()
-        g["total-tps"] = g["tx-per-sec"] * g["num-db"]
+        g = aggregate_throughput(df)
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
-    merged = agg(a).merge(
-        agg(b), on=["num-db", "tx-type", "concurrent"], suffixes=("_a", "_b")
+    merged = paired_merge(
+        agg(a),
+        agg(b),
+        ["run", "num-db", "tx-type", "concurrent"],
     )
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["total-tps_b"], r["total-tps_a"]), axis=1
+    )
+    return merged
+
+
+def fairness_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
+    def agg(df: pd.DataFrame) -> pd.DataFrame:
+        g = throughput_fairness(df)
+        g["concurrent"] = g["num-db"] * conc_per_db
+        return g
+
+    merged = paired_merge(agg(a), agg(b), ["run", "num-db", "concurrent"])
+    merged["jain-ratio"] = merged.apply(
+        lambda r: _ratio(r["jain_b"], r["jain_a"]), axis=1
     )
     return merged
 
@@ -184,9 +300,10 @@ def latency_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     pctiles = {"p50": 0.5, "p90": 0.9, "p95": 0.95}
 
     def agg(df: pd.DataFrame) -> pd.DataFrame:
+        df = with_run_identity(df, [])
         rows = []
-        for (numdb, tp), grp in df.groupby(["num-db", "tx-type"]):
-            row = {"num-db": numdb, "tx-type": tp}
+        for (run, numdb, tp), grp in df.groupby(["run", "num-db", "tx-type"]):
+            row = {"run": run, "num-db": numdb, "tx-type": tp}
             for name, q in pctiles.items():
                 row[name] = grp["latency"].quantile(q)
             rows.append(row)
@@ -194,8 +311,10 @@ def latency_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
         out["concurrent"] = out["num-db"] * conc_per_db
         return out
 
-    merged = agg(a).merge(
-        agg(b), on=["num-db", "tx-type", "concurrent"], suffixes=("_a", "_b")
+    merged = paired_merge(
+        agg(a),
+        agg(b),
+        ["run", "num-db", "tx-type", "concurrent"],
     )
     for p in pctiles:
         merged[f"{p}-ratio"] = merged.apply(
@@ -206,14 +325,19 @@ def latency_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
 
 def retries_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
-        d = df.copy()
-        logical = logical_tx_series(d)
-        d["retries-per-tx"] = d["num-retries"] / logical.where(logical > 0)
-        g = d.groupby("num-db")["retries-per-tx"].median().reset_index()
+        d = with_run_identity(df, ["num-db", "db"])
+        d["logical-tx"] = logical_tx_series(d)
+        g = (
+            d.groupby(["run", "num-db"], as_index=False)
+            .agg({"num-retries": "sum", "logical-tx": "sum"})
+        )
+        g["retries-per-tx"] = g["num-retries"] / g["logical-tx"].where(
+            g["logical-tx"] > 0
+        )
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
-    merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
+    merged = paired_merge(agg(a), agg(b), ["run", "num-db", "concurrent"])
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["retries-per-tx_b"], r["retries-per-tx_a"]), axis=1
     )
@@ -224,11 +348,11 @@ def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     """Backend round-trips per committed transaction per concurrency step."""
 
     def agg(df: pd.DataFrame) -> pd.DataFrame:
-        d = df.copy()
+        d = with_run_identity(df, ["num-db", "db"])
         d["backend-ops"] = backend_ops_series(d)
         d["logical-tx"] = logical_tx_series(d)
         g = (
-            d.groupby("num-db")
+            d.groupby(["run", "num-db"])
             .agg({"backend-ops": "sum", "logical-tx": "sum"})
             .reset_index()
         )
@@ -238,7 +362,7 @@ def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
-    merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
+    merged = paired_merge(agg(a), agg(b), ["run", "num-db", "concurrent"])
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["ops-per-tx_b"], r["ops-per-tx_a"]), axis=1
     )
@@ -249,8 +373,9 @@ def diagnostic_metrics_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int)
     """Opt-in component metrics normalized by logical benchmark operations."""
 
     def agg(df: pd.DataFrame) -> pd.DataFrame:
+        df = with_run_identity(df, [])
         g = (
-            df.groupby(["num-db", "component", "metric"])
+            df.groupby(["run", "num-db", "component", "metric"])
             .agg({"value": "sum", "logical-tx": "sum"})
             .reset_index()
         )
@@ -258,10 +383,19 @@ def diagnostic_metrics_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int)
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
-    merged = agg(a).merge(
-        agg(b),
-        on=["num-db", "component", "metric", "concurrent"],
-        suffixes=("_a", "_b"),
+    a_agg, b_agg = agg(a), agg(b)
+    metric_keys = ["component", "metric"]
+    common_metrics = (
+        a_agg[metric_keys]
+        .drop_duplicates()
+        .merge(b_agg[metric_keys].drop_duplicates(), on=metric_keys)
+    )
+    a_agg = a_agg.merge(common_metrics, on=metric_keys)
+    b_agg = b_agg.merge(common_metrics, on=metric_keys)
+    merged = paired_merge(
+        a_agg,
+        b_agg,
+        ["run", "num-db", "component", "metric", "concurrent"],
     )
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["per-tx_b"], r["per-tx_a"]), axis=1
@@ -273,21 +407,30 @@ def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     """Coordinator submissions per round, a direction-neutral batching signal."""
 
     def agg(df: pd.DataFrame) -> pd.DataFrame:
+        df = with_run_identity(df, [])
         d = df[
             (df["component"] == "coordinator")
             & (df["metric"].isin(["submissions", "rounds"]))
         ]
         if d.empty:
-            return pd.DataFrame(columns=["num-db", "concurrent", "batch-factor"])
-        g = d.groupby(["num-db", "metric"])["value"].sum().unstack(fill_value=0)
+            return pd.DataFrame(
+                columns=["run", "num-db", "concurrent", "batch-factor"]
+            )
+        g = (
+            d.groupby(["run", "num-db", "metric"])["value"]
+            .sum()
+            .unstack(fill_value=0)
+        )
         if "submissions" not in g or "rounds" not in g:
-            return pd.DataFrame(columns=["num-db", "concurrent", "batch-factor"])
+            return pd.DataFrame(
+                columns=["run", "num-db", "concurrent", "batch-factor"]
+            )
         g["batch-factor"] = g["submissions"] / g["rounds"].where(g["rounds"] > 0)
         g = g.reset_index()
         g["concurrent"] = g["num-db"] * conc_per_db
-        return g[["num-db", "concurrent", "batch-factor"]]
+        return g[["run", "num-db", "concurrent", "batch-factor"]]
 
-    merged = agg(a).merge(agg(b), on=["num-db", "concurrent"], suffixes=("_a", "_b"))
+    merged = paired_merge(agg(a), agg(b), ["run", "num-db", "concurrent"])
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["batch-factor_b"], r["batch-factor_a"]), axis=1
     )
@@ -296,22 +439,76 @@ def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
 
 def deadlock_table(a: pd.DataFrame, b: pd.DataFrame):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
+        df = with_run_identity(df, [])
         d = df[df["overlap-pct"] == 100]
         if d.empty:
             d = df
         g = (
-            d.groupby("num-keys")["latency-ms"]
+            d.groupby(["run", "num-keys"])["latency-ms"]
             .quantile([0.5, 0.9])
             .unstack()
             .reset_index()
         )
-        g.columns = ["num-keys", "p50", "p90"]
+        g.columns = ["run", "num-keys", "p50", "p90"]
         return g
 
-    merged = agg(a).merge(agg(b), on="num-keys", suffixes=("_a", "_b"))
+    merged = paired_merge(agg(a), agg(b), ["run", "num-keys"])
     for pct in ("p50", "p90"):
         merged[f"{pct}-ratio"] = merged.apply(
             lambda r, p=pct: _ratio(r[f"{p}_b"], r[f"{p}_a"]), axis=1
+        )
+    return merged
+
+
+def deadlock_stats_table(a: pd.DataFrame, b: pd.DataFrame):
+    def select(df: pd.DataFrame) -> pd.DataFrame:
+        d = with_run_identity(df, [])
+        d = d[d["overlap-pct"] == 100].copy()
+        if d.empty:
+            d = with_run_identity(df, [])
+        candidates_col = (
+            "direct-candidates"
+            if "direct-candidates" in d.columns
+            else "direct-attempts"
+        )
+        landed_col = (
+            "direct-landed" if "direct-landed" in d.columns else "direct-commits"
+        )
+        d["tx-per-sec"] = (
+            d["count"] * 1000.0 / d["cell-duration-ms"].where(
+                d["cell-duration-ms"] > 0
+            )
+        )
+        d["retries-per-tx"] = d["num-retries"] / d["count"].where(d["count"] > 0)
+        d["direct-candidates-per-tx"] = (
+            d[candidates_col] / d["count"].where(d["count"] > 0)
+        )
+        d["direct-land-rate"] = d[landed_col] / d[candidates_col].where(
+            d[candidates_col] > 0
+        )
+        return d[
+            [
+                "run",
+                "num-keys",
+                "tx-per-sec",
+                "retries-per-tx",
+                "direct-candidates-per-tx",
+                "direct-land-rate",
+                "worker-drain-ms",
+            ]
+        ]
+
+    merged = paired_merge(select(a), select(b), ["run", "num-keys"])
+    for metric in [
+        "tx-per-sec",
+        "retries-per-tx",
+        "direct-candidates-per-tx",
+        "direct-land-rate",
+        "worker-drain-ms",
+    ]:
+        merged[f"{metric}-ratio"] = merged.apply(
+            lambda r, metric=metric: _ratio(r[f"{metric}_b"], r[f"{metric}_a"]),
+            axis=1,
         )
     return merged
 
@@ -533,9 +730,8 @@ def append_summary(path: Path, title: str, summaries: list[str]) -> None:
 def _tidy_throughput(a, b, la, lb, conc_per_db):
     frames = []
     for src, df in ((la, a), (lb, b)):
-        d = df.copy()
+        d = aggregate_throughput(df)
         d["concurrent"] = d["num-db"] * conc_per_db
-        d["total-tps"] = d["tx-per-sec"] * d["num-db"]
         d["source"] = src
         frames.append(d)
     return pd.concat(frames, ignore_index=True)
@@ -554,10 +750,16 @@ def _tidy_latency(a, b, la, lb, conc_per_db):
 def _tidy_retries(a, b, la, lb, conc_per_db):
     frames = []
     for src, df in ((la, a), (lb, b)):
-        d = df.copy()
+        d = with_run_identity(df, ["num-db", "db"])
+        d["logical-tx"] = logical_tx_series(d)
+        d = (
+            d.groupby(["run", "num-db"], as_index=False)
+            .agg({"num-retries": "sum", "logical-tx": "sum"})
+        )
         d["concurrent"] = d["num-db"] * conc_per_db
-        logical = logical_tx_series(d)
-        d["retries-per-tx"] = d["num-retries"] / logical.where(logical > 0)
+        d["retries-per-tx"] = d["num-retries"] / d["logical-tx"].where(
+            d["logical-tx"] > 0
+        )
         d["source"] = src
         frames.append(d)
     return pd.concat(frames, ignore_index=True)
@@ -566,7 +768,8 @@ def _tidy_retries(a, b, la, lb, conc_per_db):
 def _tidy_deadlock(a, b, la, lb):
     frames = []
     for src, df in ((la, a), (lb, b)):
-        d = df[df["overlap-pct"] == 100].copy()
+        d = with_run_identity(df, [])
+        d = d[d["overlap-pct"] == 100].copy()
         if d.empty:
             d = df.copy()
         d["source"] = src
@@ -691,17 +894,50 @@ def main() -> int:
     a_tp, b_tp = read_csv(args.a, "throughput.csv"), read_csv(args.b, "throughput.csv")
     if a_tp is not None and b_tp is not None:
         tbl = throughput_table(a_tp, b_tp, cpd)
-        cols = ["concurrent", "tx-type", "total-tps_a", "total-tps_b", "ratio"]
-        print_table(f"Throughput (total tx/s, {lb}/{la})", tbl[cols])
+        cols = [
+            "run",
+            "concurrent",
+            "tx-type",
+            "total-tps_a",
+            "total-tps_b",
+            "ratio",
+        ]
+        print_table(f"Aggregate throughput (total tx/s, {lb}/{la})", tbl[cols])
         for tx_type, grp in tbl.groupby("tx-type"):
             summaries.append(
                 summarize(f"throughput[{tx_type}]", grp["ratio"], lower_is_better=False)
             )
+        fair = fairness_table(a_tp, b_tp, cpd)
+        fair_cols = [
+            "run",
+            "concurrent",
+            "db-tps-p10_a",
+            "db-tps-p50_a",
+            "db-tps-p90_a",
+            "jain_a",
+            "db-tps-p10_b",
+            "db-tps-p50_b",
+            "db-tps-p90_b",
+            "jain_b",
+            "jain-ratio",
+        ]
+        print_table(
+            f"Per-Database throughput fairness ({lb}/{la})",
+            fair[fair_cols],
+        )
+        summaries.append(
+            summarize(
+                "throughput-fairness[jain]",
+                fair["jain-ratio"],
+                lower_is_better=False,
+            )
+        )
 
     a_la, b_la = read_csv(args.a, "samples.csv"), read_csv(args.b, "samples.csv")
     if a_la is not None and b_la is not None:
         tbl = latency_table(a_la, b_la, cpd)
         cols = [
+            "run",
             "concurrent",
             "tx-type",
             "p50_a",
@@ -723,12 +959,18 @@ def main() -> int:
     a_st, b_st = read_csv(args.a, "stats.csv"), read_csv(args.b, "stats.csv")
     if a_st is not None and b_st is not None:
         tbl = retries_table(a_st, b_st, cpd)
-        cols = ["concurrent", "retries-per-tx_a", "retries-per-tx_b", "ratio"]
+        cols = [
+            "run",
+            "concurrent",
+            "retries-per-tx_a",
+            "retries-per-tx_b",
+            "ratio",
+        ]
         print_table(f"Retries per transaction ({lb}/{la})", tbl[cols])
         summaries.append(summarize("retries", tbl["ratio"], lower_is_better=True))
 
         tbl = backend_ops_table(a_st, b_st, cpd)
-        cols = ["concurrent", "ops-per-tx_a", "ops-per-tx_b", "ratio"]
+        cols = ["run", "concurrent", "ops-per-tx_a", "ops-per-tx_b", "ratio"]
         print_table(f"Backend round-trips per transaction ({lb}/{la})", tbl[cols])
         summaries.append(
             summarize("backend-ops/tx", tbl["ratio"], lower_is_better=True)
@@ -739,6 +981,7 @@ def main() -> int:
     if a_diag is not None and b_diag is not None:
         tbl = diagnostic_metrics_table(a_diag, b_diag, cpd)
         cols = [
+            "run",
             "concurrent",
             "component",
             "metric",
@@ -751,7 +994,7 @@ def main() -> int:
         backend = tbl[tbl["component"].str.startswith("backend.")]
         if not backend.empty:
             role_totals = (
-                backend.groupby(["concurrent", "component"])
+                backend.groupby(["run", "concurrent", "component"])
                 .agg({"per-tx_a": "sum", "per-tx_b": "sum"})
                 .reset_index()
             )
@@ -769,7 +1012,15 @@ def main() -> int:
 
         protocol = tbl[~tbl["component"].str.startswith("backend.")]
         for (component, metric), group in protocol.groupby(["component", "metric"]):
-            direction = None if component == "splitter" else True
+            direction = (
+                None
+                if component == "splitter"
+                or (
+                    component == "direct_commit"
+                    and metric in ["candidates", "landed"]
+                )
+                else True
+            )
             summaries.append(
                 summarize(
                     f"diag-{component}/tx[{metric}]",
@@ -802,6 +1053,43 @@ def main() -> int:
                 "deadlock-p90", tbl["p90-ratio"], lower_is_better=True, noisy=True
             )
         )
+
+    a_ds = read_csv(args.a, "deadlock-stats.csv")
+    b_ds = read_csv(args.b, "deadlock-stats.csv")
+    if a_ds is not None and b_ds is not None:
+        tbl = deadlock_stats_table(a_ds, b_ds)
+        cols = [
+            "run",
+            "num-keys",
+            "tx-per-sec_a",
+            "tx-per-sec_b",
+            "tx-per-sec-ratio",
+            "retries-per-tx_a",
+            "retries-per-tx_b",
+            "retries-per-tx-ratio",
+            "direct-candidates-per-tx_a",
+            "direct-candidates-per-tx_b",
+            "direct-land-rate_a",
+            "direct-land-rate_b",
+            "worker-drain-ms_a",
+            "worker-drain-ms_b",
+        ]
+        print_table(f"Deadlock completion and protocol outcomes ({lb}/{la})", tbl[cols])
+        for metric, lower_is_better in [
+            ("tx-per-sec", False),
+            ("retries-per-tx", True),
+            ("direct-candidates-per-tx", True),
+            ("direct-land-rate", False),
+            ("worker-drain-ms", True),
+        ]:
+            summaries.append(
+                summarize(
+                    f"deadlock-{metric}",
+                    tbl[f"{metric}-ratio"],
+                    lower_is_better=lower_is_better,
+                    noisy=True,
+                )
+            )
 
     a_sc, b_sc = read_json(args.a, "score.json"), read_json(args.b, "score.json")
     if a_sc is not None and b_sc is not None:

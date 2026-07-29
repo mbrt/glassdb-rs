@@ -49,6 +49,11 @@ pub struct Stats {
     /// Number of deduplicated shard-coordinator worker rounds started.
     pub coord_rounds: u64,
 
+    /// Number of mutation attempts shaped for ADR-051's direct single-key path.
+    pub direct_commit_candidates: u64,
+    /// Number of direct single-key commits that landed.
+    pub direct_commit_landed: u64,
+
     /// Number of deduplicated split candidates processed in the background.
     pub split_candidates: u64,
     /// Number of locally observed split source/root linearizations.
@@ -73,6 +78,8 @@ impl Stats {
         self.lock_retries += other.lock_retries;
         self.coord_submissions += other.coord_submissions;
         self.coord_rounds += other.coord_rounds;
+        self.direct_commit_candidates += other.direct_commit_candidates;
+        self.direct_commit_landed += other.direct_commit_landed;
         self.split_candidates += other.split_candidates;
         self.split_completed += other.split_completed;
         self.split_deferred += other.split_deferred;
@@ -92,12 +99,15 @@ impl Stats {
         &mut self,
         lock_calls: u64,
         coord: glassdb_trans::ShardCoordinatorStats,
+        direct: glassdb_trans::DirectCommitStats,
         split: glassdb_trans::SplitterStats,
     ) {
         self.lock_calls += lock_calls;
         self.lock_retries += coord.cas_retries;
         self.coord_submissions += coord.submissions;
         self.coord_rounds += coord.rounds;
+        self.direct_commit_candidates += direct.candidates;
+        self.direct_commit_landed += direct.landed;
         self.split_candidates += split.candidates;
         self.split_completed += split.completed;
         self.split_deferred += split.deferred;
@@ -125,6 +135,12 @@ impl Sub for Stats {
                 .coord_submissions
                 .saturating_sub(other.coord_submissions),
             coord_rounds: self.coord_rounds.saturating_sub(other.coord_rounds),
+            direct_commit_candidates: self
+                .direct_commit_candidates
+                .saturating_sub(other.direct_commit_candidates),
+            direct_commit_landed: self
+                .direct_commit_landed
+                .saturating_sub(other.direct_commit_landed),
             split_candidates: self.split_candidates.saturating_sub(other.split_candidates),
             split_completed: self.split_completed.saturating_sub(other.split_completed),
             split_deferred: self.split_deferred.saturating_sub(other.split_deferred),
@@ -146,6 +162,8 @@ mod tests {
             },
             coord_submissions: 10,
             coord_rounds: 8,
+            direct_commit_candidates: 7,
+            direct_commit_landed: 5,
             split_candidates: 3,
             split_completed: 2,
             split_deferred: 1,
@@ -159,6 +177,8 @@ mod tests {
             },
             coord_submissions: 14,
             coord_rounds: 10,
+            direct_commit_candidates: 11,
+            direct_commit_landed: 8,
             split_candidates: 5,
             split_completed: 3,
             split_deferred: 1,
@@ -169,6 +189,8 @@ mod tests {
         assert_eq!(delta.cache.l2_hits, 1);
         assert_eq!(delta.coord_submissions, 4);
         assert_eq!(delta.coord_rounds, 2);
+        assert_eq!(delta.direct_commit_candidates, 4);
+        assert_eq!(delta.direct_commit_landed, 3);
         assert_eq!(delta.split_candidates, 2);
         assert_eq!(delta.split_completed, 1);
         assert_eq!(delta.split_deferred, 0);
