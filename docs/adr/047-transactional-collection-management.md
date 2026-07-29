@@ -27,9 +27,9 @@ Backend mutations retain the conditional boundary of
 [ADR-044](044-cas-fenced-structural-gate.md) to quiesce each node before
 fencing it.
 
-[ADR-041](041-epoch-versioned-collection-catalog.md) must be revised to version
-these transactional ID-based directories before acceptance. Snapshot semantics
-are otherwise outside this ADR.
+[ADR-041](041-timestamp-versioned-collection-catalog.md) versions these
+transactional ID-based directories. Snapshot semantics are otherwise outside
+this ADR.
 
 ## Context
 

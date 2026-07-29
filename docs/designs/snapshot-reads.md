@@ -4,17 +4,21 @@
 
 **Proposed.** This design adds long-lived, internally consistent, read-only
 transactions over a fixed historical database cut. The umbrella API decision is
-[ADR-037](../adr/037-bounded-staleness-snapshot-transactions.md); sealed cuts,
-historical data, retention, and the collection catalog are split into the
-focused ADRs indexed below.
+[ADR-037](../adr/037-bounded-staleness-snapshot-transactions.md); cut
+definition, historical data, retention, and the collection catalog are split
+into the focused ADRs indexed below.
+
+A cut is a commit timestamp taken from the backend's own clock, so acquiring
+one performs no coordination and no object is written by every commit or read
+by every snapshot. [Cut definition](#cut-definition) records that decision and
+the two coordinated alternatives it replaced.
 
 Snapshot capability is part of the one database format in this proposal. There
 is no creation-time or operational mode that lets read-write transactions avoid
-the epoch, manifest, certification, and history protocol. If that mandatory
-work imposes an unreasonable burden on strict transactions, the proposal is
-rejected rather than split into snapshot-capable and strict-only formats. The
-[performance acceptance gate](#performance-acceptance-gate) must be completed
-before these ADRs can be accepted.
+the certification and history protocol. The commit critical path itself is
+unchanged, so the mandatory cost is writing and retaining history rather than
+commit latency. The [performance acceptance gate](#performance-acceptance-gate)
+must be completed before these ADRs can be accepted.
 
 This document is the living companion to those proposed decisions. In
 particular, the numeric defaults and optional implementation optimizations may
@@ -22,15 +26,15 @@ evolve while the proposal is reviewed.
 
 ## Goal & scope
 
-`Database::read_tx` is a snapshot-preferred read-only API. When snapshot
-acquisition succeeds, it gives the execution one global cut and keeps that cut
-unchanged for the execution's lifetime. Reads at that cut are:
+`Database::read_tx` is a read-only API. It gives the execution one global cut
+and keeps that cut unchanged for the execution's lifetime. Reads at that cut
+are:
 
 - internally consistent across keys, ranges, collections, and subcollections;
 - read-only, lock-free, and free of commit-time validation;
 - allowed to be boundedly stale;
 - valid for a bounded but analytics-friendly lifetime; and
-- independent of later epoch closure or reclamation decisions.
+- independent of later writers and of reclamation decisions.
 
 The API supports point reads, ADR-033's forward keys-only range scans and
 materialized pages, collection and subcollection enumeration, and
@@ -47,157 +51,106 @@ databases need not be upgraded or backfilled.
 
 | Term | Meaning |
 |---|---|
-| **Admission generation** | The currently appendable global writer generation. Fencing it orders every earlier admission before the fence and sends later admissions to the next generation. An empty fenced generation proves freshness without publishing an empty epoch. |
-| **Epoch** | A non-empty, monotonically ordered generation of read-write transaction admissions. |
-| **Lane** | One of zero or more client-owned CAS append structures registered inside an epoch. A lane batches metadata operations, never transaction semantics or outcomes. |
-| **Admission** | A durable transaction entry naming its preparation manifest. It is a promise to reach committed-and-discoverable or aborted-and-fenced, not a commit. |
-| **Sealed cut** | The complete logical database state through one sealed epoch: a downward-closed prefix of the strict-serializable order, not a copied database. |
-| **Freshness certificate** | Same-client evidence that every commit omitted by a candidate cut is newer than a retained local duration-clock sample. |
-| **Snapshot control record** | Strongly read database metadata containing the operational-state generation and contiguous `latest_sealed` frontier used to linearize a bind. |
+| **Server-time observation** | A reading of the backend's own clock reported alongside a successful operation, comparable across all clients of one database (ADR-052). |
+| **Commit timestamp** | The position a committed transaction occupies in the cut order, assigned from server-time observations once every lock is held. |
+| **Cut** | The complete logical database state at one timestamp: a downward-closed prefix of the strict-serializable order, not a copied database. |
+| **Cut grid / slot** | The fixed-period partition of the timestamp domain that every client computes identically; admissible cuts are grid points, and a slot is the interval between adjacent ones. |
+| **Anchoring** | Whether a backend's reported time is known to be at or after the operation applied (apply-anchored) or only to fall inside the request (message-anchored). Declared per backend by ADR-052. |
+| **Margin** | How far a cut trails the reader's server-time observation. It sums three allowances: skew within the backend's fleet, the granularity of its reported time, and, for a message-anchored backend, the request timeout. |
+| **Commit-age bound** | The maximum age a transaction's commit timestamp may reach before it must abort or be durably aborted by a peer. |
 | **History head / floor version** | A leaf entry's pointer into one key's retained history / the first certified version at or before the oldest still-readable cut. |
 
 ## User contract
 
 ### Execution
 
-`Database::read_tx` first tries to bind the freshest admissible sealed epoch.
-The selected epoch is fixed before invoking the closure. A snapshot execution
-does not acquire data locks, validate at the end, or advance to another epoch.
-It has no conflict-driven reason to replay the closure, so a single invocation
-is an implementation goal. The public API does not promise exact-once closure
-execution: it accepts `FnMut`, and every invocation must be free of external
-side effects and safe to cancel at the deadline. The storage layer may retry
-idempotent reads against the same epoch and deadline without reinvoking the
-closure.
+`Database::read_tx` binds one cut before invoking the closure and keeps it for
+the execution's lifetime. The execution acquires no data locks, validates
+nothing at the end, and never advances to another cut. Binding performs no
+coordination and cannot fail for lack of a frontier, so the closure runs exactly
+once and the API accepts `FnOnce`. The body must still be safe to cancel at the
+deadline. The storage layer may retry idempotent reads against the same cut and
+deadline without reinvoking the closure.
 
-By default, failure to obtain a sufficiently fresh epoch before the begin
-timeout falls back to a strict read-only OCC implementation of the same
-`ReadTransaction` facade. The fallback is current rather than stale, but it may
-replay the complete closure during validation conflicts. Point reads and every
-range page contribute to one attempt's accumulated read and predicate set; a
-retry starts a new attempt and reconstructs every materialized page. Shipping
-transparent fallback therefore requires the facade to use
-`Transaction::scan_keys` inside that attempt, rather than delegate pages to
-independent `Collection::scan_keys` transactions.
+There is no fallback mode, no acquisition timeout, and no per-call
+`require_snapshot` option, because there is no acquisition step that can fail.
+A caller may request a cut fresher than the client currently holds evidence
+for, which costs at most one small backend operation and fails only the way any
+backend operation fails.
 
-A per-call `require_snapshot` option disables this fallback. In that mode an
-admission failure returns `FreshSnapshotUnavailable` before the closure runs.
-Once a snapshot attempt has started, expiry, corruption, or an unavailable read
-never switches it to a strict transaction.
-
-Both modes are internally consistent and share one fixed overall execution
-deadline. Only snapshot mode promises a fixed, possibly stale cut without data
-locks or commit validation; `require_snapshot` is the option that guarantees
-fully unlocked execution.
+Snapshot capability is a property of the open database rather than of a call. A
+backend that reports no server time cannot support cuts, as ADR-052 describes;
+that is reported when the database is opened and by any `read_tx` on it.
 
 Existing `Database::tx` remains strict and retryable even when its collected
-write set is empty. The selected semantics come from the API, not from inspecting
-the closure after it runs.
+write set is empty. The selected semantics come from the API, not from
+inspecting the closure after it runs.
 
 ### Freshness and lifetime
 
-Freshness measures the age of the earliest committed transaction that the cut
-may omit, not the wall-clock age of the epoch object. A sealed epoch remains
-current indefinitely while there are no omitted writes, so an idle database
-creates no empty sealed epochs or heartbeat writes.
+Freshness measures how far the cut trails the present, and it is entirely a
+function of how recently the client observed the backend's clock. A cut is
+never invalidated by age: an older observation yields a staler cut, never an
+inconsistent one.
 
-Snapshot begin proves that bound with a local freshness certificate, not an
-untrusted cross-client timestamp. It samples its suspension-aware duration clock
-immediately before issuing the admission-generation fence CAS, then freezes the
-registered lanes and seals every pre-fence admission or proves the frozen suffix
-empty.
-Admissions after the fence use the next generation and cannot commit before
-being admitted, so any omitted commit is newer than that pre-request sample.
-The sample is retained while an in-doubt CAS is resolved; it may be replaced
-only after proving that CAS did not land and before issuing a new attempt.
+Binding is three local steps and at most one backend operation:
 
-After resolving the frozen suffix, begin is ready to bind the resulting frontier
-or a newer sealed one, never a cached older cut. A recent certificate may be
-reused by the same client until its remaining freshness budget expires. In both
-cases, immediately before the final strongly consistent read of the snapshot
-control record, it starts the fixed execution deadline. That read validates the
-operational-state generation and `latest_sealed`, selects the newest cut at or
-beyond the certified frontier, and linearizes binding. The freshness budget is
-rechecked when the read returns. Another client establishes its own proof. An
-idle begin may rotate an empty admission generation to obtain this proof, but
-does not publish an empty epoch.
+1. take the client's most recent server-time observation, refreshing it with a
+   small backend operation if the caller's staleness request needs a newer one;
+2. subtract the policy margin, which covers skew within the backend's fleet and
+   the granularity of its reported time, then snap down to the nearest cut
+   point; and
+3. start the fixed `started_at + lifetime` deadline and invoke the closure.
 
-Concretely, begin is one bounded loop:
+An active client already holds a fresh observation from its ordinary traffic,
+so binding usually performs no backend operation at all, and an idle client
+pays one small request. There is no fence, no certificate, no control-record
+read, and no retry loop, so there is nothing for a begin timeout to bound.
 
-1. establish the original begin deadline, which no retry resets;
-2. obtain a certificate by sampling immediately before the fence CAS, retaining
-   that sample through in-doubt recovery, and resolving the pre-fence suffix—or
-   reuse an unexpired certificate owned by the same logical client;
-3. reject the candidate if no positive freshness budget remains after the
-   policy's total duration-clock uncertainty;
-4. record a prospective `started_at`, then strongly read the snapshot control
-   record and validate its operational-state generation;
-5. select the newest `latest_sealed` cut no older than the certified frontier;
-6. sample again after the control read; if the certificate's budget has expired,
-   discard the prospective bind without invoking the closure and restart at step
-   2 only if the original begin deadline permits; and
-7. otherwise bind the cut and the fixed `started_at + lifetime` deadline. If no
-   further acquisition attempt fits, use strict fallback or return
-   `FreshSnapshotUnavailable` according to the call option.
+The cut may never be extrapolated forward from the local clock. The local clock
+decides *when* to refresh an observation; it never contributes to the cut
+itself. Extrapolating would readmit local clock rate into the safety argument
+that [Cut definition](#cut-definition) sets out.
 
-Only the successful final control-read attempt supplies the snapshot execution
-start. Retrying acquisition may replace a failed prospective start, but it never
-extends the original begin timeout.
+A bind also validates the database's operational state and its published
+[history floor](#the-history-floor) against one observation no older than the
+policy's control-staleness bound. ADR-040 extends both its drain wait and its
+pre-reclamation wait by that bound, so neither ordering needs a strongly
+consistent read. A running execution re-checks the floor whenever it refreshes
+that observation.
 
-The acquisition deadline is capped by both the begin timeout and the requested
-staleness budget after deducting the policy's maximum duration-clock
-uncertainty. If the pre-fence suffix cannot be resolved in that time, or the
-request leaves no provable positive budget, begin falls back or fails; it never
-infers freshness merely from an old epoch or a racy observation of open lanes.
+A snapshot execution's lifetime starts immediately before the closure is
+invoked and ends at `started_at + lifetime`. The age of the cut affects nothing
+but staleness: a cut taken at the edge of the staleness bound still receives the
+full configured lifetime.
 
-A snapshot execution's lifetime begins immediately before its final control
-read and ends at `started_at + lifetime`. The epoch is bound by that read, just
-before the closure is invoked. A strict fallback starts its lifetime immediately
-before its first closure invocation. Epoch age affects admission only: a cut
-accepted just inside the freshness bound still receives the full configured
-lifetime from the start of binding; the epoch's prior age does not reduce it.
-Strict fallback retries share the same start and never reset it.
+Local clocks retain one job: measuring elapsed time for the deadline and for
+deciding when to refresh an observation. That clock must be monotonic and
+advance through process and machine suspension. This is a BOOTTIME-class
+contract; a generic monotonic API is insufficient unless its platform
+implementation is qualified to include suspension. Wall-clock adjustment cannot
+extend a deadline.
 
-With the proposed one-hour maximum, a strict fallback may replay the complete
-closure for as long as that fixed deadline permits. This proposal deliberately
-adds no separate retry-count cap: a count would make availability depend on
-contention rather than the requested time budget. Callers that cannot tolerate
-that replay window can request a shorter lifetime or set `require_snapshot`.
-Fallback retry count and time spent retrying are reported separately.
+Because cut selection no longer depends on local clocks, a bad one costs
+staleness or a premature expiry rather than consistency. The remaining
+sensitivity is between a reader measuring its lifetime and GC measuring its
+retention wait, which is a rate divergence over one bounded interval and is
+covered by the policy's guard.
 
-The duration clock must be monotonic, advance through process and machine
-suspension, and stay within the policy's bounded duration uncertainty over the
-full retention horizon. This is a BOOTTIME-class contract; a generic monotonic
-API is insufficient unless its platform implementation is qualified to include
-suspension. Wall-clock adjustment cannot extend a deadline.
-
-Clock capability and health fail closed by role. A client that cannot prove the
-duration contract may still execute strict reads and writes, but snapshot begin
-falls back or fails before invoking the closure. Losing that proof during an
-active snapshot conservatively expires and discards its result. A GC worker with
-an unhealthy or unsupported duration clock retains history and performs no
-time-authorized reclamation.
-
-Each reader and GC process must also maintain a conservative runtime health
-check against an independent coarse elapsed-time signal. It checks before
-snapshot admission or time-authorized deletion and whenever control returns
-after a wait or possible suspension. When both elapsed deltas are usable, a
-disagreement larger than that role's allocated uncertainty marks the duration
-clock unhealthy; an inconclusive comparison fails closed. The default allocation
-is 15 seconds of reader under-count and 15 seconds of GC over-count, whose sum is
-the policy's 30-second end-to-end maximum. The comparison anchor is retained for
-the full certificate, active-read, or GC retention interval and is not reset by
-a successful intermediate check. This check can reject a clock but cannot make
-an unqualified platform safe, and a timestamp written by a different client
-cannot prove the local clock's rate. Arbitrary platform or hypervisor violations
-shared by both signals remain an environmental fault assumption.
+Drift is detected for free. Every backend response carries a server-time
+observation, so each client continuously compares its own clock against the
+backend's in both directions and marks itself unhealthy beyond the policy
+allowance. An unhealthy client may still commit, because its commit timestamps
+come from the backend rather than from itself; it stops binding cuts, and as a
+GC worker it retains history and performs no time-authorized reclamation. A
+fully cache-served execution issues no requests of its own, so it must refresh
+a server-time observation at a bounded interval or expire.
 
 The implementation races the whole closure future against the deadline, checks
 before and after every storage await, and checks again when the closure returns.
 Results completing after the deadline are discarded and return
 `ReadTransactionExpired`; a range page fails atomically rather than returning a
-partial page. Resuming pagination and strict retry neither change nor reset the
-deadline.
+partial page. Resuming pagination does not change or reset the deadline.
 
 ### Proposed policy defaults
 
@@ -210,47 +163,66 @@ is no strict-only capability or creation-time opt-out.
 
 | Setting | Proposed default | Purpose |
 |---|---:|---|
-| Activity-driven epoch target | 5 seconds | Normal cut cadence while writes are active |
-| Maximum snapshot staleness | 90 seconds | Hard omission-age budget for sealing and acquisition |
-| Snapshot begin timeout | 30 seconds | Time allowed to help produce an admissible cut |
+| Cut grid period | 5 seconds | Spacing of admissible cuts; also the retention-coalescing and change-log unit. Bounds retained versions per key at `(staleness + lifetime) / period`, so a coarser grid trades staleness for storage |
+| Fleet-skew allowance | 1 second | Skew between servers within the backend's fleet |
+| Reported-granularity allowance | 1 second | Truncation in the backend's reported time; one second for an HTTP `Date` |
+| Apply-anchoring allowance | backend request timeout | Bound on the gap between stamp and apply for a message-anchored backend; zero when apply-anchored |
+| Cut margin | sum of the three allowances | The safety term subtracted from the observation |
+| Maximum snapshot staleness | 30 seconds | Total distance a cut may trail the present |
 | Maximum read lifetime | 1 hour | Supports cold object-store scans and analytics |
-| Maximum duration-clock uncertainty | 30 seconds | Total worst-case reader-under-count versus GC-over-count across the full horizon; clocks include suspension |
-| Final-phase writer grace | 15 seconds | Time before a stalled admitted writer is resolved or aborted |
-| Minimum history retention | 70 minutes | Derived safety floor; see ADR-040 |
+| Commit-age bound | 30 seconds | Age at which a still-pending transaction's timestamp forces abort |
+| Control-staleness bound | 60 seconds | Oldest operational-state and history-floor observation a bind may use; added to the drain wait and to GC's pre-reclamation wait |
+| Reader-versus-GC elapsed-rate allowance | 5 seconds | Rate divergence over one retention interval |
+| Minimum history retention | 65 minutes | Derived safety floor; see ADR-040 |
 
-The 90-second value is a hard admission boundary, not normal lag: under healthy
-operation snapshots should usually trail by no more than the roughly five-second
-epoch target. A caller may choose a smaller bound and accept more sealing work or
-more strict fallbacks. With a one-hour lifetime, the 70-minute retention floor
-leaves an 8.5-minute guard beyond maximum staleness plus lifetime for history
-duration-clock uncertainty, history certification, GC cadence, and operation
-margin. The clock term is one end-to-end relative bound between the slowest
-supported reader clock and fastest supported GC clock, not a separate allowance
-that each side may consume independently.
+Maximum staleness decomposes into the age of the observation a bind uses, the
+margin, and the grid period. Only the margin is a safety term, and it is a sum
+of three separately sized allowances rather than one number, because they come
+from unrelated sources and differ per backend.
 
-A persisted operational state may stop new snapshot admission. Strict
-transactions continue to use epochs and durable certification, and existing
+Fleet skew is the smallest of the three: providers keep server clocks within
+milliseconds, so a second is already three orders of magnitude of headroom.
+Granularity is fixed by the format of the reported time. The apply-anchoring
+allowance dominates on a message-anchored backend and is zero on an
+apply-anchored one, so the margin is a property of the deployment's backend
+rather than a universal constant. Against S3 with a three-second request
+timeout the margin is five seconds; against Cloud Storage it is two.
+
+The rest of the staleness budget is a freshness preference, and a caller may ask
+for less at the cost of refreshing its observation more often. Under healthy
+operation a cut should trail by roughly the margin plus the grid period.
+
+With a one-hour lifetime, the 65-minute retention floor leaves a 4.5-minute
+guard beyond maximum staleness plus lifetime for the reader-versus-GC rate
+allowance, the control-staleness bound, history certification, GC cadence, and
+operation margin. GC's wait between publishing a history floor and acting on it
+is that same control-staleness term rather than an additional one, because both
+exist for the same reason: a reader may be holding a metadata observation that
+old.
+
+A persisted operational state may stop new snapshot binds. Strict transactions
+continue to assign timestamps and emit durable certification, and existing
 snapshots retain their full lifetimes. Only after the maximum outstanding
 lifetime drains may GC reduce history to latest-state roots. There are still no
-reader pins: GC waits the full maximum lifetime plus its safety guard from the
-durable admission-disable fence, and retains history if it cannot prove that
-interval elapsed.
+reader pins: GC waits the maximum lifetime, its safety guard, and the
+control-staleness bound from the durable disable fence, and retains history if
+it cannot prove that interval elapsed.
 
-Every bind, including one using a cached freshness certificate, starts its
-deadline before strongly validating the operational-state generation. A bind
-linearized before the disable CAS is therefore already aging when drain begins;
-a bind ordered after it observes `draining` and cannot start a snapshot.
+That last term is what removes the strongly consistent read from every bind. A
+bind validates operational state from an observation no older than the bound,
+so a bind that has not yet seen `draining` is covered by the extra wait rather
+than by exact ordering against the disable CAS.
 
 Re-enabling is a fenced transition, not a Boolean flip. First durably enter
 `rebuilding`, close the latest-only reclamation generation, and resolve every
 delete it authorized—or fence it against delayed execution—before establishing
-the baseline fence. Every writer still emits certified history while snapshots
-are disabled; the mode changes what GC may retain, not the write format. Once
-the old reclamation generation is fenced, pre-fence writes are included in the
+the baseline fence. Every writer still emits certified history while binds are
+disabled; the mode changes what GC may retain, not the write format. Once the
+old reclamation generation is fenced, pre-fence writes are included in the
 baseline and every post-fence supersession is retained under the new generation.
-Only after verifying and sealing that floor may the control record admit
-snapshots at or after it. The operational states are
-`enabled -> draining -> disabled -> rebuilding -> enabled`.
+Only after verifying that baseline and publishing the new history floor may
+binds resume, and never at a cut older than that floor. The operational states
+are `enabled -> draining -> disabled -> rebuilding -> enabled`.
 
 Every operational transition and recovery step is ownerless, idempotent, and
 helpable after the initiating client disappears. `draining` and `rebuilding`
@@ -263,146 +235,417 @@ restart state, and required temporary storage headroom.
 
 ### Errors and observability
 
-- `FreshSnapshotUnavailable`: no admissible cut before the begin timeout and
-  strict fallback was disabled.
+- `SnapshotUnsupported`: the backend reports no server time, or the operational
+  state currently rejects binds. This is a property of the database or its
+  operational state, not a transient acquisition failure.
 - `ReadTransactionExpired`: the execution crossed its fixed deadline. At or
   after the deadline this error wins over a simultaneous backend result.
+- `SnapshotTooOld`: the cut is below the published history floor, at bind or on
+  a later re-validation. It means the database can no longer serve the cut, so
+  retrying with a fresher one is correct. In a healthy database it fires only
+  during a rebuild; otherwise it is the reader-versus-GC clock violation being
+  reported instead of silently answered.
 - Missing, cyclic, non-monotonic, or uncertified history inside the promised
   window is a corruption/invariant error, never `NotFound`.
-- Backend unavailability cannot be turned into a freshness promise; snapshot
-  begin fails closed or uses the explicit strict fallback.
-- An unavailable or unhealthy duration clock follows the same pre-execution
-  fallback rule; loss of clock proof after binding conservatively returns
-  `ReadTransactionExpired` and discards the result.
+- Backend unavailability makes a cut staler, never unsafe. A bind that needs a
+  fresher observation than the client holds surfaces the underlying backend
+  error rather than inventing a freshness claim.
+- An unhealthy local clock refuses to bind. Losing clock health during an
+  execution conservatively returns `ReadTransactionExpired` and discards the
+  result, because the deadline can no longer be trusted.
 
-Statistics should distinguish snapshot selection, strict fallback, helped
-sealing, freshness-certificate retries, fence CAS conflicts, clock-health
-rejection, expiry, forced live-writer aborts, strict fallback retries, history
-certification backlog, sealed-frontier lag, rebuild progress, and historical
-objects traversed. These are operational outcomes, not changes to user-visible
+Statistics should distinguish cut staleness at bind, observation refreshes per
+bind, holders resolved during snapshot reads, clock-drift rejections, expiry,
+commit-age aborts, history certification backlog, rebuild progress, historical
+objects traversed, and the fraction of snapshot reads served without a backend
+operation. These are operational outcomes, not changes to user-visible
 consistency.
+
+The margin between the history floor and the oldest admissible cut deserves its
+own gauge. It is the headroom protecting live readers, and it shrinking toward
+zero is the early warning that `SnapshotTooOld` is about to start firing.
+
+## Cut definition
+
+**Decision: hybrid-logical-clock commit timestamps sourced from the backend's
+clock, read on a locally derived cut grid.** An earlier revision of this design
+built cuts from a global sealed epoch. That model was rejected before
+acceptance; the comparison is recorded here because it is the decision the rest
+of the design hangs on.
+
+### What a cut has to be
+
+A cut must be a downward-closed prefix of the existing strict-serializable
+order: whenever the cut contains `U` and there is a serialization edge
+`T -> U`, it must also contain `T`. Internal consistency across keys, ranges,
+collections, and subcollections is a corollary of that single property rather
+than a separate requirement. What distinguishes the candidate mechanisms is how
+they establish it, and what each one costs transactions that never read a
+snapshot.
+
+### Rejected: a global sealed epoch
+
+Assign every committed read-write transaction to one database-wide epoch,
+admitted durably before its terminal certificate, and seal an epoch once every
+admission in it is resolved. Locks and intents precede admission, so every
+serialization edge implies `epoch(T) <= epoch(U)` and a sealed epoch is
+downward-closed by construction.
+
+This is correct and needs no clock to define the cut, which is its real
+attraction. It was rejected because the cut boundary is a database-wide object:
+
+- **A choke point on both paths.** Every commit writes the admission structure
+  and every uncached bind CAS-fences a single generation object and strongly
+  reads a single control record. Cloud object stores document per-object update
+  rates around one per second; the workload profile in this document already
+  projects ten fences per second against one object.
+- **Unrelated transactions share a fate.** A frontier that advances contiguously
+  cannot pass one stalled admission, so snapshot freshness for the whole
+  database is a function of its single worst transaction. Recovering liveness
+  requires force-aborting healthy writers on a grace timer, which is read-only
+  work aborting read-write work that it does not conflict with.
+- **A mandatory round trip.** Admission sits between durable payloads and the
+  terminal certificate, adding a serialized wave to every commit and making
+  ADR-027's parallel first-intent path ineligible, for a feature most
+  transactions never use.
+
+### Rejected: scope-limited epochs
+
+Keep the epoch machinery but maintain one frontier per collection, fencing only
+the collections a reader touches. This restores independence between unrelated
+collections and prices acquisition by the reader's actual scope.
+
+It was rejected as a partial mitigation rather than a solution. A hot collection
+remains its own choke point, cross-collection writers pay a fence per
+participant, the commit path still carries a round trip, ADR-027 is still
+ineligible, and the cost is still paid by databases that never read a snapshot.
+It is strictly better than a global epoch and strictly worse than timestamps on
+every principle this design is trying to hold.
+
+### Chosen: hybrid-logical-clock timestamps
+
+Each read-write transaction assigns itself a commit timestamp taken from the
+backend's clock. A cut is a timestamp, and a reader selects one from a
+server-time observation it already holds, with no dedicated coordination step.
+
+**Assignment.** Timestamps come from the backend's clock rather than from
+client clocks. Every client already contacts one shared party on every
+operation, and both S3 and Cloud Storage report a server time on every
+response, so that clock is available at no cost. Once every lock is held, a
+transaction sets its commit timestamp to the maximum of the server time
+reported by its own lock-install responses and every timestamp it observed on
+the versions and holder records it touched, plus one. The value is recorded in
+holder records as a lower bound while the transaction runs and frozen into its
+commit certificate. Assigning it costs no round trip: the reading rides on a
+response the protocol already waits for.
+
+A timestamp does not have to land at or after the moment its intents became
+durable. Per-key monotonicity and edge propagation both come from the locks and
+the maximum rule, and a timestamp that is slightly early only makes the
+commit-age bound fire sooner. Readers absorb the difference in their margin
+instead, which is why ADR-052 has a backend declare whether its reported time is
+apply-anchored rather than requiring that it be.
+
+**Propagation.** Every serialization edge in this system passes through a lock,
+which is what makes the maximum rule sufficient:
+
+- *Write-write and write-read.* `U` must acquire a lock `T` holds, so it either
+  waits for `T`'s outcome or wounds it. If it waits, it observes `T`'s
+  certificate and its timestamp and is pushed above it. If it wounds, `T`
+  aborts and there is no edge.
+- *Read-write anti-dependencies.* ADR-020's validate-and-lock takes shared
+  `locked_by` read locks over the read set, so a later writer of that key
+  observes the earlier transaction's holder record and is pushed above it.
+
+Timestamps therefore only have to propagate across genuine lock conflicts,
+which always resolve to wait-for-outcome or wound. Versions of one key are
+strictly increasing, because every writer of a key holds its write lock and
+takes the maximum with the current version.
+
+**Read timestamp and the margin.** A reader derives its cut from an actual
+response it received, never from its own clock. Let `D` be the server time on a
+response received before it starts reading, and let `E` be the margin, the sum
+of three allowances:
+
+- skew within the backend's fleet;
+- the granularity of its reported time; and
+- for a message-anchored backend, how far a stamp may precede its apply.
+
+Any write whose intent installs after that response was generated was stamped
+at a fleet clock reading of at least `D - E`, so its commit timestamp is at
+least `D - E`. Choosing
+
+```text
+T_read < D - E
+```
+
+therefore makes every such write invisible to the cut. Writes whose intents
+installed earlier are visible as holders on the keys the reader touches and are
+resolved there. No client clock appears anywhere in that argument.
+
+The third allowance is the only one that looks unbounded, and it is not. A
+stamp and its apply both fall inside a single request, so they differ by at most
+that request's duration, and a response the client actually received arrived
+within the client's own request timeout. The term is therefore bounded by a
+value the deployment already configures, with no provider guarantee involved. On
+an apply-anchored backend it is zero.
+
+In practice a reader takes the greatest cut point at or below `D - margin`,
+where the policy's staleness margin is at least `E`. Beyond absorbing `E` the
+margin also lets in-flight transactions settle, so that readers rarely have to
+resolve holders, and gives the grid room; that part is a policy preference
+rather than a safety requirement.
+
+The local clock may decide *when* to take a fresh sample, but it never
+contributes to `T_read`. Extrapolating a cut forward from the last observation
+would put local clock rate back into the safety argument.
+
+Safety and freshness therefore separate cleanly: an old observation yields a
+stale cut, never a wrong one, and freshness costs at most one small request,
+which an active client already has for free. This is why maximum staleness
+drops from 90 seconds, a figure that existed only to cover arbitrary client
+clocks, to a few seconds sized to `E`. The retention floor ADR-040 derives from
+staleness shrinks correspondingly; that cascade is not yet applied.
+
+**Using cached observations.** A cached leaf observation may serve a cut only
+if its own watermark is at or after `T_read + E`. Otherwise a write could have
+landed on that leaf below the cut after the observation was taken, and the
+reader would resolve that key at a different effective time from the rest of
+its cut. This is the entry-point freshness rule the value cache needs. A fully
+cache-served execution samples no server time of its own, so it must refresh a
+server-time observation at a bounded interval or expire.
+
+That rule is what would otherwise make a warm cache worthless. A scan that ran
+an hour ago holds leaves whose watermarks all precede today's cut, so every one
+fails the test and is re-read even if the collection never changed. ADR-036
+already revalidates a leaf without transferring its body, but one request per
+leaf is no better than reading it. ADR-055 batches that revalidation: a listing
+reports each object's revision, a revision matching the cached one advances the
+watermark exactly as an unchanged conditional read does, and a page settles as
+many leaves as it reports. Revalidation then costs one request per page, so a
+scan transfers bodies only for leaves that actually changed.
+
+**The cut grid.** Admissible read timestamps are quantized to a fixed grid
+derived from the policy, `origin + floor((t - origin) / period) * period`, with
+a proposed 5-second period. Every client computes the same grid locally with no
+coordination. Effective staleness is at most `margin + period`.
+
+The grid is what makes discrete cuts available again without a global sequence.
+Only the last version of a key within a slot is observable at any cut point, so
+retention can coalesce a slot to one version per key.
+
+**Resolving pending holders.** A reader that encounters a holder whose
+timestamp lower bound is at or below its cut must resolve that holder's outcome
+rather than skip it; a lower bound above the cut proves the writer is invisible.
+This is not new machinery or new interference: ADR-020's "resolving the
+effective current writer" already makes every strict read do exactly this
+through `resolve_holders`. A holder old enough to matter here is also past its
+lease, which ADR-021 and ADR-024 already reclaim.
+
+**Commit-age bound.** A transaction must not commit with a timestamp older than
+a bounded commit age, and any peer may CAS a pending transaction past that
+bound to aborted using the durable fence ADR-022 already defines. The bound
+covers only the window from lock completion to the commit CAS, not the user
+body, so a generous value well inside the margin costs healthy writers nothing.
+
+This bound is not needed for cut correctness, which readers get by resolving
+holders. It exists so that a slot can be declared closed, which is what
+retention coalescing requires. The trigger is the
+transaction's own age rather than an unrelated global event, so unlike the
+sealed-epoch grace it cannot abort a writer because someone else is slow.
+
+**Clock roles and health.** Local clocks retain exactly one job: measuring
+elapsed time for deadlines and for deciding when to resample. That needs
+monotonicity and bounded rate through suspension, which is the existing
+BOOTTIME-class requirement, and an error there costs staleness rather than
+correctness. Every response additionally offers a free comparison between the
+local clock and the backend's, so a client that has drifted in either direction
+detects it with no external reference and marks itself unhealthy. A client with
+a bad clock can still commit, because its timestamps come from the backend and
+not from itself. The allowance on that comparison has to exceed the excursion of
+a leap smear, because both providers smear a leap second over 24 hours while the
+client's own clock may step instead, putting the two half a second apart for a
+day through no fault of either.
+
+A backend that reports no server time cannot support this argument. The default
+is to fail closed and refuse snapshot execution. A deployment may instead
+declare that it trusts client clocks, which requires the staleness margin to
+exceed twice the maximum absolute client skew and reinstates skew as a safety
+input. That is a documented mode, not the baseline.
+
+**Obtaining server time.** One monotone cell per `Database` holding the maximum
+server time seen on any response is sufficient for both roles, so no
+per-request attribution is needed. A writer reads the cell after its lock
+installs complete; a larger value is always safe because it only delays
+visibility. A reader may use any genuine past observation, because writes
+installing after it are excluded by the margin and writes installing before it
+are visible as holders on the keys it touches.
+
+The two backends differ in what they can report, which is what ADR-052's
+anchoring declaration exists to express. Cloud Storage returns the object
+resource on the write itself, including a server-assigned modification time, so
+it is apply-anchored and pays no third allowance. S3 returns an `ETag` and no
+modification time on `PutObject`, so reading one back would cost an extra round
+trip per mutation; it uses the `Date` response header instead and is
+message-anchored. The AWS SDK exposes response headers through a client-level
+interceptor, the same mechanism the S3 client already uses for its own `Expires`
+handling.
+
+Either reading counts only when it provably came from the origin. A cached or
+proxied response carries an unrelated clock, so a backend must discard a
+reported time it cannot attribute, rather than fold it into the cell. The
+simulated and in-process backends must model server time with injectable fleet
+skew so the margin can be exercised deterministically.
+
+### Assumptions about backend time
+
+Neither provider documents the accuracy of the time it reports, and neither
+publishes a bound on skew within its own fleet. This section records what the
+assumption actually rests on, so that it is not mistaken for a guarantee.
+
+The strongest artifact is an AWS statement that they hold a SOC control keeping
+clocks under a millisecond, which is externally audited but describes AWS
+infrastructure generally rather than the S3 API. Amazon Time Sync documents a
+typical error bound under 100µs over NTP and under 40µs with a hardware clock,
+and Google states that all its services, including all APIs, run on one smeared
+time base from their atomic clocks. Both providers reject requests signed more
+than about fifteen minutes from their own time, which shows each treats its own
+clock as authoritative, though the tolerance is far too loose to be a fleet
+bound. AWS ships `correctClockSkew` in its own SDKs, deriving the client offset
+from precisely the response header used here.
+
+Against a one-second allowance, evidence of millisecond-scale agreement leaves
+three orders of magnitude of headroom. It remains an environmental assumption of
+the same kind as trusting that the backend implements conditional writes
+correctly, and a strictly weaker one than either the client-clock alternative or
+what comparable systems assume: YugabyteDB ships with half a second of assumed
+skew across customer-operated machines.
+
+Leap seconds do not enter the argument. Both providers smear one over 24 hours,
+drifting up to half a second from UTC, but the design compares backend times
+only against each other and never against UTC, so a smear cancels. It reaches
+only the local-clock drift detector, whose allowance is sized for it above.
+
+### Costs accepted
+
+- **Cut safety rests on the backend's clock.** A sealed epoch's boundary cannot
+  be corrupted by any clock at all. This boundary depends on `E`, and no
+  provider documents any part of it, as
+  [the assumptions above](#assumptions-about-backend-time) set out. It is a far
+  narrower assumption than arbitrary client clocks on arbitrary machines, the
+  margin is sized to absorb it with room to spare, and drift is detected on
+  every response. The separate question of reader-versus-GC clock disagreement
+  is answered by the [history floor](#the-history-floor), which turns a
+  violation into an error rather than a wrong answer.
+- **The backend trait grows.** Every response must carry a server-time
+  observation, an additive amendment to ADR-023 that touches every backend
+  implementation. Backends that cannot supply one lose snapshot capability
+  unless the deployment opts into trusting client clocks.
+- **Freshness is asserted rather than proven.** The discarded fence certificate
+  could prove that a cut omitted nothing older than a stated age. A timestamp
+  cut asserts it from the reader's own clock, which is what comparable systems
+  do, but it is a real loss.
+- **Exactness is lost.** An epoch cut is an exact set of transactions fixed by
+  CAS ordering. Precise incremental change capture between two consistent points
+  would be cleaner on epochs; it is deferred rather than solved here.
+
+### What the decision eliminates
+
+Because binding performs no backend operation beyond holding a recent
+observation, the whole acquisition apparatus the epoch model needed is absent:
+no admission generation, no snapshot control record, no admission lanes or
+their registration, no cooperative sealing, no `latest_sealed` frontier, no
+freshness certificates, no begin timeout, no `FreshSnapshotUnavailable`, and no
+strict read-only OCC fallback. Binding cannot fail, so the closure runs exactly
+once and `read_tx` takes `FnOnce`.
+
+ADR-020's commit sequence and ADR-027's parallel single read-write path also
+survive intact, which is what narrows the
+[performance gate](#performance-acceptance-gate) to history rather than commit
+latency. ADR-051's logless one-CAS commit does not survive, but that is
+mandatory history rather than cut selection, so no choice about cuts would have
+saved it; see [Mandatory cost](#mandatory-cost).
 
 ## Design at a glance
 
-### Global epochs
+### Write path
 
-Every committed read-write transaction belongs to one monotonically increasing,
-database-wide epoch. A sealed epoch is a downward-closed prefix of the existing
-strict-serializable transaction order. `latest_sealed` advances contiguously;
-snapshot begin chooses the newest sealed epoch satisfying its freshness request.
+Snapshot support adds two things to the commit sequence: a commit timestamp,
+carried in records the protocol already writes, and per-key history
+certification after the commit point. Nothing else about ADR-020 or ADR-027
+changes.
 
-Writers use the correctness-first sequence:
+The sequence below is therefore the only write path. ADR-051's logless direct
+commit has no place in it, because a single leaf CAS produces neither an
+immutable payload nor a certificate, so an inline-eligible overwrite takes this
+path like any other write. Its inline representation survives: step 7 may leave
+the committed bytes in the leaf for strict latest reads.
+
+The full sequence, counting execution of the user body:
 
 1. execute the user body without coordination;
 2. install every point, absence/membership, range, and catalog intent, while
    proving structural gates absent for ordinary node rewrites;
 3. revalidate and capture actual predecessors while holding those locks;
-4. durably prepare an authoritative manifest, then write and verify every
+4. assign the commit timestamp from the server time reported by those installs
+   and every timestamp observed while executing;
+5. durably prepare an authoritative manifest, then write and verify every
    named immutable payload or physical root, recording an immutable
    initialization witness for each mutable root;
-5. durably admit the manifest identity and digest into an open epoch;
-6. publish a terminal commit certificate that names that manifest; and
+6. publish a terminal commit certificate naming that manifest and timestamp; and
 7. certify per-key history and release locks asynchronously.
 
-This overview counts execution of the user body. ADR-038's six protocol steps
-begin with lock acquisition after that body has produced its candidate read and
-write sets.
+Step 4 adds no backend operation. The server time is a header on responses that
+step 2 already waited for, and the timestamp travels in holder records step 2
+already writes.
 
-Admission happens only after the serialization dependencies are fixed. Thus any
-transaction that depends on this writer must observe its intent or wait for its
-outcome before entering a later epoch. Every serialization edge `T -> U`
-therefore implies `epoch(T) <= epoch(U)`.
+The cut order follows from the locks rather than from anything published
+globally. Because a timestamp is assigned only after every lock is held, any
+transaction that depends on this writer must observe its holder record or wait
+for its outcome, and is pushed above its timestamp.
 
-This proof includes predicates, not only point values. Every epoch-bearing
-transaction must lock and revalidate every point, absence/membership, range,
-and catalog predicate on which its writes may depend before admission, and must
-prove structural gates absent for ordinary node rewrites. Any optimization that
-admits an epoch-bearing transaction without preserving those edges invalidates
-the sealed-cut proof.
+This covers predicates, not only point values. Every writing transaction must
+lock and revalidate every point, absence/membership, range, and catalog
+predicate on which its writes may depend, and must prove structural gates
+absent for ordinary node rewrites. An optimization that drops one of those
+edges breaks the cut.
 
 ADR-033 and ADR-044 supply the concrete range rule: any transaction containing
 both a scan and a write takes membership-read locks on every leaf covered
 through each scan's effective frontier, then revalidates while holding them.
 If a limited page's frontier moves outward, it retains the locks, extends
-the covered range, and repeats to a fixpoint before epoch admission.
+the covered range, and repeats to a fixpoint before assigning its timestamp.
 
 The preparation manifest is a GC root from before its named objects are created
 until terminal commit or abort. The terminal CAS is allowed only after all
 immutable payloads, physical roots, and root initialization witnesses are known
 durable.
-Helpers and sealers reverify immutable payload digests. A root is mutable after
-visibility, so its immutable witness proves the initial body while its current
-body is checked only for the same stable incarnation binding. Thus observing a
-committed certificate still implies that every value and prepared routing root
-exists, preserving the durability invariant of the current latest-value
-protocol. The commit certificate and epoch admission may later be co-issued
-behind a small two-part candidate certificate because all intents and payloads
-are already visible. The baseline proof does not rely on that latency
-optimization.
+Helpers reverify immutable payload digests. A root is mutable after visibility,
+so its immutable witness proves the initial body while its current body is
+checked only for the same stable incarnation binding. Thus observing a committed
+certificate still implies that every value and prepared routing root exists,
+preserving the durability invariant of the current latest-value protocol.
 
-### Cooperative sealing and admission lanes
+### Closing a slot
 
-There is no coordinator process. Epoch sealing is an ownerless, idempotent CAS
-state machine helped by active writers and snapshot begin:
+A transaction still pending when its timestamp reaches the commit-age bound must
+abort, and any peer may durably abort it through ADR-022's existing fence. Its
+commit CAS and that fence race; whichever lands first is final, and a
+transaction whose certificate already landed can never be aborted. A peer
+without conservative evidence of the age waits a full bound from its own
+observation.
 
-```text
-open E -> closing E / frozen lane set -> resolving E -> sealed E
-```
+Once no transaction can still commit into a grid slot, that slot is closed. Slot
+closure is what lets retention coalesce a slot to one version per key. It is not
+part of the cut-correctness argument, which readers obtain by resolving holders,
+and its
+trigger is a transaction's own age, so no writer is ever aborted because an
+unrelated transaction is slow.
 
-A logical client (`Database` instance, including its clones) registers a sparse
-admission lane in the open epoch root and opportunistically batches its
-independent transaction admissions into lane CAS operations. The batching is
-strictly client-local: independently opened clients are never combined, even
-when they share a process. It is physical group commit only; each entry retains
-its own transaction identity and outcome. High-throughput clients may use
-several lanes; idle databases and inactive clients create none.
-
-Snapshot execution does not mutate coordination state, but acquisition can: an
-uncached begin CAS-fences the shared admission generation and every successful
-bind strongly reads the snapshot control record. One `Database` clone family
-shares certificate state and singleflights concurrent acquisition; independent
-clients establish their own proofs. Expected uncached begin QPS, fence-CAS
-retries, and control-record read concentration are part of the performance gate.
-
-Closing the epoch root freezes its registered lane set. CAS-closing each lane
-then total-orders every append against closure. A new epoch may accept writers
-after the prior epoch's admissions are frozen; it need not wait for the prior
-epoch to seal. This keeps read-write availability independent of a stalled
-snapshot frontier.
-
-The final-phase writer grace begins when its lane is closed. After the proposed
-15 seconds, a sealer may race a durable pending-to-aborted CAS even when the
-writer still refreshes its ordinary lease. Commit wins if its terminal CAS lands
-first; otherwise the abort fence wins permanently and the writer retries in a
-new transaction. Time chooses when to force progress, while the CAS and durable
-fence—not elapsed time—prove safety. A helper that cannot conservatively prove
-the close age waits a full grace interval from its own observation.
-
-The grace starts at lane close, not admission. Payload and root preparation has
-already completed before admission. A transaction that is still pending after
-the grace may therefore lose the terminal CAS race even when its owner is
-healthy and retry as a new transaction. A transaction whose commit certificate
-already landed cannot be force-aborted; sealers instead help its history become
-discoverable. The default grace is an availability trade-off chosen from
-admission-to-terminal and object-store tail-latency measurements, not a safety
-timeout.
-
-The sealer resolves every frozen admission to one of two durable states:
-
-- committed and discoverable from every written data or catalog entry; or
-- aborted and fenced so an arbitrarily delayed artifact cannot resurrect it.
-
-Only then may the epoch seal. Competing sealers and clients that crash after any
-step converge through the same CAS transitions. Correctness never depends on a
-client pause, request-duration, or clock-skew timeout. Compact epoch/lane outcome
-fences remain authoritative after bulky transaction objects are reclaimed, and
-every admission, lock/install, commit, resolver, wound, recovery, and GC path
-validates them. A delayed artifact may become an unreachable orphan, but can
-never regain a committed outcome or enter a closed lane.
-
-If sealing falls behind the freshness bound, strict read-write traffic
-continues. New snapshot reads use their configured strict fallback or return
-`FreshSnapshotUnavailable`.
+Compact transaction outcome fences remain authoritative after bulky transaction
+objects are reclaimed, and every lock/install, commit, resolver, wound,
+recovery, and GC path validates them. A delayed artifact may become an
+unreachable orphan, but can never regain a committed outcome.
 
 ### Historical data
 
@@ -414,57 +657,95 @@ versions.
 The greenfield format separates:
 
 - small transaction commit/certification metadata, which supplies one atomic
-  outcome, epoch, and authoritative manifest digest for all writes;
+  outcome, commit timestamp, and authoritative manifest digest for all writes;
 - independently reclaimable immutable per-key values; and
-- per-key immutable history chunks with a sparse epoch index.
+- per-key immutable history chunks with a sparse timestamp index.
 
 Every write, including full commits, records the actual effective predecessor
 observed while its install lock is held. The leaf entry names the current history
-head and may also carry ADR-051's inline current bytes for strict latest reads.
-Those bytes never replace the immutable history payload or certificate. Indexed
-history lookup finds the newest certified version at or before the snapshot
-epoch without work linear in the number of retained overwrites.
+head, that version's commit timestamp, and optionally ADR-051's inline current
+bytes. Those three together let the entry answer any cut at or above the current
+version without dereferencing anything; they never replace the immutable history
+payload or certificate, which a lower cut still resolves through. Indexed history
+lookup finds the newest certified version at or before the cut without work
+linear in the number of retained overwrites.
 
 A tombstone is a normal version. Following the same chain therefore handles
 create, delete, and recreate without treating an absent current key as proof that
 it was absent historically. All writes from one transaction share the same
-commit certificate and epoch, preserving cross-key and cross-collection
+commit certificate and timestamp, preserving cross-key and cross-collection
 atomicity. A committed certificate with a missing or mismatched manifest payload
 is corruption, never a partial transaction.
 
-A leaf key-directory entry with a retained history head is not vestigial. After
-a delete, retain that entry and its history-head pointer while any admissible or
-still-live snapshot cut may resolve the key to a present version, including a
-floor version that may have committed long before the retention window began.
-Only after GC proves every such cut observes absence may it prune the directory
-entry, tombstone, and obsolete history. Point lookup and forward `KeyScan`
-traversal depend on this enumeration invariant.
+A deleted key stays resolvable while any admissible or still-live cut may see it
+as present, including through a floor version that committed long before the
+retention window began. Only after GC proves every such cut observes absence may
+it prune the residue, tombstone, and obsolete history. Point lookup and forward
+`KeyScan` traversal depend on this enumeration invariant.
+
+Where that residue lives matters, because the obligation is long and the object
+it would naturally sit in is hot. Two unrelated things keep a deleted key's entry
+alive: strict optimistic validation needs the tombstone as a validation token
+until no concurrent transaction can validate against it, which the lease already
+bounds at seconds; snapshot enumeration needs the key resolvable for the whole
+65-minute window. Only the first is on the strict path.
+
+So once a deletion's slot closes, ADR-039 migrates the residue out of the leaf
+into a side structure over the same key range, batched per slot. Leaves carry
+live keys only, strict traffic never loads the structure, and a snapshot scan
+reads it beside the leaf under the same watermark rule, merging two ordered
+streams. Split accounting counts live entries alone, so garbage cannot trigger a
+split.
+
+The workloads this protects are ordinary — queues, TTL expiry, log trimming,
+session keys — anything deleting distinct keys without reusing them. Churn that
+recreates the same key was never affected, because the entry is reused. Left in
+the leaf, a FIFO delete pattern concentrates residue at one end of the range,
+where leaves holding no live keys would split repeatedly on garbage. ADR-031
+defers merge, so those splits would be permanent long after the garbage went
+away.
 
 The value cache is keyed by `(logical path, writer)`. ADR-051's inline leaf state
-is the latest-value shortcut for strict reads, but a historical value can never
-populate or poison that current state.
+serves strict reads and, per ADR-039, any cut at or above its recorded commit
+timestamp; a historical value can never populate or poison that current state.
+
+A cached leaf observation may serve a cut only if its own server-time watermark
+is at or after the cut plus the margin, as [Cut definition](#cut-definition)
+requires. Values, history chunks, manifests, and certificates are immutable and
+cache without further conditions; the entry point is the only part of a
+snapshot read that needs a freshness rule.
+
+Because the entry point is the only such part, making its watermark cheap to
+advance is what decides whether a warm cache is worth having. ADR-055 supplies
+that: a listing reports revisions, so a page of unchanged leaves is revalidated
+in one request and only genuinely changed leaves are re-read. Requests then
+track the change rather than the collection, which is the sense in which a
+snapshot read is served from cache. Listing itself still scales with the size of
+the prefix, so a very large collection with a very small change set remains the
+case that would justify an index by change instead.
 
 ### Catalog
 
-Collection existence and parent-child membership move from the mutable
-root-local subcollection set to an epoch-versioned system catalog. Collection
-creation first writes and verifies a physical B-link root bound to a fresh stable
-incarnation ID and an immutable initialization witness under its durable
+Collection existence and parent-child membership are versioned by commit
+timestamp on top of ADR-047's transactional `name → CollectionId` directories,
+which remain the authoritative current-state lookup structure. Collection
+creation first writes and verifies a physical B-link root bound to a fresh
+stable incarnation ID and an immutable initialization witness under its durable
 preparation manifest. The manifest keeps the root live until the transaction
 commits or is durably aborted. The transaction then atomically makes that
 incarnation visible in its existence record and its parent's membership record.
 
-The reusable fixed `_i` path is never passed to unconditional backend deletion.
-Abort CAS-compacts it to a small permanent tombstone containing the incarnation
-and fence; a later creation may replace only the exact observed tombstone by
-CAS. Therefore a delayed old reclamation cannot erase a newer incarnation.
-Incarnation-unique child paths may be deleted because they are never reused.
-Catalog visibility can never name an absent or differently bound root.
-Collection deletion is not currently public.
+Collection identity is incarnation-addressed under ADR-046, so no path is ever
+reused and no name-derived root tombstone is needed. Incarnation-unique child
+paths may be deleted because their IDs are never reused, while historical
+catalog records retain a dropped ID through the snapshot horizon so a recreated
+logical name cannot alias an older incarnation. Catalog visibility can never
+name an absent or differently bound root. Collection deletion is not currently
+public.
 
 This makes collection existence, subcollection enumeration, and data reads share
-one global cut. Physical B-link roots remain routing objects rather than the
-logical source of historical collection existence.
+one cut. Physical B-link roots remain routing objects rather than the logical
+source of historical collection existence.
 
 ### Point reads and transactional key scans
 
@@ -476,27 +757,48 @@ limit filled, without promising that another key exists. Reverse scans and
 stateful cursors remain out of scope. Callers needing values issue ordinary
 point reads for the returned keys before the transaction ends.
 
-In snapshot mode, every point read and `scan_keys` call resolves logical state
-at the transaction's one fixed epoch. Scans enter the latest physical B-link
-topology at the lower bound and follow the forward right-sibling chain.
-Copy-before-shrink and current-topology revalidation absorb concurrent splits;
-history resolution supplies membership and values at the bound epoch. Snapshot
-scans register no predicate read set, acquire no data locks, and perform no
-commit validation. A collection missing at that epoch returns `NotFound`.
+Every point read and `scan_keys` call resolves logical state at the
+transaction's one fixed cut. Scans enter the latest physical B-link topology at
+the lower bound and follow the forward right-sibling chain. Copy-before-shrink
+and current-topology revalidation absorb concurrent splits; history resolution
+supplies membership and values at the bound cut. Snapshot scans register no
+predicate read set, acquire no data locks, and perform no commit validation. A
+collection missing at that cut returns `NotFound`.
+
+A read that encounters a holder whose timestamp lower bound is at or below the
+cut resolves that holder's outcome, exactly as a strict read already does; a
+lower bound above the cut proves the writer invisible. This is the only point at
+which a snapshot read can wait on a writer, it is per key, and a holder old
+enough to reach a cut is already past its lease.
+
+With no such holder, the entry's current version is the newest committed one,
+and ADR-039 has the entry record its commit timestamp. If that timestamp is at
+or below the cut, the current version is by definition the newest version at the
+cut, so ADR-051's inline bytes answer the read immediately and a tombstone
+answers absence. Only a current version above the cut sends the reader to
+history. Because a cold key's current version lies below almost every admissible
+cut, this is the common case rather than a special one: a snapshot scan over a
+leaf of cold inline keys resolves keys and values from that leaf alone, which is
+what lets a snapshot execution run from cache. The reader needs no extra
+freshness rule for it, since the cached leaf already had to satisfy the cut-plus-
+margin watermark to be used at all.
+
+A key with no leaf entry at all is the one case that needs a second object. Its
+deletion may have migrated to the range's residue structure, so the reader
+consults that under the same watermark to distinguish a key deleted after its cut
+from one that never existed. A scan reads it once per leaf and merges; a point
+read reads it only on a miss. Both are cacheable on the same terms as the leaf,
+so this costs a snapshot execution one more cached object per leaf and costs
+strict traffic nothing.
 
 Pagination is repeated `scan_keys` calls inside the same `read_tx` closure,
 passing a page's `next_after()` key back through `KeyScan::after`. The resume key
 is an ordinary exclusive bound, not an opaque or process-local cursor. Every
-such call shares the fixed epoch and deadline. A separate `read_tx` call may
-bind a later cut, just as separate `Collection::scan_keys` calls remain separate
+such call shares the fixed cut and deadline. A separate `read_tx` call may bind
+a later cut, just as separate `Collection::scan_keys` calls remain separate
 strict transactions under ADR-033.
 
-Strict fallback invokes the existing `Transaction::scan_keys` operation inside
-one OCC attempt. All pages contribute their accepted logical results and
-effective-frontier predicates to that attempt; validation failure replays the
-whole closure and rebuilds the pages. This preserves ADR-033's lock-free first
-attempt and full-read-set locked retry without introducing a second strict
-scanner. Its scan-plus-write locking rules continue to apply to ordinary
+ADR-033's scan-plus-write locking rules continue to apply unchanged to ordinary
 read-write transactions.
 
 History pointers and any routing needed by a live snapshot cannot be removed.
@@ -507,69 +809,153 @@ returning a partial result.
 ### Retention and GC
 
 Snapshot reads create no pins or heartbeats. GC instead retains the worst-case
-window implied by the persisted policy. For the oldest possibly readable cut it
-keeps every newer version plus the first version at or before that cut (the floor
-version). A transaction certificate remains while any data or catalog history
-references it.
+window implied by the persisted policy. Within that window it keeps, per key,
+the newest version at or before each admissible grid point; the floor version is
+just that rule applied to the oldest readable cut. A transaction certificate
+remains while any data or catalog history references it.
+
+Everything else is unobservable by construction, because cuts exist only at grid
+points, and it is reclaimed as soon as its slot closes rather than waiting out
+the window. A live reader is bound to a grid point too, so it cannot see these
+versions either. That makes coalescing a separate reclamation class from the
+window: it removes nothing any cut can observe, so it neither waits for the
+history floor nor advances it.
+
+The effect on a hot key is the point. A key written a hundred times a second
+produces five hundred versions per five-second slot, of which one survives, and
+the intermediate ones survive for seconds rather than 65 minutes. More usefully,
+retained versions per key become bounded by `(staleness + lifetime) / period`
+independent of write rate, so storage stops scaling with write volume.
 
 Retention is measured from supersession, not original commit. A value that was
 current for years and is replaced immediately after a snapshot begins must still
 remain readable for that snapshot's full lifetime.
 
-GC does not trust an unbounded client timestamp to establish supersession age.
-It may wait the full retention interval from its own suspension-aware
-duration-clock observation of the supersession; after a crash or ownership
-change, inability to prove elapsed time restarts that conservative wait. A
-bounded persisted clock may shorten the delay only with its configured
-uncertainty deducted. This can over-retain but cannot reclaim early.
+GC does not trust a writer's recorded time to establish supersession age. It may
+wait the full retention interval from its own observation of the supersession;
+after a crash or ownership change, inability to prove elapsed time restarts that
+conservative wait. This can over-retain but cannot reclaim early.
+
+Only a rate divergence between a reader measuring its lifetime and GC measuring
+this wait can put the two out of step, and the policy guard covers it. Cut
+selection itself no longer depends on either clock.
+
+### The history floor
+
+The guard is an assumption, and an assumption that is only asserted fails
+silently. Its failure mode is the worst one available here. If GC reclaims a
+deleted key's directory entry while a reader still needs it, that reader sees an
+absent key, and absence is a legitimate answer at cuts before the key existed.
+There is nothing to distinguish reclaimed history from history that never was,
+so a clock problem becomes a wrong answer with no error raised anywhere.
+
+GC therefore publishes a history floor: the oldest cut it still guarantees to
+serve completely, quantized to the grid and advancing monotonically. The
+ordering is the whole mechanism — the floor must be durable **before** the
+deletions it authorizes begin. Reclaiming first and publishing after leaves
+precisely the window the floor exists to close.
+
+A bind requires its cut at or above the floor and otherwise fails with
+`SnapshotTooOld`. Under healthy operation the freshest admissible cut sits an
+entire retention window above the floor, so this fires only during a rebuild or
+when the guard has actually been violated.
+
+Checking it costs nothing. The floor lives in the same small bounded-staleness
+metadata a bind already reads for operational state, and that read's own
+response supplies a server-time observation, so one cached read serves three
+purposes. A reader may validate against a floor observation up to the
+control-staleness bound old, and GC waits that same bound after publishing
+before it reclaims — the identical trick the bind-disable fence already uses. A
+long execution re-checks on the observation refresh it must perform anyway,
+which catches a violation that develops mid-execution before any torn result
+reaches the caller.
+
+This does not make the floor a choke point. No writer touches it, GC writes it
+at its own cadence rather than per transaction, and every reader may use a stale
+copy.
+
+What it changes is where clocks sit. GC advancing the floor too eagerly is
+detectable by every reader; advancing it too slowly only over-retains. Clocks
+move out of the correctness argument into liveness and retention. The floor does
+not defend against GC reclaiming above its own published floor, which would be a
+protocol violation rather than a clock one and remains corruption.
 
 ADR-035's paginated, shuffled walk over deterministic `_t/<ss>/` shards remains
-the completeness mechanism for transaction and pre-admission preparation
-cleanup. Snapshot history adds compact epoch/lane outcomes and history indexes
-as GC roots and candidate sources; it does not replace the backend's opaque
-provider cursor contract. Those backend cursors are unrelated to
-`KeyScan::after`. GC may retain excess history during an outage, but it never
-deletes promised history early. During the operational `disabled` state it
-retains latest-state roots and compact epoch fences; rebuilding a new history
-floor is required before snapshot admission resumes.
+the completeness mechanism for transaction and preparation cleanup. Snapshot
+history adds compact outcome fences and history indexes as GC roots and
+candidate sources; it does not replace the backend's opaque provider cursor
+contract. Those backend cursors are unrelated to `KeyScan::after`. GC may retain
+excess history during an outage, but it never deletes promised history early.
+During the operational `disabled` state it retains latest-state roots and
+compact outcome fences; rebuilding a new history floor is required before binds
+resume.
 
-## Mandatory write path and future single read-write optimization
+## Mandatory cost
 
-ADR-051's inline fast path commits with one leaf CAS and emits no external
-history or transaction object. ADR-027's non-inline fallback publishes its
-transaction object and first write intent in parallel. Neither satisfies the
-baseline's intent-before-admission and mandatory-history ordering. Running epoch
-admission beside either path is not sufficient: a later-epoch transaction can
-read the old value while the older install is delayed, creating a serialization
-edge that crosses epochs in the wrong direction.
+Every database in this format pays for snapshot capability whether or not it
+ever calls `read_tx`, so it matters exactly what that cost is. There are two
+parts, and only the second was avoidable.
 
-Every writer therefore uses the intention-first, history-emitting protocol under
-this design. There is no runtime latest-only database mode, and epoch admission
-and history emission remain part of the write protocol even while the
-operational switch rejects new snapshots. Inline current values remain available
-as a strict-read optimization after certification. Preserving ADR-051-like
-single read-write latency while emitting mandatory history is a research goal,
-not a requirement on the baseline. Any replacement is acceptable only if its
-user-visible latency and throughput pass the workload gate below.
+The logged commit paths keep their latency. ADR-020's protocol and ADR-027's
+parallel single read-write commit both remain in force, because a commit
+timestamp needs no object of its own and no ordering against anything global.
+Dropping epochs is what buys this: there is no admission step for an install to
+race, so the edge-ordering problem that would have forced every writer onto one
+intention-first protocol does not arise.
 
-An epoch-aware single-write optimization remains possible future work. Any such
-optimization needs its own ADR and must preserve the epoch-edge, durability, and
-abort-fencing proofs. It is not a prerequisite for accepting snapshot reads.
+ADR-051's logless direct commit does not survive, and that is the real cost.
+That path commits an eligible small overwrite with a single leaf CAS, writing no
+transaction object and no external record at all. Mandatory history needs an
+immutable payload and a certificate for every version, and one leaf CAS cannot
+produce them, so an inline-eligible overwrite falls back to ADR-027's logged
+parallel path. Small single-key overwrites are exactly the workload ADR-051 was
+built for, so the gate below must measure them against the inline baseline
+rather than against the logged one.
+
+What ADR-051 does keep is its representation, and it gets more useful here than
+it was. Inline current bytes remain authoritative for strict latest reads, and
+because ADR-039 records the current version's commit timestamp in the entry,
+they also answer any cut at or above it. Only the one-CAS commit is lost.
+
+On top of that sits ADR-039's history: an extra immutable payload per written
+key, predecessor capture, asynchronous certification, and the bytes all of that
+retains. Inline values are paid for twice, since the leaf copy and the history
+payload both persist for the retention window, which is a reason to re-tune
+ADR-051's budgets rather than inherit them.
+
+One cost moves the other way. ADR-051's logless CAS introduced an in-doubt
+outcome of its own, because an attempt cancelled after dispatch may or may not
+have committed with no record to consult. Removing that path removes that case,
+so the in-doubt surface returns to what the logged protocol already had.
+
+Restoring a certified one-CAS commit is a research goal rather than a
+prerequisite. Any such path needs its own ADR and must preserve the durability
+and abort-fencing proofs while still emitting history.
 
 ## Performance acceptance gate
 
 Snapshot capability cannot be opted out, including by applications that never
-call `read_tx`. Consequently ADR-037 through ADR-041 remain **Proposed** until a
-reviewed benchmark report shows reasonable latency and throughput for the
-mandatory format/protocol across the primary workloads below. An operationally
-`disabled` snapshot state is not an escape hatch: it changes retention and
-admission, not write format or commit work.
+call `read_tx`. Consequently ADR-037 through ADR-041, ADR-052, and ADR-055 remain
+**Proposed** until a reviewed benchmark report shows reasonable cost for the
+mandatory format across the primary workloads below. An operationally `disabled`
+state is not an escape hatch: it changes retention, not write format.
+
+Because the logged commit paths are unchanged, this gate is narrower than it
+would have been under a coordinated cut. It measures what ADR-039's history
+costs: extra immutable payloads, predecessor capture, asynchronous
+certification, and retained bytes. Commit-path latency is still measured, to
+confirm that the timestamp genuinely rides along rather than adding a wave.
+
+One cell is not narrow, and it is the one to watch. An inline-eligible small
+overwrite loses ADR-051's single-CAS commit and falls back to the logged path,
+so its regression is structural rather than incremental. It must be measured as
+its own predeclared cell against the inline baseline; a favorable aggregate over
+larger values must not be allowed to absorb it.
 
 The benchmark plan compares the proposed format with the current
 ADR-020/027/051 latest-value format under the same backend latency, concurrency,
 logical work, value sizes, and fault profile. It is explicitly outcome-based:
-storage-wave count, lane layout, and use of a specialized fast path are not pass
-criteria.
+storage-wave count and use of a specialized fast path are not pass criteria.
 
 For every primary workload cell below, the initial reasonableness budget is p95
 and p99 latency at most `1.25x` baseline and statistically converged throughput
@@ -601,9 +987,12 @@ The four primary workload families are:
   of the returned values, each in strict and snapshot mode; plus strict
   scan-then-write. The finite matrix includes small and large results, mid-leaf
   and cross-leaf bounds, stable membership and create/delete churn, and reports
-  both transactions and logical keys/bytes per second. `prefix` and `all` are
-  conformance cases over the same primitive rather than separate performance
-  families.
+  both transactions and logical keys/bytes per second. It also includes a cold
+  cache and a cache warmed by an earlier scan, over both an unchanged collection
+  and one with a small change set, because ADR-055 is what makes a warm cache
+  worth anything to a snapshot scan and a cold-cache-only matrix would never
+  exercise it. `prefix` and `all` are conformance cases over the same primitive
+  rather than separate performance families.
 
 Use representative fan-outs and values from 1 KiB through 1 MiB where the
 operation actually reads or writes values, including hot keys and concurrent
@@ -615,35 +1004,28 @@ certification and write-back queues reach a stationary bound at the offered
 load; queue stability is measurement validity, not a separate performance
 budget.
 
-Within the read-only families, include acquisition cells matching the project's
-existing 500-client scale profile: 500 independent active clients renewing
-certificates uniformly every 50 seconds (ten uncached fences per second, leaving
-margin inside the 90-second staleness bound after the 30-second uncertainty
-deduction), plus a cold burst of 100 independent clients. For the cold case,
-which has no current equivalent, the predeclared absolute targets are at least
-ten uncached begins per second in steady state and at least 99% of the burst
-binding within the 30-second begin timeout. Clone-family cached binds are
-separate cells. These are read-workload latency and throughput targets, not a
-required acquisition mechanism.
+Binding no longer has an acquisition mechanism to benchmark, so the former
+fence-rate and cold-burst cells are gone. What remains worth measuring at the
+project's existing 500-client scale profile is that binding stays free in
+practice: report the fraction of binds served from an observation the client
+already held, and the latency of the idle-client case that must refresh one.
 
 Run the matrix when no snapshot is ever requested as well as with concurrent
-snapshot reads. Separate warm registered lanes, newly opened epochs, cold
-clients, clone-family begins, and independently opened clients. Repeat under
-healthy operation, object-store tail latency, CAS contention, lost replies, and
+snapshot reads, and separate warm clients from idle ones. Repeat under healthy
+operation, object-store tail latency, CAS contention, lost replies, and
 history-certification backlog.
 
 Report foreground p50/p95/p99 latency and storage waves, scale-out throughput,
 backend reads/writes/CAS retries per committed transaction, bytes written and
-retained, asynchronous backlog, forced abort/retry rate, and estimated object
+retained, asynchronous backlog, commit-age abort rate, and estimated object
 operation and storage cost. Metrics other than the latency, throughput, and
 stationary-queue validity check diagnose the result but do not mandate a
-particular implementation. Cold registration is reported separately rather than
-hidden in the average.
+particular implementation.
 
-If any primary workload cannot meet the predeclared latency and throughput
-budgets without invalidating the epoch-edge or durability proofs, reject this
-snapshot design. Do not add a strict-only database format or make snapshot
-correctness conditional on an opt-out.
+If any primary workload cannot meet the predeclared budgets without invalidating
+the cut, durability, or fencing arguments, reject this snapshot design. Do not
+add a strict-only database format or make snapshot correctness conditional on an
+opt-out.
 
 ## Comparison
 
@@ -659,9 +1041,10 @@ See the official [bbolt transaction documentation](https://pkg.go.dev/go.etcd.io
 
 ### FoundationDB
 
-FoundationDB gives a transaction one read version; its transaction system and
-storage servers provide the ordered frontier that GlassDB must synthesize from
-object-store CAS. FoundationDB normally retains only a short multi-version
+FoundationDB gives a transaction one read version, obtained from a proxy that
+every transaction must contact. That centralized sequencer is what GlassDB has
+no equivalent of, and building one out of object-store CAS is the model this
+design rejected. FoundationDB normally retains only a short multi-version
 window—its documentation describes reads older than roughly five seconds as
 potentially `transaction_too_old`. Its term "snapshot read" also has a narrower
 meaning inside a read-write transaction: the read omits conflict ranges rather
@@ -673,42 +1056,60 @@ GlassDB trades substantially more retained object history for hour-scale,
 serverless snapshots and keeps strict read-write transactions as a separate
 mode.
 
+### Hybrid-logical-clock databases
+
+CockroachDB, YugabyteDB, and MongoDB all define read timestamps from a hybrid
+logical clock rather than a sequencer, which is the family this design joins.
+They synchronize node clocks with an external time service and size an
+uncertainty interval against it. GlassDB has no nodes to synchronize, so it
+takes the physical component from the one party every client already contacts
+on every operation, and pays for that with staleness rather than with a
+restart-on-uncertainty rule that a long read-only execution could not use.
+
 ## Validation
 
 The protocol needs deterministic tests at its externally visible and recovery
-boundaries, not only unit tests of the epoch state machine. At minimum, the test
-plan must cover:
+boundaries. At minimum, the test plan must cover:
 
-- admission append versus lane close in both CAS orders, a next-generation
-  commit before the fence reply, competing sealers, and crash recovery after
-  every transition;
-- certificate reuse and expiry before, during, and after the final control read,
-  proving that acquisition retries neither invoke the closure nor reset the
-  original begin timeout, and that exhaustion selects exactly fallback or
-  `FreshSnapshotUnavailable`;
-- partial manifests, commit versus forced abort of a live lease, lost
-  acknowledgements, root tombstone/recreate versus delayed reclamation, and
-  delayed artifacts after an epoch seals;
-- serialization-edge tests for point, absence/membership, range, and catalog
-  predicates plus structural-gate admission, including delayed older installs
-  and later-epoch readers;
-- shared strict/snapshot conformance tests for ADR-033's half-open `range`,
-  `prefix`, `all`, exclusive `after`, `limit`, `next_after`, sorted materialized
-  pages, zero limit, invalid bounds, and a collection missing at the selected
-  cut; strict-only tests retain staged create/delete/overwrite behavior;
-- the existing ADR-033 conflict cases under strict fallback: pending committed
-  membership holders, create/delete races, logical-page acceptance across value
-  overwrites and pure splits, the lock-free first read-only attempt followed by
-  full-read-set locked retry, and expanding-frontier scan-plus-write locking;
-- a strict-fallback conflict after the first page and before the second, proving
-  that the whole closure restarts from its first `scan_keys` call and no resume
-  state or page from the failed attempt enters the returned result;
+- timestamp monotonicity per key and across serialization edges, including a
+  writer whose local clock is far behind, a delayed install racing a later
+  reader, and wound versus wait resolution of a conflicting holder;
+- injected fleet skew at and beyond the margin, proving that a cut stays intact
+  within the margin and that the failure outside it is reproducible rather than
+  incidental;
+- a message-anchored backend that stamps its reported time before the write
+  applies, at and beyond the request timeout, proving that the apply-anchoring
+  allowance is what covers the gap and that an apply-anchored backend needs
+  none of it;
+- a reported time arriving from something other than the origin, proving the
+  backend discards it rather than admitting a foreign clock;
+- local clock and backend diverging by a leap smear's excursion, proving the
+  drift detector tolerates it;
+- a client that never refreshes its observation, proving its cuts grow staler
+  and never become inconsistent, plus the cache-served execution that must
+  refresh or expire;
+- backends that report no server time, and the documented client-clock mode,
+  each failing closed or degrading exactly as specified;
+- partial manifests, commit versus commit-age abort, lost acknowledgements,
+  root tombstone/recreate versus delayed reclamation, and delayed artifacts
+  arriving after a slot closes;
+- a reader encountering a pending holder at, just below, and just above its
+  cut, proving it resolves exactly the first two and waits on no other writer;
+- shared conformance tests for ADR-033's half-open `range`, `prefix`, `all`,
+  exclusive `after`, `limit`, `next_after`, sorted materialized pages, zero
+  limit, invalid bounds, and a collection missing at the selected cut;
 - point, forward `KeyScan`, pagination, split, and catalog reads checked against
-  an oracle reconstructed from the transactions certified in each sealed epoch;
-- a multi-page walk bound at epoch `E` while create, delete, overwrite, and split
+  an oracle reconstructed from the transactions committed at or before each cut;
+- a multi-page walk bound at cut `T` while create, delete, overwrite, and split
   operations occur between pages, proving the final keys have no gaps or
-  duplicates and all point-read values match `E`; a separate `read_tx` is
+  duplicates and all point-read values match `T`; a separate `read_tx` is
   explicitly allowed to bind a later cut;
+- an inline-eligible small overwrite, proving it takes the logged path and
+  emits history, that its inline bytes still serve strict latest reads, and that
+  those bytes are never mistaken for a historical version at any cut;
+- a snapshot read of a key whose current version sits at, just below, and just
+  above the cut, proving the first two are answered from the leaf with no
+  history object read and the third is not, including the tombstone case;
 - create/delete/recreate history, committed holders awaiting write-back,
   malformed predecessor chains, and exact GC floor-version boundaries; after a
   delete and pruning at each boundary, point lookup plus forward `KeyScan`
@@ -716,54 +1117,136 @@ plan must cover:
 - expiry around every storage await and while the user closure future is
   pending, including simulated process suspension, with late results discarded
   and page failure remaining atomic;
-- qualified and unqualified duration-clock behavior under suspension, forward
-  jumps, disagreement with the coarse detector, and recovery: an unhealthy
-  reader discards its result while an unhealthy GC worker retains history;
-- bind versus disable in both object-orderings, plus delayed GC operations
-  across disable/drain/rebuild at exact retention boundaries, with crash/restart
-  after every ownerless transition and rebuild step;
-- clone-family acquisition singleflight and independent-client fence contention
-  under the workload and regression budgets in the performance gate.
+- local-clock drift in both directions against the backend's reported time,
+  proving detection, that an unhealthy client stops binding but keeps
+  committing, and that an unhealthy GC worker retains history;
+- a key overwritten many times inside one slot, proving that after closure only
+  the newest version at each grid point survives, that every cut still reads the
+  same value it read before coalescing, and that a predecessor reference into a
+  coalesced version is not reported as corruption;
+- a delete and recreate inside one slot, proving the intermediate tombstone
+  coalesces away while a slot-final tombstone is retained along with the
+  enumeration invariant it carries;
+- a transaction committing at the very edge of the commit-age bound against a
+  slot GC is closing, proving closure and coalescing cannot race a version into
+  a cut that was already served;
+- a FIFO workload deleting distinct keys from one end of a range for longer than
+  the retention window, proving leaf size and split count track live keys rather
+  than the delete rate, and that a snapshot scan over the emptied range still
+  enumerates exactly the keys present at its cut;
+- a residue migration interleaved with a split of the same leaf, and with a
+  strict read, a strict write, and a snapshot scan over the migrating key,
+  proving the key is enumerated exactly once throughout and never disappears
+  between the two structures;
+- a scan binding a cut against a cache warmed an hour earlier over a collection
+  that did not change, proving bodies are transferred for no leaf and requests
+  scale with pages rather than leaves, and the same scan against a collection
+  where a few leaves changed, proving exactly those are re-read;
+- a leaf written between a cached observation and the listing that reports it,
+  proving the differing revision never advances a watermark, and a leaf omitted
+  from a page entirely, proving omission neither installs absence nor marks the
+  entry obsolete;
+- a listing whose `started-at` precedes the cached observation it reports,
+  proving a stale page cannot lower a watermark or invalidate newer evidence;
+- a leaf rewritten with byte-identical contents, proving the unchanged revision
+  is treated as no rewrite and that the cut still resolves correctly, which is
+  ADR-042's semantics rather than an exception to them;
+- a cut at, just above, and just below the history floor, proving the first two
+  bind and the third returns `SnapshotTooOld`, plus a floor advancing past a
+  running execution's cut, proving it is caught on the next observation refresh
+  and discards its result rather than returning it;
+- GC crashing between publishing a floor and performing the reclamation it
+  authorizes, proving recovery is safe in that order and unsafe in the reverse
+  one, and that a reader validating against a floor observation at the
+  staleness bound still precedes the reclamation;
+- an injected reader-versus-GC clock-rate violation over a full retention
+  window, proving a pruned deleted key surfaces `SnapshotTooOld` rather than
+  reading as absent, which is the wrong answer this mechanism exists to prevent;
+- bind versus disable across the control-staleness bound, plus delayed GC
+  operations across disable/drain/rebuild at exact retention boundaries, with
+  crash/restart after every ownerless transition and rebuild step.
 
 The existing deterministic-simulation tape replay, PCT schedules, cycle and
 membership workloads, fault injection, and byte-identical operation replay are
-the basis. A new epoch oracle must verify the exact logical state of every
-sealed cut; serializability-only ring checks do not prove cut selection or
-freshness.
+the basis, extended with a modeled backend clock. A new cut oracle must verify
+the exact logical state at every grid point; serializability-only ring checks do
+not prove cut selection or freshness.
 
 ## Constituent ADRs
 
 - **[ADR-037](../adr/037-bounded-staleness-snapshot-transactions.md) —
   Bounded-staleness snapshot transactions.** *Proposed.* Defines the public
-  read-only contract, fallback, fixed cut/deadline, and persisted policy.
-- **[ADR-038](../adr/038-cooperative-sealed-epochs.md) — Cooperative sealed
-  epochs.** *Proposed.* Defines the global frontier, sparse admission lanes,
-  intention-first writers, cooperative sealing, and fail-closed liveness.
-- **[ADR-039](../adr/039-epoch-versioned-key-history.md) — Epoch-versioned key
-  history.** *Proposed.* Defines independently reclaimable values and indexed
-  per-key history.
+  read-only contract, the fixed cut and deadline, and the persisted policy.
+- **[ADR-038](../adr/038-hlc-snapshot-cuts.md) — Hybrid-logical-clock snapshot
+  cuts.** *Proposed.* Defines timestamp assignment, propagation across locks,
+  cut selection, the grid, and the commit-age bound.
+- **[ADR-039](../adr/039-timestamp-versioned-key-history.md) —
+  Timestamp-versioned key history.** *Proposed.* Defines independently
+  reclaimable values and indexed per-key history.
 - **[ADR-040](../adr/040-snapshot-history-retention.md) — Snapshot history
   retention.** *Proposed.* Defines pin-free retention, floor versions,
-  supersession-based GC, and the admission disable switch.
-- **[ADR-041](../adr/041-epoch-versioned-collection-catalog.md) —
-  Epoch-versioned collection catalog.** *Proposed.* Makes collection existence
-  and parent-child membership part of the same global cut as data.
+  supersession-based GC, and the bind-disable switch.
+- **[ADR-041](../adr/041-timestamp-versioned-collection-catalog.md) —
+  Timestamp-versioned collection catalog.** *Proposed.* Makes collection
+  existence and parent-child membership part of the same cut as data.
+- **[ADR-052](../adr/052-backend-server-time-observation.md) — Backend
+  server-time observation.** *Proposed.* Supplies the comparable clock ADR-038
+  requires, and is a prerequisite for it.
+- **[ADR-055](../adr/055-batched-cache-revalidation-by-listing.md) — Batched
+  cache revalidation by listing.** *Proposed.* Reports object revisions in
+  listings so a scan revalidates a warm cache per page rather than per object.
 
 ## Open questions / future work
 
 - Complete the mandatory performance gate before accepting any constituent ADR.
   Reject the design if any of the four primary workload families misses its
-  predeclared latency or throughput budget.
-- Consider an epoch-aware single-write fast path only if profiling justifies its
-  complexity; it is not an acceptance prerequisite.
-- Qualify the supported platform clock matrix and runtime health detector for
-  the BOOTTIME-class contract, including suspension tests and fail-closed
-  behavior.
-- Tune lane segmentation, local batch size, and the number of lanes per active
-  client without adding an intentional batching delay. Choose final-phase grace
-  from measured admission-to-terminal and backend tail latency.
+  predeclared budget.
+- Verify how each supported backend reports server time and how the in-process
+  and simulated backends model it, including injectable fleet skew.
+- Qualify the supported platform clock matrix for the BOOTTIME-class elapsed
+  contract, including suspension tests and fail-closed behavior. This is now a
+  deadline concern rather than a consistency one.
+- Choose the margin from measured provider fleet skew rather than from the
+  conservative default proposed here.
 - Choose history-chunk and sparse-index sizing from hot-key and range-scan
   benchmarks while preserving a bounded lookup.
+- Investigate restoring a certified single-CAS commit for inline-eligible
+  overwrites, recovering what ADR-051 loses here. This is the largest identified
+  regression and the reason ADR-037 keeps rejecting a second format, so its
+  feasibility should be settled before the format is considered final even
+  though it is not a prerequisite for acceptance. Two obstacles define the
+  search, and they are of different difficulty.
+
+  The first looks harder than it is. A one-CAS commit writes only the leaf, and
+  mandatory history wants an immutable payload plus a certificate. But the
+  certificate exists to give a *multi-key* write set one atomic outcome, and an
+  eligible transaction touches exactly one key, so the CAS is already its
+  outcome. What remains is retaining the superseded version, and for a value
+  small enough to inline, that could stay in the leaf as a short in-node version
+  chain that spills to an external chunk only when it outgrows a budget. The
+  trade is leaf size, CAS bandwidth, and split rate against object count, which
+  is the same trade ADR-051's budgets already make.
+
+  The second is the real obstacle. A logged writer stamps from its own
+  lock-install responses, so the gap between stamp and apply is bounded by one
+  request, which is what the apply-anchoring allowance covers. A direct commit
+  installs nothing, so it must stamp from an observation it already holds, and
+  nothing bounds that observation's age except the client's local clock. Too old
+  an observation lets a write install after a reader's observation while
+  carrying a timestamp below the reader's cut, which is precisely the invisible
+  write the margin exists to prevent. Restricting the path to a healthy client
+  holding a recent observation, and adding the permitted age as a fourth margin
+  allowance, would close it — at the cost of readmitting local clock rate into
+  eligibility, though not into cut selection itself. Whether that is an
+  acceptable weakening is the question to answer first, because it decides
+  whether the rest is worth designing.
+- Reconsider a per-slot change log if a collection grows large enough that
+  ADR-055's listing dominates. Listing costs one request per page of the prefix
+  regardless of how little changed, while a log indexed by change would cost
+  nothing for the unchanged remainder. The obstacles are recorded in ADR-055:
+  the log needs its own reclamation and a completeness proof, and keeping it off
+  the commit path forces a background build that has to repartition transactions
+  by object.
 - Add safe online `SnapshotPolicy` enlargement/shrinkage if operational demand
   justifies its transition protocol.
 - Define collection drop and physical topology reclamation using the reserved
@@ -774,28 +1257,48 @@ freshness.
 This design extends the object-storage-native transaction protocol and the
 dynamic range-sharding B-link topology. On acceptance:
 
-- ADR-038 inserts epoch admission into ADR-020's commit sequence.
+- ADR-052 extends ADR-023's backend trait with a server-time observation and
+  leaves its operation set, opaque versions, and conditional read unchanged.
+- ADR-038 adds a commit timestamp to ADR-020's existing sequence without adding
+  an operation to it. ADR-027's parallel single read-write commit is unaffected.
 - ADR-039 supersedes ADR-019's unified value placement and ADR-051's logless
-  direct-commit guarantee, adds retained per-key history, and keeps inline
-  current values as a strict-read optimization.
+  direct-commit guarantee, adds retained per-key history, and extends ADR-051's
+  inline current values from a strict-read optimization to a cut-read one.
+- ADR-028's same-key round reservation exists only to protect a direct commit's
+  in-doubt recovery evidence. With no direct commits in this format it becomes
+  vestigial; the coordinator invariant it sits on is unaffected.
 - ADR-040 supersedes ADR-022's current-reference-only liveness for committed
-  values and its cleanup of outcome evidence needed as an epoch fence, while
-  retaining its pending-lock recovery machinery and ADR-035's paginated,
-  sharded discovery of transaction and pre-admission preparation garbage.
-- ADR-041 supersedes ADR-016, ADR-018, and ADR-031 where they make the physical
-  `_i` root authoritative for collection existence and parent-child membership,
-  plus ADR-022's unconditional deletion of reusable root paths.
+  values and its cleanup of outcome evidence needed as a fence, while retaining
+  its pending-lock recovery machinery and ADR-035's paginated, sharded discovery
+  of transaction and preparation garbage. It also gives GC an ordering
+  obligation ADR-022 has no equivalent of: publish the history floor before
+  acting on it.
+- ADR-041 versions ADR-046 and ADR-047's ID-based collection directories, and
+  supersedes ADR-016, ADR-018, and ADR-031 where they make the physical `_i`
+  root authoritative for collection existence and parent-child membership.
 - ADR-031/032/044's copy-before-shrink topology and structural gate remain the
-  physical routing proof;
-  history retention adds the no-premature-teardown constraint.
+  physical routing proof; history retention adds the no-premature-teardown
+  constraint. ADR-039 additionally refines ADR-031's soft split cap to count live
+  entries only, so that retention cannot reshape a tree ADR-031 has no merge to
+  reshape back; its split protocol, right-link traversal, and hard object cap are
+  untouched.
+- ADR-036's local validation watermarks remain process-local and separate from
+  ADR-052's cross-client observation. A cached leaf may serve a cut only under
+  the rule in [Cut definition](#cut-definition). ADR-055 changes how cheaply a
+  watermark is advanced, not what a watermark means or when one suffices.
+- ADR-055 extends ADR-035's `ListPage` alone. Pagination, the opaque cursor,
+  unspecified ordering, and the non-snapshot traversal are unchanged, and the
+  last of these is why a listing may only advance watermarks and never conclude
+  absence. It relies on ADR-042's revision-as-content-validator semantics, so an
+  identical rewrite is deliberately indistinguishable.
 - ADR-037 extends rather than supersedes ADR-033: `ReadTransaction` uses the same
   forward `KeyScan`/`KeyPage` surface. Calls inside one snapshot execution share
-  a fixed cut, strict fallback calls share one retryable OCC attempt, and
-  separate `Collection::scan_keys` calls retain ADR-033's current behavior.
+  a fixed cut, and separate `Collection::scan_keys` calls retain ADR-033's
+  current behavior.
 - ADR-035's opaque backend-list cursor is independent of key-based
-  `KeyScan::after`; neither carries a snapshot between `read_tx` calls.
+  `KeyScan::after`; neither carries a cut between `read_tx` calls.
 
-On acceptance, ADR-038/039 supersede ADR-051's logless direct path and partially
-supersede ADR-027's parallel first-intent fallback with the intention-first,
-history-emitting baseline. A future certified fast-path ADR may optimize that
-baseline without changing snapshot semantics.
+On acceptance, ADR-039 supersedes ADR-051's logless direct-commit path, because
+a single leaf CAS cannot emit history. ADR-027's logged parallel path is
+unaffected and absorbs that traffic. A future certified one-CAS ADR may restore
+the optimization without changing snapshot semantics.
