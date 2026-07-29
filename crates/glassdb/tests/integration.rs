@@ -191,7 +191,7 @@ async fn stats_report_direct_commit_coverage() {
     db.tx(|tx| {
         let coll = coll.clone();
         async move {
-            let value = tx.read(&coll, b"key").await?.unwrap();
+            let value = tx.read(&coll, b"key").await?.ok_or(Error::NotFound)?;
             tx.write(&coll, b"key", &value)
         }
     })
@@ -444,6 +444,53 @@ async fn concurrent_rmw() {
 
     let val = coll2.read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 60);
+}
+
+// ADR-053: a single-key read-modify-write whose version is superseded before it
+// publishes replays its body, reevaluating against the winner under the same
+// transaction. The caller sees one successful commit applied exactly once, and
+// the key stays on the logless path — falling back to locking would publish a
+// holder that pushes its next writer off the direct path for no reason.
+#[tokio::test(start_paused = true)]
+async fn a_superseded_read_modify_write_replays_without_locking() {
+    let db = init_db(mem()).await;
+    let coll = create_top(&db, b"replay-c").await;
+    coll.write(b"key", &write_int(1)).await.unwrap();
+
+    let before = db.stats();
+    let attempts = AtomicUsize::new(0);
+    db.tx(|tx| {
+        let coll = coll.clone();
+        let attempts = &attempts;
+        async move {
+            let n = read_int_from_tx(&tx, &coll, b"key").await?;
+            // Supersede the read exactly once, after the body observed it.
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                coll.write(b"key", &write_int(100)).await?;
+            }
+            tx.write(&coll, b"key", &incremented_value(b"key", n, 1)?)
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the superseded attempt replays its body once"
+    );
+    assert_eq!(
+        read_int(&coll.read(b"key").await.unwrap().unwrap()),
+        101,
+        "the replay incremented the winner's value, not the stale one it read"
+    );
+
+    // The interposed overwrite and the replayed commit both land directly, and
+    // neither the loss nor the replay ever acquires a lock.
+    let delta = db.stats() - before;
+    assert_eq!(delta.direct_commit_landed, 2);
+    assert_eq!(delta.lock_calls, 0, "a replayed loss publishes no holder");
+    assert_eq!(delta.tx_retries, 1);
 }
 
 #[tokio::test(start_paused = true)]

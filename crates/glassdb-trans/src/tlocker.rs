@@ -1311,6 +1311,7 @@ impl DataLocker {
                 | FoldOutcome::Reroute
                 | FoldOutcome::Landed
                 | FoldOutcome::Moved
+                | FoldOutcome::Replay
                 | FoldOutcome::InDoubt(_) => {
                     return Ok(ShardOutcome::Conflict);
                 }

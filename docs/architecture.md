@@ -612,9 +612,17 @@ no write-back ([ADR-051](adr/051-inline-latest-values.md)). The CAS installs
 `Inline { writer: txid, value }` with no lock holder, which is simultaneously the
 commit point and the published value: a reader that sees it needs nothing else,
 and a reader that does not see it observes the predecessor. Eligibility is
-decided before anything is written — a live pending or unknown holder, an
-exclusive structural gate, a collection-delete intent, a moved read version, or a
-value over either inline budget makes the transaction fall through to the logged
+decided before anything is written, so an attempt that does not commit has staged
+nothing at all.
+
+That makes a non-landing attempt something to *classify* rather than fail
+([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A
+read-modify-write whose loss is certified — excluded from a coordinator round, or
+superseded before publication — replays its body under the same, still
+unengaged, id, so a local scheduling loss does not publish a holder that would
+push the key's next writer onto the logged path. Genuine ineligibility — a live
+pending or unknown holder, an exclusive structural gate, a collection-delete
+intent, a missing key, or a value over either inline budget — takes the logged
 path below under the same id.
 
 Because the commit is invisible until the CAS lands, a retry is proved
@@ -623,7 +631,7 @@ a cancelled attempt writes no aborted object (the abort guard fires only for a
 transaction that took a logged identity). The coordinator reserves the key for at
 most one logless member per round, so a batched blind writer cannot erase another
 direct commit's recovery evidence. An uncertain CAS followed by a moved entry
-surfaces `Error::InDoubt` as usual.
+surfaces `Error::InDoubt` as usual, and is never downgraded to a replay.
 
 #### Single read-modify-write, logged
 

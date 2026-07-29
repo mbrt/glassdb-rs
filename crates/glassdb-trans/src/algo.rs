@@ -378,7 +378,7 @@ impl ShardResolver for CommitInstallResolver {
         // entry: a live pending holder, a moved pointer, or a superseded read
         // means we lost the race.
         let res = resolve_entry_locks(ctx, &self.key, cur, None).await?;
-        if eligible_writer(&res, self.read_version.as_ref()).is_none() {
+        if eligible_writer(&res, self.read_version.as_ref()).is_err() {
             return Ok(Step::Skip {
                 outcome: self.unlanded(ctx),
             });
@@ -456,9 +456,11 @@ impl CommitInstallResolver {
 /// the budgets close (a leaf that cannot fit the payload).
 ///
 /// Like [`CommitInstallResolver`] it re-resolves eligibility on every fold and
-/// classifies its own fate. `Landed` means committed; `Moved` means nothing was
-/// written, so the caller may fall back to the logged protocol under the same
-/// id; `InDoubt` means the CAS may have committed and must not be re-run.
+/// classifies its own fate. `Landed` means committed; `Replay` means nothing was
+/// written *and* the loss is certified, so the caller may reevaluate the
+/// transaction body under the same id (ADR-053); `Moved` means nothing was
+/// written but only the locked protocol can resolve the entry's state;
+/// `InDoubt` means the CAS may have committed and must not be re-run.
 struct DirectCommitResolver {
     id: TxId,
     raw_key: Vec<u8>,
@@ -493,17 +495,22 @@ impl ShardResolver for DirectCommitResolver {
             || staged_locks.delete_intent().is_some()
         {
             return Ok(Step::Skip {
-                outcome: self.unlanded(ctx),
+                outcome: self.unlanded(ctx, Ineligible::Locked),
             });
         }
 
         let res = resolve_entry_locks(ctx, &self.key, cur, None).await?;
-        let mut admission = InlineAdmission::new(ctx.inline, staged);
-        if eligible_writer(&res, self.read_version.as_ref()).is_none()
-            || !admission.admit(&self.raw_key, &self.value)
-        {
+        if let Err(why) = eligible_writer(&res, self.read_version.as_ref()) {
             return Ok(Step::Skip {
-                outcome: self.unlanded(ctx),
+                outcome: self.unlanded(ctx, why),
+            });
+        }
+        // A budget the folded leaf closes is a stable property of that leaf, not
+        // a race a re-run of the body can win (ADR-053).
+        let mut admission = InlineAdmission::new(ctx.inline, staged);
+        if !admission.admit(&self.raw_key, &self.value) {
+            return Ok(Step::Skip {
+                outcome: self.unlanded(ctx, Ineligible::Locked),
             });
         }
 
@@ -536,7 +543,23 @@ impl ShardResolver for DirectCommitResolver {
         if in_doubt {
             return FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into());
         }
+        // An exhausted CAS budget does not certify that this attempt staged
+        // nothing durable in an earlier attempt of the round, so it is not a
+        // body-replay case (ADR-053).
         FoldOutcome::Moved
+    }
+
+    fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        if in_doubt {
+            return FoldOutcome::InDoubt(format!(
+                "direct commit for {} in-doubt: excluded after an uncertain CAS",
+                self.id
+            ));
+        }
+        // A peer claimed the key before this member folded, so it staged nothing
+        // at all this round: a read-modify-write may reevaluate its body against
+        // the winner rather than publish a holder (ADR-053).
+        self.definitive_loss()
     }
 
     fn owned_keys(&self) -> Vec<&[u8]> {
@@ -555,21 +578,50 @@ impl DirectCommitResolver {
     }
 
     /// How to report a fold that is not publishing the commit marker. Every such
-    /// reason (a structural gate, a delete fence, a lost race, a budget the
-    /// folded leaf rejects) is only evidence that the marker is *not there now*.
-    /// Without an in-doubt CAS that also proves nothing was ever written, so the
-    /// logged protocol takes over under the same id. After one it cannot be told
-    /// from our own commit having landed and then been superseded, so the
-    /// ambiguity is irreducible (ADR-051).
-    fn unlanded(&self, ctx: &ResolveCtx<'_>) -> FoldOutcome {
+    /// reason is only evidence that the marker is *not there now*. Without an
+    /// in-doubt CAS that also proves nothing was ever written; after one it
+    /// cannot be told from our own commit having landed and then been
+    /// superseded, so the ambiguity is irreducible and is never downgraded to a
+    /// replay (ADR-051, ADR-053).
+    fn unlanded(&self, ctx: &ResolveCtx<'_>, why: Ineligible) -> FoldOutcome {
         if matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
             return FoldOutcome::InDoubt(format!(
                 "direct commit for {} in-doubt: marker absent after an uncertain CAS",
                 self.id
             ));
         }
-        FoldOutcome::Moved
+        match why {
+            Ineligible::Replay => self.definitive_loss(),
+            Ineligible::Locked => FoldOutcome::Moved,
+        }
     }
+
+    /// How to report a loss that provably staged nothing durable. Only a
+    /// read-modify-write has a read-dependent computation worth reevaluating; a
+    /// blind overwrite would recompute the same bytes, so it takes the locked
+    /// protocol instead (ADR-053).
+    fn definitive_loss(&self) -> FoldOutcome {
+        match self.read_version {
+            Some(_) => FoldOutcome::Replay,
+            None => FoldOutcome::Moved,
+        }
+    }
+}
+
+/// What an attempted direct commit (ADR-051) established about its transaction,
+/// so the engine can tell a certified logless loss from genuine ineligibility
+/// (ADR-053). An in-doubt attempt is not represented here: it is an error,
+/// because it must never be re-run.
+enum DirectAttempt {
+    /// The one-CAS commit landed. The transaction is committed.
+    Committed,
+    /// Nothing durable was staged and the loss is certified, so the
+    /// read-modify-write body is reevaluated against current state under the
+    /// same, still unengaged, id.
+    Replay,
+    /// The attempt met state only the regular locked protocol can resolve, so it
+    /// acquires and validates through the general path under the same id.
+    Locked,
 }
 
 /// A transaction shaped like a single read-write overwrite (ADR-027): the value
@@ -613,30 +665,47 @@ fn single_rw_shape(data: &Data) -> Option<SingleRw> {
     })
 }
 
+/// Why a direct attempt cannot publish over an entry, and therefore what the
+/// engine may do about it (ADR-053).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ineligible {
+    /// The read this write depends on is definitively superseded. Nothing
+    /// durable was staged, so the read-modify-write body can be reevaluated
+    /// against the winner under the same id.
+    Replay,
+    /// The entry holds state the direct path cannot arbitrate. Only the regular
+    /// locked protocol resolves it, so replaying the body would spin.
+    Locked,
+}
+
 /// Decides the effective committed writer the single read-write fast path must
-/// build on from lock-domain entry state, or `None` when the key cannot
-/// take the fast path's commit CAS.
+/// build on from lock-domain entry state, or why the key cannot take the fast
+/// path's commit CAS.
 ///
 /// Writer resolution help-forwards a committed holder while lock coordination
 /// separately classifies live conflicts. A create / put over a tombstone or a
 /// read-modify-write whose read was superseded is rejected (ADR-027).
-fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Option<TxId> {
+///
+/// Only a superseded read is [`Ineligible::Replay`], and the checks are ordered
+/// so a stronger reason wins: a key read as deleted names the same writer that
+/// deleted it, so testing existence first keeps it on the locked path (ADR-053).
+fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Result<TxId, Ineligible> {
     // A live holder is a genuine conflict: defer to the full locked path so it
     // can wound-wait. Committed/aborted holders never reach `pending`.
     if !res.pending.is_empty() {
-        return None;
+        return Err(Ineligible::Locked);
     }
     // The key must currently exist; a create or a put over a tombstone has no
     // predecessor value, which the fast path does not handle.
     let writer = match &res.writer {
         Some(w) if !res.deleted() => w.clone(),
-        _ => return None,
+        _ => return Err(Ineligible::Locked),
     };
     match read_version {
         // A read-modify-write commits only if its read is still current.
-        Some(rv) if rv != &writer => None,
+        Some(rv) if rv != &writer => Err(Ineligible::Replay),
         // A blind put (no read) is last-writer-wins and always serializable.
-        _ => Some(writer),
+        _ => Ok(writer),
     }
 }
 
@@ -769,9 +838,10 @@ impl Algo {
     /// only when a higher-priority peer aborted this transaction, so it must
     /// retry with a fresh id (priority preserved), or [`TransError::Retry`] when
     /// the body must re-run in place — a read-only transaction whose reads
-    /// changed, or a read-write transaction whose read moved before it locked
-    /// the key (re-run holding its locks, ADR-024). CAS contention and suspected
-    /// deadlocks are handled internally.
+    /// changed, a read-write transaction whose read moved before it locked the
+    /// key (re-run holding its locks, ADR-024), or a read-modify-write whose
+    /// certified logless loss leaves it holding nothing at all (ADR-053). CAS
+    /// contention and suspected deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.data.writes.is_empty() && !tx.collection_data.has_writes() {
             if tx.should_lock_reads() {
@@ -787,8 +857,15 @@ impl Algo {
         // write + one shard CAS (ADR-020/ADR-027). Both write nothing when
         // ineligible, so the full locked path takes over under the same id.
         if tx.collection_data.reads.is_empty() && tx.collection_data.changes.is_empty() {
-            if self.try_commit_direct(tx).await?.is_some() {
-                return Ok(());
+            match self.try_commit_direct(tx).await? {
+                DirectAttempt::Committed => return Ok(()),
+                // A certified logless loss reevaluates the body rather than
+                // publishing a holder that would make every subsequent direct
+                // attempt on the key ineligible (ADR-053). The id is unengaged —
+                // no object, no lock, no published identity — so the ordinary
+                // retry contract applies with no cleanup.
+                DirectAttempt::Replay => return Err(TransError::Retry),
+                DirectAttempt::Locked => {}
             }
             if self.try_commit_single_rw(tx).await?.is_some() {
                 return Ok(());
@@ -1215,13 +1292,14 @@ impl Algo {
     }
 
     /// Resolves the committed predecessor a single read-write fast path would
-    /// build on, and the leaf that owns its key, or `None` when the key cannot
-    /// take a fast-path commit CAS at all — a create, a genuinely conflicting
-    /// entry, a superseded read, or a closed structural gate. Checked before
-    /// anything is written, so an ineligible transaction falls back to the full
-    /// path under the same id. A lock left by an *already-committed* writer
-    /// whose write-back is still pending does not block: it is help-forwarded
-    /// to its effective writer, the predecessor we build on (ADR-027).
+    /// build on, and the leaf that owns its key, or why the key cannot take a
+    /// fast-path commit CAS at all — a create, a genuinely conflicting entry, a
+    /// superseded read, or a closed structural gate. Checked before anything is
+    /// written, so an ineligible transaction either replays its body or falls
+    /// back to the locked path under the same id (ADR-053). A lock left by an
+    /// *already-committed* writer whose write-back is still pending does not
+    /// block: it is help-forwarded to its effective writer, the predecessor we
+    /// build on (ADR-027).
     ///
     /// Resolves on the shard the transaction body's read already cached
     /// (`Any`: no revalidation round-trip). The commit fold below re-reads the
@@ -1237,13 +1315,13 @@ impl Algo {
         key: &KeyRef,
         raw_key: &[u8],
         read_version: Option<&TxId>,
-    ) -> Result<Option<Predecessor>, TransError> {
+    ) -> Result<Result<Predecessor, Ineligible>, TransError> {
         let (_, locator) = self.resolver.resolve_key(key, Requirement::Any).await?;
         if locator
             .node()
             .is_some_and(|node| node.structural_gate().lock_type() == LockType::Write)
         {
-            return Ok(None);
+            return Ok(Err(Ineligible::Locked));
         }
         let entry = locator
             .node()
@@ -1275,23 +1353,27 @@ impl Algo {
     /// value itself. It installs no lock, writes no transaction object, and has
     /// nothing to write back — the CAS is the commit point.
     ///
-    /// Returns `Ok(Some(()))` on a committed CAS; `Ok(None)` when the
-    /// transaction is not eligible or lost the race, in which case *nothing has
-    /// been written* so the caller falls back to the logged protocol under the
-    /// **same id**; and an in-doubt [`StorageError::Unavailable`] when the CAS
-    /// may have committed (re-running the body could apply it twice).
+    /// Nothing is written unless the CAS commits, so a non-landing attempt is
+    /// classified rather than failed (ADR-053): a read-modify-write whose loss is
+    /// *certified* — excluded from its coordinator round, or superseded before
+    /// publication — reports [`DirectAttempt::Replay`] and reevaluates its body
+    /// under the **same id**, while everything else reports
+    /// [`DirectAttempt::Locked`] and takes the regular locked protocol. An
+    /// in-doubt CAS that may have committed is an error
+    /// ([`StorageError::Unavailable`]) and is never replayed, because re-running
+    /// the body could apply it twice.
     ///
     /// The attempt publishes no pre-commit identity, so it cannot be wounded and
     /// takes no part in wound-wait. Cancellation before the CAS leaves no state;
     /// after it, the outcome is crash-equivalent.
-    async fn try_commit_direct(&self, tx: &mut Handle) -> Result<Option<()>, TransError> {
+    async fn try_commit_direct(&self, tx: &mut Handle) -> Result<DirectAttempt, TransError> {
         let Some(SingleRw {
             key,
             value,
             read_version,
         }) = single_rw_shape(&tx.data)
         else {
-            return Ok(None);
+            return Ok(DirectAttempt::Locked);
         };
         self.direct_commit_stats
             .candidates
@@ -1299,14 +1381,18 @@ impl Algo {
         // The per-value budget is decidable here; the aggregate leaf budget
         // needs the folded leaf, so the resolver re-checks both.
         if value.len() > self.coord.inline_policy().max_value_bytes {
-            return Ok(None);
+            return Ok(DirectAttempt::Locked);
         }
         let raw_key = key.key().to_vec();
-        let Some(Predecessor { leaf_path, writer }) = self
+        let Predecessor { leaf_path, writer } = match self
             .single_rw_predecessor(&key, &raw_key, read_version.as_ref())
             .await?
-        else {
-            return Ok(None);
+        {
+            Ok(predecessor) => predecessor,
+            // A read superseded before anything was staged is the second
+            // certified body-replay case (ADR-053).
+            Err(Ineligible::Replay) => return Ok(DirectAttempt::Replay),
+            Err(Ineligible::Locked) => return Ok(DirectAttempt::Locked),
         };
 
         let resolver = Arc::new(DirectCommitResolver {
@@ -1333,22 +1419,30 @@ impl Algo {
                 // collectable. Only a hint: it was resolved before the CAS, and
                 // a logless predecessor has no object to collect at all.
                 feed_gc_hints(&self.gc, vec![writer]);
-                Ok(Some(()))
+                Ok(DirectAttempt::Committed)
             }
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::InDoubt(msg),
                 ..
             }) => Err(TransError::Storage(StorageError::Unavailable(msg))),
-            // These outcomes staged nothing, so the logged protocol takes over
-            // under the same id: the entry moved or is genuinely contended
-            // (`Moved`), the inline node did not fit or the round was exhausted
-            // (`Conflict`), a split moved the key (`Reroute`), or a shutdown
-            // ran no CAS at all (`None`).
+            // The round certified that this read-modify-write staged nothing
+            // durable, so its body is reevaluated instead of publishing a holder
+            // merely because it shared a coordinator round (ADR-053).
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Replay,
+                ..
+            }) => Ok(DirectAttempt::Replay),
+            // These outcomes staged nothing either, but none of them certifies
+            // the replay case, so the locked protocol takes over under the same
+            // id: the entry moved or is genuinely contended (`Moved`), the inline
+            // node did not fit or the round was exhausted (`Conflict`), a split
+            // moved the key (`Reroute`), or a shutdown ran no CAS at all
+            // (`None`).
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Moved | FoldOutcome::Conflict | FoldOutcome::Reroute,
                 ..
             })
-            | None => Ok(None),
+            | None => Ok(DirectAttempt::Locked),
             Some(_) => Err(TransError::other(
                 "direct commit produced a non-commit outcome",
             )),
@@ -1391,7 +1485,7 @@ impl Algo {
             return Ok(None);
         };
         let raw_key = key.key().to_vec();
-        let Some(Predecessor {
+        let Ok(Predecessor {
             leaf_path,
             writer: effective,
         }) = self
@@ -2494,13 +2588,13 @@ mod tests {
     }
 
     // Single-rw fast path (ADR-030): a lone read-modify-write whose read was
-    // superseded is caught with a transparent retry, never a surfaced error, and
-    // never commits its stale value. The exact retry flavour depends only on
-    // whether the commit's `Any` eligibility snapshot was still cached:
-    // `Wounded` when a stale snapshot passed the check and the seeded CAS then
-    // missed (renew via the regular path, no lock held), or `Retry` when the
-    // snapshot was evicted, so the eligibility read fell through to fresh bytes
-    // and the full path validated after locking. Both converge on a fresh read.
+    // superseded by *another instance* is caught with a transparent retry, never
+    // a surfaced error, and never commits its stale value. This client's cached
+    // snapshot predates the peer's create, so the key reads as absent — an
+    // unsupported shape rather than a certified stale read, which is why the
+    // locked path takes over instead of replaying the body (ADR-053). It resolves
+    // as `Wounded` or `Retry` depending on whether the snapshot survived to the
+    // commit fold; both converge on a fresh read.
     #[tokio::test]
     async fn single_rw_stale_read_renews_and_converges() {
         let (tm, tctx) = new_algo().await;
@@ -3331,18 +3425,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             eligible_writer(&res, Some(&h1)),
-            Some(h1.clone()),
+            Ok(h1.clone()),
             "an RMW that read the committed holder builds on it"
         );
         assert_eq!(
             eligible_writer(&res, None),
-            Some(h1.clone()),
+            Ok(h1.clone()),
             "a blind put builds on the committed holder"
         );
         assert_eq!(
             eligible_writer(&res, Some(&h0)),
-            None,
-            "a read of the superseded value is still stale"
+            Err(Ineligible::Replay),
+            "a read of the superseded value is stale, and replayable"
         );
 
         // End to end: the writer commits over H1 (help-forwarding it into the
@@ -3525,6 +3619,317 @@ mod tests {
                 "{what} cannot disprove a landed uncertain CAS, got {outcome:?}"
             );
         }
+    }
+
+    // ADR-053: only a *superseded read* certifies the body-replay case, and an
+    // uncertain CAS still outranks it. Every other way a fold declines is either
+    // state the direct path cannot arbitrate or evidence that proves nothing, so
+    // it reports `Moved` and the locked protocol takes over. Classifying too
+    // broadly would spin the body forever against a holder or a closed budget.
+    #[tokio::test]
+    async fn direct_commit_replays_only_a_certified_superseded_read() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = key_ref(b"k");
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+        let seed = entry(&tctx, b"k").await.unwrap();
+        let current = seed.current.writer().cloned().unwrap();
+        let locks = NodeLocks::default();
+
+        let direct = |read_version| DirectCommitResolver {
+            id: TxId::with_priority(9, b"direct"),
+            raw_key: b"k".to_vec(),
+            key: keyp.clone(),
+            value: Arc::from(b"v2".as_slice()),
+            read_version,
+        };
+
+        // A read the entry has moved past: nothing is staged and the loss is
+        // definitive, so the body is reevaluated against the winner.
+        let stale = direct(Some(TxId::with_priority(1, b"stale")));
+        let staged = BTreeMap::from([(b"k".to_vec(), seed.clone())]);
+        let outcome = fold(&stale, &tctx, ReloadCause::Fresh, &staged, &locks).await;
+        assert!(
+            matches!(outcome, FoldOutcome::Replay),
+            "a superseded read staged nothing and can be reevaluated, got {outcome:?}"
+        );
+        let outcome = fold(
+            &stale,
+            &tctx,
+            ReloadCause::Reloaded { in_doubt: true },
+            &staged,
+            &locks,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FoldOutcome::InDoubt(_)),
+            "an uncertain CAS is never downgraded to a replay, got {outcome:?}"
+        );
+
+        // A live pending holder is a genuine conflict only wound-wait resolves,
+        // even though this transaction also staged nothing.
+        let holder = TxId::with_priority(1, b"holder");
+        tctx.tmon.begin_tx(&holder);
+        let held = ShardEntry {
+            lock_type: LockType::Write,
+            locked_by: vec![holder],
+            ..seed.clone()
+        };
+        let outcome = fold(
+            &direct(Some(current.clone())),
+            &tctx,
+            ReloadCause::Fresh,
+            &BTreeMap::from([(b"k".to_vec(), held)]),
+            &locks,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FoldOutcome::Moved),
+            "a live holder needs the locked protocol, not a replay, got {outcome:?}"
+        );
+
+        // A key read as deleted names the very writer that deleted it, so the
+        // read is *not* superseded. Testing existence before the read version is
+        // what keeps this unsupported shape off the replay path.
+        let deleter = TxId::with_priority(1, b"deleter");
+        let buried = ShardEntry {
+            current: CurrentState::Tombstone {
+                writer: deleter.clone(),
+            },
+            ..seed.clone()
+        };
+        let outcome = fold(
+            &direct(Some(deleter)),
+            &tctx,
+            ReloadCause::Fresh,
+            &BTreeMap::from([(b"k".to_vec(), buried)]),
+            &locks,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FoldOutcome::Moved),
+            "a put over a tombstone is unsupported, not stale, got {outcome:?}"
+        );
+
+        // The round-level classifications: a same-key claim proves this member
+        // folded nothing, while a spent CAS budget proves nothing about an
+        // earlier attempt of the same round. And a blind overwrite has no
+        // read-dependent computation to reevaluate.
+        let rmw = direct(Some(current));
+        assert!(matches!(rmw.excluded_outcome(false), FoldOutcome::Replay));
+        assert!(matches!(
+            rmw.excluded_outcome(true),
+            FoldOutcome::InDoubt(_)
+        ));
+        assert!(
+            matches!(rmw.exhausted_outcome(false), FoldOutcome::Moved),
+            "an exhausted budget does not certify a replay"
+        );
+        assert!(
+            matches!(direct(None).excluded_outcome(false), FoldOutcome::Moved),
+            "a blind overwrite takes the locked protocol instead of replaying"
+        );
+    }
+
+    // ADR-053: a read-modify-write whose observed version is superseded before
+    // anything is published reevaluates its body under the same id. Nothing was
+    // staged, so the attempt neither renews nor takes a lock — publishing one
+    // would make the key's next direct attempt ineligible for no reason.
+    #[tokio::test]
+    async fn direct_commit_superseded_read_replays_in_place() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = key_ref(b"k");
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+
+        // Read v1, then let a later commit supersede it. Both versions are this
+        // client's own, so its snapshot sees the winner rather than a stale leaf.
+        let stale = do_read(&tctx, &keyp).await;
+        let winner = commit_writes(&tm, vec![wa(&keyp, b"v2")])
+            .await
+            .id()
+            .clone();
+
+        let mut h = begin_data(
+            &tm,
+            Data {
+                reads: vec![stale],
+                writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
+            },
+        );
+        let err = tm.commit(&mut h).await.unwrap_err();
+        assert!(
+            matches!(err, TransError::Retry),
+            "a superseded read replays its body in place, got {err:?}"
+        );
+        assert!(
+            !h.engaged,
+            "a replayed attempt staged nothing, so it publishes no identity"
+        );
+        let status = tctx
+            .tlogger
+            .commit_status_at(h.id(), Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            status.status,
+            TxCommitStatus::Unknown,
+            "a replayed attempt wrote no transaction object"
+        );
+        tm.end(&mut h).await.unwrap();
+
+        // The stale value never committed and the key kept its logless shape.
+        let e = entry(&tctx, b"k").await.unwrap();
+        assert_eq!(e.current.writer(), Some(&winner));
+        assert!(
+            e.locked_by.is_empty(),
+            "a replayed attempt publishes no holder"
+        );
+
+        // Reevaluating against the winner commits directly.
+        let fresh = do_read(&tctx, &keyp).await;
+        let replayed = commit_access(
+            &tm,
+            Data {
+                reads: vec![fresh],
+                writes: vec![wa(&keyp, b"v3")],
+                scans: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(
+            entry(&tctx, b"k").await.unwrap().current,
+            CurrentState::Inline {
+                writer: replayed.id().clone(),
+                value: Arc::from(b"v3".as_slice()),
+            },
+            "the replayed body commits in one leaf CAS"
+        );
+    }
+
+    // ADR-053 regression: two eligible read-modify-writes on one key share a
+    // coordinator round, where only one may stage its logless commit. The loser
+    // must reevaluate its body under the same id rather than publish a holder —
+    // creating one would make every subsequent direct attempt on the key
+    // ineligible, turning a local scheduling loss into a lasting logged phase.
+    #[tokio::test(start_paused = true)]
+    async fn direct_commit_same_key_round_loser_replays_its_body() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let (tm, tctx) = new_algo_from_backend(backend).await;
+
+        let ka = b"k".to_vec();
+        let kb = same_shard_sibling(&ka);
+        let kap = key_ref(&ka);
+        let kbp = key_ref(&kb);
+        commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
+        commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
+
+        // Both attempts read the same current version, so both are eligible.
+        let ra1 = do_read(&tctx, &kap).await;
+        let ra2 = do_read(&tctx, &kap).await;
+        let rmw = |read| {
+            begin_data(
+                &tm,
+                Data {
+                    reads: vec![read],
+                    writes: vec![wa(&kap, b"v2")],
+                    scans: Vec::new(),
+                },
+            )
+        };
+        let (mut h1, mut h2) = (rmw(ra1), rmw(ra2));
+
+        // A disjoint-key acquire drives the round and parks in the gated load, so
+        // both direct commits queue into one still-open batch. Their own first
+        // fold attempt is cache-served (`Any`, ADR-030), so without a driver they
+        // would each win a solo round and never contend.
+        gate.arm();
+        let driver = TxId::with_priority(1, b"driver");
+        tctx.tmon.begin_tx(&driver);
+        let locker = tctx.locker.clone();
+        let data_b = Data {
+            reads: Vec::new(),
+            writes: vec![wa(&kbp, b"vb2")],
+            scans: Vec::new(),
+        };
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
+        let acquire = tokio::spawn(async move {
+            locker
+                .data()
+                .lock_at(&driver, &data_b, false, requirement)
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+
+        let ta = tm.clone();
+        let first = tokio::spawn(async move {
+            let res = ta.commit(&mut h1).await;
+            (h1, res)
+        });
+        let tb = tm.clone();
+        let second = tokio::spawn(async move {
+            let res = tb.commit(&mut h2).await;
+            (h2, res)
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(matches!(
+            acquire.await.unwrap().unwrap(),
+            LockOutcome::Locked(_)
+        ));
+        let (h1, r1) = first.await.unwrap();
+        let (h2, r2) = second.await.unwrap();
+
+        // Which member wins the round's claim depends on id order; that exactly
+        // one does is the property under test.
+        let (winner, replayed) = match (&r1, &r2) {
+            (Ok(()), Err(TransError::Retry)) => (h1.id().clone(), h2),
+            (Err(TransError::Retry), Ok(())) => (h2.id().clone(), h1),
+            other => panic!("expected one commit and one replay, got {other:?}"),
+        };
+
+        // The winner's commit is the leaf CAS itself, and the loser left nothing
+        // behind for a peer to resolve: no holder on the key and no transaction
+        // object under its still-unengaged id.
+        let e = entry(&tctx, &ka).await.unwrap();
+        assert_eq!(
+            e.current,
+            CurrentState::Inline {
+                writer: winner,
+                value: Arc::from(b"v2".as_slice()),
+            },
+            "the round's winner published its value directly"
+        );
+        assert!(
+            e.locked_by.is_empty(),
+            "the contended round published no holder"
+        );
+        assert!(
+            !replayed.engaged,
+            "a replayed attempt publishes no identity"
+        );
+        let status = tctx
+            .tlogger
+            .commit_status_at(replayed.id(), Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            status.status,
+            TxCommitStatus::Unknown,
+            "the replayed attempt wrote no transaction object"
+        );
+
+        // Reevaluating the body against the winner converges without locking.
+        let ra3 = do_read(&tctx, &kap).await;
+        let mut h = rmw(ra3);
+        tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
+        assert_eq!(
+            entry(&tctx, &ka).await.unwrap().current.writer(),
+            Some(h.id()),
+            "the replayed body commits directly on its next attempt"
+        );
     }
 
     // The same classification for ADR-027's logged fast path, whose commit is

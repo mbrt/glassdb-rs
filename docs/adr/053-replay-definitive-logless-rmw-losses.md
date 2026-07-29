@@ -2,7 +2,12 @@
 
 ## Status
 
-Proposed.
+Accepted.
+
+The body-replay classification is implemented (the direct resolver's
+`Replay` / locked-fallback split and the coordinator's separate
+same-key-exclusion outcome). Removing ADR-027's parallel logged path, which this
+decision also requires, is still outstanding.
 
 This refines
 [ADR-051](051-inline-latest-values.md)'s direct-commit fallback policy.

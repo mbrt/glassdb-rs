@@ -98,6 +98,11 @@ pub(crate) enum FoldOutcome {
     /// the key is now genuinely locked by someone else), so the fast path must
     /// renew its id and re-run. Definitively did not land.
     Moved,
+    /// A logless direct commit definitively staged nothing *and* the round
+    /// certifies it left no durable state anywhere, so its read-modify-write
+    /// body may be reevaluated against the current version under the same id
+    /// rather than publishing a holder (ADR-053).
+    Replay,
     /// A commit-critical CAS was in-doubt (`Unavailable`) and the re-fold could
     /// not prove whether it landed, so the commit may or may not have happened:
     /// the one irreducible ambiguity, surfaced rather than risking a
@@ -207,6 +212,17 @@ pub(crate) trait ShardResolver: Send + Sync {
 
     /// The outcome delivered when a structural change invalidated routing.
     fn reroute_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        self.exhausted_outcome(in_doubt)
+    }
+
+    /// The outcome delivered when a peer already claimed one of this member's
+    /// [`logless_keys`](ShardResolver::logless_keys) this round, so nothing was
+    /// folded for it at all. Distinct from exhaustion: the peer's claim proves
+    /// this member staged nothing, which a spent CAS budget does not, so a
+    /// resolver may treat it as a certified loss rather than an unknown one
+    /// (ADR-053). `in_doubt` still reports whether an *earlier* attempt of this
+    /// round carried this member's own stage.
+    fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
         self.exhausted_outcome(in_doubt)
     }
 
@@ -487,13 +503,14 @@ impl CasWorker {
                 // A logless commit's staged entry is the only evidence it ever
                 // ran, so a second one on the same key would erase the first
                 // within one uncertain write (ADR-051). Fold nothing for it: it
-                // learns it did not land and takes the logged protocol.
+                // learns it did not land, and because the claim proves it staged
+                // nothing this attempt, it learns that definitively (ADR-053).
                 if m.resolver
                     .logless_keys()
                     .iter()
                     .any(|&k| logless.contains(k))
                 {
-                    let outcome = m.resolver.exhausted_outcome(in_doubt.contains(tx));
+                    let outcome = m.resolver.excluded_outcome(in_doubt.contains(tx));
                     results.push((tx.clone(), outcome, false));
                     continue;
                 }
@@ -1667,11 +1684,32 @@ mod tests {
     // the only record of its commit, so it claims its key for the round and
     // classifies an abandoned round the way `DirectCommitResolver` does — the
     // ambiguity is irreducible only if its own stage rode a CAS that may have
-    // landed.
+    // landed. `replayable` models a read-modify-write, whose certified losses are
+    // `Replay` rather than `Moved` (ADR-053), and makes exclusion observably
+    // distinct from exhaustion.
     struct LoglessCommitProbe {
         key: Vec<u8>,
         tx: TxId,
         value: Arc<[u8]>,
+        replayable: bool,
+    }
+
+    impl LoglessCommitProbe {
+        fn new(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
+            Self {
+                key: key.to_vec(),
+                tx: tx.clone(),
+                value: Arc::from(value),
+                replayable: false,
+            }
+        }
+
+        fn replayable(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
+            Self {
+                replayable: true,
+                ..Self::new(key, tx, value)
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1704,6 +1742,16 @@ mod tests {
         fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
             if in_doubt {
                 return FoldOutcome::InDoubt("logless commit after an uncertain CAS".into());
+            }
+            FoldOutcome::Moved
+        }
+
+        fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt {
+                return FoldOutcome::InDoubt("logless commit after an uncertain CAS".into());
+            }
+            if self.replayable {
+                return FoldOutcome::Replay;
             }
             FoldOutcome::Moved
         }
@@ -1765,11 +1813,7 @@ mod tests {
             c1.submit_shard(
                 &leaf(),
                 &t1,
-                Arc::new(LoglessCommitProbe {
-                    key: b"k".to_vec(),
-                    tx: t1.clone(),
-                    value: Arc::from(b"first".as_slice()),
-                }),
+                Arc::new(LoglessCommitProbe::new(b"k", &t1, b"first")),
                 Requirement::Any,
             )
             .await
@@ -1780,11 +1824,7 @@ mod tests {
             c2.submit_shard(
                 &leaf(),
                 &t2,
-                Arc::new(LoglessCommitProbe {
-                    key: b"k".to_vec(),
-                    tx: t2.clone(),
-                    value: Arc::from(b"second".as_slice()),
-                }),
+                Arc::new(LoglessCommitProbe::new(b"k", &t2, b"second")),
                 Requirement::Any,
             )
             .await
@@ -1811,6 +1851,127 @@ mod tests {
                 })
             ),
             "the skipped member never staged, so its loss stays definitive"
+        );
+        coord.close().await;
+    }
+
+    // ADR-053: a same-key claim is reported through `excluded_outcome`, not
+    // `exhausted_outcome`. The distinction is load-bearing — the claim proves the
+    // excluded member folded nothing at all, while a spent CAS budget proves
+    // nothing about an earlier attempt — so a read-modify-write shaped member
+    // learns a *replayable* loss where an exhausted round would only tell it the
+    // entry moved.
+    #[tokio::test(start_paused = true)]
+    async fn an_excluded_logless_member_learns_a_replayable_loss() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+
+        gate.arm();
+        let (c1, t1) = (coord.clone(), first.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (c2, t2) = (coord.clone(), second.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(matches!(
+            driver.await.unwrap().unwrap(),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            })
+        ));
+        assert!(
+            matches!(
+                joiner.await.unwrap().unwrap(),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Replay,
+                    cas_precondition: None,
+                })
+            ),
+            "the excluded member folded nothing, so its loss is replayable"
+        );
+        coord.close().await;
+    }
+
+    // ADR-053: an excluded member does not inherit the uncertainty of a *different*
+    // member's write. Even when the round's first CAS comes back in-doubt, the
+    // member that was skipped for a same-key claim issued no write of its own, so
+    // its own lack of durable effects still certifies a replay rather than
+    // stranding it in-doubt.
+    #[tokio::test(start_paused = true)]
+    async fn an_excluded_replayable_member_does_not_inherit_the_rounds_in_doubt() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (gated, gate) = Gate::wrap(mem);
+        let backend = in_doubt_then_ok(gated as Arc<dyn Backend>) as Arc<dyn Backend>;
+        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+
+        gate.arm();
+        let (c1, t1) = (coord.clone(), first.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (c2, t2) = (coord.clone(), second.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(
+            matches!(
+                driver.await.unwrap().unwrap(),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Landed,
+                    ..
+                })
+            ),
+            "the member whose CAS was retried lands on the second attempt"
+        );
+        assert!(
+            matches!(
+                joiner.await.unwrap().unwrap(),
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Replay,
+                    cas_precondition: None,
+                })
+            ),
+            "the skipped member issued no write, so it replays rather than doubting"
         );
         coord.close().await;
     }
