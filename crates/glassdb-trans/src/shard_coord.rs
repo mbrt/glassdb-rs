@@ -90,13 +90,12 @@ pub(crate) enum FoldOutcome {
     /// The submitted leaf no longer owns one of this operation's keys. The
     /// caller must descend again and regroup before retrying.
     Reroute,
-    /// The single read-write commit-install landed: this transaction's write
-    /// lock is in the shard's version chain, or it was already there (idempotent,
-    /// help-forwarded). The committed object may now be published (ADR-027).
+    /// A logless direct commit landed: this transaction's value is published in
+    /// the shard's version chain, or it was already there (idempotent, ADR-051).
     Landed,
-    /// The commit-install lost the race: the entry moved to another writer (or
-    /// the key is now genuinely locked by someone else), so the fast path must
-    /// renew its id and re-run. Definitively did not land.
+    /// A logless direct commit lost the race: the entry moved to another writer
+    /// (or the key is now genuinely locked by someone else), so only the regular
+    /// locked protocol can resolve it. Definitively did not land.
     Moved,
     /// A logless direct commit definitively staged nothing *and* the round
     /// certifies it left no durable state anywhere, so its read-modify-write
@@ -123,9 +122,9 @@ pub(crate) struct CoordinatedOutcome {
 /// first pass, or a re-fold after a CAS that failed precondition
 /// (`Reloaded { in_doubt: false }`) or came back in-doubt
 /// (`Reloaded { in_doubt: true }`). The in-doubt bit is the member's own: it is
-/// set only for the members whose stage rode the uncertain CAS. Only the
-/// commit-install resolver consults it — to distinguish a definitive `Moved`
-/// from an irreducible `InDoubt` — so every other resolver ignores it and stays
+/// set only for the members whose stage rode the uncertain CAS. Only the direct
+/// commit resolver consults it — to distinguish a definitive loss from an
+/// irreducible `InDoubt` — so every other resolver ignores it and stays
 /// idempotent across re-folds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReloadCause {
@@ -266,7 +265,7 @@ struct ShardMember {
 /// descent. `members` maps each contending transaction to its installed
 /// resolver and outcome slot. `first_requirement` is the cache requirement for the
 /// round's first fold attempt: `Any` lets a lone round reuse a leaf the
-/// submitter just cached (the single read-write fast path) without a
+/// submitter just cached (the logless direct commit) without a
 /// revalidation round-trip. A failed mutation invalidates that exact seed, so
 /// retries use `Any` to consume the winner or newer shared knowledge.
 #[derive(Clone)]
@@ -311,7 +310,7 @@ impl MergeRequest for CasReq {
     fn can_reorder(&self) -> bool {
         // Read-only acquires, releases, and write-backs can join any batch
         // instead of FIFO-blocking behind an unrelated writer (ADR-026); an
-        // exclusive acquire / commit-install keeps FIFO order. A pure scheduling
+        // exclusive acquire / direct commit keeps FIFO order. A pure scheduling
         // hint — merging itself no longer depends on it.
         self.members.values().all(|m| m.resolver.reorderable())
     }
@@ -492,7 +491,7 @@ impl CasWorker {
                 // Mutating this leaf would strand the key, so deliver the
                 // member's re-route outcome — the same signal it uses to
                 // re-descend after exhausting the CAS budget (an acquirer's
-                // `Conflict` release-and-relock, the fast path's `Moved` renew) —
+                // `Conflict` release-and-relock, a direct commit's `Moved`) —
                 // and fold nothing for it. Its caller re-resolves through the
                 // directory and re-submits on the leaf that now owns the key.
                 if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
@@ -579,8 +578,8 @@ impl CasWorker {
                     }
                     // In-doubt lock CAS (ADR-009): re-folding our own resolvers
                     // over a freshly-read shard is idempotent, so recover in place
-                    // by reloading and re-folding. Commit-install must treat a
-                    // subsequent move as irreducibly in-doubt (ADR-027) — but only
+                    // by reloading and re-folding. A direct commit must treat a
+                    // subsequent move as irreducibly in-doubt (ADR-051) — but only
                     // the members this CAS actually carried.
                     Err(StorageError::Unavailable(_)) => {
                         in_doubt.extend(
@@ -856,7 +855,7 @@ impl ShardCoordinator {
 
     /// Submits one shard member (any resolver installed by a caller — the
     /// [`Locker`](crate::Locker)'s acquire / write-back / release or the
-    /// [`Algo`](crate::Algo)'s commit-install) through the [`Dedup`] and awaits
+    /// [`Algo`](crate::Algo)'s direct commit) through the [`Dedup`] and awaits
     /// its single-round [`CoordinatedOutcome`]. The worker merges it into any
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus any successful-CAS
@@ -2368,12 +2367,12 @@ mod tests {
         backend
     }
 
-    // A commit-install-shaped resolver: it stages its write lock (issuing a CAS)
-    // on its first two folds, then on the third fold classifies its lost race the
-    // same way `CommitInstallResolver` does — `InDoubt` if any earlier CAS this
-    // round was in-doubt, else a definitive `Moved`. Records the deciding fold's
+    // A commit-shaped resolver: it stages a mutation (issuing a CAS) on its first
+    // two folds, then on the third fold classifies its lost race the same way
+    // `DirectCommitResolver` does — `InDoubt` if any earlier CAS this round was
+    // in-doubt, else a definitive `Moved`. Records the deciding fold's
     // `in_doubt` cause so the test can pin the coordinator's state machine.
-    struct StickyInstallProbe {
+    struct StickyCommitProbe {
         key: Vec<u8>,
         tx: TxId,
         folds: std::sync::atomic::AtomicUsize,
@@ -2381,7 +2380,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for StickyInstallProbe {
+    impl ShardResolver for StickyCommitProbe {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
@@ -2426,18 +2425,18 @@ mod tests {
         }
     }
 
-    // Regression (single read-write fast path double-apply): once any CAS in a
-    // round comes back in-doubt, its write may have landed durably and been
-    // help-forwarded to a peer, so the in-doubt classification must stay *sticky*
-    // across a later precondition-miss. Otherwise a commit-install whose lock
-    // landed-but-unacked (then superseded) is misclassified `Moved`, and the fast
-    // path abandons and re-runs a non-idempotent write a peer already observed —
-    // breaking the `final <= started` serializability bound.
+    // Regression (logless commit double-apply): once any CAS in a round comes
+    // back in-doubt, its write may have landed durably and been help-forwarded to
+    // a peer, so the in-doubt classification must stay *sticky* across a later
+    // precondition-miss. Otherwise a commit that landed-but-unacked and was then
+    // superseded is misclassified `Moved`, and its caller abandons and re-runs a
+    // non-idempotent write a peer already observed — breaking the
+    // `final <= started` serializability bound.
     //
     // This pins the coordinator half of the fix in isolation: the exact `cause`
     // state transition, driven with a stubbed member so no concurrent scheduling
-    // is needed. The *end-to-end* manifestation (the real commit-install being
-    // abandoned and double-applying under the true 3-way co-batched interleaving)
+    // is needed. The *end-to-end* manifestation (a real commit being abandoned
+    // and double-applying under the true 3-way co-batched interleaving)
     // is covered deterministically by the committed fuzz reproducer
     // `fuzz/corpus/concurrent_tx/crash-95084997…`, which the corpus-replay test
     // (`crates/glassdb/tests/fuzz_corpus.rs`) replays through the sim scheduler.
@@ -2465,7 +2464,7 @@ mod tests {
             .submit_shard(
                 &leaf(),
                 &tx,
-                Arc::new(StickyInstallProbe {
+                Arc::new(StickyCommitProbe {
                     key: b"k".to_vec(),
                     tx: tx.clone(),
                     folds: std::sync::atomic::AtomicUsize::new(0),
@@ -2491,12 +2490,12 @@ mod tests {
                 })
             ),
             "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
-             not Moved (else the fast path abandons and double-applies)"
+             not Moved (else the caller abandons and double-applies)"
         );
     }
 
-    // A commit-install-shaped resolver that keeps staging until the round's
-    // retry budget is exhausted.
+    // A commit-shaped resolver that keeps staging until the round's retry budget
+    // is exhausted.
     struct AlwaysStageProbe {
         key: Vec<u8>,
         tx: TxId,
@@ -2564,7 +2563,7 @@ mod tests {
     }
 
     // Regression: exhausting the retry budget must not turn a possibly-landed
-    // commit-install CAS into `Moved`, which would permit a non-idempotent retry.
+    // commit CAS into `Moved`, which would permit a non-idempotent retry.
     #[tokio::test]
     async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());

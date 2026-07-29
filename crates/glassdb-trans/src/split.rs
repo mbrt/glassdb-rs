@@ -2334,13 +2334,12 @@ mod tests {
         );
         other_locker
             .data()
-            .write_back_single_put(
+            .write_back_one_put(
                 &holder,
                 &paths::from_node(COLL, "L"),
                 b"d",
                 &KeyRef::new(collection(), b"d"),
                 &Arc::from(b"new-d".as_slice()),
-                None,
             )
             .await;
         let current = Directory::new(other.shards.clone())

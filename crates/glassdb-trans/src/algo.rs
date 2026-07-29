@@ -42,7 +42,7 @@ use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{
-    InlineAdmission, LockResolution, resolve_entry_locks, resolve_entry_locks_at, resolved_current,
+    InlineAdmission, LockResolution, resolve_entry_locks, resolve_entry_locks_at,
 };
 use crate::resolver::Resolver;
 use crate::shard_coord::{
@@ -313,140 +313,6 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
-/// The result of installing the single read-write fast path's write lock through
-/// the coordinator (ADR-027 / ADR-028): the shard side of the two parallel
-/// commit writes, combined by [`Algo`] with the committed-object write to decide
-/// the transaction's fate.
-enum InstallOutcome {
-    /// The write lock is installed (or we are already in the chain): this
-    /// transaction is inserted into the shard's version history.
-    Landed(Option<LeafObservation>),
-    /// The entry moved out from under us: the fast path lost the race and must
-    /// renew (its committed object, if written, becomes an orphan for GC).
-    Moved,
-    /// The lock CAS was in-doubt and the entry then moved, so it cannot be told
-    /// whether the lock landed first: irreducibly in-doubt.
-    InDoubt(String),
-}
-
-/// Installs the single read-write fast path's write lock (ADR-027): resolve the
-/// key's effective committed writer against the freshly-folded entry, then stage
-/// `locked_by = [id]` with `current_writer` help-forwarded to that writer.
-/// Commit-critical and self-classifying: unlike the locker's resolvers it reports
-/// its own fate (`Landed` / `Moved` / `InDoubt`) instead of a generic lock, and
-/// consults [`ReloadCause`] to tell a definitive loss from an irreducible
-/// in-doubt. Installed by [`Algo`] on the shard coordinator (ADR-028).
-///
-/// It re-resolves eligibility on **every** fold (never trusting the caller's
-/// pre-check across the round): the fold loads the shard fresh, so a holder
-/// installed after the pre-check must still be observed here or it would be
-/// silently stomped instead of losing the race (ADR-027 / ADR-028).
-struct CommitInstallResolver {
-    id: TxId,
-    raw_key: Vec<u8>,
-    key: KeyRef,
-    read_version: Option<TxId>,
-}
-
-#[async_trait]
-impl ShardResolver for CommitInstallResolver {
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError> {
-        let cur = staged.get(&self.raw_key);
-
-        // Already in the chain: our lock is installed, or a follow-on writer
-        // help-forwarded us into the pointer (idempotent success, ADR-027).
-        if let Some(e) = cur
-            && (e.locked_by.contains(&self.id) || e.current.writer() == Some(&self.id))
-        {
-            return Ok(Step::Skip {
-                outcome: FoldOutcome::Landed,
-            });
-        }
-
-        if staged_locks.structural_gate().lock_type() == LockType::Write {
-            return Ok(Step::Skip {
-                outcome: self.unlanded(ctx),
-            });
-        }
-
-        // Re-resolve the effective writer / eligibility against the current
-        // entry: a live pending holder, a moved pointer, or a superseded read
-        // means we lost the race.
-        let res = resolve_entry_locks(ctx, &self.key, cur, None).await?;
-        if eligible_writer(&res, self.read_version.as_ref()).is_err() {
-            return Ok(Step::Skip {
-                outcome: self.unlanded(ctx),
-            });
-        }
-
-        // Stage the write lock, publishing the resolved predecessor's current
-        // state so replacing a committed-but-not-written-back holder in
-        // `locked_by` help-forwards its value instead of orphaning it (ADR-027).
-        let mut e = cur
-            .cloned()
-            .unwrap_or_else(|| ShardEntry::new(self.raw_key.clone()));
-        e.lock_type = LockType::Write;
-        e.locked_by = vec![self.id.clone()];
-        e.current = resolved_current(
-            &self.raw_key,
-            cur,
-            &res,
-            &mut InlineAdmission::new(ctx.inline, staged),
-        );
-        Ok(Step::Stage {
-            entries: vec![(self.raw_key.clone(), e)],
-            locks: staged_locks.clone(),
-            admission: StageAdmission::ExistingKeys,
-            // The lock is installed only once the round's CAS confirms it; on a
-            // precondition/in-doubt the engine re-folds and re-classifies.
-            outcome: FoldOutcome::Landed,
-        })
-    }
-
-    fn reorderable(&self) -> bool {
-        false
-    }
-
-    fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
-        if in_doubt {
-            return FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into());
-        }
-        // Pure version churn exhausted the budget: renew and re-run (the commit
-        // point is a single CAS, so this absorbs contention, not conflict).
-        FoldOutcome::Moved
-    }
-
-    fn owned_keys(&self) -> Vec<&[u8]> {
-        // Installing the write lock may create the entry, so it must land on the
-        // leaf that owns the key — re-route (renew and re-run) if a split moved
-        // it after routing (ADR-031).
-        vec![self.raw_key.as_slice()]
-    }
-}
-
-impl CommitInstallResolver {
-    /// How to report a fold that is not installing the lock. Every such reason
-    /// (a structural gate, a live holder, a superseded read) is only evidence
-    /// that the lock is *not there now*. After an in-doubt CAS that cannot tell
-    /// a lock that never landed from one that landed and was then
-    /// help-forwarded away, so the ambiguity is irreducible; without one the
-    /// loss is definitive and the fast path renews (ADR-027).
-    fn unlanded(&self, ctx: &ResolveCtx<'_>) -> FoldOutcome {
-        if matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
-            return FoldOutcome::InDoubt(format!(
-                "single-rw lock for {} in-doubt: absent after an uncertain CAS",
-                self.id
-            ));
-        }
-        FoldOutcome::Moved
-    }
-}
-
 /// Commits an eligible single read-write transaction in one conditional leaf
 /// CAS (ADR-051): it publishes `Inline { writer, value }` over the resolved
 /// predecessor, installing no lock, writing no transaction object, and leaving
@@ -455,8 +321,8 @@ impl CommitInstallResolver {
 /// declines rather than publishing a pointer to a value nothing else holds when
 /// the budgets close (a leaf that cannot fit the payload).
 ///
-/// Like [`CommitInstallResolver`] it re-resolves eligibility on every fold and
-/// classifies its own fate. `Landed` means committed; `Replay` means nothing was
+/// It re-resolves eligibility on every fold and classifies its own fate.
+/// `Landed` means committed; `Replay` means nothing was
 /// written *and* the loss is certified, so the caller may reevaluate the
 /// transaction body under the same id (ADR-053); `Moved` means nothing was
 /// written but only the locked protocol can resolve the entry's state;
@@ -624,25 +490,24 @@ enum DirectAttempt {
     Locked,
 }
 
-/// A transaction shaped like a single read-write overwrite (ADR-027): the value
-/// it puts and, for a read-modify-write, the version its read observed.
+/// A transaction shaped like a single read-write overwrite: the value it puts
+/// and, for a read-modify-write, the version its read observed.
 struct SingleRw {
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
 }
 
-/// The predecessor a single read-write fast path builds on and the leaf that
-/// owns its key.
+/// The predecessor a direct commit builds on and the leaf that owns its key.
 struct Predecessor {
     leaf_path: String,
     writer: TxId,
 }
 
-/// Recognizes a transaction both single read-write fast paths can commit:
-/// exactly one put, no scans, and every read of that same key and found. A
-/// delete publishes a tombstone and a read that found nothing makes this a
-/// create; neither has a predecessor for the fast paths to build on.
+/// Recognizes a transaction the direct commit path can publish: exactly one put,
+/// no scans, and every read of that same key and found. A delete publishes a
+/// tombstone and a read that found nothing makes this a create; neither has a
+/// predecessor for a direct commit to build on.
 fn single_rw_shape(data: &Data) -> Option<SingleRw> {
     if data.writes.len() != 1 || !data.scans.is_empty() {
         return None;
@@ -678,13 +543,12 @@ enum Ineligible {
     Locked,
 }
 
-/// Decides the effective committed writer the single read-write fast path must
-/// build on from lock-domain entry state, or why the key cannot take the fast
-/// path's commit CAS.
+/// Decides the effective committed writer a direct commit must build on from
+/// lock-domain entry state, or why the key cannot take the direct commit CAS.
 ///
 /// Writer resolution help-forwards a committed holder while lock coordination
 /// separately classifies live conflicts. A create / put over a tombstone or a
-/// read-modify-write whose read was superseded is rejected (ADR-027).
+/// read-modify-write whose read was superseded is rejected (ADR-051).
 ///
 /// Only a superseded read is [`Ineligible::Replay`], and the checks are ordered
 /// so a stronger reason wins: a key read as deleted names the same writer that
@@ -696,7 +560,7 @@ fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Result<
         return Err(Ineligible::Locked);
     }
     // The key must currently exist; a create or a put over a tombstone has no
-    // predecessor value, which the fast path does not handle.
+    // predecessor value, which the direct path does not handle.
     let writer = match &res.writer {
         Some(w) if !res.deleted() => w.clone(),
         _ => return Err(Ineligible::Locked),
@@ -731,7 +595,7 @@ pub struct Algo {
     resolver: Resolver,
     locker: Locker,
     // The single shard-mutation coordinator (ADR-028), shared with the locker:
-    // the single read-write fast path installs its lock through this — one
+    // the logless direct commit publishes its value through this — one
     // deduplicated fold round — instead of a bespoke racing shard CAS.
     coord: ShardCoordinator,
     mon: Monitor,
@@ -851,11 +715,10 @@ impl Algo {
             return self.commit_readonly(tx).await;
         }
         self.validate_coordination_keys(&tx.data)?;
-        // Try the single read-write fast paths first, cheapest first: a lone
-        // overwrite whose value fits the inline budgets commits in one leaf CAS
-        // with no transaction object at all (ADR-051); otherwise one object
-        // write + one shard CAS (ADR-020/ADR-027). Both write nothing when
-        // ineligible, so the full locked path takes over under the same id.
+        // Try the logless direct path first: a lone overwrite whose value fits
+        // the inline budgets commits in one leaf CAS with no transaction object
+        // at all (ADR-051). It writes nothing unless it commits, so a
+        // non-landing attempt is classified rather than failed (ADR-053).
         if tx.collection_data.reads.is_empty() && tx.collection_data.changes.is_empty() {
             match self.try_commit_direct(tx).await? {
                 DirectAttempt::Committed => return Ok(()),
@@ -866,9 +729,6 @@ impl Algo {
                 // retry contract applies with no cleanup.
                 DirectAttempt::Replay => return Err(TransError::Retry),
                 DirectAttempt::Locked => {}
-            }
-            if self.try_commit_single_rw(tx).await?.is_some() {
-                return Ok(());
             }
         }
         self.commit_locked(tx).await
@@ -1291,15 +1151,15 @@ impl Algo {
         self.revalidate(tx).await
     }
 
-    /// Resolves the committed predecessor a single read-write fast path would
-    /// build on, and the leaf that owns its key, or why the key cannot take a
-    /// fast-path commit CAS at all — a create, a genuinely conflicting entry, a
-    /// superseded read, or a closed structural gate. Checked before anything is
-    /// written, so an ineligible transaction either replays its body or falls
-    /// back to the locked path under the same id (ADR-053). A lock left by an
-    /// *already-committed* writer whose write-back is still pending does not
-    /// block: it is help-forwarded to its effective writer, the predecessor we
-    /// build on (ADR-027).
+    /// Resolves the committed predecessor a direct commit would build on, and the
+    /// leaf that owns its key, or why the key cannot take the direct commit CAS at
+    /// all — a create, a genuinely conflicting entry, a superseded read, or a
+    /// closed structural gate. Checked before anything is written, so an
+    /// ineligible transaction either replays its body or falls back to the locked
+    /// path under the same id (ADR-053). A lock left by an *already-committed*
+    /// writer whose write-back is still pending does not block: it is
+    /// help-forwarded to its effective writer, the predecessor we build on
+    /// (ADR-020).
     ///
     /// Resolves on the shard the transaction body's read already cached
     /// (`Any`: no revalidation round-trip). The commit fold below re-reads the
@@ -1447,251 +1307,6 @@ impl Algo {
                 "direct commit produced a non-commit outcome",
             )),
         }
-    }
-
-    /// The single read-write fast path (ADR-027, superseding ADR-020): a
-    /// transaction that overwrites exactly one already-existing key commits with
-    /// **two parallel writes** — the committed transaction object and one shard
-    /// CAS that installs a write lock — followed by an asynchronous write-back
-    /// that converts the lock to a `current_writer` pointer. Reads may only touch
-    /// that same key (a found RMW or a blind put); anything else needs the full
-    /// path.
-    ///
-    /// The lock (rather than a bare pointer) is what lets the two writes overlap:
-    /// a locked entry is resolved through the holder's status, which tolerates a
-    /// not-yet-discoverable object, so the object write carries no happens-before
-    /// requirement against the lock write (contrast ADR-020/ADR-007).
-    ///
-    /// Returns `Ok(Some(()))` on a fast commit; `Ok(None)` when the transaction
-    /// is not eligible, in which case *nothing has been written* and the caller
-    /// falls back to the full locked path under the **same id**;
-    /// [`TransError::Wounded`] when a lost race (or a wound landing in the
-    /// parallel window) forces a renewed re-run (the speculatively-written
-    /// committed object is left unreferenced and GC'd); and an in-doubt
-    /// [`StorageError::Unavailable`] for the one irreducible ambiguity (a fast
-    /// follow-on writer moved the entry during an in-doubt lock CAS).
-    ///
-    /// Once the committed object is written the fast path never returns
-    /// `Ok(None)`: a fall-back would re-run the body under the same id against an
-    /// already-committed, immutable object holding stale values. It only
-    /// completes, renews, or surfaces in-doubt.
-    async fn try_commit_single_rw(&self, tx: &mut Handle) -> Result<Option<()>, TransError> {
-        let Some(SingleRw {
-            key,
-            value,
-            read_version,
-        }) = single_rw_shape(&tx.data)
-        else {
-            return Ok(None);
-        };
-        let raw_key = key.key().to_vec();
-        let Ok(Predecessor {
-            leaf_path,
-            writer: effective,
-        }) = self
-            .single_rw_predecessor(&key, &raw_key, read_version.as_ref())
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        // Build the committed transaction object. It records the write (and the
-        // pointer it will supersede, for GC's reverse check) plus the write lock
-        // it holds, so a dead-but-committed object still describes its own
-        // back-references (ADR-022). The decoded transaction object is published
-        // only after its durable write succeeds, so a fast path that ends up
-        // wounded or in-doubt cannot expose an uncommitted proposed object.
-        //
-        // The recorded predecessor is the resolved effective writer, so it names
-        // the true committed value even when the shard's `current_writer` pointer
-        // still lags behind a help-forwarded holder.
-        let recorded_prev = effective;
-        let mut tl = TxLog::new(tx.id.clone(), TxCommitStatus::Ok);
-        tl.locks = vec![TxLock::Entry {
-            key: key.clone(),
-            typ: LockType::Write,
-        }];
-        tl.writes.push(TxWrite {
-            key: key.clone(),
-            value: value.clone(),
-            deleted: false,
-            prev_writer: recorded_prev,
-        });
-
-        // Take the logged identity before either write. From here the lock can
-        // land without its object, so a dropped future must be able to finalize
-        // the id: registration is what lets the cancellation guard
-        // ([`Algo::async_abort`]) and [`Algo::end`] mark it aborted instead of
-        // leaving peers to wait out the unknown-holder grace period. It is
-        // in-memory and refreshed by nobody, so the path still writes twice.
-        if tx.status == Status::New {
-            self.mon.begin_tx(&tx.id);
-        }
-        tx.engaged = true;
-
-        // Issue both commit-critical writes concurrently (ADR-027): the committed
-        // object (its existence is the unambiguous, idempotent commit signal) and
-        // the shard lock install (which inserts us into the version chain). The
-        // install goes through the shard coordinator (ADR-028), so it merges with
-        // any disjoint-key acquire/write-back on the same shard into one CAS
-        // round instead of racing its own.
-        //
-        // Committing through the monitor (rather than writing the object
-        // directly) retires the registration on success, so a commit leaves no
-        // pending identity for cleanup to trip over.
-        let object = self.mon.commit_tx(tl);
-        let install = self.commit_install(
-            &tx.id,
-            &leaf_path,
-            raw_key.clone(),
-            key.clone(),
-            read_version.clone(),
-        );
-        let (object, install) = tokio::join!(object, install);
-
-        match (object, install?) {
-            // Committed: the object is durable and our lock is in the chain.
-            (Ok(()), InstallOutcome::Landed(receipt)) => {
-                tx.status = Status::Committed;
-                self.write_back_single_rw(&tx.id, &leaf_path, &raw_key, &key, &value, receipt)
-                    .await;
-                Ok(Some(()))
-            }
-            // A wound landed in the parallel window: our object was finalized
-            // `aborted` out from under us. The write did not commit — renew.
-            (Err(TransError::AlreadyFinalized), _) => self.abandon_single_rw(tx),
-            (Err(e), _) => Err(e.context(format!("writing single-rw tx object for {}", tx.id))),
-            // The object committed but our lock never inserted us into the chain
-            // (a follow-on writer built on the old value): the committed object
-            // is an orphan — renew and let GC reclaim it.
-            (Ok(()), InstallOutcome::Moved) => self.abandon_single_rw(tx),
-            // In-doubt lock install whose entry then moved: we cannot tell whether
-            // we committed. Surface it rather than risk a double-apply.
-            (Ok(()), InstallOutcome::InDoubt(msg)) => {
-                Err(TransError::Storage(StorageError::Unavailable(msg)))
-            }
-        }
-    }
-
-    /// Installs the single read-write fast path's write lock on `raw_key`'s shard
-    /// through the shard coordinator's fold engine (ADR-028): one deduplicated
-    /// round that merges with disjoint acquires/write-backs on the same shard
-    /// instead of racing its own bespoke CAS. Never waits (a live holder makes it
-    /// [`InstallOutcome::Moved`], not a wait). `read_version` is the read this
-    /// write depends on (for a read-modify-write) or `None` for a blind put; the
-    /// effective predecessor is re-resolved inside the fold against the current
-    /// shard state.
-    async fn commit_install(
-        &self,
-        id: &TxId,
-        leaf_path: &str,
-        raw_key: Vec<u8>,
-        key: KeyRef,
-        read_version: Option<TxId>,
-    ) -> Result<InstallOutcome, TransError> {
-        let resolver = Arc::new(CommitInstallResolver {
-            id: id.clone(),
-            raw_key,
-            key,
-            read_version,
-        });
-        // The commit's eligibility check just resolved this leaf through the
-        // cache, so the fold's first attempt reuses that cached copy without a
-        // revalidation round-trip (`Any`); a stale copy self-corrects via
-        // the version-conditional CAS + reload (ADR-030).
-        match self
-            .coord
-            .submit_shard(leaf_path, id, resolver, Requirement::Any)
-            .await?
-        {
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
-                cas_precondition,
-            }) => Ok(InstallOutcome::Landed(cas_precondition)),
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::InDoubt(msg),
-                ..
-            }) => Ok(InstallOutcome::InDoubt(msg)),
-            // A shutdown mid-flight leaves the lock un-installed, so the fast
-            // path renews (its committed object, if any, is an orphan for GC).
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Moved,
-                ..
-            })
-            | None => Ok(InstallOutcome::Moved),
-            // Commit-install never waits, releases, or takes a generic lock.
-            Some(_) => Err(TransError::other(
-                "commit-install produced a non-install outcome",
-            )),
-        }
-    }
-
-    /// Converts the fast path's write lock to a published `current_writer`
-    /// pointer and releases it (ADR-027 write-back), reusing the deduplicated
-    /// write-back path (ADR-026). Spawned in the background so commit returns
-    /// without waiting for it; run inline when no background executor exists
-    /// (unit tests, or after shutdown dropped it) so the lock is not left to
-    /// lazy reclaim. Best-effort: the transaction is already committed, so a
-    /// failure only delays lazy lock cleanup. Feeds the superseded writer to GC.
-    async fn write_back_single_rw(
-        &self,
-        id: &TxId,
-        leaf_path: &str,
-        raw_key: &[u8],
-        key: &KeyRef,
-        value: &Arc<[u8]>,
-        installed_from: Option<LeafObservation>,
-    ) {
-        match self.background.as_ref().and_then(|w| w.upgrade()) {
-            Some(bg) => {
-                let locker = self.locker.clone();
-                let gc = self.gc.clone();
-                let id = id.clone();
-                let leaf_path = leaf_path.to_string();
-                let raw_key = raw_key.to_vec();
-                let key = key.clone();
-                let value = value.clone();
-                let installed_from = installed_from.clone();
-                bg.spawn_waited(async move {
-                    let superseded = locker
-                        .data()
-                        .write_back_single_put(
-                            &id,
-                            &leaf_path,
-                            &raw_key,
-                            &key,
-                            &value,
-                            installed_from.as_ref(),
-                        )
-                        .await;
-                    feed_gc_hints(&gc, superseded);
-                });
-            }
-            None => {
-                let superseded = self
-                    .locker
-                    .data()
-                    .write_back_single_put(
-                        id,
-                        leaf_path,
-                        raw_key,
-                        key,
-                        value,
-                        installed_from.as_ref(),
-                    )
-                    .await;
-                feed_gc_hints(&self.gc, superseded);
-            }
-        }
-    }
-
-    /// Abandons a fast-path attempt whose committed object was already written
-    /// but whose commit-point CAS did not land: hand the now-orphaned object to
-    /// GC and signal a renewed re-run
-    /// ([`TransError::Wounded`]) so the retry gets a fresh id.
-    fn abandon_single_rw(&self, tx: &Handle) -> Result<Option<()>, TransError> {
-        self.gc.schedule_tx_cleanup(tx.id.clone());
-        Err(TransError::Wounded)
     }
 
     /// Publishes the committed transaction's pointers and releases its locks.
@@ -2551,7 +2166,7 @@ mod tests {
     // locks. The engine validates *after* locking, so unlike a pre-lock check the
     // moved key is itself locked during the re-run window — the v1 guarantee that
     // the retry holds all its locks. Two writes force the full locked path (the
-    // single-rw fast path handles a lone write; see the test below).
+    // direct commit path handles a lone write; see the test below).
     #[tokio::test]
     async fn stale_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
@@ -2587,7 +2202,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
     }
 
-    // Single-rw fast path (ADR-030): a lone read-modify-write whose read was
+    // Single-rw commit (ADR-030): a lone read-modify-write whose read was
     // superseded by *another instance* is caught with a transparent retry, never
     // a surfaced error, and never commits its stale value. This client's cached
     // snapshot predates the peer's create, so the key reads as absent — an
@@ -2623,7 +2238,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         // The stale write never committed: v2 is still current (the abandoned
-        // fast-path object is unreferenced, so help-forward cannot promote it).
+        // attempt's object is unreferenced, so help-forward cannot promote it).
         assert_eq!(
             do_read(&tctx, &keyp).await.last_writer.unwrap(),
             *h2.id(),
@@ -2882,13 +2497,13 @@ mod tests {
             .count()
     }
 
-    // ADR-028: the single read-write commit-install is folded by the same shard
-    // coordinator as ordinary lock acquisition, so an install and a disjoint-key
+    // ADR-028: the logless direct commit is folded by the same shard coordinator
+    // as ordinary lock acquisition, so a direct commit and a disjoint-key
     // acquire contending one shard batch into a single CAS round instead of
-    // racing two separate loads+CASes. The install lands its write lock and the
+    // racing two separate loads+CASes. The commit publishes its value and the
     // acquire installs its lock in the one store.
     #[tokio::test(start_paused = true)]
-    async fn single_rw_install_merges_with_disjoint_acquire() {
+    async fn direct_commit_merges_with_disjoint_acquire() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let rec = Arc::new(RecordingBackend::new(backend));
@@ -2900,15 +2515,13 @@ mod tests {
         let kap = key_ref(&ka);
         let kbp = key_ref(&kb);
 
-        // Seed keys A and B committed: the fast-path install builds on A's
+        // Seed keys A and B committed: the direct commit builds on A's
         // predecessor, and the disjoint acquire overwrites an existing B, so it
         // takes no membership root lock and the round stays a single shard CAS.
         commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
         commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
 
-        let txa = TxId::with_priority(1_000_000_000, b"install");
         let txb = TxId::with_priority(2_000_000_000, b"acquire");
-        tctx.tmon.begin_tx(&txa);
         tctx.tmon.begin_tx(&txb);
 
         let shard_path = paths::tree_root(TEST_COLL);
@@ -2916,8 +2529,8 @@ mod tests {
         gate.arm();
 
         // The disjoint acquire is submitted first and becomes the dedup driver,
-        // parking in the gated current-bound load; the single-rw install then joins
-        // that open batch. (Post-ADR-030 the install's own first attempt is
+        // parking in the gated current-bound load; the direct commit then joins
+        // that open batch. (Post-ADR-030 the commit's own first attempt is
         // `Any` and would skip the load on a warm cache, so it merges via
         // the driver's already-loading round rather than racing a solo, cache-
         // served CAS — which is exactly the ADR-028 single-round behavior.)
@@ -2935,28 +2548,30 @@ mod tests {
                 .await
         });
 
-        // Let the driver park in the gated load before the install joins.
+        // Let the driver park in the gated load before the commit joins.
         rt::sleep(Duration::from_secs(1)).await;
 
-        let (ta, pa, ka2, kap2) = (
-            txa.clone(),
-            paths::tree_root(TEST_COLL),
-            ka.clone(),
-            kap.clone(),
+        let mut ha = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&kap, b"v2")],
+                scans: Vec::new(),
+            },
         );
-        let install =
-            tokio::spawn(async move { ca.commit_install(&ta, &pa, ka2, kap2, None).await });
+        let txa = ha.id().clone();
+        let commit = tokio::spawn(async move {
+            let result = ca.commit(&mut ha).await;
+            (ha, result)
+        });
 
-        // Once the install has queued into the open batch, release the load.
+        // Once the commit has queued into the open batch, release the load.
         rt::sleep(Duration::from_secs(1)).await;
         gate.release();
 
-        let install = install.await.unwrap().unwrap();
+        let (_ha, committed) = commit.await.unwrap();
         let acquire = acquire.await.unwrap().unwrap();
-        assert!(
-            matches!(install, InstallOutcome::Landed(_)),
-            "the fast-path install must land"
-        );
+        committed.expect("the direct commit must land");
         assert!(
             matches!(acquire, LockOutcome::Locked(_)),
             "the disjoint acquire must lock"
@@ -2965,23 +2580,30 @@ mod tests {
         assert_eq!(
             shard_stores(&log, &shard_path),
             1,
-            "install and disjoint acquire share one CAS"
+            "direct commit and disjoint acquire share one CAS"
         );
 
         // Both mutations landed in the shared shard write.
         let ea = entry(&tctx, &ka).await.unwrap();
-        assert_eq!(ea.locked_by, vec![txa], "install holds A's write lock");
+        assert_eq!(
+            ea.current,
+            CurrentState::Inline {
+                writer: txa,
+                value: Arc::from(b"v2".as_slice()),
+            },
+            "the direct commit published its value"
+        );
         let eb = entry(&tctx, &kb).await.unwrap();
         assert!(eb.locked_by.contains(&txb), "acquire holds B's lock");
     }
 
-    // ADR-028 regression (batched in-doubt): a commit-install co-batched with a
+    // ADR-028 regression (batched in-doubt): a direct commit co-batched with a
     // disjoint-key acquire whose shared CAS comes back in-doubt (`Unavailable`)
-    // recovers idempotently — the engine reloads and re-folds, the install finds
-    // itself already in the chain (`Landed`), and the acquire re-installs its own
-    // lock (`Locked`) without double-applying. No error is surfaced.
+    // recovers idempotently — the engine reloads and re-folds, the commit finds
+    // its own marker already published (`Landed`), and the acquire re-installs
+    // its own lock (`Locked`) without double-applying. No error is surfaced.
     #[tokio::test(start_paused = true)]
-    async fn commit_install_batched_in_doubt_recovers() {
+    async fn direct_commit_batched_in_doubt_recovers() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, indoubt) = InDoubtCas::wrap(mem);
         let (backend, gate) = Gate::wrap(backend);
@@ -2992,15 +2614,13 @@ mod tests {
         let kap = key_ref(&ka);
         let kbp = key_ref(&kb);
 
-        // Seed keys A and B committed (un-gated, before arming): the install has
+        // Seed keys A and B committed (un-gated, before arming): the commit has
         // a predecessor and the acquire overwrites an existing B, so it takes no
         // membership root lock and the round stays a single shard CAS.
         commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
         commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
 
-        let txa = TxId::with_priority(1_000_000_000, b"install");
         let txb = TxId::with_priority(2_000_000_000, b"acquire");
-        tctx.tmon.begin_tx(&txa);
         tctx.tmon.begin_tx(&txb);
 
         // Arm the merge gate and the in-doubt first CAS together.
@@ -3008,14 +2628,19 @@ mod tests {
         gate.arm();
 
         let (ca, cb) = (tm.clone(), tctx.locker.clone());
-        let (ta, pa, ka2, kap2) = (
-            txa.clone(),
-            paths::tree_root(TEST_COLL),
-            ka.clone(),
-            kap.clone(),
+        let mut ha = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&kap, b"v2")],
+                scans: Vec::new(),
+            },
         );
-        let install =
-            tokio::spawn(async move { ca.commit_install(&ta, &pa, ka2, kap2, None).await });
+        let txa = ha.id().clone();
+        let commit = tokio::spawn(async move {
+            let result = ca.commit(&mut ha).await;
+            (ha, result)
+        });
         let data_b = Data {
             reads: Vec::new(),
             writes: vec![wa(&kbp, b"vb2")],
@@ -3032,20 +2657,23 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         gate.release();
 
-        // The in-doubt CAS actually landed, so the re-fold sees both members in
-        // the chain: the install classifies itself Landed, the acquire re-locks.
-        let install = install.await.unwrap().unwrap();
+        // The in-doubt CAS actually landed, so the re-fold sees both members
+        // applied: the commit classifies itself Landed, the acquire re-locks.
+        let (_ha, committed) = commit.await.unwrap();
         let acquire = acquire.await.unwrap().unwrap();
-        assert!(
-            matches!(install, InstallOutcome::Landed(_)),
-            "the install recovers as landed, not in-doubt"
-        );
+        committed.expect("the commit recovers as landed, not in-doubt");
         assert!(
             matches!(acquire, LockOutcome::Locked(_)),
             "the co-batched acquire re-locks idempotently"
         );
 
-        assert_eq!(entry(&tctx, &ka).await.unwrap().locked_by, vec![txa]);
+        assert_eq!(
+            entry(&tctx, &ka).await.unwrap().current,
+            CurrentState::Inline {
+                writer: txa,
+                value: Arc::from(b"v2".as_slice()),
+            }
+        );
         assert!(entry(&tctx, &kb).await.unwrap().locked_by.contains(&txb));
     }
 
@@ -3057,9 +2685,9 @@ mod tests {
     // ~handful of parallel attempts that fit before the deadlock timeout forces
     // the serial CAS budget to be exhausted, i.e. the `Conflict` path.
     //
-    // Uses a two-key write so the transaction is ineligible for the single
-    // read-write fast path (ADR-020) and genuinely exercises the full locked
-    // path's same-id serial-fallback behaviour.
+    // Uses a two-key write so the transaction is ineligible for the direct commit
+    // path (ADR-051) and genuinely exercises the full locked path's same-id
+    // serial-fallback behaviour.
     #[tokio::test(start_paused = true)]
     async fn cas_contention_relocks_keeping_id() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -3105,8 +2733,8 @@ mod tests {
         assert!(e2.locked_by.is_empty());
     }
 
-    // A value the inline per-value budget rejects, so its transaction takes
-    // ADR-027's logged single read-write path instead of ADR-051's logless one.
+    // A value the inline per-value budget rejects, so its transaction takes the
+    // regular locked path instead of ADR-051's logless one (ADR-053).
     fn logged_value() -> Vec<u8> {
         vec![b'v'; glassdb_storage::InlinePolicy::default().max_value_bytes + 1]
     }
@@ -3121,13 +2749,12 @@ mod tests {
         (tm, tctx, log)
     }
 
-    // CAS-write counts by object kind, the fingerprint of a commit path: the
-    // single read-write fast path (ADR-027) issues one tx-object write and two
-    // shard writes (the lock CAS then the write-back CAS that publishes the
-    // pointer — here inline because tests build the algo with no background
-    // executor); the full locked path also issues two shard writes (lock install
-    // + write-back) but writes its tx object differently. Node-level locks fold
-    // into those writes rather than adding another CAS (ADR-032).
+    // CAS-write counts by object kind, the fingerprint of a commit path: a
+    // logless direct commit (ADR-051) issues one shard write and no tx object at
+    // all; the locked path issues one tx-object write and two shard writes (the
+    // lock CAS then the write-back CAS that publishes the pointer — here inline
+    // because tests build the algo with no background executor). Node-level
+    // locks fold into those writes rather than adding another CAS (ADR-032).
     #[derive(Debug, Default)]
     struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
@@ -3180,14 +2807,15 @@ mod tests {
         (tm, tctx, log)
     }
 
-    // An eligible single-key overwrite whose value misses the inline budget
-    // commits through the logged fast path (ADR-027, the ADR-051 fallback): one
-    // committed `_t/` object write, one leaf lock CAS, one leaf write-back CAS
-    // (inline here, no background executor), and no separate membership write —
-    // and the new value is durable and readable. With split deferred the leaf is
-    // the collection root `_r`, so both leaf CAS's land there (ADR-031).
+    // ADR-053: a single-key read-modify-write whose value misses the inline
+    // budget has no logged fast path to fall to, so it commits through the
+    // regular locked protocol: one committed `_t/` object write, one leaf lock
+    // CAS, one leaf write-back CAS (inline here, no background executor), and no
+    // separate membership write — and the new value is durable and readable. With
+    // split deferred the leaf is the collection root `_r`, so both leaf CAS's
+    // land there (ADR-031).
     #[tokio::test]
-    async fn single_rw_overwrite_takes_fast_path() {
+    async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
         let (tm, tctx, log) = new_recording_algo().await;
         let keyp = key_ref(b"k");
 
@@ -3195,6 +2823,7 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
+        tctx.locker.lock_calls_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3207,10 +2836,14 @@ mod tests {
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
+        assert!(
+            tctx.locker.lock_calls_and_reset() >= 1,
+            "an over-budget value goes straight to locking, it never replays"
+        );
         let c = write_counts(&log);
         assert_eq!(
             c.leaf, 2,
-            "fast path: one lock CAS plus one write-back CAS, no membership: {c:?}"
+            "locked path: one lock CAS plus one write-back CAS, no membership: {c:?}"
         );
         assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
 
@@ -3277,7 +2910,7 @@ mod tests {
         tm.end(&mut handle).await.unwrap();
         assert!(
             tctx.locker.lock_calls_and_reset() >= 1,
-            "an observed gate bypasses commit-install"
+            "an observed gate bypasses the direct commit"
         );
         assert_eq!(
             do_read(&tctx, &keyp).await.last_writer,
@@ -3322,9 +2955,10 @@ mod tests {
         );
     }
 
-    // A blind single-key put over an existing key (no read) is also eligible.
+    // A blind single-key put over an existing key (no read) takes the same
+    // locked path when its value misses the inline budget.
     #[tokio::test]
-    async fn single_rw_blind_put_takes_fast_path() {
+    async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
         let (tm, tctx, log) = new_recording_algo().await;
         let keyp = key_ref(b"k");
 
@@ -3346,7 +2980,7 @@ mod tests {
         let c = write_counts(&log);
         assert_eq!(
             c.leaf, 2,
-            "fast path: one lock CAS plus one write-back CAS, no membership: {c:?}"
+            "locked path: one lock CAS plus one write-back CAS, no membership: {c:?}"
         );
         assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
         assert_eq!(
@@ -3355,22 +2989,22 @@ mod tests {
         );
     }
 
-    // ADR-027 regression: the fast path leaves a write lock held by the
+    // ADR-020 regression: the locked path leaves a write lock held by the
     // *committed* writer until its asynchronous write-back publishes the pointer
     // and releases it. A single-key writer arriving in that window must treat the
     // committed holder as effectively unlocked — help-forwarding it as the
-    // predecessor — and stay on the lock-free fast path, rather than bailing to
-    // the full locked path on the mere presence of the lock (the measured
-    // regression). A stale read still bails.
+    // predecessor — and stay on the lock-free direct path, rather than bailing to
+    // the locked path on the mere presence of the lock (the measured regression).
+    // A stale read replays instead.
     #[tokio::test]
-    async fn single_rw_committed_holder_stays_on_fast_path() {
+    async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
         let leaf_path = paths::tree_root(TEST_COLL);
         let raw = b"k".to_vec();
 
-        // H0 publishes v1; H1 overwrites with v2 through the fast path, leaving
-        // the pointer at H1 with no lock.
+        // H0 publishes v1; H1 overwrites through the locked path (its value
+        // misses the inline budget), so it has a committed transaction object.
         let h0 = commit_writes(&tm, vec![wa(&keyp, b"v1")])
             .await
             .id()
@@ -3380,8 +3014,8 @@ mod tests {
             .id()
             .clone();
 
-        // Recreate the ADR-027 commit window before write-back: the lock is still
-        // held by the committed H1 while the pointer lags at its predecessor H0.
+        // Recreate the commit window before write-back: the lock is still held by
+        // the committed H1 while the pointer lags at its predecessor H0.
         let loaded = tctx
             .shards
             .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
@@ -3439,13 +3073,14 @@ mod tests {
             "a read of the superseded value is stale, and replayable"
         );
 
-        // End to end: the writer commits over H1 (help-forwarding it into the
-        // chain, not orphaning it), and its value reads back.
+        // End to end: the writer commits directly over H1 (help-forwarding it
+        // into the chain, not orphaning it), taking no lock of its own.
+        tctx.locker.lock_calls_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
                 reads: vec![r],
-                writes: vec![wa(&keyp, &logged_value())],
+                writes: vec![wa(&keyp, b"v3")],
                 scans: Vec::new(),
             },
         );
@@ -3453,6 +3088,11 @@ mod tests {
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
+        assert_eq!(
+            tctx.locker.lock_calls_and_reset(),
+            0,
+            "the committed holder did not push the writer onto the locked path"
+        );
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&h2));
         assert!(e.locked_by.is_empty());
@@ -3520,8 +3160,8 @@ mod tests {
             .id()
             .clone();
 
-        // The ADR-027 commit window: the lock is still held by the committed H1
-        // while the current state lags at its predecessor H0.
+        // The locked path's commit window: the lock is still held by the committed
+        // H1 while the current state lags at its predecessor H0.
         let loaded = tctx
             .shards
             .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
@@ -3932,120 +3572,12 @@ mod tests {
         );
     }
 
-    // The same classification for ADR-027's logged fast path, whose commit is
-    // even more exposed: its committed object is already durable, so a `Moved`
-    // it cannot justify makes it abandon and re-run a transaction that may hold
-    // a landed write lock.
-    #[tokio::test]
-    async fn single_rw_lock_gated_after_uncertain_cas_stays_in_doubt() {
-        let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
-        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
-
-        let seed = entry(&tctx, b"k").await.unwrap();
-        let resolver = CommitInstallResolver {
-            id: TxId::with_priority(2, b"install"),
-            raw_key: b"k".to_vec(),
-            key: keyp.clone(),
-            read_version: seed.current.writer().cloned(),
-        };
-        let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
-        let mut gated = NodeLocks::default();
-        gated.set_structural_gate(TxId::with_priority(1, b"splitter"));
-
-        let outcome = fold(&resolver, &tctx, ReloadCause::Fresh, &staged, &gated).await;
-        assert!(
-            matches!(outcome, FoldOutcome::Moved),
-            "a gate on a fresh fold proves the lock never landed, got {outcome:?}"
-        );
-
-        let outcome = fold(
-            &resolver,
-            &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
-            &staged,
-            &gated,
-        )
-        .await;
-        assert!(
-            matches!(outcome, FoldOutcome::InDoubt(_)),
-            "a gate cannot disprove a landed uncertain lock CAS, got {outcome:?}"
-        );
-    }
-
-    // ADR-027/028: the fast path's two commit writes are independent. If the lock
-    // install never lands (here: sustained shard-CAS contention exhausting the
-    // coordinator's bounded fold budget) while the committed object write *did*
-    // land, the transaction is not in the version chain — its committed object is
-    // an orphan. The fast path must renew (surface `Wounded`) rather than report
-    // success, and must never double-apply: a renewed attempt commits the value
-    // exactly once.
-    #[tokio::test(start_paused = true)]
-    async fn single_rw_lock_cas_contention_renews_and_commits_once() {
-        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        // Fail exactly the coordinator's whole fold budget of shard-lock CAS
-        // attempts, so the object write lands but the lock install never does.
-        let (backend, flaky) = FlakyCas::wrap(mem, crate::shard_coord::CAS_RETRIES);
-        let (tm, tctx) = new_algo_from_backend(backend).await;
-        let keyp = key_ref(b"k");
-
-        // Seed over the (unarmed) backend so the key exists and is committable.
-        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
-        let seed_writer = entry(&tctx, b"k")
-            .await
-            .unwrap()
-            .current
-            .writer()
-            .unwrap()
-            .clone();
-        let r = do_read(&tctx, &keyp).await;
-
-        flaky.arm();
-        let mut h = begin_data(
-            &tm,
-            Data {
-                reads: vec![r.clone()],
-                writes: vec![wa(&keyp, &logged_value())],
-                scans: Vec::new(),
-            },
-        );
-        let orphan = h.id().clone();
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(
-            matches!(err, TransError::Wounded),
-            "a lock CAS that never lands must renew, got {err:?}"
-        );
-
-        // The whole budget was spent (sustained contention on the lock CAS), and
-        // the orphan committed object never entered the chain: the entry still
-        // points at the seed writer, unlocked.
-        assert_eq!(
-            flaky.remaining(),
-            0,
-            "expected sustained lock-CAS contention"
-        );
-        let e = entry(&tctx, b"k").await.unwrap();
-        assert_eq!(e.current.writer(), Some(&seed_writer));
-        assert!(e.locked_by.is_empty());
-
-        // The renewed attempt (same priority, fresh id) commits exactly once.
-        let mut h2 = tm.rebegin(h);
-        assert_ne!(*h2.id(), orphan, "renew mints a fresh id");
-        tm.commit(&mut h2).await.unwrap();
-        tm.end(&mut h2).await.unwrap();
-
-        let e = entry(&tctx, b"k").await.unwrap();
-        assert_eq!(e.current.writer(), Some(h2.id()));
-        assert!(e.locked_by.is_empty());
-        let rv = do_read(&tctx, &keyp).await;
-        assert_eq!(rv.last_writer.unwrap(), *h2.id());
-    }
-
-    // Creating a key is ineligible for the single read-write fast path (it has no
-    // predecessor value to build on), so it takes the full locked path. The fast
-    // path never calls the locker, so a non-zero lock-call count proves the full
-    // path was taken. The membership-write lock is folded into the same leaf CAS
-    // as the entry lock (ADR-032), so lock install + write-back is exactly two.
+    // Creating a key is ineligible for the direct commit path (it has no
+    // predecessor value to build on), so it takes the locked path. The direct
+    // path never calls the locker, so a non-zero lock-call count proves the
+    // locked path was taken. The membership-write lock is folded into the same
+    // leaf CAS as the entry lock (ADR-032), so lock install + write-back is
+    // exactly two.
     #[tokio::test]
     async fn single_rw_create_uses_full_path() {
         let (tm, tctx, log) = new_recording_algo().await;
@@ -4076,7 +3608,7 @@ mod tests {
         assert!(entry(&tctx, b"new").await.unwrap().exists());
     }
 
-    // A delete is ineligible for the fast path too (it publishes a tombstone, not
+    // A delete is ineligible for the direct path too (it publishes a tombstone, not
     // a pointer over a predecessor), so it takes the full locked path; the
     // non-zero lock-call count proves it. Membership locking folds into the
     // entry-lock CAS (ADR-032).
@@ -4113,7 +3645,7 @@ mod tests {
         assert!(entry(&tctx, b"k").await.unwrap().current.is_tombstone());
     }
 
-    // A two-key write is ineligible (the fast path publishes one pointer): full
+    // A two-key write is ineligible (the direct path publishes one value): full
     // locked path.
     #[tokio::test]
     async fn single_rw_multi_key_uses_full_path() {

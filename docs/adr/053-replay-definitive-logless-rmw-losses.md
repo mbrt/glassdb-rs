@@ -2,18 +2,15 @@
 
 ## Status
 
-Accepted.
-
-The body-replay classification is implemented (the direct resolver's
-`Replay` / locked-fallback split and the coordinator's separate
-same-key-exclusion outcome). Removing ADR-027's parallel logged path, which this
-decision also requires, is still outstanding.
+Accepted — implemented (the direct resolver's `Replay` / locked-fallback split,
+the coordinator's separate same-key-exclusion outcome, and the removal of
+ADR-027's parallel logged path).
 
 This refines
 [ADR-051](051-inline-latest-values.md)'s direct-commit fallback policy.
 ADR-051 remains otherwise unchanged.
 
-On acceptance, this supersedes
+This supersedes
 [ADR-027](027-single-rw-parallel-lock-publish.md)'s parallel logged
 single-read-write path. Transactions that genuinely require logging use the
 regular locked protocol from

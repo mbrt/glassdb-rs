@@ -304,8 +304,8 @@ split-point policy, and node fan-out/sizing.
 - **Directory caching.** Invalidation strategy and memory budget for cached
   index nodes (reuse of the ADR-023 object cache; interaction with ADR-030
   `AllowStale` seeding).
-- **Fast paths.** How the single read-write fast path (ADR-027) and read-only
-  fast path interact with a stale cached descent.
+- **Fast paths.** How the logless direct commit (ADR-051) and read-only fast path
+  interact with a stale cached descent.
 - **Node fan-out / sizing.** Interior fan-out and leaf soft cap vs tree height,
   CAS cost, and cache footprint — to be pinned by a benchmark plan.
 

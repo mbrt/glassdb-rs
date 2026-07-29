@@ -148,12 +148,14 @@ Caching and batching are in place: the `ObjectCache` / `ValueCache` (ADR-023),
 asynchronous background write-back, and dedup-batched CAS on acquisition,
 release, and write-back (ADR-025/026).
 
-The **single read-write fast path** ([ADR-027](../adr/027-single-rw-parallel-lock-publish.md))
-commits a lone overwrite of an existing key with two **parallel** writes — the
-committed transaction object and one shard CAS that installs a write lock — then
-an asynchronous write-back converts the lock to a `current_writer` pointer.
-Ineligible transactions (create/delete, multi-key, cross-key reads, stale reads,
-locked entries) fall back to the full locked path.
+The **logless direct commit** ([ADR-051](../adr/051-inline-latest-values.md))
+commits a lone overwrite of an existing key with one leaf CAS that publishes the
+value itself — no lock and no transaction object. A non-landing attempt is
+classified rather than failed ([ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md)):
+a certified read-modify-write loss replays its body under the same id, and
+genuine ineligibility (create/delete, multi-key, cross-key reads, locked entries,
+values over the inline budgets) takes the regular locked protocol. There is no
+separate single-key logged protocol.
 
 All shard/root entry mutations flow through **one shard-mutation coordinator**
 ([ADR-028](../adr/028-shard-mutation-coordinator.md)): a single per-object mechanism
@@ -325,24 +327,22 @@ Every design decision is captured in its own ADR.
   reorderable — the analog of marking unlocks reorderable. Stays beneath
   the per-object step, leaving the ADR-020/021/024/009 semantics unchanged.
 - **[ADR-027](../adr/027-single-rw-parallel-lock-publish.md) — Parallel single
-  read-write commit via a lock.** ✅ Implemented. Supersedes ADR-020's single
-  read-write fast path: it publishes a **write lock** instead of a bare
-  `current_writer` pointer, issues its committed-object write and its shard lock
-  install **concurrently** (~1 RTT on the critical path), and converts the lock
-  to the pointer asynchronously. Committed iff both land; a live-pending holder,
-  a create/delete, a missing key, or a superseded read makes it ineligible and it
-  falls back to the full locked path under the same id. It now holds a lock during
-  the pre-commit window, so it participates in wound-wait and lease/GC bookkeeping;
-  one irreducible in-doubt (an `Unavailable` install CAS whose entry then moved)
-  surfaces as `InDoubt`.
+  read-write commit via a lock.** ❌ Superseded and removed by
+  [ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md). It published a
+  **write lock** instead of a bare `current_writer` pointer and issued its
+  committed-object write and its shard lock install **concurrently** (~1 RTT on
+  the critical path). ADR-051's logless direct commit took over the eligible
+  cases, and keeping a third commit protocol for the remainder was judged not
+  worth its distinct eligibility, cancellation, orphan-recovery, and in-doubt
+  rules. Ineligible single read-writes now use the regular locked protocol.
 - **[ADR-028](../adr/028-shard-mutation-coordinator.md) — Unified shard-mutation
   coordinator.** ✅ Implemented. Generalizes ADR-025/026's deduplication into a
   single per-object **mechanism** over which callers install **resolvers** that
   encode policy: load once, fold the round's resolvers in wound-wait order, CAS
-  once, recover by reload. Every shard/root mutation — acquire, commit-install
-  (ADR-027's install), write-back, release — flows through one coordinator, so the
-  last racing CAS (the fast-path install) stops racing. ADR-025's merge predicate
-  and ADR-027's bespoke reclassify loop dissolve into the fold; the concurrency
+  once, recover by reload. Every shard/root mutation — acquire, single read-write
+  commit, write-back, release — flows through one coordinator, so the last racing
+  CAS (the single read-write commit) stops racing. ADR-025's merge predicate and
+  ADR-027's bespoke reclassify loop dissolve into the fold; the concurrency
   semantics of ADR-002/021/024 are unchanged.
 - **[ADR-029](../adr/029-gc-through-shard-coordinator.md) — GC through the
   shard-mutation coordinator.** ✅ Implemented. Closes ADR-028's one exception:
@@ -353,7 +353,7 @@ Every design decision is captured in its own ADR.
   CAS that clears the last holder. ADR-022's GC policy is unchanged.
 - **[ADR-030](../adr/030-seed-shard-loads.md) — Reusing cached shard loads across a
   transaction's coordinator rounds.** ✅ Implemented. Adds an `AllowStale`
-  freshness flag to the object-cache read path so the single read-write fast path
+  freshness flag to the object-cache read path so a single read-write commit
   reuses a shard the transaction already cached (its body read, or the eligibility
   pre-check) for its first fold attempt with **no backend op**, restoring the
   single-load commit ADR-028 had split in two. A stale snapshot self-corrects: the
@@ -408,18 +408,17 @@ Group B — protocol details:
       (skew-padded) check with an observer-relative (no-skew) no-progress check.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
-      (ADR-020). The single-RW fast path's lock CAS is a further in-doubt site
-      (see below): a lost ack resolves by reading the shard back, leaving one
-      irreducible in-doubt (a fast follow-on writer moved the entry, ADR-027).
+      (ADR-020). The single-RW commit CAS is a further in-doubt site (see below):
+      a lost ack resolves by reading the shard back, leaving one irreducible
+      in-doubt (a fast follow-on writer moved the entry, ADR-051).
 - [x] Read-only fast-path shape in the new layout (ADR-020).
-- [x] Single-RW fast path (ADR-020, revised by ADR-027). A read-write transaction
-      that overwrites a single existing key commits with two **parallel** writes —
-      the committed transaction object and one shard CAS that installs a write
-      lock — then an **asynchronous** write-back converts the lock to a
-      `current_writer` pointer. It commits iff both writes land (object committed
-      and lock in the chain); ineligible transactions (create/delete, multi-key,
-      cross-key reads, stale reads, locked entries) fall back to the full locked +
-      logged path.
+- [x] Single-RW commit path (ADR-020, revised by ADR-027, now ADR-051/053). A
+      read-write transaction that overwrites a single existing key publishes its
+      value in **one** leaf CAS with no lock and no transaction object. A
+      non-landing attempt either replays its body (a certified read-modify-write
+      loss) or takes the regular locked + logged path; ineligible shapes
+      (create/delete, multi-key, cross-key reads, locked entries, values over the
+      inline budgets) go straight to it.
 
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):

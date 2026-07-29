@@ -957,22 +957,17 @@ impl DataLocker {
         superseded
     }
 
-    /// Publishes the single read-write fast path's committed pointer and releases
-    /// its write lock on one key (ADR-027): the fast path installs
-    /// `locked_by = [id]` through the coordinator's commit-install fold, so this
-    /// converts that lock to `current_writer = id` and drops it. Routed through
-    /// the same deduplicated write-back path the full commit uses (ADR-026), so
-    /// it batches with any in-flight round for the shard. Best-effort and
-    /// idempotent — a lost race leaves the lock to lazy reclaim / lease expiry.
-    /// Returns the `current_writer` it superseded, a GC candidate hint (ADR-022).
-    pub(crate) async fn write_back_single_put(
+    /// Publishes one committed put and releases its lock, aimed at an explicit
+    /// leaf path rather than at a held [`LockedTx`], so a test can direct a
+    /// delayed write-back at a path a split may already have retired.
+    #[cfg(test)]
+    pub(crate) async fn write_back_one_put(
         &self,
         id: &TxId,
         leaf_path: &str,
         raw_key: &[u8],
         key: &KeyRef,
         value: &Arc<[u8]>,
-        installed_from: Option<&LeafObservation>,
     ) -> Vec<TxId> {
         let intents = Arc::new(vec![KeyIntent {
             raw_key: raw_key.to_vec(),
@@ -980,18 +975,9 @@ impl DataLocker {
             desired: Desired::Put,
             inline: inline_candidate(Desired::Put, Some(value), &self.coord.inline_policy()),
         }]);
-        self.write_back_routed(
-            id,
-            leaf_path,
-            intents,
-            // The commit-install CAS certified this precondition immediately
-            // before installing our holder and advanced its watermark.
-            installed_from
-                .map(|observation| Requirement::AtLeast(observation.current_after()))
-                .unwrap_or(Requirement::Any),
-        )
-        .await
-        .unwrap_or_default()
+        self.write_back_routed(id, leaf_path, intents, Requirement::Any)
+            .await
+            .unwrap_or_default()
     }
 
     /// Releases `id` from one exact leaf path.
@@ -1303,8 +1289,8 @@ impl DataLocker {
                     }
                 }
                 FoldOutcome::LeafFull => return Ok(ShardOutcome::LeafFull),
-                // Release, write-back, and commit-install outcomes cannot reach
-                // an acquire. Treat one defensively as a conflict so the caller
+                // Release, write-back, and direct-commit outcomes cannot reach an
+                // acquire. Treat one defensively as a conflict so the caller
                 // takes the safe release-and-relock path.
                 FoldOutcome::Conflict
                 | FoldOutcome::Released { .. }
@@ -2087,19 +2073,18 @@ mod tests {
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
 
-        // `write_back_single_put` applies the per-value budget itself, so it
-        // exercises the drop rather than relying on the caller to have done it.
+        // The write-back derives the intent's inline payload from the policy, so
+        // it exercises the drop rather than relying on the caller to have done it.
         let groups = group_of(key, put_intent(key));
         lock_ok(&locker, &tx, &groups).await;
         locker
             .data()
-            .write_back_single_put(
+            .write_back_one_put(
                 &tx,
                 &paths::tree_root(COLL),
                 key,
                 &key_ref(key),
                 &Arc::from(b"too-long".as_slice()),
-                None,
             )
             .await;
 
