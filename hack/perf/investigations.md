@@ -126,6 +126,8 @@ but it is not the inline-capacity fix. A global 64-entry split threshold would
 solve the focused case by widening every tree, including ones that never need
 direct capacity.
 
+The logged-publication decision is recorded in proposed
+[ADR-054](../../docs/adr/054-reserve-inline-publication-for-logless-commits.md).
 The next design candidate should instead preserve the suppression and hint a
 background split only when direct publication encounters aggregate inline
 pressure. Such a split creates more authoritative capacity while retaining the
