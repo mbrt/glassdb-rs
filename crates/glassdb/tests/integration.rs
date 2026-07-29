@@ -36,26 +36,36 @@ fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
 
+fn try_read_int(b: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(b.try_into().ok()?))
+}
+
 fn read_int(b: &[u8]) -> i64 {
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(b);
-    i64::from_le_bytes(arr)
+    try_read_int(b).expect("integer value has the wrong width")
 }
 
 async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
     match tx.read(c, k).await {
-        Ok(Some(v)) => Ok(read_int(&v)),
+        Ok(Some(v)) => try_read_int(&v)
+            .ok_or_else(|| Error::internal(format!("key {k:?} has invalid integer value {v:?}"))),
         // Treat a missing value as zero (i.e. initialize it).
         Ok(None) => Ok(0),
         Err(e) => Err(e),
     }
 }
 
+fn incremented_value(key: &[u8], current: i64, amount: i64) -> Result<Vec<u8>, Error> {
+    current
+        .checked_add(amount)
+        .map(write_int)
+        .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))
+}
+
 async fn rmw(db: &Database, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
     for _ in 0..iters {
         db.tx(|tx| async move {
             let num = read_int_from_tx(&tx, coll, key).await?;
-            tx.write(coll, key, &write_int(num + 1))
+            tx.write(coll, key, &incremented_value(key, num, 1)?)
         })
         .await?;
     }
@@ -189,8 +199,16 @@ async fn stats_report_transactional_decoded_cache_hits() {
     let reader_ref = &reader;
     reader_db
         .tx(|tx| async move {
-            assert_eq!(tx.read(reader_ref, key).await?.unwrap(), value);
-            assert_eq!(tx.read(reader_ref, key).await?.unwrap(), value);
+            let first = tx.read(reader_ref, key).await?.ok_or(Error::NotFound)?;
+            glassdb::ensure_tx!(
+                first == value,
+                Error::internal(format!("first cached read returned {first:?}"))
+            );
+            let second = tx.read(reader_ref, key).await?.ok_or(Error::NotFound)?;
+            glassdb::ensure_tx!(
+                second == value,
+                Error::internal(format!("second cached read returned {second:?}"))
+            );
             Ok(())
         })
         .await
@@ -375,9 +393,9 @@ async fn multiple_rmw(
     for _ in 0..iters {
         db.tx(|tx| async move {
             let n1 = read_int_from_tx(&tx, coll, key1).await?;
-            tx.write(coll, key1, &write_int(n1 + 1))?;
+            tx.write(coll, key1, &incremented_value(key1, n1, 1)?)?;
             let n2 = read_int_from_tx(&tx, coll, key2).await?;
-            tx.write(coll, key2, &write_int(n2 + 1))
+            tx.write(coll, key2, &incremented_value(key2, n2, 1)?)
         })
         .await?;
     }
@@ -470,8 +488,11 @@ async fn concurrent_reads() {
         db.tx(|tx| async move {
             let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             for (k, r) in keys.iter().zip(vals) {
-                let cur = read_int(&r?.ok_or(Error::NotFound)?);
-                tx.write(coll, k, &write_int(cur + 1))?;
+                let value = r?.ok_or(Error::NotFound)?;
+                let cur = try_read_int(&value).ok_or_else(|| {
+                    Error::internal(format!("key {k:?} has invalid integer value {value:?}"))
+                })?;
+                tx.write(coll, k, &incremented_value(k, cur, 1)?)?;
             }
             Ok(())
         })
@@ -748,13 +769,19 @@ async fn transactional_key_scan_reflects_staged_membership() {
         tx.write(coll, b"b", b"new")?;
         tx.delete(coll, b"c")?;
         let first = tx.scan_keys(coll, scan).await?;
-        assert_eq!(first.keys(), &[b"a".to_vec(), b"b".to_vec()]);
+        glassdb::ensure_tx!(
+            first.keys() == [b"a".to_vec(), b"b".to_vec()],
+            Error::internal(format!("first staged key scan returned {:?}", first.keys()))
+        );
 
         tx.write(coll, b"d", b"new")?;
         let second = tx.scan_keys(coll, scan).await?;
-        assert_eq!(
-            second.keys(),
-            &[b"a".to_vec(), b"b".to_vec(), b"d".to_vec()]
+        glassdb::ensure_tx!(
+            second.keys() == [b"a".to_vec(), b"b".to_vec(), b"d".to_vec()],
+            Error::internal(format!(
+                "second staged key scan returned {:?}",
+                second.keys()
+            ))
         );
         Ok(())
     })
@@ -1488,8 +1515,8 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
         db.tx(|tx| async move {
             let n1 = read_int_from_tx(&tx, coll_ref, b"k1").await?;
             let n2 = read_int_from_tx(&tx, coll_ref, b"k2").await?;
-            tx.write(coll_ref, b"k1", &write_int(n1 + 10))?;
-            tx.write(coll_ref, b"k2", &write_int(n2 + 10))
+            tx.write(coll_ref, b"k1", &incremented_value(b"k1", n1, 10)?)?;
+            tx.write(coll_ref, b"k2", &incremented_value(b"k2", n2, 10)?)
         }),
     )
     .await;

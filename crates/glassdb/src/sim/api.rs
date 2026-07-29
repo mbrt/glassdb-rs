@@ -267,11 +267,8 @@ fn api_invariant_message(error: &Error) -> Option<&str> {
 }
 
 fn check_api_invariant(condition: bool, detail: impl std::fmt::Display) -> Result<(), Error> {
-    if condition {
-        Ok(())
-    } else {
-        Err(api_invariant_error(detail))
-    }
+    crate::ensure_tx!(condition, api_invariant_error(detail));
+    Ok(())
 }
 
 fn api_collection_name(client: usize, slot: usize) -> Vec<u8> {

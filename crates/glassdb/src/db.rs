@@ -461,6 +461,15 @@ impl Database {
     /// as `|tx| async move { ... }`. The framework owns the retry loop and may
     /// invoke `f` multiple times, so `f` must be `FnMut`.
     ///
+    /// # Body errors
+    ///
+    /// When `f` returns an error, the attempt's writes are discarded and its
+    /// reads are validated. If those reads were inconsistent, `f` is invoked
+    /// again; otherwise the original error is returned. Conditions derived from
+    /// transaction reads must therefore return an error, for example with
+    /// [`crate::ensure_tx!`], rather than assert or panic. Panics bypass read
+    /// validation.
+    ///
     /// # Cancellation
     ///
     /// This future is durability-safe to cancel: dropping it mid-flight is

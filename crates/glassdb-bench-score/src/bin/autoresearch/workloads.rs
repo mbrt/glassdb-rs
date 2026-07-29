@@ -54,13 +54,19 @@ fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
 
-fn read_int(b: &[u8]) -> i64 {
-    if b.len() < 8 {
-        return 0;
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(&b[..8]);
-    i64::from_le_bytes(arr)
+fn read_int(key: &[u8], value: &[u8]) -> Result<i64, Error> {
+    value
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_le_bytes)
+        .ok_or_else(|| Error::internal(format!("key {key:?} has invalid integer value {value:?}")))
+}
+
+fn incremented_value(key: &[u8], current: i64) -> Result<Vec<u8>, Error> {
+    current
+        .checked_add(1)
+        .map(write_int)
+        .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))
 }
 
 // --- Setup helpers --------------------------------------------------------
@@ -87,12 +93,12 @@ async fn single_rmw(db: &Database) -> Result<Sample, Error> {
     m.begin(db);
     for _ in 0..SINGLE_RMW_TX {
         db.tx(|tx| async move {
-            let v = match tx.read(coll, key).await {
-                Ok(Some(v)) => v,
-                Ok(None) => Vec::new(),
+            let current = match tx.read(coll, key).await {
+                Ok(Some(value)) => read_int(key, &value)?,
+                Ok(None) => 0,
                 Err(e) => return Err(e),
             };
-            tx.write(coll, key, &write_int(read_int(&v) + 1))
+            tx.write(coll, key, &incremented_value(key, current)?)
         })
         .await?;
     }
@@ -113,12 +119,12 @@ async fn multi_rmw(db: &Database) -> Result<Sample, Error> {
         db.tx(|tx| async move {
             let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             for (k, rv) in keys.iter().zip(vals) {
-                let v = match rv {
-                    Ok(Some(v)) => v,
-                    Ok(None) => Vec::new(),
+                let current = match rv {
+                    Ok(Some(value)) => read_int(k, &value)?,
+                    Ok(None) => 0,
                     Err(e) => return Err(e),
                 };
-                tx.write(coll, k, &write_int(read_int(&v) + 1))?;
+                tx.write(coll, k, &incremented_value(k, current)?)?;
             }
             Ok(())
         })

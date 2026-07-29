@@ -23,6 +23,7 @@ Always use `make test-all` to run tests. This runs format checks, linting
 - Test interfaces and intended behavior instead of internals
 - Prefer integration tests to mocks as much as possible
 - Always add deterministic regression tests when fixing bugs, they also serve as documentation
+- Conditions derived from transaction reads must return errors from the transaction body. Do not assert or otherwise panic there: returned errors are read-validated and retried when the attempt observed an inconsistent snapshot.
 
 ### Formatting Code
 

@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture, HookOutcome};
 use glassdb::backend::{Backend, BackendError};
-use glassdb::{Collection, CollectionPath, Database, Error};
+use glassdb::{Collection, CollectionPath, Database, Error, Transaction};
 use glassdb_storage::TxCommitStatus;
 
 type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + Send + Sync>;
@@ -162,10 +162,25 @@ fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
 
+fn try_read_int(b: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(b.get(..8)?.try_into().ok()?))
+}
+
 fn read_int(b: &[u8]) -> i64 {
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(&b[..8]);
-    i64::from_le_bytes(arr)
+    try_read_int(b).expect("integer value has the wrong width")
+}
+
+async fn read_existing_int(tx: &Transaction, coll: &Collection, key: &[u8]) -> Result<i64, Error> {
+    let value = tx.read(coll, key).await?.ok_or(Error::NotFound)?;
+    try_read_int(&value)
+        .ok_or_else(|| Error::internal(format!("key {key:?} has invalid integer value {value:?}")))
+}
+
+fn incremented_value(key: &[u8], current: i64) -> Result<Vec<u8>, Error> {
+    current
+        .checked_add(1)
+        .map(write_int)
+        .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))
 }
 
 /// Encodes `n` padded past the inline per-value budget (ADR-051), so its commit
@@ -216,11 +231,16 @@ async fn increment_with(
     // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
     db.tx(|tx| async move {
         let cur = match tx.read(coll, key).await {
-            Ok(Some(v)) => read_int(&v),
+            Ok(Some(v)) => try_read_int(&v).ok_or_else(|| {
+                Error::internal(format!("key {key:?} has invalid integer value {v:?}"))
+            })?,
             Ok(None) => 0,
             Err(e) => return Err(e),
         };
-        tx.write(coll, key, &encode(cur + 1))
+        let next = cur
+            .checked_add(1)
+            .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))?;
+        tx.write(coll, key, &encode(next))
     })
     .await
 }
@@ -418,10 +438,10 @@ async fn logged_commit_lost_ack_retries_transparently() {
     // by reference so the body stays `FnMut` (re-runnable on a retry).
     let coll = &coll;
     db.tx(|tx| async move {
-        let a = read_int(&tx.read(coll, b"a").await.unwrap().unwrap());
-        let b = read_int(&tx.read(coll, b"b").await.unwrap().unwrap());
-        tx.write(coll, b"a", &write_int(a + 1))?;
-        tx.write(coll, b"b", &write_int(b + 1))
+        let a = read_existing_int(&tx, coll, b"a").await?;
+        let b = read_existing_int(&tx, coll, b"b").await?;
+        tx.write(coll, b"a", &incremented_value(b"a", a)?)?;
+        tx.write(coll, b"b", &incremented_value(b"b", b)?)
     })
     .await
     .expect("the logged commit must retry the in-doubt log write transparently");
@@ -471,10 +491,10 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // closure re-run here — the lock retry is invisible to `Database::tx`).
     let coll = &coll;
     db.tx(|tx| async move {
-        let a = read_int(&tx.read(coll, b"a").await.unwrap().unwrap());
-        let b = read_int(&tx.read(coll, b"b").await.unwrap().unwrap());
-        tx.write(coll, b"a", &write_int(a + 1))?;
-        tx.write(coll, b"b", &write_int(b + 1))
+        let a = read_existing_int(&tx, coll, b"a").await?;
+        let b = read_existing_int(&tx, coll, b"b").await?;
+        tx.write(coll, b"a", &incremented_value(b"a", a)?)?;
+        tx.write(coll, b"b", &incremented_value(b"b", b)?)
     })
     .await
     .expect("a pre-commit in-doubt lock outcome must be recovered in place");

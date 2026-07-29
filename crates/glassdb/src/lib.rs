@@ -34,6 +34,20 @@ pub use scan::{KeyPage, KeyScan};
 pub use stats::Stats;
 pub use tx::Transaction;
 
+/// Returns an error from a transaction attempt when `condition` is false.
+///
+/// This is the transaction-body analogue of `assert!`: returning the error lets
+/// [`Database::tx`] validate the attempt's reads and retry if they were
+/// inconsistent. Assertions and other panics bypass that validation.
+#[macro_export]
+macro_rules! ensure_tx {
+    ($condition:expr, $error:expr $(,)?) => {
+        if !$condition {
+            return Err($error);
+        }
+    };
+}
+
 // The split soft-cap policy, so callers can tune when a collection's B-link
 // tree splits (see [`DatabaseBuilder::split_policy`]), and the inline-value
 // budgets (see [`DatabaseBuilder::inline_policy`]).
