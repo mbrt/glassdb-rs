@@ -136,6 +136,54 @@ cross-client logged-value resolution adds transaction-object lookups and a long
 tail to contended multi-key mutations. That attribution needs a repeated,
 phase-level run before changing policy.
 
+### Multi-RMW tail follow-up
+
+Status: closed as non-reproducible; the measured representation trade-off
+supports ADR-054 and does not justify a tail-specific engine change.
+
+The follow-up first isolates ADR-054 by comparing its accepted parent
+`f618e738` with implementation `7bc6fb01`. Three alternating S3-profile
+`hi/per-shape` pairs use eight workers per shape, four client Databases per
+shape, eight hot keys, a 10% throughput-CI target, and a 30-second cap. Every
+shape converges with zero failures.
+
+- `rwMany` throughput ratios are `1.459`, `1.062`, and `1.473`.
+- p50 ratios are `0.998`, `0.995`, and `1.014`; p90 ratios are `0.988`,
+  `1.009`, and `0.926`.
+- Object-read ratios are `0.923`, `1.021`, and `0.968`; object-write ratios are
+  `0.967`, `0.997`, and `0.981`.
+
+The original broad comparison (`ed590a8c` to `7bc6fb01`) is also repeated with
+the same settings. Its throughput ratios are `0.961`, `1.593`, and `1.390`,
+while p90 ratios are `0.984`, `1.022`, and `1.012`. Neither comparison
+reproduces the prior `0.377x` throughput and `13.9x` p90 result. That result was
+a one-run outlier, not evidence that ADR-054 regressed multi-RMW.
+
+Temporary instrumentation, applied identically to the isolated refs, wraps
+each benchmark Database with role- and byte-aware backend counters and brackets
+the measured foreground separately from shutdown. It also records decoded L1
+hits and misses. The wrapper perturbs scheduling, so its timing is not used;
+the operation and byte deltas are stable and all runs still converge without
+failures.
+
+For `rwMany` in the cross-client `per-shape` topology:
+
+- transaction-log body reads rise by only `11.3–14.8 B/transaction`; physical
+  transaction-log calls are too variable to distinguish because unchanged
+  conditional reads transfer no body;
+- L1 misses rise by `0.12–0.39/transaction`;
+- node reads fall by `57–81 B/transaction`; and
+- node writes fall by `2.14–2.15 KiB/transaction`.
+
+The shared-Database topology makes the added transaction-log body transfer
+almost disappear (`0.071–0.079 B/transaction` across the whole mixed cell),
+confirming that the decoded cache absorbs repeated resolution when clients
+share it. Cross-client caches cannot share that entry, but their extra body
+transfer remains much smaller than the leaf bytes no longer rewritten.
+Shutdown attribution is zero for every per-shape run and negligible in the
+shared runs, so this is a foreground representation trade-off rather than
+deferred cleanup.
+
 ### Demand-driven split validation
 
 A focused scenario in the existing `rtbench` binary fills one 192-entry leaf's
@@ -179,12 +227,13 @@ tree widening helps only when demand spans the new ranges.
 
 ADR-054 removes logged write-back amplification, and ADR-056 supplies the
 focused inline-capacity fix without globally lowering split thresholds. The
-focused result proves that pressure is observed, rerouted, converted into
-capacity, and repaid by later mutations. It does not establish that the current
-1 KiB/64 KiB budgets are optimal, nor quantify permanent widening under a broad
-workload.
+multi-RMW follow-up finds no durable tail regression and shows that the
+cross-client transaction-object transfer is small beside the saved leaf bytes.
+The focused split result proves that pressure is observed, rerouted, converted
+into capacity, and repaid by later mutations. It does not establish that the
+current 1 KiB/64 KiB budgets are optimal, nor quantify permanent widening under
+a broad workload.
 
-The next investigation is the repeated ADR-054 `hi/per-shape` multi-RMW tail.
-After that attribution, the policy sweep should compare no inlining, current
-defaults, and smaller aggregate budgets across value sizes before treating the
-defaults as settled.
+The next investigation is the inline-policy sweep: compare no inlining,
+current defaults, and smaller aggregate budgets across value sizes before
+treating the defaults as settled.
