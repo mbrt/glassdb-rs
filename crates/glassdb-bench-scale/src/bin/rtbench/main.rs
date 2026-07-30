@@ -32,6 +32,7 @@
 mod clientmetrics;
 mod cpu;
 mod diagnostics;
+mod inline_pressure;
 
 // musl's default allocator serializes multi-threaded allocation on a coarse
 // lock, which collapses into a futex/`sys`-CPU storm under the benchmark's
@@ -95,7 +96,11 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     delay_scale: f64,
     /// Which test to run.
-    #[arg(long, default_value = "simple", value_parser = ["simple", "rw9010", "deadlock"])]
+    #[arg(
+        long,
+        default_value = "simple",
+        value_parser = ["simple", "rw9010", "deadlock", "inline-pressure"]
+    )]
     test_name: String,
     /// Transaction mix for the `rw9010` test: a named preset (`balanced` =
     /// 1,6,3, the default 10%-write mix; `readheavy` = 1,14,5; `writeheavy` =
@@ -126,6 +131,16 @@ struct Args {
     /// Output file with one aggregate row per deadlock cell.
     #[arg(long, default_value = "deadlock-stats.csv")]
     deadlock_stats_out: String,
+    /// Output file with one row per phase of the inline-pressure scenario.
+    #[arg(long, default_value = "inline-pressure.csv")]
+    inline_pressure_out: String,
+    /// Maximum wait for each background split in the inline-pressure scenario.
+    #[arg(
+        long,
+        default_value = "5s",
+        value_parser = glassdb_bench_scale::parse_duration
+    )]
+    inline_pressure_settle_timeout: Duration,
     /// Explicit key counts for the deadlock sweep, e.g. `--deadlock-keys=1`.
     /// The default visits 1 through 6 keys.
     #[arg(long, value_delimiter = ',')]
@@ -203,6 +218,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             diagnostics.as_mut(),
         )?,
         "deadlock" => run_deadlock(&handle, &args, setup.backend, time_scale)?,
+        "inline-pressure" => inline_pressure::run(
+            &handle,
+            setup.backend,
+            inline_pressure::Options {
+                out: &args.inline_pressure_out,
+                time_scale,
+                num_runs: args.num_runs,
+                run_cooldown: args.run_cooldown,
+                drain_timeout: args.drain_timeout,
+                settle_timeout: args.inline_pressure_settle_timeout,
+            },
+        )?,
         other => return Err(format!("unknown test name {other:?}").into()),
     }
     Ok(())
@@ -491,9 +518,9 @@ impl Benchmarker {
             self.num_keys.to_string(),
             self.num_workers.to_string(),
             self.num_keys_per_worker.to_string(),
-            self.delta_stats.tx_n.to_string(),
+            self.delta_stats.transactions.completed.to_string(),
             res.samples.len().to_string(),
-            self.delta_stats.tx_retries.to_string(),
+            self.delta_stats.transactions.retries.to_string(),
             fmt_float(txs),
             fmt_ms(res.avg()),
             fmt_ms(res.percentile(0.25)),
@@ -1389,9 +1416,9 @@ fn run_deadlock(
                     "{},{k},{overlap},{overlap_pct},{count},{:.2},{},{},{},{:.2}",
                     run + 1,
                     results.tot_duration.as_secs_f64() * 1000.0,
-                    s.tx_retries,
-                    s.direct_commit_candidates,
-                    s.direct_commit_landed,
+                    s.transactions.retries,
+                    s.direct_commit.candidates,
+                    s.direct_commit.landed,
                     ben.worker_drain().as_secs_f64() * 1000.0,
                 )?;
                 eprintln!(
@@ -1402,9 +1429,9 @@ fn run_deadlock(
                     count,
                     results.percentile(0.5),
                     results.percentile(0.9),
-                    s.tx_retries,
-                    s.direct_commit_landed,
-                    s.direct_commit_candidates,
+                    s.transactions.retries,
+                    s.direct_commit.landed,
+                    s.direct_commit.candidates,
                     ben.worker_drain(),
                 );
             }
@@ -1482,16 +1509,16 @@ fn dump_stats(
         // Summing every backend-op class keeps it meaningful across engine
         // versions that categorize ops differently (e.g. v1's tag/metadata ops
         // vs v2 folding all coordination into object reads/writes).
-        let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists;
+        let backend_ops = s.backend.obj_writes + s.backend.obj_reads + s.backend.obj_lists;
         writeln!(
             out,
             "{run},{numdb},{i},{},{},{},{},{},{},{}",
-            res.stats.tx_n,
+            res.stats.transactions.completed,
             res.logical_tx(),
-            res.stats.tx_retries,
-            res.stats.obj_writes,
-            res.stats.obj_reads,
-            res.stats.obj_lists,
+            res.stats.transactions.retries,
+            res.stats.backend.obj_writes,
+            res.stats.backend.obj_reads,
+            res.stats.backend.obj_lists,
             backend_ops
         )?;
     }

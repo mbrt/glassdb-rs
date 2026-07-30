@@ -1,7 +1,7 @@
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cumulative statistics for the decoded L1 and persistent encoded-body L2.
+/// Cache activity for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
     /// Decoded L1 reads served locally.

@@ -136,6 +136,16 @@ fn distinct_tapes_can_produce_distinct_schedules() {
 }
 
 #[test]
+fn existing_rmw_workload_exercises_inline_pressure_splitting() {
+    let workload = contended_workload();
+    let recorded = record_once(0, &workload);
+    assert!(
+        recorded.iter().any(|op| op.path.contains("/_s/")),
+        "the existing RMW schedule should reach a structural split"
+    );
+}
+
+#[test]
 fn serializability_holds_under_contention() {
     // run_and_assert panics on any violation; reaching the end means the
     // invariant held for this tape.

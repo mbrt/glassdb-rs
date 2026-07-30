@@ -3,9 +3,9 @@
 //!
 //! Coordination objects are grow-only: a leaf that crosses its soft cap is
 //! halved so no single object becomes a scalability or contention bottleneck.
-//! Splitting runs off the hot path in a periodic background task, fed
-//! candidates the coordinator observes as it writes leaves — never a key-space
-//! enumeration.
+//! Splitting runs off the hot path in a periodic background task, fed candidates
+//! from stored over-cap leaves and direct-commit inline admission misses —
+//! never a key-space enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
 //! a one-node structure-write lock. Before joining collection topology in
@@ -41,6 +41,7 @@
 //! leaving the independent collection record untouched.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -49,8 +50,8 @@ use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
     CollectionStore, Directory, IndexNode, InlinePolicy, LeafObservation, LockType, Node,
-    Observation, Requirement, Shard, ShardStore, SplitPolicy, StorageError, StructuralLog,
-    StructuralLogPhase, Timeline, TxCommitStatus, TxLock, TxLog,
+    Observation, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy, StorageError,
+    StructuralLog, StructuralLogPhase, Timeline, TxCommitStatus, TxLock, TxLog,
 };
 use tokio::sync::Notify;
 
@@ -96,21 +97,84 @@ pub(crate) struct PendingSeparator {
 }
 
 /// The feed of leaves that may need splitting (ADR-031), owned by the
-/// [`Splitter`]. A handle is handed to the coordinator behind the
-/// [`SplitHinter`] seam: it pushes a leaf's path right after storing it over
-/// the soft cap, and the splitter drains and re-checks. Cloneable (all fields
-/// `Arc`), so the producer handle and the splitter share one queue and policy.
+/// [`Splitter`]. The coordinator observes stored leaf size through
+/// [`SplitHinter`], while direct-commit admission reports inline pressure
+/// through [`SplitHintSink`]. The splitter drains and re-checks both causes.
+/// Cloneable so the producers and splitter share one queue and policy.
 #[derive(Clone)]
 pub(crate) struct SplitCandidates {
     policy: SplitPolicy,
+    inline: InlinePolicy,
     clock: Clock,
     queue: Arc<Mutex<VecDeque<SplitCandidate>>>,
+}
+
+/// Lightweight producer handle for split hints decided outside the shard
+/// coordinator.
+#[derive(Clone)]
+pub(crate) struct SplitHintSink {
+    candidates: SplitCandidates,
+}
+
+impl SplitHintSink {
+    /// Records recoverable aggregate inline pressure for authoritative
+    /// revalidation by the splitter.
+    pub(crate) fn observe_inline_pressure(&self, path: &str, key: &[u8], value_len: usize) {
+        if !self.candidates.inline.admits_value(value_len) {
+            return;
+        }
+        self.candidates.push(SplitCandidate {
+            path: path.to_string(),
+            priority: self.candidates.new_id(),
+            reason: SplitReason::InlinePressure {
+                key: key.to_vec(),
+                value_len,
+            },
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_inline_pressure(&self) -> usize {
+        self.candidates
+            .queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|candidate| candidate.reason.is_inline_pressure())
+            .count()
+    }
 }
 
 #[derive(Clone)]
 struct SplitCandidate {
     path: String,
     priority: TxId,
+    reason: SplitReason,
+}
+
+#[derive(Clone)]
+enum SplitReason {
+    SoftCap,
+    InlinePressure { key: Vec<u8>, value_len: usize },
+}
+
+impl SplitReason {
+    fn class(&self) -> u8 {
+        match self {
+            SplitReason::SoftCap => 0,
+            SplitReason::InlinePressure { .. } => 1,
+        }
+    }
+
+    fn is_inline_pressure(&self) -> bool {
+        matches!(self, SplitReason::InlinePressure { .. })
+    }
+}
+
+enum SplitNeed {
+    Split,
+    NotActionable,
+    Reroute,
 }
 
 #[derive(Default)]
@@ -118,25 +182,98 @@ struct Stats {
     candidates: AtomicU64,
     completed: AtomicU64,
     deferred: AtomicU64,
+    inline_pressure_candidates: AtomicU64,
+    inline_pressure_completed: AtomicU64,
+    inline_pressure_deferred: AtomicU64,
+    inline_pressure_discarded: AtomicU64,
 }
 
-/// Cumulative background split activity since the previous stats snapshot.
+/// Background split activity for one snapshot or accumulated interval.
 ///
 /// `completed` counts locally observed source/root linearizations. A split may
 /// also be `deferred` if a later publication or cleanup step needs another
 /// sweep, so the fields are not mutually exclusive outcomes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SplitterStats {
+    /// Deduplicated candidates processed for any split cause.
     pub candidates: u64,
+    /// Locally observed source/root split linearizations for any cause.
     pub completed: u64,
+    /// Retryable candidate attempts requeued for any cause.
     pub deferred: u64,
+    /// Activity attributable specifically to aggregate inline pressure.
+    pub inline_pressure: InlinePressureStats,
+}
+
+/// Split activity attributable to aggregate inline pressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlinePressureStats {
+    /// Processed candidates.
+    pub candidates: u64,
+    /// Locally observed leaf splits.
+    pub completed: u64,
+    /// Retryable candidate attempts requeued.
+    pub deferred: u64,
+    /// Candidates discarded after authoritative revalidation.
+    pub discarded: u64,
+}
+
+impl AddAssign for InlinePressureStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.completed += rhs.completed;
+        self.deferred += rhs.deferred;
+        self.discarded += rhs.discarded;
+    }
+}
+
+impl Sub for InlinePressureStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            completed: self.completed.saturating_sub(rhs.completed),
+            deferred: self.deferred.saturating_sub(rhs.deferred),
+            discarded: self.discarded.saturating_sub(rhs.discarded),
+        }
+    }
+}
+
+impl AddAssign for SplitterStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.completed += rhs.completed;
+        self.deferred += rhs.deferred;
+        self.inline_pressure += rhs.inline_pressure;
+    }
+}
+
+impl Sub for SplitterStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            completed: self.completed.saturating_sub(rhs.completed),
+            deferred: self.deferred.saturating_sub(rhs.deferred),
+            inline_pressure: self.inline_pressure - rhs.inline_pressure,
+        }
+    }
 }
 
 impl SplitCandidates {
     /// Creates an empty candidate feed using `clock` for wound-wait priority.
+    #[cfg(test)]
     fn with_clock(policy: SplitPolicy, clock: Clock) -> Self {
+        Self::with_policies(policy, InlinePolicy::default(), clock)
+    }
+
+    /// Creates an empty candidate feed with co-wired split and inline policies.
+    fn with_policies(policy: SplitPolicy, inline: InlinePolicy, clock: Clock) -> Self {
         SplitCandidates {
             policy,
+            inline,
             clock,
             queue: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -147,19 +284,24 @@ impl SplitCandidates {
         &self.policy
     }
 
-    /// Drains every queued candidate, de-duplicated, for one sweep cycle.
+    fn hint_sink(&self) -> SplitHintSink {
+        SplitHintSink {
+            candidates: self.clone(),
+        }
+    }
+
+    /// Drains every queued candidate, de-duplicated by path and cause, for one
+    /// sweep cycle.
     fn drain(&self) -> Vec<SplitCandidate> {
         let mut q = self.queue.lock().unwrap();
-        let mut by_path = std::collections::BTreeMap::<String, SplitCandidate>::new();
+        let mut by_path = std::collections::BTreeMap::<(String, u8), SplitCandidate>::new();
         while let Some(candidate) = q.pop_front() {
-            match by_path.get_mut(&candidate.path) {
-                Some(current) if candidate.priority.older(&current.priority) => {
-                    *current = candidate;
-                }
+            let key = (candidate.path.clone(), candidate.reason.class());
+            match by_path.get_mut(&key) {
+                Some(current) => current.merge(candidate),
                 None => {
-                    by_path.insert(candidate.path.clone(), candidate);
+                    by_path.insert(key, candidate);
                 }
-                _ => {}
             }
         }
         by_path.into_values().collect()
@@ -167,6 +309,11 @@ impl SplitCandidates {
 
     /// Requeues a deferred split without changing its wound-wait priority.
     fn requeue(&self, candidate: SplitCandidate) {
+        self.push(candidate);
+    }
+
+    /// Adds one volatile candidate while keeping the best-effort feed bounded.
+    fn push(&self, candidate: SplitCandidate) {
         let mut q = self.queue.lock().unwrap();
         if q.len() >= CANDIDATE_QUEUE_CAP {
             q.pop_front();
@@ -177,6 +324,28 @@ impl SplitCandidates {
     /// Mints an operation id at normal transaction priority.
     fn new_id(&self) -> TxId {
         TxId::new_at(self.clock.now())
+    }
+}
+
+impl SplitCandidate {
+    /// Coalesces same-path, same-cause observations without sacrificing the
+    /// oldest structural priority or the largest requested headroom.
+    fn merge(&mut self, other: SplitCandidate) {
+        if other.priority.older(&self.priority) {
+            self.priority = other.priority.clone();
+        }
+        if let (
+            SplitReason::InlinePressure { key, value_len },
+            SplitReason::InlinePressure {
+                key: other_key,
+                value_len: other_len,
+            },
+        ) = (&mut self.reason, other.reason)
+            && other_len > *value_len
+        {
+            *key = other_key;
+            *value_len = other_len;
+        }
     }
 }
 
@@ -195,13 +364,10 @@ impl SplitHinter for SplitCandidates {
         if !over_cap {
             return;
         }
-        let mut q = self.queue.lock().unwrap();
-        if q.len() >= CANDIDATE_QUEUE_CAP {
-            q.pop_front();
-        }
-        q.push_back(SplitCandidate {
+        self.push(SplitCandidate {
             path: path.to_string(),
             priority: self.new_id(),
+            reason: SplitReason::SoftCap,
         });
     }
 }
@@ -221,8 +387,9 @@ pub struct Splitter {
     resolver: Resolver,
     timeline: Timeline,
     db_root: String,
-    // The leaf-candidate feed this splitter drains. A clone injected into the
-    // coordinator at construction reports over-cap leaf writes into it.
+    // The candidate feed this splitter drains. The coordinator receives a
+    // clone for stored-leaf capacity; direct resolvers receive lightweight hint
+    // sinks for inline-pressure observations.
     candidates: SplitCandidates,
     // Separators a split could not publish on the first try; re-driven each
     // sweep so the parent index eventually learns them (ADR-031). Purely
@@ -256,7 +423,7 @@ impl Splitter {
         policy: SplitPolicy,
         inline: InlinePolicy,
     ) -> (ShardCoordinator, Self) {
-        let candidates = SplitCandidates::with_clock(policy, clock);
+        let candidates = SplitCandidates::with_policies(policy, inline, clock);
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
@@ -264,7 +431,6 @@ impl Splitter {
             mon.clone(),
             retry,
             policy,
-            inline,
             Arc::new(candidates.clone()),
         );
         let splitter = Splitter::with_candidates(
@@ -282,12 +448,36 @@ impl Splitter {
         (coord, splitter)
     }
 
+    /// Returns a producer handle for split hints decided outside the shard
+    /// coordinator.
+    pub(crate) fn hint_sink(&self) -> SplitHintSink {
+        self.candidates.hint_sink()
+    }
+
     /// Returns and resets background split activity counters.
     pub fn stats_and_reset(&self) -> SplitterStats {
         SplitterStats {
             candidates: self.stats.candidates.swap(0, Ordering::Relaxed),
             completed: self.stats.completed.swap(0, Ordering::Relaxed),
             deferred: self.stats.deferred.swap(0, Ordering::Relaxed),
+            inline_pressure: InlinePressureStats {
+                candidates: self
+                    .stats
+                    .inline_pressure_candidates
+                    .swap(0, Ordering::Relaxed),
+                completed: self
+                    .stats
+                    .inline_pressure_completed
+                    .swap(0, Ordering::Relaxed),
+                deferred: self
+                    .stats
+                    .inline_pressure_deferred
+                    .swap(0, Ordering::Relaxed),
+                discarded: self
+                    .stats
+                    .inline_pressure_discarded
+                    .swap(0, Ordering::Relaxed),
+            },
         }
     }
 
@@ -411,18 +601,32 @@ impl Splitter {
     async fn run_once(&self) {
         for candidate in self.candidates.drain() {
             self.stats.candidates.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = self
-                .split_path_with_id(&candidate.path, candidate.priority.renew())
-                .await
-            {
+            let pressure = candidate.reason.is_inline_pressure();
+            if pressure {
+                self.stats
+                    .inline_pressure_candidates
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Err(e) = self.process_candidate(&candidate).await {
                 tracing::debug!(
                     target: "glassdb::splitter",
                     path = %candidate.path,
                     error = %e,
                     "split candidate deferred"
                 );
-                if !matches!(e, TransError::InvalidInput(_)) {
+                let discard = pressure
+                    && matches!(e, TransError::InvalidInput(_) | TransError::StaleCollection);
+                if discard {
+                    self.stats
+                        .inline_pressure_discarded
+                        .fetch_add(1, Ordering::Relaxed);
+                } else if !matches!(e, TransError::InvalidInput(_)) {
                     self.stats.deferred.fetch_add(1, Ordering::Relaxed);
+                    if pressure {
+                        self.stats
+                            .inline_pressure_deferred
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     self.candidates.requeue(candidate);
                 }
             }
@@ -443,22 +647,140 @@ impl Splitter {
         }
     }
 
+    /// Dispatches one candidate through its cause-specific validation path.
+    async fn process_candidate(&self, candidate: &SplitCandidate) -> Result<(), TransError> {
+        match &candidate.reason {
+            SplitReason::SoftCap => {
+                self.split_path_with_id(
+                    &candidate.path,
+                    candidate.priority.renew(),
+                    &candidate.reason,
+                )
+                .await
+            }
+            SplitReason::InlinePressure { key, value_len } => {
+                self.split_inline_pressure(
+                    &candidate.path,
+                    key,
+                    *value_len,
+                    candidate.priority.renew(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Reroutes and revalidates one pressure observation before splitting.
+    async fn split_inline_pressure(
+        &self,
+        observed_path: &str,
+        key: &[u8],
+        value_len: usize,
+        id: TxId,
+    ) -> Result<(), TransError> {
+        let parsed = paths::parse(observed_path)
+            .map_err(|error| StorageError::with_source("parsing pressure path", error))?;
+        let located = match self
+            .dir
+            .leaf_for(
+                &parsed.prefix,
+                key,
+                Requirement::AtLeast(self.timeline.now()),
+            )
+            .await
+        {
+            Ok(located) => located,
+            Err(StorageError::NotFound) => {
+                self.stats
+                    .inline_pressure_discarded
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let reason = SplitReason::InlinePressure {
+            key: key.to_vec(),
+            value_len,
+        };
+        match located
+            .node()
+            .map(|node| self.split_need(node, &reason))
+            .unwrap_or(SplitNeed::NotActionable)
+        {
+            SplitNeed::Split => self.split_path_with_id(&located.path, id, &reason).await,
+            SplitNeed::NotActionable => {
+                self.stats
+                    .inline_pressure_discarded
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            SplitNeed::Reroute => Err(TransError::Retry),
+        }
+    }
+
+    /// Classifies whether `node` still needs the split represented by `reason`.
+    fn split_need(&self, node: &Node, reason: &SplitReason) -> SplitNeed {
+        match reason {
+            SplitReason::SoftCap => {
+                if node.over_soft_cap(self.candidates.policy()) {
+                    SplitNeed::Split
+                } else {
+                    SplitNeed::NotActionable
+                }
+            }
+            SplitReason::InlinePressure { key, value_len } => {
+                let Some(leaf) = node.as_leaf() else {
+                    return SplitNeed::Reroute;
+                };
+                if !node.owns(key) {
+                    return SplitNeed::Reroute;
+                }
+                if !self.candidates.inline.admits_value(*value_len)
+                    || leaf.len() < 2
+                    || !leaf.lookup(key).is_some_and(ShardEntry::exists)
+                {
+                    return SplitNeed::NotActionable;
+                }
+                let other_inline_bytes = leaf
+                    .entries()
+                    .filter(|entry| entry.key.as_slice() != key.as_slice())
+                    .map(|entry| entry.current.inline_len())
+                    .sum();
+                if self
+                    .candidates
+                    .inline
+                    .admits(other_inline_bytes, *value_len)
+                {
+                    SplitNeed::NotActionable
+                } else {
+                    SplitNeed::Split
+                }
+            }
+        }
+    }
+
     /// Splits the leaf at object `path` if it is still over the soft cap: an
     /// in-place root split when `path` is the collection root `_r`, else a
     /// standalone node half-split.
     async fn split_path(&self, path: &str) -> Result<(), TransError> {
-        self.split_path_with_id(path, self.candidates.new_id())
+        let reason = SplitReason::SoftCap;
+        self.split_path_with_id(path, self.candidates.new_id(), &reason)
             .await
     }
 
     /// Splits `path` using an already-aged wound-wait priority.
-    async fn split_path_with_id(&self, path: &str, id: TxId) -> Result<(), TransError> {
+    async fn split_path_with_id(
+        &self,
+        path: &str,
+        id: TxId,
+        reason: &SplitReason,
+    ) -> Result<(), TransError> {
         let pr = paths::parse(path)
             .map_err(|e| StorageError::with_source("parsing candidate path", e))?;
         if paths::is_tree_root(path) {
-            self.split_root(&pr.prefix, id).await
+            self.split_root(&pr.prefix, id, reason).await
         } else {
-            self.split_nonroot(&pr.prefix, &pr.suffix, id).await
+            self.split_nonroot(&pr.prefix, &pr.suffix, id, reason).await
         }
     }
 
@@ -526,6 +848,7 @@ impl Splitter {
         let worker = self.candidates.new_id();
         self.mon.begin_tx(&worker);
         let mut recovery_pending = false;
+        let reason = SplitReason::SoftCap;
         let source_token = (!paths::is_tree_root(path)).then_some(parsed.suffix.as_str());
         let result = match self
             .prepare_structural_intent(&parsed.prefix, source_token, topology_participant)
@@ -536,6 +859,7 @@ impl Splitter {
                     self.coordinate_root_split(
                         &parsed.prefix,
                         &worker,
+                        &reason,
                         &mut intent,
                         &mut recovery_pending,
                     )
@@ -545,6 +869,7 @@ impl Splitter {
                         &parsed.prefix,
                         &parsed.suffix,
                         &worker,
+                        &reason,
                         &mut intent,
                         &mut recovery_pending,
                     )
@@ -807,7 +1132,13 @@ impl Splitter {
     }
 
     /// Halves a standalone node and finalizes its wound-wait participant.
-    async fn split_nonroot(&self, prefix: &str, token: &str, id: TxId) -> Result<(), TransError> {
+    async fn split_nonroot(
+        &self,
+        prefix: &str,
+        token: &str,
+        id: TxId,
+        reason: &SplitReason,
+    ) -> Result<(), TransError> {
         let mut recovery_pending = false;
         let result = match self.begin_topology_tx(prefix, &id).await {
             Ok(()) => match self
@@ -821,6 +1152,7 @@ impl Splitter {
                                 prefix,
                                 token,
                                 &id,
+                                reason,
                                 &mut intent,
                                 &mut recovery_pending,
                             )
@@ -856,6 +1188,7 @@ impl Splitter {
         prefix: &str,
         token: &str,
         worker: &TxId,
+        reason: &SplitReason,
         intent: &mut Observation<StructuralLog>,
         recovery_pending: &mut bool,
     ) -> Result<(), TransError> {
@@ -878,10 +1211,23 @@ impl Splitter {
         else {
             return Err(TransError::Retry);
         };
-        if !node.over_soft_cap(self.candidates.policy()) {
-            return self
-                .release_structural_gate(prefix, Some(token), worker)
-                .await;
+        match self.split_need(&node, reason) {
+            SplitNeed::Split => {}
+            SplitNeed::NotActionable => {
+                if reason.is_inline_pressure() {
+                    self.stats
+                        .inline_pressure_discarded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return self
+                    .release_structural_gate(prefix, Some(token), worker)
+                    .await;
+            }
+            SplitNeed::Reroute => {
+                self.release_structural_gate(prefix, Some(token), worker)
+                    .await?;
+                return Err(TransError::Retry);
+            }
         }
 
         let Some((right, split_key)) = node.split(&right_token) else {
@@ -923,6 +1269,11 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        if reason.is_inline_pressure() {
+            self.stats
+                .inline_pressure_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.publish_separators(
             prefix,
             &split_key,
@@ -935,7 +1286,12 @@ impl Splitter {
     }
 
     /// Grows an overflowing collection root into a two-child index.
-    async fn split_root(&self, prefix: &str, id: TxId) -> Result<(), TransError> {
+    async fn split_root(
+        &self,
+        prefix: &str,
+        id: TxId,
+        reason: &SplitReason,
+    ) -> Result<(), TransError> {
         let mut recovery_pending = false;
         let result = match self.begin_topology_tx(prefix, &id).await {
             Ok(()) => match self.prepare_structural_intent(prefix, None, &id).await {
@@ -945,6 +1301,7 @@ impl Splitter {
                             self.coordinate_root_split(
                                 prefix,
                                 &id,
+                                reason,
                                 &mut intent,
                                 &mut recovery_pending,
                             )
@@ -1038,6 +1395,7 @@ impl Splitter {
         &self,
         prefix: &str,
         worker: &TxId,
+        reason: &SplitReason,
         intent: &mut Observation<StructuralLog>,
         recovery_pending: &mut bool,
     ) -> Result<(), TransError> {
@@ -1057,8 +1415,20 @@ impl Splitter {
         else {
             return Err(TransError::Retry);
         };
-        if !node.over_soft_cap(self.candidates.policy()) {
-            return self.release_structural_gate(prefix, None, worker).await;
+        match self.split_need(&node, reason) {
+            SplitNeed::Split => {}
+            SplitNeed::NotActionable => {
+                if reason.is_inline_pressure() {
+                    self.stats
+                        .inline_pressure_discarded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return self.release_structural_gate(prefix, None, worker).await;
+            }
+            SplitNeed::Reroute => {
+                self.release_structural_gate(prefix, None, worker).await?;
+                return Err(TransError::Retry);
+            }
         }
 
         let l_token = prepared.created_tokens[0].clone();
@@ -1118,6 +1488,11 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        if reason.is_inline_pressure() {
+            self.stats
+                .inline_pressure_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.shards.delete_structural_log(intent).await?;
         Ok(())
     }
@@ -1654,6 +2029,23 @@ mod tests {
         }
     }
 
+    fn inline_live(key: &[u8], value: &[u8]) -> ShardEntry {
+        ShardEntry {
+            current: CurrentState::Inline {
+                writer: TxId::from_bytes(vec![1]),
+                value: Arc::from(value),
+            },
+            ..ShardEntry::new(key)
+        }
+    }
+
+    fn pressure_inline() -> InlinePolicy {
+        InlinePolicy {
+            max_value_bytes: 8,
+            max_leaf_bytes: 8,
+        }
+    }
+
     fn leaf_node(keys: &[&[u8]], high: Option<&[u8]>, right: Option<&str>) -> Node {
         Node::leaf(Shard::from_entries(keys.iter().map(|k| live(k))))
             .with_high_key(high.map(<[u8]>::to_vec))
@@ -1691,7 +2083,6 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             *candidates.policy(),
-            InlinePolicy::default(),
             Arc::new(candidates.clone()),
         );
         Splitter::with_candidates(
@@ -1915,8 +2306,9 @@ mod tests {
         let worker = TxId::with_priority(2, b"worker");
         sp.mon.begin_tx(&worker);
         let mut recovery_pending = false;
+        let reason = SplitReason::SoftCap;
         assert!(matches!(
-            sp.coordinate_root_split(COLL, &worker, &mut intent, &mut recovery_pending)
+            sp.coordinate_root_split(COLL, &worker, &reason, &mut intent, &mut recovery_pending,)
                 .await,
             Err(TransError::Retry)
         ));
@@ -2136,9 +2528,175 @@ mod tests {
                 candidates: 1,
                 completed: 1,
                 deferred: 0,
+                ..SplitterStats::default()
             }
         );
         assert_eq!(sp.stats_and_reset(), SplitterStats::default());
+    }
+
+    #[tokio::test]
+    async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
+        let s = store();
+        let root = Node::leaf(Shard::from_entries([
+            live(b"a"),
+            live(b"b"),
+            live(b"c"),
+            live(b"d"),
+            live(b"e"),
+            inline_live(b"f", b"12345678"),
+            live(b"g"),
+            live(b"h"),
+        ]));
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let candidates = SplitCandidates::with_policies(
+            SplitPolicy::default(),
+            pressure_inline(),
+            Clock::real(),
+        );
+        let sp = splitter_with_candidates(&s, &bg, candidates.clone());
+        let root_path = paths::tree_root(COLL);
+
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"h", 8);
+        sp.run_once().await;
+
+        let dir = Directory::new(s.shards.clone());
+        assert_eq!(
+            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "one request performs only the root's median split"
+        );
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                completed: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    completed: 1,
+                    ..InlinePressureStats::default()
+                },
+                ..SplitterStats::default()
+            }
+        );
+
+        let target = dir
+            .leaf_for(COLL, b"h", Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        let reason = SplitReason::InlinePressure {
+            key: b"h".to_vec(),
+            value_len: 8,
+        };
+        assert!(
+            matches!(
+                target.node().map(|node| sp.split_need(node, &reason)),
+                Some(SplitNeed::Split)
+            ),
+            "the first median left real pressure for a future observation"
+        );
+
+        // The old root path is deliberately stale now. Key-directed
+        // revalidation must find and split the current owning child.
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"h", 8);
+        sp.run_once().await;
+
+        assert_eq!(
+            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "a second real observation drives exactly one more split"
+        );
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                completed: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    completed: 1,
+                    ..InlinePressureStats::default()
+                },
+                ..SplitterStats::default()
+            }
+        );
+        let target = dir
+            .leaf_for(COLL, b"h", Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            target.node().map(|node| sp.split_need(node, &reason)),
+            Some(SplitNeed::NotActionable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
+        let s = store();
+        let root = Node::leaf(Shard::from_entries([live(b"a"), live(b"b")]));
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let candidates = SplitCandidates::with_policies(
+            SplitPolicy::default(),
+            pressure_inline(),
+            Clock::real(),
+        );
+        let sp = splitter_with_candidates(&s, &bg, candidates.clone());
+        let root_path = paths::tree_root(COLL);
+
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"b", 8);
+        sp.run_once().await;
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    discarded: 1,
+                    ..InlinePressureStats::default()
+                },
+                ..SplitterStats::default()
+            },
+            "a value that now fits does not reshape the tree"
+        );
+
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"missing", 8);
+        sp.run_once().await;
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    discarded: 1,
+                    ..InlinePressureStats::default()
+                },
+                ..SplitterStats::default()
+            },
+            "a key that disappeared does not reshape the tree"
+        );
+        assert!(
+            s.load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .as_leaf()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2166,6 +2724,7 @@ mod tests {
                 candidates: 1,
                 completed: 0,
                 deferred: 1,
+                ..SplitterStats::default()
             }
         );
         assert!(
@@ -2193,6 +2752,7 @@ mod tests {
                 candidates: 1,
                 completed: 1,
                 deferred: 0,
+                ..SplitterStats::default()
             }
         );
         assert!(
@@ -2318,7 +2878,6 @@ mod tests {
             other_mon.clone(),
             RetryConfig::default(),
             SplitPolicy::default(),
-            InlinePolicy::default(),
             Arc::new(crate::shard_coord::NoSplitHints),
         );
         let other_locker = crate::tlocker::Locker::new(

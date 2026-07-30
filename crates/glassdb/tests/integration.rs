@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{
-    Backend, Collection, CollectionPath, Database, Error, ProtocolTiming, SplitPolicy, Transaction,
+    Backend, Collection, CollectionPath, Database, Error, InlinePolicy, ProtocolTiming,
+    SplitPolicy, Transaction,
 };
 use glassdb_storage::{Node, TxCommitStatus};
 use tokio::sync::{Barrier, Notify, oneshot};
@@ -89,9 +90,9 @@ async fn rw() {
     assert_eq!(buf, val);
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 3);
-    assert_eq!(stats.tx_writes, 1);
-    assert_eq!(stats.tx_retries, 0);
+    assert_eq!(stats.transactions.completed, 3);
+    assert_eq!(stats.transactions.writes, 1);
+    assert_eq!(stats.transactions.retries, 0);
 }
 
 #[tokio::test]
@@ -117,7 +118,7 @@ async fn individually_oversized_key_is_invalid_input() {
     assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
     let delta = db.stats() - before;
     assert_eq!(
-        delta.lock_calls, 0,
+        delta.locker.calls, 0,
         "invalid keys are rejected before locking"
     );
 }
@@ -126,7 +127,7 @@ async fn individually_oversized_key_is_invalid_input() {
 // (the same reset-on-read accumulation pattern as the backend object counters),
 // not only through the internal diagnostics snapshot. A committed write
 // transaction takes the locked commit path (a read-only commit does not), so it
-// must bump `lock_calls` while a pure read leaves the counter unchanged.
+// must bump `locker.calls` while a pure read leaves the counter unchanged.
 #[tokio::test(start_paused = true)]
 async fn stats_report_locker_activity() {
     let db = init_db(mem()).await;
@@ -140,25 +141,25 @@ async fn stats_report_locker_activity() {
     coll.write(b"key1", b"value1").await.unwrap();
     let after_write = db.stats();
     assert!(
-        after_write.lock_calls > before.lock_calls,
+        after_write.locker.calls > before.locker.calls,
         "a committed write must report locker calls: {} -> {}",
-        before.lock_calls,
-        after_write.lock_calls
+        before.locker.calls,
+        after_write.locker.calls
     );
     assert!(
-        after_write.coord_submissions > before.coord_submissions,
+        after_write.coordinator.submissions > before.coordinator.submissions,
         "a committed write must submit coordinator work: {} -> {}",
-        before.coord_submissions,
-        after_write.coord_submissions
+        before.coordinator.submissions,
+        after_write.coordinator.submissions
     );
     assert!(
-        after_write.coord_rounds > before.coord_rounds,
+        after_write.coordinator.rounds > before.coordinator.rounds,
         "a committed write must start coordinator rounds: {} -> {}",
-        before.coord_rounds,
-        after_write.coord_rounds
+        before.coordinator.rounds,
+        after_write.coordinator.rounds
     );
     assert!(
-        after_write.coord_submissions >= after_write.coord_rounds,
+        after_write.coordinator.submissions >= after_write.coordinator.rounds,
         "one round cannot serve more work than was submitted"
     );
 
@@ -167,13 +168,13 @@ async fn stats_report_locker_activity() {
     let _ = coll.read(b"key1").await.unwrap();
     let after_read = db.stats();
     assert_eq!(
-        after_read.lock_calls, after_write.lock_calls,
+        after_read.locker.calls, after_write.locker.calls,
         "a read-only commit takes no locks"
     );
 
     db.shutdown().await;
     let drained = db.stats();
-    assert!(drained.coord_submissions >= after_write.coord_submissions);
+    assert!(drained.coordinator.submissions >= after_write.coordinator.submissions);
     assert_eq!(db.stats(), drained, "stats snapshots remain cumulative");
 }
 
@@ -199,8 +200,72 @@ async fn stats_report_direct_commit_coverage() {
     .unwrap();
 
     let delta = db.stats() - before;
-    assert_eq!(delta.direct_commit_candidates, 1);
-    assert_eq!(delta.direct_commit_landed, 1);
+    assert_eq!(delta.direct_commit.candidates, 1);
+    assert_eq!(delta.direct_commit.landed, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
+    let db = Database::builder("example", mem())
+        .inline_policy(InlinePolicy {
+            max_value_bytes: 8,
+            max_leaf_bytes: 8,
+        })
+        .open()
+        .await
+        .unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"inline-pressure")
+        .await
+        .unwrap();
+    coll.write(b"a", &write_int(0)).await.unwrap();
+    coll.write(b"b", &write_int(0)).await.unwrap();
+
+    let before_first = db.stats();
+    rmw(&db, &coll, b"a", 1).await.unwrap();
+    let first = db.stats() - before_first;
+    assert_eq!(first.direct_commit.candidates, 1);
+    assert_eq!(first.direct_commit.landed, 1);
+
+    let before_miss = db.stats();
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    let miss = db.stats() - before_miss;
+    assert_eq!(miss.direct_commit.candidates, 1);
+    assert_eq!(miss.direct_commit.landed, 0);
+    assert!(
+        miss.locker.calls > 0,
+        "the discovering mutation completes through the locked fallback"
+    );
+
+    let before_split = db.stats();
+    let mut after_split = before_split;
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        after_split = db.stats();
+        if after_split.splitter.inline_pressure.completed
+            > before_split.splitter.inline_pressure.completed
+        {
+            break;
+        }
+    }
+    let split = after_split - before_split;
+    assert_eq!(split.splitter.inline_pressure.candidates, 1);
+    assert_eq!(split.splitter.inline_pressure.completed, 1);
+    assert_eq!(split.splitter.inline_pressure.discarded, 0);
+
+    let before_retry = db.stats();
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    let retry = db.stats() - before_retry;
+    assert_eq!(retry.direct_commit.candidates, 1);
+    assert_eq!(retry.direct_commit.landed, 1);
+    assert_eq!(
+        retry.locker.calls, 0,
+        "the split gives the later mutation enough inline headroom"
+    );
+    assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 2);
+    db.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -218,8 +283,8 @@ async fn stats_report_transactional_decoded_cache_hits() {
     let before_cold = reader_db.stats();
     assert_eq!(reader.read(key).await.unwrap().unwrap(), value);
     let cold = reader_db.stats() - before_cold;
-    assert_eq!(cold.tx_reads, 1);
-    assert_eq!(cold.tx_cache_hits, 0);
+    assert_eq!(cold.transactions.reads, 1);
+    assert_eq!(cold.transactions.cache_hits, 0);
 
     let before_warm = reader_db.stats();
     let reader_ref = &reader;
@@ -240,8 +305,8 @@ async fn stats_report_transactional_decoded_cache_hits() {
         .await
         .unwrap();
     let warm = reader_db.stats() - before_warm;
-    assert_eq!(warm.tx_reads, 1);
-    assert_eq!(warm.tx_cache_hits, 1);
+    assert_eq!(warm.transactions.reads, 1);
+    assert_eq!(warm.transactions.cache_hits, 1);
 
     let before_stale = reader_db.stats();
     assert_eq!(
@@ -253,15 +318,15 @@ async fn stats_report_transactional_decoded_cache_hits() {
         value
     );
     let stale = reader_db.stats() - before_stale;
-    assert_eq!(stale.tx_reads, 0);
-    assert_eq!(stale.tx_cache_hits, 0);
+    assert_eq!(stale.transactions.reads, 0);
+    assert_eq!(stale.transactions.cache_hits, 0);
 
     reader.delete(key).await.unwrap();
     let before_deleted = reader_db.stats();
     assert!(reader.read(key).await.unwrap().is_none());
     let deleted = reader_db.stats() - before_deleted;
-    assert_eq!(deleted.tx_reads, 1);
-    assert_eq!(deleted.tx_cache_hits, 1);
+    assert_eq!(deleted.transactions.reads, 1);
+    assert_eq!(deleted.transactions.cache_hits, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -288,9 +353,9 @@ async fn delete() {
     );
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 4);
-    assert_eq!(stats.tx_writes, 2);
-    assert!(stats.tx_retries <= 1);
+    assert_eq!(stats.transactions.completed, 4);
+    assert_eq!(stats.transactions.writes, 2);
+    assert!(stats.transactions.retries <= 1);
 }
 
 /// Regression: reading a found key and deleting that same key in one
@@ -400,10 +465,10 @@ async fn rmw_single() {
     rmw(&db, &coll, key, 30).await.unwrap();
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 31);
-    assert_eq!(stats.tx_reads, 30);
-    assert_eq!(stats.tx_writes, 30);
-    assert_eq!(stats.tx_retries, 0);
+    assert_eq!(stats.transactions.completed, 31);
+    assert_eq!(stats.transactions.reads, 30);
+    assert_eq!(stats.transactions.writes, 30);
+    assert_eq!(stats.transactions.retries, 0);
 
     let val = coll.read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 30);
@@ -488,9 +553,9 @@ async fn a_superseded_read_modify_write_replays_without_locking() {
     // The interposed overwrite and the replayed commit both land directly, and
     // neither the loss nor the replay ever acquires a lock.
     let delta = db.stats() - before;
-    assert_eq!(delta.direct_commit_landed, 2);
-    assert_eq!(delta.lock_calls, 0, "a replayed loss publishes no holder");
-    assert_eq!(delta.tx_retries, 1);
+    assert_eq!(delta.direct_commit.landed, 2);
+    assert_eq!(delta.locker.calls, 0, "a replayed loss publishes no holder");
+    assert_eq!(delta.transactions.retries, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -506,8 +571,8 @@ async fn multiple_rmw_single() {
     assert_eq!(read_int(&val), 30);
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 32);
-    assert_eq!(stats.tx_retries, 0);
+    assert_eq!(stats.transactions.completed, 32);
+    assert_eq!(stats.transactions.retries, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -574,8 +639,8 @@ async fn concurrent_reads() {
     }
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 32);
-    assert_eq!(stats.tx_retries, 0);
+    assert_eq!(stats.transactions.completed, 32);
+    assert_eq!(stats.transactions.retries, 0);
 
     for k in keys {
         let b = coll.read(k).await.unwrap().unwrap();
@@ -620,8 +685,8 @@ async fn read_stale() {
     }
 
     let stats = db.stats();
-    assert_eq!(stats.tx_n, 31);
-    assert_eq!(stats.tx_retries, 0);
+    assert_eq!(stats.transactions.completed, 31);
+    assert_eq!(stats.transactions.retries, 0);
 }
 
 // `Database::diagnostics` smoke test: on a fresh Database the snapshot is empty, and after
@@ -762,7 +827,7 @@ async fn list_keys() {
     // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
     // never a directory `list` of an object prefix.
     let stats = db.stats();
-    assert_eq!(stats.obj_lists, 0);
+    assert_eq!(stats.backend.obj_lists, 0);
 }
 
 #[tokio::test]
@@ -908,7 +973,7 @@ async fn scan_then_create_prevents_phantom_write_skew() {
         .unwrap()
         .into_keys();
     assert_eq!(keys.len(), 1, "only one create-if-empty may commit");
-    assert!(db.stats().tx_retries >= 1);
+    assert!(db.stats().transactions.retries >= 1);
 }
 
 #[tokio::test]

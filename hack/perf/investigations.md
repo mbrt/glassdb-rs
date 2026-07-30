@@ -16,7 +16,9 @@ This file is evidence, not a record of accepted behavior:
 
 Status: logged-publication simplification implemented by
 [ADR-054](../../docs/adr/054-reserve-inline-publication-for-logless-commits.md);
-inline-pressure splitting and budget tuning remain open.
+inline-pressure splitting implemented and validated by
+[ADR-056](../../docs/adr/056-demand-driven-inline-pressure-splits.md); budget
+tuning remains open.
 
 Reference: `5c3e5ac6`, after ADR-053. The goal is to isolate ADR-051's
 provisional inline budgets from the later contention fix.
@@ -134,17 +136,55 @@ cross-client logged-value resolution adds transaction-object lookups and a long
 tail to contended multi-key mutations. That attribution needs a repeated,
 phase-level run before changing policy.
 
+### Demand-driven split validation
+
+A focused scenario in the existing `rtbench` binary fills one 192-entry leaf's
+64 KiB aggregate budget with 64 direct 1 KiB mutations. Two distinct external
+keys then encounter aggregate rejection. The first requests the root split; the
+second, after rerouting, requests a split of the still-saturated child. A final
+64-mutation wave alternates between the two leaves with newly available
+capacity. The fixture stays below ADR-031's ordinary entry and encoded-byte
+thresholds, so pressure is the only possible split cause.
+
+The harness is applied identically to `e88cb819` and `0be65fee`; the historical
+copy changes only its statistics-field adapter because ADR-056's pressure
+counters do not exist there. Three release-mode pairs per profile are
+interleaved by side.
+
+- Every target run processes two pressure candidates, completes two splits,
+  and records no deferral or discard. The tree grows from one leaf to three.
+  The base remains at one.
+- Both discovering mutations still use the locked fallback. The later wave
+  changes from `0/64` to `64/64` direct landings and from 64 lock calls to zero.
+- S3-profile recovery throughput improves by `3.50–3.65x`, with p50 at
+  `0.26–0.27x`, p90 at `0.29–0.32x`, operations/transaction at `0.26–0.29x`,
+  and write bytes/transaction at `0.20–0.22x`.
+- GCS-profile recovery throughput improves by `3.46–3.90x`, with p50 at
+  `0.22–0.25x`, p90 at `0.51–0.66x`, operations/transaction at `0.28–0.29x`,
+  and write bytes/transaction at `0.20–0.22x`.
+- Including both discovering fallbacks and structural work, total
+  operations/transaction fall to `0.53–0.55x` in S3 and `0.53–0.54x` in GCS;
+  total write bytes/transaction fall to `0.42–0.45x` and `0.42–0.44x`.
+
+Access order is material under the GCS profile. An initial version grouped 32
+recovery mutations on one new leaf before moving to the next. It still doubled
+throughput, but target p90 rose to `1.61–1.64x` because the model enforces GCS's
+one-write-per-second limit per object and its retry backoff can overshoot the
+next token. Alternating the same fixed keys across the two leaves measures the
+parallel capacity created by the split and changes p90 to `0.51–0.66x`. This
+does not promise relief for a workload that remains concentrated on one leaf;
+tree widening helps only when demand spans the new ranges.
+
 ### Current conclusion
 
-Complete write-back suppression is a useful byte-amplification simplification,
-but it is not the inline-capacity fix. A global 64-entry split threshold would
-solve the focused case by widening every tree, including ones that never need
-direct capacity.
+ADR-054 removes logged write-back amplification, and ADR-056 supplies the
+focused inline-capacity fix without globally lowering split thresholds. The
+focused result proves that pressure is observed, rerouted, converted into
+capacity, and repaid by later mutations. It does not establish that the current
+1 KiB/64 KiB budgets are optimal, nor quantify permanent widening under a broad
+workload.
 
-The logged-publication simplification is implemented by
-[ADR-054](../../docs/adr/054-reserve-inline-publication-for-logless-commits.md).
-The next design candidate should instead preserve the suppression and hint a
-background split only when direct publication encounters aggregate inline
-pressure. Such a split creates more authoritative capacity while retaining the
-64 KiB per-object bound. Its trigger rate, first-rejection fallback, and
-worst-case tree-width growth need an explicit design before implementation.
+The next investigation is the repeated ADR-054 `hi/per-shape` multi-RMW tail.
+After that attribution, the policy sweep should compare no inlining, current
+defaults, and smaller aggregate budgets across value sizes before treating the
+defaults as settled.

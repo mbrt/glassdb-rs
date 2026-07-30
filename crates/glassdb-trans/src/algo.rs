@@ -24,6 +24,7 @@
 //! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
 use std::collections::BTreeSet;
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -47,7 +48,7 @@ use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
 };
-use crate::split::Splitter;
+use crate::split::{SplitHintSink, Splitter};
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -75,13 +76,31 @@ struct DirectCommitCounters {
     landed: AtomicU64,
 }
 
-/// Cumulative coverage from ADR-051's direct single-key commit path.
+/// Direct single-key commit coverage for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectCommitStats {
     /// Mutation attempts shaped for the direct path.
     pub candidates: u64,
     /// Candidates that committed directly.
     pub landed: u64,
+}
+
+impl AddAssign for DirectCommitStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.landed += rhs.landed;
+    }
+}
+
+impl Sub for DirectCommitStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            landed: self.landed.saturating_sub(rhs.landed),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -328,10 +347,12 @@ impl<'a> ValidationContext<'a> {
 struct DirectCommitResolver {
     id: TxId,
     raw_key: Vec<u8>,
+    leaf_path: String,
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
     inline: InlinePolicy,
+    split_hints: SplitHintSink,
 }
 
 #[async_trait]
@@ -378,9 +399,18 @@ impl ShardResolver for DirectCommitResolver {
             .map(|(_, entry)| entry.current.inline_len())
             .sum();
         if !self.inline.admits(other_inline_bytes, self.value.len()) {
-            return Ok(Step::Skip {
-                outcome: self.unlanded(ctx, Ineligible::Locked),
-            });
+            let outcome = self.unlanded(ctx, Ineligible::Locked);
+            if self.inline.admits_value(self.value.len()) {
+                // Resolution runs in the coordinator worker, so this
+                // best-effort observation is detached from the submitter even
+                // though the coordinator has no inline-pressure policy.
+                self.split_hints.observe_inline_pressure(
+                    &self.leaf_path,
+                    &self.raw_key,
+                    self.value.len(),
+                );
+            }
+            return Ok(Step::Skip { outcome });
         }
 
         // Publish the value itself as the new current state, dropping the
@@ -606,6 +636,7 @@ pub struct Algo {
     clock: Clock,
     timeline: Timeline,
     split_policy: SplitPolicy,
+    inline_policy: InlinePolicy,
     collection_catalog: CollectionCatalog,
     collection_lifecycle: CollectionLifecycle,
     splitter: Splitter,
@@ -632,6 +663,7 @@ impl Algo {
         background: Option<Weak<Background>>,
         resolver: Resolver,
         split_policy: SplitPolicy,
+        inline_policy: InlinePolicy,
         splitter: Splitter,
     ) -> Self {
         let collection_lifecycle = locker.collection_lifecycle(shards.clone());
@@ -645,6 +677,7 @@ impl Algo {
             clock,
             timeline,
             split_policy,
+            inline_policy,
             collection_catalog,
             collection_lifecycle,
             splitter,
@@ -1241,10 +1274,10 @@ impl Algo {
         self.direct_commit_stats
             .candidates
             .fetch_add(1, Ordering::Relaxed);
-        let inline = self.coord.inline_policy();
-        // The per-value budget is decidable here; the aggregate leaf budget
-        // needs the folded leaf, so the resolver re-checks both.
-        if value.len() > inline.max_value_bytes {
+        let inline = self.inline_policy;
+        // Reject values no partition could admit before routing; aggregate
+        // pressure from other keys needs the folded leaf (ADR-056).
+        if !inline.admits_value(value.len()) {
             return Ok(DirectAttempt::Locked);
         }
         let raw_key = key.key().to_vec();
@@ -1262,10 +1295,12 @@ impl Algo {
         let resolver = Arc::new(DirectCommitResolver {
             id: tx.id.clone(),
             raw_key,
+            leaf_path: leaf_path.clone(),
             key,
             value,
             read_version,
             inline,
+            split_hints: self.splitter.hint_sink(),
         });
         let outcome = self
             .coord
@@ -1816,6 +1851,7 @@ mod tests {
             None,
             resolver,
             glassdb_storage::SplitPolicy::default(),
+            glassdb_storage::InlinePolicy::default(),
             splitter,
         );
         (
@@ -1865,6 +1901,24 @@ mod tests {
         tm.begin(data, CollectionData::default())
     }
 
+    /// Runs one resolver fold and retains its complete classification.
+    async fn fold_step(
+        resolver: &dyn ShardResolver,
+        tctx: &Tctx,
+        cause: ReloadCause,
+        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        locks: &NodeLocks,
+    ) -> Step {
+        let writers = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
+        let ctx = ResolveCtx {
+            resolver: &writers,
+            tmon: &tctx.tmon,
+            requirement: Requirement::Any,
+            cause,
+        };
+        resolver.resolve(&ctx, staged, locks).await.unwrap()
+    }
+
     /// Runs one fold of `resolver` over the leaf state a coordinator round would
     /// hand it, and reports the outcome it classifies. Lets a test drive the
     /// `cause` and node-lock combinations that a live interleaving can only
@@ -1876,14 +1930,7 @@ mod tests {
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         locks: &NodeLocks,
     ) -> FoldOutcome {
-        let writers = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
-        let ctx = ResolveCtx {
-            resolver: &writers,
-            tmon: &tctx.tmon,
-            requirement: Requirement::Any,
-            cause,
-        };
-        match resolver.resolve(&ctx, staged, locks).await.unwrap() {
+        match fold_step(resolver, tctx, cause, staged, locks).await {
             Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
         }
     }
@@ -2828,7 +2875,7 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -2842,7 +2889,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "an over-budget value goes straight to locking, it never replays"
         );
         let c = write_counts(&log);
@@ -2889,7 +2936,7 @@ mod tests {
                 .unwrap()
         );
 
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut handle = begin_data(
             &tm,
             Data {
@@ -2914,7 +2961,7 @@ mod tests {
         result.unwrap();
         tm.end(&mut handle).await.unwrap();
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "an observed gate bypasses the direct commit"
         );
         assert_eq!(
@@ -3080,7 +3127,7 @@ mod tests {
 
         // End to end: the writer commits directly over H1 (help-forwarding it
         // into the chain, not orphaning it), taking no lock of its own.
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3094,7 +3141,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert_eq!(
-            tctx.locker.lock_calls_and_reset(),
+            tctx.locker.stats_and_reset().calls,
             0,
             "the committed holder did not push the writer onto the locked path"
         );
@@ -3232,10 +3279,12 @@ mod tests {
         let resolver = DirectCommitResolver {
             id: TxId::with_priority(2, b"direct"),
             raw_key: b"k".to_vec(),
+            leaf_path: paths::tree_root(TEST_COLL),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
             inline: InlinePolicy::default(),
+            split_hints: tm.splitter.hint_sink(),
         };
         let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
@@ -3280,14 +3329,17 @@ mod tests {
         let seed = entry(&tctx, b"k").await.unwrap();
         let current = seed.current.writer().cloned().unwrap();
         let locks = NodeLocks::default();
+        let split_hints = tm.splitter.hint_sink();
 
         let direct = |read_version| DirectCommitResolver {
             id: TxId::with_priority(9, b"direct"),
             raw_key: b"k".to_vec(),
+            leaf_path: paths::tree_root(TEST_COLL),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version,
             inline: InlinePolicy::default(),
+            split_hints: split_hints.clone(),
         };
 
         // A read the entry has moved past: nothing is staged and the loss is
@@ -3381,10 +3433,45 @@ mod tests {
                 },
             ),
         ]);
-        let outcome = fold(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await;
-        assert!(
-            matches!(outcome, FoldOutcome::Moved),
-            "a closed aggregate budget takes the locked protocol, got {outcome:?}"
+        assert!(matches!(
+            fold_step(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
+            Step::Skip {
+                outcome: FoldOutcome::Moved
+            }
+        ));
+        assert_eq!(split_hints.pending_inline_pressure(), 1);
+        assert!(matches!(
+            fold_step(
+                &budgeted,
+                &tctx,
+                ReloadCause::Reloaded { in_doubt: true },
+                &crowded,
+                &locks,
+            )
+            .await,
+            Step::Skip {
+                outcome: FoldOutcome::InDoubt(_)
+            }
+        ));
+        assert_eq!(split_hints.pending_inline_pressure(), 2);
+
+        let impossible = DirectCommitResolver {
+            inline: InlinePolicy {
+                max_value_bytes: 64,
+                max_leaf_bytes: 1,
+            },
+            ..direct(Some(current.clone()))
+        };
+        assert!(matches!(
+            fold_step(&impossible, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
+            Step::Skip {
+                outcome: FoldOutcome::Moved
+            }
+        ));
+        assert_eq!(
+            split_hints.pending_inline_pressure(),
+            2,
+            "a value no leaf can admit does not request a split"
         );
 
         // The round-level classifications: a same-key claim proves this member
@@ -3621,7 +3708,7 @@ mod tests {
         let keyp = key_ref(b"new");
 
         log.lock().unwrap().clear();
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3634,7 +3721,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "a create takes the full locked path"
         );
         let c = write_counts(&log);
@@ -3658,7 +3745,7 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3671,7 +3758,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "a delete takes the full locked path"
         );
         let c = write_counts(&log);
@@ -4289,11 +4376,11 @@ mod tests {
         assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 
         // No concurrent change: the listing validates and commits.
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(&tm, data.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
-        assert_eq!(tctx.locker.lock_calls_and_reset(), 0);
+        assert_eq!(tctx.locker.stats_and_reset().calls, 0);
 
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
@@ -4310,9 +4397,9 @@ mod tests {
         let (fresh, keys) = scan_data(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         tm.reset(&mut stale, fresh);
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         tm.commit(&mut stale).await.unwrap();
-        assert!(tctx.locker.lock_calls_and_reset() >= 1);
+        assert!(tctx.locker.stats_and_reset().calls >= 1);
         let log = tctx
             .tlogger
             .get_at(stale.id(), Requirement::Any)

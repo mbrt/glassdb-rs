@@ -186,7 +186,13 @@ impl SimWorkload for MembershipWorkload {
         media: Option<SimMedia>,
     ) -> Result<Database, Error> {
         // A tiny split soft cap so a handful of keys forces B-link splits.
-        open_det_db(backend, tiny_split_policy(), media).await
+        open_det_db(
+            backend,
+            tiny_split_policy(),
+            glassdb_storage::InlinePolicy::default(),
+            media,
+        )
+        .await
     }
 
     async fn seed(&self, db: &Database) {

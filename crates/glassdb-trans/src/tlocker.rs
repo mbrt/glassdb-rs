@@ -26,6 +26,7 @@
 //! progress where the parallel path could livelock.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,6 +79,29 @@ pub struct HeldLeafSnapshot {
 pub struct TxLockSnapshot {
     pub tx_id: TxId,
     pub leaves: Vec<HeldLeafSnapshot>,
+}
+
+/// Snapshot of distributed-locker activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LockerStats {
+    /// Lock-acquisition calls, including serial-fallback re-locks.
+    pub calls: u64,
+}
+
+impl AddAssign for LockerStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.calls += rhs.calls;
+    }
+}
+
+impl Sub for LockerStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            calls: self.calls.saturating_sub(rhs.calls),
+        }
+    }
 }
 
 /// The lock a transaction wants on a key's shard entry.
@@ -770,10 +794,9 @@ impl Locker {
         }
     }
 
-    /// Returns and resets the count of lock-acquisition calls (one per `lock()`
-    /// attempt, including serial-fallback re-locks).
-    pub fn lock_calls_and_reset(&self) -> usize {
-        self.data.lock_calls_and_reset()
+    /// Returns and resets distributed-locker activity counters.
+    pub fn stats_and_reset(&self) -> LockerStats {
+        self.data.stats_and_reset()
     }
 
     /// Returns one entry per transaction that currently holds any leaf lock,
@@ -944,10 +967,11 @@ impl DataLocker {
         }
     }
 
-    /// Returns and resets the count of lock-acquisition calls (one per `lock()`
-    /// attempt, including serial-fallback re-locks).
-    fn lock_calls_and_reset(&self) -> usize {
-        self.calls.swap(0, Ordering::Relaxed) as usize
+    /// Returns and resets distributed-locker activity counters.
+    fn stats_and_reset(&self) -> LockerStats {
+        LockerStats {
+            calls: self.calls.swap(0, Ordering::Relaxed),
+        }
     }
 
     /// Returns one entry per transaction that currently holds any leaf lock,
@@ -1378,7 +1402,6 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             policy,
-            glassdb_storage::InlinePolicy::default(),
             Arc::new(crate::shard_coord::NoSplitHints),
         );
         let locker = Locker::new(

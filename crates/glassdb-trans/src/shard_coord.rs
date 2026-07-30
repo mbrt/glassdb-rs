@@ -26,6 +26,7 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,8 +36,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    InlinePolicy, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
-    SplitPolicy, StorageError,
+    LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError,
 };
 
 use crate::error::TransError;
@@ -54,12 +55,32 @@ struct Stats {
     n_retries: AtomicU64,
 }
 
-/// Cumulative coordination work since the previous stats snapshot.
+/// Coordination work for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShardCoordinatorStats {
     pub submissions: u64,
     pub rounds: u64,
     pub cas_retries: u64,
+}
+
+impl AddAssign for ShardCoordinatorStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.submissions += rhs.submissions;
+        self.rounds += rhs.rounds;
+        self.cas_retries += rhs.cas_retries;
+    }
+}
+
+impl Sub for ShardCoordinatorStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            submissions: self.submissions.saturating_sub(rhs.submissions),
+            rounds: self.rounds.saturating_sub(rhs.rounds),
+            cas_retries: self.cas_retries.saturating_sub(rhs.cas_retries),
+        }
+    }
 }
 
 /// One transaction's outcome for a single deduplicated CAS round, deposited by
@@ -310,10 +331,9 @@ impl MergeRequest for CasReq {
     }
 }
 
-/// Sink for the leaf-write events the coordinator emits on its CAS path, so a
-/// background growth policy can decide whether to split (ADR-031). The
-/// coordinator depends only on this seam — never on the splitter's queue: it
-/// reports the leaf it just stored and knows nothing of soft caps. The
+/// Sink for stored-leaf capacity observations, so a background growth policy
+/// can decide whether to split (ADR-031). The coordinator depends only on this
+/// seam — never on the splitter's queue or policy. The
 /// [`Splitter`](crate::Splitter) supplies the implementation; a coordinator
 /// with none attached uses [`NoSplitHints`].
 pub trait SplitHinter: Send + Sync {
@@ -340,12 +360,10 @@ struct CoordCore {
     resolver: Resolver,
     retry: RetryConfig,
     stats: Stats,
-    // Where over-cap leaf writes are reported (ADR-031): the background
+    // Where stored over-cap leaves are reported: the background
     // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
-    // Emitted on the write path so growth needs no key-space enumeration.
     hinter: Arc<dyn SplitHinter>,
     policy: SplitPolicy,
-    inline: InlinePolicy,
 }
 
 struct CoordState {
@@ -667,24 +685,19 @@ impl ShardCoordinator {
             tmon,
             retry,
             SplitPolicy::default(),
-            InlinePolicy::default(),
             Arc::new(NoSplitHints),
         )
     }
 
-    /// Creates a coordinator that reports over-cap leaf writes to `hinter` — the
-    /// background [`Splitter`](crate::Splitter)'s queue (ADR-031). `policy`
-    /// governs the coordinator's hard node-size limit and `inline` configures
-    /// the direct-commit admission policy exposed to [`Algo`](crate::Algo); the
-    /// hinting seam carries only leaf-write observations and never exposes
-    /// splitter configuration.
+    /// Creates a coordinator that reports capacity observations to `hinter` —
+    /// normally the background [`Splitter`](crate::Splitter)'s queue.
+    /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         shards: ShardStore,
         resolver: Resolver,
         tmon: Monitor,
         retry: RetryConfig,
         policy: SplitPolicy,
-        inline: InlinePolicy,
         hinter: Arc<dyn SplitHinter>,
     ) -> Self {
         let core = Arc::new(CoordCore {
@@ -694,7 +707,6 @@ impl ShardCoordinator {
             retry,
             stats: Stats::default(),
             policy,
-            inline,
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
@@ -722,12 +734,6 @@ impl ShardCoordinator {
     /// Returns a per-object dedup coordination snapshot (ADR-025).
     pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
         self.inner.dedup.snapshot()
-    }
-
-    /// The inline-value budgets used by logless direct commits (ADR-051,
-    /// ADR-054).
-    pub(crate) fn inline_policy(&self) -> InlinePolicy {
-        self.inner.core.inline
     }
 
     /// Submits one shard member (any resolver installed by a caller — the
@@ -885,15 +891,8 @@ mod tests {
         let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord = ShardCoordinator::with_hinter(
-            shards.clone(),
-            resolver,
-            mon,
-            retry,
-            policy,
-            InlinePolicy::default(),
-            hinter,
-        );
+        let coord =
+            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
         (coord, shards, timeline, bg)
     }
 

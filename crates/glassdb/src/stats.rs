@@ -2,11 +2,57 @@
 //! `stats.go` (the backend counting is provided by `glassdb_backend`'s
 //! `StatsBackend`).
 
-use std::ops::Sub;
+use std::ops::{AddAssign, Sub};
 use std::time::Duration;
 
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
+use glassdb_trans::{DirectCommitStats, LockerStats, ShardCoordinatorStats, SplitterStats};
+
+/// Transaction activity for one snapshot or accumulated interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransactionStats {
+    /// Number of completed transactions.
+    pub completed: u64,
+    /// Time spent within transactions.
+    pub elapsed: Duration,
+    /// Number of reads.
+    pub reads: u64,
+    /// Number of distinct transactional reads derived entirely from local objects.
+    /// Counted once per key per transaction attempt, including cached
+    /// not-found results.
+    pub cache_hits: u64,
+    /// Number of writes.
+    pub writes: u64,
+    /// Number of retried transactions.
+    pub retries: u64,
+}
+
+impl AddAssign for TransactionStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.completed += rhs.completed;
+        self.elapsed += rhs.elapsed;
+        self.reads += rhs.reads;
+        self.cache_hits += rhs.cache_hits;
+        self.writes += rhs.writes;
+        self.retries += rhs.retries;
+    }
+}
+
+impl Sub for TransactionStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            completed: self.completed.saturating_sub(rhs.completed),
+            elapsed: self.elapsed.saturating_sub(rhs.elapsed),
+            reads: self.reads.saturating_sub(rhs.reads),
+            cache_hits: self.cache_hits.saturating_sub(rhs.cache_hits),
+            writes: self.writes.saturating_sub(rhs.writes),
+            retries: self.retries.saturating_sub(rhs.retries),
+        }
+    }
+}
 
 /// Holds cumulative performance counters for a database.
 ///
@@ -14,103 +60,31 @@ use glassdb_storage::CacheStats;
 /// measure a specific interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Transaction execution activity.
+    pub transactions: TransactionStats,
+    /// Backend object operations.
+    pub backend: BackendStats,
     /// Decoded L1 and persistent encoded-body L2 cache activity.
     pub cache: CacheStats,
-
-    /// Number of completed transactions.
-    pub tx_n: u64,
-    /// Time spent within transactions.
-    pub tx_time: Duration,
-    /// Number of reads.
-    pub tx_reads: u64,
-    /// Number of distinct transactional reads derived entirely from local objects.
-    /// Counted once per key per transaction attempt, including cached
-    /// not-found results.
-    pub tx_cache_hits: u64,
-    /// Number of writes.
-    pub tx_writes: u64,
-    /// Number of retried transactions.
-    pub tx_retries: u64,
-
-    /// Number of object reads.
-    pub obj_reads: u64,
-    /// Number of object writes.
-    pub obj_writes: u64,
-    /// Number of list calls.
-    pub obj_lists: u64,
-
-    /// Number of lock-acquisition calls made by the distributed locker.
-    pub lock_calls: u64,
-    /// Number of shard-coordinator inner CAS retries performed under contention.
-    pub lock_retries: u64,
-
-    /// Number of mutation requests submitted to the shard coordinator.
-    pub coord_submissions: u64,
-    /// Number of deduplicated shard-coordinator worker rounds started.
-    pub coord_rounds: u64,
-
-    /// Number of mutation attempts shaped for ADR-051's direct single-key path.
-    pub direct_commit_candidates: u64,
-    /// Number of direct single-key commits that landed.
-    pub direct_commit_landed: u64,
-
-    /// Number of deduplicated split candidates processed in the background.
-    pub split_candidates: u64,
-    /// Number of locally observed split source/root linearizations.
-    pub split_completed: u64,
-    /// Number of retryable split candidates requeued for a later sweep.
-    pub split_deferred: u64,
+    /// Distributed-locker activity.
+    pub locker: LockerStats,
+    /// Shared shard-coordinator activity.
+    pub coordinator: ShardCoordinatorStats,
+    /// Logless direct-commit coverage.
+    pub direct_commit: DirectCommitStats,
+    /// Background tree-split activity.
+    pub splitter: SplitterStats,
 }
 
-impl Stats {
-    pub(crate) fn add(&mut self, other: &Stats) {
-        self.cache += other.cache;
-        self.tx_n += other.tx_n;
-        self.tx_time += other.tx_time;
-        self.tx_reads += other.tx_reads;
-        self.tx_cache_hits += other.tx_cache_hits;
-        self.tx_writes += other.tx_writes;
-        self.tx_retries += other.tx_retries;
-        self.obj_reads += other.obj_reads;
-        self.obj_writes += other.obj_writes;
-        self.obj_lists += other.obj_lists;
-        self.lock_calls += other.lock_calls;
-        self.lock_retries += other.lock_retries;
-        self.coord_submissions += other.coord_submissions;
-        self.coord_rounds += other.coord_rounds;
-        self.direct_commit_candidates += other.direct_commit_candidates;
-        self.direct_commit_landed += other.direct_commit_landed;
-        self.split_candidates += other.split_candidates;
-        self.split_completed += other.split_completed;
-        self.split_deferred += other.split_deferred;
-    }
-
-    pub(crate) fn add_backend(&mut self, b: &BackendStats) {
-        self.obj_reads += b.obj_reads;
-        self.obj_writes += b.obj_writes;
-        self.obj_lists += b.obj_lists;
-    }
-
-    pub(crate) fn add_cache(&mut self, cache: CacheStats) {
-        self.cache += cache;
-    }
-
-    pub(crate) fn add_protocol(
-        &mut self,
-        lock_calls: u64,
-        coord: glassdb_trans::ShardCoordinatorStats,
-        direct: glassdb_trans::DirectCommitStats,
-        split: glassdb_trans::SplitterStats,
-    ) {
-        self.lock_calls += lock_calls;
-        self.lock_retries += coord.cas_retries;
-        self.coord_submissions += coord.submissions;
-        self.coord_rounds += coord.rounds;
-        self.direct_commit_candidates += direct.candidates;
-        self.direct_commit_landed += direct.landed;
-        self.split_candidates += split.candidates;
-        self.split_completed += split.completed;
-        self.split_deferred += split.deferred;
+impl AddAssign for Stats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.transactions += rhs.transactions;
+        self.backend += rhs.backend;
+        self.cache += rhs.cache;
+        self.locker += rhs.locker;
+        self.coordinator += rhs.coordinator;
+        self.direct_commit += rhs.direct_commit;
+        self.splitter += rhs.splitter;
     }
 }
 
@@ -119,31 +93,13 @@ impl Sub for Stats {
 
     fn sub(self, other: Stats) -> Stats {
         Stats {
+            transactions: self.transactions - other.transactions,
+            backend: self.backend - other.backend,
             cache: self.cache - other.cache,
-            tx_n: self.tx_n.saturating_sub(other.tx_n),
-            tx_time: self.tx_time.saturating_sub(other.tx_time),
-            tx_reads: self.tx_reads.saturating_sub(other.tx_reads),
-            tx_cache_hits: self.tx_cache_hits.saturating_sub(other.tx_cache_hits),
-            tx_writes: self.tx_writes.saturating_sub(other.tx_writes),
-            tx_retries: self.tx_retries.saturating_sub(other.tx_retries),
-            obj_reads: self.obj_reads.saturating_sub(other.obj_reads),
-            obj_writes: self.obj_writes.saturating_sub(other.obj_writes),
-            obj_lists: self.obj_lists.saturating_sub(other.obj_lists),
-            lock_calls: self.lock_calls.saturating_sub(other.lock_calls),
-            lock_retries: self.lock_retries.saturating_sub(other.lock_retries),
-            coord_submissions: self
-                .coord_submissions
-                .saturating_sub(other.coord_submissions),
-            coord_rounds: self.coord_rounds.saturating_sub(other.coord_rounds),
-            direct_commit_candidates: self
-                .direct_commit_candidates
-                .saturating_sub(other.direct_commit_candidates),
-            direct_commit_landed: self
-                .direct_commit_landed
-                .saturating_sub(other.direct_commit_landed),
-            split_candidates: self.split_candidates.saturating_sub(other.split_candidates),
-            split_completed: self.split_completed.saturating_sub(other.split_completed),
-            split_deferred: self.split_deferred.saturating_sub(other.split_deferred),
+            locker: self.locker - other.locker,
+            coordinator: self.coordinator - other.coordinator,
+            direct_commit: self.direct_commit - other.direct_commit,
+            splitter: self.splitter - other.splitter,
         }
     }
 }
@@ -151,48 +107,135 @@ impl Sub for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glassdb_trans::InlinePressureStats;
 
     #[test]
-    fn subtraction_covers_cache_and_protocol_counters() {
+    fn subtraction_covers_component_snapshots() {
         let before = Stats {
+            transactions: TransactionStats {
+                completed: 2,
+                elapsed: Duration::from_secs(3),
+                reads: 7,
+                cache_hits: 4,
+                writes: 5,
+                retries: 1,
+            },
+            backend: BackendStats {
+                obj_reads: 12,
+                obj_writes: 8,
+                obj_lists: 3,
+            },
             cache: CacheStats {
                 l1_hits: 4,
                 l2_hits: 2,
                 ..Default::default()
             },
-            coord_submissions: 10,
-            coord_rounds: 8,
-            direct_commit_candidates: 7,
-            direct_commit_landed: 5,
-            split_candidates: 3,
-            split_completed: 2,
-            split_deferred: 1,
-            ..Default::default()
+            locker: LockerStats { calls: 6 },
+            coordinator: ShardCoordinatorStats {
+                submissions: 10,
+                rounds: 8,
+                cas_retries: 2,
+            },
+            direct_commit: DirectCommitStats {
+                candidates: 7,
+                landed: 5,
+            },
+            splitter: SplitterStats {
+                candidates: 3,
+                completed: 2,
+                deferred: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 2,
+                    completed: 1,
+                    deferred: 1,
+                    discarded: 0,
+                },
+            },
         };
         let after = Stats {
+            transactions: TransactionStats {
+                completed: 5,
+                elapsed: Duration::from_secs(8),
+                reads: 18,
+                cache_hits: 10,
+                writes: 9,
+                retries: 3,
+            },
+            backend: BackendStats {
+                obj_reads: 19,
+                obj_writes: 11,
+                obj_lists: 5,
+            },
             cache: CacheStats {
                 l1_hits: 9,
                 l2_hits: 3,
                 ..Default::default()
             },
-            coord_submissions: 14,
-            coord_rounds: 10,
-            direct_commit_candidates: 11,
-            direct_commit_landed: 8,
-            split_candidates: 5,
-            split_completed: 3,
-            split_deferred: 1,
-            ..Default::default()
+            locker: LockerStats { calls: 10 },
+            coordinator: ShardCoordinatorStats {
+                submissions: 14,
+                rounds: 10,
+                cas_retries: 3,
+            },
+            direct_commit: DirectCommitStats {
+                candidates: 11,
+                landed: 8,
+            },
+            splitter: SplitterStats {
+                candidates: 5,
+                completed: 3,
+                deferred: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 5,
+                    completed: 2,
+                    deferred: 1,
+                    discarded: 1,
+                },
+            },
         };
-        let delta = after - before;
-        assert_eq!(delta.cache.l1_hits, 5);
-        assert_eq!(delta.cache.l2_hits, 1);
-        assert_eq!(delta.coord_submissions, 4);
-        assert_eq!(delta.coord_rounds, 2);
-        assert_eq!(delta.direct_commit_candidates, 4);
-        assert_eq!(delta.direct_commit_landed, 3);
-        assert_eq!(delta.split_candidates, 2);
-        assert_eq!(delta.split_completed, 1);
-        assert_eq!(delta.split_deferred, 0);
+        assert_eq!(
+            after - before,
+            Stats {
+                transactions: TransactionStats {
+                    completed: 3,
+                    elapsed: Duration::from_secs(5),
+                    reads: 11,
+                    cache_hits: 6,
+                    writes: 4,
+                    retries: 2,
+                },
+                backend: BackendStats {
+                    obj_reads: 7,
+                    obj_writes: 3,
+                    obj_lists: 2,
+                },
+                cache: CacheStats {
+                    l1_hits: 5,
+                    l2_hits: 1,
+                    ..Default::default()
+                },
+                locker: LockerStats { calls: 4 },
+                coordinator: ShardCoordinatorStats {
+                    submissions: 4,
+                    rounds: 2,
+                    cas_retries: 1,
+                },
+                direct_commit: DirectCommitStats {
+                    candidates: 4,
+                    landed: 3,
+                },
+                splitter: SplitterStats {
+                    candidates: 2,
+                    completed: 1,
+                    deferred: 0,
+                    inline_pressure: InlinePressureStats {
+                        candidates: 3,
+                        completed: 1,
+                        deferred: 0,
+                        discarded: 1,
+                    },
+                },
+            }
+        );
     }
 }

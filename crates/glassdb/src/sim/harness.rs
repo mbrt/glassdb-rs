@@ -13,7 +13,7 @@ use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::OpRecord;
 use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
-use glassdb_storage::SplitPolicy;
+use glassdb_storage::{InlinePolicy, SplitPolicy};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
@@ -93,12 +93,14 @@ impl<'a> Arbitrary<'a> for FaultConfig {
 /// and optional persistent-cache media.
 pub(crate) async fn open_det_db(
     backend: &Arc<dyn Backend>,
-    policy: SplitPolicy,
+    split_policy: SplitPolicy,
+    inline_policy: InlinePolicy,
     media: Option<SimMedia>,
 ) -> Result<Database, Error> {
     let builder = Database::builder(DB_NAME, backend.clone())
         .deterministic_time(true)
-        .split_policy(policy)
+        .split_policy(split_policy)
+        .inline_policy(inline_policy)
         .protocol_timing(ProtocolTiming::simulation());
     let builder = if let Some(media) = media {
         builder.simulated_persistent_cache(
@@ -342,7 +344,12 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
         backend: &Arc<dyn Backend>,
         media: Option<SimMedia>,
     ) -> impl Future<Output = Result<Database, Error>> + Send {
-        open_det_db(backend, SplitPolicy::default(), media)
+        open_det_db(
+            backend,
+            SplitPolicy::default(),
+            InlinePolicy::default(),
+            media,
+        )
     }
 
     /// Creates and seeds this workload's collection(s) before the clients start,
