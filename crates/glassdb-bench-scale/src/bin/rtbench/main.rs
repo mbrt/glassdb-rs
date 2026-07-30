@@ -32,6 +32,7 @@
 mod clientmetrics;
 mod cpu;
 mod diagnostics;
+mod inline_pressure;
 
 // musl's default allocator serializes multi-threaded allocation on a coarse
 // lock, which collapses into a futex/`sys`-CPU storm under the benchmark's
@@ -95,7 +96,11 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     delay_scale: f64,
     /// Which test to run.
-    #[arg(long, default_value = "simple", value_parser = ["simple", "rw9010", "deadlock"])]
+    #[arg(
+        long,
+        default_value = "simple",
+        value_parser = ["simple", "rw9010", "deadlock", "inline-pressure"]
+    )]
     test_name: String,
     /// Transaction mix for the `rw9010` test: a named preset (`balanced` =
     /// 1,6,3, the default 10%-write mix; `readheavy` = 1,14,5; `writeheavy` =
@@ -126,6 +131,16 @@ struct Args {
     /// Output file with one aggregate row per deadlock cell.
     #[arg(long, default_value = "deadlock-stats.csv")]
     deadlock_stats_out: String,
+    /// Output file with one row per phase of the inline-pressure scenario.
+    #[arg(long, default_value = "inline-pressure.csv")]
+    inline_pressure_out: String,
+    /// Maximum wait for each background split in the inline-pressure scenario.
+    #[arg(
+        long,
+        default_value = "5s",
+        value_parser = glassdb_bench_scale::parse_duration
+    )]
+    inline_pressure_settle_timeout: Duration,
     /// Explicit key counts for the deadlock sweep, e.g. `--deadlock-keys=1`.
     /// The default visits 1 through 6 keys.
     #[arg(long, value_delimiter = ',')]
@@ -203,6 +218,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             diagnostics.as_mut(),
         )?,
         "deadlock" => run_deadlock(&handle, &args, setup.backend, time_scale)?,
+        "inline-pressure" => inline_pressure::run(
+            &handle,
+            setup.backend,
+            inline_pressure::Options {
+                out: &args.inline_pressure_out,
+                time_scale,
+                num_runs: args.num_runs,
+                run_cooldown: args.run_cooldown,
+                drain_timeout: args.drain_timeout,
+                settle_timeout: args.inline_pressure_settle_timeout,
+            },
+        )?,
         other => return Err(format!("unknown test name {other:?}").into()),
     }
     Ok(())

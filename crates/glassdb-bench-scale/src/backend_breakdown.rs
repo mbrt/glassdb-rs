@@ -13,6 +13,8 @@ pub struct OperationCounts {
     pub reads: u64,
     pub writes: u64,
     pub lists: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
 }
 
 impl OperationCounts {
@@ -29,6 +31,8 @@ impl Sub for OperationCounts {
             reads: self.reads.saturating_sub(other.reads),
             writes: self.writes.saturating_sub(other.writes),
             lists: self.lists.saturating_sub(other.lists),
+            read_bytes: self.read_bytes.saturating_sub(other.read_bytes),
+            write_bytes: self.write_bytes.saturating_sub(other.write_bytes),
         }
     }
 }
@@ -58,6 +62,17 @@ impl BackendBreakdown {
 
     pub fn total(self) -> u64 {
         self.rows().into_iter().map(|(_, ops)| ops.total()).sum()
+    }
+
+    pub fn read_bytes(self) -> u64 {
+        self.rows().into_iter().map(|(_, ops)| ops.read_bytes).sum()
+    }
+
+    pub fn write_bytes(self) -> u64 {
+        self.rows()
+            .into_iter()
+            .map(|(_, ops)| ops.write_bytes)
+            .sum()
     }
 }
 
@@ -91,6 +106,8 @@ struct AtomicCounts {
     reads: AtomicU64,
     writes: AtomicU64,
     lists: AtomicU64,
+    read_bytes: AtomicU64,
+    write_bytes: AtomicU64,
 }
 
 impl AtomicCounts {
@@ -99,6 +116,8 @@ impl AtomicCounts {
             reads: self.reads.load(Ordering::Relaxed),
             writes: self.writes.load(Ordering::Relaxed),
             lists: self.lists.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -183,6 +202,20 @@ impl ClassifiedBackend {
             .lists
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    fn count_read_bytes(&self, path: &str, bytes: usize) {
+        self.counters
+            .role(classify(path))
+            .read_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn count_write_bytes(&self, path: &str, bytes: usize) {
+        self.counters
+            .role(classify(path))
+            .write_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
 }
 
 fn classify(path: &str) -> ObjectRole {
@@ -216,7 +249,9 @@ fn classify(path: &str) -> ObjectRole {
 impl Backend for ClassifiedBackend {
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
         self.count_read(path);
-        self.inner.read(path).await
+        let reply = self.inner.read(path).await?;
+        self.count_read_bytes(path, reply.contents.len());
+        Ok(reply)
     }
 
     async fn read_if_modified(
@@ -225,7 +260,9 @@ impl Backend for ClassifiedBackend {
         expected: &Version,
     ) -> Result<ReadReply, BackendError> {
         self.count_read(path);
-        self.inner.read_if_modified(path, expected).await
+        let reply = self.inner.read_if_modified(path, expected).await?;
+        self.count_read_bytes(path, reply.contents.len());
+        Ok(reply)
     }
 
     async fn write_if(
@@ -235,6 +272,7 @@ impl Backend for ClassifiedBackend {
         expected: &Version,
     ) -> Result<Version, BackendError> {
         self.count_write(path);
+        self.count_write_bytes(path, value.len());
         self.inner.write_if(path, value, expected).await
     }
 
@@ -244,6 +282,7 @@ impl Backend for ClassifiedBackend {
         value: Vec<u8>,
     ) -> Result<Version, BackendError> {
         self.count_write(path);
+        self.count_write_bytes(path, value.len());
         self.inner.write_if_not_exists(path, value).await
     }
 
@@ -344,6 +383,8 @@ mod tests {
                 reads: 3,
                 writes: 3,
                 lists: 0,
+                read_bytes: 4,
+                write_bytes: 7,
             }
         );
         assert_eq!(got.other.lists, 1);
@@ -357,6 +398,8 @@ mod tests {
                 reads: 2,
                 writes: 3,
                 lists: 1,
+                read_bytes: 8,
+                write_bytes: 13,
             },
             ..Default::default()
         };
@@ -365,6 +408,8 @@ mod tests {
                 reads: 5,
                 writes: 4,
                 lists: 0,
+                read_bytes: 12,
+                write_bytes: 10,
             },
             ..Default::default()
         };
@@ -374,6 +419,8 @@ mod tests {
                 reads: 3,
                 writes: 1,
                 lists: 0,
+                read_bytes: 4,
+                write_bytes: 0,
             }
         );
     }

@@ -147,6 +147,8 @@ impl DiagnosticSession {
             ("reads", counts.reads),
             ("writes", counts.writes),
             ("lists", counts.lists),
+            ("read-bytes", counts.read_bytes),
+            ("write-bytes", counts.write_bytes),
         ] {
             self.write_metric(run, num_dbs, logical_tx, component, metric, value)?;
         }
@@ -200,6 +202,7 @@ mod tests {
         let metrics = std::fs::read_to_string(dir.path().join("metrics.csv")).unwrap();
         assert!(metrics.starts_with("run,num-db,logical-tx,component,metric,value\n"));
         assert!(metrics.contains("1,1,0,backend.database_metadata,reads,"));
+        assert!(metrics.contains("1,1,0,backend.database_metadata,write-bytes,"));
         assert!(metrics.contains("1,1,0,coordinator,rounds,0"));
 
         let failures = std::fs::read_to_string(dir.path().join("failure-state.txt")).unwrap();

@@ -6,12 +6,13 @@
 # It builds `rtbench` + `autoresearch` (+ `mixbench`, when present) from a base
 # ref (default `main`, built in a reused detached git worktree) and from the
 # target tree (the current worktree by default), interleaves paired workload
-# repetitions into `out-refs/`, and diffs them with `compare.py`. Throughput and latency are
-# the primary axes; retries and backend round-trips per transaction
+# repetitions into `out-refs/`, and diffs them with `compare.py`. Throughput and
+# latency are the primary axes; retries and backend round-trips per transaction
 # (object-storage efficiency) are secondary. `mixbench` adds a mixed-workload
 # contention grid (per-shape throughput and ops/tx across contention mode x
 # Database topology) that surfaces the in-process request-dedup efficiency the
-# low-contention rw9010 sweep does not.
+# low-contention rw9010 sweep does not. A phased `rtbench` scenario also checks
+# that inline saturation drives structural capacity and restores direct commits.
 #
 # Because each ref compiles its own engine (the Backend trait differs across v1
 # and v2), the two sides are built from separate source trees and reconciled
@@ -56,6 +57,8 @@
 #   DURATION=15s / 3s       rw9010 duration per concurrency step
 #   NUM_RUNS=1 / 2          paired rw9010/deadlock repetitions (order alternates)
 #   DEADLOCK_DURATION=8s / 3s   deadlock duration per contention configuration
+#   INLINE_PROFILES=s3,gcs  latency profiles for the inline-pressure scenario
+#   INLINE_SETTLE_TIMEOUT=5s / 3s  maximum wait for each demanded split
 #   COUNT=5 / 3             autoresearch suite repeats (reports the median)
 #   RW_MIX="balanced readheavy writeheavy"   rw9010 mixes to run
 #   MIX_DURATION=2s / 1s    mixbench minimum measured window per cell
@@ -108,6 +111,7 @@ if [ "$SUMMARY" = "1" ]; then
   DB_LIST="${DB_LIST:-1,10}"
   DURATION="${DURATION:-3s}"
   DEADLOCK_DURATION="${DEADLOCK_DURATION:-3s}"
+  INLINE_SETTLE_TIMEOUT="${INLINE_SETTLE_TIMEOUT:-3s}"
   # A few repeats even in the fast path: the autoresearch score and the rw9010
   # sweep are the low-variance signals worth trusting, and a single sample
   # collapses the digest's min/median/max into false precision. Cheap because
@@ -124,6 +128,7 @@ else
   DB_LIST="${DB_LIST:-1,10,20,40}"
   DURATION="${DURATION:-15s}"
   DEADLOCK_DURATION="${DEADLOCK_DURATION:-8s}"
+  INLINE_SETTLE_TIMEOUT="${INLINE_SETTLE_TIMEOUT:-5s}"
   COUNT="${COUNT:-5}"
   NUM_RUNS="${NUM_RUNS:-1}"
   MIX_DURATION="${MIX_DURATION:-2s}"
@@ -135,6 +140,7 @@ else
 fi
 NUM_KEYS="${NUM_KEYS:-5000}"
 RW_MIX="${RW_MIX:-balanced readheavy writeheavy}"
+INLINE_PROFILES="${INLINE_PROFILES:-s3,gcs}"
 # mixbench (mixed-workload contention grid) tunables. Skipped automatically for
 # any ref that predates the binary (e.g. an old BASE).
 MIX_MODES="${MIX_MODES:-lo,hi}"
@@ -201,6 +207,22 @@ validate_csv_rows() {
     END {
       if (rows != expected) {
         printf("%s: expected %d rows, found %d\n", FILENAME, expected, rows) > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$path"
+}
+
+validate_csv_rows_one_of() {
+  local path="$1" expected_a="$2" expected_b="$3"
+  awk -v expected_a="$expected_a" -v expected_b="$expected_b" '
+    NR > 1 { rows++ }
+    END {
+      if (rows != expected_a && rows != expected_b) {
+        printf(
+          "%s: expected %d or %d rows, found %d\n",
+          FILENAME, expected_a, expected_b, rows
+        ) > "/dev/stderr"
         exit 1
       }
     }
@@ -285,6 +307,10 @@ supports_diagnostics() {
 
 supports_deadlock_stats() {
   "$1" --help 2>&1 | grep -q -- "--deadlock-stats-out"
+}
+
+supports_inline_pressure() {
+  "$1" --help 2>&1 | grep -q -- "--inline-pressure-out"
 }
 
 append_csv_with_run() {
@@ -381,6 +407,24 @@ run_deadlock_once() {
   fi
 }
 
+run_inline_pressure_once() {
+  local label="$1" bindir="$2" has_drain="$3" profile="$4" repetition="$5"
+  local drain_args=()
+  [ "$has_drain" = "1" ] && drain_args=(--drain-timeout="$DRAIN_TIMEOUT")
+  local d="$OUT/inline-pressure/$profile/$label"
+  local raw="$OUT/inline-pressure/$profile/$label/runs/$repetition"
+  mkdir -p "$raw"
+  log "$label inline-pressure profile=$profile paired-run=$repetition/$NUM_RUNS"
+  run_bounded "$bindir/rtbench" \
+    --backend=memory --delays="$profile" --delay-scale="$DELAY_SCALE" \
+    "${drain_args[@]}" --test-name=inline-pressure --num-runs=1 \
+    --inline-pressure-settle-timeout="$INLINE_SETTLE_TIMEOUT" \
+    --inline-pressure-out="$raw/inline-pressure.csv" >&2
+  validate_csv_rows_one_of "$raw/inline-pressure.csv" 7 8
+  append_csv_with_run \
+    "$raw/inline-pressure.csv" "$d/inline-pressure.csv" "$repetition"
+}
+
 run_aux_side() {
   local label="$1" bindir="$2"
   # mixbench: all shapes together over the contention x topology grid. Only
@@ -434,11 +478,13 @@ fi
 
 # Determine the mix set: every requested mix only when both binaries support
 # --rw-mix, else fall back to the default balanced mix (run flagless).
-A_MIX=0; B_MIX=0; A_DRAIN=0; B_DRAIN=0
+A_MIX=0; B_MIX=0; A_DRAIN=0; B_DRAIN=0; A_INLINE=0; B_INLINE=0
 supports_rw_mix "$BASE_BIN" && A_MIX=1
 supports_rw_mix "$TARGET_BIN" && B_MIX=1
 supports_drain_timeout "$BASE_BIN/rtbench" && A_DRAIN=1
 supports_drain_timeout "$TARGET_BIN/rtbench" && B_DRAIN=1
+supports_inline_pressure "$BASE_BIN/rtbench" && A_INLINE=1
+supports_inline_pressure "$TARGET_BIN/rtbench" && B_INLINE=1
 if [ "$DIAGNOSTICS" != "0" ] && [ "$DIAGNOSTICS" != "1" ]; then
   log "ERROR: DIAGNOSTICS must be 0 or 1, got $DIAGNOSTICS"
   exit 2
@@ -456,12 +502,18 @@ else
   log "WARNING: a side lacks --rw-mix (base=$A_MIX target=$B_MIX); running balanced only"
   MIXES="balanced"
 fi
+RUN_INLINE=0
+if [ "$A_INLINE" = "1" ] && [ "$B_INLINE" = "1" ]; then
+  RUN_INLINE=1
+else
+  log "NOTE: a side lacks inline-pressure support (base=$A_INLINE target=$B_INLINE); skipping it"
+fi
 
 MODE_DESC="full"
 [ "$SUMMARY" = "1" ] && MODE_DESC="summary (fast, no plots)"
 log "BASE=$BASE ($LABEL_A) vs TARGET=$TARGET_DESC ($LABEL_B); mode: $MODE_DESC; \
 mixes: $MIXES; diagnostics: $DIAGNOSTICS; drain-timeout: $DRAIN_TIMEOUT; \
-command-timeout: $COMMAND_TIMEOUT"
+inline-pressure: $RUN_INLINE; command-timeout: $COMMAND_TIMEOUT"
 rm -rf "$OUT"
 
 # --- Run paired repetitions -------------------------------------------------
@@ -487,6 +539,22 @@ for repetition in $(seq 1 "$NUM_RUNS"); do
     run_deadlock_once "$LABEL_B" "$TARGET_BIN" "$B_DRAIN" "$repetition"
     run_deadlock_once "$LABEL_A" "$BASE_BIN" "$A_DRAIN" "$repetition"
   fi
+
+  if [ "$RUN_INLINE" = "1" ]; then
+    for profile in ${INLINE_PROFILES//,/ }; do
+      if (( repetition % 2 == 1 )); then
+        run_inline_pressure_once \
+          "$LABEL_A" "$BASE_BIN" "$A_DRAIN" "$profile" "$repetition"
+        run_inline_pressure_once \
+          "$LABEL_B" "$TARGET_BIN" "$B_DRAIN" "$profile" "$repetition"
+      else
+        run_inline_pressure_once \
+          "$LABEL_B" "$TARGET_BIN" "$B_DRAIN" "$profile" "$repetition"
+        run_inline_pressure_once \
+          "$LABEL_A" "$BASE_BIN" "$A_DRAIN" "$profile" "$repetition"
+      fi
+    done
+  fi
 done
 
 expected_rw=$(( $(csv_items "$DB_LIST") * NUM_RUNS ))
@@ -494,6 +562,18 @@ for mix in $MIXES; do
   validate_rw_results "$OUT/$mix/$LABEL_A/client-stats.csv" "$expected_rw"
   validate_rw_results "$OUT/$mix/$LABEL_B/client-stats.csv" "$expected_rw"
 done
+if [ "$RUN_INLINE" = "1" ]; then
+  expected_inline=$(( 7 * NUM_RUNS ))
+  legacy_expected_inline=$(( 8 * NUM_RUNS ))
+  for profile in ${INLINE_PROFILES//,/ }; do
+    validate_csv_rows_one_of \
+      "$OUT/inline-pressure/$profile/$LABEL_A/inline-pressure.csv" \
+      "$expected_inline" "$legacy_expected_inline"
+    validate_csv_rows_one_of \
+      "$OUT/inline-pressure/$profile/$LABEL_B/inline-pressure.csv" \
+      "$expected_inline" "$legacy_expected_inline"
+  done
+fi
 
 # These sections have their own internal statistical repetition/adaptive
 # sampling. Run them adjacently after the explicitly paired rtbench cells.
@@ -528,6 +608,16 @@ for mix in $MIXES; do
     --label-a "$LABEL_A" --label-b "$LABEL_B" --title "rw9010/$mix" \
     "${PLOT_ARGS[@]}" --summary-out "$SUMMARY"
 done
+
+if [ "$RUN_INLINE" = "1" ]; then
+  for profile in ${INLINE_PROFILES//,/ }; do
+    uv run "$SCRIPT_DIR/compare.py" \
+      --a "$OUT/inline-pressure/$profile/$LABEL_A" \
+      --b "$OUT/inline-pressure/$profile/$LABEL_B" \
+      --label-a "$LABEL_A" --label-b "$LABEL_B" \
+      --title "inline-pressure/$profile" --no-plots --summary-out "$SUMMARY"
+  done
+fi
 
 uv run "$SCRIPT_DIR/compare.py" \
   --a "$OUT/contention/$LABEL_A" --b "$OUT/contention/$LABEL_B" \

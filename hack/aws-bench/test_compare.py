@@ -32,6 +32,9 @@ pd = compare.pd
 
 
 class CompareTest(unittest.TestCase):
+    def test_geomean_preserves_a_zero_ratio(self) -> None:
+        self.assertEqual(compare._geomean(pd.Series([0.0, 1.0])), 0.0)
+
     def test_aggregate_throughput_uses_completions_and_common_clock(self) -> None:
         rows = pd.DataFrame(
             [
@@ -188,6 +191,78 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(len(table), 1)
         self.assertEqual(table.loc[0, "component"], "coordinator")
         self.assertEqual(table.loc[0, "ratio"], 1.5)
+
+    def test_diagnostic_operation_totals_do_not_mix_in_bytes(self) -> None:
+        table = pd.DataFrame(
+            [
+                {
+                    "run": 1,
+                    "concurrent": 10,
+                    "component": "backend.node",
+                    "metric": metric,
+                    "per-tx_a": value_a,
+                    "per-tx_b": value_b,
+                }
+                for metric, value_a, value_b in [
+                    ("reads", 2, 3),
+                    ("writes", 1, 1),
+                    ("read-bytes", 2000, 3000),
+                    ("write-bytes", 1000, 1000),
+                ]
+            ]
+        )
+
+        ops = compare.diagnostic_role_totals(table, ["reads", "writes", "lists"])
+        byte_counts = compare.diagnostic_role_totals(
+            table, ["read-bytes", "write-bytes"]
+        )
+
+        self.assertEqual(ops.loc[0, "per-tx_a"], 3)
+        self.assertEqual(ops.loc[0, "per-tx_b"], 4)
+        self.assertEqual(byte_counts.loc[0, "per-tx_a"], 3000)
+        self.assertEqual(byte_counts.loc[0, "per-tx_b"], 4000)
+
+    def test_inline_pressure_ratios_are_paired_by_phase_and_run(self) -> None:
+        def rows(throughput: list[int], landed: list[float]):
+            return pd.DataFrame(
+                [
+                    {
+                        "run": run,
+                        "phase": "recovery",
+                        "logical-tx": 64,
+                        "tx-per-sec": tps,
+                        "p50-ms": 10,
+                        "p90-ms": 20,
+                        "lock-calls": 64,
+                        "backend-ops": 192,
+                        "write-bytes": 64_000,
+                        "direct-candidates": 64,
+                        "direct-landed": int(64 * land_rate),
+                    }
+                    for run, (tps, land_rate) in enumerate(
+                        zip(throughput, landed, strict=True), start=1
+                    )
+                ]
+            )
+
+        old = rows([100, 200], [0, 0])
+        old = pd.concat(
+            [
+                old,
+                old.iloc[[0]].assign(
+                    run=1,
+                    phase="shutdown",
+                    **{"logical-tx": 0},
+                ),
+            ],
+            ignore_index=True,
+        )
+        table = compare.inline_pressure_table(old, rows([150, 100], [1, 1]))
+
+        self.assertEqual(table["run"].tolist(), [1, 2])
+        self.assertEqual(table["tx-per-sec-ratio"].tolist(), [1.5, 0.5])
+        self.assertEqual(table["direct-land-rate_b"].tolist(), [1, 1])
+        self.assertEqual(table["backend-ops-per-tx_a"].tolist(), [3, 3])
 
 
 if __name__ == "__main__":

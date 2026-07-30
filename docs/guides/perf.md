@@ -7,6 +7,61 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-056: demand-driven inline-pressure splits
+
+[ADR-056](../adr/056-demand-driven-inline-pressure-splits.md) requests a
+background median split when aggregate inline capacity prevents an otherwise
+eligible direct commit.
+
+### Setup
+
+- base: `e88cb819` (accepted ADR, before implementation); target: `0be65fee`
+- ratio = target / base (throughput >1 good; latency/ops/bytes <1 good)
+- release `rtbench`, in-memory backend with `s3` and `gcs` delay profiles,
+  `delay-scale=0.02`, and three paired, interleaved runs per profile
+- per-side command: `rtbench --backend=memory --delays=<s3|gcs>
+  --delay-scale=0.02 --test-name=inline-pressure --num-runs=1
+  --inline-pressure-settle-timeout=3s`
+- the focused scenario starts with 192 existing external 1 KiB values, below
+  the ordinary 256-entry split threshold. It lands 64 direct mutations to fill
+  the 64 KiB inline budget, uses two distinct mutations to request a root and
+  then a non-root split, and measures 64 later mutations interleaved across the
+  resulting leaves
+- the same benchmark-only harness was applied to both refs. Every run completed
+  all 130 mutations and shutdown without an error
+
+### S3 profile
+
+- recovery throughput ratio: min `3.50`, median `3.56`, max `3.65`
+- recovery p50 ratio: `0.26–0.27` (median `0.26`); p90 ratio:
+  `0.29–0.32` (median `0.31`)
+- recovery backend operations/transaction ratio: `0.26–0.29` (median `0.28`);
+  write bytes/transaction ratio: `0.20–0.22` (median `0.21`)
+- whole-scenario backend operations/transaction ratio: `0.53–0.55`; write
+  bytes/transaction ratio: `0.42–0.45`
+
+### GCS profile
+
+- recovery throughput ratio: min `3.46`, median `3.87`, max `3.90`
+- recovery p50 ratio: `0.22–0.25` (median `0.23`); p90 ratio:
+  `0.51–0.66` (median `0.60`)
+- recovery backend operations/transaction ratio: `0.28–0.29` (median `0.28`);
+  write bytes/transaction ratio: `0.20–0.22` (median `0.21`)
+- whole-scenario backend operations/transaction ratio: `0.53–0.54`; write
+  bytes/transaction ratio: `0.42–0.44`
+
+### Protocol outcomes
+
+- both discovering mutations use the locked fallback on both refs
+- recovery direct land rate changes from `0/64` to `64/64`; recovery lock calls
+  change from `64` to `0`
+- whole-scenario direct land rate changes from `64/130` (`0.492`) to `128/130`
+  (`0.985`), and lock calls change from `66` to `2`
+- every target run records exactly two pressure candidates and two completed
+  pressure splits, with zero deferrals and zero discards. The base records no
+  splits. Starting from one leaf, the final leaf count is therefore `1` on the
+  base and `3` on the target
+
 ## ADR-054: reserve inline publication for logless commits
 
 [ADR-054](../adr/054-reserve-inline-publication-for-logless-commits.md) stops

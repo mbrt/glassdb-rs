@@ -19,6 +19,7 @@ produced by `rtbench` and (optionally) the `autoresearch` scoring harness:
 * `stats.csv`       -> retries/tx and backend-ops/tx (object-storage round-trips);
 * `deadlock.csv`    -> latency under contention (p50/p90 at 100% overlap);
 * `deadlock-stats.csv` -> completion/retry/direct-path/drain metrics per cell;
+* `inline-pressure.csv` -> direct-commit recovery after demand-driven splits;
 * `score.json`      -> autoresearch primary score + per-workload cost/ops per tx;
 * `mixbench.json`   -> mixed-workload grid: per-shape throughput and ops/tx across
                        contention mode x Database topology (the contention /
@@ -109,6 +110,8 @@ def _ratio(b: float, a: float) -> float:
 
 def _geomean(s: pd.Series) -> float:
     s = pd.Series(s).dropna()
+    if (s == 0).any():
+        return 0.0
     s = s[s > 0]
     if s.empty:
         return float("nan")
@@ -434,6 +437,62 @@ def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     merged["ratio"] = merged.apply(
         lambda r: _ratio(r["batch-factor_b"], r["batch-factor_a"]), axis=1
     )
+    return merged
+
+
+def diagnostic_role_totals(
+    table: pd.DataFrame, metrics: list[str]
+) -> pd.DataFrame:
+    """Fold selected backend metrics by physical object role."""
+    selected = table[
+        table["component"].str.startswith("backend.")
+        & table["metric"].isin(metrics)
+    ]
+    if selected.empty:
+        return pd.DataFrame()
+    totals = (
+        selected.groupby(["run", "concurrent", "component"])
+        .agg({"per-tx_a": "sum", "per-tx_b": "sum"})
+        .reset_index()
+    )
+    totals["ratio"] = totals.apply(
+        lambda r: _ratio(r["per-tx_b"], r["per-tx_a"]), axis=1
+    )
+    return totals
+
+
+def inline_pressure_table(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    """Pair the fixed phases of the inline-pressure scenario by run."""
+
+    def select(df: pd.DataFrame) -> pd.DataFrame:
+        d = with_run_identity(df, ["phase"])
+        # The first version of this scenario reported shutdown separately.
+        # Current artifacts fold it into total, so ignore it when comparing
+        # across the schema boundary.
+        d = d[d["phase"] != "shutdown"].copy()
+        logical_tx = d["logical-tx"].where(d["logical-tx"] > 0)
+        direct_candidates = d["direct-candidates"].where(
+            d["direct-candidates"] > 0
+        )
+        d["direct-land-rate"] = d["direct-landed"] / direct_candidates
+        d["lock-calls-per-tx"] = d["lock-calls"] / logical_tx
+        d["backend-ops-per-tx"] = d["backend-ops"] / logical_tx
+        d["write-bytes-per-tx"] = d["write-bytes"] / logical_tx
+        return d
+
+    merged = paired_merge(select(a), select(b), ["run", "phase"])
+    for metric in [
+        "tx-per-sec",
+        "p50-ms",
+        "p90-ms",
+        "lock-calls-per-tx",
+        "backend-ops-per-tx",
+        "write-bytes-per-tx",
+    ]:
+        merged[f"{metric}-ratio"] = merged.apply(
+            lambda r, metric=metric: _ratio(r[f"{metric}_b"], r[f"{metric}_a"]),
+            axis=1,
+        )
     return merged
 
 
@@ -991,20 +1050,24 @@ def main() -> int:
         ]
         print_table(f"Diagnostic metrics per transaction ({lb}/{la})", tbl[cols])
 
-        backend = tbl[tbl["component"].str.startswith("backend.")]
-        if not backend.empty:
-            role_totals = (
-                backend.groupby(["run", "concurrent", "component"])
-                .agg({"per-tx_a": "sum", "per-tx_b": "sum"})
-                .reset_index()
-            )
-            role_totals["ratio"] = role_totals.apply(
-                lambda r: _ratio(r["per-tx_b"], r["per-tx_a"]), axis=1
-            )
+        role_totals = diagnostic_role_totals(tbl, ["reads", "writes", "lists"])
+        if not role_totals.empty:
             for component, group in role_totals.groupby("component"):
                 summaries.append(
                     summarize(
                         f"diag-ops/tx[{component}]",
+                        group["ratio"],
+                        lower_is_better=True,
+                    )
+                )
+        role_totals = diagnostic_role_totals(
+            tbl, ["read-bytes", "write-bytes"]
+        )
+        if not role_totals.empty:
+            for component, group in role_totals.groupby("component"):
+                summaries.append(
+                    summarize(
+                        f"diag-bytes/tx[{component}]",
                         group["ratio"],
                         lower_is_better=True,
                     )
@@ -1037,6 +1100,71 @@ def main() -> int:
         if not batch.empty:
             summaries.append(
                 summarize("diag-coordinator[batch-factor]", batch["ratio"])
+            )
+
+    a_ip = read_csv(args.a, "inline-pressure.csv")
+    b_ip = read_csv(args.b, "inline-pressure.csv")
+    if a_ip is not None and b_ip is not None:
+        tbl = inline_pressure_table(a_ip, b_ip)
+        cols = [
+            "run",
+            "phase",
+            "tx-per-sec_a",
+            "tx-per-sec_b",
+            "tx-per-sec-ratio",
+            "p50-ms-ratio",
+            "direct-land-rate_a",
+            "direct-land-rate_b",
+            "lock-calls-per-tx_a",
+            "lock-calls-per-tx_b",
+            "backend-ops-per-tx_a",
+            "backend-ops-per-tx_b",
+            "backend-ops-per-tx-ratio",
+            "write-bytes-per-tx_a",
+            "write-bytes-per-tx_b",
+            "write-bytes-per-tx-ratio",
+            "split-completed_a",
+            "split-completed_b",
+            "pressure-completed_a",
+            "pressure-completed_b",
+        ]
+        print_table(f"Inline-pressure phases ({lb}/{la})", tbl[cols])
+        recovery = tbl[tbl["phase"] == "recovery"]
+        total = tbl[tbl["phase"] == "total"]
+        for metric, lower_is_better in [
+            ("tx-per-sec", False),
+            ("p50-ms", True),
+            ("p90-ms", True),
+            ("lock-calls-per-tx", True),
+            ("backend-ops-per-tx", True),
+            ("write-bytes-per-tx", True),
+        ]:
+            summaries.append(
+                summarize(
+                    f"inline-recovery-{metric}",
+                    recovery[f"{metric}-ratio"],
+                    lower_is_better=lower_is_better,
+                )
+            )
+        for metric in ["backend-ops-per-tx", "write-bytes-per-tx"]:
+            summaries.append(
+                summarize(
+                    f"inline-total-{metric}",
+                    total[f"{metric}-ratio"],
+                    lower_is_better=True,
+                )
+            )
+        if not recovery.empty:
+            summaries.append(
+                "inline-recovery-direct-land-rate: "
+                f"{la}={recovery['direct-land-rate_a'].median():.3f} "
+                f"{lb}={recovery['direct-land-rate_b'].median():.3f}"
+            )
+        if not total.empty:
+            summaries.append(
+                "inline-total-completed-splits: "
+                f"{la}={total['split-completed_a'].median():.1f} "
+                f"{lb}={total['split-completed_b'].median():.1f}"
             )
 
     a_dl, b_dl = read_csv(args.a, "deadlock.csv"), read_csv(args.b, "deadlock.csv")
