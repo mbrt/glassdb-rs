@@ -102,6 +102,8 @@ impl DatabaseBuilder {
     }
 
     /// Overrides the node sizing policy, including split triggers and hard cap.
+    /// Every client of one database should use the same policy because splits
+    /// durably reshape shared topology.
     pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
         self.split_policy = policy;
         self
@@ -109,7 +111,9 @@ impl DatabaseBuilder {
 
     /// Overrides the budgets for logless direct commits whose authoritative
     /// value is stored in the leaf (ADR-051, ADR-054). Values outside the
-    /// budgets take the regular logged protocol.
+    /// budgets take the regular logged protocol. Every client of one database
+    /// should use the same policy because aggregate-pressure misses can request
+    /// durable tree splits (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.inline_policy = policy;
         self

@@ -378,9 +378,16 @@ impl ShardResolver for DirectCommitResolver {
             .map(|(_, entry)| entry.current.inline_len())
             .sum();
         if !self.inline.admits(other_inline_bytes, self.value.len()) {
-            return Ok(Step::Skip {
-                outcome: self.unlanded(ctx, Ineligible::Locked),
-            });
+            let outcome = self.unlanded(ctx, Ineligible::Locked);
+            return if self.inline.admits_value(self.value.len()) {
+                Ok(Step::SkipWithInlinePressure {
+                    outcome,
+                    key: self.raw_key.clone(),
+                    value_len: self.value.len(),
+                })
+            } else {
+                Ok(Step::Skip { outcome })
+            };
         }
 
         // Publish the value itself as the new current state, dropping the
@@ -1242,9 +1249,9 @@ impl Algo {
             .candidates
             .fetch_add(1, Ordering::Relaxed);
         let inline = self.coord.inline_policy();
-        // The per-value budget is decidable here; the aggregate leaf budget
-        // needs the folded leaf, so the resolver re-checks both.
-        if value.len() > inline.max_value_bytes {
+        // Reject values no partition could admit before routing; aggregate
+        // pressure from other keys needs the folded leaf (ADR-056).
+        if !inline.admits_value(value.len()) {
             return Ok(DirectAttempt::Locked);
         }
         let raw_key = key.key().to_vec();
@@ -1865,6 +1872,24 @@ mod tests {
         tm.begin(data, CollectionData::default())
     }
 
+    /// Runs one resolver fold and retains its complete classification.
+    async fn fold_step(
+        resolver: &dyn ShardResolver,
+        tctx: &Tctx,
+        cause: ReloadCause,
+        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        locks: &NodeLocks,
+    ) -> Step {
+        let writers = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
+        let ctx = ResolveCtx {
+            resolver: &writers,
+            tmon: &tctx.tmon,
+            requirement: Requirement::Any,
+            cause,
+        };
+        resolver.resolve(&ctx, staged, locks).await.unwrap()
+    }
+
     /// Runs one fold of `resolver` over the leaf state a coordinator round would
     /// hand it, and reports the outcome it classifies. Lets a test drive the
     /// `cause` and node-lock combinations that a live interleaving can only
@@ -1876,15 +1901,10 @@ mod tests {
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         locks: &NodeLocks,
     ) -> FoldOutcome {
-        let writers = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
-        let ctx = ResolveCtx {
-            resolver: &writers,
-            tmon: &tctx.tmon,
-            requirement: Requirement::Any,
-            cause,
-        };
-        match resolver.resolve(&ctx, staged, locks).await.unwrap() {
-            Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
+        match fold_step(resolver, tctx, cause, staged, locks).await {
+            Step::Skip { outcome }
+            | Step::SkipWithInlinePressure { outcome, .. }
+            | Step::Stage { outcome, .. } => outcome,
         }
     }
 
@@ -3381,11 +3401,46 @@ mod tests {
                 },
             ),
         ]);
-        let outcome = fold(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await;
-        assert!(
-            matches!(outcome, FoldOutcome::Moved),
-            "a closed aggregate budget takes the locked protocol, got {outcome:?}"
-        );
+        match fold_step(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await {
+            Step::SkipWithInlinePressure {
+                outcome,
+                key,
+                value_len,
+            } => {
+                assert!(matches!(outcome, FoldOutcome::Moved));
+                assert_eq!(key, b"k");
+                assert_eq!(value_len, 2);
+            }
+            _ => panic!("a recoverable aggregate miss must report inline pressure"),
+        }
+        assert!(matches!(
+            fold_step(
+                &budgeted,
+                &tctx,
+                ReloadCause::Reloaded { in_doubt: true },
+                &crowded,
+                &locks,
+            )
+            .await,
+            Step::SkipWithInlinePressure {
+                outcome: FoldOutcome::InDoubt(_),
+                ..
+            }
+        ));
+
+        let impossible = DirectCommitResolver {
+            inline: InlinePolicy {
+                max_value_bytes: 64,
+                max_leaf_bytes: 1,
+            },
+            ..direct(Some(current.clone()))
+        };
+        assert!(matches!(
+            fold_step(&impossible, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
+            Step::Skip {
+                outcome: FoldOutcome::Moved
+            }
+        ));
 
         // The round-level classifications: a same-key claim proves this member
         // folded nothing, while a spent CAS budget proves nothing about an

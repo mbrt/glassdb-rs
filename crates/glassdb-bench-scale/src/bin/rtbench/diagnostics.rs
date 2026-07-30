@@ -82,6 +82,26 @@ impl DiagnosticSession {
             ("splitter", "candidates", sum(|s| s.split_candidates)),
             ("splitter", "completed", sum(|s| s.split_completed)),
             ("splitter", "deferred", sum(|s| s.split_deferred)),
+            (
+                "splitter",
+                "inline_pressure_candidates",
+                sum(|s| s.split_inline_pressure_candidates),
+            ),
+            (
+                "splitter",
+                "inline_pressure_completed",
+                sum(|s| s.split_inline_pressure_completed),
+            ),
+            (
+                "splitter",
+                "inline_pressure_deferred",
+                sum(|s| s.split_inline_pressure_deferred),
+            ),
+            (
+                "splitter",
+                "inline_pressure_discarded",
+                sum(|s| s.split_inline_pressure_discarded),
+            ),
         ] {
             self.write_metric(run, num_dbs, logical_tx, component, metric, value)?;
         }

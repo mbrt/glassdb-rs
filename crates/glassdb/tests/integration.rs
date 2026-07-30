@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{
-    Backend, Collection, CollectionPath, Database, Error, ProtocolTiming, SplitPolicy, Transaction,
+    Backend, Collection, CollectionPath, Database, Error, InlinePolicy, ProtocolTiming,
+    SplitPolicy, Transaction,
 };
 use glassdb_storage::{Node, TxCommitStatus};
 use tokio::sync::{Barrier, Notify, oneshot};
@@ -201,6 +202,70 @@ async fn stats_report_direct_commit_coverage() {
     let delta = db.stats() - before;
     assert_eq!(delta.direct_commit_candidates, 1);
     assert_eq!(delta.direct_commit_landed, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
+    let db = Database::builder("example", mem())
+        .inline_policy(InlinePolicy {
+            max_value_bytes: 8,
+            max_leaf_bytes: 8,
+        })
+        .open()
+        .await
+        .unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"inline-pressure")
+        .await
+        .unwrap();
+    coll.write(b"a", &write_int(0)).await.unwrap();
+    coll.write(b"b", &write_int(0)).await.unwrap();
+
+    let before_first = db.stats();
+    rmw(&db, &coll, b"a", 1).await.unwrap();
+    let first = db.stats() - before_first;
+    assert_eq!(first.direct_commit_candidates, 1);
+    assert_eq!(first.direct_commit_landed, 1);
+
+    let before_miss = db.stats();
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    let miss = db.stats() - before_miss;
+    assert_eq!(miss.direct_commit_candidates, 1);
+    assert_eq!(miss.direct_commit_landed, 0);
+    assert!(
+        miss.lock_calls > 0,
+        "the discovering mutation completes through the locked fallback"
+    );
+
+    let before_split = db.stats();
+    let mut after_split = before_split;
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        after_split = db.stats();
+        if after_split.split_inline_pressure_completed
+            > before_split.split_inline_pressure_completed
+        {
+            break;
+        }
+    }
+    let split = after_split - before_split;
+    assert_eq!(split.split_inline_pressure_candidates, 1);
+    assert_eq!(split.split_inline_pressure_completed, 1);
+    assert_eq!(split.split_inline_pressure_discarded, 0);
+
+    let before_retry = db.stats();
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    let retry = db.stats() - before_retry;
+    assert_eq!(retry.direct_commit_candidates, 1);
+    assert_eq!(retry.direct_commit_landed, 1);
+    assert_eq!(
+        retry.lock_calls, 0,
+        "the split gives the later mutation enough inline headroom"
+    );
+    assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
+    assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 2);
+    db.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -60,6 +60,14 @@ pub struct Stats {
     pub split_completed: u64,
     /// Number of retryable split candidates requeued for a later sweep.
     pub split_deferred: u64,
+    /// Number of processed split candidates caused by aggregate inline pressure.
+    pub split_inline_pressure_candidates: u64,
+    /// Number of locally observed leaf splits directly caused by inline pressure.
+    pub split_inline_pressure_completed: u64,
+    /// Number of retryable inline-pressure candidates requeued.
+    pub split_inline_pressure_deferred: u64,
+    /// Number of inline-pressure candidates discarded after revalidation.
+    pub split_inline_pressure_discarded: u64,
 }
 
 impl Stats {
@@ -83,6 +91,10 @@ impl Stats {
         self.split_candidates += other.split_candidates;
         self.split_completed += other.split_completed;
         self.split_deferred += other.split_deferred;
+        self.split_inline_pressure_candidates += other.split_inline_pressure_candidates;
+        self.split_inline_pressure_completed += other.split_inline_pressure_completed;
+        self.split_inline_pressure_deferred += other.split_inline_pressure_deferred;
+        self.split_inline_pressure_discarded += other.split_inline_pressure_discarded;
     }
 
     pub(crate) fn add_backend(&mut self, b: &BackendStats) {
@@ -111,6 +123,10 @@ impl Stats {
         self.split_candidates += split.candidates;
         self.split_completed += split.completed;
         self.split_deferred += split.deferred;
+        self.split_inline_pressure_candidates += split.inline_pressure_candidates;
+        self.split_inline_pressure_completed += split.inline_pressure_completed;
+        self.split_inline_pressure_deferred += split.inline_pressure_deferred;
+        self.split_inline_pressure_discarded += split.inline_pressure_discarded;
     }
 }
 
@@ -144,6 +160,18 @@ impl Sub for Stats {
             split_candidates: self.split_candidates.saturating_sub(other.split_candidates),
             split_completed: self.split_completed.saturating_sub(other.split_completed),
             split_deferred: self.split_deferred.saturating_sub(other.split_deferred),
+            split_inline_pressure_candidates: self
+                .split_inline_pressure_candidates
+                .saturating_sub(other.split_inline_pressure_candidates),
+            split_inline_pressure_completed: self
+                .split_inline_pressure_completed
+                .saturating_sub(other.split_inline_pressure_completed),
+            split_inline_pressure_deferred: self
+                .split_inline_pressure_deferred
+                .saturating_sub(other.split_inline_pressure_deferred),
+            split_inline_pressure_discarded: self
+                .split_inline_pressure_discarded
+                .saturating_sub(other.split_inline_pressure_discarded),
         }
     }
 }
@@ -167,6 +195,10 @@ mod tests {
             split_candidates: 3,
             split_completed: 2,
             split_deferred: 1,
+            split_inline_pressure_candidates: 2,
+            split_inline_pressure_completed: 1,
+            split_inline_pressure_deferred: 1,
+            split_inline_pressure_discarded: 0,
             ..Default::default()
         };
         let after = Stats {
@@ -182,6 +214,10 @@ mod tests {
             split_candidates: 5,
             split_completed: 3,
             split_deferred: 1,
+            split_inline_pressure_candidates: 5,
+            split_inline_pressure_completed: 2,
+            split_inline_pressure_deferred: 1,
+            split_inline_pressure_discarded: 1,
             ..Default::default()
         };
         let delta = after - before;
@@ -194,5 +230,9 @@ mod tests {
         assert_eq!(delta.split_candidates, 2);
         assert_eq!(delta.split_completed, 1);
         assert_eq!(delta.split_deferred, 0);
+        assert_eq!(delta.split_inline_pressure_candidates, 3);
+        assert_eq!(delta.split_inline_pressure_completed, 1);
+        assert_eq!(delta.split_inline_pressure_deferred, 0);
+        assert_eq!(delta.split_inline_pressure_discarded, 1);
     }
 }

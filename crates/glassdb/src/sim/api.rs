@@ -764,7 +764,13 @@ impl SimWorkload for ApiWorkload {
         backend: &Arc<dyn Backend>,
         media: Option<SimMedia>,
     ) -> Result<Database, Error> {
-        open_det_db(backend, tiny_split_policy(), media).await
+        open_det_db(
+            backend,
+            tiny_split_policy(),
+            glassdb_storage::InlinePolicy::default(),
+            media,
+        )
+        .await
     }
 
     async fn seed(&self, db: &Database) {

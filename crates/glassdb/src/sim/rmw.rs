@@ -2,13 +2,15 @@
 //! Unlike the transaction API workload, clients deliberately overlap on keys and
 //! increments are non-idempotent, so acknowledged/started bounds are the oracle.
 
+use std::future::Future;
 use std::sync::Mutex;
 
 use arbitrary::{Arbitrary, Unstructured};
 
-use crate::{Collection, CollectionPath, Database, Error};
+use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, SplitPolicy};
 
-use super::harness::SimWorkload;
+use super::SimMedia;
+use super::harness::{SimWorkload, open_det_db};
 use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, key_name, read_int, try_read_int, write_int};
 /// Number of distinct keys the workload operates on.
 pub const RMW_KEY_COUNT: usize = 4;
@@ -222,6 +224,24 @@ impl SimWorkload for RmwWorkload {
         Mutex::new(RmwAcct::new())
     }
 
+    fn open_db(
+        backend: &std::sync::Arc<dyn glassdb_backend::Backend>,
+        media: Option<SimMedia>,
+    ) -> impl Future<Output = Result<Database, Error>> + Send {
+        // Two distinct direct increments fill a leaf, so the existing
+        // contention/fault schedules also cover pressure-driven structural
+        // work without adding a second lifecycle oracle or workload.
+        open_det_db(
+            backend,
+            SplitPolicy::default(),
+            InlinePolicy {
+                max_value_bytes: 8,
+                max_leaf_bytes: 16,
+            },
+            media,
+        )
+    }
+
     async fn seed(&self, db: &Database) {
         let coll = db
             .root_collection()
@@ -273,18 +293,20 @@ impl SimWorkload for RmwWorkload {
 mod tests {
     use std::sync::Arc;
 
-    use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_storage::SplitPolicy;
-
     use super::*;
-    use crate::sim::harness::open_det_db;
+    use glassdb_backend::{Backend, memory::MemoryBackend};
 
     #[tokio::test]
     async fn missing_preseeded_key_is_not_treated_as_zero() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let db = open_det_db(&backend, SplitPolicy::default(), None)
-            .await
-            .unwrap();
+        let db = open_det_db(
+            &backend,
+            SplitPolicy::default(),
+            InlinePolicy::default(),
+            None,
+        )
+        .await
+        .unwrap();
         let collection = db
             .root_collection()
             .create_collection_if_absent(INCREMENT_COLLECTION)

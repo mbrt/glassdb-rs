@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 This extends [ADR-031](031-dynamic-range-sharding.md)'s background split policy
 and resolves the capacity follow-up left by

@@ -41,6 +41,19 @@ impl InlinePolicy {
         }
     }
 
+    /// Reports whether `value_len` bytes are eligible for an otherwise empty
+    /// leaf.
+    ///
+    /// This includes both the per-value limit and the aggregate limit: a value
+    /// that cannot fit by itself cannot be helped by repartitioning a leaf.
+    pub fn admits_value(&self, value_len: usize) -> bool {
+        // A zero per-value budget disables inlining outright, so an empty value
+        // is rejected too rather than slipping through as zero bytes.
+        self.max_value_bytes != 0
+            && value_len <= self.max_value_bytes
+            && value_len <= self.max_leaf_bytes
+    }
+
     /// Reports whether `value_len` bytes may be inlined in a leaf whose other
     /// keys already carry `others_len` inline bytes.
     ///
@@ -48,12 +61,7 @@ impl InlinePolicy {
     /// neither figure: overwriting an inline value with one of the same size
     /// always readmits.
     pub fn admits(&self, others_len: usize, value_len: usize) -> bool {
-        // A zero per-value budget disables inlining outright, so an empty value
-        // is rejected too rather than slipping through as zero bytes.
-        if self.max_value_bytes == 0 || value_len > self.max_value_bytes {
-            return false;
-        }
-        others_len + value_len <= self.max_leaf_bytes
+        self.admits_value(value_len) && others_len <= self.max_leaf_bytes.saturating_sub(value_len)
     }
 }
 
@@ -83,9 +91,22 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_exceeds_the_empty_leaf_budget_cannot_be_admitted() {
+        let policy = InlinePolicy {
+            max_value_bytes: 100,
+            max_leaf_bytes: 30,
+        };
+
+        assert!(policy.admits_value(30));
+        assert!(!policy.admits_value(31));
+        assert!(!policy.admits(0, 31));
+    }
+
+    #[test]
     fn the_empty_policy_admits_nothing() {
         let policy = InlinePolicy::none();
 
+        assert!(!policy.admits_value(0));
         assert!(!policy.admits(0, 0));
         assert!(!policy.admits(0, 1));
     }
