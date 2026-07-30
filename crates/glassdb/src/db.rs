@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 use crate::collection::{Collection, CollectionPath};
 use crate::diagnostics::Diagnostics;
 use crate::error::Error;
-use crate::stats::Stats;
+use crate::stats::{Stats, TransactionStats};
 use crate::tx::Transaction;
 use crate::version::check_or_create_db_meta;
 
@@ -498,17 +498,18 @@ impl Database {
     /// Counters only increase; subtract snapshots for intervals. Collection is
     /// not an atomic cut across concurrently active engine components.
     pub fn stats(&self) -> Stats {
-        let bstats = self.inner.backend.stats_and_reset();
-        let lock_calls = self.inner.locker.lock_calls_and_reset() as u64;
-        let coord = self.inner.coord.stats_and_reset();
-        let direct = self.inner.algo.direct_commit_stats_and_reset();
-        let split = self.inner.splitter.stats_and_reset();
-        let cache = self.inner.objects.cache_stats_and_reset();
-        let mut s = self.inner.stats.lock().unwrap();
-        s.add_backend(&bstats);
-        s.add_protocol(lock_calls, coord, direct, split);
-        s.add_cache(cache);
-        *s
+        let delta = Stats {
+            backend: self.inner.backend.stats_and_reset(),
+            cache: self.inner.objects.cache_stats_and_reset(),
+            locker: self.inner.locker.stats_and_reset(),
+            coordinator: self.inner.coord.stats_and_reset(),
+            direct_commit: self.inner.algo.direct_commit_stats_and_reset(),
+            splitter: self.inner.splitter.stats_and_reset(),
+            ..Default::default()
+        };
+        let mut stats = self.inner.stats.lock().unwrap();
+        *stats += delta;
+        *stats
     }
 
     /// Returns a snapshot of the shard coordinator's and locker's live state,
@@ -638,23 +639,27 @@ impl DbInner {
     {
         let _guard = self.admit_operation()?;
 
-        let mut stats = Stats {
-            tx_n: 1,
+        let mut stats = TransactionStats {
+            completed: 1,
             ..Default::default()
         };
         let begin = rt::Instant::now();
         let res = self.tx_impl(f, &mut stats).await;
-        stats.tx_time = begin.elapsed();
-        self.update_stats(&stats);
+        stats.elapsed = begin.elapsed();
+        self.update_transaction_stats(stats);
         res
     }
 
-    fn update_stats(&self, s: &Stats) {
+    fn update_transaction_stats(&self, transaction: TransactionStats) {
         let mut stats = self.stats.lock().unwrap();
-        stats.add(s);
+        stats.transactions += transaction;
     }
 
-    async fn tx_impl<T, F, Fut>(self: &Arc<Self>, mut f: F, stats: &mut Stats) -> Result<T, Error>
+    async fn tx_impl<T, F, Fut>(
+        self: &Arc<Self>,
+        mut f: F,
+        stats: &mut TransactionStats,
+    ) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
@@ -682,9 +687,9 @@ impl DbInner {
             // Collect the accesses produced by the user function.
             let (access, collection_access) = tx.collect_accesses();
             let metrics = tx.metrics();
-            stats.tx_reads += access.reads.len() as u64;
-            stats.tx_cache_hits += metrics.cache_hits;
-            stats.tx_writes += access.writes.len() as u64;
+            stats.reads += access.reads.len() as u64;
+            stats.cache_hits += metrics.cache_hits;
+            stats.writes += access.writes.len() as u64;
 
             let value = match fn_res {
                 Ok(v) => {
@@ -721,7 +726,7 @@ impl DbInner {
                     match self.algo.validate_reads(h).await {
                         Err(TransError::Retry) => {
                             tx.reset();
-                            stats.tx_retries += 1;
+                            stats.retries += 1;
                             continue;
                         }
                         Err(TransError::Wounded) => {
@@ -733,7 +738,7 @@ impl DbInner {
                             abort_guard.arm(new.id().clone());
                             handle = Some(new);
                             tx.reset();
-                            stats.tx_retries += 1;
+                            stats.retries += 1;
                             continue;
                         }
                         _ => break Err(ferr),
@@ -763,12 +768,12 @@ impl DbInner {
                     abort_guard.arm(new.id().clone());
                     handle = Some(new);
                     tx.reset();
-                    stats.tx_retries += 1;
+                    stats.retries += 1;
                     continue;
                 }
                 Err(TransError::Retry) => {
                     tx.reset();
-                    stats.tx_retries += 1;
+                    stats.retries += 1;
                     continue;
                 }
                 Err(e) => break Err(e.into()),

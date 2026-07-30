@@ -1,6 +1,7 @@
 //! A [`Backend`] decorator that counts operations. Ported from the Go
 //! `statsBackend` in `stats.go`.
 
+use std::ops::{AddAssign, Sub};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,6 +19,26 @@ pub struct BackendStats {
     pub obj_reads: u64,
     pub obj_writes: u64,
     pub obj_lists: u64,
+}
+
+impl AddAssign for BackendStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.obj_reads += rhs.obj_reads;
+        self.obj_writes += rhs.obj_writes;
+        self.obj_lists += rhs.obj_lists;
+    }
+}
+
+impl Sub for BackendStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            obj_reads: self.obj_reads.saturating_sub(rhs.obj_reads),
+            obj_writes: self.obj_writes.saturating_sub(rhs.obj_writes),
+            obj_lists: self.obj_lists.saturating_sub(rhs.obj_lists),
+        }
+    }
 }
 
 /// Wraps a backend and counts the operations performed on it.

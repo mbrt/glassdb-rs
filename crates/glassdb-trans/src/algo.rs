@@ -24,6 +24,7 @@
 //! aborts-and-renews with priority preserved ([`TxId::renew`]).
 
 use std::collections::BTreeSet;
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -75,13 +76,31 @@ struct DirectCommitCounters {
     landed: AtomicU64,
 }
 
-/// Cumulative coverage from ADR-051's direct single-key commit path.
+/// Direct single-key commit coverage for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectCommitStats {
     /// Mutation attempts shaped for the direct path.
     pub candidates: u64,
     /// Candidates that committed directly.
     pub landed: u64,
+}
+
+impl AddAssign for DirectCommitStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.landed += rhs.landed;
+    }
+}
+
+impl Sub for DirectCommitStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            landed: self.landed.saturating_sub(rhs.landed),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2848,7 +2867,7 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -2862,7 +2881,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "an over-budget value goes straight to locking, it never replays"
         );
         let c = write_counts(&log);
@@ -2909,7 +2928,7 @@ mod tests {
                 .unwrap()
         );
 
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut handle = begin_data(
             &tm,
             Data {
@@ -2934,7 +2953,7 @@ mod tests {
         result.unwrap();
         tm.end(&mut handle).await.unwrap();
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "an observed gate bypasses the direct commit"
         );
         assert_eq!(
@@ -3100,7 +3119,7 @@ mod tests {
 
         // End to end: the writer commits directly over H1 (help-forwarding it
         // into the chain, not orphaning it), taking no lock of its own.
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3114,7 +3133,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert_eq!(
-            tctx.locker.lock_calls_and_reset(),
+            tctx.locker.stats_and_reset().calls,
             0,
             "the committed holder did not push the writer onto the locked path"
         );
@@ -3676,7 +3695,7 @@ mod tests {
         let keyp = key_ref(b"new");
 
         log.lock().unwrap().clear();
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3689,7 +3708,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "a create takes the full locked path"
         );
         let c = write_counts(&log);
@@ -3713,7 +3732,7 @@ mod tests {
         let r = do_read(&tctx, &keyp).await;
 
         log.lock().unwrap().clear();
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(
             &tm,
             Data {
@@ -3726,7 +3745,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         assert!(
-            tctx.locker.lock_calls_and_reset() >= 1,
+            tctx.locker.stats_and_reset().calls >= 1,
             "a delete takes the full locked path"
         );
         let c = write_counts(&log);
@@ -4344,11 +4363,11 @@ mod tests {
         assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 
         // No concurrent change: the listing validates and commits.
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         let mut h = begin_data(&tm, data.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
-        assert_eq!(tctx.locker.lock_calls_and_reset(), 0);
+        assert_eq!(tctx.locker.stats_and_reset().calls, 0);
 
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
@@ -4365,9 +4384,9 @@ mod tests {
         let (fresh, keys) = scan_data(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         tm.reset(&mut stale, fresh);
-        tctx.locker.lock_calls_and_reset();
+        tctx.locker.stats_and_reset();
         tm.commit(&mut stale).await.unwrap();
-        assert!(tctx.locker.lock_calls_and_reset() >= 1);
+        assert!(tctx.locker.stats_and_reset().calls >= 1);
         let log = tctx
             .tlogger
             .get_at(stale.id(), Requirement::Any)

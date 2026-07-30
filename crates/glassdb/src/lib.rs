@@ -31,7 +31,7 @@ pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionEntry, CollectionsIter, KeysIter};
 pub use scan::{KeyPage, KeyScan};
-pub use stats::Stats;
+pub use stats::{Stats, TransactionStats};
 pub use tx::Transaction;
 
 /// Returns an error from a transaction attempt when `condition` is false.
@@ -53,11 +53,14 @@ macro_rules! ensure_tx {
 // budgets (see [`DatabaseBuilder::inline_policy`]).
 pub use glassdb_data::MAX_COLLECTION_NAME_BYTES;
 pub use glassdb_storage::{CacheStats, InlinePolicy, PersistentCacheConfig, SplitPolicy};
-pub use glassdb_trans::ProtocolTiming;
+pub use glassdb_trans::{
+    DirectCommitStats, InlinePressureStats, LockerStats, ProtocolTiming, ShardCoordinatorStats,
+    SplitterStats,
+};
 
 // Re-export the backend abstraction so callers can construct a Database without
 // depending on the backend crate directly.
-pub use glassdb_backend::{self as backend, Backend, memory, middleware};
+pub use glassdb_backend::{self as backend, Backend, BackendStats, memory, middleware};
 
 // Cloud backends, gated behind features so the heavy SDK dependencies are only
 // pulled in when requested.

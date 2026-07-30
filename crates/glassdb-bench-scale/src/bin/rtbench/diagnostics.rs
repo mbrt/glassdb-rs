@@ -53,7 +53,7 @@ impl DiagnosticSession {
         let backend = self.backend.snapshot() - backend_before;
         let stats_backend_ops: u64 = stats
             .iter()
-            .map(|s| s.obj_reads + s.obj_writes + s.obj_lists)
+            .map(|s| s.backend.obj_reads + s.backend.obj_writes + s.backend.obj_lists)
             .sum();
         if backend.total() != stats_backend_ops {
             return Err(format!(
@@ -69,38 +69,46 @@ impl DiagnosticSession {
 
         let sum = |field: fn(&Stats) -> u64| stats.iter().map(field).sum();
         for (component, metric, value) in [
-            ("locker", "calls", sum(|s| s.lock_calls)),
-            ("coordinator", "submissions", sum(|s| s.coord_submissions)),
-            ("coordinator", "rounds", sum(|s| s.coord_rounds)),
-            ("coordinator", "cas_retries", sum(|s| s.lock_retries)),
+            ("locker", "calls", sum(|s| s.locker.calls)),
+            (
+                "coordinator",
+                "submissions",
+                sum(|s| s.coordinator.submissions),
+            ),
+            ("coordinator", "rounds", sum(|s| s.coordinator.rounds)),
+            (
+                "coordinator",
+                "cas_retries",
+                sum(|s| s.coordinator.cas_retries),
+            ),
             (
                 "direct_commit",
                 "candidates",
-                sum(|s| s.direct_commit_candidates),
+                sum(|s| s.direct_commit.candidates),
             ),
-            ("direct_commit", "landed", sum(|s| s.direct_commit_landed)),
-            ("splitter", "candidates", sum(|s| s.split_candidates)),
-            ("splitter", "completed", sum(|s| s.split_completed)),
-            ("splitter", "deferred", sum(|s| s.split_deferred)),
+            ("direct_commit", "landed", sum(|s| s.direct_commit.landed)),
+            ("splitter", "candidates", sum(|s| s.splitter.candidates)),
+            ("splitter", "completed", sum(|s| s.splitter.completed)),
+            ("splitter", "deferred", sum(|s| s.splitter.deferred)),
             (
                 "splitter",
                 "inline_pressure_candidates",
-                sum(|s| s.split_inline_pressure_candidates),
+                sum(|s| s.splitter.inline_pressure.candidates),
             ),
             (
                 "splitter",
                 "inline_pressure_completed",
-                sum(|s| s.split_inline_pressure_completed),
+                sum(|s| s.splitter.inline_pressure.completed),
             ),
             (
                 "splitter",
                 "inline_pressure_deferred",
-                sum(|s| s.split_inline_pressure_deferred),
+                sum(|s| s.splitter.inline_pressure.deferred),
             ),
             (
                 "splitter",
                 "inline_pressure_discarded",
-                sum(|s| s.split_inline_pressure_discarded),
+                sum(|s| s.splitter.inline_pressure.discarded),
             ),
         ] {
             self.write_metric(run, num_dbs, logical_tx, component, metric, value)?;

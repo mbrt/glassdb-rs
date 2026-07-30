@@ -41,6 +41,7 @@
 //! leaving the independent collection record untouched.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -151,7 +152,7 @@ struct Stats {
     inline_pressure_discarded: AtomicU64,
 }
 
-/// Cumulative background split activity since the previous stats snapshot.
+/// Background split activity for one snapshot or accumulated interval.
 ///
 /// `completed` counts locally observed source/root linearizations. A split may
 /// also be `deferred` if a later publication or cleanup step needs another
@@ -164,14 +165,65 @@ pub struct SplitterStats {
     pub completed: u64,
     /// Retryable candidate attempts requeued for any cause.
     pub deferred: u64,
-    /// Processed candidates caused by aggregate inline pressure.
-    pub inline_pressure_candidates: u64,
-    /// Locally observed leaf splits directly caused by inline pressure.
-    pub inline_pressure_completed: u64,
-    /// Retryable inline-pressure candidate attempts requeued.
-    pub inline_pressure_deferred: u64,
-    /// Inline-pressure candidates discarded after authoritative revalidation.
-    pub inline_pressure_discarded: u64,
+    /// Activity attributable specifically to aggregate inline pressure.
+    pub inline_pressure: InlinePressureStats,
+}
+
+/// Split activity attributable to aggregate inline pressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlinePressureStats {
+    /// Processed candidates.
+    pub candidates: u64,
+    /// Locally observed leaf splits.
+    pub completed: u64,
+    /// Retryable candidate attempts requeued.
+    pub deferred: u64,
+    /// Candidates discarded after authoritative revalidation.
+    pub discarded: u64,
+}
+
+impl AddAssign for InlinePressureStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.completed += rhs.completed;
+        self.deferred += rhs.deferred;
+        self.discarded += rhs.discarded;
+    }
+}
+
+impl Sub for InlinePressureStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            completed: self.completed.saturating_sub(rhs.completed),
+            deferred: self.deferred.saturating_sub(rhs.deferred),
+            discarded: self.discarded.saturating_sub(rhs.discarded),
+        }
+    }
+}
+
+impl AddAssign for SplitterStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.completed += rhs.completed;
+        self.deferred += rhs.deferred;
+        self.inline_pressure += rhs.inline_pressure;
+    }
+}
+
+impl Sub for SplitterStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            completed: self.completed.saturating_sub(rhs.completed),
+            deferred: self.deferred.saturating_sub(rhs.deferred),
+            inline_pressure: self.inline_pressure - rhs.inline_pressure,
+        }
+    }
 }
 
 impl SplitCandidates {
@@ -374,22 +426,24 @@ impl Splitter {
             candidates: self.stats.candidates.swap(0, Ordering::Relaxed),
             completed: self.stats.completed.swap(0, Ordering::Relaxed),
             deferred: self.stats.deferred.swap(0, Ordering::Relaxed),
-            inline_pressure_candidates: self
-                .stats
-                .inline_pressure_candidates
-                .swap(0, Ordering::Relaxed),
-            inline_pressure_completed: self
-                .stats
-                .inline_pressure_completed
-                .swap(0, Ordering::Relaxed),
-            inline_pressure_deferred: self
-                .stats
-                .inline_pressure_deferred
-                .swap(0, Ordering::Relaxed),
-            inline_pressure_discarded: self
-                .stats
-                .inline_pressure_discarded
-                .swap(0, Ordering::Relaxed),
+            inline_pressure: InlinePressureStats {
+                candidates: self
+                    .stats
+                    .inline_pressure_candidates
+                    .swap(0, Ordering::Relaxed),
+                completed: self
+                    .stats
+                    .inline_pressure_completed
+                    .swap(0, Ordering::Relaxed),
+                deferred: self
+                    .stats
+                    .inline_pressure_deferred
+                    .swap(0, Ordering::Relaxed),
+                discarded: self
+                    .stats
+                    .inline_pressure_discarded
+                    .swap(0, Ordering::Relaxed),
+            },
         }
     }
 
@@ -2487,8 +2541,11 @@ mod tests {
             SplitterStats {
                 candidates: 1,
                 completed: 1,
-                inline_pressure_candidates: 1,
-                inline_pressure_completed: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    completed: 1,
+                    ..InlinePressureStats::default()
+                },
                 ..SplitterStats::default()
             }
         );
@@ -2527,8 +2584,11 @@ mod tests {
             SplitterStats {
                 candidates: 1,
                 completed: 1,
-                inline_pressure_candidates: 1,
-                inline_pressure_completed: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    completed: 1,
+                    ..InlinePressureStats::default()
+                },
                 ..SplitterStats::default()
             }
         );
@@ -2562,8 +2622,11 @@ mod tests {
             sp.stats_and_reset(),
             SplitterStats {
                 candidates: 1,
-                inline_pressure_candidates: 1,
-                inline_pressure_discarded: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    discarded: 1,
+                    ..InlinePressureStats::default()
+                },
                 ..SplitterStats::default()
             },
             "a value that now fits does not reshape the tree"
@@ -2575,8 +2638,11 @@ mod tests {
             sp.stats_and_reset(),
             SplitterStats {
                 candidates: 1,
-                inline_pressure_candidates: 1,
-                inline_pressure_discarded: 1,
+                inline_pressure: InlinePressureStats {
+                    candidates: 1,
+                    discarded: 1,
+                    ..InlinePressureStats::default()
+                },
                 ..SplitterStats::default()
             },
             "a key that disappeared does not reshape the tree"

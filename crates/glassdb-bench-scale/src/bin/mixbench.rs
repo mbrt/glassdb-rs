@@ -260,11 +260,11 @@ struct RawOps {
 impl RawOps {
     fn of(delta: Stats) -> Self {
         RawOps {
-            reads: delta.obj_reads,
-            writes: delta.obj_writes,
-            lists: delta.obj_lists,
-            txn: delta.tx_n,
-            retries: delta.tx_retries,
+            reads: delta.backend.obj_reads,
+            writes: delta.backend.obj_writes,
+            lists: delta.backend.obj_lists,
+            txn: delta.transactions.completed,
+            retries: delta.transactions.retries,
         }
     }
 

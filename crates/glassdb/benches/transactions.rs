@@ -105,9 +105,9 @@ async fn report_stats<F: AsyncFnMut()>(label: &str, db: &Database, mut body: F) 
     let n = STATS_ITERS.max(1) as f64;
     println!(
         "  stats {label}: retries/op={:.3} w/op={:.2} r/op={:.2}",
-        s.tx_retries as f64 / n,
-        s.obj_writes as f64 / n,
-        s.obj_reads as f64 / n,
+        s.transactions.retries as f64 / n,
+        s.backend.obj_writes as f64 / n,
+        s.backend.obj_reads as f64 / n,
     );
 }
 

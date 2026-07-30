@@ -72,7 +72,7 @@ impl TransactionInner {
     fn record_read(&mut self, key: KeyRef, mut state: ReadState) {
         // Concurrent reads of one path can both miss the transaction-local
         // state. Preserve a hit observed by either result while still counting
-        // the path once, consistently with `tx_reads`.
+        // the path once, consistently with `TransactionStats::reads`.
         if self.reads.get(&key).is_some_and(ReadState::cache_hit) {
             state.set_cache_hit();
         }
@@ -836,7 +836,7 @@ mod tests {
             "the listing observes the full, sorted committed set"
         );
         assert!(
-            db.stats().tx_retries >= 1,
+            db.stats().transactions.retries >= 1,
             "the listing must have retried after its snapshot was invalidated"
         );
     }

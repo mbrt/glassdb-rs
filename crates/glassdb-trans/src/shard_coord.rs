@@ -26,6 +26,7 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -54,12 +55,32 @@ struct Stats {
     n_retries: AtomicU64,
 }
 
-/// Cumulative coordination work since the previous stats snapshot.
+/// Coordination work for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShardCoordinatorStats {
     pub submissions: u64,
     pub rounds: u64,
     pub cas_retries: u64,
+}
+
+impl AddAssign for ShardCoordinatorStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.submissions += rhs.submissions;
+        self.rounds += rhs.rounds;
+        self.cas_retries += rhs.cas_retries;
+    }
+}
+
+impl Sub for ShardCoordinatorStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            submissions: self.submissions.saturating_sub(rhs.submissions),
+            rounds: self.rounds.saturating_sub(rhs.rounds),
+            cas_retries: self.cas_retries.saturating_sub(rhs.cas_retries),
+        }
+    }
 }
 
 /// One transaction's outcome for a single deduplicated CAS round, deposited by

@@ -491,9 +491,9 @@ impl Benchmarker {
             self.num_keys.to_string(),
             self.num_workers.to_string(),
             self.num_keys_per_worker.to_string(),
-            self.delta_stats.tx_n.to_string(),
+            self.delta_stats.transactions.completed.to_string(),
             res.samples.len().to_string(),
-            self.delta_stats.tx_retries.to_string(),
+            self.delta_stats.transactions.retries.to_string(),
             fmt_float(txs),
             fmt_ms(res.avg()),
             fmt_ms(res.percentile(0.25)),
@@ -1389,9 +1389,9 @@ fn run_deadlock(
                     "{},{k},{overlap},{overlap_pct},{count},{:.2},{},{},{},{:.2}",
                     run + 1,
                     results.tot_duration.as_secs_f64() * 1000.0,
-                    s.tx_retries,
-                    s.direct_commit_candidates,
-                    s.direct_commit_landed,
+                    s.transactions.retries,
+                    s.direct_commit.candidates,
+                    s.direct_commit.landed,
                     ben.worker_drain().as_secs_f64() * 1000.0,
                 )?;
                 eprintln!(
@@ -1402,9 +1402,9 @@ fn run_deadlock(
                     count,
                     results.percentile(0.5),
                     results.percentile(0.9),
-                    s.tx_retries,
-                    s.direct_commit_landed,
-                    s.direct_commit_candidates,
+                    s.transactions.retries,
+                    s.direct_commit.landed,
+                    s.direct_commit.candidates,
                     ben.worker_drain(),
                 );
             }
@@ -1482,16 +1482,16 @@ fn dump_stats(
         // Summing every backend-op class keeps it meaningful across engine
         // versions that categorize ops differently (e.g. v1's tag/metadata ops
         // vs v2 folding all coordination into object reads/writes).
-        let backend_ops = s.obj_writes + s.obj_reads + s.obj_lists;
+        let backend_ops = s.backend.obj_writes + s.backend.obj_reads + s.backend.obj_lists;
         writeln!(
             out,
             "{run},{numdb},{i},{},{},{},{},{},{},{}",
-            res.stats.tx_n,
+            res.stats.transactions.completed,
             res.logical_tx(),
-            res.stats.tx_retries,
-            res.stats.obj_writes,
-            res.stats.obj_reads,
-            res.stats.obj_lists,
+            res.stats.transactions.retries,
+            res.stats.backend.obj_writes,
+            res.stats.backend.obj_reads,
+            res.stats.backend.obj_lists,
             backend_ops
         )?;
     }

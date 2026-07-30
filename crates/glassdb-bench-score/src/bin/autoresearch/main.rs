@@ -53,9 +53,9 @@ const WEIGHTS: Weights = Weights {
 
 impl Weights {
     fn cost(&self, s: &Stats) -> f64 {
-        self.obj_read * s.obj_reads as f64
-            + self.obj_write * s.obj_writes as f64
-            + self.obj_list * s.obj_lists as f64
+        self.obj_read * s.backend.obj_reads as f64
+            + self.obj_write * s.backend.obj_writes as f64
+            + self.obj_list * s.backend.obj_lists as f64
     }
 }
 
@@ -187,7 +187,7 @@ async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
 
 /// Turns a raw [`Sample`] into a per-transaction-normalized [`WorkloadResult`].
 fn to_result(s: Sample) -> Result<WorkloadResult, Box<dyn Error>> {
-    let txn = s.stats.tx_n;
+    let txn = s.stats.transactions.completed;
     if txn == 0 {
         return Err(format!("workload {}: no transactions recorded", s.name).into());
     }
@@ -195,10 +195,10 @@ fn to_result(s: Sample) -> Result<WorkloadResult, Box<dyn Error>> {
     Ok(WorkloadResult {
         name: s.name,
         txn,
-        obj_reads: s.stats.obj_reads,
-        obj_writes: s.stats.obj_writes,
-        obj_lists: s.stats.obj_lists,
-        retries: s.stats.tx_retries,
+        obj_reads: s.stats.backend.obj_reads,
+        obj_writes: s.stats.backend.obj_writes,
+        obj_lists: s.stats.backend.obj_lists,
+        retries: s.stats.transactions.retries,
         cost_per_tx: WEIGHTS.cost(&s.stats) / n,
         alloc_bytes_per_tx: s.alloc_bytes as f64 / n,
         allocs_per_tx: s.alloc_count as f64 / n,
