@@ -42,7 +42,8 @@ use crate::collections::{CollectionCatalog, CollectionData, CollectionLifecycle,
 use crate::error::TransError;
 use crate::gc::Gc;
 use crate::monitor::{Monitor, TxRecoveryManifest};
-use crate::node_locking::{LockResolution, resolve_entry_locks, resolve_entry_locks_at};
+use crate::node_locking::resolve_entry_locks;
+use crate::resolver::HolderResolution;
 use crate::resolver::Resolver;
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
@@ -586,7 +587,10 @@ enum Ineligible {
 /// Only a superseded read is [`Ineligible::Replay`], and the checks are ordered
 /// so a stronger reason wins: a key read as deleted names the same writer that
 /// deleted it, so testing existence first keeps it on the locked path (ADR-053).
-fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Result<TxId, Ineligible> {
+fn eligible_writer(
+    res: &HolderResolution,
+    read_version: Option<&TxId>,
+) -> Result<TxId, Ineligible> {
     // A live holder is a genuine conflict: defer to the full locked path so it
     // can wound-wait. Committed/aborted holders never reach `pending`.
     if !res.pending.is_empty() {
@@ -595,7 +599,7 @@ fn eligible_writer(res: &LockResolution, read_version: Option<&TxId>) -> Result<
     // The key must currently exist; a create or a put over a tombstone has no
     // predecessor value, which the direct path does not handle.
     let writer = match &res.writer {
-        Some(w) if !res.deleted() => w.clone(),
+        Some(w) if !res.deleted => w.clone(),
         _ => return Err(Ineligible::Locked),
     };
     match read_version {
@@ -1209,29 +1213,18 @@ impl Algo {
     async fn single_rw_predecessor(
         &self,
         key: &KeyRef,
-        raw_key: &[u8],
         read_version: Option<&TxId>,
     ) -> Result<Result<Predecessor, Ineligible>, TransError> {
-        let (_, locator) = self.resolver.resolve_key(key, Requirement::Any).await?;
+        let (lock_state, locator) = self
+            .resolver
+            .resolve_key_holders(key, None, Requirement::Any)
+            .await?;
         if locator
             .node()
             .is_some_and(|node| node.structural_gate().lock_type() == LockType::Write)
         {
             return Ok(Err(Ineligible::Locked));
         }
-        let entry = locator
-            .node()
-            .and_then(|node| node.as_leaf())
-            .and_then(|leaf| leaf.lookup(raw_key));
-        let lock_state = resolve_entry_locks_at(
-            &self.resolver,
-            &self.mon,
-            key,
-            entry,
-            None,
-            Requirement::Any,
-        )
-        .await?;
         Ok(
             eligible_writer(&lock_state, read_version).map(|writer| Predecessor {
                 // The leaf that owns this key, resolved by descent (ADR-031),
@@ -1282,7 +1275,7 @@ impl Algo {
         }
         let raw_key = key.key().to_vec();
         let Predecessor { leaf_path, writer } = match self
-            .single_rw_predecessor(&key, &raw_key, read_version.as_ref())
+            .single_rw_predecessor(&key, read_version.as_ref())
             .await?
         {
             Ok(predecessor) => predecessor,
@@ -3097,18 +3090,11 @@ mod tests {
         // an RMW that read H1 and a blind put are both committable and build on
         // H1, while a read of the superseded H0 is still rejected as stale.
         let requirement = Requirement::AtLeast(tm.timeline.now());
-        let (_, locator) = tm.resolver.resolve_key(&keyp, requirement).await.unwrap();
-        let resolved_entry = locator.node().unwrap().as_leaf().unwrap().lookup(&raw);
-        let res = resolve_entry_locks_at(
-            &tm.resolver,
-            &tm.mon,
-            &keyp,
-            resolved_entry,
-            None,
-            requirement,
-        )
-        .await
-        .unwrap();
+        let (res, _) = tm
+            .resolver
+            .resolve_key_holders(&keyp, None, requirement)
+            .await
+            .unwrap();
         assert_eq!(
             eligible_writer(&res, Some(&h1)),
             Ok(h1.clone()),

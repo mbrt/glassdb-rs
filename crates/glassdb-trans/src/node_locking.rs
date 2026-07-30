@@ -12,86 +12,9 @@ use glassdb_storage::{CurrentState, LockType, NodeLocks, Requirement, ShardEntry
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::resolver::Resolver;
+use crate::resolver::{HolderResolution, Resolver};
 use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
 use crate::wound_wait::{Reclaim, try_reclaim};
-
-/// Entry state needed by lock coordination after writer resolution and holder
-/// liveness classification.
-pub(crate) struct LockResolution {
-    pub(crate) writer: Option<TxId>,
-    pub(crate) deleted: bool,
-    pub(crate) pending: Vec<TxId>,
-}
-
-impl LockResolution {
-    /// Reports whether the effective writer deleted the key.
-    pub(crate) fn deleted(&self) -> bool {
-        self.deleted
-    }
-}
-
-/// Resolves an entry's writer and classifies the foreign holders that remain
-/// live for lock coordination.
-pub(crate) async fn resolve_entry_locks_at(
-    resolver: &Resolver,
-    monitor: &Monitor,
-    key: &KeyRef,
-    entry: Option<&ShardEntry>,
-    own_lock_holder: Option<&TxId>,
-    requirement: Requirement,
-) -> Result<LockResolution, TransError> {
-    let Some(entry) = entry else {
-        return Ok(LockResolution {
-            writer: None,
-            deleted: false,
-            pending: Vec::new(),
-        });
-    };
-    let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
-    if exclusive && entry.locked_by.len() > 1 {
-        return Err(TransError::other(
-            "exclusive shard entry has more than one holder",
-        ));
-    }
-    let own_exclusive = exclusive
-        && own_lock_holder.is_some_and(|id| entry.locked_by.iter().any(|holder| holder == id));
-    let writer = if own_exclusive {
-        // Our own exclusive hold means no foreign holder can be ahead of the
-        // recorded state, so the entry alone answers.
-        entry.current.writer().cloned()
-    } else {
-        resolver
-            .resolve_writer_at(key, Some(entry), requirement)
-            .await?
-            .writer
-    };
-    let deleted = match &writer {
-        None => false,
-        Some(writer) if entry.current.writer() == Some(writer) => entry.current.is_tombstone(),
-        Some(writer) => {
-            let value = monitor.committed_value_at(key, writer, requirement).await?;
-            value.status == TxCommitStatus::Ok && !value.value.not_written && value.value.deleted
-        }
-    };
-    let mut pending = Vec::new();
-    for holder in &entry.locked_by {
-        if Some(holder) == own_lock_holder {
-            continue;
-        }
-        if matches!(
-            monitor.tx_status_at(holder, requirement).await?,
-            TxCommitStatus::Pending | TxCommitStatus::Unknown
-        ) {
-            pending.push(holder.clone());
-        }
-    }
-    Ok(LockResolution {
-        writer,
-        deleted,
-        pending,
-    })
-}
 
 /// The current state to publish for a resolved effective writer.
 ///
@@ -101,7 +24,7 @@ pub(crate) async fn resolve_entry_locks_at(
 /// (ADR-051). Help-forwarding a different logged writer installs an external
 /// pointer or tombstone; only logless direct commits introduce new inline
 /// states (ADR-054).
-pub(crate) fn resolved_current(entry: Option<&ShardEntry>, res: &LockResolution) -> CurrentState {
+pub(crate) fn resolved_current(entry: Option<&ShardEntry>, res: &HolderResolution) -> CurrentState {
     let Some(writer) = res.writer.clone() else {
         return CurrentState::Absent;
     };
@@ -123,16 +46,10 @@ pub(crate) async fn resolve_entry_locks(
     key: &KeyRef,
     entry: Option<&ShardEntry>,
     own_lock_holder: Option<&TxId>,
-) -> Result<LockResolution, TransError> {
-    resolve_entry_locks_at(
-        ctx.resolver,
-        ctx.tmon,
-        key,
-        entry,
-        own_lock_holder,
-        ctx.requirement,
-    )
-    .await
+) -> Result<HolderResolution, TransError> {
+    ctx.resolver
+        .resolve_holders_at(key, entry, own_lock_holder, ctx.requirement)
+        .await
 }
 
 /// Wound-wait policy over one node's structural gate and membership lock.
@@ -408,15 +325,14 @@ pub(crate) async fn quiesce_entries(
 ) -> Result<QuiescedEntries, TransError> {
     let mut resolved_entries = BTreeMap::new();
     for (key, entry) in entries {
-        let resolved = resolve_entry_locks_at(
-            resolver,
-            monitor,
-            &KeyRef::new(collection.clone(), key),
-            Some(entry),
-            Some(id),
-            requirement,
-        )
-        .await?;
+        let resolved = resolver
+            .resolve_holders_at(
+                &KeyRef::new(collection.clone(), key),
+                Some(entry),
+                Some(id),
+                requirement,
+            )
+            .await?;
         for holder in &resolved.pending {
             if monitor.tx_status(holder).await? == TxCommitStatus::Unknown {
                 return Ok(QuiescedEntries::Wait(holder.clone()));
