@@ -48,7 +48,7 @@ use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
 };
-use crate::split::Splitter;
+use crate::split::{SplitHintSink, Splitter};
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -347,10 +347,12 @@ impl<'a> ValidationContext<'a> {
 struct DirectCommitResolver {
     id: TxId,
     raw_key: Vec<u8>,
+    leaf_path: String,
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
     inline: InlinePolicy,
+    split_hints: SplitHintSink,
 }
 
 #[async_trait]
@@ -398,15 +400,17 @@ impl ShardResolver for DirectCommitResolver {
             .sum();
         if !self.inline.admits(other_inline_bytes, self.value.len()) {
             let outcome = self.unlanded(ctx, Ineligible::Locked);
-            return if self.inline.admits_value(self.value.len()) {
-                Ok(Step::SkipWithInlinePressure {
-                    outcome,
-                    key: self.raw_key.clone(),
-                    value_len: self.value.len(),
-                })
-            } else {
-                Ok(Step::Skip { outcome })
-            };
+            if self.inline.admits_value(self.value.len()) {
+                // Resolution runs in the coordinator worker, so this
+                // best-effort observation is detached from the submitter even
+                // though the coordinator has no inline-pressure policy.
+                self.split_hints.observe_inline_pressure(
+                    &self.leaf_path,
+                    &self.raw_key,
+                    self.value.len(),
+                );
+            }
+            return Ok(Step::Skip { outcome });
         }
 
         // Publish the value itself as the new current state, dropping the
@@ -632,6 +636,7 @@ pub struct Algo {
     clock: Clock,
     timeline: Timeline,
     split_policy: SplitPolicy,
+    inline_policy: InlinePolicy,
     collection_catalog: CollectionCatalog,
     collection_lifecycle: CollectionLifecycle,
     splitter: Splitter,
@@ -658,6 +663,7 @@ impl Algo {
         background: Option<Weak<Background>>,
         resolver: Resolver,
         split_policy: SplitPolicy,
+        inline_policy: InlinePolicy,
         splitter: Splitter,
     ) -> Self {
         let collection_lifecycle = locker.collection_lifecycle(shards.clone());
@@ -671,6 +677,7 @@ impl Algo {
             clock,
             timeline,
             split_policy,
+            inline_policy,
             collection_catalog,
             collection_lifecycle,
             splitter,
@@ -1267,7 +1274,7 @@ impl Algo {
         self.direct_commit_stats
             .candidates
             .fetch_add(1, Ordering::Relaxed);
-        let inline = self.coord.inline_policy();
+        let inline = self.inline_policy;
         // Reject values no partition could admit before routing; aggregate
         // pressure from other keys needs the folded leaf (ADR-056).
         if !inline.admits_value(value.len()) {
@@ -1288,10 +1295,12 @@ impl Algo {
         let resolver = Arc::new(DirectCommitResolver {
             id: tx.id.clone(),
             raw_key,
+            leaf_path: leaf_path.clone(),
             key,
             value,
             read_version,
             inline,
+            split_hints: self.splitter.hint_sink(),
         });
         let outcome = self
             .coord
@@ -1842,6 +1851,7 @@ mod tests {
             None,
             resolver,
             glassdb_storage::SplitPolicy::default(),
+            glassdb_storage::InlinePolicy::default(),
             splitter,
         );
         (
@@ -1921,9 +1931,7 @@ mod tests {
         locks: &NodeLocks,
     ) -> FoldOutcome {
         match fold_step(resolver, tctx, cause, staged, locks).await {
-            Step::Skip { outcome }
-            | Step::SkipWithInlinePressure { outcome, .. }
-            | Step::Stage { outcome, .. } => outcome,
+            Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
         }
     }
 
@@ -3271,10 +3279,12 @@ mod tests {
         let resolver = DirectCommitResolver {
             id: TxId::with_priority(2, b"direct"),
             raw_key: b"k".to_vec(),
+            leaf_path: paths::tree_root(TEST_COLL),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
             inline: InlinePolicy::default(),
+            split_hints: tm.splitter.hint_sink(),
         };
         let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
@@ -3319,14 +3329,17 @@ mod tests {
         let seed = entry(&tctx, b"k").await.unwrap();
         let current = seed.current.writer().cloned().unwrap();
         let locks = NodeLocks::default();
+        let split_hints = tm.splitter.hint_sink();
 
         let direct = |read_version| DirectCommitResolver {
             id: TxId::with_priority(9, b"direct"),
             raw_key: b"k".to_vec(),
+            leaf_path: paths::tree_root(TEST_COLL),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version,
             inline: InlinePolicy::default(),
+            split_hints: split_hints.clone(),
         };
 
         // A read the entry has moved past: nothing is staged and the loss is
@@ -3420,18 +3433,13 @@ mod tests {
                 },
             ),
         ]);
-        match fold_step(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await {
-            Step::SkipWithInlinePressure {
-                outcome,
-                key,
-                value_len,
-            } => {
-                assert!(matches!(outcome, FoldOutcome::Moved));
-                assert_eq!(key, b"k");
-                assert_eq!(value_len, 2);
+        assert!(matches!(
+            fold_step(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
+            Step::Skip {
+                outcome: FoldOutcome::Moved
             }
-            _ => panic!("a recoverable aggregate miss must report inline pressure"),
-        }
+        ));
+        assert_eq!(split_hints.pending_inline_pressure(), 1);
         assert!(matches!(
             fold_step(
                 &budgeted,
@@ -3441,11 +3449,11 @@ mod tests {
                 &locks,
             )
             .await,
-            Step::SkipWithInlinePressure {
-                outcome: FoldOutcome::InDoubt(_),
-                ..
+            Step::Skip {
+                outcome: FoldOutcome::InDoubt(_)
             }
         ));
+        assert_eq!(split_hints.pending_inline_pressure(), 2);
 
         let impossible = DirectCommitResolver {
             inline: InlinePolicy {
@@ -3460,6 +3468,11 @@ mod tests {
                 outcome: FoldOutcome::Moved
             }
         ));
+        assert_eq!(
+            split_hints.pending_inline_pressure(),
+            2,
+            "a value no leaf can admit does not request a split"
+        );
 
         // The round-level classifications: a same-key claim proves this member
         // folded nothing, while a spent CAS budget proves nothing about an

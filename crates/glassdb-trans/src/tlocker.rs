@@ -1402,7 +1402,6 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             policy,
-            glassdb_storage::InlinePolicy::default(),
             Arc::new(crate::shard_coord::NoSplitHints),
         );
         let locker = Locker::new(

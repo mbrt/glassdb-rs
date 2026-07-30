@@ -4,8 +4,8 @@
 //! Coordination objects are grow-only: a leaf that crosses its soft cap is
 //! halved so no single object becomes a scalability or contention bottleneck.
 //! Splitting runs off the hot path in a periodic background task, fed candidates
-//! the coordinator observes from stored over-cap leaves and aggregate inline
-//! admission misses — never a key-space enumeration.
+//! from stored over-cap leaves and direct-commit inline admission misses —
+//! never a key-space enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
 //! a one-node structure-write lock. Before joining collection topology in
@@ -97,16 +97,52 @@ pub(crate) struct PendingSeparator {
 }
 
 /// The feed of leaves that may need splitting (ADR-031), owned by the
-/// [`Splitter`]. A handle is handed to the coordinator behind the
-/// [`SplitHinter`] seam: it pushes ordinary and inline-pressure observations,
-/// and the splitter drains and re-checks them. Cloneable (all fields `Arc`), so
-/// the producer handle and the splitter share one queue and policy.
+/// [`Splitter`]. The coordinator observes stored leaf size through
+/// [`SplitHinter`], while direct-commit admission reports inline pressure
+/// through [`SplitHintSink`]. The splitter drains and re-checks both causes.
+/// Cloneable so the producers and splitter share one queue and policy.
 #[derive(Clone)]
 pub(crate) struct SplitCandidates {
     policy: SplitPolicy,
     inline: InlinePolicy,
     clock: Clock,
     queue: Arc<Mutex<VecDeque<SplitCandidate>>>,
+}
+
+/// Lightweight producer handle for split hints decided outside the shard
+/// coordinator.
+#[derive(Clone)]
+pub(crate) struct SplitHintSink {
+    candidates: SplitCandidates,
+}
+
+impl SplitHintSink {
+    /// Records recoverable aggregate inline pressure for authoritative
+    /// revalidation by the splitter.
+    pub(crate) fn observe_inline_pressure(&self, path: &str, key: &[u8], value_len: usize) {
+        if !self.candidates.inline.admits_value(value_len) {
+            return;
+        }
+        self.candidates.push(SplitCandidate {
+            path: path.to_string(),
+            priority: self.candidates.new_id(),
+            reason: SplitReason::InlinePressure {
+                key: key.to_vec(),
+                value_len,
+            },
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_inline_pressure(&self) -> usize {
+        self.candidates
+            .queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|candidate| candidate.reason.is_inline_pressure())
+            .count()
+    }
 }
 
 #[derive(Clone)]
@@ -248,6 +284,12 @@ impl SplitCandidates {
         &self.policy
     }
 
+    fn hint_sink(&self) -> SplitHintSink {
+        SplitHintSink {
+            candidates: self.clone(),
+        }
+    }
+
     /// Drains every queued candidate, de-duplicated by path and cause, for one
     /// sweep cycle.
     fn drain(&self) -> Vec<SplitCandidate> {
@@ -328,20 +370,6 @@ impl SplitHinter for SplitCandidates {
             reason: SplitReason::SoftCap,
         });
     }
-
-    fn observe_inline_pressure(&self, path: &str, key: &[u8], value_len: usize) {
-        if !self.inline.admits_value(value_len) {
-            return;
-        }
-        self.push(SplitCandidate {
-            path: path.to_string(),
-            priority: self.new_id(),
-            reason: SplitReason::InlinePressure {
-                key: key.to_vec(),
-                value_len,
-            },
-        });
-    }
 }
 
 /// Background executor that halves over-full B-link nodes (ADR-031). Holds no
@@ -359,8 +387,9 @@ pub struct Splitter {
     resolver: Resolver,
     timeline: Timeline,
     db_root: String,
-    // The candidate feed this splitter drains. A clone injected into the
-    // coordinator reports ordinary capacity and inline-pressure observations.
+    // The candidate feed this splitter drains. The coordinator receives a
+    // clone for stored-leaf capacity; direct resolvers receive lightweight hint
+    // sinks for inline-pressure observations.
     candidates: SplitCandidates,
     // Separators a split could not publish on the first try; re-driven each
     // sweep so the parent index eventually learns them (ADR-031). Purely
@@ -402,7 +431,6 @@ impl Splitter {
             mon.clone(),
             retry,
             policy,
-            inline,
             Arc::new(candidates.clone()),
         );
         let splitter = Splitter::with_candidates(
@@ -418,6 +446,12 @@ impl Splitter {
             retry,
         );
         (coord, splitter)
+    }
+
+    /// Returns a producer handle for split hints decided outside the shard
+    /// coordinator.
+    pub(crate) fn hint_sink(&self) -> SplitHintSink {
+        self.candidates.hint_sink()
     }
 
     /// Returns and resets background split activity counters.
@@ -2049,7 +2083,6 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             *candidates.policy(),
-            candidates.inline,
             Arc::new(candidates.clone()),
         );
         Splitter::with_candidates(
@@ -2524,7 +2557,9 @@ mod tests {
         let sp = splitter_with_candidates(&s, &bg, candidates.clone());
         let root_path = paths::tree_root(COLL);
 
-        candidates.observe_inline_pressure(&root_path, b"h", 8);
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"h", 8);
         sp.run_once().await;
 
         let dir = Directory::new(s.shards.clone());
@@ -2568,7 +2603,9 @@ mod tests {
 
         // The old root path is deliberately stale now. Key-directed
         // revalidation must find and split the current owning child.
-        candidates.observe_inline_pressure(&root_path, b"h", 8);
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"h", 8);
         sp.run_once().await;
 
         assert_eq!(
@@ -2616,7 +2653,9 @@ mod tests {
         let sp = splitter_with_candidates(&s, &bg, candidates.clone());
         let root_path = paths::tree_root(COLL);
 
-        candidates.observe_inline_pressure(&root_path, b"b", 8);
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"b", 8);
         sp.run_once().await;
         assert_eq!(
             sp.stats_and_reset(),
@@ -2632,7 +2671,9 @@ mod tests {
             "a value that now fits does not reshape the tree"
         );
 
-        candidates.observe_inline_pressure(&root_path, b"missing", 8);
+        candidates
+            .hint_sink()
+            .observe_inline_pressure(&root_path, b"missing", 8);
         sp.run_once().await;
         assert_eq!(
             sp.stats_and_reset(),
@@ -2837,7 +2878,6 @@ mod tests {
             other_mon.clone(),
             RetryConfig::default(),
             SplitPolicy::default(),
-            InlinePolicy::default(),
             Arc::new(crate::shard_coord::NoSplitHints),
         );
         let other_locker = crate::tlocker::Locker::new(

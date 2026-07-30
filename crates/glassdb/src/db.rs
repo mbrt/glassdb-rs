@@ -242,6 +242,7 @@ impl DatabaseBuilder {
             Some(bg_weak),
             resolver,
             split_policy,
+            inline_policy,
             splitter.clone(),
         );
 

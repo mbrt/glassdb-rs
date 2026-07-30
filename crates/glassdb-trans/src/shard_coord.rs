@@ -36,8 +36,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    InlinePolicy, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
-    SplitPolicy, StorageError,
+    LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy,
+    StorageError,
 };
 
 use crate::error::TransError;
@@ -184,16 +184,6 @@ pub(crate) enum Step {
     },
     /// Stage nothing; deliver `outcome` to the member regardless of the CAS.
     Skip { outcome: FoldOutcome },
-    /// Stage nothing and report aggregate inline pressure independently of the
-    /// member's outcome (ADR-056).
-    ///
-    /// The coordinator emits the hint while it still owns the fold, so dropping
-    /// the caller cannot retract an observation that may help later mutations.
-    SkipWithInlinePressure {
-        outcome: FoldOutcome,
-        key: Vec<u8>,
-        value_len: usize,
-    },
 }
 
 /// The shared handles a resolver may consult mid-fold: the effective-writer
@@ -341,25 +331,16 @@ impl MergeRequest for CasReq {
     }
 }
 
-/// Sink for capacity observations emitted by coordinator folds, so a background
-/// growth policy can decide whether to split (ADR-031, ADR-056). The
-/// coordinator depends only on this seam — never on the splitter's queue or
-/// policy. The [`Splitter`](crate::Splitter) supplies the implementation; a
-/// coordinator with none attached uses [`NoSplitHints`].
+/// Sink for stored-leaf capacity observations, so a background growth policy
+/// can decide whether to split (ADR-031). The coordinator depends only on this
+/// seam — never on the splitter's queue or policy. The
+/// [`Splitter`](crate::Splitter) supplies the implementation; a coordinator
+/// with none attached uses [`NoSplitHints`].
 pub trait SplitHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `shard`. Best-effort: a
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &str, shard: &Shard);
-
-    /// Notes that a direct publication for `key` could fit by value size but
-    /// lacked aggregate inline headroom in the observed leaf (ADR-056).
-    ///
-    /// Implementations should only record a bounded, best-effort hint because
-    /// this runs synchronously with the fold that classified the publication.
-    /// The default preserves source compatibility for hint consumers that only
-    /// observe ADR-031's ordinary capacity trigger.
-    fn observe_inline_pressure(&self, _path: &str, _key: &[u8], _value_len: usize) {}
 }
 
 /// The default [`SplitHinter`] that drops every hint: for a coordinator with no
@@ -379,12 +360,10 @@ struct CoordCore {
     resolver: Resolver,
     retry: RetryConfig,
     stats: Stats,
-    // Where stored over-cap leaves and aggregate inline misses are reported:
-    // the background [`Splitter`](crate::Splitter)'s queue when one is wired,
-    // else a no-op. Emitting at the fold avoids key-space enumeration.
+    // Where stored over-cap leaves are reported: the background
+    // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
     hinter: Arc<dyn SplitHinter>,
     policy: SplitPolicy,
-    inline: InlinePolicy,
 }
 
 struct CoordState {
@@ -594,16 +573,6 @@ impl CasWorker {
                         results.push((tx.clone(), outcome, true));
                     }
                     Step::Skip { outcome } => results.push((tx.clone(), outcome, false)),
-                    Step::SkipWithInlinePressure {
-                        outcome,
-                        key,
-                        value_len,
-                    } => {
-                        self.core
-                            .hinter
-                            .observe_inline_pressure(path, &key, value_len);
-                        results.push((tx.clone(), outcome, false));
-                    }
                 }
             }
 
@@ -716,24 +685,19 @@ impl ShardCoordinator {
             tmon,
             retry,
             SplitPolicy::default(),
-            InlinePolicy::default(),
             Arc::new(NoSplitHints),
         )
     }
 
     /// Creates a coordinator that reports capacity observations to `hinter` —
     /// normally the background [`Splitter`](crate::Splitter)'s queue.
-    /// `policy` governs the coordinator's hard node-size limit and `inline`
-    /// configures the direct-commit admission policy exposed to
-    /// [`Algo`](crate::Algo); neither policy is exposed through the hinting
-    /// seam.
+    /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         shards: ShardStore,
         resolver: Resolver,
         tmon: Monitor,
         retry: RetryConfig,
         policy: SplitPolicy,
-        inline: InlinePolicy,
         hinter: Arc<dyn SplitHinter>,
     ) -> Self {
         let core = Arc::new(CoordCore {
@@ -743,7 +707,6 @@ impl ShardCoordinator {
             retry,
             stats: Stats::default(),
             policy,
-            inline,
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
@@ -771,12 +734,6 @@ impl ShardCoordinator {
     /// Returns a per-object dedup coordination snapshot (ADR-025).
     pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
         self.inner.dedup.snapshot()
-    }
-
-    /// The inline-value budgets used by logless direct commits (ADR-051,
-    /// ADR-054).
-    pub(crate) fn inline_policy(&self) -> InlinePolicy {
-        self.inner.core.inline
     }
 
     /// Submits one shard member (any resolver installed by a caller — the
@@ -934,15 +891,8 @@ mod tests {
         let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
         let shards = ShardStore::new(objects);
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord = ShardCoordinator::with_hinter(
-            shards.clone(),
-            resolver,
-            mon,
-            retry,
-            policy,
-            InlinePolicy::default(),
-            hinter,
-        );
+        let coord =
+            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
         (coord, shards, timeline, bg)
     }
 
@@ -1104,32 +1054,6 @@ mod tests {
         }
     }
 
-    struct SkipWithPressure;
-
-    #[async_trait::async_trait]
-    impl ShardResolver for SkipWithPressure {
-        async fn resolve(
-            &self,
-            _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
-            _staged_locks: &NodeLocks,
-        ) -> Result<Step, TransError> {
-            Ok(Step::SkipWithInlinePressure {
-                outcome: FoldOutcome::Conflict,
-                key: b"k".to_vec(),
-                value_len: 8,
-            })
-        }
-
-        fn reorderable(&self) -> bool {
-            false
-        }
-
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Conflict
-        }
-    }
-
     // The fold trace: each member records its id and the keys it saw already
     // staged when its turn came, so a test can assert fold order and threading.
     type FoldTrace = Arc<Mutex<Vec<(TxId, Vec<Vec<u8>>)>>>;
@@ -1218,47 +1142,12 @@ mod tests {
     #[derive(Default)]
     struct HintCounter {
         calls: std::sync::atomic::AtomicUsize,
-        pressure: Mutex<Vec<(String, Vec<u8>, usize)>>,
     }
 
     impl SplitHinter for HintCounter {
         fn observe_leaf(&self, _path: &str, _shard: &Shard) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
-
-        fn observe_inline_pressure(&self, path: &str, key: &[u8], value_len: usize) {
-            self.pressure
-                .lock()
-                .unwrap()
-                .push((path.to_string(), key.to_vec(), value_len));
-        }
-    }
-
-    #[tokio::test]
-    async fn skip_reports_inline_pressure_through_the_coordinator() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let hints = Arc::new(HintCounter::default());
-        let (coord, _shards, _timeline, _bg) =
-            coord_over_with(backend, SplitPolicy::default(), hints.clone()).await;
-        let tx = TxId::with_priority(1, b"t");
-
-        let out = coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipWithPressure), Requirement::Any)
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            out,
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
-                cas_precondition: None,
-            })
-        ));
-        assert_eq!(
-            *hints.pressure.lock().unwrap(),
-            vec![(leaf(), b"k".to_vec(), 8)]
-        );
-        coord.close().await;
     }
 
     // A resolver that stages entries drives one CAS, receives its exact
