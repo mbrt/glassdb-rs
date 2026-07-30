@@ -135,6 +135,15 @@ obligation from a policy-bounded window into an open-ended one and makes the
 contract about arbitrary history rather than a recent consistent view. Deferred
 rather than rejected: the versioned format admits it later.
 
+That reasoning covers arbitrary history and not the narrower case of naming a
+cut still inside the retained window, which asks for nothing GC is not already
+keeping. The narrower case is deferred only because it shares an entry point
+with the broader one, and it carries a condition the broader one does not: a
+supplied cut cannot be taken on trust, because one that is too fresh reinstates
+the invisible-write hazard the margin exists to prevent. A client would have to
+establish admissibility against its own observation rather than accept the
+value, in addition to the floor check every bind already performs.
+
 ### Reader-held pins or leases instead of a bounded lifetime
 
 Pins would let a reader hold a cut for as long as it likes. Ephemeral clients
@@ -145,8 +154,24 @@ tracking live clients; see ADR-040.
 ### Portable snapshot-bearing continuation tokens
 
 Exporting a cut across processes or clients would make pagination resumable
-outside one execution. It requires carrying a retention obligation across
-lifetime and trust boundaries with no holder to attribute it to. Deferred.
+outside one execution, and would let several workers scan disjoint ranges of one
+cut at once. For a system whose lifetime default exists to serve cold
+object-store scans and analytics, that is the shape those workloads actually
+want, and under ADR-038 a cut is only a timestamp that ADR-052 already makes
+comparable between clients, so sharing one needs no coordination.
+
+An earlier revision deferred this because it meant carrying a retention
+obligation across lifetime and trust boundaries with no holder to attribute it
+to. ADR-040's history floor removed that difficulty: retention is a policy
+window that GC honors whether or not anyone is reading, so there is no
+obligation to attribute, and a cut that has aged out of the window is refused
+with `SnapshotTooOld` rather than served incorrectly.
+
+Still deferred, but for what remains rather than for that. A resumed cut lives
+no longer than a lifetime, since ADR-040 derives the retention window from it,
+so this buys parallelism and restartability and not duration. And an exported
+cut must be validated for admissibility by whoever receives it, never trusted as
+supplied. Those are the terms on which it should be reconsidered.
 
 ### A strict read-only fallback behind the same facade
 

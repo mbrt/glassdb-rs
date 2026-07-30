@@ -124,6 +124,16 @@ invoked and ends at `started_at + lifetime`. The age of the cut affects nothing
 but staleness: a cut taken at the edge of the staleness bound still receives the
 full configured lifetime.
 
+A scan that cannot finish inside the lifetime has one answer, and it is the
+lifetime itself. Raising it is a policy change with a proportional storage cost,
+because ADR-040 derives the retention window from staleness plus lifetime plus
+the guard. Resuming a cut in a later execution would not help even if the
+contract allowed it, which is worth saying because the opposite seems obvious:
+the resumable window and the lifetime are the same quantity, so with the
+proposed defaults a resumed cut would survive the 65-minute window barely past
+the hour it already had. What resumption would buy is scanning one cut from
+several workers at once, which ADR-037 keeps deferred.
+
 Local clocks retain one job: measuring elapsed time for the deadline and for
 deciding when to refresh an observation. That clock must be monotonic and
 advance through process and machine suspension. This is a BOOTTIME-class
@@ -989,13 +999,35 @@ larger values must not be allowed to absorb it.
 
 The benchmark plan compares the proposed format with the current
 ADR-020/027/051 latest-value format under the same backend latency, concurrency,
-logical work, value sizes, and fault profile. It is explicitly outcome-based:
-storage-wave count and use of a specialized fast path are not pass criteria.
+logical work, value sizes, and fault profile.
+
+It distinguishes shape from cost. Storage-wave count and whether a specialized
+fast path is taken are shape, and stay outside the pass criteria: how an
+implementation arranges its round trips is its own business. Backend operations
+and stored bytes are not shape. Object storage bills both directly, which makes
+them the cost itself while latency and throughput are proxies for it. They are
+budgeted here rather than merely reported, because this format changes those two
+quantities more than anything else it changes.
 
 For every primary workload cell below, the initial reasonableness budget is p95
-and p99 latency at most `1.25x` baseline and statistically converged throughput
-at least `0.85x` baseline. A favorable aggregate cannot hide a failing primary
-cell. A cell is one predeclared tuple of operation, strict/snapshot mode, key or
+and p99 latency at most `1.25x` baseline, statistically converged throughput at
+least `0.85x` baseline, and backend operations at most `1.25x` baseline, counted
+per committed transaction for a write cell and per execution for a read-only
+one. For the warm-cache scan cells that ADR-055 exists to serve, that last
+budget is stated against pages of the listed prefix rather than against leaves
+in the collection: a scan over an unchanged collection that issues requests
+proportional to its leaves has failed however good its latency looks.
+
+The inline-eligible overwrite is the one exception, and it takes an explicit
+absolute operation count rather than the ratio. A ratio there would encode a
+decision nobody made, since one CAS against a logged commit fails `1.25x` by
+construction and the cell would report a foregone conclusion instead of a
+judgement. The benchmark report states that count and argues for it, and
+reviewing that argument is how this design decides whether the regression is
+acceptable.
+
+A favorable aggregate cannot hide a failing primary cell. A cell is one
+predeclared tuple of operation, strict/snapshot mode, key or
 result count, applicable value-size bucket, contention level, client state, and
 scan shape where applicable. Each tuple is evaluated separately; the benchmark
 report fixes the finite matrix before collecting comparison results.
@@ -1005,7 +1037,8 @@ snapshot cell is compared with the current strict read-only execution of the
 same logical operation. In particular, scan baselines use the accepted
 `Transaction::scan_keys` implementation with the identical `KeyScan`; no
 benchmark-only iterator or reverse-scan control is introduced. The same `1.25x`
-latency and `0.85x` throughput budgets apply. These ratios may be revised only
+latency, `0.85x` throughput, and `1.25x` operations budgets apply. These ratios
+may be revised only
 while the design is **Proposed**, before running the acceptance comparison, with
 an explicit rationale and review.
 
@@ -1039,6 +1072,26 @@ certification and write-back queues reach a stationary bound at the offered
 load; queue stability is measurement validity, not a separate performance
 budget.
 
+Steady-state retained bytes are budgeted once per declared policy rather than
+per cell, as a multiple of live logical bytes at stationary retention. The worst
+case is derivable and should be confirmed rather than assumed: coalescing bounds
+retained versions per key at `(maximum staleness + maximum read lifetime) / cut
+grid period`, which is 726 at the proposed defaults, so a continuously rewritten
+key may hold 726 retained versions against its one live one. The matrix
+therefore includes a continuously hot key, and a coarser grid period alongside
+the default, so the report demonstrates the storage knob working rather than
+only asserting it exists. ADR-051's inline bytes are retained twice for the
+window, once in the leaf and once as immutable history, and the report separates
+those bytes so its budgets can be re-tuned against a measurement.
+
+Retention is not stationary until a full retention window has elapsed, 65
+minutes at the proposed defaults, so any shorter run measures a store still
+filling and understates it. The matrix runs under a scaled policy that preserves
+the ratios between staleness, lifetime, and grid period, and one full-window run
+at the proposed defaults confirms the scaling did not distort the result.
+Stationary retention is a validity condition for the storage budget exactly as
+queue stability is for throughput.
+
 Binding no longer has an acquisition mechanism to benchmark, so the former
 fence-rate and cold-burst cells are gone. What remains worth measuring at the
 project's existing 500-client scale profile is that binding stays free in
@@ -1051,11 +1104,13 @@ operation, object-store tail latency, CAS contention, lost replies, and
 history-certification backlog.
 
 Report foreground p50/p95/p99 latency and storage waves, scale-out throughput,
-backend reads/writes/CAS retries per committed transaction, bytes written and
-retained, asynchronous backlog, commit-age abort rate, and estimated object
-operation and storage cost. Metrics other than the latency, throughput, and
-stationary-queue validity check diagnose the result but do not mandate a
-particular implementation.
+backend reads/writes/CAS retries per committed transaction and per read-only
+execution, bytes written and retained, asynchronous backlog, commit-age abort
+rate, and estimated object operation and storage cost. Latency, throughput,
+backend operations, and steady-state retained bytes are the pass criteria, and
+the queue- and retention-stationarity checks are validity conditions for them.
+The remaining metrics diagnose the result and do not mandate a particular
+implementation.
 
 If any primary workload cannot meet the predeclared budgets without invalidating
 the cut, durability, or fencing arguments, reject this snapshot design. Do not
@@ -1296,6 +1351,12 @@ not prove cut selection or freshness.
   the log needs its own reclamation and a completeness proof, and keeping it off
   the commit path forces a background build that has to repartition transactions
   by object.
+- Reconsider exporting a bound cut so several workers can scan disjoint ranges
+  of one cut concurrently, which is the shape the analytics workload behind the
+  lifetime default actually wants. ADR-037 records why the original objection no
+  longer applies and what replaces it: the receiver must establish admissibility
+  from its own observation instead of trusting the supplied value, and the gain
+  is parallelism and restartability rather than a longer scan.
 - Add safe online `SnapshotPolicy` enlargement/shrinkage if operational demand
   justifies its transition protocol.
 - Define collection drop and physical topology reclamation using the reserved
