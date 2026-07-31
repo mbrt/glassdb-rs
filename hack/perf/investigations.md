@@ -18,7 +18,7 @@ Status: logged-publication simplification implemented by
 [ADR-054](../../docs/adr/054-reserve-inline-publication-for-logless-commits.md);
 inline-pressure splitting implemented and validated by
 [ADR-056](../../docs/adr/056-demand-driven-inline-pressure-splits.md); budget
-tuning remains open.
+tuning completed by the [inline-policy sweep](#inline-policy-sweep) below.
 
 Reference: `5c3e5ac6`, after ADR-053. The goal is to isolate ADR-051's
 provisional inline budgets from the later contention fix.
@@ -27,7 +27,7 @@ provisional inline budgets from the later contention fix.
 
 A temporary role-counting backend wrapper, removed after the experiment,
 distinguishes node, transaction-log, and structural-log operations and bytes.
-Three runs sweep no inlining, the current 1 KiB / 64 KiB policy, 4 KiB and
+Three runs sweep no inlining, the then-current 1 KiB / 64 KiB policy, 4 KiB and
 16 KiB aggregate budgets, and selected per-value and encoded-object limits.
 The workloads cover serial and dense-leaf RMW, batch write, cold and warm read,
 cache pressure, and foreground versus background split work under the S3, GCS,
@@ -35,8 +35,8 @@ and memory profiles. Every run completes without transaction failures.
 
 #### Direct-path benefit
 
-- On a serial S3-profile RMW, the current policy reduces median latency from
-  `614` to `177 ms/transaction` for 128 B values and from `627` to
+- On a serial S3-profile RMW, the then-current policy reduces median latency
+  from `614` to `177 ms/transaction` for 128 B values and from `627` to
   `192 ms/transaction` for 1 KiB values. A cold inline read uses one node
   operation instead of a node plus transaction-log read; a warm read gains
   little once the transaction object is cached.
@@ -54,7 +54,7 @@ and memory profiles. Every run completes without transaction failures.
   operations with or without inlining. At 1 KiB, however, median node-write
   volume rises from `11.26` to `118.24 KiB/transaction`: write-back adds a
   cached copy of values already durable in the transaction object.
-- After that batch, the current policy lands only `50%` of 1 KiB single-key
+- After that batch, the then-current policy lands only `50%` of 1 KiB single-key
   RMWs directly. Median latency remains roughly flat (`457` versus
   `451 ms/transaction`) and operations fall only from `2.48` to `2.38`, while
   node-write volume rises from `4.84` to `95.54 KiB/transaction`.
@@ -62,7 +62,7 @@ and memory profiles. Every run completes without transaction failures.
   land `3.1%` and `12.5%` of 1 KiB direct candidates, respectively, but increase
   median S3-profile RMW latency to `667` and `626 ms/transaction` and operations
   to `3.63` and `3.42`.
-- With 900 keys split across five leaves, the current policy lands exactly
+- With 900 keys split across five leaves, the then-current policy lands exactly
   `320/900` 1 KiB candidates: 64 values per leaf, the 64 KiB budget's capacity.
   Compared with no inlining, median mutation work rises from `2.55` to
   `3.45` operations/transaction, node-write volume from `7.89` to
@@ -324,11 +324,11 @@ focused inline-capacity fix without globally lowering split thresholds. The
 multi-RMW follow-up finds no durable tail regression and shows that the
 cross-client transaction-object transfer is small beside the saved leaf bytes.
 The focused split result proves that pressure is observed, rerouted, converted
-into capacity, and repaid by later mutations. It does not establish that the
-current 1 KiB/64 KiB budgets are optimal, nor quantify permanent widening under
-a broad workload.
+into capacity, and repaid by later mutations. It did not establish that the
+then-current 1 KiB/64 KiB budgets were optimal, nor quantify permanent widening
+under a broad workload.
 
-The inline-policy sweep recommends changing the default from 1 KiB / 64 KiB to
-1 KiB / 16 KiB. Real-provider and repeated-wave measurements remain useful for
-later tuning, but are not a blocker: 16 KiB is the safer cross-profile default,
-while 64 KiB remains an explicit workload-specific option.
+The inline-policy sweep changed the default from 1 KiB / 64 KiB to 1 KiB /
+16 KiB. Real-provider and repeated-wave measurements remain useful for later
+tuning, but are not a blocker: 16 KiB is the safer cross-profile default, while
+64 KiB remains an explicit workload-specific option.

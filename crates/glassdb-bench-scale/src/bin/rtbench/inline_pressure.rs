@@ -6,7 +6,7 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use glassdb::{Collection, Database, Error as GError, Stats};
+use glassdb::{Collection, Database, Error as GError, InlinePolicy, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::backend_breakdown::{BackendBreakdown, BackendBreakdownHandle, wrap};
 use glassdb_bench_scale::bench::{Bench, Results};
@@ -21,8 +21,13 @@ const SATURATION_KEYS: std::ops::Range<usize> = 0..SATURATION_KEY_COUNT;
 const ROOT_PRESSURED_KEY: usize = 64;
 const LEAF_PRESSURED_KEY: usize = 65;
 const RECOVERY_KEY_COUNT: usize = 64;
+// Keep ADR-056's workload stable when product defaults are retuned.
+const INLINE_POLICY: InlinePolicy = InlinePolicy {
+    max_value_bytes: VALUE_BYTES,
+    max_leaf_bytes: SATURATION_KEY_COUNT * VALUE_BYTES,
+};
 const _: () = assert!(KEY_COUNT < 256);
-const _: () = assert!(SATURATION_KEY_COUNT * VALUE_BYTES == 64 * 1024);
+const _: () = assert!(INLINE_POLICY.max_leaf_bytes == 64 * 1024);
 const _: () = assert!(ROOT_PRESSURED_KEY != LEAF_PRESSURED_KEY);
 const _: () = assert!(LEAF_PRESSURED_KEY < KEY_COUNT);
 
@@ -82,7 +87,7 @@ fn run_once(
     let name = format!("benchinlinepressure{invocation}{run}");
     seed_collection(handle, backend, &name, options.drain_timeout)?;
 
-    let db = handle.block_on(Database::open(&name, backend.clone()))?;
+    let db = open_database(handle, backend, &name)?;
     let collection = handle.block_on(db.open_collection("inline-pressure"))?;
     let mut cursor = Cursor::new(&db, backend_stats);
     let total_start = cursor;
@@ -174,7 +179,7 @@ fn seed_collection(
     name: &str,
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let db = handle.block_on(Database::open(name, backend.clone()))?;
+    let db = open_database(handle, backend, name)?;
     let collection =
         handle.block_on(db.root_collection().create_collection_if_absent(COLLECTION))?;
     let collection = &collection;
@@ -189,6 +194,18 @@ fn seed_collection(
         tokio::time::Instant::now() + drain_timeout,
     ))?;
     Ok(())
+}
+
+fn open_database(
+    handle: &Handle,
+    backend: &Arc<dyn Backend>,
+    name: &str,
+) -> Result<Database, GError> {
+    handle.block_on(
+        Database::builder(name, backend.clone())
+            .inline_policy(INLINE_POLICY)
+            .open(),
+    )
 }
 
 async fn measure_keys(

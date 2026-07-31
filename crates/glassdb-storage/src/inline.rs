@@ -5,7 +5,7 @@
 const DEFAULT_MAX_VALUE_BYTES: usize = 1024;
 
 /// Default largest aggregate inline payload one leaf may carry.
-const DEFAULT_MAX_LEAF_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_LEAF_BYTES: usize = 16 * 1024;
 
 /// How much committed value data a leaf may carry inline.
 ///
@@ -14,7 +14,8 @@ const DEFAULT_MAX_LEAF_BYTES: usize = 64 * 1024;
 /// regular logged protocol and is eventually published as an external pointer.
 /// The budgets are a runtime tuning knob, never persisted, and values already
 /// inline are grandfathered — lowering a budget leaves them alone, because an
-/// inline value may be a key's only copy.
+/// inline value may be a key's only copy. The default admits values up to 1 KiB
+/// and bounds aggregate inline leaf payload at 16 KiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlinePolicy {
     /// Largest value that may be inlined at all.
