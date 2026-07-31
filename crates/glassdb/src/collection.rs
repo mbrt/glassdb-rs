@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, MAX_COLLECTION_NAME_BYTES};
-use glassdb_trans::{Reader, Resolver};
 
 use crate::db::DbInner;
 use crate::error::Error;
@@ -100,12 +99,7 @@ impl Collection {
     ) -> Result<Option<Vec<u8>>, Error> {
         let _guard = self.db.admit_operation()?;
         let key = KeyRef::new(self.address.clone(), key);
-        let r = Reader::new(
-            Resolver::new(self.db.shards.clone(), self.db.tmon.clone()),
-            self.db.timeline.clone(),
-            self.db.retry,
-        );
-        match r.read(&key, max_staleness).await {
+        match self.db.engine.read(&key, max_staleness).await {
             Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),
             Err(e) => Err(Error::from_read(e)),
         }

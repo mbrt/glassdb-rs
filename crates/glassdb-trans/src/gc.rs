@@ -42,7 +42,7 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, Clock, rt};
 use glassdb_data::{KeyRef, TxId, paths, shuffle};
 use glassdb_storage::{
-    Directory, Observation, Requirement, ShardStore, StorageError, TLogger, Timeline,
+    Observation, Requirement, ShardStore, StorageError, TLogger, Timeline, TreeRouter,
     TxCommitStatus, TxLock, TxLog,
 };
 
@@ -77,7 +77,7 @@ pub struct Gc {
     tl: TLogger,
     shards: ShardStore,
     collection_lifecycle: CollectionLifecycle,
-    dir: Directory,
+    router: TreeRouter,
     locker: Locker,
     mon: Monitor,
     clock: Clock,
@@ -121,23 +121,24 @@ impl Gc {
     /// Creates a collector over the transaction log, shard store, locker, and
     /// monitor. Freshness barriers use `timeline`; lease horizons use `clock`
     /// so they remain deterministic under the DST executor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bg: Weak<Background>,
         tl: TLogger,
         shards: ShardStore,
         timeline: Timeline,
         locker: Locker,
+        collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
         clock: Clock,
     ) -> Self {
-        let dir = Directory::new(shards.clone());
-        let collection_lifecycle = locker.collection_lifecycle(shards.clone());
+        let router = TreeRouter::new(shards.clone());
         Gc {
             bg,
             tl,
             shards,
             collection_lifecycle,
-            dir,
+            router,
             locker,
             mon,
             clock,
@@ -304,7 +305,7 @@ impl Gc {
         // collection forever merely because this same log stores a live value
         // in another collection.
         self.locker
-            .directories()
+            .collections()
             .recover_write_back(tid, &log.collection_changes, &log.locks)
             .await?;
         let dropped = log
@@ -398,7 +399,7 @@ impl Gc {
     /// entry can name `txid` only if `txid` put it there.
     ///
     /// The recorded keys are routed to their leaves by descent
-    /// ([`Directory::group_keys_by_leaf`]) so each touched leaf is fetched once —
+    /// ([`TreeRouter::group_keys_by_leaf`]) so each touched leaf is fetched once —
     /// a write and its write-lock name the same key, and sibling keys share a
     /// leaf, so a per-key load would re-read the same leaf several times per
     /// candidate. Each key carries the [`CheckKind`] that says which field to
@@ -428,7 +429,7 @@ impl Gc {
                 .push((key, kind));
         }
         for items in by_collection.into_values() {
-            let groups = match self.dir.group_keys_by_leaf(items, requirement).await {
+            let groups = match self.router.group_keys_by_leaf(items, requirement).await {
                 Ok(groups) => groups,
                 // Reclaiming a collection removes every reference it could
                 // contain; its absent tree is therefore negative evidence.
@@ -456,7 +457,7 @@ impl Gc {
         }
         if self
             .locker
-            .directories()
+            .collections()
             .is_referenced(tid, &log.locks, requirement)
             .await?
         {
@@ -501,7 +502,7 @@ impl Gc {
                 .push((key, ()));
         }
         for items in by_collection.into_values() {
-            match self.dir.group_keys_by_leaf(items, requirement).await {
+            match self.router.group_keys_by_leaf(items, requirement).await {
                 Ok(groups) => {
                     leaf_paths.extend(groups.into_iter().map(|group| group.path));
                 }
@@ -510,9 +511,9 @@ impl Gc {
             }
         }
         for path in leaf_paths {
-            self.locker.data().release_leaf(tid, &path).await?;
+            self.locker.keys().release_leaf(tid, &path).await?;
         }
-        self.locker.directories().release(tid, locks).await?;
+        self.locker.collections().release(tid, locks).await?;
         for collection in topology {
             let records = self
                 .shards
@@ -522,7 +523,7 @@ impl Gc {
                 return Ok(false);
             }
             self.locker
-                .directories()
+                .collections()
                 .release_topology_participant(&collection, tid)
                 .await?;
         }
@@ -542,22 +543,44 @@ enum CheckKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::Resolver;
-    use crate::shard_coord::ShardCoordinator;
+    use crate::collection_coordination::CollectionStateResolver;
+    use crate::collections::TopologySettler;
+    use crate::key_state_resolver::KeyStateResolver;
+    use crate::shard_coord::{ShardCoordinator, SplitHinter};
     use crate::tlocker::LockOutcome;
+    use async_trait::async_trait;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{CollectionAddress, CollectionId};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, CurrentState, Directory, LockType, Node,
-        Shard, ShardEntry, Timeline, TxCollectionChange, TxCollectionOp, TxWrite,
+        CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard,
+        ShardEntry, Timeline, TreeRouter, TxCollectionChange, TxCollectionOp, TxWrite,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
 
     const COLL: &str = "db/_c/0000000000000000000000";
+
+    struct UnexpectedTopologySettler;
+
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+    }
+
+    #[async_trait]
+    impl TopologySettler for UnexpectedTopologySettler {
+        async fn settle_topology_participant(
+            &self,
+            _collection: &CollectionAddress,
+            _id: &TxId,
+        ) -> Result<(), TransError> {
+            panic!("GC tests must not settle topology participants")
+        }
+    }
 
     fn collection() -> glassdb_data::CollectionAddress {
         glassdb_data::CollectionAddress::root("db")
@@ -614,19 +637,25 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord = ShardCoordinator::new(
+        let key_state = KeyStateResolver::new(mon.clone());
+        let coord = ShardCoordinator::with_hinter(
             shards.clone(),
-            resolver,
+            key_state,
             mon.clone(),
             RetryConfig::default(),
+            glassdb_storage::SplitPolicy::default(),
+            Arc::new(NoSplitHints),
         );
-        let dir = Directory::new(shards.clone());
+        let router = TreeRouter::new(shards.clone());
         let locker = Locker::new(
             coord.clone(),
-            dir,
-            records.clone(),
-            tl.clone(),
+            router,
+            CollectionStateResolver::new(
+                records.clone(),
+                tl.clone(),
+                mon.clone(),
+                RetryConfig::default(),
+            ),
             mon.clone(),
             RetryConfig::default(),
         );
@@ -636,6 +665,13 @@ mod tests {
             shards.clone(),
             timeline.clone(),
             locker.clone(),
+            CollectionLifecycle::new(
+                records.clone(),
+                shards.clone(),
+                mon.clone(),
+                RetryConfig::default(),
+                Arc::new(UnexpectedTopologySettler),
+            ),
             mon.clone(),
             clock,
         );
@@ -1242,9 +1278,9 @@ mod tests {
                 .await
         });
         let locker = ctx.locker.clone();
-        let data = crate::algo::Data {
+        let data = crate::access::Data {
             reads: Vec::new(),
-            writes: vec![crate::algo::WriteAccess::put(
+            writes: vec![crate::access::WriteAccess::put(
                 key_path(&kb),
                 Arc::from(&b"v2"[..]),
             )],
@@ -1254,7 +1290,7 @@ mod tests {
         let lock_requirement = Requirement::AtLeast(ctx.timeline.now());
         let acquire = tokio::spawn(async move {
             locker
-                .data()
+                .keys()
                 .lock_at(&live2, &data, false, lock_requirement)
                 .await
         });

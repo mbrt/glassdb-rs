@@ -91,7 +91,8 @@ impl From<BackendError> for TransError {
 
 /// Converts a transaction-engine error into a storage error, for the read /
 /// resolution paths whose public surface is `StorageError`. Shared by the
-/// [`Reader`](crate::Reader) and the [`Resolver`](crate::Resolver).
+/// [`Reader`](crate::reader::Reader) and the
+/// [`KeyResolver`](crate::key_resolver::KeyResolver).
 pub(crate) fn trans_to_storage(e: TransError) -> StorageError {
     match e {
         TransError::Storage(s) => s,

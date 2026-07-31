@@ -1,36 +1,40 @@
 //! Transaction engine. Ported from the Go `internal/trans` package: the commit
 //! algorithm, distributed locking, lifecycle monitor, read path, and GC.
 
+mod access;
 mod algo;
+mod collection_catalog;
+mod collection_coordination;
 mod collections;
-mod directory_locker;
+mod engine;
 mod error;
 mod gc;
+mod key_resolver;
+mod key_state_resolver;
 mod monitor;
 mod node_locking;
 mod reader;
-mod resolver;
 mod shard_coord;
 mod split;
 mod tlocker;
 mod wound_wait;
 
-pub use algo::{
-    Algo, Data, DirectCommitStats, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation,
-    ScanRange, WriteAccess,
+pub use access::{
+    Data, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
+pub use algo::DirectCommitStats;
 pub use collections::{
-    CollectionCatalog, CollectionChange, CollectionData, CollectionOp, DirectoryRead,
-    DirectoryReadKind, DirectorySnapshot,
+    CollectionChange, CollectionData, CollectionOp, DirectoryRead, DirectoryReadKind,
+    DirectorySnapshot,
 };
+pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
-pub use gc::Gc;
-pub use monitor::{Monitor, ProtocolTiming};
-pub use reader::{ReadOutcome, ReadValue, Reader};
-pub use resolver::{Resolver, ScanResult};
-pub use shard_coord::{ShardCoordinator, ShardCoordinatorStats, SplitHinter};
-pub use split::{InlinePressureStats, Splitter, SplitterStats};
-pub use tlocker::{HeldLeafSnapshot, Locker, LockerStats, TxLockSnapshot};
+pub use key_resolver::ScanResult;
+pub use monitor::ProtocolTiming;
+pub use reader::{ReadOutcome, ReadValue};
+pub use shard_coord::ShardCoordinatorStats;
+pub use split::{InlinePressureStats, SplitterStats};
+pub use tlocker::{HeldLeafSnapshot, LockerStats, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface does not force callers to pull
 // in `glassdb-concurr` directly.

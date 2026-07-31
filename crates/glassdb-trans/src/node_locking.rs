@@ -1,66 +1,77 @@
 //! Shared node-lock policy for leaf mutations and structural operations.
 //!
-//! The shard coordinator is deliberately policy-free. This module owns the
-//! wound-wait transitions applied to membership locks and the full-node
-//! quiescing sequence required before a split closes the structural gate.
+//! The shard coordinator owns the shared transactional fold mechanics. This
+//! module owns the wound-wait transitions applied to membership locks and the
+//! full-node quiescing sequence required before a split closes the structural
+//! gate.
 
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, KeyRef, LeafRef, TxId};
-use glassdb_storage::{CurrentState, LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
+use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
 
 use crate::error::TransError;
+use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
-use crate::resolver::{HolderResolution, Resolver};
 use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
 use crate::wound_wait::{Reclaim, try_reclaim};
 
-/// The current state to publish for a resolved effective writer.
-///
-/// A resolution that merely confirms the state already recorded returns it
-/// unchanged: rewriting it as `External` would drop authoritative inline bytes
-/// that a logless writer has no transaction object to restore them from
-/// (ADR-051). Help-forwarding a different logged writer installs an external
-/// pointer or tombstone; only logless direct commits introduce new inline
-/// states (ADR-054).
-pub(crate) fn resolved_current(entry: Option<&ShardEntry>, res: &HolderResolution) -> CurrentState {
-    let Some(writer) = res.writer.clone() else {
-        return CurrentState::Absent;
-    };
-    if let Some(entry) = entry
-        && entry.current.writer() == Some(&writer)
-    {
-        return entry.current.clone();
-    }
-    if res.deleted {
-        CurrentState::Tombstone { writer }
-    } else {
-        CurrentState::External { writer }
-    }
-}
-
-/// Resolves entry lock state using the coordination round's evidence bound.
-pub(crate) async fn resolve_entry_locks(
-    ctx: &ResolveCtx<'_>,
-    key: &KeyRef,
-    entry: Option<&ShardEntry>,
-    own_lock_holder: Option<&TxId>,
-) -> Result<HolderResolution, TransError> {
-    ctx.resolver
-        .resolve_holders_at(key, entry, own_lock_holder, ctx.requirement)
-        .await
-}
-
 /// Wound-wait policy over one node's structural gate and membership lock.
 pub(crate) struct NodeLockReconciler<'a> {
+    key_state: &'a KeyStateResolver,
     monitor: &'a Monitor,
     id: &'a TxId,
 }
 
 impl<'a> NodeLockReconciler<'a> {
-    pub(crate) fn new(monitor: &'a Monitor, id: &'a TxId) -> Self {
-        Self { monitor, id }
+    pub(crate) fn new(key_state: &'a KeyStateResolver, monitor: &'a Monitor, id: &'a TxId) -> Self {
+        Self {
+            key_state,
+            monitor,
+            id,
+        }
+    }
+
+    /// Resolves every entry and removes holders this structural operation can
+    /// reclaim before closing the node's structural gate.
+    pub(crate) async fn quiesce_entries(
+        &self,
+        collection: &CollectionAddress,
+        entries: &BTreeMap<Vec<u8>, ShardEntry>,
+        requirement: Requirement,
+    ) -> Result<QuiescedEntries, TransError> {
+        let mut resolved_entries = BTreeMap::new();
+        for (key, entry) in entries {
+            let resolved = self
+                .key_state
+                .resolve_holders(
+                    &KeyRef::new(collection.clone(), key),
+                    Some(entry),
+                    Some(self.id),
+                    requirement,
+                )
+                .await?;
+            for holder in &resolved.pending {
+                if self.monitor.tx_status(holder).await? == TxCommitStatus::Unknown {
+                    return Ok(QuiescedEntries::Wait(holder.clone()));
+                }
+                if matches!(
+                    try_reclaim(self.monitor, self.id, holder).await?,
+                    Reclaim::Wait
+                ) {
+                    return Ok(QuiescedEntries::Wait(holder.clone()));
+                }
+            }
+            let mut quiesced = entry.clone();
+            quiesced.current = resolved.resolved_current(Some(entry));
+            quiesced.locked_by.retain(|holder| holder == self.id);
+            if quiesced.locked_by.is_empty() {
+                quiesced.lock_type = LockType::None;
+            }
+            resolved_entries.insert(key.clone(), quiesced);
+        }
+        Ok(QuiescedEntries::Ready(resolved_entries))
     }
 
     /// Admits an ordinary node rewrite by proving the gate absent in the state
@@ -259,15 +270,10 @@ impl ShardResolver for StructuralGateResolver {
             .map_err(|e| TransError::with_source("parsing leaf path", e))?
             .collection()
             .clone();
-        let entries = match quiesce_entries(
-            ctx.resolver,
-            ctx.tmon,
-            &collection,
-            &self.id,
-            staged,
-            ctx.requirement,
-        )
-        .await?
+        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
+        let entries = match reconciler
+            .quiesce_entries(&collection, staged, ctx.requirement)
+            .await?
         {
             QuiescedEntries::Ready(entries) => entries,
             QuiescedEntries::Wait(holder) => {
@@ -277,7 +283,6 @@ impl ShardResolver for StructuralGateResolver {
             }
         };
         let mut locks = staged_locks.clone();
-        let reconciler = NodeLockReconciler::new(ctx.tmon, &self.id);
         if let Some(holder) = reconciler.acquire_structural_gate(&mut locks).await? {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Wait(holder),
@@ -311,43 +316,4 @@ impl ShardResolver for StructuralGateResolver {
 pub(crate) enum QuiescedEntries {
     Ready(BTreeMap<Vec<u8>, ShardEntry>),
     Wait(TxId),
-}
-
-/// Resolves every entry and removes all holders that the structural operation
-/// successfully wounds.
-pub(crate) async fn quiesce_entries(
-    resolver: &Resolver,
-    monitor: &Monitor,
-    collection: &CollectionAddress,
-    id: &TxId,
-    entries: &BTreeMap<Vec<u8>, ShardEntry>,
-    requirement: Requirement,
-) -> Result<QuiescedEntries, TransError> {
-    let mut resolved_entries = BTreeMap::new();
-    for (key, entry) in entries {
-        let resolved = resolver
-            .resolve_holders_at(
-                &KeyRef::new(collection.clone(), key),
-                Some(entry),
-                Some(id),
-                requirement,
-            )
-            .await?;
-        for holder in &resolved.pending {
-            if monitor.tx_status(holder).await? == TxCommitStatus::Unknown {
-                return Ok(QuiescedEntries::Wait(holder.clone()));
-            }
-            if matches!(try_reclaim(monitor, id, holder).await?, Reclaim::Wait) {
-                return Ok(QuiescedEntries::Wait(holder.clone()));
-            }
-        }
-        let mut quiesced = entry.clone();
-        quiesced.current = resolved_current(Some(entry), &resolved);
-        quiesced.locked_by.retain(|holder| holder == id);
-        if quiesced.locked_by.is_empty() {
-            quiesced.lock_type = LockType::None;
-        }
-        resolved_entries.insert(key.clone(), quiesced);
-    }
-    Ok(QuiescedEntries::Ready(resolved_entries))
 }

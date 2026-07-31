@@ -5,7 +5,6 @@ pub mod cache;
 mod cache_stats;
 mod cached_store;
 mod collection_store;
-mod directory;
 mod disk_cache;
 mod error;
 mod inline;
@@ -16,6 +15,7 @@ mod shard_store;
 mod structlog;
 mod timeline;
 mod tlogger;
+mod tree_router;
 pub mod txobject;
 mod version;
 
@@ -39,7 +39,6 @@ pub use cached_store::{
     CachedStore, CasResult, Observation, ObservationCheck, Requirement, Revision,
 };
 pub use collection_store::{CollectionRecord, CollectionStore};
-pub use directory::{Directory, LeafGroup, LeafLocator};
 pub use disk_cache::{
     OpenedPersistentCache, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
 };
@@ -55,4 +54,5 @@ pub use tlogger::{
     TLogger, TValue, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxLog,
     TxStatus, TxWrite,
 };
+pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};
 pub use version::Version;

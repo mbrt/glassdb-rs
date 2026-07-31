@@ -1,35 +1,18 @@
-//! Effective-writer resolution over the v2 shard coordination objects
-//! (ADR-017/020/024).
+//! Logical key and range resolution over the B-link tree.
 //!
-//! A key's value lives in the transaction object of whichever transaction last
-//! committed it, so a shard entry only points at the *effective writer*: the
-//! `current_writer` pointer, plus any committed-but-not-yet-written-back
-//! exclusive holder that must be help-forwarded. Resolving that pointer is a
-//! coordination concern shared by three
-//! consumers with different needs:
-//!
-//! - the [`Reader`](crate::Reader) materializes the value the writer holds,
-//! - the commit algorithm ([`Algo`](crate::Algo)) validates reads by comparing
-//!   the observed writer against the current one (ADR-024), and
-//! - coordination paths resolve the writer and live holders as one coherent
-//!   view before changing an entry.
-//!
-//! This module owns both projections so all consumers go through one place and
-//! none re-implement help-forwarding. The caller's requirement is propagated
-//! through the leaf and transaction-state dependencies of the resolution.
+//! Routing and scan composition live here; transaction-dependent interpretation
+//! of loaded nodes and entries belongs to
+//! [`KeyStateResolver`](crate::key_state_resolver::KeyStateResolver).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
-use glassdb_storage::{
-    CurrentState, Directory, LeafLocator, LockType, Requirement, ShardEntry, ShardStore,
-    StorageError, TxCommitStatus,
-};
+use glassdb_storage::{LeafLocator, Requirement, ShardEntry, StorageError, TreeRouter};
 
-use crate::algo::{LeafCoverage, ScanMutation, ScanRange};
+use crate::access::{LeafCoverage, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
-use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
+use crate::key_state_resolver::{HolderResolution, KeyStateResolver, WriterResolution};
+use crate::monitor::KeyCommitStatus;
 
 /// The result of a phantom-safe scan: the live keys in key order, the covered
 /// leaves' membership dependencies, and the effective page frontier.
@@ -41,130 +24,23 @@ pub struct ScanResult {
     pub frontier: Option<Vec<u8>>,
 }
 
-/// What is known about the effective writer's value alongside its identity.
-///
-/// A leaf entry that names the effective writer is authoritative about its own
-/// value (ADR-051), so resolution can answer "what did this writer write?"
-/// without touching a transaction object.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) enum ResolvedValue {
-    /// The leaf names a writer behind the effective one — a help-forwarded
-    /// committed holder — so only that holder's transaction object says what it
-    /// wrote. A predecessor's bytes are never its value.
-    #[default]
-    Unresolved,
-    /// The effective writer's value lives in its transaction object.
-    External,
-    /// The effective writer's authoritative value bytes.
-    Inline(Arc<[u8]>),
-    /// The effective writer deleted the key.
-    Tombstone,
-}
-
-impl ResolvedValue {
-    /// What `current` proves about its own writer's value.
-    pub(crate) fn from_current(current: &CurrentState) -> Self {
-        match current {
-            CurrentState::Absent => ResolvedValue::Unresolved,
-            CurrentState::External { .. } => ResolvedValue::External,
-            CurrentState::Inline { value, .. } => ResolvedValue::Inline(value.clone()),
-            CurrentState::Tombstone { .. } => ResolvedValue::Tombstone,
-        }
-    }
-
-    /// Reports whether the key exists, or `None` when the value is unresolved
-    /// and only the writer's transaction object can say.
-    pub(crate) fn exists(&self) -> Option<bool> {
-        match self {
-            ResolvedValue::Unresolved => None,
-            ResolvedValue::External | ResolvedValue::Inline(_) => Some(true),
-            ResolvedValue::Tombstone => Some(false),
-        }
-    }
-}
-
-/// The effective writer resolved using transaction-state evidence satisfying a
-/// requested freshness requirement.
-#[derive(Debug, Clone)]
-pub(crate) struct WriterResolution {
-    /// The effective committed writer holding the key's value (the MVCC
-    /// pointer), or `None` if the key has no committed value.
-    pub writer: Option<TxId>,
-    /// What the leaf proved about that writer's value.
-    pub value: ResolvedValue,
-    pub cache_hit: bool,
-}
-
-impl Default for WriterResolution {
-    fn default() -> Self {
-        Self {
-            writer: None,
-            value: ResolvedValue::Unresolved,
-            cache_hit: true,
-        }
-    }
-}
-
-/// One coherent interpretation of an entry's foreign lock holders.
-///
-/// The effective writer and the holders that remain live are derived from the
-/// same transaction-status observation for each holder. They must not be
-/// resolved independently: a holder can commit between two local status reads,
-/// producing a predecessor writer paired with an incorrectly removable lock.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct HolderResolution {
-    /// The effective committed writer after help-forwarding a committed
-    /// exclusive holder.
-    pub(crate) writer: Option<TxId>,
-    /// Whether the effective writer deleted the key.
-    pub(crate) deleted: bool,
-    /// Foreign holders still pending or not yet classifiable.
-    pub(crate) pending: Vec<TxId>,
-}
-
-/// Resolves a key's shard entry to its effective committed writer, help-
-/// forwarding committed holders through the [`Monitor`]. The single home for
-/// "who currently holds this key's value", shared by the read and commit paths.
+/// Resolves logical keys and ranges through the B-link tree.
 #[derive(Clone)]
-pub struct Resolver {
-    dir: Directory,
-    tmon: Monitor,
+pub(crate) struct KeyResolver {
+    router: TreeRouter,
+    state: KeyStateResolver,
 }
 
-impl Resolver {
-    /// Creates a resolver over the shard coordination store and monitor. Key
-    /// routing descends the collection's B-link directory through the shared
-    /// decoded object store, so unchanged nodes need no body transfer.
-    pub fn new(shards: ShardStore, tmon: Monitor) -> Self {
-        Resolver {
-            dir: Directory::new(shards),
-            tmon,
-        }
-    }
-
-    /// Scans `prefix` left-to-right and returns both the raw keys that currently
-    /// exist (committed and not tombstoned, in key order) and the membership
-    /// dependencies of every leaf the scan covered (ADR-032 phantom prevention).
-    ///
-    /// Committed holders are help-forwarded, so a key whose writer committed but
-    /// has not yet published its `current_writer` pointer (write-back is
-    /// asynchronous) still lists. The scan follows the leaf right-sibling chain
-    /// ([`Directory::leaves`]), so an in-progress split is absorbed rather than
-    /// dropping or duplicating keys. Membership versions and pending membership
-    /// holders detect creates/deletes without conflicting with value overwrites;
-    /// a changed covered-leaf set falls back to logical page validation.
-    pub async fn live_keys_scan(
-        &self,
-        collection: &CollectionAddress,
-    ) -> Result<ScanResult, StorageError> {
-        self.scan_keys(collection, &ScanRange::all(), &[], None, None)
-            .await
+impl KeyResolver {
+    /// Creates key resolution over a tree router and loaded-state resolver.
+    pub(crate) fn new(router: TreeRouter, state: KeyStateResolver) -> Self {
+        Self { router, state }
     }
 
     /// Resolves one bounded, forward page and its membership dependencies.
     /// `cap` is an optional inclusive validation frontier that prevents a
     /// limited-page recheck from reading beyond the range already protected.
-    pub async fn scan_keys(
+    pub(crate) async fn scan_keys(
         &self,
         collection: &CollectionAddress,
         range: &ScanRange,
@@ -192,7 +68,7 @@ impl Resolver {
         key: &KeyRef,
         writer: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
-        self.tmon.committed_value(key, writer).await
+        self.state.committed_value(key, writer).await
     }
 
     /// Resolves a page and all dependent transaction states against one shared
@@ -208,7 +84,7 @@ impl Resolver {
     ) -> Result<ScanResult, StorageError> {
         let prefix = collection.physical_prefix();
         let Some(mut loc) = self
-            .dir
+            .router
             .first_leaf_at(&prefix, &range.start, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(collection))?
@@ -226,7 +102,7 @@ impl Resolver {
 
         let mut overlay: BTreeMap<Vec<u8>, bool> = overlay
             .iter()
-            .filter(|mutation| in_scan_window(range, &mutation.key, cap))
+            .filter(|mutation| Self::in_scan_window(range, &mutation.key, cap))
             .map(|mutation| (mutation.key.clone(), mutation.present))
             .collect();
         let mut keys = Vec::new();
@@ -244,7 +120,7 @@ impl Resolver {
                 .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
             let mut candidates: BTreeSet<Vec<u8>> = leaf
                 .entries()
-                .filter(|entry| in_scan_window(range, &entry.key, cap))
+                .filter(|entry| Self::in_scan_window(range, &entry.key, cap))
                 .map(|entry| entry.key.clone())
                 .collect();
             let overlay_keys: Vec<Vec<u8>> = overlay
@@ -271,7 +147,8 @@ impl Resolver {
                         match leaf.lookup(&key) {
                             None => false,
                             Some(entry) => self
-                                .entry_exists_at(&key_ref, entry, own_lock_holder, requirement)
+                                .state
+                                .entry_exists(&key_ref, entry, own_lock_holder, requirement)
                                 .await
                                 .map_err(trans_to_storage)?,
                         }
@@ -297,7 +174,7 @@ impl Resolver {
                 break;
             }
             let Some(next) = self
-                .dir
+                .router
                 .next_leaf(&prefix, &loc, requirement)
                 .await
                 .map_err(|error| error.classify_collection_absence(collection))?
@@ -327,7 +204,7 @@ impl Resolver {
         let prefix = collection.physical_prefix();
         if range.is_empty() {
             if self
-                .dir
+                .router
                 .first_leaf_at(&prefix, &range.start, requirement)
                 .await
                 .map_err(|error| error.classify_collection_absence(collection))?
@@ -339,7 +216,7 @@ impl Resolver {
         }
 
         let leaves = self
-            .dir
+            .router
             .leaves_through(&prefix, &range.start, frontier, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(collection))?;
@@ -359,29 +236,18 @@ impl Resolver {
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<LeafCoverage, StorageError> {
-        let mut pending_membership = Vec::new();
         let node = loc.node();
         if let Some(node) = node {
-            self.ensure_collection_live(node).await?;
+            self.state.ensure_collection_live(node).await?;
         }
-        if let Some(node) = node
-            && node.membership_lock().lock_type() == LockType::Write
-        {
-            for holder in node.membership_lock().holders() {
-                if own_lock_holder == Some(holder) {
-                    continue;
-                }
-                let status = self
-                    .tmon
-                    .tx_status_at(holder, requirement)
-                    .await
-                    .map_err(trans_to_storage)?;
-                if status == TxCommitStatus::Pending {
-                    pending_membership.push(holder.clone());
-                }
+        let pending_membership = match node {
+            Some(node) => {
+                self.state
+                    .pending_membership(node, own_lock_holder, requirement)
+                    .await?
             }
-        }
-        pending_membership.sort();
+            None => Vec::new(),
+        };
         Ok(LeafCoverage {
             path: loc.path.as_str().into(),
             membership_version: node.map_or(0, |node| node.membership_version()),
@@ -403,12 +269,12 @@ impl Resolver {
         // iterator (which would not be higher-ranked / `Send` when the commit
         // path spawns this resolution).
         let items: Vec<(KeyRef, KeyRef)> = keys.iter().map(|k| (k.clone(), k.clone())).collect();
-        let groups = self.dir.group_keys_by_leaf(items, requirement).await?;
+        let groups = self.router.group_keys_by_leaf(items, requirement).await?;
 
         let mut out = HashMap::with_capacity(keys.len());
         for group in &groups {
             if let Some(node) = group.node() {
-                self.ensure_collection_live(node).await?;
+                self.state.ensure_collection_live(node).await?;
             }
             let leaf = group
                 .node()
@@ -420,7 +286,8 @@ impl Resolver {
                 .transpose()?;
             for (raw_key, key) in &group.keys {
                 let resolved = self
-                    .resolve_writer_at(key, leaf.and_then(|leaf| leaf.lookup(raw_key)), requirement)
+                    .state
+                    .resolve_writer(key, leaf.and_then(|leaf| leaf.lookup(raw_key)), requirement)
                     .await
                     .map_err(trans_to_storage)?;
                 out.insert(key.clone(), resolved.writer);
@@ -443,7 +310,8 @@ impl Resolver {
     ) -> Result<(WriterResolution, LeafLocator), TransError> {
         let loc = self.locate_key(key, requirement).await?;
         let writer = self
-            .resolve_writer_at(key, Self::entry_at(&loc, key.key())?, requirement)
+            .state
+            .resolve_writer(key, Self::entry_at(&loc, key.key())?, requirement)
             .await?;
         Ok((writer, loc))
     }
@@ -462,7 +330,8 @@ impl Resolver {
     ) -> Result<(HolderResolution, LeafLocator), TransError> {
         let loc = self.locate_key(key, requirement).await?;
         let holders = self
-            .resolve_holders_at(
+            .state
+            .resolve_holders(
                 key,
                 Self::entry_at(&loc, key.key())?,
                 own_lock_holder,
@@ -483,12 +352,13 @@ impl Resolver {
         // (the fast path's `Any` reuse, else a current lower bound), so the root `_r`
         // is not revalidated on every commit.
         let loc = self
-            .dir
+            .router
             .leaf_for_fresh(&prefix, key.key(), Requirement::Any, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {
-            self.ensure_collection_live(node)
+            self.state
+                .ensure_collection_live(node)
                 .await
                 .map_err(TransError::from)?;
         }
@@ -509,168 +379,9 @@ impl Resolver {
         Ok(leaf.and_then(|leaf| leaf.lookup(raw_key)))
     }
 
-    async fn ensure_collection_live(
-        &self,
-        node: &glassdb_storage::Node,
-    ) -> Result<(), StorageError> {
-        let Some(holder) = node.collection_delete_intent() else {
-            return Ok(());
-        };
-        match self
-            .tmon
-            .await_tx_final(holder)
-            .await
-            .map_err(trans_to_storage)?
-        {
-            TxFinalStatus::Committed => Err(StorageError::StaleCollection),
-            TxFinalStatus::Aborted => Ok(()),
-        }
+    fn in_scan_window(range: &ScanRange, key: &[u8], cap: Option<&[u8]>) -> bool {
+        range.contains(key) && cap.is_none_or(|cap| key <= cap)
     }
-
-    /// Resolves the effective writer named by `entry`, using Monitor evidence
-    /// satisfying `requirement` to help-forward a committed exclusive holder.
-    pub(crate) async fn resolve_writer_at(
-        &self,
-        key: &KeyRef,
-        entry: Option<&ShardEntry>,
-        requirement: Requirement,
-    ) -> Result<WriterResolution, TransError> {
-        let Some(entry) = entry else {
-            return Ok(WriterResolution::default());
-        };
-        let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
-        let mut writer = entry.current.writer().cloned();
-        let mut value = ResolvedValue::from_current(&entry.current);
-        let mut cache_hit = true;
-        if exclusive && entry.locked_by.len() > 1 {
-            return Err(TransError::other(
-                "exclusive shard entry has more than one holder",
-            ));
-        }
-        if exclusive && let Some(holder) = entry.locked_by.first() {
-            let (status, status_cache_hit) = self
-                .tmon
-                .tx_status_at_with_cache(holder, requirement)
-                .await?;
-            cache_hit &= status_cache_hit;
-            if status == TxCommitStatus::Ok {
-                let cv = self
-                    .tmon
-                    .committed_value_at(key, holder, requirement)
-                    .await?;
-                cache_hit &= cv.cache_hit;
-                if cv.status == TxCommitStatus::Ok && !cv.value.not_written {
-                    writer = Some(holder.clone());
-                    // The leaf still records the predecessor, so its state says
-                    // nothing about the holder we just moved ahead to.
-                    value = ResolvedValue::Unresolved;
-                }
-            }
-        }
-        Ok(WriterResolution {
-            writer,
-            value,
-            cache_hit,
-        })
-    }
-
-    /// Resolves both an entry's effective writer and its live foreign holders
-    /// from one status observation per holder.
-    ///
-    /// Coordination paths use this richer view because publishing a resolved
-    /// writer and removing a finalized lock are one logical decision. Pure
-    /// reads keep using [`Resolver::resolve_writer_at`], which need not inspect
-    /// shared read-lock holders that cannot affect the value.
-    pub(crate) async fn resolve_holders_at(
-        &self,
-        key: &KeyRef,
-        entry: Option<&ShardEntry>,
-        own_lock_holder: Option<&TxId>,
-        requirement: Requirement,
-    ) -> Result<HolderResolution, TransError> {
-        let Some(entry) = entry else {
-            return Ok(HolderResolution::default());
-        };
-        let exclusive = matches!(entry.lock_type, LockType::Write | LockType::Create);
-        if exclusive && entry.locked_by.len() > 1 {
-            return Err(TransError::other(
-                "exclusive shard entry has more than one holder",
-            ));
-        }
-
-        let mut writer = entry.current.writer().cloned();
-        let mut deleted = entry.current.is_tombstone();
-        let mut pending = Vec::new();
-        for holder in &entry.locked_by {
-            if Some(holder) == own_lock_holder {
-                continue;
-            }
-            let status = self.tmon.tx_status_at(holder, requirement).await?;
-            match status {
-                TxCommitStatus::Ok if exclusive => {
-                    // Committed is terminal, so reading the value after this
-                    // observation cannot cross back into a live-holder state.
-                    let value = self
-                        .tmon
-                        .committed_value_at(key, holder, requirement)
-                        .await?;
-                    if value.status == TxCommitStatus::Ok && !value.value.not_written {
-                        writer = Some(holder.clone());
-                        deleted = value.value.deleted;
-                    }
-                }
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                    pending.push(holder.clone());
-                }
-                TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
-            }
-        }
-        Ok(HolderResolution {
-            writer,
-            deleted,
-            pending,
-        })
-    }
-
-    /// Reports whether `entry` names a live key at `requirement`.
-    async fn entry_exists_at(
-        &self,
-        key: &KeyRef,
-        entry: &ShardEntry,
-        own_lock_holder: Option<&TxId>,
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        let resolved = if own_lock_holder.is_some_and(|id| {
-            matches!(entry.lock_type, LockType::Write | LockType::Create)
-                && entry.locked_by.iter().any(|holder| holder == id)
-        }) {
-            // Our own exclusive hold means no foreign holder can be ahead of
-            // the recorded state, so the entry alone answers.
-            WriterResolution {
-                writer: entry.current.writer().cloned(),
-                value: ResolvedValue::from_current(&entry.current),
-                cache_hit: true,
-            }
-        } else {
-            self.resolve_writer_at(key, Some(entry), requirement)
-                .await?
-        };
-        let Some(writer) = resolved.writer else {
-            return Ok(false);
-        };
-        if let Some(exists) = resolved.value.exists() {
-            return Ok(exists);
-        }
-        let value = self
-            .tmon
-            .committed_value_at(key, &writer, requirement)
-            .await?;
-        Ok(value.status == TxCommitStatus::Ok && !value.value.not_written && !value.value.deleted)
-    }
-}
-
-fn in_scan_window(range: &ScanRange, key: &[u8], cap: Option<&[u8]>) -> bool {
-    range.contains(key) && cap.is_none_or(|cap| key <= cap)
 }
 
 #[cfg(test)]
@@ -687,9 +398,11 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, paths};
     use glassdb_storage::{
-        CachedStore, CurrentState, Node, Shard, TLogger, Timeline, TxLog, TxWrite,
+        CachedStore, CurrentState, LockType, Node, Shard, ShardEntry, ShardStore, TLogger,
+        Timeline, TreeRouter, TxCommitStatus,
     };
 
+    use crate::monitor::Monitor;
     use crate::reader::Reader;
 
     const DB: &str = "db";
@@ -713,18 +426,31 @@ mod tests {
     // `Background` must be kept alive for the monitor's lifetime.
     async fn resolver_over(
         backend: Arc<dyn Backend>,
-    ) -> (Resolver, Monitor, Timeline, Arc<Background>) {
+    ) -> (KeyResolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DB);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let mon = Monitor::with_config(
+            tl,
+            timeline.clone(),
+            Arc::downgrade(&bg),
+            glassdb_concurr::Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         let shards = ShardStore::new(objects);
         shards
             .create_root(COLL, &Node::leaf(Shard::new()))
             .await
             .unwrap();
-        (Resolver::new(shards, mon.clone()), mon, timeline, bg)
+        let state = KeyStateResolver::new(mon.clone());
+        (
+            KeyResolver::new(TreeRouter::new(shards), state),
+            mon,
+            timeline,
+            bg,
+        )
     }
 
     struct TestStore {
@@ -750,7 +476,7 @@ mod tests {
         TestStore { shards, timeline }
     }
 
-    async fn effective_writer(resolver: &Resolver, key: &KeyRef) -> Option<TxId> {
+    async fn effective_writer(resolver: &KeyResolver, key: &KeyRef) -> Option<TxId> {
         resolver
             .resolve_key(key, Requirement::Any)
             .await
@@ -920,56 +646,6 @@ mod tests {
                     && (r.path.contains("/_n/") || r.path.ends_with("/_r"))
             })
             .count()
-    }
-
-    // Writer and liveness must describe the same holder state. Resolving them
-    // in separate passes could instead pair the pending predecessor with the
-    // committed holder's removable lock.
-    #[tokio::test]
-    async fn holder_resolution_is_coherent_across_commit() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (resolver, monitor, _timeline, _background) = resolver_over(backend).await;
-        let key = key_ref(b"key");
-        let predecessor = TxId::with_priority(1, b"predecessor");
-        let holder = TxId::with_priority(2, b"holder");
-
-        monitor.begin_tx(&holder);
-        let mut committed = TxLog::new(holder.clone(), TxCommitStatus::Pending);
-        committed.writes = vec![TxWrite {
-            key: key.clone(),
-            value: Arc::from(b"v".as_slice()),
-            deleted: false,
-            prev_writer: predecessor.clone(),
-        }];
-        let entry = ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![holder.clone()],
-            current: CurrentState::External {
-                writer: predecessor.clone(),
-            },
-            ..ShardEntry::new(key.key())
-        };
-
-        let pending = resolver
-            .resolve_holders_at(&key, Some(&entry), None, Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(pending.writer, Some(predecessor));
-        assert_eq!(pending.pending, vec![holder.clone()]);
-
-        monitor.commit_tx(committed).await.unwrap();
-        assert_eq!(
-            monitor.tx_status(&holder).await.unwrap(),
-            TxCommitStatus::Ok,
-            "the holder committed before the second resolution"
-        );
-
-        let committed = resolver
-            .resolve_holders_at(&key, Some(&entry), None, Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(committed.writer, Some(holder));
-        assert!(committed.pending.is_empty());
     }
 
     #[tokio::test]

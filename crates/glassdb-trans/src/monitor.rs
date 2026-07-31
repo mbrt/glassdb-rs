@@ -228,18 +228,6 @@ pub(crate) struct KeyCommitStatus {
 }
 
 impl Monitor {
-    /// Creates a monitor using the real wall-clock and default retry timing.
-    pub fn new(tl: TLogger, timeline: Timeline, background: Weak<Background>) -> Self {
-        Self::with_config(
-            tl,
-            timeline,
-            background,
-            Clock::real(),
-            RetryConfig::default(),
-            ProtocolTiming::default(),
-        )
-    }
-
     /// Creates a monitor with a custom clock (used in tests for deterministic
     /// expiry/refresh timing), retry-backoff configuration, and transaction
     /// liveness timing. The retry config tunes the backoff used when polling a

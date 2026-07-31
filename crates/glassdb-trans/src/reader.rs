@@ -3,7 +3,7 @@
 //! A key's value no longer lives in a per-key object; it lives in the
 //! transaction object of whichever transaction last committed it. Reading a key
 //! therefore resolves its shard entry to an *effective writer* — delegated to
-//! the [`Resolver`], the shared home for that coordination step — and then
+//! the [`KeyResolver`], the shared home for that coordination step — and then
 //! materializes the value from that writer's decoded transaction object through
 //! the [`Monitor`].
 
@@ -17,7 +17,8 @@ use glassdb_storage::{
 };
 
 use crate::error::trans_to_storage;
-use crate::resolver::{ResolvedValue, Resolver};
+use crate::key_resolver::KeyResolver;
+use crate::key_state_resolver::ResolvedValue;
 
 /// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
 /// outcome before the error is surfaced. Reads are idempotent (ADR-009), so
@@ -52,11 +53,11 @@ pub struct ReadOutcome {
 }
 
 /// Reads values by resolving a key's shard entry to its effective committed
-/// writer (via the [`Resolver`]) and materializing the value from that writer's
+/// writer (via the [`KeyResolver`]) and materializing the value from that writer's
 /// transaction object.
 #[derive(Clone)]
 pub struct Reader {
-    resolver: Resolver,
+    resolver: KeyResolver,
     timeline: Timeline,
     retry: RetryConfig,
 }
@@ -64,7 +65,7 @@ pub struct Reader {
 impl Reader {
     /// Creates a reader that resolves and materializes values through
     /// `resolver` using `retry` for transient read failures.
-    pub fn new(resolver: Resolver, timeline: Timeline, retry: RetryConfig) -> Self {
+    pub fn new(resolver: KeyResolver, timeline: Timeline, retry: RetryConfig) -> Self {
         Reader {
             resolver,
             timeline,
@@ -110,7 +111,7 @@ impl Reader {
             .await
     }
 
-    /// Resolves `key` to its effective writer (via the [`Resolver`]), then
+    /// Resolves `key` to its effective writer (via the [`KeyResolver`]), then
     /// materializes the value from that writer's transaction object.
     async fn resolve_value(
         &self,

@@ -1,5 +1,5 @@
-//! The shard-mutation coordinator (ADR-028): the single per-object mechanism
-//! through which every shard/leaf entry mutation flows.
+//! The shard-mutation coordinator (ADR-028): the transaction-aware shared
+//! fold engine through which every shard/leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
 //! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_r`,
@@ -11,18 +11,17 @@
 //! each transaction's own outcome ([`FoldOutcome`]) travels back through a
 //! per-submission slot the caller reads once its submission resolves.
 //!
-//! The coordinator is the *mechanism* and knows nothing of locks, transaction
-//! ids, wound-wait, or commit. It loads the leaf object once, **folds** the
-//! round's installed [`ShardResolver`]s over a running staged entry map (each
-//! resolver observing the entries staged by the resolvers before it), drops any
-//! entry left vestigial (no holder, no `current_writer`), CASes once, recovers
-//! precondition/in-doubt by reload-and-re-fold, and deposits each member's
-//! outcome (ADR-029). All lock/transaction *policy* lives in the resolvers the
-//! callers install: [`Locker`](crate::Locker) installs the Acquire / WriteBack /
-//! Release resolvers, and [`Algo`](crate::Algo) installs the single read-write
-//! CommitInstall. Those resolvers stage entry and node-level coordination in the
-//! same object CAS (ADR-032). The per-transaction held-lock bookkeeping lives
-//! with its owner, the [`Locker`](crate::Locker), not in the engine.
+//! The coordinator owns the cross-operation protocol required to combine
+//! heterogeneous mutations safely: transaction identity, oldest-first fold
+//! order, per-member in-doubt attribution, routing and capacity admission, and
+//! same-key exclusion for logless publication. It loads the leaf object once,
+//! **folds** the round's installed [`ShardResolver`]s over a running staged entry
+//! map, drops vestigial entries, CASes once, recovers by reload-and-re-fold, and
+//! deposits each member's outcome (ADR-029). The resolvers own each
+//! operation's mutation decision: [`Locker`](crate::tlocker::Locker) installs Acquire /
+//! WriteBack / Release, and [`Algo`](crate::algo::Algo) installs direct commit. The
+//! per-transaction held-lock bookkeeping and cross-shard strategy stay with the
+//! [`Locker`](crate::tlocker::Locker), not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,15 +40,15 @@ use glassdb_storage::{
 };
 
 use crate::error::TransError;
+use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
-use crate::resolver::Resolver;
 
 /// Maximum inner CAS retries on a single shard/root before treating the
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
 
 /// Counters for CAS activity across every submitter (the
-/// [`Locker`](crate::Locker) and [`Algo`](crate::Algo)).
+/// [`Locker`](crate::tlocker::Locker) and [`Algo`](crate::algo::Algo)).
 #[derive(Default)]
 struct Stats {
     n_retries: AtomicU64,
@@ -85,8 +84,9 @@ impl Sub for ShardCoordinatorStats {
 
 /// One transaction's outcome for a single deduplicated CAS round, deposited by
 /// the engine into that transaction's [`OutcomeSlot`] and read by its caller once
-/// the [`Dedup`] submission resolves. Heterogeneous across resolver kinds: the
-/// engine treats it as an opaque payload it stages and delivers.
+/// the [`Dedup`] submission resolves. The worker transports values without
+/// inspecting their variants, while this closed enum deliberately defines the
+/// result vocabulary shared by the installed resolver kinds (ADR-028).
 #[derive(Clone, Debug)]
 pub(crate) enum FoldOutcome {
     /// A lock was installed (Acquire), carrying the strongest entry intention
@@ -186,21 +186,20 @@ pub(crate) enum Step {
     Skip { outcome: FoldOutcome },
 }
 
-/// The shared handles a resolver may consult mid-fold: the effective-writer
-/// [`Resolver`] (help-forwarding), the [`Monitor`] (wound-wait status), and why
-/// this fold is running ([`ReloadCause`], for commit-install in-doubt).
+/// The shared handles a resolver may consult mid-fold: loaded key-state
+/// resolution, the transaction monitor, and why this fold is running.
 pub(crate) struct ResolveCtx<'a> {
-    pub(crate) resolver: &'a Resolver,
+    pub(crate) key_state: &'a KeyStateResolver,
     pub(crate) tmon: &'a Monitor,
     pub(crate) requirement: Requirement,
     pub(crate) cause: ReloadCause,
 }
 
-/// One operation's policy decision over a shard, folded by the coordinator. The
-/// engine treats it as opaque: it calls [`resolve`](ShardResolver::resolve),
-/// threads any staged entries, and deposits the returned outcome. All
-/// lock/transaction semantics live in the resolvers the callers install
-/// ([`Locker`](crate::Locker) and [`Algo`](crate::Algo)), not in the engine.
+/// One operation's mutation decision over a shard, folded by the coordinator.
+/// The engine calls [`resolve`](ShardResolver::resolve), threads any staged
+/// entries, and deposits the returned outcome. Resolver implementations own the
+/// acquire, write-back, release, and direct-commit decisions; the coordinator
+/// owns the ordering, admission, and recovery contract they share (ADR-028).
 #[async_trait]
 pub(crate) trait ShardResolver: Send + Sync {
     /// Resolves this member against entries and node locks as currently staged
@@ -333,9 +332,8 @@ impl MergeRequest for CasReq {
 
 /// Sink for stored-leaf capacity observations, so a background growth policy
 /// can decide whether to split (ADR-031). The coordinator depends only on this
-/// seam — never on the splitter's queue or policy. The
-/// [`Splitter`](crate::Splitter) supplies the implementation; a coordinator
-/// with none attached uses [`NoSplitHints`].
+/// seam — never on the splitter's queue or policy. The splitter supplies the
+/// implementation.
 pub trait SplitHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `shard`. Best-effort: a
     /// spurious call only costs the splitter a reload and re-check, so the
@@ -343,25 +341,16 @@ pub trait SplitHinter: Send + Sync {
     fn observe_leaf(&self, path: &str, shard: &Shard);
 }
 
-/// The default [`SplitHinter`] that drops every hint: for a coordinator with no
-/// background splitter attached (tests, tools). Leaf growth is never observed,
-/// so the tree only ever grows through an explicitly wired splitter.
-pub(crate) struct NoSplitHints;
-
-impl SplitHinter for NoSplitHints {
-    fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
-}
-
 /// State shared by the [`ShardCoordinator`] and its dedup [`CasWorker`]: the
 /// storage handles, retry config, and stats.
 struct CoordCore {
     tmon: Monitor,
     shards: ShardStore,
-    resolver: Resolver,
+    key_state: KeyStateResolver,
     retry: RetryConfig,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
-    // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
+    // [`Splitter`](crate::split::Splitter)'s queue when one is wired.
     hinter: Arc<dyn SplitHinter>,
     policy: SplitPolicy,
 }
@@ -483,7 +472,7 @@ impl CasWorker {
             let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
             for (tx, m) in ordered {
                 let ctx = ResolveCtx {
-                    resolver: &self.core.resolver,
+                    key_state: &self.core.key_state,
                     tmon: &self.core.tmon,
                     // Resolver dependencies belong to the logical round, not the
                     // cache seed used after a failed CAS. Preserve the submitters'
@@ -626,7 +615,7 @@ impl CasWorker {
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
             // happens-before the dedup delivers to the caller. Recording the held
-            // lock is the caller's job (the [`Locker`](crate::Locker)), done when
+            // lock is the caller's job (the [`Locker`](crate::tlocker::Locker)), done when
             // it observes its own `Locked` outcome.
             for (tx, outcome, member_staged) in results {
                 if let Some(m) = members.get(&tx) {
@@ -662,39 +651,24 @@ impl Worker<CasReq, TransError> for CasWorker {
     }
 }
 
-/// The single per-object mechanism through which every shard/root entry mutation
-/// flows (ADR-028): a [`Dedup`] over the CAS coordination objects that loads each
-/// object once, folds every contending transaction's resolver, does one CAS, and
-/// deposits each transaction's outcome. It is a pure mechanism: the
-/// per-transaction held-lock bookkeeping lives with its owner, the
-/// [`Locker`](crate::Locker).
+/// The transaction-aware shared fold engine through which every shard/root entry
+/// mutation flows (ADR-028): a [`Dedup`] over the CAS coordination objects
+/// that orders contending transactions, loads each object once, folds their
+/// resolvers, does one CAS, and deposits each transaction's outcome. Transaction
+/// lifecycle and per-transaction held-lock bookkeeping remain with their
+/// higher-level owners.
 #[derive(Clone)]
 pub struct ShardCoordinator {
     inner: Arc<CoordState>,
 }
 
 impl ShardCoordinator {
-    /// Creates a coordinator over the shared shard store, resolver, and monitor.
-    /// `retry` configures the exponential backoff applied between CAS
-    /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
-    /// between hold-and-wait re-polls of a conflicting holder.
-    pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
-        Self::with_hinter(
-            shards,
-            resolver,
-            tmon,
-            retry,
-            SplitPolicy::default(),
-            Arc::new(NoSplitHints),
-        )
-    }
-
     /// Creates a coordinator that reports capacity observations to `hinter` —
-    /// normally the background [`Splitter`](crate::Splitter)'s queue.
+    /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         shards: ShardStore,
-        resolver: Resolver,
+        key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
         policy: SplitPolicy,
@@ -703,7 +677,7 @@ impl ShardCoordinator {
         let core = Arc::new(CoordCore {
             tmon,
             shards,
-            resolver,
+            key_state,
             retry,
             stats: Stats::default(),
             policy,
@@ -737,8 +711,8 @@ impl ShardCoordinator {
     }
 
     /// Submits one shard member (any resolver installed by a caller — the
-    /// [`Locker`](crate::Locker)'s acquire / write-back / release or the
-    /// [`Algo`](crate::Algo)'s direct commit) through the [`Dedup`] and awaits
+    /// [`Locker`](crate::tlocker::Locker)'s acquire / write-back / release or the
+    /// [`Algo`](crate::algo::Algo)'s direct commit) through the [`Dedup`] and awaits
     /// its single-round [`CoordinatedOutcome`]. The worker merges it into any
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus any successful-CAS
@@ -755,7 +729,7 @@ impl ShardCoordinator {
     ///
     /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
-    /// ([`Directory`](glassdb_storage::Directory)).
+    /// ([`TreeRouter`](glassdb_storage::TreeRouter)).
     pub(crate) async fn submit_shard(
         &self,
         path: &str,
@@ -824,6 +798,12 @@ mod tests {
 
     const COLL: &str = "coordp";
 
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+    }
+
     // Every coordination round in these tests targets one leaf object. A
     // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
     // entries (no collection metadata), exactly what the shard fold operates on.
@@ -888,11 +868,18 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let mon = Monitor::with_config(
+            tl,
+            timeline.clone(),
+            Arc::downgrade(&bg),
+            glassdb_concurr::Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         let shards = ShardStore::new(objects);
-        let resolver = Resolver::new(shards.clone(), mon.clone());
+        let key_state = KeyStateResolver::new(mon.clone());
         let coord =
-            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
+            ShardCoordinator::with_hinter(shards.clone(), key_state, mon, retry, policy, hinter);
         (coord, shards, timeline, bg)
     }
 

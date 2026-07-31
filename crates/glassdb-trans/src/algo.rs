@@ -33,23 +33,24 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
-    CurrentState, InlinePolicy, LeafObservation, LeafObservationCheck, LockType, NodeLocks,
-    Requirement, SequencePoint, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline,
-    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
+    CurrentState, InlinePolicy, LeafObservationCheck, LockType, NodeLocks, Requirement,
+    SequencePoint, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCollectionChange,
+    TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 
-use crate::collections::{CollectionCatalog, CollectionData, CollectionLifecycle, CollectionOp};
+use crate::access::{Data, ReadAccess, WriteOp};
+use crate::collection_catalog::CollectionCatalog;
+use crate::collections::{CollectionData, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::gc::Gc;
+use crate::key_resolver::KeyResolver;
+use crate::key_state_resolver::HolderResolution;
 use crate::monitor::{Monitor, TxRecoveryManifest};
-use crate::node_locking::resolve_entry_locks;
-use crate::resolver::HolderResolution;
-use crate::resolver::Resolver;
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
 };
-use crate::split::{SplitHintSink, Splitter};
+use crate::split::SplitHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -109,145 +110,6 @@ enum Status {
     New,
     Validating,
     Committed,
-}
-
-/// A single key read within a transaction.
-#[derive(Debug, Clone)]
-pub struct ReadAccess {
-    pub key: KeyRef,
-    /// Effective writer observed by the read, including a tombstone writer.
-    pub last_writer: Option<TxId>,
-    /// Exact leaf state from which the writer was resolved.
-    pub leaf: LeafObservation,
-}
-
-/// A single key write within a transaction.
-#[derive(Debug, Clone)]
-pub struct WriteAccess {
-    pub key: KeyRef,
-    pub(crate) op: WriteOp,
-}
-
-/// The write operation staged for a key.
-#[derive(Debug, Clone)]
-pub(crate) enum WriteOp {
-    Put(Arc<[u8]>),
-    Delete,
-}
-
-impl WriteAccess {
-    pub fn put(key: KeyRef, value: Arc<[u8]>) -> Self {
-        Self {
-            key,
-            op: WriteOp::Put(value),
-        }
-    }
-
-    pub fn delete(key: KeyRef) -> Self {
-        Self {
-            key,
-            op: WriteOp::Delete,
-        }
-    }
-}
-
-/// A range/sorted listing performed within a transaction (ADR-031 phantom
-/// prevention). It records the logical page plus the membership version and
-/// pending membership-write holders of every covered leaf. Commit validates
-/// those dependencies and falls back to the logical page after physical churn.
-#[derive(Debug, Clone)]
-pub struct ScanAccess {
-    /// Collection the scan ranged over.
-    pub collection: CollectionAddress,
-    /// Normalized logical range and page limit.
-    pub range: ScanRange,
-    /// Staged membership mutations visible when the scan ran.
-    pub overlay: Vec<ScanMutation>,
-    /// Keys surfaced to the transaction body.
-    pub keys: Vec<Vec<u8>>,
-    /// Inclusive validation/locking frontier; `None` means positive infinity.
-    pub frontier: Option<Vec<u8>>,
-    /// The leaves the scan covered, in key order, with membership dependencies.
-    pub covered: Vec<LeafCoverage>,
-}
-
-/// A normalized half-open key range used by the transaction engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanRange {
-    /// Inclusive lower bound before applying `start_exclusive`.
-    pub start: Vec<u8>,
-    /// Whether the lower-bound key itself is excluded.
-    pub start_exclusive: bool,
-    /// Exclusive upper bound; `None` means positive infinity.
-    pub end: Option<Vec<u8>>,
-    /// Maximum number of keys to surface; `None` is unbounded.
-    pub limit: Option<usize>,
-}
-
-impl ScanRange {
-    /// Returns the unbounded range over every raw key.
-    pub fn all() -> Self {
-        Self {
-            start: Vec::new(),
-            start_exclusive: false,
-            end: None,
-            limit: None,
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.limit == Some(0)
-            || self
-                .end
-                .as_deref()
-                .is_some_and(|end| self.start.as_slice() >= end)
-    }
-
-    /// Reports whether `key` lies in this normalized range.
-    pub fn contains(&self, key: &[u8]) -> bool {
-        let above_start = if self.start_exclusive {
-            key > self.start.as_slice()
-        } else {
-            key >= self.start.as_slice()
-        };
-        above_start && self.end.as_deref().is_none_or(|end| key < end)
-    }
-}
-
-/// One staged membership mutation captured at scan time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanMutation {
-    /// Raw collection key.
-    pub key: Vec<u8>,
-    /// Whether the staged state makes the key present.
-    pub present: bool,
-}
-
-/// One leaf a scan covered and its membership-only validation dependencies.
-#[derive(Debug, Clone)]
-pub struct LeafCoverage {
-    pub path: Arc<str>,
-    pub membership_version: u64,
-    pub pending_membership: Vec<TxId>,
-    pub(crate) observation: LeafObservation,
-}
-
-impl PartialEq for LeafCoverage {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-            && self.membership_version == other.membership_version
-            && self.pending_membership == other.pending_membership
-    }
-}
-
-impl Eq for LeafCoverage {}
-
-/// The reads, writes, and range scans that make up a transaction.
-#[derive(Debug, Clone, Default)]
-pub struct Data {
-    pub reads: Vec<ReadAccess>,
-    pub writes: Vec<WriteAccess>,
-    pub scans: Vec<ScanAccess>,
 }
 
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
@@ -386,7 +248,10 @@ impl ShardResolver for DirectCommitResolver {
             });
         }
 
-        let res = resolve_entry_locks(ctx, &self.key, cur, None).await?;
+        let res = ctx
+            .key_state
+            .resolve_holders(&self.key, cur, None, ctx.requirement)
+            .await?;
         if let Err(why) = eligible_writer(&res, self.read_version.as_ref()) {
             return Ok(Step::Skip {
                 outcome: self.unlanded(ctx, why),
@@ -629,7 +494,7 @@ fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, Tran
 #[derive(Clone)]
 pub struct Algo {
     shards: ShardStore,
-    resolver: Resolver,
+    resolver: KeyResolver,
     locker: Locker,
     // The single shard-mutation coordinator (ADR-028), shared with the locker:
     // the logless direct commit publishes its value through this — one
@@ -643,7 +508,7 @@ pub struct Algo {
     inline_policy: InlinePolicy,
     collection_catalog: CollectionCatalog,
     collection_lifecycle: CollectionLifecycle,
-    splitter: Splitter,
+    split_hints: SplitHintSink,
     direct_commit_stats: Arc<DirectCommitCounters>,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
@@ -651,9 +516,10 @@ pub struct Algo {
 }
 
 impl Algo {
-    /// Creates an algorithm coordinator. Validation barriers use `timeline`;
-    /// `clock` is the wall-clock source for transaction-id timestamps and must
-    /// match the monitor's clock so priorities and lease timing share one base.
+    /// Creates a transaction algorithm coordinator.
+    ///
+    /// Validation barriers use `timeline`; `clock` must match the monitor's
+    /// clock so transaction priorities and lease timing share one time base.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shards: ShardStore,
@@ -662,15 +528,15 @@ impl Algo {
         coord: ShardCoordinator,
         mon: Monitor,
         collection_catalog: CollectionCatalog,
+        collection_lifecycle: CollectionLifecycle,
         clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
-        resolver: Resolver,
+        resolver: KeyResolver,
         split_policy: SplitPolicy,
         inline_policy: InlinePolicy,
-        splitter: Splitter,
+        split_hints: SplitHintSink,
     ) -> Self {
-        let collection_lifecycle = locker.collection_lifecycle(shards.clone());
         Algo {
             shards,
             resolver,
@@ -684,7 +550,7 @@ impl Algo {
             inline_policy,
             collection_catalog,
             collection_lifecycle,
-            splitter,
+            split_hints,
             direct_commit_stats: Arc::new(DirectCommitCounters::default()),
             background,
         }
@@ -1025,7 +891,7 @@ impl Algo {
             .await?;
         let directory_locks = self
             .locker
-            .directories()
+            .collections()
             .lock(
                 &tx.id,
                 &tx.collection_data.reads,
@@ -1076,7 +942,7 @@ impl Algo {
                 )
                 .await?
         {
-            self.locker.directories().release(&tx.id, &locks).await?;
+            self.locker.collections().release(&tx.id, &locks).await?;
             return self.revalidate(tx).await;
         }
 
@@ -1084,7 +950,7 @@ impl Algo {
         // attempt is cleared if this same transaction reruns a different body.
         tx.fenced_drops.extend(active_drops);
         self.collection_lifecycle
-            .fence_drops(&tx.id, &tx.collection_data.changes, &self.splitter)
+            .fence_drops(&tx.id, &tx.collection_data.changes)
             .await?;
 
         // Commit point: create-or-flip the transaction object to committed.
@@ -1109,7 +975,7 @@ impl Algo {
 
         if let Err(error) = self
             .locker
-            .directories()
+            .collections()
             .write_back(&tx.id, &tx.collection_data.changes, &locks)
             .await
         {
@@ -1154,7 +1020,7 @@ impl Algo {
         let validation_start = self.timeline.now();
         let directory_locks = self
             .locker
-            .directories()
+            .collections()
             .lock(&tx.id, &tx.collection_data.reads, &[])
             .await?;
         let locked = match self.acquire_locks(tx, validation_start).await? {
@@ -1187,7 +1053,7 @@ impl Algo {
         {
             return Ok(());
         }
-        self.locker.directories().release(&tx.id, &locks).await?;
+        self.locker.collections().release(&tx.id, &locks).await?;
         self.revalidate(tx).await
     }
 
@@ -1293,7 +1159,7 @@ impl Algo {
             value,
             read_version,
             inline,
-            split_hints: self.splitter.hint_sink(),
+            split_hints: self.split_hints.clone(),
         });
         let outcome = self
             .coord
@@ -1357,12 +1223,12 @@ impl Algo {
                 let gc = self.gc.clone();
                 let id = id.clone();
                 bg.spawn_waited(async move {
-                    let superseded = locker.data().write_back(&id, &locked).await;
+                    let superseded = locker.keys().write_back(&id, &locked).await;
                     feed_gc_hints(&gc, superseded);
                 });
             }
             None => {
-                let superseded = self.locker.data().write_back(id, &locked).await;
+                let superseded = self.locker.keys().write_back(id, &locked).await;
                 feed_gc_hints(&self.gc, superseded);
             }
         }
@@ -1417,13 +1283,13 @@ impl Algo {
             let scan_requirement = Requirement::AtLeast(validation_start);
             let outcome = if serial {
                 self.locker
-                    .data()
+                    .keys()
                     .lock_at(&tx.id, &tx.data, true, scan_requirement)
                     .await
             } else {
-                let data_locker = self.locker.data();
+                let key_locker = self.locker.keys();
                 tokio::select! {
-                    res = data_locker.lock_at(&tx.id, &tx.data, false, scan_requirement) => res,
+                    res = key_locker.lock_at(&tx.id, &tx.data, false, scan_requirement) => res,
                     _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
                 }
             };
@@ -1461,7 +1327,7 @@ impl Algo {
     /// transaction object stays pending; only the shard/root lock entries clear.
     async fn release_for_retry(&self, tx: &Handle) -> Result<(), TransError> {
         self.locker
-            .data()
+            .keys()
             .release_locks(&tx.id)
             .await
             .map_err(|e| e.context(format!("releasing locks before re-lock for tx {}", tx.id)))
@@ -1726,6 +1592,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::access::{ScanAccess, ScanRange, WriteAccess};
+    use crate::collection_coordination::CollectionStateResolver;
+    use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::ProtocolTiming;
     use crate::reader::Reader;
     use glassdb_backend::middleware::{
@@ -1735,8 +1604,8 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, LeafRef, paths};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, CurrentState, Directory, Node, Shard,
-        ShardEntry, ShardStore, TLogger, TxCommitStatus,
+        CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
+        ShardStore, TLogger, TreeRouter, TxCommitStatus,
     };
 
     const TEST_DB: &str = "testp";
@@ -1790,14 +1659,22 @@ mod tests {
         );
         let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects.clone());
-        let resolver = Resolver::new(shards.clone(), tmon.clone());
-        let dir = Directory::new(shards.clone());
+        let collection_state = CollectionStateResolver::new(
+            records.clone(),
+            tlogger.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+        );
+        let key_state = KeyStateResolver::new(tmon.clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
+        let router = TreeRouter::new(shards.clone());
         let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             records.clone(),
             shards.clone(),
             timeline.clone(),
             tmon.clone(),
+            key_state,
             Clock::real(),
             RetryConfig::default(),
             TEST_COLL,
@@ -1806,11 +1683,17 @@ mod tests {
         );
         let locker = Locker::new(
             coord.clone(),
-            dir,
-            records.clone(),
-            tlogger.clone(),
+            router,
+            collection_state.clone(),
             tmon.clone(),
             RetryConfig::default(),
+        );
+        let collection_lifecycle = CollectionLifecycle::new(
+            records.clone(),
+            shards.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+            Arc::new(splitter.clone()),
         );
         let gc = Gc::new(
             bg_weak.clone(),
@@ -1818,6 +1701,7 @@ mod tests {
             shards.clone(),
             timeline.clone(),
             locker.clone(),
+            collection_lifecycle.clone(),
             tmon.clone(),
             Clock::real(),
         );
@@ -1838,14 +1722,15 @@ mod tests {
             locker.clone(),
             coord.clone(),
             tmon.clone(),
-            CollectionCatalog::new(locker.clone()),
+            CollectionCatalog::new(collection_state),
+            collection_lifecycle,
             Clock::real(),
             gc,
             None,
             resolver,
             glassdb_storage::SplitPolicy::default(),
             glassdb_storage::InlinePolicy::default(),
-            splitter,
+            splitter.hint_sink(),
         );
         (
             algo,
@@ -1880,7 +1765,10 @@ mod tests {
 
     async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
-            Resolver::new(tctx.shards.clone(), tctx.tmon.clone()),
+            KeyResolver::new(
+                TreeRouter::new(tctx.shards.clone()),
+                KeyStateResolver::new(tctx.tmon.clone()),
+            ),
             tctx.timeline.clone(),
             RetryConfig::default(),
         );
@@ -1902,9 +1790,9 @@ mod tests {
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         locks: &NodeLocks,
     ) -> Step {
-        let writers = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
+        let key_state = KeyStateResolver::new(tctx.tmon.clone());
         let ctx = ResolveCtx {
-            resolver: &writers,
+            key_state: &key_state,
             tmon: &tctx.tmon,
             requirement: Requirement::Any,
             cause,
@@ -2325,7 +2213,7 @@ mod tests {
         tctx.tmon.begin_tx(&holder);
         let held = tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &holder,
                 &Data {
@@ -2587,7 +2475,7 @@ mod tests {
         let tb = txb.clone();
         let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
         let acquire = tokio::spawn(async move {
-            cb.data()
+            cb.keys()
                 .lock_at(&tb, &data_b, false, lock_requirement)
                 .await
         });
@@ -2693,7 +2581,7 @@ mod tests {
         let tb = txb.clone();
         let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
         let acquire = tokio::spawn(async move {
-            cb.data()
+            cb.keys()
                 .lock_at(&tb, &data_b, false, lock_requirement)
                 .await
         });
@@ -3270,7 +3158,7 @@ mod tests {
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
             inline: InlinePolicy::default(),
-            split_hints: tm.splitter.hint_sink(),
+            split_hints: tm.split_hints.clone(),
         };
         let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
@@ -3315,7 +3203,7 @@ mod tests {
         let seed = entry(&tctx, b"k").await.unwrap();
         let current = seed.current.writer().cloned().unwrap();
         let locks = NodeLocks::default();
-        let split_hints = tm.splitter.hint_sink();
+        let split_hints = tm.split_hints.clone();
 
         let direct = |read_version| DirectCommitResolver {
             id: TxId::with_priority(9, b"direct"),
@@ -3605,7 +3493,7 @@ mod tests {
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         let acquire = tokio::spawn(async move {
             locker
-                .data()
+                .keys()
                 .lock_at(&driver, &data_b, false, requirement)
                 .await
         });
@@ -3868,7 +3756,7 @@ mod tests {
         };
         let locked = match tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &holder,
                 &holder_data,
@@ -3936,7 +3824,7 @@ mod tests {
         };
         match tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &holder,
                 &holder_data,
@@ -4014,7 +3902,7 @@ mod tests {
         };
         let other_locked = match tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &other,
                 &other_data,
@@ -4040,7 +3928,7 @@ mod tests {
         };
         let current_locked = match tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &current,
                 &current_data,
@@ -4060,8 +3948,8 @@ mod tests {
                 .unwrap()
         );
 
-        tctx.locker.data().release_locks(&current).await.unwrap();
-        tctx.locker.data().release_locks(&other).await.unwrap();
+        tctx.locker.keys().release_locks(&current).await.unwrap();
+        tctx.locker.keys().release_locks(&other).await.unwrap();
     }
 
     #[tokio::test]
@@ -4122,7 +4010,7 @@ mod tests {
         };
         let other_locked = match tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &other,
                 &other_data,
@@ -4160,7 +4048,7 @@ mod tests {
             "post-bound current evidence satisfies both validation steps locally"
         );
 
-        tctx.locker.data().release_locks(&other).await.unwrap();
+        tctx.locker.keys().release_locks(&other).await.unwrap();
         drop(other_locked);
     }
 
@@ -4324,7 +4212,10 @@ mod tests {
     // test collection, returning the scan's live keys alongside so a test can
     // assert on the snapshot and later re-validate the same coverage.
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
-        let resolver = Resolver::new(tctx.shards.clone(), tctx.tmon.clone());
+        let resolver = KeyResolver::new(
+            TreeRouter::new(tctx.shards.clone()),
+            KeyStateResolver::new(tctx.tmon.clone()),
+        );
         let scan = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)
             .await
@@ -4415,7 +4306,7 @@ mod tests {
         };
         let locked = match tctx
             .locker
-            .data()
+            .keys()
             .lock_at(
                 &holder,
                 &holder_data,

@@ -1,12 +1,10 @@
 //! Transactional collection catalog accesses and physical lifecycle changes.
 
-mod catalog;
 mod lifecycle;
 
 use glassdb_data::{CollectionAddress, CollectionId};
 
-pub use catalog::CollectionCatalog;
-pub(crate) use lifecycle::CollectionLifecycle;
+pub use lifecycle::{CollectionLifecycle, TopologySettler};
 
 /// One directory dependency observed by a transaction body.
 #[derive(Debug, Clone)]
