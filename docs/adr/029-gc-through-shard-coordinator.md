@@ -4,6 +4,11 @@
 
 Accepted (implemented).
 
+The coordinator's current responsibility boundary is described in
+[`architecture.md`](../architecture.md#component-responsibilities). Its
+transaction-aware fold contract does not change this ADR's GC policy or its
+single-coordinator reclamation decision.
+
 Closes the one exception carved out by
 [ADR-028](028-shard-mutation-coordinator.md) (the shard-mutation coordinator
 invariant) and refines the stale-lock / empty-entry pruning **mechanism** of

@@ -4,6 +4,12 @@
 
 Accepted (implemented).
 
+The current responsibility boundary is described in
+[`architecture.md`](../architecture.md#component-responsibilities): the
+implemented coordinator is a transaction-aware shared fold engine, not a
+policy-ignorant mechanism. The single-coordinator invariant and resolver
+correctness contracts are unchanged.
+
 The one documented exception to the invariant below — GC's out-of-band
 mark-sweep CAS — is closed by
 [ADR-029](029-gc-through-shard-coordinator.md), which routes GC's lock

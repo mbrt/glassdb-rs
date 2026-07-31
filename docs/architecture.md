@@ -97,8 +97,8 @@ in-memory backend and middleware. The deterministic-simulation runtime (the
 
 ## Component Responsibilities
 
-Inside the transaction engine (`glassdb-trans`) the division of labour follows a
-deliberate **policy vs. mechanism** split, with one structural invariant:
+Inside the transaction engine (`glassdb-trans`) the division of labour separates
+transaction orchestration from shared shard mutation, with one structural invariant:
 **shard routing and shard CAS never leak above the locker**. `Algo` decides
 *what* must happen to commit a transaction — purely in terms of logical keys
 (paths), the version tokens observed at read time, and staged writes — while the
@@ -112,9 +112,10 @@ and CASes no object.)
 Every shard/root entry mutation — lock acquire, single read-write commit-install,
 write-back, release, and GC reclamation — flows through **one shard-mutation
 coordinator** that loads the object once, folds the round's operations in
-wound-wait order, and CASes once (ADR-028/029). `Algo` and the `Locker` supply
-the policy as *resolvers*; the coordinator is the shared mechanism and knows
-nothing of locks or transaction ids. For the full design see
+wound-wait order, and CASes once (ADR-028/029). The coordinator is a
+transaction-aware shared mutation engine: it owns identity, ordering, admission,
+and recovery across the heterogeneous round, while `Algo` and the `Locker`
+supply each operation's mutation decision as an installed resolver. For the full design see
 [designs/object-storage-native.md](designs/object-storage-native.md).
 
 ```
@@ -147,10 +148,10 @@ nothing of locks or transaction ids. For the full design see
       │                    │ + Algo CommitInstall + Gc release │
       │                    ▼                                   │
       │       ┌───────────────────────────────┐                │
-      │       │ ShardCoordinator — MECHANISM  │                │
-      │       │ one round/object: load once · │                │
-      │       │ fold (wound-wait order) · CAS │                │
-      │       │ once · reload-recover in-doubt│                │
+      │       │ ShardCoordinator — FOLD ENGINE│                │
+      │       │ identity · order · admission  │                │
+      │       │ load once · fold · CAS once · │                │
+      │       │ per-member in-doubt recovery  │                │
       │       └───────────────┬───────────────┘                │
       ▼                       ▼            ▼ (tx logs)          ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
@@ -194,15 +195,17 @@ and validates collection preconditions; it performs no lock CAS or recovery
 write-back itself. This keeps `CollectionRecord` coordination out of both the
 B-link `ShardStore` and the semantic catalog.
 
-Beneath the locker boundary, one further split separates **policy from
-mechanism**: every data-node entry mutation flows through a single
-`ShardCoordinator`, which owns the *mechanism* (one single-flight round per
-object: load once, fold the round's operations, CAS once, recover
-precondition/in-doubt by reload) while the callers supply *policy* as installed
-resolvers — `Locker` installs acquire / write-back / release, `Algo` installs the
-single read-write `CommitInstall`, and `Gc` reclaims through the `Locker`'s unlock
-methods (ADR-028/029). The coordinator is ignorant of locks, transaction ids, and
-wound-wait; the fold visits members oldest-first so it never has to backtrack.
+Beneath the locker boundary, every data-node entry mutation flows through a
+single transaction-aware `ShardCoordinator`. It owns the protocol shared by a
+heterogeneous round: single-flight batching, transaction identity,
+oldest-first wound-wait order, ownership and capacity admission, same-key
+logless exclusion, one CAS, per-member uncertainty attribution, and
+reload-and-re-fold recovery. Installed resolvers own the operation-specific
+mutation decisions — `Locker` supplies acquire / write-back / release, `Algo`
+supplies direct commit, and `Gc` reclaims through the `Locker`'s unlock methods
+(ADR-028/029). Cross-shard acquisition strategy, transaction lifecycle,
+commit orchestration, GC selection, and held-lock bookkeeping remain outside
+the coordinator.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
@@ -211,7 +214,7 @@ wound-wait; the fold visits members oldest-first so it never has to backtrack.
 | `Locker::data`        | data-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
 | `Locker::directories` | directory-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, status resolution, recovery write-back and release | key routing, B-link topology |
 | `CollectionCatalog`   | collection semantics | directory reads and binding changes | logical snapshots, read-your-writes validation, capacity/precondition checks | CAS, wound-wait, transaction logs |
-| `ShardCoordinator`    | data-node **mechanism** | object path, resolvers | one round per object: single-flight, load-once, monotonic fold, single CAS, reload-recover, vestigial-entry pruning | locks, `TxId`, wound-wait, commit |
+| `ShardCoordinator`    | shared mutation engine | object paths, `TxId`, resolvers | one round per object: single-flight, oldest-first fold, ownership/capacity admission, logless exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
 | `Reader`              | read mechanism   | paths                        | effective-writer resolution                                                                                            | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
 | `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |

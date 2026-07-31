@@ -1,5 +1,5 @@
-//! The shard-mutation coordinator (ADR-028): the single per-object mechanism
-//! through which every shard/leaf entry mutation flows.
+//! The shard-mutation coordinator (ADR-028): the transaction-aware shared
+//! fold engine through which every shard/leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
 //! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_r`,
@@ -11,18 +11,17 @@
 //! each transaction's own outcome ([`FoldOutcome`]) travels back through a
 //! per-submission slot the caller reads once its submission resolves.
 //!
-//! The coordinator is the *mechanism* and knows nothing of locks, transaction
-//! ids, wound-wait, or commit. It loads the leaf object once, **folds** the
-//! round's installed [`ShardResolver`]s over a running staged entry map (each
-//! resolver observing the entries staged by the resolvers before it), drops any
-//! entry left vestigial (no holder, no `current_writer`), CASes once, recovers
-//! precondition/in-doubt by reload-and-re-fold, and deposits each member's
-//! outcome (ADR-029). All lock/transaction *policy* lives in the resolvers the
-//! callers install: [`Locker`](crate::Locker) installs the Acquire / WriteBack /
-//! Release resolvers, and [`Algo`](crate::Algo) installs the single read-write
-//! CommitInstall. Those resolvers stage entry and node-level coordination in the
-//! same object CAS (ADR-032). The per-transaction held-lock bookkeeping lives
-//! with its owner, the [`Locker`](crate::Locker), not in the engine.
+//! The coordinator owns the cross-operation protocol required to combine
+//! heterogeneous mutations safely: transaction identity, oldest-first fold
+//! order, per-member in-doubt attribution, routing and capacity admission, and
+//! same-key exclusion for logless publication. It loads the leaf object once,
+//! **folds** the round's installed [`ShardResolver`]s over a running staged entry
+//! map, drops vestigial entries, CASes once, recovers by reload-and-re-fold, and
+//! deposits each member's outcome (ADR-029). The resolvers own each
+//! operation's mutation decision: [`Locker`](crate::Locker) installs Acquire /
+//! WriteBack / Release, and [`Algo`](crate::Algo) installs direct commit. The
+//! per-transaction held-lock bookkeeping and cross-shard strategy stay with the
+//! [`Locker`](crate::Locker), not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,8 +84,9 @@ impl Sub for ShardCoordinatorStats {
 
 /// One transaction's outcome for a single deduplicated CAS round, deposited by
 /// the engine into that transaction's [`OutcomeSlot`] and read by its caller once
-/// the [`Dedup`] submission resolves. Heterogeneous across resolver kinds: the
-/// engine treats it as an opaque payload it stages and delivers.
+/// the [`Dedup`] submission resolves. The worker transports values without
+/// inspecting their variants, while this closed enum deliberately defines the
+/// result vocabulary shared by the installed resolver kinds (ADR-028).
 #[derive(Clone, Debug)]
 pub(crate) enum FoldOutcome {
     /// A lock was installed (Acquire), carrying the strongest entry intention
@@ -196,11 +196,11 @@ pub(crate) struct ResolveCtx<'a> {
     pub(crate) cause: ReloadCause,
 }
 
-/// One operation's policy decision over a shard, folded by the coordinator. The
-/// engine treats it as opaque: it calls [`resolve`](ShardResolver::resolve),
-/// threads any staged entries, and deposits the returned outcome. All
-/// lock/transaction semantics live in the resolvers the callers install
-/// ([`Locker`](crate::Locker) and [`Algo`](crate::Algo)), not in the engine.
+/// One operation's mutation decision over a shard, folded by the coordinator.
+/// The engine calls [`resolve`](ShardResolver::resolve), threads any staged
+/// entries, and deposits the returned outcome. Resolver implementations own the
+/// acquire, write-back, release, and direct-commit decisions; the coordinator
+/// owns the ordering, admission, and recovery contract they share (ADR-028).
 #[async_trait]
 pub(crate) trait ShardResolver: Send + Sync {
     /// Resolves this member against entries and node locks as currently staged
@@ -662,12 +662,12 @@ impl Worker<CasReq, TransError> for CasWorker {
     }
 }
 
-/// The single per-object mechanism through which every shard/root entry mutation
-/// flows (ADR-028): a [`Dedup`] over the CAS coordination objects that loads each
-/// object once, folds every contending transaction's resolver, does one CAS, and
-/// deposits each transaction's outcome. It is a pure mechanism: the
-/// per-transaction held-lock bookkeeping lives with its owner, the
-/// [`Locker`](crate::Locker).
+/// The transaction-aware shared fold engine through which every shard/root entry
+/// mutation flows (ADR-028): a [`Dedup`] over the CAS coordination objects
+/// that orders contending transactions, loads each object once, folds their
+/// resolvers, does one CAS, and deposits each transaction's outcome. Transaction
+/// lifecycle and per-transaction held-lock bookkeeping remain with their
+/// higher-level owners.
 #[derive(Clone)]
 pub struct ShardCoordinator {
     inner: Arc<CoordState>,
