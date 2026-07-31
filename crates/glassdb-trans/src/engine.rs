@@ -7,21 +7,22 @@ use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, Clock, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, TxId, paths};
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, Directory, InlinePolicy, Node,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
     PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, ShardStore,
-    SplitPolicy, StorageError, TLogger, Timeline,
+    SplitPolicy, StorageError, TLogger, Timeline, TreeRouter,
 };
 
 use crate::access::{Data, ScanMutation, ScanRange};
 use crate::algo::{Algo, DirectCommitStats, Handle};
-use crate::collections::{
-    CollectionCatalog, CollectionData, CollectionLifecycle, DirectorySnapshot,
-};
+use crate::collection_catalog::CollectionCatalog;
+use crate::collection_coordination::CollectionStateResolver;
+use crate::collections::{CollectionData, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
 use crate::gc::Gc;
+use crate::key_resolver::{KeyResolver, ScanResult};
+use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::{Monitor, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::resolver::{Resolver, ScanResult};
 use crate::shard_coord::{ShardCoordinator, ShardCoordinatorStats};
 use crate::split::{Splitter, SplitterStats};
 use crate::tlocker::{Locker, LockerStats, TxLockSnapshot};
@@ -149,7 +150,7 @@ pub struct Engine {
     backend: Arc<StatsBackend>,
     objects: CachedStore,
     reader: Reader,
-    resolver: Resolver,
+    resolver: KeyResolver,
     collection_catalog: CollectionCatalog,
     algo: Algo,
     coord: ShardCoordinator,
@@ -210,7 +211,11 @@ impl Engine {
             retry,
             protocol_timing,
         );
-        let resolver = Resolver::new(shards.clone(), monitor.clone());
+        let collection_state =
+            CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
+        let collection_catalog = CollectionCatalog::new(collection_state.clone());
+        let key_state = KeyStateResolver::new(monitor.clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
@@ -218,7 +223,7 @@ impl Engine {
             shards.clone(),
             timeline.clone(),
             monitor.clone(),
-            resolver.clone(),
+            key_state,
             clock.clone(),
             retry,
             name,
@@ -227,13 +232,11 @@ impl Engine {
         );
         let locker = Locker::new(
             coord.clone(),
-            Directory::new(shards.clone()),
-            records.clone(),
-            tlogger.clone(),
+            TreeRouter::new(shards.clone()),
+            collection_state,
             monitor.clone(),
             retry,
         );
-        let collection_catalog = CollectionCatalog::new(locker.clone());
         let collection_lifecycle = CollectionLifecycle::new(
             records,
             shards.clone(),

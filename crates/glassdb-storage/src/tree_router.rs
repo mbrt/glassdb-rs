@@ -1,6 +1,6 @@
-//! Tree descent over the B-link coordination directory (ADR-031).
+//! Tree descent over the B-link tree (ADR-031).
 //!
-//! The [`Directory`] resolves a key to the leaf that owns it by descending from
+//! The [`TreeRouter`] resolves a key to the leaf that owns it by descending from
 //! the collection root `_r` through index nodes, and it enumerates the leaves
 //! in key order for listing. Descent is **self-correcting**: every node carries
 //! a high-key and a right-sibling, so a lookup that lands too far left —
@@ -9,8 +9,8 @@
 //! from the root.
 //!
 //! This layer is pure routing: it reads nodes through the [`ShardStore`] (hence
-//! the decoded object store, so interior nodes stay cached and off the hot path) and
-//! never mutates the tree. Splitting and locking live above it.
+//! the decoded object store, so interior nodes stay cached and off the hot
+//! path) and never mutates the tree. Splitting and locking live above it.
 
 use std::collections::BTreeMap;
 
@@ -39,7 +39,7 @@ impl LeafLocator {
     }
 }
 
-/// A group of keys routed to one leaf by [`Directory::group_keys_by_leaf`]: the
+/// A group of keys routed to one leaf by [`TreeRouter::group_keys_by_leaf`]: the
 /// owning leaf and the raw keys (with their payloads) that landed in it.
 pub struct LeafGroup<T> {
     pub path: String,
@@ -84,16 +84,16 @@ impl Located {
     }
 }
 
-/// Descends and scans the B-link coordination directory of a collection.
+/// Descends and scans a collection's B-link tree.
 #[derive(Clone)]
-pub struct Directory {
+pub struct TreeRouter {
     shards: ShardStore,
 }
 
-impl Directory {
-    /// Creates a directory that reads nodes through `shards`.
+impl TreeRouter {
+    /// Creates a router that reads nodes through `shards`.
     pub fn new(shards: ShardStore) -> Self {
-        Directory { shards }
+        TreeRouter { shards }
     }
 
     /// Resolves the leaf that owns `key`, descending from the root `_r` and
@@ -617,8 +617,8 @@ mod tests {
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(COLL, &root).await.unwrap();
 
-        let dir = Directory::new(s.shards.clone());
-        let loc = dir
+        let router = TreeRouter::new(s.shards.clone());
+        let loc = router
             .leaf_for(COLL, b"only", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -630,15 +630,17 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         assert!(matches!(
-            dir.leaf_for(COLL, b"k", Requirement::AtLeast(s.timeline.now()))
+            router
+                .leaf_for(COLL, b"k", Requirement::AtLeast(s.timeline.now()))
                 .await,
             Err(StorageError::NotFound)
         ));
         // Structural traversal can still model absence as no reachable leaves.
         assert!(
-            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            router
+                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .is_empty()
@@ -649,7 +651,7 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), "_n/L0"),
@@ -658,7 +660,7 @@ mod tests {
             (b"pear", "_n/L1"),
             (b"zebra", "_n/L1"),
         ] {
-            let loc = dir
+            let loc = router
                 .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
@@ -690,8 +692,8 @@ mod tests {
         let root = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
-        let dir = Directory::new(s.shards.clone());
-        let loc = dir
+        let router = TreeRouter::new(s.shards.clone());
+        let loc = router
             .leaf_for(COLL, b"pear", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -706,9 +708,9 @@ mod tests {
     async fn leaves_are_returned_in_key_order() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
 
-        let leaves = dir
+        let leaves = router
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -721,7 +723,7 @@ mod tests {
             ]
         );
 
-        let leftmost = dir
+        let leftmost = router
             .leftmost_leaf(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -738,21 +740,22 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let s = store_over(backend);
         seed_two_level(&s).await;
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
 
         // Warm the cache with a first descent, then measure only the steady state.
-        dir.leaf_for_fresh(
-            COLL,
-            b"apple",
-            Requirement::Any,
-            Requirement::AtLeast(s.timeline.now()),
-        )
-        .await
-        .unwrap();
+        router
+            .leaf_for_fresh(
+                COLL,
+                b"apple",
+                Requirement::Any,
+                Requirement::AtLeast(s.timeline.now()),
+            )
+            .await
+            .unwrap();
         log.lock().unwrap().clear();
 
         for _ in 0..3 {
-            let loc = dir
+            let loc = router
                 .leaf_for_fresh(
                     COLL,
                     b"apple",
@@ -802,7 +805,7 @@ mod tests {
         s_b.create_root(COLL, &root).await.unwrap();
 
         // Process A warms its cache with the root-as-leaf (stale requirement).
-        let dir_a = Directory::new(s_a.shards.clone());
+        let dir_a = TreeRouter::new(s_a.shards.clone());
         let warm = dir_a
             .leaf_for_fresh(COLL, b"a", Requirement::Any, Requirement::Any)
             .await
@@ -857,10 +860,10 @@ mod tests {
     async fn parent_index_for_finds_leaf_parent_and_none_for_single_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
 
         // The parent of any key's leaf is the root index `_r`.
-        let parent = dir
+        let parent = router
             .parent_index_for(COLL, b"mango", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap()
@@ -872,7 +875,7 @@ mod tests {
         let single = store();
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         single.create_root(COLL, &root).await.unwrap();
-        let single_dir = Directory::new(single.shards.clone());
+        let single_dir = TreeRouter::new(single.shards.clone());
         assert!(
             single_dir
                 .parent_index_for(COLL, b"only", Requirement::AtLeast(single.timeline.now()))
@@ -886,10 +889,10 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         assert_eq!(CollectionAddress::root("db").physical_prefix(), COLL);
 
-        let groups = dir
+        let groups = router
             .group_keys_by_leaf(
                 [
                     (KeyRef::new(CollectionAddress::root("db"), b"cat"), 'c'),
@@ -915,12 +918,12 @@ mod tests {
     #[tokio::test]
     async fn grouped_routing_classifies_the_collection_that_failed() {
         let s = store();
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
         let requirement = Requirement::AtLeast(s.timeline.now());
 
-        let root_error = dir
+        let root_error = router
             .group_keys_by_leaf(
                 [
                     (KeyRef::new(root.clone(), b"root"), ()),
@@ -931,7 +934,7 @@ mod tests {
             .await;
         assert!(matches!(root_error, Err(StorageError::NotFound)));
 
-        let child_error = dir
+        let child_error = router
             .group_keys_by_leaf(
                 [
                     (KeyRef::new(child, b"child"), ()),

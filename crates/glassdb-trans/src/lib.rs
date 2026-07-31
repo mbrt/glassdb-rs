@@ -3,15 +3,17 @@
 
 mod access;
 mod algo;
+mod collection_catalog;
+mod collection_coordination;
 mod collections;
-mod directory_locker;
 mod engine;
 mod error;
 mod gc;
+mod key_resolver;
+mod key_state_resolver;
 mod monitor;
 mod node_locking;
 mod reader;
-mod resolver;
 mod shard_coord;
 mod split;
 mod tlocker;
@@ -27,9 +29,9 @@ pub use collections::{
 };
 pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
+pub use key_resolver::ScanResult;
 pub use monitor::ProtocolTiming;
 pub use reader::{ReadOutcome, ReadValue};
-pub use resolver::ScanResult;
 pub use shard_coord::ShardCoordinatorStats;
 pub use split::{InlinePressureStats, SplitterStats};
 pub use tlocker::{HeldLeafSnapshot, LockerStats, TxLockSnapshot};

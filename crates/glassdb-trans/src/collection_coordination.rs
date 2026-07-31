@@ -1,4 +1,4 @@
-//! Transactional locking and write-back for collection records.
+//! Transactional state resolution, locking, and write-back for collection records.
 
 use std::collections::BTreeMap;
 
@@ -26,28 +26,32 @@ impl LockedDirectories {
     }
 }
 
-/// Coordinates locks and committed effects on collection records.
+/// Resolves transaction-dependent state in collection records.
 #[derive(Clone)]
-pub(crate) struct DirectoryLocker {
+pub(crate) struct CollectionStateResolver {
     records: CollectionStore,
     transactions: TLogger,
     monitor: Monitor,
     retry: RetryConfig,
 }
 
-impl DirectoryLocker {
-    /// Creates directory locking over collection and transaction stores.
-    pub(crate) fn new(
-        records: CollectionStore,
-        transactions: TLogger,
-        monitor: Monitor,
-        retry: RetryConfig,
-    ) -> Self {
-        DirectoryLocker {
-            records,
-            transactions,
-            monitor,
-            retry,
+/// Coordinates collection locks and their committed effects.
+#[derive(Clone)]
+pub(crate) struct CollectionLocker {
+    state: CollectionStateResolver,
+    records: CollectionStore,
+    monitor: Monitor,
+    retry: RetryConfig,
+}
+
+impl CollectionLocker {
+    /// Creates collection locking over shared collection-state resolution.
+    pub(crate) fn new(state: CollectionStateResolver) -> Self {
+        Self {
+            records: state.records.clone(),
+            monitor: state.monitor.clone(),
+            retry: state.retry,
+            state,
         }
     }
 
@@ -77,8 +81,182 @@ impl DirectoryLocker {
         Ok(LockedDirectories { locks })
     }
 
-    /// Loads a record after resolving lifecycle and directory holders.
-    pub(crate) async fn load_resolved_record(
+    /// Applies committed directory effects and releases their locks.
+    pub(crate) async fn write_back(
+        &self,
+        id: &TxId,
+        changes: &[CollectionChange],
+        locks: &[TxLock],
+    ) -> Result<(), TransError> {
+        for parent in Self::locked_collections(locks) {
+            self.state
+                .apply_committed_write_back(parent, id, changes)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Recovers committed directory effects from durable metadata.
+    pub(crate) async fn recover_write_back(
+        &self,
+        id: &TxId,
+        changes: &[TxCollectionChange],
+        locks: &[TxLock],
+    ) -> Result<(), TransError> {
+        let changes = CollectionStateResolver::recover_changes(changes);
+        self.write_back(id, &changes, locks).await
+    }
+
+    /// Releases every recorded directory lock held by `id`.
+    pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<(), TransError> {
+        for parent in Self::locked_collections(locks) {
+            let prefix = parent.physical_prefix();
+            loop {
+                let (mut record, observed) =
+                    match self.records.load_record(&prefix, Requirement::Any).await {
+                        Ok(record) => record,
+                        Err(StorageError::NotFound) => break,
+                        Err(error) => return Err(error.into()),
+                    };
+                if !record.remove_directory_holder(id) {
+                    break;
+                }
+                if self.records.store_record(&record, &observed).await? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reports whether any recorded directory still refers to `id`.
+    pub(crate) async fn is_referenced(
+        &self,
+        id: &TxId,
+        locks: &[TxLock],
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        for collection in Self::locked_collections(locks) {
+            if let Ok((record, _)) = self
+                .records
+                .load_record(&collection.physical_prefix(), requirement)
+                .await
+                && record.directory_lock().contains(id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Removes a settled structural operation from collection topology.
+    pub(crate) async fn release_topology_participant(
+        &self,
+        collection: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError> {
+        let prefix = collection.physical_prefix();
+        loop {
+            let (mut record, observed) =
+                match self.records.load_record(&prefix, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+            if !record.remove_topology_participant(id) {
+                return Ok(());
+            }
+            if self.records.store_record(&record, &observed).await? {
+                return Ok(());
+            }
+        }
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        parent: &CollectionAddress,
+        id: &TxId,
+        desired: LockType,
+    ) -> Result<(), TransError> {
+        let mut backoff = self.retry.backoff();
+        loop {
+            let (mut record, observed) = self
+                .state
+                .resolve_observed(parent, Some(id), Requirement::Any)
+                .await?;
+            let lock = record.directory_lock();
+            let already_held = lock.contains(id)
+                && (desired == LockType::Read || lock.lock_type() == LockType::Write);
+            if already_held {
+                return Ok(());
+            }
+            let conflicts = match desired {
+                LockType::Read => lock.lock_type() == LockType::Write,
+                LockType::Write => !lock.holders().is_empty(),
+                _ => false,
+            };
+            if conflicts
+                && let Some(holder) = lock.holders().iter().find(|holder| *holder != id).cloned()
+            {
+                resolve_tx_conflict(&self.monitor, id, &holder).await?;
+                rt::sleep(backoff.next_delay()).await;
+                continue;
+            }
+            match desired {
+                LockType::Read => record.add_directory_reader(id.clone()),
+                LockType::Write => record.set_directory_writer(id.clone()),
+                _ => {
+                    return Err(TransError::other(
+                        "invalid collection-directory lock request",
+                    ));
+                }
+            }
+            if self.records.store_record(&record, &observed).await? {
+                return Ok(());
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
+    }
+
+    fn locked_collections(locks: &[TxLock]) -> impl Iterator<Item = &CollectionAddress> {
+        locks.iter().filter_map(|lock| match lock {
+            TxLock::Directory { collection, .. } => Some(collection),
+            _ => None,
+        })
+    }
+}
+
+impl CollectionStateResolver {
+    /// Creates collection-state resolution over record and transaction stores.
+    pub(crate) fn new(
+        records: CollectionStore,
+        transactions: TLogger,
+        monitor: Monitor,
+        retry: RetryConfig,
+    ) -> Self {
+        Self {
+            records,
+            transactions,
+            monitor,
+            retry,
+        }
+    }
+
+    /// Loads a collection record after resolving foreign lifecycle and
+    /// directory holders.
+    pub(crate) async fn resolve(
+        &self,
+        collection: &CollectionAddress,
+        own: Option<&TxId>,
+        requirement: Requirement,
+    ) -> Result<CollectionRecord, TransError> {
+        self.resolve_observed(collection, own, requirement)
+            .await
+            .map(|(record, _)| record)
+    }
+
+    /// Loads a record and its CAS observation after resolving foreign holders.
+    async fn resolve_observed(
         &self,
         parent: &CollectionAddress,
         own: Option<&TxId>,
@@ -131,141 +309,7 @@ impl DirectoryLocker {
         }
     }
 
-    /// Applies committed directory effects and releases their locks.
-    pub(crate) async fn write_back(
-        &self,
-        id: &TxId,
-        changes: &[CollectionChange],
-        locks: &[TxLock],
-    ) -> Result<(), TransError> {
-        for parent in directory_collections(locks) {
-            self.write_back_one(parent, id, changes).await?;
-        }
-        Ok(())
-    }
-
-    /// Recovers committed directory effects from durable metadata.
-    pub(crate) async fn recover_write_back(
-        &self,
-        id: &TxId,
-        changes: &[TxCollectionChange],
-        locks: &[TxLock],
-    ) -> Result<(), TransError> {
-        let changes = recover_collection_changes(changes);
-        self.write_back(id, &changes, locks).await
-    }
-
-    /// Releases every recorded directory lock held by `id`.
-    pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<(), TransError> {
-        for parent in directory_collections(locks) {
-            let prefix = parent.physical_prefix();
-            loop {
-                let (mut record, observed) =
-                    match self.records.load_record(&prefix, Requirement::Any).await {
-                        Ok(record) => record,
-                        Err(StorageError::NotFound) => break,
-                        Err(error) => return Err(error.into()),
-                    };
-                if !record.remove_directory_holder(id) {
-                    break;
-                }
-                if self.records.store_record(&record, &observed).await? {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Reports whether any recorded directory still refers to `id`.
-    pub(crate) async fn is_referenced(
-        &self,
-        id: &TxId,
-        locks: &[TxLock],
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        for collection in directory_collections(locks) {
-            if let Ok((record, _)) = self
-                .records
-                .load_record(&collection.physical_prefix(), requirement)
-                .await
-                && record.directory_lock().contains(id)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Removes a settled structural operation from collection topology.
-    pub(crate) async fn release_topology_participant(
-        &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-    ) -> Result<(), TransError> {
-        let prefix = collection.physical_prefix();
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(&prefix, Requirement::Any).await {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                };
-            if !record.remove_topology_participant(id) {
-                return Ok(());
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(());
-            }
-        }
-    }
-
-    pub(crate) async fn acquire(
-        &self,
-        parent: &CollectionAddress,
-        id: &TxId,
-        desired: LockType,
-    ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        loop {
-            let (mut record, observed) = self
-                .load_resolved_record(parent, Some(id), Requirement::Any)
-                .await?;
-            let lock = record.directory_lock();
-            let already_held = lock.contains(id)
-                && (desired == LockType::Read || lock.lock_type() == LockType::Write);
-            if already_held {
-                return Ok(());
-            }
-            let conflicts = match desired {
-                LockType::Read => lock.lock_type() == LockType::Write,
-                LockType::Write => !lock.holders().is_empty(),
-                _ => false,
-            };
-            if conflicts
-                && let Some(holder) = lock.holders().iter().find(|holder| *holder != id).cloned()
-            {
-                resolve_tx_conflict(&self.monitor, id, &holder).await?;
-                rt::sleep(backoff.next_delay()).await;
-                continue;
-            }
-            match desired {
-                LockType::Read => record.add_directory_reader(id.clone()),
-                LockType::Write => record.set_directory_writer(id.clone()),
-                _ => {
-                    return Err(TransError::other(
-                        "invalid collection-directory lock request",
-                    ));
-                }
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(());
-            }
-            rt::sleep(backoff.next_delay()).await;
-        }
-    }
-
-    async fn write_back_one(
+    async fn apply_committed_write_back(
         &self,
         parent: &CollectionAddress,
         id: &TxId,
@@ -344,30 +388,87 @@ impl DirectoryLocker {
                 log.status
             )));
         }
-        let changes = recover_collection_changes(&log.collection_changes);
-        self.write_back_one(parent, id, &changes).await
+        let changes = Self::recover_changes(&log.collection_changes);
+        self.apply_committed_write_back(parent, id, &changes).await
+    }
+
+    fn recover_changes(changes: &[TxCollectionChange]) -> Vec<CollectionChange> {
+        changes
+            .iter()
+            .map(|change| CollectionChange {
+                parent: change.parent.clone(),
+                name: change.name.clone(),
+                collection: change.collection.clone(),
+                expected: None,
+                op: match change.op {
+                    TxCollectionOp::Create => CollectionOp::Create,
+                    TxCollectionOp::Drop => CollectionOp::Drop,
+                },
+            })
+            .collect()
     }
 }
 
-fn directory_collections(locks: &[TxLock]) -> impl Iterator<Item = &CollectionAddress> {
-    locks.iter().filter_map(|lock| match lock {
-        TxLock::Directory { collection, .. } => Some(collection),
-        _ => None,
-    })
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-fn recover_collection_changes(changes: &[TxCollectionChange]) -> Vec<CollectionChange> {
-    changes
-        .iter()
-        .map(|change| CollectionChange {
-            parent: change.parent.clone(),
-            name: change.name.clone(),
-            collection: change.collection.clone(),
-            expected: None,
-            op: match change.op {
-                TxCollectionOp::Create => CollectionOp::Create,
-                TxCollectionOp::Drop => CollectionOp::Drop,
-            },
-        })
-        .collect()
+    use glassdb_backend::memory::MemoryBackend;
+    use glassdb_concurr::{Background, Clock};
+    use glassdb_storage::{CachedStore, Timeline};
+
+    use super::*;
+    use crate::monitor::ProtocolTiming;
+
+    fn new_locker() -> (CollectionLocker, CollectionStore, Arc<Background>) {
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            timeline.clone(),
+            None,
+        );
+        let records = CollectionStore::new(objects.clone());
+        let transactions = TLogger::new(objects, "db");
+        let background = Arc::new(Background::new());
+        let monitor = Monitor::with_config(
+            transactions.clone(),
+            timeline,
+            Arc::downgrade(&background),
+            Clock::real(),
+            RetryConfig::default(),
+            ProtocolTiming::default(),
+        );
+        let state = CollectionStateResolver::new(
+            records.clone(),
+            transactions,
+            monitor,
+            RetryConfig::default(),
+        );
+        (CollectionLocker::new(state), records, background)
+    }
+
+    #[tokio::test]
+    async fn sole_reader_can_upgrade_to_writer() {
+        let (locker, records, _background) = new_locker();
+        let parent = CollectionAddress::root("db");
+        let prefix = parent.physical_prefix();
+        assert!(
+            records
+                .create_record(&prefix, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        let id = TxId::from_bytes(vec![1]);
+
+        locker.acquire(&parent, &id, LockType::Read).await.unwrap();
+        locker.acquire(&parent, &id, LockType::Write).await.unwrap();
+
+        let (record, _) = records
+            .load_record(&prefix, Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(record.directory_lock().lock_type(), LockType::Write);
+        assert_eq!(record.directory_lock().holders(), std::slice::from_ref(&id));
+    }
 }

@@ -10,10 +10,10 @@
 //! Every node rewrite proves the exclusive structural gate absent in the state
 //! it conditionally replaces (ADR-044).
 //!
-//! [`Locker`] is the common lock boundary. Its data view owns how a transaction
+//! [`Locker`] is the common lock boundary. Its key view owns how a transaction
 //! groups keys, the parallel/serial acquisition strategy, the hold-and-wait
-//! loop, and per-transaction held-lock bookkeeping; its directory view owns
-//! collection-record coordination. The data mutation *mechanism* — deduplicated
+//! loop, and per-transaction held-lock bookkeeping; its collection view owns
+//! collection locks and their committed effects. The data mutation *mechanism* — deduplicated
 //! load + resolve + CAS with retry — lives in the
 //! [`ShardCoordinator`](crate::shard_coord::ShardCoordinator) below it, which
 //! the locker shares with the commit algorithm so every shard/root mutation
@@ -36,15 +36,14 @@ use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{KeyRef, LeafRef, TxId, paths};
 use glassdb_storage::{
-    CollectionStore, CurrentState, Directory, LeafObservation, LockType, NodeLocks, Requirement,
-    ShardEntry, TLogger, TxLock,
+    CurrentState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TreeRouter, TxLock,
 };
 
 use crate::access::{Data, WriteOp};
-use crate::directory_locker::DirectoryLocker;
+use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::error::TransError;
 use crate::monitor::Monitor;
-use crate::node_locking::{NodeLockReconciler, resolve_entry_locks, resolved_current};
+use crate::node_locking::NodeLockReconciler;
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
     Step,
@@ -135,7 +134,7 @@ struct ShardGroup {
     membership: LockType,
 }
 
-/// The locks acquired through [`Locker::data`]. Opaque to the caller: it carries
+/// The locks acquired through [`Locker::keys`]. Opaque to the caller: it carries
 /// the per-leaf key groups this transaction holds and is later passed back for
 /// write-back.
 pub(crate) struct LockedTx {
@@ -188,7 +187,7 @@ fn lock_type(desired: Desired) -> LockType {
 /// read. Optimistic read validation is the engine's job (it validates after
 /// locking, ADR-024), so no read token is carried here.
 async fn build_groups(
-    dir: &Directory,
+    router: &TreeRouter,
     data: &Data,
     scan_requirement: Requirement,
 ) -> Result<BTreeMap<String, ShardGroup>, TransError> {
@@ -217,7 +216,7 @@ async fn build_groups(
     // a stale index misroute self-corrects via right-links, and the leaf's own
     // coordination CAS revalidates at the version, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
-    let grouped = dir
+    let grouped = router
         .group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any)
         .await
         .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
@@ -254,7 +253,7 @@ async fn build_groups(
         if scan.range.is_empty() {
             continue;
         }
-        for leaf in dir
+        for leaf in router
             .leaves_through(
                 &scan.collection.physical_prefix(),
                 &scan.range.start,
@@ -301,7 +300,7 @@ impl ShardResolver for AcquireResolver {
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let mut locks = staged_locks.clone();
-        let reconciler = NodeLockReconciler::new(ctx.tmon, &self.id);
+        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
         if let Some(holder) = reconciler.admit_non_structural(&mut locks).await? {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Wait(holder),
@@ -407,7 +406,7 @@ impl ShardResolver for WriteBackResolver {
         });
         let owns_membership = staged_locks.membership().contains(&self.id);
         let mut locks = staged_locks.clone();
-        if let Some(holder) = NodeLockReconciler::new(ctx.tmon, &self.id)
+        if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
             .admit_non_structural(&mut locks)
             .await?
         {
@@ -482,7 +481,7 @@ impl ShardResolver for ReleaseResolver {
             .any(|entry| entry.locked_by.contains(&self.id));
         let owns_membership = staged_locks.membership().contains(&self.id);
         let mut locks = staged_locks.clone();
-        if let Some(holder) = NodeLockReconciler::new(ctx.tmon, &self.id)
+        if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
             .admit_non_structural(&mut locks)
             .await?
         {
@@ -568,8 +567,11 @@ async fn resolve_and_lock(
     // ones come back as conflicts to wound-wait. The monitor folds lease expiry
     // and the unknown-tx grace period into `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
-    let resolved = resolve_entry_locks(ctx, &intent.key, Some(&e), Some(id)).await?;
-    e.current = resolved_current(Some(&e), &resolved);
+    let resolved = ctx
+        .key_state
+        .resolve_holders(&intent.key, Some(&e), Some(id), ctx.requirement)
+        .await?;
+    e.current = resolved.resolved_current(Some(&e));
     let mut pending = resolved.pending;
 
     let exists_before = e.current.exists();
@@ -733,25 +735,25 @@ enum Woke {
     PollTimeout,
 }
 
-/// Exposes data-node and collection-directory locking through separate views.
+/// Exposes data-node and collection locking through separate views.
 ///
-/// The data view hides routing, waits, wound-wait, and CAS retries behind a
-/// policy layer over the shared [`ShardCoordinator`] (ADR-028). The directory
+/// The key view hides routing, waits, wound-wait, and CAS retries behind a
+/// policy layer over the shared [`ShardCoordinator`] (ADR-028). The collection
 /// view coordinates collection records independently from B-link nodes.
 #[derive(Clone)]
 pub struct Locker {
-    data: DataLocker,
-    directories: DirectoryLocker,
+    keys: KeyLocker,
+    collections: CollectionLocker,
 }
 
 /// Coordinates locks and committed effects on data leaves.
 #[derive(Clone)]
-pub(crate) struct DataLocker {
+pub(crate) struct KeyLocker {
     /// The shared shard-mutation mechanism: dedup + resolve + CAS. Also held by
     /// the commit algorithm, so both drive one dedup.
     coord: ShardCoordinator,
     /// Routes a transaction's keys to their owning leaves by descent (ADR-031).
-    dir: Directory,
+    router: TreeRouter,
     /// Used to park on a conflicting holder during hold-and-wait.
     tmon: Monitor,
     /// Backoff config for the hold-and-wait re-poll cadence.
@@ -768,49 +770,45 @@ pub(crate) struct DataLocker {
 }
 
 impl Locker {
-    /// Creates a locker over the shared [`ShardCoordinator`], the directory used
-    /// to route keys to leaves (ADR-031), and the transaction monitor. `retry`
-    /// configures the exponential backoff applied between hold-and-wait re-polls
-    /// of a conflicting holder, so a wait is never busy-retried (its
-    /// `max_interval` caps the re-poll cadence).
+    /// Creates data and collection locking over their shared coordination
+    /// dependencies.
     pub fn new(
         coord: ShardCoordinator,
-        dir: Directory,
-        records: CollectionStore,
-        transactions: TLogger,
+        router: TreeRouter,
+        collection_state: CollectionStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
     ) -> Self {
         Locker {
-            data: DataLocker::new(coord, dir, tmon.clone(), retry),
-            directories: DirectoryLocker::new(records, transactions, tmon, retry),
+            keys: KeyLocker::new(coord, router, tmon.clone(), retry),
+            collections: CollectionLocker::new(collection_state),
         }
     }
 
     /// Returns and resets distributed-locker activity counters.
     pub fn stats_and_reset(&self) -> LockerStats {
-        self.data.stats_and_reset()
+        self.keys.stats_and_reset()
     }
 
     /// Returns one entry per transaction that currently holds any leaf lock,
     /// with the held paths sorted by path. Output is sorted by transaction id
     /// for stable display.
     pub fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
-        self.data.tx_locks_snapshot()
+        self.keys.tx_locks_snapshot()
     }
 
     /// Returns the data-leaf locking interface.
-    pub(crate) fn data(&self) -> &DataLocker {
-        &self.data
+    pub(crate) fn keys(&self) -> &KeyLocker {
+        &self.keys
     }
 
-    /// Returns the collection-directory locking interface.
-    pub(crate) fn directories(&self) -> &DirectoryLocker {
-        &self.directories
+    /// Returns the collection locking interface.
+    pub(crate) fn collections(&self) -> &CollectionLocker {
+        &self.collections
     }
 }
 
-impl DataLocker {
+impl KeyLocker {
     /// Acquires a transaction's locks while resolving predicate-lock coverage
     /// against the supplied pre-lock requirement barrier.
     pub(crate) async fn lock_at(
@@ -820,7 +818,7 @@ impl DataLocker {
         serial: bool,
         scan_requirement: Requirement,
     ) -> Result<LockOutcome, TransError> {
-        let mut groups = build_groups(&self.dir, data, scan_requirement).await?;
+        let mut groups = build_groups(&self.router, data, scan_requirement).await?;
         let validations = match self
             .lock_shards_at(id, &groups, serial, scan_requirement)
             .await?
@@ -840,7 +838,7 @@ impl DataLocker {
 
     /// Releases every lock `id` holds across the leaves it has acquired,
     /// **without publishing any value** and **leaving the transaction object
-    /// pending**. Unlike [`DataLocker::write_back`] (the
+    /// pending**. Unlike [`KeyLocker::write_back`] (the
     /// post-commit release that republishes `current_writer` pointers), this
     /// just clears `id` from the lock holders so the transaction can re-acquire
     /// its locks from scratch under the same id.
@@ -939,10 +937,10 @@ impl DataLocker {
         self.release_leaf_at(id, path, Requirement::Any).await
     }
 
-    fn new(coord: ShardCoordinator, dir: Directory, tmon: Monitor, retry: RetryConfig) -> Self {
+    fn new(coord: ShardCoordinator, router: TreeRouter, tmon: Monitor, retry: RetryConfig) -> Self {
         Self {
             coord,
-            dir,
+            router,
             tmon,
             retry,
             tlocks: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
@@ -1097,7 +1095,7 @@ impl DataLocker {
                         .map(|intent| (intent.key.clone(), intent))
                         .collect();
                     let groups = self
-                        .dir
+                        .router
                         .group_keys_by_leaf_fresh(items, Requirement::Any, requirement)
                         .await
                         .map_err(|e| TransError::from(e).context("rerouting delayed write-back"))?;
@@ -1318,8 +1316,9 @@ impl DataLocker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection_coordination::CollectionStateResolver;
+    use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::ProtocolTiming;
-    use crate::resolver::Resolver;
     use crate::shard_coord::SplitHinter;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
@@ -1328,8 +1327,8 @@ mod tests {
     use glassdb_concurr::{Background, Clock, RetryConfig};
     use glassdb_data::{CollectionAddress, paths};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, Directory, Node, Shard, ShardEntry,
-        ShardStore, SplitPolicy, TLogger, Timeline, TxCommitStatus,
+        CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
+        SplitPolicy, TLogger, Timeline, TreeRouter, TxCommitStatus,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1384,11 +1383,11 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let resolver = Resolver::new(shards.clone(), mon.clone());
-        let dir = Directory::new(shards.clone());
+        let key_state = KeyStateResolver::new(mon.clone());
+        let router = TreeRouter::new(shards.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
-            resolver,
+            key_state,
             mon.clone(),
             RetryConfig::default(),
             policy,
@@ -1396,9 +1395,8 @@ mod tests {
         );
         let locker = Locker::new(
             coord.clone(),
-            dir,
-            records,
-            tl,
+            router,
+            CollectionStateResolver::new(records, tl, mon.clone(), RetryConfig::default()),
             mon.clone(),
             RetryConfig::default(),
         );
@@ -1514,7 +1512,7 @@ mod tests {
     // Acquires shard locks in parallel mode, asserting success.
     async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
         match locker
-            .data()
+            .keys()
             .lock_shards_at(id, groups, false, Requirement::Any)
             .await
             .unwrap()
@@ -1598,7 +1596,7 @@ mod tests {
         let waiting_tx = tx.clone();
         let waiting = tokio::spawn(async move {
             waiting_locker
-                .data()
+                .keys()
                 .lock_shards_at(
                     &waiting_tx,
                     &group_of(b"target", put_intent(b"target")),
@@ -1662,7 +1660,7 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
 
         let outcome = locker
-            .data()
+            .keys()
             .lock_shards_at(
                 &tx,
                 &group_of(b"z", put_intent(b"z")),
@@ -1729,7 +1727,7 @@ mod tests {
         assert!(loaded.node().membership_lock().contains(&tx));
         assert_eq!(loaded.node().membership_version(), 0);
 
-        locker.data().release_leaf(&tx, &path).await.unwrap();
+        locker.keys().release_leaf(&tx, &path).await.unwrap();
         let loaded = ctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
@@ -1806,7 +1804,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             locker2
-                .data()
+                .keys()
                 .lock_shards_at(&young2, &groups, false, Requirement::Any)
                 .await
         });
@@ -1854,7 +1852,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             locker2
-                .data()
+                .keys()
                 .lock_shards_at(&young2, &groups, false, Requirement::Any)
                 .await
         });
@@ -1875,7 +1873,7 @@ mod tests {
         }];
         ctx.monitor.commit_tx(tl).await.unwrap();
         locker
-            .data()
+            .keys()
             .write_back(
                 &old,
                 &LockedTx {
@@ -1908,7 +1906,7 @@ mod tests {
         lock_ok(&locker, &tx, &groups).await;
         // First writer of a fresh key overwrites no pointer: no GC hint.
         let superseded = locker
-            .data()
+            .keys()
             .write_back(
                 &tx,
                 &LockedTx {
@@ -1947,7 +1945,7 @@ mod tests {
         // First committer publishes the pointer for `key`; it supersedes nothing.
         let old = mk_tid(1, "old");
         let lt_old = lock_commit(&locker, &ctx, &old, key).await;
-        assert!(locker.data().write_back(&old, &lt_old).await.is_empty());
+        assert!(locker.keys().write_back(&old, &lt_old).await.is_empty());
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current.writer(),
             Some(&old)
@@ -1957,7 +1955,7 @@ mod tests {
         // pointer it replaced.
         let new = mk_tid(2, "new");
         let lt_new = lock_commit(&locker, &ctx, &new, key).await;
-        assert_eq!(locker.data().write_back(&new, &lt_new).await, vec![old]);
+        assert_eq!(locker.keys().write_back(&new, &lt_new).await, vec![old]);
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current.writer(),
             Some(&new)
@@ -2071,7 +2069,7 @@ mod tests {
 
         let groups = group_of(key, put_intent(key));
         locker
-            .data()
+            .keys()
             .write_back(
                 &tx,
                 &LockedTx {
@@ -2128,7 +2126,7 @@ mod tests {
 
         ctx.monitor.begin_tx(&reader);
         let outcome = locker
-            .data()
+            .keys()
             .lock_shards_at(
                 &reader,
                 &group_of(key, read_intent(key)),
@@ -2170,14 +2168,14 @@ mod tests {
             scans: Vec::new(),
         };
         let out = locker
-            .data()
+            .keys()
             .lock_at(&tx, &data, false, Requirement::Any)
             .await
             .unwrap();
         assert!(matches!(out, LockOutcome::Locked(_)));
         assert!(!locker.tx_locks_snapshot().is_empty());
 
-        locker.data().release_locks(&tx).await.unwrap();
+        locker.keys().release_locks(&tx).await.unwrap();
 
         // The released create-lock left the fresh key with no holder and no
         // committed writer, so the fold pruned the now-vestigial entry (ADR-029):
@@ -2356,12 +2354,12 @@ mod tests {
         let g1 = group_of(key, read_intent(key));
         let g2 = group_of(key, read_intent(key));
         let h1 = tokio::spawn(async move {
-            l1.data()
+            l1.keys()
                 .lock_shards_at(&t1, &g1, false, Requirement::Any)
                 .await
         });
         let h2 = tokio::spawn(async move {
-            l2.data()
+            l2.keys()
                 .lock_shards_at(&t2, &g2, false, Requirement::Any)
                 .await
         });
@@ -2412,12 +2410,12 @@ mod tests {
         let g1 = group_of(&ka, put_intent(&ka));
         let g2 = group_of(&kb, put_intent(&kb));
         let h1 = tokio::spawn(async move {
-            l1.data()
+            l1.keys()
                 .lock_shards_at(&t1, &g1, false, Requirement::Any)
                 .await
         });
         let h2 = tokio::spawn(async move {
-            l2.data()
+            l2.keys()
                 .lock_shards_at(&t2, &g2, false, Requirement::Any)
                 .await
         });
@@ -2460,7 +2458,7 @@ mod tests {
         let waiting_group = group_of(&kb, put_intent(&kb));
         let waiting = tokio::spawn(async move {
             waiting_locker
-                .data()
+                .keys()
                 .lock_shards_at(&waiting_id, &waiting_group, false, Requirement::Any)
                 .await
         });
@@ -2519,8 +2517,8 @@ mod tests {
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
         let (t1, t2) = (tx1.clone(), tx2.clone());
-        let h1 = tokio::spawn(async move { l1.data().write_back(&t1, &lt1).await });
-        let h2 = tokio::spawn(async move { l2.data().write_back(&t2, &lt2).await });
+        let h1 = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
+        let h2 = tokio::spawn(async move { l2.keys().write_back(&t2, &lt2).await });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap();
@@ -2561,9 +2559,9 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         // The write-back is the driver (parks in the gated load); the acquire
         // queues and is absorbed once the load returns.
-        let hw = tokio::spawn(async move { l1.data().write_back(&t1, &lt1).await });
+        let hw = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
         let ha = tokio::spawn(async move {
-            l2.data()
+            l2.keys()
                 .lock_shards_at(&t2, &g2, false, Requirement::Any)
                 .await
         });
@@ -2609,8 +2607,8 @@ mod tests {
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
         let (t1, t2) = (tx1.clone(), tx2.clone());
-        let h1 = tokio::spawn(async move { l1.data().release_locks(&t1).await });
-        let h2 = tokio::spawn(async move { l2.data().release_locks(&t2).await });
+        let h1 = tokio::spawn(async move { l1.keys().release_locks(&t1).await });
+        let h2 = tokio::spawn(async move { l2.keys().release_locks(&t2).await });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap().unwrap();
@@ -2651,12 +2649,12 @@ mod tests {
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
-            lo.data()
+            lo.keys()
                 .lock_shards_at(&to, &go, false, Requirement::Any)
                 .await
         });
         let hy = tokio::spawn(async move {
-            ly.data()
+            ly.keys()
                 .lock_shards_at(&ty, &gy, false, Requirement::Any)
                 .await
         });
@@ -2712,12 +2710,12 @@ mod tests {
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
-            lo.data()
+            lo.keys()
                 .lock_shards_at(&to, &go, false, Requirement::Any)
                 .await
         });
         let hy = tokio::spawn(async move {
-            ly.data()
+            ly.keys()
                 .lock_shards_at(&ty, &gy, false, Requirement::Any)
                 .await
         });
@@ -2730,7 +2728,7 @@ mod tests {
         ));
 
         // The older releases; the younger's hold-and-wait loop then re-acquires.
-        locker.data().release_locks(&old).await.unwrap();
+        locker.keys().release_locks(&old).await.unwrap();
         assert!(matches!(
             hy.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
@@ -2768,12 +2766,12 @@ mod tests {
         let ga = group_of(key, put_intent(key));
         let gb = group_of(key, put_intent(key));
         let ha = tokio::spawn(async move {
-            la.data()
+            la.keys()
                 .lock_shards_at(&ta, &ga, false, Requirement::Any)
                 .await
         });
         let hb = tokio::spawn(async move {
-            lb.data()
+            lb.keys()
                 .lock_shards_at(&tb, &gb, false, Requirement::Any)
                 .await
         });
@@ -2798,7 +2796,7 @@ mod tests {
         );
 
         // After the winner releases, the loser proceeds: progress, no livelock.
-        locker.data().release_locks(&a).await.unwrap();
+        locker.keys().release_locks(&a).await.unwrap();
         assert!(matches!(
             hb.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
@@ -2834,9 +2832,9 @@ mod tests {
             gate.arm();
             let (lw, la) = (locker.clone(), locker.clone());
             let (cw, ca) = (committer.clone(), acquirer.clone());
-            let hw = tokio::spawn(async move { lw.data().write_back(&cw, &lt).await });
+            let hw = tokio::spawn(async move { lw.keys().write_back(&cw, &lt).await });
             let ha = tokio::spawn(async move {
-                la.data()
+                la.keys()
                     .lock_shards_at(&ca, &g, false, Requirement::Any)
                     .await
             });
@@ -2887,7 +2885,7 @@ mod tests {
 
         ctx.coord.close().await;
         let err = locker
-            .data()
+            .keys()
             .lock_shards_at(
                 &tx,
                 &group_of(b"key2", put_intent(b"key2")),
@@ -2917,7 +2915,7 @@ mod tests {
         let y = young.clone();
         let g = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
-            l.data()
+            l.keys()
                 .lock_shards_at(&y, &g, false, Requirement::Any)
                 .await
         });
@@ -2926,7 +2924,7 @@ mod tests {
         waiting.abort();
         let _ = waiting.await;
 
-        locker.data().release_locks(&old).await.unwrap();
+        locker.keys().release_locks(&old).await.unwrap();
         let other = mk_tid(3, "other");
         ctx.monitor.begin_tx(&other);
         lock_ok(&locker, &other, &group_of(key, put_intent(key))).await;

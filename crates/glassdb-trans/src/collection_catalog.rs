@@ -5,39 +5,30 @@ use std::collections::BTreeMap;
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::{CollectionRecord, Requirement, SplitPolicy};
 
-use super::{CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind, DirectorySnapshot};
+use crate::collection_coordination::CollectionStateResolver;
+use crate::collections::{
+    CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind, DirectorySnapshot,
+};
 use crate::error::TransError;
-use crate::tlocker::Locker;
 
 /// Builds and validates semantic views of transactional collection directories.
 #[derive(Clone)]
-pub struct CollectionCatalog {
-    locker: Locker,
-}
-
-fn directory_fits(record: &CollectionRecord, policy: &SplitPolicy) -> bool {
-    let content_limit = policy
-        .node_max_bytes
-        .saturating_sub(policy.split_headroom_bytes);
-    record.content_encoded_len() <= content_limit && record.encoded_len() <= policy.node_max_bytes
+pub(crate) struct CollectionCatalog {
+    state: CollectionStateResolver,
 }
 
 impl CollectionCatalog {
     /// Creates access to transactional collection directories.
-    pub fn new(locker: Locker) -> Self {
-        CollectionCatalog { locker }
+    pub(crate) fn new(state: CollectionStateResolver) -> Self {
+        CollectionCatalog { state }
     }
 
     /// Loads a direct-child directory after resolving finalized transactions.
-    pub async fn snapshot(
+    pub(crate) async fn snapshot(
         &self,
         parent: &CollectionAddress,
     ) -> Result<DirectorySnapshot, TransError> {
-        let (record, _) = self
-            .locker
-            .directories()
-            .load_resolved_record(parent, None, Requirement::Any)
-            .await?;
+        let record = self.state.resolve(parent, None, Requirement::Any).await?;
         Ok(DirectorySnapshot {
             children: record
                 .children()
@@ -63,11 +54,7 @@ impl CollectionCatalog {
             .chain(changes.iter().map(|change| &change.parent))
         {
             if !records.contains_key(parent) {
-                let (record, _) = self
-                    .locker
-                    .directories()
-                    .load_resolved_record(parent, id, requirement)
-                    .await?;
+                let record = self.state.resolve(parent, id, requirement).await?;
                 records.insert(parent.clone(), record);
             }
         }
@@ -105,13 +92,18 @@ impl CollectionCatalog {
             }
         }
         for parent in changes.iter().map(|change| &change.parent) {
-            if !directory_fits(&records[parent], split_policy) {
+            if !Self::directory_fits(&records[parent], split_policy) {
                 return Err(TransError::InvalidInput(
                     "subcollection directory exceeds the collection-record size limit".into(),
                 ));
             }
         }
         Ok(true)
+    }
+
+    fn directory_fits(record: &CollectionRecord, policy: &SplitPolicy) -> bool {
+        record.content_encoded_len() <= policy.content_limit()
+            && record.encoded_len() <= policy.node_max_bytes
     }
 }
 
@@ -123,20 +115,12 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::CollectionId;
     use glassdb_storage::{
-        CachedStore, CollectionStore, Directory, LockType, ShardStore, TLogger, Timeline,
-        TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog,
+        CachedStore, CollectionStore, LockType, TLogger, Timeline, TxCollectionChange,
+        TxCollectionOp, TxCommitStatus, TxLock, TxLog,
     };
 
     use super::*;
     use crate::monitor::Monitor;
-    use crate::resolver::Resolver;
-    use crate::shard_coord::{ShardCoordinator, SplitHinter};
-
-    struct NoSplitHints;
-
-    impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &str, _shard: &glassdb_storage::Shard) {}
-    }
 
     fn new_catalog() -> (CollectionCatalog, CollectionStore, Monitor, Arc<Background>) {
         let timeline = Timeline::new();
@@ -147,7 +131,6 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects.clone());
         let background = Arc::new(Background::new());
         let transactions = TLogger::new(objects, "db");
         let monitor = Monitor::with_config(
@@ -158,59 +141,14 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let resolver = Resolver::new(shards.clone(), monitor.clone());
-        let coordinator = ShardCoordinator::with_hinter(
-            shards.clone(),
-            resolver,
-            monitor.clone(),
-            RetryConfig::default(),
-            glassdb_storage::SplitPolicy::default(),
-            Arc::new(NoSplitHints),
-        );
-        let locker = Locker::new(
-            coordinator,
-            Directory::new(shards),
+        let state = CollectionStateResolver::new(
             records.clone(),
             transactions,
             monitor.clone(),
             RetryConfig::default(),
         );
-        let catalog = CollectionCatalog::new(locker);
+        let catalog = CollectionCatalog::new(state);
         (catalog, records, monitor, background)
-    }
-
-    #[tokio::test]
-    async fn sole_directory_reader_can_upgrade_to_writer() {
-        let (catalog, records, _monitor, _background) = new_catalog();
-        let parent = CollectionAddress::root("db");
-        let prefix = parent.physical_prefix();
-        assert!(
-            records
-                .create_record(&prefix, &CollectionRecord::new())
-                .await
-                .unwrap()
-        );
-        let id = TxId::from_bytes(vec![1]);
-
-        catalog
-            .locker
-            .directories()
-            .acquire(&parent, &id, LockType::Read)
-            .await
-            .unwrap();
-        catalog
-            .locker
-            .directories()
-            .acquire(&parent, &id, LockType::Write)
-            .await
-            .unwrap();
-
-        let (record, _) = records
-            .load_record(&prefix, Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(record.directory_lock().lock_type(), LockType::Write);
-        assert_eq!(record.directory_lock().holders(), std::slice::from_ref(&id));
     }
 
     #[tokio::test]

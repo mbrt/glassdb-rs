@@ -40,8 +40,8 @@ use glassdb_storage::{
 };
 
 use crate::error::TransError;
+use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
-use crate::resolver::Resolver;
 
 /// Maximum inner CAS retries on a single shard/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -186,11 +186,10 @@ pub(crate) enum Step {
     Skip { outcome: FoldOutcome },
 }
 
-/// The shared handles a resolver may consult mid-fold: the effective-writer
-/// [`Resolver`] (help-forwarding), the [`Monitor`] (wound-wait status), and why
-/// this fold is running ([`ReloadCause`], for commit-install in-doubt).
+/// The shared handles a resolver may consult mid-fold: loaded key-state
+/// resolution, the transaction monitor, and why this fold is running.
 pub(crate) struct ResolveCtx<'a> {
-    pub(crate) resolver: &'a Resolver,
+    pub(crate) key_state: &'a KeyStateResolver,
     pub(crate) tmon: &'a Monitor,
     pub(crate) requirement: Requirement,
     pub(crate) cause: ReloadCause,
@@ -347,7 +346,7 @@ pub trait SplitHinter: Send + Sync {
 struct CoordCore {
     tmon: Monitor,
     shards: ShardStore,
-    resolver: Resolver,
+    key_state: KeyStateResolver,
     retry: RetryConfig,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
@@ -473,7 +472,7 @@ impl CasWorker {
             let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
             for (tx, m) in ordered {
                 let ctx = ResolveCtx {
-                    resolver: &self.core.resolver,
+                    key_state: &self.core.key_state,
                     tmon: &self.core.tmon,
                     // Resolver dependencies belong to the logical round, not the
                     // cache seed used after a failed CAS. Preserve the submitters'
@@ -669,7 +668,7 @@ impl ShardCoordinator {
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         shards: ShardStore,
-        resolver: Resolver,
+        key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
         policy: SplitPolicy,
@@ -678,7 +677,7 @@ impl ShardCoordinator {
         let core = Arc::new(CoordCore {
             tmon,
             shards,
-            resolver,
+            key_state,
             retry,
             stats: Stats::default(),
             policy,
@@ -730,7 +729,7 @@ impl ShardCoordinator {
     ///
     /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
-    /// ([`Directory`](glassdb_storage::Directory)).
+    /// ([`TreeRouter`](glassdb_storage::TreeRouter)).
     pub(crate) async fn submit_shard(
         &self,
         path: &str,
@@ -878,9 +877,9 @@ mod tests {
             crate::monitor::ProtocolTiming::default(),
         );
         let shards = ShardStore::new(objects);
-        let resolver = Resolver::new(shards.clone(), mon.clone());
+        let key_state = KeyStateResolver::new(mon.clone());
         let coord =
-            ShardCoordinator::with_hinter(shards.clone(), resolver, mon, retry, policy, hinter);
+            ShardCoordinator::with_hinter(shards.clone(), key_state, mon, retry, policy, hinter);
         (coord, shards, timeline, bg)
     }
 

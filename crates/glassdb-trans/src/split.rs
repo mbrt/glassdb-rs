@@ -50,19 +50,17 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
-    CollectionStore, Directory, IndexNode, InlinePolicy, LeafObservation, LockType, Node,
-    Observation, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy, StorageError,
-    StructuralLog, StructuralLogPhase, Timeline, TxCommitStatus, TxLock, TxLog,
+    CollectionStore, IndexNode, InlinePolicy, LeafObservation, LockType, Node, Observation,
+    Requirement, Shard, ShardEntry, ShardStore, SplitPolicy, StorageError, StructuralLog,
+    StructuralLogPhase, Timeline, TreeRouter, TxCommitStatus, TxLock, TxLog,
 };
 use tokio::sync::Notify;
 
 use crate::collections::TopologySettler;
 use crate::error::TransError;
+use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::{Monitor, TxRecoveryManifest};
-use crate::node_locking::{
-    NodeLockReconciler, QuiescedEntries, StructuralGateResolver, quiesce_entries,
-};
-use crate::resolver::Resolver;
+use crate::node_locking::{NodeLockReconciler, QuiescedEntries, StructuralGateResolver};
 use crate::shard_coord::{FoldOutcome, ShardCoordinator, SplitHinter};
 
 /// How often the splitter drains its candidate queue. A split is a handful of
@@ -385,9 +383,9 @@ pub struct Splitter {
     bg: Weak<Background>,
     records: CollectionStore,
     shards: ShardStore,
-    dir: Directory,
+    router: TreeRouter,
     mon: Monitor,
-    resolver: Resolver,
+    key_state: KeyStateResolver,
     timeline: Timeline,
     db_root: String,
     // The candidate feed this splitter drains. The coordinator receives a
@@ -420,7 +418,7 @@ impl Splitter {
         shards: ShardStore,
         timeline: Timeline,
         mon: Monitor,
-        resolver: Resolver,
+        key_state: KeyStateResolver,
         clock: Clock,
         retry: RetryConfig,
         db_root: &str,
@@ -430,7 +428,7 @@ impl Splitter {
         let candidates = SplitCandidates::with_policies(policy, inline, clock);
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
-            resolver.clone(),
+            key_state.clone(),
             mon.clone(),
             retry,
             policy,
@@ -442,7 +440,7 @@ impl Splitter {
             shards,
             timeline,
             mon,
-            resolver,
+            key_state,
             db_root,
             coord.clone(),
             candidates,
@@ -492,20 +490,20 @@ impl Splitter {
         shards: ShardStore,
         timeline: Timeline,
         mon: Monitor,
-        resolver: Resolver,
+        key_state: KeyStateResolver,
         db_root: &str,
         coord: ShardCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
     ) -> Self {
-        let dir = Directory::new(shards.clone());
+        let router = TreeRouter::new(shards.clone());
         Splitter {
             bg,
             records,
             shards,
-            dir,
+            router,
             mon,
-            resolver,
+            key_state,
             timeline,
             db_root: db_root.to_string(),
             candidates,
@@ -648,7 +646,7 @@ impl Splitter {
         let parsed = paths::parse(observed_path)
             .map_err(|error| StorageError::with_source("parsing pressure path", error))?;
         let located = match self
-            .dir
+            .router
             .leaf_for(
                 &parsed.prefix,
                 key,
@@ -962,21 +960,15 @@ impl Splitter {
                 .cloned()
                 .map(|entry| (entry.key.clone(), entry))
                 .collect();
-            let entries = match quiesce_entries(
-                &self.resolver,
-                &self.mon,
-                &collection,
-                id,
-                &entries,
-                Requirement::Any,
-            )
-            .await?
+            let reconciler = NodeLockReconciler::new(&self.key_state, &self.mon, id);
+            let entries = match reconciler
+                .quiesce_entries(&collection, &entries, Requirement::Any)
+                .await?
             {
                 QuiescedEntries::Ready(entries) => entries,
                 QuiescedEntries::Wait(_) => return Ok(None),
             };
             let mut locks = node.locks().clone();
-            let reconciler = NodeLockReconciler::new(&self.mon, id);
             if reconciler
                 .acquire_structural_gate(&mut locks)
                 .await?
@@ -1635,7 +1627,7 @@ impl Splitter {
                 ));
             }
             vec![
-                self.dir
+                self.router
                     .token_reachable_at_key(
                         &record.prefix,
                         &[],
@@ -1643,7 +1635,7 @@ impl Splitter {
                         requirement,
                     )
                     .await?,
-                self.dir
+                self.router
                     .token_reachable_at_key(
                         &record.prefix,
                         &record.split_key,
@@ -1659,7 +1651,7 @@ impl Splitter {
                 ));
             }
             vec![
-                self.dir
+                self.router
                     .token_reachable_at_key(
                         &record.prefix,
                         &record.split_key,
@@ -1722,7 +1714,7 @@ impl Splitter {
         let publication_start = Requirement::AtLeast(self.timeline.now());
         for _ in 0..PARENT_RETRIES {
             let Some(parent) = self
-                .dir
+                .router
                 .parent_index_for(prefix, split_key, publication_start)
                 .await?
             else {
@@ -2095,10 +2087,10 @@ mod tests {
         mon: Monitor,
         candidates: SplitCandidates,
     ) -> Splitter {
-        let resolver = Resolver::new(shards.shards.clone(), mon.clone());
+        let key_state = KeyStateResolver::new(mon.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.shards.clone(),
-            resolver.clone(),
+            key_state.clone(),
             mon.clone(),
             RetryConfig::default(),
             *candidates.policy(),
@@ -2110,7 +2102,7 @@ mod tests {
             shards.shards.clone(),
             shards.timeline.clone(),
             mon,
-            resolver,
+            key_state,
             "db",
             coord,
             candidates,
@@ -2188,9 +2180,10 @@ mod tests {
             .await
             .unwrap();
 
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         assert_eq!(
-            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            router
+                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -2198,7 +2191,7 @@ mod tests {
             "one leaf became two"
         );
         for key in keys {
-            let loc = dir
+            let loc = router
                 .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
@@ -2232,8 +2225,8 @@ mod tests {
             .unwrap();
         assert!(node.as_index().is_some(), "root became an index");
 
-        let dir = Directory::new(s.shards.clone());
-        let leaves = dir
+        let router = TreeRouter::new(s.shards.clone());
+        let leaves = router
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2257,7 +2250,7 @@ mod tests {
         );
         // Every key remains reachable by descent, in order.
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
-            let loc = dir
+            let loc = router
                 .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
@@ -2383,8 +2376,8 @@ mod tests {
             .await
             .unwrap();
 
-        let dir = Directory::new(s.shards.clone());
-        let leaves = dir
+        let router = TreeRouter::new(s.shards.clone());
+        let leaves = router
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2399,7 +2392,7 @@ mod tests {
         let index = root_node.as_index().unwrap();
         assert_eq!(index.len(), 2, "parent gained the separator");
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
-            let loc = dir
+            let loc = router
                 .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
@@ -2466,9 +2459,9 @@ mod tests {
             "root now has two index children"
         );
         // Every original leaf is still reached in order (now via one more hop).
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         for k in [b"a".as_slice(), b"m", b"t"] {
-            let loc = dir
+            let loc = router
                 .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
@@ -2492,7 +2485,7 @@ mod tests {
         let sp = splitter(&s, &bg, tiny());
 
         sp.split_path(&paths::tree_root(COLL)).await.unwrap();
-        let after_first = Directory::new(s.shards.clone())
+        let after_first = TreeRouter::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2503,7 +2496,7 @@ mod tests {
         }
         sp.split_path(&paths::tree_root(COLL)).await.unwrap();
 
-        let after_second = Directory::new(s.shards.clone())
+        let after_second = TreeRouter::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2543,7 +2536,7 @@ mod tests {
         let sp = splitter_with_candidates(&s, &bg, candidates);
         sp.run_once().await;
 
-        let leaves = Directory::new(s.shards.clone())
+        let leaves = TreeRouter::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2588,9 +2581,10 @@ mod tests {
             .observe_inline_pressure(&root_path, b"h", 8);
         sp.run_once().await;
 
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         assert_eq!(
-            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            router
+                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -2611,7 +2605,7 @@ mod tests {
             }
         );
 
-        let target = dir
+        let target = router
             .leaf_for(COLL, b"h", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2635,7 +2629,8 @@ mod tests {
         sp.run_once().await;
 
         assert_eq!(
-            dir.leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            router
+                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -2655,7 +2650,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        let target = dir
+        let target = router
             .leaf_for(COLL, b"h", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2817,7 +2812,7 @@ mod tests {
             mon.tx_status(&younger).await.unwrap(),
             TxCommitStatus::Aborted
         );
-        let leaves = Directory::new(s.shards.clone())
+        let leaves = TreeRouter::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2866,7 +2861,7 @@ mod tests {
 
         sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
 
-        let leaf = Directory::new(s.shards.clone())
+        let leaf = TreeRouter::new(s.shards.clone())
             .leaf_for(COLL, b"d", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -2900,10 +2895,10 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let other_resolver = Resolver::new(other.shards.clone(), other_mon.clone());
+        let other_key_state = KeyStateResolver::new(other_mon.clone());
         let other_coord = ShardCoordinator::with_hinter(
             other.shards.clone(),
-            other_resolver,
+            other_key_state,
             other_mon.clone(),
             RetryConfig::default(),
             SplitPolicy::default(),
@@ -2911,14 +2906,18 @@ mod tests {
         );
         let other_locker = crate::tlocker::Locker::new(
             other_coord,
-            Directory::new(other.shards.clone()),
-            other.records.clone(),
-            other_transactions,
+            TreeRouter::new(other.shards.clone()),
+            crate::collection_coordination::CollectionStateResolver::new(
+                other.records.clone(),
+                other_transactions,
+                other_mon.clone(),
+                RetryConfig::default(),
+            ),
             other_mon,
             RetryConfig::default(),
         );
         other_locker
-            .data()
+            .keys()
             .write_back_one_put(
                 &holder,
                 &paths::from_node(COLL, "L"),
@@ -2926,7 +2925,7 @@ mod tests {
                 &KeyRef::new(collection(), b"d"),
             )
             .await;
-        let current = Directory::new(other.shards.clone())
+        let current = TreeRouter::new(other.shards.clone())
             .leaf_for(COLL, b"d", Requirement::Any)
             .await
             .unwrap();
@@ -2965,7 +2964,7 @@ mod tests {
         );
         sp.run_once().await;
         assert_eq!(
-            Directory::new(s.shards.clone())
+            TreeRouter::new(s.shards.clone())
                 .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
@@ -2976,7 +2975,7 @@ mod tests {
         mon.abort_tx(&older).await.unwrap();
         sp.run_once().await;
         assert_eq!(
-            Directory::new(s.shards.clone())
+            TreeRouter::new(s.shards.clone())
                 .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
@@ -3016,7 +3015,7 @@ mod tests {
 
         // The only cap crossed is the byte cap, so a split here proves the byte
         // cap now has a producer.
-        let leaves = Directory::new(s.shards.clone())
+        let leaves = TreeRouter::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
@@ -3081,9 +3080,9 @@ mod tests {
         );
 
         // Every key is still reachable in order.
-        let dir = Directory::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone());
         for k in [b"a".as_slice(), b"b", b"m", b"n", b"o"] {
-            let loc = dir
+            let loc = router
                 .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
@@ -3140,7 +3139,7 @@ mod tests {
             "the participant stays registered while structural recovery is pending"
         );
         assert_eq!(
-            Directory::new(s.shards.clone())
+            TreeRouter::new(s.shards.clone())
                 .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
