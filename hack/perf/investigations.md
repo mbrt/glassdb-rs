@@ -223,6 +223,100 @@ parallel capacity created by the split and changes p90 to `0.51–0.66x`. This
 does not promise relief for a workload that remains concentrated on one leaf;
 tree widening helps only when demand spans the new ranges.
 
+### Inline-policy sweep
+
+Status: complete. Among the tested policies, the recommended default is a
+1 KiB per-value limit and a 16 KiB aggregate leaf limit. The temporary harness
+was removed after recording the results.
+
+The sweep used reference `9fce478d`. It ran three 32-cell
+matrices in forward/reverse/forward order over the same policies, values, and
+S3/GCS delay profiles. Every cell measured 24 serial RMWs, 128 interleaved
+dense RMWs, cold and warm reads after a fresh 256 KiB-cache reopen, and one
+128-key logged batch. Fresh strong reads verified the serial and dense markers
+after bounded shutdown. All 864 phase rows reported zero failures, every
+bounded shutdown completed, and all fresh verification passed. Eligible
+partial-admission cells included a separate three-second settle phase so the
+splitter's real-time sweep cadence was measured outside foreground throughput.
+
+The dense-wave medians below are relative to `InlinePolicy::none()`. Node bytes
+include foreground, settle, and shutdown node mutations, amortized over the 128
+logical mutations. Split counts are pressure splits over the same interval.
+
+| Value / aggregate policy | Direct land, S3 / GCS | S3 rate / p50 / p90 | GCS rate / p50 / p90 | Node KiB/tx, S3 / GCS | Splits, S3 / GCS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 B / any inline budget | 100% / 100% | `2.54–2.59x` / `0.37–0.38x` / `0.41x` | `1.12x` / `0.36–0.37x` / `2.36x` | `5.0` / `5.0` | `0` / `0` |
+| 128 B / 4 KiB | 25% / 72% | `0.87x` / `1.33x` / `1.25x` | `1.18x` / `0.42x` / `1.28x` | `13.5` / `7.8` | `1` / `3` |
+| 128 B / 16 or 64 KiB | 100% / 100% | `2.43–2.48x` / `0.38–0.39x` / `0.42–0.43x` | `1.15–1.16x` / `0.37x` / `2.35x` | `12.8` / `12.8` | `0` / `0` |
+| 1 KiB / 4 KiB | 6% / 16% | `0.54x` / `1.47x` / `1.33x` | `0.80x` / `1.01x` / `1.37x` | `16.1` / `11.8` | `3` / `8` |
+| 1 KiB / 16 KiB | 13% / 50% | `0.65x` / `1.44x` / `1.32x` | `0.99x` / `0.87x` / `1.29x` | `35.4` / `26.0` | `1` / `6` |
+| 1 KiB / 64 KiB | 50% / 50% | `1.09x` / `0.82x` / `1.27x` | `0.75x` / `1.24x` / `1.48x` | `81.4` / `86.7` | `1` / `1` |
+
+The GCS p90 inversion is expected from this model: an uninterrupted sequence
+of direct root CASes hits the modeled one-write-per-second same-object limit,
+and its retry backoff overshoots the next token. Inlining still removes work and
+improves p50, but a single hot leaf has worse modeled tail latency. Splitting
+can spread disjoint keys over objects; one hot key cannot benefit. Node-CAS p50
+was otherwise stable at roughly `104–109 ms` in S3. The delay model charges no
+extra latency for larger payloads, so these results measure operation count and
+rate limiting, not the real transfer cost of a 64 KiB CAS.
+
+The cost boundary is sharper than foreground latency alone:
+
+- Full admission at 8 B removes one transaction-log mutation per dense RMW,
+  reduces backend operations to `0.36x`, and leaves node bytes effectively
+  unchanged. This is an unambiguous win in both profiles.
+- Full admission at 128 B also removes one transaction-log mutation and reduces
+  operations to `0.35–0.37x`, but node write bytes rise from roughly `5–6` to
+  `12.8 KiB/tx`. The 16 KiB and 64 KiB policies are equivalent in this cell;
+  4 KiB falls onto the partial-admission cliff.
+- At 1 KiB, the 64 KiB policy saves only `0.48` S3 and `0.44` GCS
+  transaction-log operations per mutation in the first dense wave. Total write
+  bytes rise by `12.5x` and `14.6x`, respectively. Smaller budgets cap each
+  leaf but pay more fallbacks and permanent splits; none dominates both
+  profiles. The 4 KiB aggregate candidate is not worth carrying forward.
+- Over-budget 4 KiB values admit nothing and behave like no inlining, within
+  run noise. This confirms that merely enabling an inline policy has no
+  material fallback tax.
+
+Reads repay some of the retained inline bytes. At 8 B and fully admitted 128 B,
+cold reads fall from `2.01` to `1.01` backend operations per key. At 1 KiB, the
+64 KiB policy's median half-coverage lowers cold operations to `1.52`; after a
+warm pass, transaction-log reads fall to `0.03–0.04` per key versus `0.27` with
+no inlining. External 4 KiB values exceed the 256 KiB cache working set and
+still need about `0.98` transaction-log reads per warm key.
+
+Logged batches publish no new inline values, but acquiring and clearing leaves
+must preserve existing ones. With 128 B values, fully admitted policies write
+`27.6 KiB` of node data versus `11.3 KiB` with no inlining. With 1 KiB values,
+the 64 KiB policy writes `75.5 KiB` of node data and `207.3 KiB` total versus
+`11.3 KiB` and `143.0 KiB`; narrower policies use smaller leaves but can touch
+many more of them after pressure splitting. Batch latency was not consistently
+different across the three samples, so bytes and node-CAS count are the useful
+signals here.
+
+The best default among the tested policies is therefore:
+
+- `max_value_bytes = 1 KiB`
+- `max_leaf_bytes = 16 KiB`
+
+This is a robust default, not a universal optimum. The 4 KiB cap reaches partial
+admission too early. The 64 KiB cap behaves identically to 16 KiB for the clear
+8 B and 128 B wins, and both retain the one-CAS path for a hot 1 KiB key. Its
+extra capacity helps transient S3 admission in the dense 1 KiB cell, but costs
+`2.3–3.3x` as many node-write bytes as 16 KiB there and performs worse in the
+GCS profile. Because the delay model does not charge for payload size, that
+comparison is biased in favor of 64 KiB. A 16 KiB default keeps the proven
+small-value and hot-key benefits while placing a four-times lower cap on
+aggregate inline payload.
+
+The trade-off is earlier, durable splitting and more leaves for dense 1 KiB
+sets. Workloads that have measured request count as more important than leaf
+bytes can still opt into 64 KiB through `DatabaseBuilder`. Lowering the default
+is correctness-safe: existing inline values are grandfathered and the policy is
+not persisted. Clients of one database should nevertheless deploy the same
+configuration, because pressure splits durably change its topology.
+
 ### Current conclusion
 
 ADR-054 removes logged write-back amplification, and ADR-056 supplies the
@@ -234,6 +328,7 @@ into capacity, and repaid by later mutations. It does not establish that the
 current 1 KiB/64 KiB budgets are optimal, nor quantify permanent widening under
 a broad workload.
 
-The next investigation is the inline-policy sweep: compare no inlining,
-current defaults, and smaller aggregate budgets across value sizes before
-treating the defaults as settled.
+The inline-policy sweep recommends changing the default from 1 KiB / 64 KiB to
+1 KiB / 16 KiB. Real-provider and repeated-wave measurements remain useful for
+later tuning, but are not a blocker: 16 KiB is the safer cross-profile default,
+while 64 KiB remains an explicit workload-specific option.
