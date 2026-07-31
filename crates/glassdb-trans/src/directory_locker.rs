@@ -220,11 +220,6 @@ impl DirectoryLocker {
         }
     }
 
-    /// Returns the collection store shared with physical lifecycle operations.
-    pub(crate) fn records(&self) -> CollectionStore {
-        self.records.clone()
-    }
-
     pub(crate) async fn acquire(
         &self,
         parent: &CollectionAddress,

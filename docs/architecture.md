@@ -98,13 +98,16 @@ in-memory backend and middleware. The deterministic-simulation runtime (the
 ## Component Responsibilities
 
 Inside the transaction engine (`glassdb-trans`) the division of labour follows a
-deliberate **policy vs. mechanism** split, with one structural invariant: the
-**shard concept never leaks above the locker**. `Algo` decides *what* must happen
-to commit a transaction — purely in terms of logical keys (paths), the version
-tokens observed at read time, and staged writes — while the `Locker` decides
-*how* to acquire those locks efficiently, owning the mapping from keys to shard
-objects and the parallel/serial CAS. (`Reader` is likewise shard-aware
-internally but exposes a path-based API.)
+deliberate **policy vs. mechanism** split, with one structural invariant:
+**shard routing and shard CAS never leak above the locker**. `Algo` decides
+*what* must happen to commit a transaction — purely in terms of logical keys
+(paths), the version tokens observed at read time, and staged writes — while the
+`Locker` decides *how* to acquire those locks efficiently, owning the mapping
+from keys to shard objects and the parallel/serial CAS. (`Reader` is likewise
+shard-aware internally but exposes a path-based API. `Algo` holds a `ShardStore`
+for one narrow purpose: re-checking during optimistic validation whether a leaf
+observation already carried in its own `Data` is still current. It routes no key
+and CASes no object.)
 
 Every shard/root entry mutation — lock acquire, single read-write commit-install,
 write-back, release, and GC reclamation — flows through **one shard-mutation
@@ -122,14 +125,14 @@ nothing of locks or transaction ids. For the full design see
                                 ▼
 ═══════════════════════════ glassdb-trans ═══════════════════════════
 
-  Algo — commit POLICY  (shard-agnostic)
+  Algo — commit POLICY  (no shard routing, no shard CAS)
     · lifecycle:        begin / rebegin / end
     · orchestrates:     lock → validate reads → commit point → write-back
     · conflict policy:  wound · deadlock-timeout · serial · backoff
     · read validation:  effective-writer token vs. observed (post-lock)
     · speaks:           Data · TxId · LockOutcome{Locked|Conflict}
 
-      │ validate           │ lock(Data, serial)  │ status        │ schedule
+      │ validate           │ lock(Data, serial)  │ status        │ reclaim hint
       │                    │  ▲ LockedTx (opaque) │               │
       ▼                    ▼  │                    ▼               ▼
  ┌─────────┐   ┌───────────────────────┐   ┌──────────┐   ┌─────────┐
@@ -204,7 +207,7 @@ wound-wait; the fold visits members oldest-first so it never has to backtrack.
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | closures, `Error`            | user body, retry loop, cancel-safety                                                                                  | locks, shards, tx logs              |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall` | **shards**, CAS details, caching    |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall`, GC candidate hints | shard routing, CAS details, caching, the split mechanism beyond its `SplitHintSink` producer handle |
 | `Locker::data`        | data-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
 | `Locker::directories` | directory-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, status resolution, recovery write-back and release | key routing, B-link topology |
 | `CollectionCatalog`   | collection semantics | directory reads and binding changes | logical snapshots, read-your-writes validation, capacity/precondition checks | CAS, wound-wait, transaction logs |

@@ -1,7 +1,9 @@
 //! Physical preparation, fencing, and reclamation of collection incarnations.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::{
@@ -12,31 +14,49 @@ use glassdb_storage::{
 use super::{CollectionChange, CollectionOp};
 use crate::error::TransError;
 use crate::monitor::{Monitor, TxFinalStatus};
-use crate::split::Splitter;
 use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
+
+/// Completes the structural recovery a finalized topology participant left
+/// behind, so a drop can freeze the topology without waiting for the background
+/// sweep. The [`Splitter`](crate::Splitter) supplies the implementation.
+#[async_trait]
+pub trait TopologySettler: Send + Sync {
+    /// Finishes and releases `id`'s structural work on `collection`. Returns
+    /// [`TransError::Retry`] while `id` is not yet final.
+    async fn settle_topology_participant(
+        &self,
+        collection: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError>;
+}
 
 /// Drives collection incarnations through preparation, deletion, and cleanup.
 #[derive(Clone)]
-pub(crate) struct CollectionLifecycle {
+pub struct CollectionLifecycle {
     records: CollectionStore,
     shards: ShardStore,
     monitor: Monitor,
     retry: RetryConfig,
+    // A drop must outlive every pre-existing topology participant before its
+    // commit point, so fencing settles them rather than racing them.
+    topology: Arc<dyn TopologySettler>,
 }
 
 impl CollectionLifecycle {
     /// Creates collection lifecycle access over the shared stores.
-    pub(crate) fn new(
+    pub fn new(
         records: CollectionStore,
         shards: ShardStore,
         monitor: Monitor,
         retry: RetryConfig,
+        topology: Arc<dyn TopologySettler>,
     ) -> Self {
         Self {
             records,
             shards,
             monitor,
             retry,
+            topology,
         }
     }
 
@@ -79,14 +99,13 @@ impl CollectionLifecycle {
         &self,
         id: &TxId,
         changes: &[CollectionChange],
-        splitter: &Splitter,
     ) -> Result<(), TransError> {
         for collection in changes
             .iter()
             .filter(|change| change.op == CollectionOp::Drop)
             .map(|change| &change.collection)
         {
-            self.freeze_topology(collection, id, splitter).await?;
+            self.freeze_topology(collection, id).await?;
             let prefix = collection.physical_prefix();
             let nodes = self.shards.list_nodes(&prefix, Requirement::Any).await?;
             for (token, _) in nodes {
@@ -147,7 +166,6 @@ impl CollectionLifecycle {
         &self,
         collection: &CollectionAddress,
         id: &TxId,
-        splitter: &Splitter,
     ) -> Result<(), TransError> {
         let prefix = collection.physical_prefix();
         let mut backoff = self.retry.backoff();
@@ -185,7 +203,7 @@ impl CollectionLifecycle {
                 .cloned()
                 .expect("participant presence was checked above");
             resolve_tx_conflict(&self.monitor, id, &participant).await?;
-            splitter
+            self.topology
                 .settle_topology_participant(collection, &participant)
                 .await?;
             rt::sleep(backoff.next_delay()).await;
@@ -364,6 +382,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::Background;
@@ -375,6 +394,19 @@ mod tests {
 
     const COLLECTION: &str = "db/_c/0000000000000000000000";
     const SOURCE_TOKEN: &str = "L";
+
+    struct UnexpectedTopologySettler;
+
+    #[async_trait]
+    impl TopologySettler for UnexpectedTopologySettler {
+        async fn settle_topology_participant(
+            &self,
+            _collection: &CollectionAddress,
+            _id: &TxId,
+        ) -> Result<(), TransError> {
+            panic!("the subject under test must not settle topology participants")
+        }
+    }
 
     struct FirstSourceWriteGate {
         armed: AtomicBool,
@@ -474,12 +506,14 @@ mod tests {
             primary.shards.clone(),
             monitor.clone(),
             retry,
+            Arc::new(UnexpectedTopologySettler),
         );
         let peer_lifecycle = CollectionLifecycle::new(
             peer.records.clone(),
             peer.shards.clone(),
             monitor.clone(),
             retry,
+            Arc::new(UnexpectedTopologySettler),
         );
         let split_id = TxId::from_bytes(vec![2]);
         let drop_id = TxId::from_bytes(vec![1]);

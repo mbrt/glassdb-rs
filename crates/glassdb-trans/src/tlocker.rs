@@ -37,11 +37,10 @@ use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{KeyRef, LeafRef, TxId, paths};
 use glassdb_storage::{
     CollectionStore, CurrentState, Directory, LeafObservation, LockType, NodeLocks, Requirement,
-    ShardEntry, ShardStore, TLogger, TxLock,
+    ShardEntry, TLogger, TxLock,
 };
 
 use crate::access::{Data, WriteOp};
-use crate::collections::CollectionLifecycle;
 use crate::directory_locker::DirectoryLocker;
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -743,10 +742,6 @@ enum Woke {
 pub struct Locker {
     data: DataLocker,
     directories: DirectoryLocker,
-    /// Used to build physical collection lifecycle operations.
-    tmon: Monitor,
-    /// Used to build physical collection lifecycle operations.
-    retry: RetryConfig,
 }
 
 /// Coordinates locks and committed effects on data leaves.
@@ -788,9 +783,7 @@ impl Locker {
     ) -> Self {
         Locker {
             data: DataLocker::new(coord, dir, tmon.clone(), retry),
-            directories: DirectoryLocker::new(records, transactions, tmon.clone(), retry),
-            tmon,
-            retry,
+            directories: DirectoryLocker::new(records, transactions, tmon, retry),
         }
     }
 
@@ -814,16 +807,6 @@ impl Locker {
     /// Returns the collection-directory locking interface.
     pub(crate) fn directories(&self) -> &DirectoryLocker {
         &self.directories
-    }
-
-    /// Builds collection lifecycle operations over the locker's control store.
-    pub(crate) fn collection_lifecycle(&self, shards: ShardStore) -> CollectionLifecycle {
-        CollectionLifecycle::new(
-            self.directories.records(),
-            shards,
-            self.tmon.clone(),
-            self.retry,
-        )
     }
 }
 

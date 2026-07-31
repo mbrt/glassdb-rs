@@ -21,8 +21,8 @@ pub use access::{
 };
 pub use algo::{Algo, DirectCommitStats, Handle};
 pub use collections::{
-    CollectionCatalog, CollectionChange, CollectionData, CollectionOp, DirectoryRead,
-    DirectoryReadKind, DirectorySnapshot,
+    CollectionCatalog, CollectionChange, CollectionData, CollectionLifecycle, CollectionOp,
+    DirectoryRead, DirectoryReadKind, DirectorySnapshot, TopologySettler,
 };
 pub use error::TransError;
 pub use gc::Gc;
@@ -30,7 +30,7 @@ pub use monitor::{Monitor, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue, Reader};
 pub use resolver::{Resolver, ScanResult};
 pub use shard_coord::{ShardCoordinator, ShardCoordinatorStats, SplitHinter};
-pub use split::{InlinePressureStats, Splitter, SplitterStats};
+pub use split::{InlinePressureStats, SplitHintSink, Splitter, SplitterStats};
 pub use tlocker::{HeldLeafSnapshot, Locker, LockerStats, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface does not force callers to pull

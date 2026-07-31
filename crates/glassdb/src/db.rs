@@ -13,8 +13,8 @@ use glassdb_storage::{
     PersistentCacheMedia, Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
 };
 use glassdb_trans::{
-    Algo, CollectionCatalog, Gc, Locker, Monitor, ProtocolTiming, Resolver, ShardCoordinator,
-    Splitter, TransError,
+    Algo, CollectionCatalog, CollectionLifecycle, Gc, Locker, Monitor, ProtocolTiming, Resolver,
+    ShardCoordinator, Splitter, TransError,
 };
 use tokio::sync::Notify;
 
@@ -219,12 +219,23 @@ impl DatabaseBuilder {
             retry,
         );
         let collection_catalog = CollectionCatalog::new(locker.clone());
+        // One shared handle: a drop's topology freeze settles pre-existing
+        // structural participants through the splitter, so that edge is wired
+        // here rather than manufactured inside `Algo` and `Gc`.
+        let collection_lifecycle = CollectionLifecycle::new(
+            records.clone(),
+            shards.clone(),
+            tmon.clone(),
+            retry,
+            Arc::new(splitter.clone()),
+        );
         let gc = Gc::new(
             bg_weak.clone(),
             tl,
             shards.clone(),
             timeline.clone(),
             locker.clone(),
+            collection_lifecycle.clone(),
             tmon.clone(),
             clock.clone(),
         );
@@ -237,13 +248,14 @@ impl DatabaseBuilder {
             coord.clone(),
             tmon.clone(),
             collection_catalog.clone(),
+            collection_lifecycle,
             clock,
             gc,
             Some(bg_weak),
             resolver,
             split_policy,
             inline_policy,
-            splitter.clone(),
+            splitter.hint_sink(),
         );
 
         let inner = Arc::new(DbInner {

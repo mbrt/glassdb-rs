@@ -50,7 +50,7 @@ use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
 };
-use crate::split::{SplitHintSink, Splitter};
+use crate::split::SplitHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 /// Number of failed parallel-locking attempts before a transaction escalates to
@@ -505,7 +505,7 @@ pub struct Algo {
     inline_policy: InlinePolicy,
     collection_catalog: CollectionCatalog,
     collection_lifecycle: CollectionLifecycle,
-    splitter: Splitter,
+    split_hints: SplitHintSink,
     direct_commit_stats: Arc<DirectCommitCounters>,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
@@ -513,9 +513,10 @@ pub struct Algo {
 }
 
 impl Algo {
-    /// Creates an algorithm coordinator. Validation barriers use `timeline`;
-    /// `clock` is the wall-clock source for transaction-id timestamps and must
-    /// match the monitor's clock so priorities and lease timing share one base.
+    /// Creates a transaction algorithm coordinator.
+    ///
+    /// Validation barriers use `timeline`; `clock` must match the monitor's
+    /// clock so transaction priorities and lease timing share one time base.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shards: ShardStore,
@@ -524,15 +525,15 @@ impl Algo {
         coord: ShardCoordinator,
         mon: Monitor,
         collection_catalog: CollectionCatalog,
+        collection_lifecycle: CollectionLifecycle,
         clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
         resolver: Resolver,
         split_policy: SplitPolicy,
         inline_policy: InlinePolicy,
-        splitter: Splitter,
+        split_hints: SplitHintSink,
     ) -> Self {
-        let collection_lifecycle = locker.collection_lifecycle(shards.clone());
         Algo {
             shards,
             resolver,
@@ -546,7 +547,7 @@ impl Algo {
             inline_policy,
             collection_catalog,
             collection_lifecycle,
-            splitter,
+            split_hints,
             direct_commit_stats: Arc::new(DirectCommitCounters::default()),
             background,
         }
@@ -946,7 +947,7 @@ impl Algo {
         // attempt is cleared if this same transaction reruns a different body.
         tx.fenced_drops.extend(active_drops);
         self.collection_lifecycle
-            .fence_drops(&tx.id, &tx.collection_data.changes, &self.splitter)
+            .fence_drops(&tx.id, &tx.collection_data.changes)
             .await?;
 
         // Commit point: create-or-flip the transaction object to committed.
@@ -1155,7 +1156,7 @@ impl Algo {
             value,
             read_version,
             inline,
-            split_hints: self.splitter.hint_sink(),
+            split_hints: self.split_hints.clone(),
         });
         let outcome = self
             .coord
@@ -1675,12 +1676,20 @@ mod tests {
             tmon.clone(),
             RetryConfig::default(),
         );
+        let collection_lifecycle = CollectionLifecycle::new(
+            records.clone(),
+            shards.clone(),
+            tmon.clone(),
+            RetryConfig::default(),
+            Arc::new(splitter.clone()),
+        );
         let gc = Gc::new(
             bg_weak.clone(),
             tlogger.clone(),
             shards.clone(),
             timeline.clone(),
             locker.clone(),
+            collection_lifecycle.clone(),
             tmon.clone(),
             Clock::real(),
         );
@@ -1702,13 +1711,14 @@ mod tests {
             coord.clone(),
             tmon.clone(),
             CollectionCatalog::new(locker.clone()),
+            collection_lifecycle,
             Clock::real(),
             gc,
             None,
             resolver,
             glassdb_storage::SplitPolicy::default(),
             glassdb_storage::InlinePolicy::default(),
-            splitter,
+            splitter.hint_sink(),
         );
         (
             algo,
@@ -3133,7 +3143,7 @@ mod tests {
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
             inline: InlinePolicy::default(),
-            split_hints: tm.splitter.hint_sink(),
+            split_hints: tm.split_hints.clone(),
         };
         let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
@@ -3178,7 +3188,7 @@ mod tests {
         let seed = entry(&tctx, b"k").await.unwrap();
         let current = seed.current.writer().cloned().unwrap();
         let locks = NodeLocks::default();
-        let split_hints = tm.splitter.hint_sink();
+        let split_hints = tm.split_hints.clone();
 
         let direct = |read_version| DirectCommitResolver {
             id: TxId::with_priority(9, b"direct"),

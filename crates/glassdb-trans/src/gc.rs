@@ -121,17 +121,18 @@ impl Gc {
     /// Creates a collector over the transaction log, shard store, locker, and
     /// monitor. Freshness barriers use `timeline`; lease horizons use `clock`
     /// so they remain deterministic under the DST executor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bg: Weak<Background>,
         tl: TLogger,
         shards: ShardStore,
         timeline: Timeline,
         locker: Locker,
+        collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
         clock: Clock,
     ) -> Self {
         let dir = Directory::new(shards.clone());
-        let collection_lifecycle = locker.collection_lifecycle(shards.clone());
         Gc {
             bg,
             tl,
@@ -542,9 +543,11 @@ enum CheckKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::TopologySettler;
     use crate::resolver::Resolver;
     use crate::shard_coord::ShardCoordinator;
     use crate::tlocker::LockOutcome;
+    use async_trait::async_trait;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
@@ -558,6 +561,19 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     const COLL: &str = "db/_c/0000000000000000000000";
+
+    struct UnexpectedTopologySettler;
+
+    #[async_trait]
+    impl TopologySettler for UnexpectedTopologySettler {
+        async fn settle_topology_participant(
+            &self,
+            _collection: &CollectionAddress,
+            _id: &TxId,
+        ) -> Result<(), TransError> {
+            panic!("GC tests must not settle topology participants")
+        }
+    }
 
     fn collection() -> glassdb_data::CollectionAddress {
         glassdb_data::CollectionAddress::root("db")
@@ -636,6 +652,13 @@ mod tests {
             shards.clone(),
             timeline.clone(),
             locker.clone(),
+            CollectionLifecycle::new(
+                records.clone(),
+                shards.clone(),
+                mon.clone(),
+                RetryConfig::default(),
+                Arc::new(UnexpectedTopologySettler),
+            ),
             mon.clone(),
             clock,
         );

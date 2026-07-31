@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use glassdb_concurr::{Background, Clock, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
@@ -55,6 +56,7 @@ use glassdb_storage::{
 };
 use tokio::sync::Notify;
 
+use crate::collections::TopologySettler;
 use crate::error::TransError;
 use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{
@@ -110,9 +112,10 @@ pub(crate) struct SplitCandidates {
 }
 
 /// Lightweight producer handle for split hints decided outside the shard
-/// coordinator.
+/// coordinator. Opaque to its holders: they report pressure, never inspect or
+/// drive the splitter's queue.
 #[derive(Clone)]
-pub(crate) struct SplitHintSink {
+pub struct SplitHintSink {
     candidates: SplitCandidates,
 }
 
@@ -450,7 +453,7 @@ impl Splitter {
 
     /// Returns a producer handle for split hints decided outside the shard
     /// coordinator.
-    pub(crate) fn hint_sink(&self) -> SplitHintSink {
+    pub fn hint_sink(&self) -> SplitHintSink {
         self.candidates.hint_sink()
     }
 
@@ -478,42 +481,6 @@ impl Splitter {
                     .inline_pressure_discarded
                     .swap(0, Ordering::Relaxed),
             },
-        }
-    }
-
-    /// Completes structural recovery before releasing one finalized topology participant.
-    pub(crate) async fn settle_topology_participant(
-        &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-    ) -> Result<(), TransError> {
-        if !self.mon.tx_status(id).await?.is_final() {
-            return Err(TransError::Retry);
-        }
-        let prefix = collection.physical_prefix();
-        loop {
-            let records = self
-                .shards
-                .list_structural_logs_for_participant(
-                    collection.db_root(),
-                    id,
-                    Requirement::AtLeast(self.timeline.now()),
-                )
-                .await?;
-            if records.is_empty() {
-                return self.leave_topology(&prefix, id).await;
-            }
-            for (_, observed) in records {
-                let record = observed.value().ok_or_else(|| {
-                    TransError::other("structural record disappeared after listing")
-                })?;
-                if record.prefix != prefix {
-                    return Err(TransError::other(
-                        "topology participant owns records for multiple collections",
-                    ));
-                }
-                self.recover_record(&observed).await?;
-            }
         }
     }
 
@@ -1928,6 +1895,45 @@ impl Splitter {
             }
         }
         Ok(missing)
+    }
+}
+
+#[async_trait]
+impl TopologySettler for Splitter {
+    /// Completes structural recovery before releasing one finalized topology participant.
+    async fn settle_topology_participant(
+        &self,
+        collection: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError> {
+        if !self.mon.tx_status(id).await?.is_final() {
+            return Err(TransError::Retry);
+        }
+        let prefix = collection.physical_prefix();
+        loop {
+            let records = self
+                .shards
+                .list_structural_logs_for_participant(
+                    collection.db_root(),
+                    id,
+                    Requirement::AtLeast(self.timeline.now()),
+                )
+                .await?;
+            if records.is_empty() {
+                return self.leave_topology(&prefix, id).await;
+            }
+            for (_, observed) in records {
+                let record = observed.value().ok_or_else(|| {
+                    TransError::other("structural record disappeared after listing")
+                })?;
+                if record.prefix != prefix {
+                    return Err(TransError::other(
+                        "topology participant owns records for multiple collections",
+                    ));
+                }
+                self.recover_record(&observed).await?;
+            }
+        }
     }
 }
 
