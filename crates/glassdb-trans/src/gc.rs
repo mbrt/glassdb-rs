@@ -1242,9 +1242,9 @@ mod tests {
                 .await
         });
         let locker = ctx.locker.clone();
-        let data = crate::algo::Data {
+        let data = crate::access::Data {
             reads: Vec::new(),
-            writes: vec![crate::algo::WriteAccess::put(
+            writes: vec![crate::access::WriteAccess::put(
                 key_path(&kb),
                 Arc::from(&b"v2"[..]),
             )],

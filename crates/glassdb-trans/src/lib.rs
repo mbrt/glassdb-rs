@@ -1,6 +1,7 @@
 //! Transaction engine. Ported from the Go `internal/trans` package: the commit
 //! algorithm, distributed locking, lifecycle monitor, read path, and GC.
 
+mod access;
 mod algo;
 mod collections;
 mod directory_locker;
@@ -15,10 +16,10 @@ mod split;
 mod tlocker;
 mod wound_wait;
 
-pub use algo::{
-    Algo, Data, DirectCommitStats, Handle, LeafCoverage, ReadAccess, ScanAccess, ScanMutation,
-    ScanRange, WriteAccess,
+pub use access::{
+    Data, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
+pub use algo::{Algo, DirectCommitStats, Handle};
 pub use collections::{
     CollectionCatalog, CollectionChange, CollectionData, CollectionOp, DirectoryRead,
     DirectoryReadKind, DirectorySnapshot,

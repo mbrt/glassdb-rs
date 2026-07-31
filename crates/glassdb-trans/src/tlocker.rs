@@ -40,7 +40,7 @@ use glassdb_storage::{
     ShardEntry, ShardStore, TLogger, TxLock,
 };
 
-use crate::algo::{Data, WriteOp};
+use crate::access::{Data, WriteOp};
 use crate::collections::CollectionLifecycle;
 use crate::directory_locker::DirectoryLocker;
 use crate::error::TransError;
@@ -2173,7 +2173,7 @@ mod tests {
         // membership-write lock.
         let data = Data {
             reads: Vec::new(),
-            writes: vec![crate::algo::WriteAccess::put(
+            writes: vec![crate::access::WriteAccess::put(
                 key_ref(key),
                 Arc::from(&b"v"[..]),
             )],

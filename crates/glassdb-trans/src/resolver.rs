@@ -27,7 +27,7 @@ use glassdb_storage::{
     StorageError, TxCommitStatus,
 };
 
-use crate::algo::{LeafCoverage, ScanMutation, ScanRange};
+use crate::access::{LeafCoverage, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
 
