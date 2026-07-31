@@ -5,6 +5,7 @@ mod access;
 mod algo;
 mod collections;
 mod directory_locker;
+mod engine;
 mod error;
 mod gc;
 mod monitor;
@@ -19,19 +20,19 @@ mod wound_wait;
 pub use access::{
     Data, LeafCoverage, ReadAccess, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
-pub use algo::{Algo, DirectCommitStats, Handle};
+pub use algo::DirectCommitStats;
 pub use collections::{
-    CollectionCatalog, CollectionChange, CollectionData, CollectionLifecycle, CollectionOp,
-    DirectoryRead, DirectoryReadKind, DirectorySnapshot, TopologySettler,
+    CollectionChange, CollectionData, CollectionOp, DirectoryRead, DirectoryReadKind,
+    DirectorySnapshot,
 };
+pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
-pub use gc::Gc;
-pub use monitor::{Monitor, ProtocolTiming};
-pub use reader::{ReadOutcome, ReadValue, Reader};
-pub use resolver::{Resolver, ScanResult};
-pub use shard_coord::{ShardCoordinator, ShardCoordinatorStats, SplitHinter};
-pub use split::{InlinePressureStats, SplitHintSink, Splitter, SplitterStats};
-pub use tlocker::{HeldLeafSnapshot, Locker, LockerStats, TxLockSnapshot};
+pub use monitor::ProtocolTiming;
+pub use reader::{ReadOutcome, ReadValue};
+pub use resolver::ScanResult;
+pub use shard_coord::ShardCoordinatorStats;
+pub use split::{InlinePressureStats, SplitterStats};
+pub use tlocker::{HeldLeafSnapshot, LockerStats, TxLockSnapshot};
 
 // Re-exported so the public diagnostics surface does not force callers to pull
 // in `glassdb-concurr` directly.

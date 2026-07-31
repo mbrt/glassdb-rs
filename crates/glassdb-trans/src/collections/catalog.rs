@@ -128,7 +128,15 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Monitor, Resolver, ShardCoordinator};
+    use crate::monitor::Monitor;
+    use crate::resolver::Resolver;
+    use crate::shard_coord::{ShardCoordinator, SplitHinter};
+
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &glassdb_storage::Shard) {}
+    }
 
     fn new_catalog() -> (CollectionCatalog, CollectionStore, Monitor, Arc<Background>) {
         let timeline = Timeline::new();
@@ -142,13 +150,22 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         let background = Arc::new(Background::new());
         let transactions = TLogger::new(objects, "db");
-        let monitor = Monitor::new(transactions.clone(), timeline, Arc::downgrade(&background));
+        let monitor = Monitor::with_config(
+            transactions.clone(),
+            timeline,
+            Arc::downgrade(&background),
+            glassdb_concurr::Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         let resolver = Resolver::new(shards.clone(), monitor.clone());
-        let coordinator = ShardCoordinator::new(
+        let coordinator = ShardCoordinator::with_hinter(
             shards.clone(),
             resolver,
             monitor.clone(),
             RetryConfig::default(),
+            glassdb_storage::SplitPolicy::default(),
+            Arc::new(NoSplitHints),
         );
         let locker = Locker::new(
             coordinator,

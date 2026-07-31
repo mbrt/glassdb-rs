@@ -82,7 +82,7 @@ glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 | `glassdb-backend`     | `lib.rs`, `memory.rs`, `stats.rs`, `middleware/`                             | The `Backend` trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger, fault, recording)                          |
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
-| `glassdb-trans`       | `access.rs`, `algo.rs`, `collections/`, `directory_locker.rs`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: the shared read/write/scan access vocabulary, commit algorithm, transactional collection lifecycle, data/directory locking, node-mutation coordinator, holder/effective-writer resolver, lifecycle monitor, read path, log GC |
+| `glassdb-trans`       | `engine.rs`, `access.rs`, `algo.rs`, `collections/`, `tlocker.rs`, `shard_coord.rs`, `resolver.rs`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: the runtime façade and assembly, shared access vocabulary, commit algorithm, collection lifecycle, locking, shard mutation, resolution, monitoring, reads, and GC |
 | `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `shard_store.rs`, `node.rs`, `shard.rs`, `txobject.rs`, `tlogger.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record and B-link-node CAS stores/codecs, transaction-log persistence, and generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
@@ -94,6 +94,16 @@ implementation detail. Its public API surface is small: `Database`,
 in-memory backend and middleware. The deterministic-simulation runtime (the
 `rt`/`exec` seam in `glassdb-concurr`) is compiled only under `--cfg sim`; see
 [testing-dst.md](guides/testing-dst.md).
+
+The cross-crate transaction boundary is deliberately narrower than the engine's
+internal module graph. `glassdb` talks to `glassdb-trans` through `Engine` and
+logical access/result types. `Engine` owns runtime assembly and lifetime,
+dispatches reads, scans, and collection snapshots, delegates transaction-attempt
+lifecycle to `Algo`, and collects engine statistics and diagnostics. The public
+crate retains metadata/version bootstrap, operation admission, the user-closure
+retry loop, public errors, and public handles. Concrete stores, routing,
+locking, monitoring, splitting, and GC components are not exported across this
+boundary.
 
 ## Component Responsibilities
 
@@ -121,11 +131,18 @@ supply each operation's mutation decision as an installed resolver. For the full
 ```
                          glassdb  (public API)
         Database · Transaction · Collection · tx_impl retry loop
-               runs the user body, collects accesses by path
-                                │  Data = reads(path, token) + writes(path, op)
+      metadata bootstrap · user body · public errors/cancellation
+                                │  logical reads/scans/snapshots + Data
                                 ▼
 ═══════════════════════════ glassdb-trans ═══════════════════════════
 
+  Engine — runtime FAÇADE
+    · owns:             assembly · lifetime · shutdown
+    · dispatches:       reads · scans · collection snapshots
+    · delegates:        transaction-attempt lifecycle
+    · reports:          component stats · live diagnostics
+                                │
+                                ▼
   Algo — commit POLICY  (no shard routing, no shard CAS)
     · lifecycle:        begin / rebegin / end
     · orchestrates:     lock → validate reads → commit point → write-back
@@ -209,7 +226,8 @@ the coordinator.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `glassdb` (`tx_impl`) | API / retry      | closures, `Error`            | user body, retry loop, cancel-safety                                                                                  | locks, shards, tx logs              |
+| `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
+| `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
 | `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall`, GC candidate hints | shard routing, CAS details, caching, the split mechanism beyond its `SplitHintSink` producer handle |
 | `Locker::data`        | data-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
 | `Locker::directories` | directory-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, status resolution, recovery write-back and release | key routing, B-link topology |

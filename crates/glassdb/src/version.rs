@@ -1,9 +1,9 @@
 //! Database metadata version check. Ported from the Go `version.go`.
 
-use glassdb_backend::{Backend, BackendError};
-use glassdb_data::{CollectionAddress, DATABASE_ID_BYTES, DatabaseId, paths};
+use glassdb_backend::Backend;
+use glassdb_data::{DATABASE_ID_BYTES, DatabaseId};
 use glassdb_proto as pb;
-use glassdb_storage::{CollectionRecord, Node, Shard};
+use glassdb_trans::Engine;
 use prost::Message;
 
 use crate::error::Error;
@@ -25,7 +25,9 @@ pub(crate) async fn check_or_create_db_meta(
         Err(Error::NotFound) => {}
         Err(e) => return Err(e),
     }
-    ensure_root_for_initialization(b, name).await?;
+    Engine::prepare_permanent_collection(b, name)
+        .await
+        .map_err(Error::from)?;
     let proposed = DatabaseId::new_random();
     match set_db_metadata(b, name, proposed).await {
         Ok(()) => Ok(proposed),
@@ -34,42 +36,6 @@ pub(crate) async fn check_or_create_db_meta(
             check_db_version(b, name).await
         }
         Err(e) => Err(Error::with_source("creating db metadata", e)),
-    }
-}
-
-async fn ensure_root_for_initialization(b: &impl Backend, name: &str) -> Result<(), Error> {
-    let prefix = CollectionAddress::root(name).physical_prefix();
-    ensure_collection_record(b, &paths::collection_record(&prefix)).await?;
-    ensure_tree_root(b, &paths::tree_root(&prefix)).await
-}
-
-async fn ensure_collection_record(b: &impl Backend, path: &str) -> Result<(), Error> {
-    match b
-        .write_if_not_exists(path, CollectionRecord::new().encode())
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(BackendError::Precondition) => {
-            let stored = b.read(path).await?;
-            CollectionRecord::decode(&stored.contents)?;
-            Ok(())
-        }
-        Err(error) => Err(Error::from(error)),
-    }
-}
-
-async fn ensure_tree_root(b: &impl Backend, path: &str) -> Result<(), Error> {
-    match b
-        .write_if_not_exists(path, Node::leaf(Shard::new()).encode())
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(BackendError::Precondition) => {
-            let stored = b.read(path).await?;
-            Node::decode(&stored.contents)?;
-            Ok(())
-        }
-        Err(error) => Err(Error::from(error)),
     }
 }
 

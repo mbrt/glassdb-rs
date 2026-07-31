@@ -18,10 +18,10 @@
 //! **folds** the round's installed [`ShardResolver`]s over a running staged entry
 //! map, drops vestigial entries, CASes once, recovers by reload-and-re-fold, and
 //! deposits each member's outcome (ADR-029). The resolvers own each
-//! operation's mutation decision: [`Locker`](crate::Locker) installs Acquire /
-//! WriteBack / Release, and [`Algo`](crate::Algo) installs direct commit. The
+//! operation's mutation decision: [`Locker`](crate::tlocker::Locker) installs Acquire /
+//! WriteBack / Release, and [`Algo`](crate::algo::Algo) installs direct commit. The
 //! per-transaction held-lock bookkeeping and cross-shard strategy stay with the
-//! [`Locker`](crate::Locker), not in the engine.
+//! [`Locker`](crate::tlocker::Locker), not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,7 +48,7 @@ use crate::resolver::Resolver;
 pub(crate) const CAS_RETRIES: usize = 50;
 
 /// Counters for CAS activity across every submitter (the
-/// [`Locker`](crate::Locker) and [`Algo`](crate::Algo)).
+/// [`Locker`](crate::tlocker::Locker) and [`Algo`](crate::algo::Algo)).
 #[derive(Default)]
 struct Stats {
     n_retries: AtomicU64,
@@ -333,23 +333,13 @@ impl MergeRequest for CasReq {
 
 /// Sink for stored-leaf capacity observations, so a background growth policy
 /// can decide whether to split (ADR-031). The coordinator depends only on this
-/// seam — never on the splitter's queue or policy. The
-/// [`Splitter`](crate::Splitter) supplies the implementation; a coordinator
-/// with none attached uses [`NoSplitHints`].
+/// seam — never on the splitter's queue or policy. The splitter supplies the
+/// implementation.
 pub trait SplitHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `shard`. Best-effort: a
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &str, shard: &Shard);
-}
-
-/// The default [`SplitHinter`] that drops every hint: for a coordinator with no
-/// background splitter attached (tests, tools). Leaf growth is never observed,
-/// so the tree only ever grows through an explicitly wired splitter.
-pub(crate) struct NoSplitHints;
-
-impl SplitHinter for NoSplitHints {
-    fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
 }
 
 /// State shared by the [`ShardCoordinator`] and its dedup [`CasWorker`]: the
@@ -361,7 +351,7 @@ struct CoordCore {
     retry: RetryConfig,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
-    // [`Splitter`](crate::Splitter)'s queue when one is wired, else a no-op.
+    // [`Splitter`](crate::split::Splitter)'s queue when one is wired.
     hinter: Arc<dyn SplitHinter>,
     policy: SplitPolicy,
 }
@@ -626,7 +616,7 @@ impl CasWorker {
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
             // happens-before the dedup delivers to the caller. Recording the held
-            // lock is the caller's job (the [`Locker`](crate::Locker)), done when
+            // lock is the caller's job (the [`Locker`](crate::tlocker::Locker)), done when
             // it observes its own `Locked` outcome.
             for (tx, outcome, member_staged) in results {
                 if let Some(m) = members.get(&tx) {
@@ -674,23 +664,8 @@ pub struct ShardCoordinator {
 }
 
 impl ShardCoordinator {
-    /// Creates a coordinator over the shared shard store, resolver, and monitor.
-    /// `retry` configures the exponential backoff applied between CAS
-    /// retries on a contended object and (in the [`Locker`](crate::Locker) above)
-    /// between hold-and-wait re-polls of a conflicting holder.
-    pub fn new(shards: ShardStore, resolver: Resolver, tmon: Monitor, retry: RetryConfig) -> Self {
-        Self::with_hinter(
-            shards,
-            resolver,
-            tmon,
-            retry,
-            SplitPolicy::default(),
-            Arc::new(NoSplitHints),
-        )
-    }
-
     /// Creates a coordinator that reports capacity observations to `hinter` —
-    /// normally the background [`Splitter`](crate::Splitter)'s queue.
+    /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         shards: ShardStore,
@@ -737,8 +712,8 @@ impl ShardCoordinator {
     }
 
     /// Submits one shard member (any resolver installed by a caller — the
-    /// [`Locker`](crate::Locker)'s acquire / write-back / release or the
-    /// [`Algo`](crate::Algo)'s direct commit) through the [`Dedup`] and awaits
+    /// [`Locker`](crate::tlocker::Locker)'s acquire / write-back / release or the
+    /// [`Algo`](crate::algo::Algo)'s direct commit) through the [`Dedup`] and awaits
     /// its single-round [`CoordinatedOutcome`]. The worker merges it into any
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus any successful-CAS
@@ -824,6 +799,12 @@ mod tests {
 
     const COLL: &str = "coordp";
 
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+    }
+
     // Every coordination round in these tests targets one leaf object. A
     // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
     // entries (no collection metadata), exactly what the shard fold operates on.
@@ -888,7 +869,14 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), COLL);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let mon = Monitor::with_config(
+            tl,
+            timeline.clone(),
+            Arc::downgrade(&bg),
+            glassdb_concurr::Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         let shards = ShardStore::new(objects);
         let resolver = Resolver::new(shards.clone(), mon.clone());
         let coord =

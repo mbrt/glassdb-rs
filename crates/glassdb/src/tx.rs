@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use glassdb_data::{CollectionAddress, CollectionId, KeyRef, TxId};
 use glassdb_storage::LeafObservation;
 use glassdb_trans::{
-    CollectionCatalog, CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead,
-    DirectoryReadKind, ReadAccess, Reader, Resolver, ScanAccess, ScanMutation, WriteAccess,
+    CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead, DirectoryReadKind,
+    ReadAccess, ScanAccess, ScanMutation, WriteAccess,
 };
 
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
@@ -37,9 +37,6 @@ use crate::scan::{KeyPage, KeyScan};
 /// released promptly instead of waiting for lease expiry.
 pub struct Transaction {
     db: Arc<DbInner>,
-    reader: Reader,
-    resolver: Resolver,
-    catalog: CollectionCatalog,
     inner: Arc<Mutex<TransactionInner>>,
 }
 
@@ -109,7 +106,7 @@ impl Transaction {
             }
         }
 
-        match self.reader.read(&key, std::time::Duration::MAX).await {
+        match self.db.engine.read(&key, std::time::Duration::MAX).await {
             Ok(outcome) => match outcome.value {
                 None => {
                     let mut inner = self.inner.lock().unwrap();
@@ -192,7 +189,8 @@ impl Transaction {
         }
 
         let result = self
-            .resolver
+            .db
+            .engine
             .scan_keys(c.address(), &range, &overlay, None, None)
             .await
             .map_err(Error::from_read)?;
@@ -509,11 +507,7 @@ impl Transaction {
     }
 
     pub(crate) fn new(db: Arc<DbInner>) -> Self {
-        let resolver = Resolver::new(db.shards.clone(), db.tmon.clone());
         Transaction {
-            reader: Reader::new(resolver.clone(), db.timeline.clone(), db.retry),
-            resolver,
-            catalog: db.collection_catalog.clone(),
             db,
             inner: Arc::new(Mutex::new(TransactionInner::default())),
         }
@@ -525,9 +519,6 @@ impl Transaction {
     pub(crate) fn handle(&self) -> Transaction {
         Transaction {
             db: self.db.clone(),
-            reader: self.reader.clone(),
-            resolver: self.resolver.clone(),
-            catalog: self.catalog.clone(),
             inner: self.inner.clone(),
         }
     }
@@ -702,7 +693,7 @@ impl Transaction {
             }
         }
 
-        let snapshot = self.catalog.snapshot(parent).await?;
+        let snapshot = self.db.engine.collection_snapshot(parent).await?;
         let children = snapshot.children.into_iter().collect::<BTreeMap<_, _>>();
         let version = snapshot.version;
         let mut inner = self.inner.lock().unwrap();

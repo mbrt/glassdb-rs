@@ -18,7 +18,7 @@ use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 
 /// Completes the structural recovery a finalized topology participant left
 /// behind, so a drop can freeze the topology without waiting for the background
-/// sweep. The [`Splitter`](crate::Splitter) supplies the implementation.
+/// sweep. The [`Splitter`](crate::split::Splitter) supplies the implementation.
 #[async_trait]
 pub trait TopologySettler: Send + Sync {
     /// Finishes and releases `id`'s structural work on `collection`. Returns
@@ -492,10 +492,13 @@ mod tests {
         let primary = store(backend.clone());
         let peer = store(backend.clone());
         let background = Arc::new(Background::new());
-        let monitor = Monitor::new(
+        let monitor = Monitor::with_config(
             TLogger::new(primary.objects.clone(), "db"),
             primary.timeline.clone(),
             Arc::downgrade(&background),
+            glassdb_concurr::Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
         );
         let retry = RetryConfig {
             initial_interval: Duration::ZERO,

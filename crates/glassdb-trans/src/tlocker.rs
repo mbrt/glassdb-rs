@@ -1320,6 +1320,7 @@ mod tests {
     use super::*;
     use crate::monitor::ProtocolTiming;
     use crate::resolver::Resolver;
+    use crate::shard_coord::SplitHinter;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
@@ -1334,6 +1335,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+    }
 
     struct TlCtx {
         shards: ShardStore,
@@ -1385,7 +1392,7 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             policy,
-            Arc::new(crate::shard_coord::NoSplitHints),
+            Arc::new(NoSplitHints),
         );
         let locker = Locker::new(
             coord.clone(),

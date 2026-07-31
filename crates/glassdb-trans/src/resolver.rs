@@ -8,8 +8,8 @@
 //! coordination concern shared by three
 //! consumers with different needs:
 //!
-//! - the [`Reader`](crate::Reader) materializes the value the writer holds,
-//! - the commit algorithm ([`Algo`](crate::Algo)) validates reads by comparing
+//! - the [`Reader`](crate::reader::Reader) materializes the value the writer holds,
+//! - the commit algorithm ([`Algo`](crate::algo::Algo)) validates reads by comparing
 //!   the observed writer against the current one (ADR-024), and
 //! - coordination paths resolve the writer and live holders as one coherent
 //!   view before changing an entry.
@@ -140,25 +140,6 @@ impl Resolver {
             dir: Directory::new(shards),
             tmon,
         }
-    }
-
-    /// Scans `prefix` left-to-right and returns both the raw keys that currently
-    /// exist (committed and not tombstoned, in key order) and the membership
-    /// dependencies of every leaf the scan covered (ADR-032 phantom prevention).
-    ///
-    /// Committed holders are help-forwarded, so a key whose writer committed but
-    /// has not yet published its `current_writer` pointer (write-back is
-    /// asynchronous) still lists. The scan follows the leaf right-sibling chain
-    /// ([`Directory::leaves`]), so an in-progress split is absorbed rather than
-    /// dropping or duplicating keys. Membership versions and pending membership
-    /// holders detect creates/deletes without conflicting with value overwrites;
-    /// a changed covered-leaf set falls back to logical page validation.
-    pub async fn live_keys_scan(
-        &self,
-        collection: &CollectionAddress,
-    ) -> Result<ScanResult, StorageError> {
-        self.scan_keys(collection, &ScanRange::all(), &[], None, None)
-            .await
     }
 
     /// Resolves one bounded, forward page and its membership dependencies.
@@ -718,7 +699,14 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DB);
         let bg = Arc::new(Background::new());
-        let mon = Monitor::new(tl, timeline.clone(), Arc::downgrade(&bg));
+        let mon = Monitor::with_config(
+            tl,
+            timeline.clone(),
+            Arc::downgrade(&bg),
+            glassdb_concurr::Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         let shards = ShardStore::new(objects);
         shards
             .create_root(COLL, &Node::leaf(Shard::new()))

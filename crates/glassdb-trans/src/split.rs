@@ -420,6 +420,7 @@ impl Splitter {
         shards: ShardStore,
         timeline: Timeline,
         mon: Monitor,
+        resolver: Resolver,
         clock: Clock,
         retry: RetryConfig,
         db_root: &str,
@@ -427,7 +428,6 @@ impl Splitter {
         inline: InlinePolicy,
     ) -> (ShardCoordinator, Self) {
         let candidates = SplitCandidates::with_policies(policy, inline, clock);
-        let resolver = Resolver::new(shards.clone(), mon.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             resolver.clone(),
@@ -1969,6 +1969,12 @@ mod tests {
 
     const COLL: &str = "db/_c/0000000000000000000000";
 
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+    }
+
     fn collection() -> CollectionAddress {
         CollectionAddress::root("db")
     }
@@ -2072,7 +2078,14 @@ mod tests {
         candidates: SplitCandidates,
     ) -> Splitter {
         let tl = TLogger::new(shards.objects.clone(), "db");
-        let mon = Monitor::new(tl.clone(), shards.timeline.clone(), Arc::downgrade(bg));
+        let mon = Monitor::with_config(
+            tl.clone(),
+            shards.timeline.clone(),
+            Arc::downgrade(bg),
+            Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         splitter_with_monitor(shards, bg, mon, candidates)
     }
 
@@ -2112,7 +2125,14 @@ mod tests {
         base_secs: u64,
     ) -> (Splitter, Monitor, u64) {
         let tl = TLogger::new(shards.objects.clone(), "db");
-        let mon = Monitor::new(tl.clone(), shards.timeline.clone(), Arc::downgrade(bg));
+        let mon = Monitor::with_config(
+            tl.clone(),
+            shards.timeline.clone(),
+            Arc::downgrade(bg),
+            Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
         let clock = Clock::anchored_at(std::time::UNIX_EPOCH + Duration::from_secs(base_secs));
         let candidates = SplitCandidates::with_clock(policy, clock);
         let splitter = splitter_with_monitor(shards, bg, mon.clone(), candidates);
@@ -2872,10 +2892,13 @@ mod tests {
         // re-descend and converge without recreating the removed holder.
         let other_bg = Arc::new(Background::new());
         let other_transactions = TLogger::new(other.objects.clone(), "db");
-        let other_mon = Monitor::new(
+        let other_mon = Monitor::with_config(
             other_transactions.clone(),
             other.timeline.clone(),
             Arc::downgrade(&other_bg),
+            Clock::real(),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
         );
         let other_resolver = Resolver::new(other.shards.clone(), other_mon.clone());
         let other_coord = ShardCoordinator::with_hinter(
@@ -2884,7 +2907,7 @@ mod tests {
             other_mon.clone(),
             RetryConfig::default(),
             SplitPolicy::default(),
-            Arc::new(crate::shard_coord::NoSplitHints),
+            Arc::new(NoSplitHints),
         );
         let other_locker = crate::tlocker::Locker::new(
             other_coord,

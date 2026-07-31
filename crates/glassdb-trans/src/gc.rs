@@ -545,7 +545,7 @@ mod tests {
     use super::*;
     use crate::collections::TopologySettler;
     use crate::resolver::Resolver;
-    use crate::shard_coord::ShardCoordinator;
+    use crate::shard_coord::{ShardCoordinator, SplitHinter};
     use crate::tlocker::LockOutcome;
     use async_trait::async_trait;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
@@ -563,6 +563,12 @@ mod tests {
     const COLL: &str = "db/_c/0000000000000000000000";
 
     struct UnexpectedTopologySettler;
+
+    struct NoSplitHints;
+
+    impl SplitHinter for NoSplitHints {
+        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+    }
 
     #[async_trait]
     impl TopologySettler for UnexpectedTopologySettler {
@@ -631,11 +637,13 @@ mod tests {
             crate::monitor::ProtocolTiming::default(),
         );
         let resolver = Resolver::new(shards.clone(), mon.clone());
-        let coord = ShardCoordinator::new(
+        let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             resolver,
             mon.clone(),
             RetryConfig::default(),
+            glassdb_storage::SplitPolicy::default(),
+            Arc::new(NoSplitHints),
         );
         let dir = Directory::new(shards.clone());
         let locker = Locker::new(

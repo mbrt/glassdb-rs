@@ -3,19 +3,13 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use glassdb_backend::{Backend, StatsBackend};
-use glassdb_concurr::{Background, Clock, RetryConfig, rt};
-use glassdb_data::{CollectionAddress, DatabaseId, TxId};
-use glassdb_storage::{
-    CachedStore, CollectionStore, Directory, InlinePolicy, PersistentCache, PersistentCacheConfig,
-    PersistentCacheMedia, Requirement, ShardStore, SplitPolicy, StorageError, TLogger, Timeline,
-};
-use glassdb_trans::{
-    Algo, CollectionCatalog, CollectionLifecycle, Gc, Locker, Monitor, ProtocolTiming, Resolver,
-    ShardCoordinator, Splitter, TransError,
-};
+use glassdb_backend::Backend;
+use glassdb_concurr::rt;
+use glassdb_data::{DatabaseId, TxId};
+use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
+use glassdb_trans::{Engine, EngineConfig, ProtocolTiming, TransError};
 use tokio::sync::Notify;
 
 use crate::collection::{Collection, CollectionPath};
@@ -24,20 +18,6 @@ use crate::error::Error;
 use crate::stats::{Stats, TransactionStats};
 use crate::tx::Transaction;
 use crate::version::check_or_create_db_meta;
-
-/// Default cache size: 512 MiB, a reasonable middle ground for production.
-const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
-
-/// Fixed wall-clock anchor used when `deterministic_time` is set: 2023-11-14
-/// 22:13:20 UTC. The exact value is irrelevant; it only needs to be constant so
-/// replays are byte-identical.
-const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
-
-#[derive(Clone)]
-struct PersistentCacheSetup {
-    config: PersistentCacheConfig,
-    media: Option<PersistentCacheMedia>,
-}
 
 /// Builds and opens a [`Database`], tweaking optional settings before opening.
 ///
@@ -48,13 +28,7 @@ struct PersistentCacheSetup {
 pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
-    cache_size: usize,
-    persistent_cache: Option<PersistentCacheSetup>,
-    deterministic_time: bool,
-    retry: RetryConfig,
-    split_policy: SplitPolicy,
-    inline_policy: InlinePolicy,
-    protocol_timing: ProtocolTiming,
+    engine_config: EngineConfig,
 }
 
 impl DatabaseBuilder {
@@ -62,7 +36,7 @@ impl DatabaseBuilder {
     /// Setting this too small may impact performance, as more backend calls are
     /// necessary.
     pub fn cache_size(mut self, bytes: usize) -> Self {
-        self.cache_size = bytes;
+        self.engine_config.set_cache_size(bytes);
         self
     }
 
@@ -79,14 +53,14 @@ impl DatabaseBuilder {
     /// status, or writing a transaction's final log). The delay grows
     /// exponentially up to [`DatabaseBuilder::retry_max_interval`].
     pub fn retry_initial_interval(mut self, interval: Duration) -> Self {
-        self.retry.initial_interval = interval;
+        self.engine_config.set_retry_initial_interval(interval);
         self
     }
 
     /// Sets the upper bound on the per-retry delay for transient
     /// transaction-coordination operations.
     pub fn retry_max_interval(mut self, interval: Duration) -> Self {
-        self.retry.max_interval = interval;
+        self.engine_config.set_retry_max_interval(interval);
         self
     }
 
@@ -97,7 +71,7 @@ impl DatabaseBuilder {
     /// a deterministic function of the simulation seed. Intended for the
     /// deterministic fuzzer; leave false in production.
     pub fn deterministic_time(mut self, enabled: bool) -> Self {
-        self.deterministic_time = enabled;
+        self.engine_config.set_deterministic_time(enabled);
         self
     }
 
@@ -105,7 +79,7 @@ impl DatabaseBuilder {
     /// Every client of one database should use the same policy because splits
     /// durably reshape shared topology.
     pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
-        self.split_policy = policy;
+        self.engine_config.set_split_policy(policy);
         self
     }
 
@@ -115,7 +89,7 @@ impl DatabaseBuilder {
     /// should use the same policy because aggregate-pressure misses can request
     /// durable tree splits (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
-        self.inline_policy = policy;
+        self.engine_config.set_inline_policy(policy);
         self
     }
 
@@ -123,7 +97,7 @@ impl DatabaseBuilder {
     /// cross-client clock-skew allowance. The configured skew must bound every
     /// client using this database so a live transaction is never reclaimed.
     pub fn protocol_timing(mut self, timing: ProtocolTiming) -> Self {
-        self.protocol_timing = timing;
+        self.engine_config.set_protocol_timing(timing);
         self
     }
 
@@ -133,13 +107,7 @@ impl DatabaseBuilder {
         let DatabaseBuilder {
             name,
             backend: b,
-            cache_size,
-            persistent_cache,
-            deterministic_time,
-            retry,
-            split_policy,
-            inline_policy,
-            protocol_timing,
+            engine_config,
         } = self;
 
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -147,134 +115,18 @@ impl DatabaseBuilder {
                 "name must be alphanumeric, got {name:?}"
             )));
         }
-        let backend = Arc::new(StatsBackend::new(b));
+        let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
         let database_id = check_or_create_db_meta(&backend, &name).await?;
-        let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let (persistent, timeline) = match persistent_cache {
-            Some(setup) => {
-                let opened =
-                    PersistentCache::open(setup.config, &name, database_id, setup.media).await;
-                // ADR-045: PersistentCache keeps track of sequence points across
-                // restarts, so a stale cached object cannot appear newer than a
-                // fresh backend read.
-                let timeline = Timeline::starting_after(opened.last_sequence_point);
-                (Some(opened.cache), timeline)
-            }
-            None => (None, Timeline::new()),
-        };
-        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
-        let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects.clone());
-        let root_prefix = CollectionAddress::root(name.as_str()).physical_prefix();
-        check_permanent_collection_objects(
-            &records,
-            &shards,
-            &root_prefix,
-            Requirement::AtLeast(timeline.now()),
-        )
-        .await?;
-        let tl = TLogger::new(objects.clone(), &name);
-        let bg = Arc::new(Background::new());
-        let clock = if deterministic_time {
-            Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
-        } else {
-            Clock::real()
-        };
-        // Subsystems hold `Weak<Background>`. `DbInner::background` (set below)
-        // is the sole strong owner; this prevents spawned-task captures (which
-        // close over `Monitor`/`Gc`/`Algo` clones) from forming a cycle that
-        // would keep `Background` alive forever.
-        let bg_weak = Arc::downgrade(&bg);
-        let tmon = Monitor::with_config(
-            tl.clone(),
-            timeline.clone(),
-            bg_weak.clone(),
-            clock.clone(),
-            retry,
-            protocol_timing,
-        );
-        let resolver = Resolver::new(shards.clone(), tmon.clone());
-        let dir = Directory::new(shards.clone());
-        // Build the coordinator and splitter as a co-wired pair over one shared
-        // candidate feed: leaf writes report split candidates into the feed,
-        // while leaf splits acquire through the same coordinator.
-        let (coord, splitter) = Splitter::with_coordinator(
-            bg_weak.clone(),
-            records.clone(),
-            shards.clone(),
-            timeline.clone(),
-            tmon.clone(),
-            clock.clone(),
-            retry,
-            &name,
-            split_policy,
-            inline_policy,
-        );
-        let locker = Locker::new(
-            coord.clone(),
-            dir,
-            records.clone(),
-            tl.clone(),
-            tmon.clone(),
-            retry,
-        );
-        let collection_catalog = CollectionCatalog::new(locker.clone());
-        // One shared handle: a drop's topology freeze settles pre-existing
-        // structural participants through the splitter, so that edge is wired
-        // here rather than manufactured inside `Algo` and `Gc`.
-        let collection_lifecycle = CollectionLifecycle::new(
-            records.clone(),
-            shards.clone(),
-            tmon.clone(),
-            retry,
-            Arc::new(splitter.clone()),
-        );
-        let gc = Gc::new(
-            bg_weak.clone(),
-            tl,
-            shards.clone(),
-            timeline.clone(),
-            locker.clone(),
-            collection_lifecycle.clone(),
-            tmon.clone(),
-            clock.clone(),
-        );
-        gc.start();
-        splitter.start();
-        let algo = Algo::new(
-            shards.clone(),
-            timeline.clone(),
-            locker.clone(),
-            coord.clone(),
-            tmon.clone(),
-            collection_catalog.clone(),
-            collection_lifecycle,
-            clock,
-            gc,
-            Some(bg_weak),
-            resolver,
-            split_policy,
-            inline_policy,
-            splitter.hint_sink(),
-        );
+        let engine = Engine::open(&name, database_id, backend, engine_config)
+            .await
+            .map_err(Error::from_read)?;
 
         let inner = Arc::new(DbInner {
             name,
             database_id,
-            backend,
-            objects,
-            shards,
-            timeline,
-            collection_catalog,
-            tmon,
-            algo,
-            coord,
-            locker,
-            splitter,
-            retry,
+            engine,
             stats: Mutex::new(Stats::default()),
             operations: OperationLifecycle::new(),
-            background: bg,
         });
         Ok(Database { inner })
     }
@@ -285,7 +137,7 @@ impl DatabaseBuilder {
         config: PersistentCacheConfig,
         media: Option<PersistentCacheMedia>,
     ) -> Self {
-        self.persistent_cache = Some(PersistentCacheSetup { config, media });
+        self.engine_config.set_persistent_cache(config, media);
         self
     }
 
@@ -293,68 +145,19 @@ impl DatabaseBuilder {
         DatabaseBuilder {
             name: name.into(),
             backend,
-            cache_size: DEFAULT_CACHE_SIZE,
-            persistent_cache: None,
-            deterministic_time: false,
-            retry: RetryConfig::default(),
-            split_policy: SplitPolicy::default(),
-            inline_policy: InlinePolicy::default(),
-            protocol_timing: ProtocolTiming::default(),
+            engine_config: EngineConfig::default(),
         }
-    }
-}
-
-/// Verifies that both physical objects of the permanent collection are present.
-async fn check_permanent_collection_objects(
-    records: &CollectionStore,
-    shards: &ShardStore,
-    prefix: &str,
-    requirement: Requirement,
-) -> Result<(), Error> {
-    match records.load_record(prefix, requirement).await {
-        Ok(_) => {}
-        Err(StorageError::NotFound) => {
-            return Err(Error::internal(
-                "initialized database is missing its permanent collection record",
-            ));
-        }
-        Err(error) => return Err(Error::from_read(error)),
-    }
-    match shards.load_root(prefix, requirement).await {
-        Ok(_) => Ok(()),
-        Err(StorageError::NotFound) => Err(Error::internal(
-            "initialized database is missing its permanent tree root",
-        )),
-        Err(error) => Err(Error::from_read(error)),
     }
 }
 
 pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) database_id: DatabaseId,
-    pub(crate) backend: Arc<StatsBackend>,
-    pub(crate) objects: CachedStore,
-    pub(crate) shards: ShardStore,
-    pub(crate) timeline: Timeline,
-    pub(crate) collection_catalog: CollectionCatalog,
-    pub(crate) tmon: Monitor,
-    pub(crate) algo: Algo,
-    pub(crate) coord: ShardCoordinator,
-    pub(crate) locker: Locker,
-    pub(crate) splitter: Splitter,
-    pub(crate) retry: RetryConfig,
+    pub(crate) engine: Engine,
     stats: Mutex<Stats>,
     // Admission and drain cover every public asynchronous operation, including
     // the few APIs that do not run through a transaction.
     operations: OperationLifecycle,
-    // Sole strong owner of the background task manager. Subsystems (Monitor,
-    // Gc, Algo) hold `Weak<Background>`s so that captured clones inside
-    // spawned tasks do not form a cycle that would prevent `Background::drop`
-    // from firing. When this struct drops, the `Arc` count reaches zero,
-    // `Background::drop` aborts every spawned task, and the captured clones
-    // unwind. `Database::shutdown` uses the same owner to wait for tasks that opted
-    // into clean-shutdown draining.
-    background: Arc<Background>,
 }
 
 /// An open GlassDB database instance.
@@ -396,12 +199,7 @@ impl Database {
     /// a backend mutation whose future was previously abandoned by cancellation.
     pub async fn shutdown(&self) {
         self.inner.operations.shutdown().await;
-        // Drain background write-backs and async aborts first: a backgrounded
-        // write-back submits through the locker's dedup, so it must complete
-        // before the dedup is closed.
-        self.inner.background.shutdown().await;
-        self.inner.coord.close().await;
-        self.inner.objects.shutdown().await;
+        self.inner.engine.shutdown().await;
     }
 
     /// Returns the permanent, key-bearing root collection.
@@ -511,13 +309,14 @@ impl Database {
     /// Counters only increase; subtract snapshots for intervals. Collection is
     /// not an atomic cut across concurrently active engine components.
     pub fn stats(&self) -> Stats {
+        let engine = self.inner.engine.stats_and_reset();
         let delta = Stats {
-            backend: self.inner.backend.stats_and_reset(),
-            cache: self.inner.objects.cache_stats_and_reset(),
-            locker: self.inner.locker.stats_and_reset(),
-            coordinator: self.inner.coord.stats_and_reset(),
-            direct_commit: self.inner.algo.direct_commit_stats_and_reset(),
-            splitter: self.inner.splitter.stats_and_reset(),
+            backend: engine.backend,
+            cache: engine.cache,
+            locker: engine.locker,
+            coordinator: engine.coordinator,
+            direct_commit: engine.direct_commit,
+            splitter: engine.splitter,
             ..Default::default()
         };
         let mut stats = self.inner.stats.lock().unwrap();
@@ -533,9 +332,10 @@ impl Database {
     /// Pull-only and zero cost unless called: each shard's lock is taken
     /// briefly while collecting counts, then released.
     pub fn diagnostics(&self) -> Diagnostics {
+        let engine = self.inner.engine.diagnostics();
         Diagnostics {
-            coordinator_dedup: self.inner.coord.dedup_snapshot(),
-            transactions: self.inner.locker.tx_locks_snapshot(),
+            coordinator_dedup: engine.coordinator_dedup,
+            transactions: engine.transactions,
         }
     }
 }
@@ -680,13 +480,13 @@ impl DbInner {
     {
         let tx = Transaction::new(self.clone());
         let mut handle = None;
-        // RAII safety net: if this future is dropped between `algo.begin` and
-        // `algo.end` (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
-        // the guard's `Drop` runs `algo.async_abort` so the engine-side tx is
+        // RAII safety net: if this future is dropped between begin and end
+        // (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
+        // the guard's `Drop` schedules an abort so the engine-side tx is
         // marked aborted promptly instead of lingering until lease expiry.
         // Updated to the current tx id after every `begin`/`rebegin`; cleared
         // once `end` has run.
-        let mut abort_guard = TransactionAbortGuard::new(&self.algo);
+        let mut abort_guard = TransactionAbortGuard::new(&self.engine);
 
         let result: Result<T, Error> = loop {
             // Hand a fresh handle to the user closure (which consumes it); `tx`
@@ -711,13 +511,11 @@ impl DbInner {
                     // recovers it from the handle, so no separate clone is kept.
                     match handle.as_mut() {
                         None => {
-                            let h = self.algo.begin(access, collection_access);
+                            let h = self.engine.begin_transaction(access, collection_access);
                             abort_guard.arm(h.id().clone());
                             handle = Some(h);
                         }
-                        Some(h) => self
-                            .algo
-                            .reset_with_collections(h, access, collection_access),
+                        Some(h) => self.engine.reset_transaction(h, access, collection_access),
                     }
                     v
                 }
@@ -729,14 +527,14 @@ impl DbInner {
                     let collection_ro = collection_access.into_read_only();
                     match handle.as_mut() {
                         None => {
-                            let h = self.algo.begin(ro, collection_ro);
+                            let h = self.engine.begin_transaction(ro, collection_ro);
                             abort_guard.arm(h.id().clone());
                             handle = Some(h);
                         }
-                        Some(h) => self.algo.reset_with_collections(h, ro, collection_ro),
+                        Some(h) => self.engine.reset_transaction(h, ro, collection_ro),
                     }
                     let h = handle.as_mut().unwrap();
-                    match self.algo.validate_reads(h).await {
+                    match self.engine.validate_reads(h).await {
                         Err(TransError::Retry) => {
                             tx.reset();
                             stats.retries += 1;
@@ -744,10 +542,10 @@ impl DbInner {
                         }
                         Err(TransError::Wounded) => {
                             if let Some(h) = handle.as_mut() {
-                                let _ = self.algo.end(h).await;
+                                let _ = self.engine.end(h).await;
                             }
                             let old = handle.take().unwrap();
-                            let new = self.algo.rebegin(old);
+                            let new = self.engine.rebegin_transaction(old);
                             abort_guard.arm(new.id().clone());
                             handle = Some(new);
                             tx.reset();
@@ -762,7 +560,7 @@ impl DbInner {
             // Try to commit.
             let commit_res = {
                 let h = handle.as_mut().unwrap();
-                self.algo.commit(h).await
+                self.engine.commit(h).await
             };
             match commit_res {
                 Ok(()) => break Ok(value),
@@ -771,10 +569,10 @@ impl DbInner {
                     // we held and restart with a fresh id that preserves our
                     // priority, so we are not starved on the retry.
                     if let Some(h) = handle.as_mut() {
-                        let _ = self.algo.end(h).await;
+                        let _ = self.engine.end(h).await;
                     }
                     let old = handle.take().unwrap();
-                    let new = self.algo.rebegin(old);
+                    let new = self.engine.rebegin_transaction(old);
                     // Refresh the cancellation safety net with the new id so a
                     // drop after the rebegin aborts the retry's tx, not the
                     // (already-ended) original.
@@ -797,7 +595,7 @@ impl DbInner {
         // safety-net guard is disarmed either way so its `Drop` does not fire
         // a redundant async abort for an already-finalized tx.
         let end_result = if let Some(h) = handle.as_mut() {
-            self.algo.end(h).await
+            self.engine.end(h).await
         } else {
             Ok(())
         };
@@ -812,31 +610,34 @@ impl DbInner {
 }
 
 /// RAII safety net for [`DbInner::tx_impl`]: if the surrounding future is
-/// dropped between `algo.begin` and `algo.end`, the guard's `Drop` runs
-/// [`Algo::async_abort`] for the currently-armed transaction id, so peer
+/// dropped between attempt begin and end, the guard schedules an abort for the
+/// currently-armed transaction id, so peer
 /// transactions see the abort marker quickly instead of waiting for the
 /// lock-lease timeout.
 ///
-/// Whether the armed id actually needs an abort is [`Algo::async_abort`]'s
-/// decision, not the guard's: an attempt that never took a logged identity is
+/// Whether the armed id actually needs an abort is the engine's decision, not
+/// the guard's: an attempt that never took a logged identity is
 /// invisible to peers and must not be given an aborted object it never had.
 struct TransactionAbortGuard<'a> {
-    algo: &'a Algo,
+    engine: &'a Engine,
     armed: Option<TxId>,
 }
 
 impl<'a> TransactionAbortGuard<'a> {
-    fn new(algo: &'a Algo) -> Self {
-        Self { algo, armed: None }
+    fn new(engine: &'a Engine) -> Self {
+        Self {
+            engine,
+            armed: None,
+        }
     }
 
     /// Arms the guard for `tx_id`. Replaces any prior id (e.g. after a wound
-    /// retry that gets a fresh id via `algo.rebegin`).
+    /// retry that gets a fresh id from the engine).
     fn arm(&mut self, tx_id: TxId) {
         self.armed = Some(tx_id);
     }
 
-    /// Disarms the guard: called once `algo.end` ran so `Drop` is a no-op.
+    /// Disarms the guard once the attempt has ended so `Drop` is a no-op.
     fn disarm(&mut self) {
         self.armed = None;
     }
@@ -845,7 +646,7 @@ impl<'a> TransactionAbortGuard<'a> {
 impl Drop for TransactionAbortGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.armed.take() {
-            self.algo.async_abort(&id);
+            self.engine.async_abort(&id);
         }
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! These are the argument and result shapes shared by the commit algorithm, the
 //! locker, and the resolver. They carry no commit policy, so the modules below
-//! [`Algo`](crate::Algo) do not have to reach up into it for their own
+//! [`Algo`](crate::algo::Algo) do not have to reach up into it for their own
 //! signatures.
 
 use std::sync::Arc;

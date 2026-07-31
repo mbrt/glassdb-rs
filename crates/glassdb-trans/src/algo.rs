@@ -1662,6 +1662,7 @@ mod tests {
             shards.clone(),
             timeline.clone(),
             tmon.clone(),
+            resolver.clone(),
             Clock::real(),
             RetryConfig::default(),
             TEST_COLL,
