@@ -47,6 +47,9 @@ epics use [`designs/_template.md`](designs/_template.md).
 
 ## Guides (`guides/`)
 
+- [`caching.md`](guides/caching.md) — how `CachedStore`, requirements, and
+  observations provide reusable currentness evidence over a strongly consistent
+  backend.
 - [`releasing.md`](guides/releasing.md) — how releases are cut and published.
 - [`reviewing-changes.md`](guides/reviewing-changes.md) — what to look for when
   reviewing a change (policy vs. mechanism, ownership).
