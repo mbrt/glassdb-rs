@@ -182,12 +182,13 @@ supply each operation's mutation decision as an installed resolver. For the full
 
 Collection management travels beside key access as `CollectionData`: logical
 directory reads plus exact create/drop binding changes. `Transaction` overlays
-those changes for read-your-writes behavior. At commit, `Algo` persists the
-prepared-collection manifest (including incarnations left by an earlier body
-retry), prepares each incarnation's `_i` record and `_r` tree root, locks and
-validates the affected parent directories, then uses the same
-transaction-log status flip as key writes. Directory write-back materializes
-committed `name → CollectionId` changes.
+those changes for read-your-writes behavior. `CollectionAttempt` retains those
+accesses together with prepared incarnations and fenced drops across same-ID
+body retries. `CollectionCommit` owns their recovery-manifest projection,
+physical preparation, catalog validation, drop fencing, and physical cleanup.
+`Algo` composes those phases with collection and key locking around the same
+validation barrier and transaction-log status flip. Directory write-back
+materializes committed `name → CollectionId` changes.
 
 Drop additionally freezes the target collection's split topology and installs
 the transaction ID as a delete intent on every root, index, and leaf object.
@@ -220,6 +221,14 @@ but cannot acquire or release locks. This keeps collection-record coordination
 out of both the B-link `ShardStore` and the semantic catalog without introducing
 a one-implementation capability trait.
 
+`CollectionCommit` is the collection side of transaction commit, not another
+locking layer. It owns collection retry-resource bookkeeping, durable manifest
+fields, preparation, validation, fencing, and cleanup by composing
+`CollectionCatalog` with `CollectionLifecycle`. `CollectionLocker` remains
+constructed and owned by `Locker`; `Algo` keeps collection locking beside key
+locking so the shared barrier, combined durable lock receipt, atomic commit
+point, and write-back ordering remain explicit transaction-wide policy.
+
 Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. `KeyResolver`, the key-lock view, `Gc`, and
 `Splitter` each own a cheap handle for their distinct read, lock, reclamation,
@@ -244,7 +253,8 @@ the coordinator.
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
 | `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | lifecycle, lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall`, GC candidate hints | shard routing, CAS details, caching, the split mechanism beyond its `SplitHintSink` producer handle |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, cross-domain lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall`, GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
+| `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | collection addresses, records, `TxId` | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
