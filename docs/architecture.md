@@ -76,6 +76,11 @@ glassdb-concurr ──────────────────┴──�
 glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 ```
 
+This is the production dependency graph. A `--cfg sim` build adds a
+simulation-only edge from `glassdb-data` to the `glassdb-concurr` runtime so
+identifier and path entropy comes from the active deterministic run; the edge
+is absent from normal library builds.
+
 | Crate                 | Key modules                                                                  | Responsibility                                                                                                                                |
 | --------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `glassdb`             | `db.rs`, `tx.rs`, `collection.rs`, `iter.rs`, `stats.rs`                     | Public API: `Database`, `Transaction`, `Collection`, iterators, statistics                                                                    |
@@ -559,6 +564,15 @@ keys collapse into a single GET + CAS (ADR-017/020), and contending transactions
 on the same shard batch through the shard-mutation coordinator into one
 owner-driven CAS (ADR-025/026/028) rather than racing separate ones.
 
+A create that reaches the reserved leaf-content limit retries after releasing
+its partial locks so the background splitter can make room. The capacity result
+starts one 30-second capacity-wait episode: leaf revisions, reroutes, and other
+full leaves do not reset it, because acquisition still lacks capacity. Success
+ends the episode naturally; expiration surfaces an internal capacity error.
+This keeps ordinary asynchronous splits retryable without turning an impossible
+split, continuous churn, or a grandfathered unsafe entry into an unbounded
+foreground wait.
+
 **Compatibility rules** (`LockType`: `None`, `Read`, `Write`, `Create`):
 
 | Requested | Current: None |     Current: Read      | Current: Write | Current: Create |
@@ -676,8 +690,11 @@ superseded before publication — replays its body under the same, still
 unengaged, id, so a local scheduling loss does not publish a holder that would
 push the key's next writer onto the locked protocol. Genuine ineligibility — a
 live pending or unknown holder, an exclusive structural gate, a collection-delete
-intent, a missing key, or a value over either inline budget — takes the regular
-[commit protocol](#commit-protocol) above under the same id. There is no third,
+intent, a missing key, a value over either inline budget, or an inline entry
+larger than its half of the leaf's reserved content budget — takes the regular
+[commit protocol](#commit-protocol) above under the same id. The last check
+preserves room for another independently accepted key, so direct publication
+cannot create an intrinsically unsplittable singleton. There is no third,
 single-key-only commit protocol between the two.
 
 Because the commit is invisible until the CAS lands, a retry is proved

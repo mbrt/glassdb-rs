@@ -71,6 +71,11 @@ const SERIAL_FALLBACK_AFTER: usize = 3;
 /// completes. Reuses v1's 5s budget (ADR-002 / architecture.md).
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for one continuous leaf-capacity retry episode. Revisions and
+/// reroutes do not extend it: until acquisition succeeds, capacity has not made
+/// foreground progress.
+const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 struct DirectCommitCounters {
     candidates: AtomicU64,
@@ -292,7 +297,7 @@ impl ShardResolver for DirectCommitResolver {
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
             locks: staged_locks.clone(),
-            admission: StageAdmission::ExistingKeys,
+            admission: StageAdmission::InlinePublication,
             outcome: FoldOutcome::Landed,
         })
     }
@@ -1143,8 +1148,10 @@ impl Algo {
     ///   serial order, which removes the equal-priority livelock.
     /// - **Leaf capacity** (a create reached the reserved content limit): drop
     ///   the partial locks and retry under the **same id** after backing off,
-    ///   giving the hinted split time to make room. Capacity pressure does not
-    ///   count toward serial escalation.
+    ///   giving the hinted split time to make room. The first capacity failure
+    ///   starts [`MAX_LEAF_FULL_WAIT`]; later revisions and reroutes do not reset
+    ///   it, because acquisition still has no capacity. Capacity pressure does
+    ///   not count toward serial escalation.
     /// - **Suspected deadlock** (the parallel wait exceeded
     ///   [`MAX_DEADLOCK_TIMEOUT`]): drop the out-of-order locks and re-acquire in
     ///   the global serial sorted order, where first-CAS-wins on the lowest
@@ -1160,6 +1167,7 @@ impl Algo {
     ) -> Result<Acquired, TransError> {
         let mut serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
         let mut conflicts: usize = 0;
+        let mut leaf_full_since: Option<rt::Instant> = None;
         loop {
             // A higher-priority peer may have aborted us; re-checked each
             // iteration so a wound landing during a long wait surfaces promptly
@@ -1195,7 +1203,14 @@ impl Algo {
                 // other leaves and wait for the hinted split without escalating
                 // to the serial lock order or re-running the transaction body.
                 Ok(LockOutcome::LeafFull) => {
+                    let since = *leaf_full_since.get_or_insert_with(rt::Instant::now);
                     self.release_for_retry(tx).await?;
+                    if since.elapsed() >= MAX_LEAF_FULL_WAIT {
+                        return Err(TransError::other(format!(
+                            "leaf capacity remained unavailable for {} seconds",
+                            MAX_LEAF_FULL_WAIT.as_secs()
+                        )));
+                    }
                     rt::sleep(tx.backoff.next_delay()).await;
                 }
                 // Suspected deadlock: drop the out-of-order locks and re-acquire
@@ -1473,7 +1488,7 @@ mod tests {
     use crate::monitor::ProtocolTiming;
     use crate::reader::Reader;
     use glassdb_backend::middleware::{
-        BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
+        BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
@@ -1512,9 +1527,22 @@ mod tests {
         new_algo_from_backend_with_cache(b, 1024).await
     }
 
+    async fn new_algo_with_policy(policy: SplitPolicy) -> (Algo, Tctx) {
+        new_algo_from_backend_with_cache_and_policy(Arc::new(MemoryBackend::new()), 1024, policy)
+            .await
+    }
+
     async fn new_algo_from_backend_with_cache(
         b: Arc<dyn Backend>,
         cache_bytes: usize,
+    ) -> (Algo, Tctx) {
+        new_algo_from_backend_with_cache_and_policy(b, cache_bytes, SplitPolicy::default()).await
+    }
+
+    async fn new_algo_from_backend_with_cache_and_policy(
+        b: Arc<dyn Backend>,
+        cache_bytes: usize,
+        split_policy: SplitPolicy,
     ) -> (Algo, Tctx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone(), None);
@@ -1553,7 +1581,7 @@ mod tests {
             Clock::real(),
             RetryConfig::default(),
             TEST_COLL,
-            glassdb_storage::SplitPolicy::default(),
+            split_policy,
             glassdb_storage::InlinePolicy::default(),
         );
         let locker = Locker::new(
@@ -1584,7 +1612,7 @@ mod tests {
             CollectionCatalog::new(collection_state),
             collection_lifecycle,
             tmon.clone(),
-            glassdb_storage::SplitPolicy::default(),
+            split_policy,
         );
 
         // Create the collection root so the test collection exists up front.
@@ -1608,7 +1636,7 @@ mod tests {
             gc,
             None,
             resolver,
-            glassdb_storage::SplitPolicy::default(),
+            split_policy,
             glassdb_storage::InlinePolicy::default(),
             splitter.hint_sink(),
         );
@@ -2169,6 +2197,106 @@ mod tests {
         tm.end(&mut h).await.unwrap();
     }
 
+    // A database can contain an unsafe singleton written by an older client or
+    // admitted under a former policy. If capacity remains unavailable while the
+    // splitter cannot relieve it, lock acquisition must report the bounded wait
+    // instead of retrying forever.
+    #[tokio::test(start_paused = true)]
+    async fn leaf_capacity_retry_episode_is_bounded() {
+        let policy = SplitPolicy {
+            leaf_max_bytes: 384,
+            node_max_bytes: 512,
+            split_headroom_bytes: 128,
+            ..SplitPolicy::default()
+        };
+        let (tm, tctx) = new_algo_with_policy(policy).await;
+
+        let mut low = 0;
+        let mut high = policy.content_limit() + 1;
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if policy.key_fits(&vec![b'a'; middle]) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        let first = vec![b'a'; low];
+        let second = vec![b'z'; low];
+        assert!(policy.key_fits(&first));
+        assert!(policy.key_fits(&second));
+
+        let writer = TxId::with_priority(1, b"old");
+        let unsafe_entry = ShardEntry {
+            current: CurrentState::Inline {
+                writer,
+                value: Arc::from(vec![b'v'; 128]),
+            },
+            ..ShardEntry::new(first.clone())
+        };
+        assert!(!policy.entry_fits_split_budget(&unsafe_entry));
+        let creator = TxId::with_priority(2, b"new");
+        let create_entry = ShardEntry {
+            lock_type: LockType::Create,
+            locked_by: vec![creator],
+            ..ShardEntry::new(second.clone())
+        };
+        assert!(
+            Node::leaf(Shard::from_entries([unsafe_entry.clone(), create_entry]))
+                .content_encoded_len()
+                > policy.content_limit(),
+            "the accepted second key must reproduce LeafFull"
+        );
+        assert!(
+            Node::leaf(Shard::from_entries([unsafe_entry.clone()])).encoded_len()
+                <= policy.node_max_bytes,
+            "the grandfathered singleton itself must remain storable"
+        );
+
+        let path = paths::tree_root(TEST_COLL);
+        let loaded = tctx
+            .shards
+            .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
+            .await
+            .unwrap();
+        assert!(
+            tctx.shards
+                .store_leaf(
+                    &path,
+                    &Shard::from_entries([unsafe_entry]),
+                    &loaded.locks,
+                    &loaded.observation,
+                )
+                .await
+                .unwrap()
+        );
+
+        let key = key_ref(&second);
+        let mut handle = begin_data(
+            &tm,
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&key, b"value")],
+                scans: Vec::new(),
+            },
+        );
+        let error = tokio::time::timeout(
+            MAX_LEAF_FULL_WAIT + Duration::from_secs(10),
+            tm.commit(&mut handle),
+        )
+        .await
+        .expect("the unchanged full leaf must produce a terminal result")
+        .unwrap_err();
+        match error {
+            TransError::Other { msg, .. } => {
+                assert!(msg.contains("leaf capacity"), "got {msg}");
+                assert!(msg.contains("remained unavailable"), "got {msg}");
+            }
+            other => panic!("expected a stalled-capacity error, got {other:?}"),
+        }
+        tm.end(&mut handle).await.unwrap();
+    }
+
     /// Controls a hook that makes a bounded number of leaf CASes miss.
     struct FlakyCas {
         armed: std::sync::atomic::AtomicBool,
@@ -2603,13 +2731,35 @@ mod tests {
             if o.op != "write_if" && o.op != "write_if_not_exists" {
                 continue;
             }
-            if o.path.contains("/_n/") || o.path.ends_with("/_r") {
-                c.leaf += 1;
-            } else if o.path.contains("/_t/") {
-                c.tx += 1;
+            if let Ok(parsed) = paths::parse(&o.path) {
+                match parsed.typ {
+                    paths::Type::TreeRoot | paths::Type::Node => c.leaf += 1,
+                    paths::Type::Transaction => c.tx += 1,
+                    _ => {}
+                }
             }
         }
         c
+    }
+
+    // Transaction shards use two symbols from the same alphabet as path type
+    // markers. In particular, a transaction can live under `/_t/_n/`; path
+    // substring checks would mistake its object create for a standalone-node
+    // write and make commit-path counts depend on random transaction entropy.
+    #[test]
+    fn write_counts_parses_transaction_shard_named_like_node() {
+        let id = TxId::from_bytes(vec![0x97, 0x30]);
+        let path = paths::from_transaction(TEST_DB, &id);
+        assert!(path.contains("/_t/_n/"), "test id mapped to {path:?}");
+        let log = Arc::new(std::sync::Mutex::new(vec![OpRecord {
+            op: "write_if_not_exists",
+            path,
+            args: Vec::new(),
+        }]));
+
+        let counts = write_counts(&log);
+        assert_eq!(counts.leaf, 0);
+        assert_eq!(counts.tx, 1);
     }
 
     // Backend reads against leaf objects: `read` is a cold full read (cache

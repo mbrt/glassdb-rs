@@ -159,6 +159,13 @@ impl SplitPolicy {
             .saturating_sub(self.split_headroom_bytes)
     }
 
+    /// Reports whether one exact leaf entry fits the per-entry budget that
+    /// preserves room for another independently admissible entry.
+    pub fn entry_fits_split_budget(&self, entry: &ShardEntry) -> bool {
+        Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len()
+            <= self.content_limit() / 2
+    }
+
     /// Reports whether `key` can fit in both a splittable leaf entry and its
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
@@ -170,14 +177,13 @@ impl SplitPolicy {
             ..ShardEntry::new(key)
         };
         let content_limit = self.content_limit();
-        let leaf_len = Node::leaf(Shard::from_entries([entry])).content_encoded_len();
         let token = "x".repeat(24);
         let index_len = Node::index(IndexNode::from_children([
             (Vec::new(), token.clone()),
             (key.to_vec(), token),
         ]))
         .content_encoded_len();
-        leaf_len <= content_limit / 2 && index_len <= content_limit
+        self.entry_fits_split_budget(&entry) && index_len <= content_limit
     }
 }
 
@@ -984,6 +990,24 @@ mod tests {
             three.over_soft_cap(&byte_policy),
             "multi-entry over the byte cap splits"
         );
+    }
+
+    #[test]
+    fn exact_entry_split_budget_is_half_the_content_limit() {
+        let entry = entry(b"boundary", 1);
+        let entry_len = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
+        let admitting = SplitPolicy {
+            node_max_bytes: entry_len * 2,
+            split_headroom_bytes: 0,
+            ..SplitPolicy::default()
+        };
+        assert!(admitting.entry_fits_split_budget(&entry));
+
+        let rejecting = SplitPolicy {
+            node_max_bytes: entry_len * 2 - 1,
+            ..admitting
+        };
+        assert!(!rejecting.entry_fits_split_budget(&entry));
     }
 
     #[test]

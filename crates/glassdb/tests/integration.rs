@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
@@ -10,7 +11,8 @@ use glassdb::{
     Backend, Collection, CollectionPath, Database, Error, InlinePolicy, ProtocolTiming,
     SplitPolicy, Transaction,
 };
-use glassdb_storage::{Node, TxCommitStatus};
+use glassdb_data::TxId;
+use glassdb_storage::{CurrentState, LockType, Node, Shard, ShardEntry, TxCommitStatus};
 use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
@@ -35,6 +37,25 @@ fn mem() -> Arc<dyn Backend> {
 
 fn write_int(n: i64) -> Vec<u8> {
     n.to_le_bytes().to_vec()
+}
+
+fn split_unsafe_boundary_key(policy: &SplitPolicy, value: &[u8], fill: u8) -> Vec<u8> {
+    let writer = TxId::with_priority(1, b"boundary");
+    let mut boundary = None;
+    for len in 1..policy.content_limit() {
+        let key = vec![fill; len];
+        let inline = ShardEntry {
+            current: CurrentState::Inline {
+                writer: writer.clone(),
+                value: Arc::from(value),
+            },
+            ..ShardEntry::new(key.clone())
+        };
+        if policy.key_fits(&key) && !policy.entry_fits_split_budget(&inline) {
+            boundary = Some(key);
+        }
+    }
+    boundary.expect("test policy has no accepted key whose inline form exceeds its split budget")
 }
 
 fn try_read_int(b: &[u8]) -> Option<i64> {
@@ -121,6 +142,71 @@ async fn individually_oversized_key_is_invalid_input() {
         delta.locker.calls, 0,
         "invalid keys are rejected before locking"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
+    let policy = SplitPolicy {
+        leaf_max_bytes: 384,
+        node_max_bytes: 512,
+        split_headroom_bytes: 128,
+        ..SplitPolicy::default()
+    };
+    let inline_value = vec![b'v'; 128];
+    let first = split_unsafe_boundary_key(&policy, &inline_value, b'a');
+    let second = vec![b'z'; first.len()];
+    assert!(policy.key_fits(&second));
+    let boundary_writer = TxId::with_priority(1, b"boundary");
+    let inline_entry = ShardEntry {
+        current: CurrentState::Inline {
+            writer: boundary_writer,
+            value: Arc::from(inline_value.as_slice()),
+        },
+        ..ShardEntry::new(first.clone())
+    };
+    let create_entry = ShardEntry {
+        lock_type: LockType::Create,
+        locked_by: vec![TxId::with_priority(2, b"creator")],
+        ..ShardEntry::new(second.clone())
+    };
+    assert!(
+        Node::leaf(Shard::from_entries([inline_entry, create_entry])).content_encoded_len()
+            > policy.content_limit(),
+        "the old inline publication must make the second accepted key hit LeafFull"
+    );
+
+    let db = Database::builder("example", mem())
+        .split_policy(policy)
+        .inline_policy(InlinePolicy {
+            max_value_bytes: inline_value.len(),
+            max_leaf_bytes: inline_value.len(),
+        })
+        .open()
+        .await
+        .unwrap();
+    let coll = create_top(&db, b"boundary").await;
+    coll.write(&first, b"seed").await.unwrap();
+
+    let before = db.stats();
+    let coll_ref = &coll;
+    let first_ref = first.as_slice();
+    let inline_ref = inline_value.as_slice();
+    db.tx(|tx| async move {
+        tx.read(coll_ref, first_ref).await?.ok_or(Error::NotFound)?;
+        tx.write(coll_ref, first_ref, inline_ref)
+    })
+    .await
+    .unwrap();
+    let direct = (db.stats() - before).direct_commit;
+    assert_eq!(direct.candidates, 1);
+    assert_eq!(direct.landed, 0, "the split-unsafe inline value fell back");
+
+    tokio::time::timeout(Duration::from_secs(5), coll.write(&second, b"second"))
+        .await
+        .expect("a second accepted key must not wait forever for an impossible split")
+        .unwrap();
+    assert_eq!(coll.read(&first).await.unwrap().unwrap(), inline_value);
+    assert_eq!(coll.read(&second).await.unwrap().unwrap(), b"second");
 }
 
 // The distributed locker's counters are surfaced through `Database::stats()`
