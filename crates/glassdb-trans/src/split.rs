@@ -724,6 +724,19 @@ impl Splitter {
         }
     }
 
+    /// Carries an oversized split output into a later sweep so one hint can
+    /// drive the whole split cascade.
+    fn enqueue_if_over_soft_cap(&self, prefix: &str, token: &str, node: &Node) {
+        if !node.over_soft_cap(self.candidates.policy()) {
+            return;
+        }
+        self.candidates.push(SplitCandidate {
+            path: paths::from_node(prefix, token),
+            priority: self.candidates.new_id(),
+            reason: SplitReason::SoftCap,
+        });
+    }
+
     /// Splits the leaf at object `path` if it is still over the soft cap: an
     /// in-place root split when `path` is the collection root `_r`, else a
     /// standalone node half-split.
@@ -1228,6 +1241,8 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        self.enqueue_if_over_soft_cap(prefix, token, &node);
+        self.enqueue_if_over_soft_cap(prefix, &right_token, &right);
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
@@ -1447,6 +1462,8 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        self.enqueue_if_over_soft_cap(prefix, &l_token, &left);
+        self.enqueue_if_over_soft_cap(prefix, &r_token, &right);
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
@@ -2551,6 +2568,49 @@ mod tests {
             }
         );
         assert_eq!(sp.stats_and_reset(), SplitterStats::default());
+    }
+
+    // One large mutation can overshoot the soft cap by enough that halving the
+    // leaf once leaves both outputs oversized. The outputs must feed the next
+    // sweep themselves; no later mutation should be needed to finish the tree.
+    #[tokio::test]
+    async fn one_hint_cascades_until_every_leaf_is_under_cap() {
+        let s = store();
+        let keys: [&[u8]; 9] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i"];
+        let root = Node::leaf(Shard::from_entries(keys.iter().map(|key| live(key))));
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let policy = SplitPolicy {
+            leaf_max_entries: 2,
+            leaf_max_bytes: 1 << 20,
+            index_max_children: 100,
+            ..SplitPolicy::default()
+        };
+        let candidates = SplitCandidates::with_clock(policy, Clock::real());
+        candidates.observe_leaf(&paths::tree_root(COLL), root.as_leaf().unwrap());
+        let sp = splitter_with_candidates(&s, &bg, candidates);
+
+        // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
+        for _ in 0..3 {
+            sp.run_once().await;
+        }
+
+        let router = TreeRouter::new(s.shards.clone());
+        let leaves = router
+            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 5);
+        assert!(leaves.iter().all(|leaf| {
+            leaf.node().unwrap().as_leaf().unwrap().len() <= policy.leaf_max_entries
+        }));
+        for key in keys {
+            let located = router
+                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap();
+            assert!(located.node().unwrap().as_leaf().unwrap().exists(key));
+        }
     }
 
     #[tokio::test]
