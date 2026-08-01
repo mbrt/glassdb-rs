@@ -227,7 +227,11 @@ impl Shard {
         let mut entries = BTreeMap::new();
         for e in raw.entries {
             let entry = entry_from_proto(e)?;
-            entries.insert(entry.key.clone(), entry);
+            if entries.insert(entry.key.clone(), entry).is_some() {
+                return Err(StorageError::other(
+                    "shard contains duplicate entries for a key",
+                ));
+            }
         }
         Ok(Shard { entries })
     }
@@ -246,10 +250,21 @@ fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
 }
 
 fn entry_from_proto(e: pb::ShardEntry) -> Result<ShardEntry, StorageError> {
+    let mut lock_type = lock_type_from_proto(e.lock_type);
+    let locked_by: Vec<TxId> = e.locked_by.into_iter().map(TxId::from_bytes).collect();
+    match (lock_type, locked_by.as_slice()) {
+        (LockType::None | LockType::Unknown, [])
+        | (LockType::Read, [_, ..])
+        | (LockType::Write | LockType::Create, [_]) => {}
+        _ => return Err(StorageError::other("shard entry has an invalid lock")),
+    }
+    if lock_type == LockType::Unknown {
+        lock_type = LockType::None;
+    }
     Ok(ShardEntry {
         key: e.key,
-        lock_type: lock_type_from_proto(e.lock_type),
-        locked_by: e.locked_by.into_iter().map(TxId::from_bytes).collect(),
+        lock_type,
+        locked_by,
         current: current_from_proto(e.current)?,
     })
 }
@@ -410,6 +425,66 @@ mod tests {
 
         assert!(Shard::decode(&no_state.encode_to_vec()).is_err());
         assert!(Shard::decode(&no_writer.encode_to_vec()).is_err());
+    }
+
+    #[test]
+    fn decoding_rejects_inconsistent_entry_locks() {
+        use pb::lock::LockType as PbLockType;
+
+        let invalid_locks = [
+            (PbLockType::None, vec![vec![1]]),
+            (PbLockType::Unknown, vec![vec![1]]),
+            (PbLockType::Read, Vec::new()),
+            (PbLockType::Write, Vec::new()),
+            (PbLockType::Write, vec![vec![1], vec![2]]),
+            (PbLockType::Create, Vec::new()),
+            (PbLockType::Create, vec![vec![1], vec![2]]),
+        ];
+
+        for (lock_type, locked_by) in invalid_locks {
+            let raw = pb::Shard {
+                entries: vec![pb::ShardEntry {
+                    key: b"k".to_vec(),
+                    lock_type: lock_type as i32,
+                    locked_by,
+                    current: None,
+                }],
+            };
+
+            let error = Shard::decode(&raw.encode_to_vec()).unwrap_err();
+            assert_eq!(error.to_string(), "shard entry has an invalid lock");
+        }
+    }
+
+    #[test]
+    fn decoding_treats_an_unspecified_empty_lock_as_unlocked() {
+        let raw = pb::Shard {
+            entries: vec![pb::ShardEntry {
+                key: b"k".to_vec(),
+                ..Default::default()
+            }],
+        };
+
+        let shard = Shard::decode(&raw.encode_to_vec()).unwrap();
+        assert_eq!(shard.lookup(b"k").unwrap().lock_type, LockType::None);
+    }
+
+    #[test]
+    fn decoding_rejects_duplicate_entry_keys() {
+        let entry = pb::ShardEntry {
+            key: b"duplicate".to_vec(),
+            lock_type: pb::lock::LockType::None as i32,
+            ..Default::default()
+        };
+        let raw = pb::Shard {
+            entries: vec![entry.clone(), entry],
+        };
+
+        let error = Shard::decode(&raw.encode_to_vec()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "shard contains duplicate entries for a key"
+        );
     }
 
     #[test]
