@@ -1488,7 +1488,7 @@ mod tests {
     use crate::monitor::ProtocolTiming;
     use crate::reader::Reader;
     use glassdb_backend::middleware::{
-        BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
+        BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
@@ -2731,13 +2731,35 @@ mod tests {
             if o.op != "write_if" && o.op != "write_if_not_exists" {
                 continue;
             }
-            if o.path.contains("/_n/") || o.path.ends_with("/_r") {
-                c.leaf += 1;
-            } else if o.path.contains("/_t/") {
-                c.tx += 1;
+            if let Ok(parsed) = paths::parse(&o.path) {
+                match parsed.typ {
+                    paths::Type::TreeRoot | paths::Type::Node => c.leaf += 1,
+                    paths::Type::Transaction => c.tx += 1,
+                    _ => {}
+                }
             }
         }
         c
+    }
+
+    // Transaction shards use two symbols from the same alphabet as path type
+    // markers. In particular, a transaction can live under `/_t/_n/`; path
+    // substring checks would mistake its object create for a standalone-node
+    // write and make commit-path counts depend on random transaction entropy.
+    #[test]
+    fn write_counts_parses_transaction_shard_named_like_node() {
+        let id = TxId::from_bytes(vec![0x97, 0x30]);
+        let path = paths::from_transaction(TEST_DB, &id);
+        assert!(path.contains("/_t/_n/"), "test id mapped to {path:?}");
+        let log = Arc::new(std::sync::Mutex::new(vec![OpRecord {
+            op: "write_if_not_exists",
+            path,
+            args: Vec::new(),
+        }]));
+
+        let counts = write_counts(&log);
+        assert_eq!(counts.leaf, 0);
+        assert_eq!(counts.tx, 1);
     }
 
     // Backend reads against leaf objects: `read` is a cold full read (cache
