@@ -4,6 +4,7 @@
 mod access;
 mod algo;
 mod collection_catalog;
+mod collection_commit;
 mod collection_coordination;
 mod collections;
 mod engine;

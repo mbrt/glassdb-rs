@@ -15,6 +15,7 @@ use glassdb_storage::{
 use crate::access::{Data, ScanMutation, ScanRange};
 use crate::algo::{Algo, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
+use crate::collection_commit::CollectionCommit;
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CollectionData, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
@@ -256,14 +257,19 @@ impl Engine {
         );
         gc.start();
         splitter.start();
+        let collection_commit = CollectionCommit::new(
+            collection_catalog.clone(),
+            collection_lifecycle,
+            monitor.clone(),
+            split_policy,
+        );
         let algo = Algo::new(
             shards,
             timeline,
             locker.clone(),
             coord.clone(),
             monitor,
-            collection_catalog.clone(),
-            collection_lifecycle,
+            collection_commit,
             clock,
             gc,
             Some(background_weak),
