@@ -165,6 +165,10 @@ pub(crate) enum StageAdmission {
     /// The stage does not add a user key, so it may consume reserved headroom
     /// but must still fit under the absolute encoded-object limit.
     ExistingKeys,
+    /// The stage publishes an inline value. In addition to the absolute object
+    /// limit, each published entry must retain the per-entry split budget so it
+    /// cannot leave behind an intrinsically unsplittable singleton.
+    InlinePublication,
     /// The stage adds at least one user key and must fit below the content limit
     /// that reserves headroom for locks and the split's shrink CAS.
     AddsKey,
@@ -536,10 +540,20 @@ impl CasWorker {
                         let create_full = admission == StageAdmission::AddsKey
                             && candidate_node.content_encoded_len()
                                 > self.core.policy.content_limit();
+                        let inline_entry_full = admission == StageAdmission::InlinePublication
+                            && changes
+                                .iter()
+                                .any(|(_, entry)| !self.core.policy.entry_fits_split_budget(entry));
                         if candidate_node.encoded_len() > self.core.policy.node_max_bytes
                             || create_full
+                            || inline_entry_full
                         {
-                            self.core.hinter.observe_leaf(path, &candidate_shard);
+                            // Splitting cannot make an intrinsically oversized
+                            // entry fit. The direct publisher falls back to an
+                            // external value, which shrinks it instead.
+                            if !inline_entry_full {
+                                self.core.hinter.observe_leaf(path, &candidate_shard);
+                            }
                             let outcome = if admission == StageAdmission::AddsKey {
                                 FoldOutcome::LeafFull
                             } else if in_doubt.contains(tx) {
@@ -2041,7 +2055,7 @@ mod tests {
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
+                admission: StageAdmission::InlinePublication,
                 outcome: FoldOutcome::Landed,
             })
         }
@@ -2113,6 +2127,63 @@ mod tests {
                 cas_precondition: None,
             })
         ));
+        coord.close().await;
+
+        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        assert!(shard.lookup(b"k").is_none(), "nothing was written");
+    }
+
+    // An inline entry may fit the physical object while still consuming more
+    // than its half of the content budget. Publishing it would let a later
+    // accepted key strand this leaf as an unsplittable singleton, so the direct
+    // attempt must fall back without issuing a futile split hint.
+    #[tokio::test]
+    async fn a_logless_inline_entry_must_preserve_the_split_budget() {
+        let tx = TxId::with_priority(1, b"t");
+        let value = b"inline";
+        let inline = ShardEntry {
+            current: CurrentState::Inline {
+                writer: tx.clone(),
+                value: Arc::from(value.as_slice()),
+            },
+            ..ShardEntry::new(b"k")
+        };
+        let entry_len = Node::leaf(Shard::from_entries([inline.clone()])).content_encoded_len();
+        let policy = SplitPolicy {
+            node_max_bytes: entry_len * 2 + 64,
+            split_headroom_bytes: 65,
+            ..SplitPolicy::default()
+        };
+        assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes);
+        assert!(!policy.entry_fits_split_budget(&ShardEntry {
+            current: CurrentState::Inline {
+                writer: tx.clone(),
+                value: Arc::from(value.as_slice()),
+            },
+            ..ShardEntry::new(b"k")
+        }));
+
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hints = Arc::new(HintCounter::default());
+        let (coord, _shards, _timeline, _bg) =
+            coord_over_with(backend.clone(), policy, hints.clone()).await;
+        let outcome = coord
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(StageInline::logless(b"k", &tx, value)),
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Conflict,
+                cas_precondition: None,
+            })
+        ));
+        assert_eq!(hints.calls.load(Ordering::SeqCst), 0);
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
