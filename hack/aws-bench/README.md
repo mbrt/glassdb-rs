@@ -361,6 +361,11 @@ while the simulated delays dominate; at very small `--delay-scale` real
 scheduling overhead is amplified, so prefer a scale near `1.0` when absolute
 latencies matter.
 
+`compare-refs.sh` also detects binaries from before this reporting convention
+and normalizes their compressed `rtbench` timings before comparison. The raw
+CSV artifacts remain unchanged, and the applied factor is written to the
+summary.
+
 Both refs must carry the enhanced `rtbench` for a full comparison (the
 `--rw-mix` flag and the `backend-ops` column in `stats.csv`, and `mixbench`).
 When the target is an older tree that lacks them, the driver falls back to the

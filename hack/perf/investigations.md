@@ -317,6 +317,34 @@ is correctness-safe: existing inline values are grandfathered and the policy is
 not persisted. Clients of one database should nevertheless deploy the same
 configuration, because pressure splits durably change its topology.
 
+### Post-selection guardrails
+
+The default-only comparison uses `fbdb99f5` (1 KiB / 64 KiB) as the base and
+`40bc6b8d` (1 KiB / 16 KiB) as the target. All cells complete with zero
+transaction failures and bounded drains.
+
+- The permanent inline-pressure scenario is explicitly pinned to 64 KiB, so
+  its protocol outcomes are identical: `64/64` recovery mutations land
+  directly and both sides complete exactly two pressure splits. Recovery
+  throughput is at parity in S3 and `0.97` in GCS.
+- Three alternating high-contention/per-shape mixbench pairs all converge. The
+  read-shape throughput geomeans are `1.03` (`roSingle`) and `1.00`
+  (`roMulti`), with backend-operations geomeans of `0.95` and `0.97`. The eight
+  128 B hot values fit under both aggregate limits, so the absence of a stable
+  delta is expected.
+- Ten alternating autoresearch pairs put the total score at a `1.005` geomean.
+  `batchWrite100` cost is `0.990`; its median object-write count is `112.5`
+  under 64 KiB and `113.5` under 16 KiB. The suite's 8 B values and logged
+  batches do not exercise the aggregate-cap difference.
+- The broad rw9010 throughput geomeans are `0.92` balanced, `1.04` read-heavy,
+  and `1.04` write-heavy; backend-operation geomeans are `1.08`, `1.02`, and
+  `1.10`. Their wide paired ranges, together with the deterministic and focused
+  results, do not establish a default-induced regression.
+
+The guardrails therefore retain the 16 KiB default. Its intentional cost
+remains the earlier pressure splitting measured by the sweep for dense 1 KiB
+values; workloads that prefer fewer objects can select 64 KiB explicitly.
+
 ### Current conclusion
 
 ADR-054 removes logged write-back amplification, and ADR-056 supplies the
@@ -329,6 +357,8 @@ then-current 1 KiB/64 KiB budgets were optimal, nor quantify permanent widening
 under a broad workload.
 
 The inline-policy sweep changed the default from 1 KiB / 64 KiB to 1 KiB /
-16 KiB. Real-provider and repeated-wave measurements remain useful for later
-tuning, but are not a blocker: 16 KiB is the safer cross-profile default, while
-64 KiB remains an explicit workload-specific option.
+16 KiB. The post-selection guardrails find no repeatable regression in the
+existing below-cap workloads. Real-provider and repeated-wave measurements
+remain useful for later tuning, but are not a blocker: 16 KiB is the safer
+cross-profile default, while 64 KiB remains an explicit workload-specific
+option.

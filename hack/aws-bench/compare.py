@@ -104,6 +104,40 @@ def read_json(input_dir: Path, name: str) -> Any | None:
     return None
 
 
+def normalize_rtbench_time(
+    df: pd.DataFrame | None, name: str, factor: float
+) -> pd.DataFrame | None:
+    """Normalize legacy compressed-time rtbench output.
+
+    Current rtbench reports simulated time after undoing ``--delay-scale``.
+    Older binaries reported compressed wall time. ``factor`` is the multiplier
+    needed to put the latter into the current reporting domain.
+    """
+    if df is None or factor == 1.0:
+        return df
+    if not np.isfinite(factor) or factor <= 0:
+        raise ValueError(f"rtbench time factor must be positive, got {factor}")
+
+    d = df.copy()
+    time_columns = {
+        "throughput.csv": ["duration-ms", "cell-duration-ms"],
+        "samples.csv": ["latency"],
+        "deadlock.csv": ["latency-ms"],
+        "deadlock-stats.csv": ["cell-duration-ms", "worker-drain-ms"],
+    }
+    rate_columns = {
+        "throughput.csv": ["tx-per-sec"],
+        "deadlock-stats.csv": ["tx-per-sec"],
+    }
+    for column in time_columns.get(name, []):
+        if column in d.columns:
+            d[column] *= factor
+    for column in rate_columns.get(name, []):
+        if column in d.columns:
+            d[column] /= factor
+    return d
+
+
 def _ratio(b: float, a: float) -> float:
     return float("nan") if a == 0 else b / a
 
@@ -930,6 +964,18 @@ def main() -> int:
     )
     parser.add_argument("--title", default="", help="prefix for the report header")
     parser.add_argument("--concurrency-per-db", type=int, default=10)
+    parser.add_argument(
+        "--rtbench-time-factor-a",
+        type=float,
+        default=1.0,
+        help="multiply legacy rtbench timings from --a by this factor",
+    )
+    parser.add_argument(
+        "--rtbench-time-factor-b",
+        type=float,
+        default=1.0,
+        help="multiply legacy rtbench timings from --b by this factor",
+    )
     parser.add_argument("--no-plots", action="store_true", help="skip overlay PNGs")
     parser.add_argument(
         "--summary-out",
@@ -950,7 +996,16 @@ def main() -> int:
 
     summaries: list[str] = []
 
-    a_tp, b_tp = read_csv(args.a, "throughput.csv"), read_csv(args.b, "throughput.csv")
+    a_tp = normalize_rtbench_time(
+        read_csv(args.a, "throughput.csv"),
+        "throughput.csv",
+        args.rtbench_time_factor_a,
+    )
+    b_tp = normalize_rtbench_time(
+        read_csv(args.b, "throughput.csv"),
+        "throughput.csv",
+        args.rtbench_time_factor_b,
+    )
     if a_tp is not None and b_tp is not None:
         tbl = throughput_table(a_tp, b_tp, cpd)
         cols = [
@@ -992,7 +1047,16 @@ def main() -> int:
             )
         )
 
-    a_la, b_la = read_csv(args.a, "samples.csv"), read_csv(args.b, "samples.csv")
+    a_la = normalize_rtbench_time(
+        read_csv(args.a, "samples.csv"),
+        "samples.csv",
+        args.rtbench_time_factor_a,
+    )
+    b_la = normalize_rtbench_time(
+        read_csv(args.b, "samples.csv"),
+        "samples.csv",
+        args.rtbench_time_factor_b,
+    )
     if a_la is not None and b_la is not None:
         tbl = latency_table(a_la, b_la, cpd)
         cols = [
@@ -1167,7 +1231,16 @@ def main() -> int:
                 f"{lb}={total['split-completed_b'].median():.1f}"
             )
 
-    a_dl, b_dl = read_csv(args.a, "deadlock.csv"), read_csv(args.b, "deadlock.csv")
+    a_dl = normalize_rtbench_time(
+        read_csv(args.a, "deadlock.csv"),
+        "deadlock.csv",
+        args.rtbench_time_factor_a,
+    )
+    b_dl = normalize_rtbench_time(
+        read_csv(args.b, "deadlock.csv"),
+        "deadlock.csv",
+        args.rtbench_time_factor_b,
+    )
     if a_dl is not None and b_dl is not None:
         tbl = deadlock_table(a_dl, b_dl)
         print_table(f"Deadlock latency at 100% overlap (ms, {lb}/{la})", tbl)
@@ -1182,8 +1255,16 @@ def main() -> int:
             )
         )
 
-    a_ds = read_csv(args.a, "deadlock-stats.csv")
-    b_ds = read_csv(args.b, "deadlock-stats.csv")
+    a_ds = normalize_rtbench_time(
+        read_csv(args.a, "deadlock-stats.csv"),
+        "deadlock-stats.csv",
+        args.rtbench_time_factor_a,
+    )
+    b_ds = normalize_rtbench_time(
+        read_csv(args.b, "deadlock-stats.csv"),
+        "deadlock-stats.csv",
+        args.rtbench_time_factor_b,
+    )
     if a_ds is not None and b_ds is not None:
         tbl = deadlock_stats_table(a_ds, b_ds)
         cols = [

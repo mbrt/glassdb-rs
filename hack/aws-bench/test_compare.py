@@ -123,6 +123,35 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(aggregate["run"].tolist(), [1, 2])
         self.assertEqual(aggregate["total-tps"].tolist(), [20, 40])
 
+    def test_legacy_compressed_time_is_normalized(self) -> None:
+        throughput = pd.DataFrame(
+            [
+                {
+                    "duration-ms": 1000.0,
+                    "tx-per-sec": 20.0,
+                }
+            ]
+        )
+        samples = pd.DataFrame([{"latency": 2.0}])
+
+        normalized_throughput = compare.normalize_rtbench_time(
+            throughput, "throughput.csv", 50.0
+        )
+        normalized_samples = compare.normalize_rtbench_time(
+            samples, "samples.csv", 50.0
+        )
+
+        self.assertEqual(normalized_throughput.loc[0, "duration-ms"], 50_000)
+        self.assertEqual(normalized_throughput.loc[0, "tx-per-sec"], 0.4)
+        self.assertEqual(normalized_samples.loc[0, "latency"], 100)
+        self.assertEqual(throughput.loc[0, "duration-ms"], 1000)
+
+    def test_invalid_legacy_time_factor_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            compare.normalize_rtbench_time(
+                pd.DataFrame([{"latency": 1.0}]), "samples.csv", 0.0
+            )
+
     def test_missing_paired_run_is_rejected(self) -> None:
         base = pd.DataFrame(
             [

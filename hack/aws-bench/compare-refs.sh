@@ -214,19 +214,13 @@ validate_csv_rows() {
 }
 
 validate_csv_rows_one_of() {
-  local path="$1" expected_a="$2" expected_b="$3"
-  awk -v expected_a="$expected_a" -v expected_b="$expected_b" '
-    NR > 1 { rows++ }
-    END {
-      if (rows != expected_a && rows != expected_b) {
-        printf(
-          "%s: expected %d or %d rows, found %d\n",
-          FILENAME, expected_a, expected_b, rows
-        ) > "/dev/stderr"
-        exit 1
-      }
-    }
-  ' "$path"
+  local path="$1" expected_a="$2" expected_b="$3" rows
+  rows="$(awk 'NR > 1 { rows++ } END { print rows + 0 }' "$path")"
+  if [ "$rows" -ne "$expected_a" ] && [ "$rows" -ne "$expected_b" ]; then
+    printf '%s: expected %d or %d rows, found %d\n' \
+      "$path" "$expected_a" "$expected_b" "$rows" >&2
+    return 1
+  fi
 }
 
 validate_mix_results() {
@@ -311,6 +305,22 @@ supports_deadlock_stats() {
 
 supports_inline_pressure() {
   "$1" --help 2>&1 | grep -q -- "--inline-pressure-out"
+}
+
+# rtbench before e2171c3c applied --delay-scale to the simulated backend but
+# reported compressed wall time. Current binaries undo that compression in
+# every reported latency and throughput metric.
+rtbench_time_factor() {
+  local source_root="$1" main
+  main="$source_root/crates/glassdb-bench-scale/src/bin/rtbench/main.rs"
+  if grep -q 'fn report_time_scale' "$main"; then
+    printf '1\n'
+  else
+    awk -v scale="$DELAY_SCALE" 'BEGIN {
+      if (scale <= 0) exit 1
+      printf "%.17g\n", 1 / scale
+    }'
+  fi
 }
 
 append_csv_with_run() {
@@ -464,16 +474,27 @@ run_aux_side() {
 ensure_worktree "$BASE_WT" "$BASE"
 build_bins "$BASE_WT"
 BASE_BIN="$BASE_WT/target/release"
+BASE_TIME_FACTOR="$(rtbench_time_factor "$BASE_WT")"
 
 if [ -n "$TARGET" ]; then
   ensure_worktree "$TARGET_WT" "$TARGET"
   build_bins "$TARGET_WT"
   TARGET_BIN="$TARGET_WT/target/release"
   TARGET_DESC="$TARGET"
+  TARGET_SOURCE_ROOT="$TARGET_WT"
 else
   build_bins "$REPO_ROOT"
   TARGET_BIN="$REPO_ROOT/target/release"
   TARGET_DESC="current worktree"
+  TARGET_SOURCE_ROOT="$REPO_ROOT"
+fi
+TARGET_TIME_FACTOR="$(rtbench_time_factor "$TARGET_SOURCE_ROOT")"
+TIME_FACTOR_ARGS=(
+  --rtbench-time-factor-a "$BASE_TIME_FACTOR"
+  --rtbench-time-factor-b "$TARGET_TIME_FACTOR"
+)
+if [ "$BASE_TIME_FACTOR" != "1" ] || [ "$TARGET_TIME_FACTOR" != "1" ]; then
+  log "normalizing legacy rtbench time: $LABEL_A=${BASE_TIME_FACTOR}x $LABEL_B=${TARGET_TIME_FACTOR}x"
 fi
 
 # Determine the mix set: every requested mix only when both binaries support
@@ -592,6 +613,9 @@ mkdir -p "$OUT"
   echo "- base: $BASE ($LABEL_A)"
   echo "- target: $TARGET_DESC ($LABEL_B)"
   echo "- ratio = $LABEL_B / $LABEL_A (throughput >1 good; latency/ops/cost <1 good)"
+  if [ "$BASE_TIME_FACTOR" != "1" ] || [ "$TARGET_TIME_FACTOR" != "1" ]; then
+    echo "- legacy rtbench time normalization: $LABEL_A=${BASE_TIME_FACTOR}x; $LABEL_B=${TARGET_TIME_FACTOR}x"
+  fi
   echo "- each line ends in a \`=> better/WORSE/~same\` verdict read in that"
   echo "  metric's own direction, so no axis has to be interpreted by hand"
   echo "- \`autoresearch-*\` is **deterministic** (single-client backend ops/tx,"
@@ -606,7 +630,7 @@ for mix in $MIXES; do
   uv run "$SCRIPT_DIR/compare.py" \
     --a "$OUT/$mix/$LABEL_A" --b "$OUT/$mix/$LABEL_B" \
     --label-a "$LABEL_A" --label-b "$LABEL_B" --title "rw9010/$mix" \
-    "${PLOT_ARGS[@]}" --summary-out "$SUMMARY"
+    "${TIME_FACTOR_ARGS[@]}" "${PLOT_ARGS[@]}" --summary-out "$SUMMARY"
 done
 
 if [ "$RUN_INLINE" = "1" ]; then
@@ -615,14 +639,15 @@ if [ "$RUN_INLINE" = "1" ]; then
       --a "$OUT/inline-pressure/$profile/$LABEL_A" \
       --b "$OUT/inline-pressure/$profile/$LABEL_B" \
       --label-a "$LABEL_A" --label-b "$LABEL_B" \
-      --title "inline-pressure/$profile" --no-plots --summary-out "$SUMMARY"
+      --title "inline-pressure/$profile" "${TIME_FACTOR_ARGS[@]}" \
+      --no-plots --summary-out "$SUMMARY"
   done
 fi
 
 uv run "$SCRIPT_DIR/compare.py" \
   --a "$OUT/contention/$LABEL_A" --b "$OUT/contention/$LABEL_B" \
   --label-a "$LABEL_A" --label-b "$LABEL_B" --title "deadlock" \
-  "${PLOT_ARGS[@]}" --summary-out "$SUMMARY"
+  "${TIME_FACTOR_ARGS[@]}" "${PLOT_ARGS[@]}" --summary-out "$SUMMARY"
 
 # Only when both sides produced a grid (both refs carry mixbench).
 if [ -f "$OUT/mixbench/$LABEL_A/mixbench.json" ] \
@@ -630,7 +655,7 @@ if [ -f "$OUT/mixbench/$LABEL_A/mixbench.json" ] \
   uv run "$SCRIPT_DIR/compare.py" \
     --a "$OUT/mixbench/$LABEL_A" --b "$OUT/mixbench/$LABEL_B" \
     --label-a "$LABEL_A" --label-b "$LABEL_B" --title "mixbench" --no-plots \
-    --summary-out "$SUMMARY"
+    "${TIME_FACTOR_ARGS[@]}" --summary-out "$SUMMARY"
 else
   log "skipping mixbench comparison (missing on a side)"
 fi
@@ -638,7 +663,7 @@ fi
 uv run "$SCRIPT_DIR/compare.py" \
   --a "$OUT/efficiency/$LABEL_A" --b "$OUT/efficiency/$LABEL_B" \
   --label-a "$LABEL_A" --label-b "$LABEL_B" --title "efficiency" --no-plots \
-  --summary-out "$SUMMARY"
+  "${TIME_FACTOR_ARGS[@]}" --summary-out "$SUMMARY"
 
 # --- Clean up worktrees ----------------------------------------------------
 
