@@ -2,6 +2,7 @@
 
 ## Design
 
+- Always respect the design principles in `docs/principles.md`.
 - Keep ADRs minimal and focused on the decisions, architecture, and trade-offs. Avoid implementation details.
 - When new ADRs make older ones obsolete, mark them as such and link to the new ADR.
 - Add ADRs only for significant decisions.
