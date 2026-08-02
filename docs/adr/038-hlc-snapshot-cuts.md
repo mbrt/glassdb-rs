@@ -123,8 +123,13 @@ abort a writer because an unrelated transaction is slow.
 - Freshness is asserted from an observation rather than proved by a fence, and
   a cut is no longer an exact set of transactions fixed by CAS ordering. Precise
   incremental change capture between two cuts becomes harder.
-- Readers may occasionally resolve a pending holder, which strict reads already
-  do, instead of being guaranteed a fully resolved cut by sealing.
+- A cut is no longer resolved by construction. A reader meeting a holder at or
+  below its cut must drive it to a terminal outcome rather than read past it,
+  because `pending` may still become a commit below that cut. This costs a
+  backend operation and can pull an otherwise cache-served execution into one.
+  Sealing precluded it outright; the margin only makes it rare, by ensuring such
+  a holder is already past its lease. The work itself is what every strict read
+  already does, so what is lost is a guarantee rather than machinery.
 
 ## Alternatives considered
 

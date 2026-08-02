@@ -237,11 +237,27 @@ are `enabled -> draining -> disabled -> rebuilding -> enabled`.
 Every operational transition and recovery step is ownerless, idempotent, and
 helpable after the initiating client disappears. `draining` and `rebuilding`
 both reject new snapshot binds and retain history when progress is uncertain.
-Disable is therefore delayed pressure relief, not an emergency delete switch:
-with the proposed defaults, existing reads may keep the full history obligation
-for roughly an hour plus the guard. Rebuilding may require a database-wide
-baseline scan while writers continue; implementations must expose its progress,
-restart state, and required temporary storage headroom.
+Disable is therefore not the emergency switch: with the proposed defaults,
+existing reads may keep the full history obligation for roughly an hour plus the
+guard. It is the heavy action, for reducing history to latest-state roots
+entirely. Rebuilding may require a database-wide baseline scan while writers
+continue; implementations must expose its progress, restart state, and required
+temporary storage headroom.
+
+The prompt relief is a deliberate advance of the history floor, and it needs no
+mechanism the floor does not already have. An operator names a floor; GC
+publishes it, waits the control-staleness bound, and reclaims everything below.
+Executions whose cuts fall under it fail with `SnapshotTooOld` on the refresh
+they already perform, so relief arrives in about a minute rather than about an
+hour. The database keeps serving throughout, because new binds take cuts near
+the present and sit far above any floor worth forcing; what narrows is the
+window, not the availability.
+
+The trade is explicit and that is the point. This abandons the lifetime the
+policy promised to executions already running, so it belongs to an operator
+under pressure rather than to a tuning loop, and the operator names the floor
+so that the readers being broken are stated rather than inferred. It breaks the
+promise loudly, as a distinct error, which is why it is safe to offer at all.
 
 ### Errors and observability
 
@@ -253,8 +269,11 @@ restart state, and required temporary storage headroom.
 - `SnapshotTooOld`: the cut is below the published history floor, at bind or on
   a later re-validation. It means the database can no longer serve the cut, so
   retrying with a fresher one is correct. In a healthy database it fires only
-  during a rebuild; otherwise it is the reader-versus-GC clock violation being
-  reported instead of silently answered.
+  during a rebuild, or when an operator has deliberately advanced the floor to
+  relieve storage; otherwise it is the reader-versus-GC clock violation being
+  reported instead of silently answered. A caller cannot distinguish the three,
+  and does not need to: retrying with a fresher cut is the response to all of
+  them.
 - Missing, cyclic, non-monotonic, or uncertified history inside the promised
   window is a corruption/invariant error, never `NotFound`.
 - Backend unavailability makes a cut staler, never unsafe. A bind that needs a
@@ -273,7 +292,11 @@ consistency.
 
 The margin between the history floor and the oldest admissible cut deserves its
 own gauge. It is the headroom protecting live readers, and it shrinking toward
-zero is the early warning that `SnapshotTooOld` is about to start firing.
+zero is the early warning that `SnapshotTooOld` is about to start firing. A
+deliberate floor advance collapses that gauge on purpose, so it should be
+distinguishable from the same collapse arriving unbidden; the first is an
+operator accepting a cost and the second is the database losing headroom it
+expected to keep.
 
 ## Cut definition
 
@@ -301,8 +324,31 @@ admission in it is resolved. Locks and intents precede admission, so every
 serialization edge implies `epoch(T) <= epoch(U)` and a sealed epoch is
 downward-closed by construction.
 
-This is correct and needs no clock to define the cut, which is its real
-attraction. It was rejected because the cut boundary is a database-wide object:
+This is correct, and it has two genuine advantages rather than the one usually
+noticed. It needs no clock to define the cut, so no allowance and no assumption
+about backend time enters the safety argument. And a sealed cut is fully
+resolved by construction: every admission below it reached a terminal outcome
+before the cut existed, so a reader never meets a writer whose outcome it has to
+determine.
+
+The chosen design gives up that second one, and it is worth being plain about
+what that costs. A reader meeting a holder whose timestamp lower bound is at or
+below its cut cannot treat `pending` as an answer the way a strict read can,
+because that writer may yet commit below the cut. It must drive the holder to a
+terminal outcome. That is a backend read at minimum, and for a dead writer it
+means waiting on the lease reclamation ADR-021 and ADR-024 perform. A cached
+leaf carrying such a holder therefore pulls backend work into an execution that
+would otherwise have been served entirely from cache, which is the one place
+this design's caching story is weaker than the sealed one's.
+
+The margin is what keeps that small rather than eliminating it. A holder at or
+below a cut is already older than the margin plus a grid period, and at the
+proposed staleness roughly thirty seconds old, which is past any lease it could
+have held. The writers a reader resolves are therefore dead ones rather than
+healthy ones in flight, and resolving them is work every strict read already
+does. Small is not none, and sealing had none.
+
+It was rejected nonetheless, because the cut boundary is a database-wide object:
 
 - **A choke point on both paths.** Every commit writes the admission structure
   and every uncached bind CAS-fences a single generation object and strongly
@@ -452,6 +498,13 @@ effective current writer" already makes every strict read do exactly this
 through `resolve_holders`. A holder old enough to matter here is also past its
 lease, which ADR-021 and ADR-024 already reclaim.
 
+It is, however, the one guarantee a sealed epoch had and this does not, since a
+sealed cut contains no unresolved writer by construction. A snapshot reader also
+cannot stop where a strict read stops: `pending` leaves open whether the writer
+commits below the cut, so it must reach a terminal outcome.
+[Rejected: a global sealed epoch](#rejected-a-global-sealed-epoch) accounts for
+what that costs.
+
 **Commit-age bound.** A transaction must not commit with a timestamp older than
 a bounded commit age, and any peer may CAS a pending transaction past that
 bound to aborted using the durable fence ADR-022 already defines. The bound
@@ -558,6 +611,12 @@ only the local-clock drift detector, whose allowance is sized for it above.
 - **Exactness is lost.** An epoch cut is an exact set of transactions fixed by
   CAS ordering. Precise incremental change capture between two consistent points
   would be cleaner on epochs; it is deferred rather than solved here.
+- **A cut is not resolved by construction.** Sealing guaranteed that every
+  writer below a cut already had a terminal outcome, so a reader never resolved
+  one and a cache-served execution stayed cache-served. Here a holder at or
+  below the cut must be driven to a terminal outcome, at the cost of a backend
+  operation. The margin makes this rare, because such a holder is necessarily
+  past its lease, but rare is the honest word rather than never.
 
 ### What the decision eliminates
 
@@ -902,8 +961,9 @@ precisely the window the floor exists to close.
 
 A bind requires its cut at or above the floor and otherwise fails with
 `SnapshotTooOld`. Under healthy operation the freshest admissible cut sits an
-entire retention window above the floor, so this fires only during a rebuild or
-when the guard has actually been violated.
+entire retention window above the floor, so this fires only during a rebuild,
+when an operator has deliberately advanced the floor to relieve storage, or when
+the guard has actually been violated.
 
 Checking it costs nothing. The floor lives in the same small bounded-staleness
 metadata a bind already reads for operational state, and that read's own
@@ -1184,7 +1244,10 @@ boundaries. At minimum, the test plan must cover:
   root tombstone/recreate versus delayed reclamation, and delayed artifacts
   arriving after a slot closes;
 - a reader encountering a pending holder at, just below, and just above its
-  cut, proving it resolves exactly the first two and waits on no other writer;
+  cut, proving it resolves exactly the first two and waits on no other writer,
+  that it reaches a terminal outcome rather than accepting `pending` as a strict
+  read may, and that an otherwise cache-served execution meeting such a holder
+  issues the backend operation this costs instead of answering from cache;
 - shared conformance tests for ADR-033's half-open `range`, `prefix`, `all`,
   exclusive `after`, `limit`, `next_after`, sorted materialized pages, zero
   limit, invalid bounds, and a collection missing at the selected cut;
@@ -1263,6 +1326,11 @@ boundaries. At minimum, the test plan must cover:
   authorizes, proving recovery is safe in that order and unsafe in the reverse
   one, and that a reader validating against a floor observation at the
   staleness bound still precedes the reclamation;
+- an operator advancing the floor above the cuts of running executions, proving
+  those executions fail with `SnapshotTooOld` on their next refresh rather than
+  returning a torn result, that reclamation still waits the control-staleness
+  bound after publication, and that binds continue to succeed over the narrowed
+  window while it happens;
 - an injected reader-versus-GC clock-rate violation over a full retention
   window, proving a pruned deleted key surfaces `SnapshotTooOld` rather than
   reading as absent, which is the wrong answer this mechanism exists to prevent;

@@ -108,6 +108,33 @@ before any torn result is returned.
 This is the same value the rebuild transition below publishes; ordinary GC and
 rebuild are two writers advancing one monotone floor.
 
+### Allow the floor to be advanced deliberately
+
+An operator under storage pressure otherwise has no action that helps soon.
+Disabling binds leaves existing readers their full lifetimes, so relief arrives
+a lifetime later, which is delayed relief rather than a valve.
+
+The floor already is one. Advancing it past a live cut is a case this decision
+specifies and readers already detect, so permit an operator to advance it
+deliberately to a floor they name. Reclamation then follows within the
+control-staleness bound instead of a lifetime, and a reader below the new floor
+fails with `SnapshotTooOld` rather than returning anything.
+
+This is orthogonal to the state machine below and does not stop service. New
+binds take cuts near the present, far above any floor worth forcing, so the
+database keeps serving snapshots over a narrower window while the history under
+it is reclaimed. Disabling binds remains the separate and heavier action for
+reducing history to latest-state roots altogether.
+
+The operator names the target floor rather than asking for an amount of relief,
+because what this action costs is which readers it breaks, and that should be
+stated rather than computed. It abandons the lifetime the policy promised to
+executions already running, which is what makes it an emergency action rather
+than a tuning knob, and the promise breaks as a distinct error rather than
+quietly. Its safety argument is the ordinary one unchanged: publish durably
+before reclaiming, wait the control-staleness bound, never reclaim above the
+published floor.
+
 Clocks now sit in liveness and retention rather than in correctness. GC
 advancing the floor too eagerly is detectable by every reader; advancing it too
 slowly only over-retains. The floor does not defend against GC reclaiming above
@@ -190,8 +217,11 @@ history early.
   copy, so it is not a coordination point on any transaction path.
 - Storage use is bounded by policy and write volume rather than reader crashes,
   but the worst-case retained volume can still be large.
-- Disabling new binds is an operational pressure valve, not permission to
-  invalidate existing transactions or immediate permission to reclaim history.
+- Disabling new binds reduces history to latest-state roots, but only once
+  outstanding lifetimes drain, so it is delayed relief rather than a valve. A
+  deliberate floor advance is the prompt one, and it is the only action here
+  that invalidates running executions; it does so visibly and while the database
+  continues to serve.
 - Re-enabling after compaction requires a baseline-building transition, not a
   Boolean flip.
 - GC must become history-aware and preserve floor versions, tombstones, catalog

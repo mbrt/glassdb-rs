@@ -70,12 +70,18 @@ read at bind time.
 
 A cut below the floor returns `SnapshotTooOld`. Under healthy operation the
 freshest admissible cut sits far above the floor, so a bind fails this way only
-when the database genuinely retains no usable history, such as during a rebuild.
-The same check repeats whenever a running execution refreshes its server-time
+when the database retains no usable history, such as during a rebuild. The same
+check repeats whenever a running execution refreshes its server-time
 observation, and crossing it cancels the closure and discards results exactly as
-the deadline does. Its purpose is to make a reader-versus-GC clock violation
-surface as an error rather than as a missing version, so it is expected never to
-fire in a healthy database. Neither case replays, so `FnOnce` is unaffected.
+the deadline does.
+
+Its purpose is to make a reader-versus-GC clock violation surface as an error
+rather than as a missing version, and in that role it should never fire. It has
+a second role that can fire in a perfectly healthy database: ADR-040 lets an
+operator advance the floor deliberately to reclaim storage, which abandons the
+lifetime promised to executions already running. A caller cannot tell the causes
+apart and has no reason to, since retrying with a fresher cut answers all of
+them. None replays, so `FnOnce` is unaffected.
 
 Store one immutable `SnapshotPolicy` in database metadata. It defines maximum
 staleness, the cut-grid period, maximum lifetime, the fleet-skew,
@@ -102,7 +108,9 @@ particular execution produces no writes.
   from pinning history indefinitely.
 - Callers gain one error they cannot prevent by construction. `SnapshotTooOld`
   reports that the database can no longer serve the cut, and retrying with a
-  fresher one is the correct response.
+  fresher one is the correct response. A long execution can therefore be ended
+  by an operator relieving storage pressure, so the lifetime is a promise the
+  database keeps rather than a guarantee it cannot break.
 - ADR-033 remains authoritative for scan bounds, ordering, page shape, and
   strict validation. Calls inside one snapshot execution additionally share its
   fixed cut; separate `Collection::scan_keys` transactions do not.
