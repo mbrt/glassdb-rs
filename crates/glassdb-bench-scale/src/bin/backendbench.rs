@@ -9,7 +9,7 @@
 //! BUCKET=my-bucket cargo run -p glassdb-bench-scale --bin backendbench -- --backend s3
 //! ```
 
-// See the note in `rtbench`: musl's default allocator contends badly under the
+// See the note in `perfbench`: musl's default allocator contends badly under the
 // concurrent workload, so use mimalloc for musl (static EC2) builds.
 #[cfg(target_env = "musl")]
 #[global_allocator]

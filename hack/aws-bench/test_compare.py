@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -170,6 +172,99 @@ class CompareTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unpaired benchmark cells"):
             compare.throughput_table(base, candidate, 10)
+
+    def test_mixed_affinity_cells_pair_by_mode_and_percentage(self) -> None:
+        def cells(throughput: float, ops: float):
+            return [
+                {
+                    "mode": "lo",
+                    "affinityPct": 50,
+                    "aggregateOps": {
+                        "totalOpsPerTx": ops,
+                        "retriesPerTx": 0.25,
+                    },
+                    "shapes": [
+                        {
+                            "shape": "rwSingle",
+                            "committed": 1000,
+                            "converged": True,
+                            "relCi": 0.1,
+                            "txPerSec": throughput,
+                            "p50Ms": 10,
+                            "p90Ms": 20,
+                        }
+                    ],
+                }
+            ]
+
+        shapes = compare.mixed_shape_table(cells(10, 4), cells(15, 3))
+        aggregate = compare.mixed_aggregate_table(cells(10, 4), cells(15, 3))
+
+        self.assertEqual(shapes.loc[0, "layout"], "50%")
+        self.assertEqual(shapes.loc[0, "tps-ratio"], 1.5)
+        self.assertEqual(aggregate.loc[0, "ops-ratio"], 0.75)
+
+    def test_perfbench_mixed_envelope_preserves_run_identity(self) -> None:
+        cell = {
+            "mode": "hi",
+            "affinityPct": 100,
+            "failures": 0,
+            "aggregateOps": {"totalOpsPerTx": 2, "retriesPerTx": 0},
+            "shapes": [
+                {
+                    "shape": "rwSingle",
+                    "committed": 100,
+                    "converged": True,
+                    "txPerSec": 10,
+                    "p50Ms": 1,
+                    "p90Ms": 2,
+                }
+            ],
+        }
+        report = {
+            "schemaVersion": 1,
+            "scenario": "mixed",
+            "runs": [{"run": 2, "cells": [cell]}],
+        }
+
+        table = compare.mixed_shape_table(report, report)
+
+        self.assertEqual(table.loc[0, "run"], 2)
+        self.assertEqual(table.loc[0, "layout"], "100%")
+
+    def test_perfbench_contention_envelope_converts_to_legacy_frames(self) -> None:
+        report = {
+            "schemaVersion": 1,
+            "scenario": "contention",
+            "runs": [
+                {
+                    "run": 1,
+                    "cells": [
+                        {
+                            "numKeys": 1,
+                            "overlap": 1,
+                            "overlapPct": 100,
+                            "committed": 2,
+                            "durationMs": 1000,
+                            "txPerSec": 2,
+                            "samplesMs": [10, 20],
+                            "retries": 1,
+                            "directCandidates": 2,
+                            "directLanded": 1,
+                            "workerDrainMs": 3,
+                            "failures": 0,
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "contention.json").write_text(json.dumps(report))
+            samples, stats = compare.perfbench_contention_frames(path)
+
+        self.assertEqual(samples["latency-ms"].tolist(), [10, 20])
+        self.assertEqual(stats.loc[0, "direct-landed"], 1)
 
     def test_inconsistent_common_cell_clock_is_rejected(self) -> None:
         rows = pd.DataFrame(

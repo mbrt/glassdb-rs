@@ -14,13 +14,9 @@ workspace = true
 # `glassdb-bench-score` crate instead.
 #
 # Binaries:
-#   rtbench       transaction throughput & latency under concurrency scaling
-#                 (ported from Go `hack/rtbench`).
+#   perfbench      mixed, contention, and inline-pressure database scenarios.
 #   backendbench  raw backend storage-op latencies (ported from Go
 #                 `hack/backendbench`).
-#   mixbench      mixed-workload contention grid: all transaction shapes run
-#                 together, swept over contention mode x Database topology, with
-#                 per-shape throughput and (per-shape or aggregate) ops/tx.
 [dependencies]
 glassdb = { path = "../glassdb", features = ["s3", "gcs", "s3-fake-server"] }
 glassdb-backend = { workspace = true }
@@ -31,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3.32"
 async-trait = "0.1.89"
 rand = "0.10.1"
-# mixbench emits/diffs its result grid as JSON.
+# perfbench emits versioned JSON result envelopes.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 aws-config = "1.8.17"
@@ -47,13 +43,6 @@ aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
 # (`--http-pool`); the TLS variant for real S3 lives in glassdb-backend-s3.
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client"] }
 aws-smithy-runtime-api = "1"
-aws-smithy-types = "1"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1.52"
-
-[dev-dependencies]
-tempfile = "3.27.0"

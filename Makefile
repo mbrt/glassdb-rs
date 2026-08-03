@@ -24,9 +24,9 @@ format:
 # Run the Criterion transaction microbenchmarks (memory + simulated S3/GCS).
 # The concurrency/throughput "scale" benchmarks (real or simulated cloud
 # backends) live in the `glassdb-bench-scale` crate; run them directly, e.g.:
-#   cargo run --release -p glassdb-bench-scale --bin rtbench -- --backend memory --test-name simple
+#   cargo run --release -p glassdb-bench-scale --bin perfbench -- mixed --modes hi --affinities 0,50,100
 #   cargo run --release -p glassdb-bench-scale --bin backendbench -- --backend memory
-# See hack/aws-bench/README.md for the real-S3 (EC2 + CloudFormation) harness.
+# See hack/aws-bench/README.md for cross-reference comparisons and real S3.
 bench:
 	cargo bench -p glassdb
 

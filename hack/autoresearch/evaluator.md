@@ -37,7 +37,7 @@ permitted, not even a "mechanical" one):
 2. Autoresearch fixed infrastructure:
    - anything under `crates/glassdb-bench-score/**` (the `autoresearch` scoring
      harness — this defines the metric) or `crates/glassdb-bench-scale/**` (the
-     `rtbench`/`backendbench` scale tools)
+     `perfbench`/`backendbench` scale tools)
    - `hack/autoresearch/check.sh`
    - `hack/autoresearch/evaluate.sh`
    - `hack/autoresearch/evaluator.md`

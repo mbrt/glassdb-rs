@@ -1,5 +1,5 @@
-//! Shared utilities for the GlassDB benchmark binaries (`rtbench`,
-//! `backendbench`), ported from the Go `internal/testkit/bench` package.
+//! Shared utilities for the GlassDB performance binaries (`perfbench` and
+//! `backendbench`), originally ported from the Go test kit.
 
 use std::time::Duration;
 

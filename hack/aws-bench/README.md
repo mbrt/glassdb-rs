@@ -1,398 +1,141 @@
-# Reproducing the performance graphs on real S3
+# Performance benchmark harness
 
-This directory runs the GlassDB benchmarks against a real Amazon S3 bucket on a
-throwaway EC2 instance and renders six figures from the result CSVs:
+`perfbench` is the single database-level performance runner. Its subcommands
+share backend selection, simulated-time scaling, repetitions, cooldown, bounded
+draining, and a versioned JSON result envelope:
 
-| Figure                 | Benchmark              | Source CSV        |
-| ---------------------- | ---------------------- | ----------------- |
-| `tx-throughput.png`    | `rtbench` rw9010       | `throughput.csv`  |
-| `tx-fairness.png`      | `rtbench` rw9010       | `throughput.csv`  |
-| `tx-latency.png`       | `rtbench` rw9010       | `samples.csv`     |
-| `ops-latency.png`      | `rtbench` rw9010       | `samples.csv`     |
-| `retries.png`          | `rtbench` rw9010       | `stats.csv`       |
-| `deadlock-latency.png` | `rtbench` deadlock     | `deadlock.csv`    |
-
-Plus `client-stats.csv` and `deadlock-stats.csv` (no figures): per-cell
-completion/drain and protocol diagnostics.
-
-`rtbench` and the shared sample-collection code live in the
-[`glassdb-bench-scale`](../../crates/glassdb-bench-scale) crate. The rw9010 workload: 50k
-keys, 1..50 concurrent DBs, each running 10 transactions in parallel (10%
-writes, 60% strong reads, 30% weak reads). The deadlock workload runs 5 workers
-contending on 1..6 shared keys at up to 100% overlap.
-
-> Absolute numbers differ with backend latencies, but the qualitative shape
-> (near-linear throughput scaling, the retry-driven tail at high concurrency) is
-> what the simulated backend is tuned to reproduce.
-
-### Client-side diagnostics (`client-stats.csv`)
-
-Every rw9010 CSV carries `run` plus the cell identity. `throughput.csv` records
-each Database's completed count against one common cell clock, so aggregate
-system throughput is `sum(count) / cell-duration` rather than
-`num_databases * median(per_database_rate)`. The per-Database spread is a
-separate Jain-fairness signal in `tx-fairness.png`.
-
-`client-stats.csv` has one row per run/concurrency cell with total wall time,
-the worker window, overrun after the requested measurement duration, graceful
-process CPU utilization, S3 HTTP attempts and responses, connections, peak
-threads, and transaction failures. Because every Database in `rtbench` shares
-one S3 client, this separates a client-side ceiling from backend throttling.
-The same numbers are logged live per cell.
-
-The deadlock workload also writes `deadlock-stats.csv`, with completion rate,
-retries, direct candidates and landed commits, and worker overrun.
-`deadlock.csv` remains the raw latency-sample source for p50/p90.
-
-## How it works
-
-`cloudformation.yaml` provisions a **dedicated VPC with a private subnet and no
-internet access** (no Internet Gateway, no NAT Gateway):
-
-- S3 is reached through a **gateway VPC endpoint** (free).
-- Shell access is through **SSM Session Manager** via `ssm` / `ssmmessages` /
-  `ec2messages` interface endpoints; the `ec2` interface endpoint lets the
-  instance stop itself.
-- The instance has **no public IP and no inbound rules**.
-
-Because there is no path to the internet, the instance cannot fetch a toolchain
-or clone the repo. Instead `deploy.sh` cross-compiles a **statically linked
-`rtbench`** (the `x86_64-unknown-linux-musl` target, so there are no
-shared-library or glibc-version dependencies) and uploads it to the bucket; the
-instance pulls it over the gateway endpoint, runs the benchmarks, uploads the
-CSVs to `results/<timestamp>/`, and then stops itself.
-
-The musl build links **mimalloc** as its global allocator (see
-`crates/glassdb-bench-scale/src/bin/rtbench/main.rs`). musl's default allocator
-serializes multi-threaded allocation on a coarse lock, which—under the
-hundreds of concurrent workers here, each churning HTTP/TLS buffers per S3
-op—collapses into a `futex`/system-CPU storm (observed as `sys` dwarfing
-`user` in `clientmetrics`, throughput dropping as concurrency rises). mimalloc's
-per-thread caches remove that contention, bringing musl on par with glibc/Go.
-
-```mermaid
-flowchart LR
-  dev["deploy.sh (your machine)"] -->|"1. create stack"| cfn[CloudFormation]
-  dev -->|"2. upload rtbench"| bucket[(S3 bucket)]
-  cfn --> ec2["EC2 (private subnet)"]
-  ec2 -->|"3. pull binary"| bucket
-  ec2 -->|"4. run vs S3"| bucket
-  ec2 -->|"5. upload CSVs"| bucket
-  ec2 -->|"6. self-stop"| ec2
-  bucket -->|"7. results -> out/"| dev
-  dev -->|"8. plot out/"| png[PNGs]
+```text
+perfbench mixed
+perfbench contention
+perfbench inline-pressure
 ```
 
-## Prerequisites
+Raw backend latency remains in `backendbench`; Criterion owns microbenchmarks;
+`autoresearch` owns the deterministic backend-operation cost score.
 
-- AWS credentials with permission to create VPC/EC2/IAM/S3 resources.
-- The AWS CLI v2 and a Rust toolchain (matching `rust-toolchain`) on your
-  machine, plus the musl target and a musl C toolchain for the static build:
-  ```bash
-  rustup target add x86_64-unknown-linux-musl
-  # Debian/Ubuntu: sudo apt-get install musl-tools
-  ```
-- [`uv`](https://docs.astral.sh/uv/) for the plotting scripts.
+## Mixed workload
 
-## Run it
+The `mixed` scenario runs four transaction shapes concurrently:
+
+- `rwSingle`: one-key read-modify-write;
+- `rwMany`: multi-key read-modify-write;
+- `roSingle`: one-key serializable read;
+- `roMulti`: multi-key serializable read.
+
+Every client `Database` runs every shape and has a distinct home collection.
+For each transaction it chooses its home with the configured affinity;
+otherwise it chooses uniformly among all collections. The default
+`0,25,50,75,100%` sweep ranges from no client-specific preference to complete
+client isolation. The separate `lo` and `hi` modes vary the key pool within a
+collection, keeping key contention independent from collection affinity.
+
+Each cell gets an isolated database namespace. A throwaway client seeds every
+collection and observes its completed-split counter. Any change resets the
+quiet timer. Fresh measurement clients open only after that counter stays
+unchanged for `--split-quiet`; failure to settle before
+`--split-settle-timeout` fails the cell. Setup split count and settlement wall
+time are included in each result.
 
 ```bash
-# 1. Build the binary, create the stack, upload the binary.
-export AWS_REGION=us-east-1            # pick a region close to you
-./hack/aws-bench/deploy.sh deploy
-
-# 2. Watch the run live (optional). Streams the bootstrap + rtbench log over
-#    SSM until you Ctrl-C; -F waits for the file if the box is still booting.
-./hack/aws-bench/deploy.sh logs
-
-# 3. Wait ~15-20 min. The instance stops itself when finished. Download the
-#    latest run's CSVs into hack/aws-bench/out/ with (the large samples.csv is
-#    compressed to samples.csv.xz on the way in, if xz is installed):
-./hack/aws-bench/deploy.sh results
-
-# 4. Render the five PNGs from the downloaded CSVs (reads/writes out/ by default).
-uv run hack/aws-bench/plot.py
-
-# To also write the PNGs into docs/img, add --write-docs.
-
-# 5. Tear everything down (empties the bucket, then deletes the stack).
-./hack/aws-bench/deploy.sh teardown
+cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+  --backend=memory --delays=s3 --delay-scale=0.02 \
+  --drain-timeout=90s --output=/tmp/mixed.json mixed \
+  --modes=lo,hi --affinities=0,25,50,75,100 \
+  --databases=4 --workers-per-shape=8 \
+  --duration=2s --max-duration=60s --target-ci=0.1
 ```
 
-### Streaming the logs
+Every shape runs until all shapes reach the requested throughput confidence
+interval, or the cell reaches `--max-duration`. Capped shapes are marked
+unconverged.
 
-The bootstrap redirects everything (the binary-poll loop and all `rtbench`
-output) to `/var/log/rtbench-bootstrap.log`, which grows live. Since the
-instance has no public IP, stream it over SSM:
+## Focused scenarios
+
+`contention` measures five overlapping multi-key RMW workers. `--keys=1`
+selects the focused hot-key regression cell; omitting it sweeps one through six
+keys and every overlap width.
 
 ```bash
-# Convenience wrapper (resolves the instance id from the stack):
-./hack/aws-bench/deploy.sh logs
-
-# ...which is equivalent to:
-aws ssm start-session --target <instance-id> \
-  --document-name AWS-StartInteractiveCommand \
-  --parameters command="sudo tail -n +1 -F /var/log/rtbench-bootstrap.log"
+cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+  --backend=memory --delays=s3 --delay-scale=0.02 \
+  --output=/tmp/contention.json contention --keys=1 --duration=2s
 ```
 
-This requires the [Session Manager
-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
-locally. For a full interactive shell instead, use the `SsmSessionCommand` from
-the stack outputs. The same log is also uploaded to
-`s3://<bucket>/results/<timestamp>/bootstrap.log` at the end of the run.
-
-### Tuning
-
-`deploy.sh` reads these environment variables (see the script header for the
-full list):
-
-| Variable            | Default        | Meaning                                |
-| ------------------- | -------------- | -------------------------------------- |
-| `INSTANCE_TYPE`     | `c7i.8xlarge`  | EC2 instance type (must be x86_64)     |
-| `TARGET`            | `x86_64-unknown-linux-musl` | Rust target triple to build |
-| `MAX_DBS`           | `50`           | rw9010 max concurrent DBs              |
-| `NUM_KEYS`          | `50000`        | rw9010 key count                       |
-| `RUN_DURATION`      | `60s`          | rw9010 duration per concurrency step   |
-| `DEADLOCK_DURATION` | `20s`          | deadlock duration per configuration    |
-| `AUTO_STOP`         | `true`         | stop the instance when finished        |
-
-### Instance sizing
-
-`rtbench` runs every DB in one process against a single shared S3 client. The
-throughput plateau is **not** a client-resource limit: a 48-vCPU `c7i.12xlarge`
-peaked at only ~13% CPU with zero S3 throttling. The bottleneck is the
-write-commit path — each write stamps lock tags via `set_tags_if`, which on S3
-is a GET+PUT (no metadata-only update), and a commit is several sequential
-round-trips that grow under lock contention. Bigger instances don't move it.
-
-So size for headroom, not throughput. The default `c7i.8xlarge` (32 vCPUs) sits
-at ~20% CPU with room for bursts. `c7i.2xlarge` (8 vCPUs) is enough for a cheap
-run but turns CPU-bound near 200 concurrent transactions, which masks the real
-ceiling.
-
-For a cheap smoke test, scale everything down, e.g.
-`MAX_DBS=5 NUM_KEYS=500 RUN_DURATION=10s ./hack/aws-bench/deploy.sh deploy`.
-
-## Plotting from a different directory
-
-`plot.py` always reads local CSVs and defaults to `hack/aws-bench/out/`. If your
-CSVs are elsewhere (for example from a local `--backend=memory` or
-`--backend=gcs` run), point at the directory:
+`inline-pressure` retains the pinned ADR-056 phase sequence and policy. It
+reports direct commits, locking, backend operations and bytes, and ordinary and
+pressure-specific split outcomes per phase.
 
 ```bash
-uv run hack/aws-bench/plot.py --input ./results-dir --out ./out
+cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+  --backend=memory --delays=s3 --delay-scale=0.02 \
+  --output=/tmp/inline-pressure.json inline-pressure --settle-timeout=5s
 ```
 
-## Reproducing locally with the fake backend (no AWS) 
+All subcommands support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
+the bucket in `$BUCKET`; simulated backends compensate reported throughput and
+latency for `--delay-scale`.
 
-The `--backend=fakes3` runs the **real** aws-sdk-s3 client against an in-process
-fake S3 server (`glassdb::s3::FakeS3`, behind the `s3-fake-server` feature) with
-the same `s3` latency profile injected at the HTTP layer. That exercises the
-full transport (SDK → smithy → hyper connection pool → loopback TCP) with no AWS
-account, so transport changes can be iterated on locally.
+## Comparing references
 
-> **Raise the open-file limit first.** The fake server is in-process, so every
-> loopback connection consumes **two** file descriptors in the same process
-> (the client socket and the server-accepted socket). A high-concurrency step
-> opens hundreds of connections, which blows past the default soft limit of
-> `1024` and surfaces as `dispatch failure: ... Too many open files (os error
-> 24)` (counted as `tx-fail`). Raise it before running:
->
-> ```bash
-> ulimit -n 1048576
-> ```
+`compare-refs.sh` builds each reference in its own worktree, alternates paired
+focused runs, runs the adaptive mixed sweep, and appends target/base ratios to
+`out-refs/summary.md`:
 
 ```bash
-# rw9010 + deadlock at the same scale as the real run, into out-fake/.
-cargo run --release -p glassdb-bench-scale --bin rtbench -- \
-  --backend=fakes3 --test-name=rw9010 \
-  --max-dbs=50 --num-keys=50000 --duration=60s \
-  --samples-out=hack/aws-bench/out-fake/samples.csv \
-  --stats-out=hack/aws-bench/out-fake/stats.csv \
-  --throughput-out=hack/aws-bench/out-fake/throughput.csv
-cargo run --release -p glassdb-bench-scale --bin rtbench -- \
-  --backend=fakes3 --test-name=deadlock \
-  --duration=20s \
-  --deadlock-out=hack/aws-bench/out-fake/deadlock.csv \
-  --deadlock-stats-out=hack/aws-bench/out-fake/deadlock-stats.csv
-
-# Compare fake vs real: per-concurrency ratios for throughput, latency,
-# retries, backend round-trips and deadlock p50/p90, and overlay PNGs into the
-# `b` dir. `compare.py` is a generic two-result-set comparator (ratio = b/a):
-uv run hack/aws-bench/compare.py \
-  --a hack/aws-bench/out --label-a real \
-  --b hack/aws-bench/out-fake --label-b fake
-```
-
-Hammer a particular concurrency band:
-
-```bash
-cargo run --release -p glassdb-bench-scale --bin rtbench -- \
-  --backend=fakes3 --test-name=rw9010 \
-  --db-list=20,30,40 --num-keys=5000 --duration=20s --delay-scale=0.2 \
-  --http-pool=tuned \
-  --samples-out=hack/aws-bench/out-fake/samples.csv \
-  --stats-out=hack/aws-bench/out-fake/stats.csv \
-  --throughput-out=hack/aws-bench/out-fake/throughput.csv \
-  --client-stats-out=hack/aws-bench/out-fake/client-stats.csv
-```
-
-`--http-pool` selects the client's connection-pool strategy so you can A/B it:
-`tuned` (default, keep idle connections warm), `default` (the SDK's stock
-client), or `churn` (reap idle connections after 1ms, exaggerating churn).
-
-> The fake serves plain HTTP/1.1, so the client talks plaintext. This reproduces
-> connection-pool and HOL behavior under latency, but not TLS-handshake cost.
-
-## In-memory backend
-
-Use `--backend=memory` together with `--delays=s3` to simulate the same behavior
-locally, without the HTTP transport.
-
-For quick iteration, scale down (e.g. `--max-dbs=5 --num-keys=500 --duration=10s`)
-and/or compress the simulated latencies with `--delay-scale` (e.g.
-`--delay-scale=0.01` runs ~100x faster). The request-rate limits scale with it,
-so relative behavior is preserved — handy for shrinking the key-initialization
-wait. `out-fake/` CSVs and plots are generated locally and not committed.
-
-To explore how prefix partitioning affects throughput, add `--prefix-depth=N`
-(default 2: the transaction-log and data subtrees are throttled separately;
-higher N models S3 splitting hot prefixes into more partitions).
-
-## Comparing two engine versions (`compare-refs.sh`)
-
-`compare-refs.sh` measures how the current engine performs against a baseline
-git ref, under the in-memory backend with simulated S3 latency **and
-throttling** (`--backend=memory --delays=s3`). This is the routine way to track
-that a redesign stays on par with — or beats — the previous version, and to prove
-the next optimization. Throughput and latency are the primary axes; transaction
-retries and **backend round-trips per transaction** (object-storage efficiency)
-are secondary.
-
-For a deeper, opt-in attribution run, set `DIAGNOSTICS=1`. Both refs must
-support the diagnostic interface; the script then asks `rtbench` to write a
-`diagnostics/metrics.csv` beside each rw9010 result set:
-
-```bash
-DIAGNOSTICS=1 hack/aws-bench/compare-refs.sh --summary
-```
-
-The tidy CSV attributes reads, writes, and lists to database metadata,
-collection roots, tree nodes, transaction logs, structural logs, or unknown
-objects. It also records locker calls, coordinator submissions/rounds/CAS
-retries, and split activity. `compare.py` reports these per logical transaction
-and derives submissions per coordinator round as a direction-neutral batching
-factor. The diagnostic backend decorator is absent when the flag is omitted,
-so headline runs keep it disabled.
-
-The same diagnostic directory contains `failure-state.txt`. If a measured
-worker or shutdown fails, `rtbench` snapshots the coordinator queues and held
-transaction locks before teardown erases that state. This failure snapshot is
-pull-only; the protocol counts come from the same cheap cumulative counters as
-`Database::stats`. Detailed event history remains the separate `tracing`
-mechanism selected by an application's subscriber. Runs with verbose event
-tracing are forensic runs, not comparable performance samples.
-
-```bash
-# main (baseline) vs the current worktree:
+# main against the current worktree
 hack/aws-bench/compare-refs.sh
 
-# quick smoke run (smaller/faster):
-DELAY_SCALE=0.02 DB_LIST=1,5 NUM_KEYS=500 DURATION=5s NUM_RUNS=1 \
-  DEADLOCK_DURATION=3s COUNT=2 RW_MIX=balanced hack/aws-bench/compare-refs.sh
-
-# fast run of every summary section (smaller windows, no plots):
+# smaller windows, no plots
 hack/aws-bench/compare-refs.sh --summary
 
-# pick the two refs explicitly:
-BASE=main TARGET=s3-redesign hack/aws-bench/compare-refs.sh
-
-# the build worktrees are removed at the end of every run; `--clean` does it
-# on demand (e.g. after an interrupted run):
-hack/aws-bench/compare-refs.sh --clean
+# explicit references
+BASE=main TARGET=my-branch LABEL_A=main LABEL_B=candidate \
+  hack/aws-bench/compare-refs.sh
 ```
 
-Each run writes a small digest to `out-refs/summary.md`: the per-section ratio
-summaries plus the autoresearch primary score. That file is the only `out-refs/`
-artifact that is **not** gitignored, so it can be committed to track the numbers
-(the autoresearch score is deterministic) across changes.
+Current references use `perfbench`. Historical references are run through their
+retired `mixbench` and `rtbench` binaries, and `compare.py` retains readers for
+their JSON and CSV artifacts. The mixed grid is compared only when both sides
+support the same affinity workload; the old `shared/per-shape` grid is not
+silently paired with it.
 
-How it works: each ref compiles its own engine (the `Backend` trait differs
-across versions), so the script builds `rtbench` + `autoresearch` and, when
-present, `mixbench` from the baseline ref in a **reused detached git worktree**
-and from the target tree. It alternates baseline/candidate order for paired
-rw9010 and deadlock repetitions, retains each raw run under `runs/<N>/`, and
-normalizes historical CSVs with an explicit run identity. It runs `rw9010` (the
-`--rw-mix` presets
-`balanced`/`readheavy`/`writeheavy`), `deadlock`, the `autoresearch` score, and
-the `mixbench` grid on both into `out-refs/`, then diffs them with `compare.py`
-(`ratio = target / base`: throughput > 1 is a win; latency / retries /
-backend-ops / cost < 1 is a win).
+Common knobs include `MIX_MODES`, `MIX_AFFINITIES`, `MIX_DATABASES`,
+`MIX_WORKERS`, `MIX_NUM_KEYS`, `MIX_HOT_KEYS`, `MIX_MULTI_KEYS`,
+`MIX_SPLIT_QUIET`, `MIX_SPLIT_SETTLE_TIMEOUT`, `MIX_DURATION`,
+`MIX_MAX_DURATION`, `MIX_TARGET_CI`, `NUM_RUNS`, `DRAIN_TIMEOUT`,
+`CONTENTION_DURATION`, and `COMMAND_TIMEOUT`.
 
-Modern benchmark binaries bound each cell's in-flight drain with
-`--drain-timeout`; the full comparison allows 90 seconds so it retains the
-current high-concurrency write tail, while `--summary` allows 30 seconds. Every
-workload command also runs under a 15-minute watchdog for historical refs that
-predate that flag. Missing or unpaired cells, incomplete drains, and terminal
-transaction failures abort the comparison. Aggregate throughput is paired by
-run and derived from completed transactions over the shared cell clock; the
-per-Database distribution is reported separately as fairness. An `InDoubt`
-returned by a measured mutation is different: the
-benchmark replays it as part of the same logical operation and includes every
-attempt in the sample's latency and backend-op cost.
+## Real S3 runner
 
-`mixbench` runs all four transaction shapes (`rwSingle`, `rwMany`, `roSingle`,
-`roMulti`) together over a contention **mode** (`lo`/`hi`) x Database
-**topology** (`shared`/`per-shape`) grid, reporting per-shape throughput and
-ops/tx. It is the section that exposes the in-process request-dedup efficiency
-the low-contention `rw9010` sweep cannot — the `hi`/`shared` cell is where
-concurrent requests actually merge. `compare.py` reads its `mixbench.json` and
-adds per-shape `mix-tps`/`mix-ops/tx`/`mix-retries/tx` (and, in the `shared`
-topology, whole-DB `mix-agg-ops/tx`) ratio lines to the digest.
+The AWS harness preserves a private execution environment: an EC2 instance in
+a VPC without Internet or NAT, an S3 gateway endpoint, SSM interface endpoints,
+an encrypted result bucket, and no inbound access. CloudFormation owns only
+that infrastructure and artifact bootstrap. `deploy.sh` owns workload choices
+by uploading the binary, `run-perfbench.sh`, and a shell-escaped configuration.
 
-Reported transaction **latency and throughput are in simulated
-(real-time-equivalent) time**: `rtbench`/`mixbench` divide `--delay-scale` back
-out of every measured latency and duration, so the numbers are comparable across
-scales and to a real-S3 run rather than reflecting the compressed wall-clock the
-run actually took. Per-transaction counts (retries, backend-ops/tx) are
-scale-free already, and the `client-stats.csv` CPU/HTTP diagnostics stay in real
-wall-clock (they measure the client process). The compensation is exact only
-while the simulated delays dominate; at very small `--delay-scale` real
-scheduling overhead is amplified, so prefer a scale near `1.0` when absolute
-latencies matter.
+Prerequisites are AWS credentials, AWS CLI v2, the Session Manager plugin for
+live logs, and a musl toolchain matching `RUST_TARGET`.
 
-`compare-refs.sh` also detects binaries from before this reporting convention
-and normalizes their compressed `rtbench` timings before comparison. The raw
-CSV artifacts remain unchanged, and the applied factor is written to the
-summary.
+```bash
+# Build, provision, and upload the runner.
+AWS_REGION=us-east-1 hack/aws-bench/deploy.sh deploy
 
-Both refs must carry the enhanced `rtbench` for a full comparison (the
-`--rw-mix` flag and the `backend-ops` column in `stats.csv`, and `mixbench`).
-When the target is an older tree that lacks them, the driver falls back to the
-`balanced` mix only and `compare.py` reconstructs backend round-trips by summing
-the per-class op columns, so the run still works.
+# Follow bootstrap and benchmark output through SSM.
+hack/aws-bench/deploy.sh logs
 
-Tunables (env): `BASE`, `TARGET`, `LABEL_A`/`LABEL_B`, `DELAY_SCALE`, `DB_LIST`,
-`NUM_KEYS`, `DURATION`, `NUM_RUNS`, `DEADLOCK_DURATION`, `COUNT`, `RW_MIX`,
-`MIX_DURATION`, `MIX_MAX_DURATION`, `MIX_TARGET_CI`, `MIX_MODES`,
-`MIX_TOPOLOGIES`, `MIX_WORKERS`, `MIX_CLIENTS`, `MIX_NUM_KEYS`, `MIX_HOT_KEYS`,
-`MIX_MULTI_KEYS`, `DRAIN_TIMEOUT`, `COMMAND_TIMEOUT`, `OUT`,
-`BASE_WT`/`TARGET_WT`.
+# Download the newest mixed/contention JSON and bootstrap log.
+hack/aws-bench/deploy.sh results
 
-> **Criterion is secondary here.** `cargo bench -p glassdb` (`make bench`)
-> measures one transaction at a time at compressed delays; it is good for
-> within-branch micro-latency A/B (`--save-baseline`/`--baseline`) and the
-> per-op printout, but not for sustained throughput under concurrency and
-> throttling. `compare-refs.sh`/`rtbench` is the authority for those; the
-> deterministic `autoresearch` score is the authority for backend-op efficiency.
+# Empty the result/benchmark bucket and remove all infrastructure.
+hack/aws-bench/deploy.sh teardown
+```
 
-## Cost & cleanup
+The default real-S3 run executes the complete mixed affinity grid and the
+contention matrix once. Set `RUNS`, `RUN_COOLDOWN`, the `MIX_*` variables, or
+`CONTENTION_*` variables to tune it. `RUN_INLINE_PRESSURE=true` adds the focused
+inline-pressure scenario. `AUTO_STOP=false` keeps the instance running for
+interactive inspection.
 
-This uses **real S3** (storage + request charges for ~50k keys and the
-benchmark traffic), an EC2 instance for the run, and **four interface VPC
-endpoints billed per hour while the stack exists**. Always run
-`deploy.sh teardown` when done. Auto-stop halts compute charges, but the
-endpoints and stored objects keep costing until the stack is deleted.
-
-`teardown` empties the bucket before deleting the stack (CloudFormation will not
-delete a non-empty bucket) with `aws s3 rm --recursive`.
+The stack creates billable EC2, S3, and interface-endpoint resources. Auto-stop
+halts compute after the run, but endpoints and stored objects continue billing
+until `deploy.sh teardown` completes.

@@ -1,21 +1,24 @@
 //! Mixed-workload contention benchmark.
 //!
 //! Runs all four transaction shapes (`rwSingle`, `rwMany`, `roSingle`,
-//! `roMulti`) **concurrently over a shared in-memory backend** with a simulated
-//! cloud-latency profile, sweeping a 2x2 grid of:
+//! `roMulti`) concurrently over one selected storage backend, sweeping:
 //!
 //! - contention **mode** (`lo` = keys drawn from a large pool so overlaps are
 //!   rare; `hi` = keys drawn from a small hot pool so they collide on the same
-//!   shards), and
-//! - Database **topology** (`shared` = one `Database` hosts every shape;
-//!   `per-shape` = `K` client `Database`s per shape, each hosting one shape).
+//!   leaves), and
+//! - home-collection **affinity** (`0` = each `Database` chooses uniformly
+//!   among every collection; `100` = each uses only its own collection).
 //!
-//! All `Database`s in a cell wrap the *same* underlying backend, so they contend
-//! through the object protocol exactly like `rtbench`'s `rw9010` — while each
-//! `Database`'s own `StatsBackend` lets `per-shape` cells attribute backend ops
-//! to a single shape. `shared` cells can only report a whole-DB op aggregate,
-//! but let the in-process request deduplication (ADR-025/026) batch across
-//! shapes; comparing the two topologies exposes how much that batching helps.
+//! Every `Database` runs every shape and has one distinct home collection. An
+//! intermediate affinity mixes home traffic with uniformly selected
+//! collections, exposing cross-client overlap without hard-coding a small set
+//! of discrete client-to-collection layouts. All clients wrap the same backend.
+//!
+//! The key set is seeded before the measurement clients open. The seeding
+//! database then waits until its completed-split counter has not changed for
+//! `--split-quiet`; a timeout fails the cell. Setup, structural convergence,
+//! collection opening, and their backend operations are outside the measured
+//! interval.
 //!
 //! Each cell uses **sequential (adaptive) sampling**: all shapes run
 //! concurrently until every shape has committed enough transactions for its
@@ -24,24 +27,13 @@
 //! significance instead of returning a noisy fixed-window number, while cheap
 //! read shapes stop being the reason the cell keeps going once they are precise.
 //!
-//! ```text
-//! cargo run --release -p glassdb-bench-scale --bin mixbench
-//! cargo run --release -p glassdb-bench-scale --bin mixbench -- --modes hi --topologies per-shape --json
-//! ```
-
-// musl's default allocator serializes multi-threaded allocation on a coarse
-// lock; mimalloc's per-thread caches remove that contention (see rtbench).
-#[cfg(target_env = "musl")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use clap::Parser;
+use clap::Args;
 use futures::future::join_all;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -49,16 +41,15 @@ use serde::Serialize;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
 use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
 use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
 
-/// The shared collection every shape reads and writes, so all shapes contend on
-/// the same key pool.
-const COLL: &str = "mix";
+use super::backend;
+use super::{Execution, cooldown};
+
+const COLLECTION_PREFIX: &str = "mix";
 
 /// Fixed opaque value written on every put; only op counts and contention
 /// matter, not the payload.
@@ -75,9 +66,8 @@ fn key_bytes(i: usize) -> Vec<u8> {
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Parser)]
-#[command(about = "Mixed-workload contention grid for glassdb")]
-struct Args {
+#[derive(Clone, Args)]
+pub(super) struct Options {
     /// Minimum measured window per cell. The cell keeps running all shapes
     /// concurrently past this until every shape's throughput estimate reaches
     /// `--target-ci`, or `--max-duration` is hit.
@@ -88,51 +78,46 @@ struct Args {
     /// `--target-ci`; such a shape's result is flagged not-converged.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     max_duration: Duration,
-    /// Time allowed after a cell stops launching transactions for in-flight
-    /// logical transactions and graceful Database shutdown to finish.
-    #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
-    drain_timeout: Duration,
     /// Target relative half-width of each shape's throughput 95% confidence
     /// interval (`0.1` = +/-10%). The cell runs until every shape reaches it or
     /// `--max-duration`. `0` disables adaptivity: run exactly `--duration`.
     #[arg(long, default_value_t = 0.1)]
     target_ci: f64,
-    /// Total concurrent workers per shape (held constant across topologies: all
-    /// on the one DB for `shared`, split evenly across the shape's K DBs for
-    /// `per-shape`).
+    /// Total concurrent workers per shape, split as evenly as possible across
+    /// the Databases.
     #[arg(long, default_value_t = 8)]
     workers_per_shape: usize,
-    /// Client `Database`s per shape in the `per-shape` topology (4*K DBs total).
+    /// Client `Database`s in each cell. Every Database runs every shape and has
+    /// a distinct home collection. Must not exceed `--workers-per-shape`.
     #[arg(long, default_value_t = 4)]
-    clients_per_shape: usize,
+    databases: usize,
     /// Keys touched by the multi-key shapes (`rwMany`, `roMulti`); clamped to
     /// the pool size in the `hi` mode.
     #[arg(long, default_value_t = 10)]
     multi_keys: usize,
-    /// Key-pool size for the `lo` (spread) mode. Keys hash across the 1024
-    /// shards, so a few thousand already populate every shard and keep overlaps
-    /// rare; larger pools add seeding cost without lowering contention further.
+    /// Key-pool size per collection for the `lo` (spread) mode. A few thousand
+    /// keys already make same-key overlap rare; larger pools add seeding cost
+    /// without materially lowering contention further.
     #[arg(long, default_value_t = 5000)]
     num_keys: usize,
     /// Key-pool size for the `hi` (hot) mode.
     #[arg(long, default_value_t = 8)]
     hot_keys: usize,
-    /// Simulated backend latency profile.
-    #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"])]
-    delays: String,
-    /// Compresses the simulated latencies/rate-limits by this factor (`1.0` =
-    /// real-time; smaller runs faster). Must be > 0.
-    #[arg(long, default_value_t = 0.02)]
-    delay_scale: f64,
     /// Contention modes to sweep.
     #[arg(long, value_delimiter = ',', default_value = "lo,hi")]
     modes: Vec<String>,
-    /// Database topologies to sweep.
-    #[arg(long, value_delimiter = ',', default_value = "shared,per-shape")]
-    topologies: Vec<String>,
-    /// Emit the full grid as JSON instead of a human-readable table.
-    #[arg(long)]
-    json: bool,
+    /// Home-collection affinity percentages to sweep. At 0%, a Database picks
+    /// uniformly from every collection. At 100%, it always uses its own.
+    #[arg(long, value_delimiter = ',', default_value = "0,25,50,75,100")]
+    affinities: Vec<u8>,
+    /// Required time with no change to the setup Database's completed-split
+    /// counter before measurement clients are opened. This is real wall time
+    /// because the background split sweep is not compressed by `--delay-scale`.
+    #[arg(long, default_value = "2s", value_parser = glassdb_bench_scale::parse_duration)]
+    split_quiet: Duration,
+    /// Maximum wall time allowed for setup splits to become quiet.
+    #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
+    split_settle_timeout: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,25 +170,10 @@ impl Mode {
     }
 
     /// Key-pool size for the mode (small = high contention).
-    fn pool_size(self, args: &Args) -> usize {
+    fn pool_size(self, options: &Options) -> usize {
         match self {
-            Mode::Lo => args.num_keys.max(1),
-            Mode::Hi => args.hot_keys.max(1),
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Topology {
-    Shared,
-    PerShape,
-}
-
-impl Topology {
-    fn label(self) -> &'static str {
-        match self {
-            Topology::Shared => "shared",
-            Topology::PerShape => "per-shape",
+            Mode::Lo => options.num_keys.max(1),
+            Mode::Hi => options.hot_keys.max(1),
         }
     }
 }
@@ -214,16 +184,6 @@ fn parse_modes(v: &[String]) -> Result<Vec<Mode>, Box<dyn Error>> {
             "lo" => Ok(Mode::Lo),
             "hi" => Ok(Mode::Hi),
             other => Err(format!("unknown mode {other:?} (expected lo|hi)").into()),
-        })
-        .collect()
-}
-
-fn parse_topologies(v: &[String]) -> Result<Vec<Topology>, Box<dyn Error>> {
-    v.iter()
-        .map(|s| match s.trim() {
-            "shared" => Ok(Topology::Shared),
-            "per-shape" | "pershape" => Ok(Topology::PerShape),
-            other => Err(format!("unknown topology {other:?} (expected shared|per-shape)").into()),
         })
         .collect()
 }
@@ -306,79 +266,90 @@ struct ShapeResult {
     /// Whether `rel_ci` met the run's `--target-ci`. `false` means the cell hit
     /// `--max-duration` first, so read this shape's throughput as indicative.
     converged: bool,
-    /// Present only in the `per-shape` topology (each DB hosts one shape).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ops: Option<OpsPerTx>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CellResult {
     mode: String,
-    topology: String,
+    affinity_pct: u8,
     databases: usize,
+    setup_splits: u64,
+    split_settle_wall_ms: u64,
     failures: u64,
     shapes: Vec<ShapeResult>,
-    /// Present only in the `shared` topology (one StatsBackend counts all
-    /// shapes, so ops cannot be attributed per shape).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aggregate_ops: Option<OpsPerTx>,
+    aggregate_ops: OpsPerTx,
 }
 
-// ---------------------------------------------------------------------------
-// Main / grid sweep
-// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RunResult {
+    run: usize,
+    cells: Vec<CellResult>,
+}
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    if !(args.delay_scale > 0.0 && args.delay_scale.is_finite()) {
-        return Err(format!("--delay-scale must be > 0, got {}", args.delay_scale).into());
+pub(super) fn run(
+    handle: &Handle,
+    factory: &backend::Factory,
+    options: &Options,
+    execution: Execution,
+) -> Result<Vec<RunResult>, Box<dyn Error>> {
+    validate(options)?;
+    let modes = parse_modes(&options.modes)?;
+    let invocation = SystemTime::UNIX_EPOCH.elapsed()?.as_millis();
+    let mut runs = Vec::with_capacity(execution.runs);
+    for run in 1..=execution.runs {
+        handle.block_on(cooldown(execution, run));
+        let mut cells = Vec::new();
+        for &mode in &modes {
+            for &affinity_pct in &options.affinities {
+                eprintln!(
+                    "mixed: run={run} mode={} affinity={}%",
+                    mode.label(),
+                    affinity_pct
+                );
+                let database_name = format!(
+                    "perfbenchmixed{invocation}r{run}{}a{affinity_pct}",
+                    mode.label()
+                );
+                cells.push(run_cell(
+                    handle,
+                    factory.backend(),
+                    &database_name,
+                    options,
+                    execution,
+                    mode,
+                    affinity_pct,
+                )?);
+            }
+        }
+        runs.push(RunResult { run, cells });
     }
-    if args.workers_per_shape == 0 {
+    Ok(runs)
+}
+
+fn validate(options: &Options) -> Result<(), Box<dyn Error>> {
+    if options.workers_per_shape == 0 {
         return Err("--workers-per-shape must be >= 1".into());
     }
-    let modes = parse_modes(&args.modes)?;
-    let topologies = parse_topologies(&args.topologies)?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let handle = rt.handle().clone();
-
-    let mut cells = Vec::new();
-    for &mode in &modes {
-        for &topo in &topologies {
-            eprintln!(
-                "running mode={} topology={} ...",
-                mode.label(),
-                topo.label()
-            );
-            cells.push(run_cell(&handle, &args, mode, topo)?);
-        }
+    if options.databases == 0 || options.databases > options.workers_per_shape {
+        return Err("--databases must be between 1 and --workers-per-shape".into());
     }
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&cells)?);
-    } else {
-        emit_text(&args, &cells);
+    if options.affinities.is_empty() || options.affinities.iter().any(|&a| a > 100) {
+        return Err("--affinities must contain percentages from 0 through 100".into());
+    }
+    if options.split_quiet.is_zero() {
+        return Err("--split-quiet must be greater than zero".into());
+    }
+    if options.split_settle_timeout < options.split_quiet {
+        return Err("--split-settle-timeout must be at least --split-quiet".into());
     }
     Ok(())
 }
 
-/// Selects and scales the simulated-latency profile.
-fn delay_profile(args: &Args) -> DelayOptions {
-    let mut d = match args.delays.as_str() {
-        "gcs" => gcs_delays(),
-        // clap's value_parser guarantees "s3" otherwise.
-        _ => s3_delays(),
-    };
-    d.scale = args.delay_scale;
-    d
-}
-
-fn open_db(handle: &Handle, backend: Arc<dyn Backend>) -> Database {
+fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
     handle
-        .block_on(Database::open("mix", backend))
+        .block_on(Database::open(name, backend))
         .expect("open db")
 }
 
@@ -394,9 +365,7 @@ fn split_workers(w: usize, k: usize) -> Vec<usize> {
         .collect()
 }
 
-/// One shape's plan within a cell: its timer plus the `(database, workers)`
-/// slots it drives. In `shared` every shape's slots point at the one DB; in
-/// `per-shape` a shape owns a disjoint set of DBs.
+/// One shape's timer and its workers per Database.
 struct ShapePlan {
     shape: Shape,
     bench: Arc<Bench>,
@@ -406,74 +375,77 @@ struct ShapePlan {
 
 fn run_cell(
     handle: &Handle,
-    args: &Args,
+    backend: Arc<dyn Backend>,
+    database_name: &str,
+    options: &Options,
+    execution: Execution,
     mode: Mode,
-    topo: Topology,
+    affinity_pct: u8,
 ) -> Result<CellResult, Box<dyn Error>> {
-    // Fresh backend per cell so cells are independent and comparable.
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend: Arc<dyn Backend> = Arc::new(DelayBackend::new(inner, delay_profile(args)));
-    let pool_size = mode.pool_size(args);
+    let pool_size = mode.pool_size(options);
+    let collection_paths = (0..options.databases)
+        .map(|i| CollectionPath::new(format!("{COLLECTION_PREFIX}-{i}").as_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Seed the shared pool once on the shared backend (unmeasured), via a
-    // throwaway Database whose stats do not touch the measurement DBs.
-    seed_pool(handle, backend.clone(), pool_size, args.drain_timeout)?;
+    // A throwaway Database owns setup and split convergence, keeping all of its
+    // cache and operation counters outside the measured clients.
+    let settlement = seed_collections(
+        handle,
+        backend.clone(),
+        database_name,
+        &collection_paths,
+        pool_size,
+        options,
+        execution,
+    )?;
 
-    // Open the cell's Databases and build each shape's worker plan.
-    // The DelayBackend compresses wall-clock by `delay_scale`; report latency
-    // and throughput in the simulated (real-time-equivalent) domain by dividing
-    // it back out (`--delay-scale` is validated > 0 in `main`).
-    let time_scale = 1.0 / args.delay_scale;
-    let w = args.workers_per_shape;
-    let mut dbs: Vec<Database> = Vec::new();
-    let mut plans: Vec<ShapePlan> = Vec::new();
-    match topo {
-        Topology::Shared => {
-            let db = open_db(handle, backend.clone());
-            dbs.push(db); // index 0
-            for shape in SHAPES {
-                plans.push(ShapePlan {
-                    shape,
-                    bench: Arc::new(Bench::with_time_scale(args.max_duration, time_scale)),
-                    slots: vec![(0, w)],
-                });
-            }
-        }
-        Topology::PerShape => {
-            for shape in SHAPES {
-                let mut slots = Vec::new();
-                for count in split_workers(w, args.clients_per_shape) {
-                    let idx = dbs.len();
-                    dbs.push(open_db(handle, backend.clone()));
-                    slots.push((idx, count));
-                }
-                plans.push(ShapePlan {
-                    shape,
-                    bench: Arc::new(Bench::with_time_scale(args.max_duration, time_scale)),
-                    slots,
-                });
-            }
-        }
-    }
+    let w = options.workers_per_shape;
+    let dbs: Vec<Database> = (0..options.databases)
+        .map(|_| open_db(handle, database_name, backend.clone()))
+        .collect();
+    let collections = handle.block_on(open_collections(&dbs, &collection_paths))?;
+    let slots: Vec<(usize, usize)> = split_workers(w, dbs.len())
+        .into_iter()
+        .enumerate()
+        .collect();
+    let plans: Vec<ShapePlan> = SHAPES
+        .into_iter()
+        .map(|shape| ShapePlan {
+            shape,
+            bench: Arc::new(Bench::with_time_scale(
+                options.max_duration,
+                execution.time_scale,
+            )),
+            slots: slots.clone(),
+        })
+        .collect();
 
-    // Bracket each Database's stats around the measured window.
+    // Collection binding and its record reads are setup, not transaction work.
+    // Bracket stats only after every client has opened every possible target.
     let base: Vec<Stats> = dbs.iter().map(|d| d.stats()).collect();
     for p in &plans {
         p.bench.start();
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let target = samples_for_rel_ci(args.target_ci);
+    let target = samples_for_rel_ci(options.target_ci);
     let ctx = WorkerCtx {
         stop: stop.clone(),
         pool_size,
-        multi_keys: args.multi_keys,
+        multi_keys: options.multi_keys,
+        affinity_pct,
     };
     let (drive, run, deadline) = handle.block_on(async {
-        let handles = spawn_workers(&dbs, &plans, &ctx);
-        let drive =
-            drive_to_significance(&plans, &stop, target, args.duration, args.max_duration).await;
-        let deadline = tokio::time::Instant::now() + args.drain_timeout;
+        let handles = spawn_workers(&dbs, &collections, &plans, &ctx);
+        let drive = drive_to_significance(
+            &plans,
+            &stop,
+            target,
+            options.duration,
+            options.max_duration,
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + execution.drain_timeout;
         let run = join_tasks_until(handles, deadline).await;
         (drive, run, deadline)
     });
@@ -500,15 +472,14 @@ fn run_cell(
     };
     if !cell_converged {
         eprintln!(
-            "  note: mode={} topology={} hit --max-duration before every shape reached \
+            "  note: mode={} affinity={}% hit --max-duration before every shape reached \
              --target-ci={}",
             mode.label(),
-            topo.label(),
-            args.target_ci,
+            affinity_pct,
+            options.target_ci,
         );
     }
 
-    // Build per-shape rows; attribute ops per shape only in `per-shape`.
     let mut shapes = Vec::with_capacity(plans.len());
     for p in &plans {
         let res = p.bench.results();
@@ -522,15 +493,6 @@ fn run_cell(
         } else {
             (0.0, 0.0)
         };
-        let ops = match topo {
-            Topology::PerShape => {
-                let raw = p.slots.iter().fold(RawOps::default(), |acc, &(idx, _)| {
-                    acc.add(RawOps::of(deltas[idx]))
-                });
-                Some(raw.per_tx(count as u64))
-            }
-            Topology::Shared => None,
-        };
         shapes.push(ShapeResult {
             shape: p.shape.name().to_string(),
             committed: count,
@@ -539,20 +501,23 @@ fn run_cell(
             p90_ms: p90,
             rel_ci: res.rate_rel_ci(),
             converged: target == 0 || count as u64 >= target,
-            ops,
         });
     }
 
-    let aggregate_ops = match topo {
-        Topology::Shared => {
-            Some(RawOps::of(deltas[0]).per_tx(shapes.iter().map(|s| s.committed as u64).sum()))
-        }
-        Topology::PerShape => None,
-    };
+    let raw = deltas
+        .into_iter()
+        .fold(RawOps::default(), |acc, stats| acc.add(RawOps::of(stats)));
+    let aggregate_ops = raw.per_tx(shapes.iter().map(|s| s.committed as u64).sum());
     Ok(CellResult {
         mode: mode.label().to_string(),
-        topology: topo.label().to_string(),
+        affinity_pct,
         databases: dbs.len(),
+        setup_splits: settlement.completed,
+        split_settle_wall_ms: settlement
+            .elapsed
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
         failures: 0,
         shapes,
         aggregate_ops,
@@ -566,6 +531,7 @@ struct WorkerCtx {
     stop: Arc<AtomicBool>,
     pool_size: usize,
     multi_keys: usize,
+    affinity_pct: u8,
 }
 
 /// Spawns every shape's workers across the cell's Databases, returning their
@@ -574,6 +540,7 @@ struct WorkerCtx {
 /// cap) elapses.
 fn spawn_workers(
     dbs: &[Database],
+    collections: &[Arc<[Collection]>],
     plans: &[ShapePlan],
     ctx: &WorkerCtx,
 ) -> Vec<JoinHandle<Result<(), GError>>> {
@@ -583,11 +550,20 @@ fn spawn_workers(
         for &(db_idx, count) in &p.slots {
             for _ in 0..count {
                 let db = dbs[db_idx].clone();
+                let collections = collections[db_idx].clone();
                 let bench = p.bench.clone();
                 let shape = p.shape;
                 let ctx = ctx.clone();
                 seed = seed.wrapping_add(0x1000_0000_0000_0001);
-                handles.push(tokio::spawn(worker(db, shape, bench, seed, ctx)));
+                handles.push(tokio::spawn(worker(
+                    db,
+                    collections,
+                    db_idx,
+                    shape,
+                    bench,
+                    seed,
+                    ctx,
+                )));
             }
         }
     }
@@ -647,26 +623,26 @@ async fn drive_to_significance(
 /// logical sample; every definitive error stops and fails the cell.
 async fn worker(
     db: Database,
+    collections: Arc<[Collection]>,
+    home: usize,
     shape: Shape,
     bench: Arc<Bench>,
     seed: u64,
     ctx: WorkerCtx,
 ) -> Result<(), GError> {
-    let coll = db
-        .open_collection(&CollectionPath::new(COLL.as_bytes())?)
-        .await?;
     let mut rng = StdRng::seed_from_u64(seed);
     let n = match shape {
         Shape::RwMany | Shape::RoMulti => ctx.multi_keys.min(ctx.pool_size).max(1),
         Shape::RwSingle | Shape::RoSingle => 1,
     };
     while !ctx.stop.load(Ordering::Relaxed) && !bench.is_finished() {
-        // Pick keys before the measured region so the RNG borrow does not span
-        // the transaction future.
+        // Select all inputs before the measured region so RNG work and borrows
+        // do not span the transaction future.
+        let collection = pick_collection(&mut rng, home, collections.len(), ctx.affinity_pct);
         let idxs = pick_keys(&mut rng, ctx.pool_size, n);
         let keys: Vec<Vec<u8>> = idxs.iter().map(|&i| key_bytes(i)).collect();
         let keys = &keys;
-        let coll = &coll;
+        let coll = &collections[collection];
         let db = &db;
         let result = bench
             .measure(|| async {
@@ -685,6 +661,18 @@ async fn worker(
     Ok(())
 }
 
+/// Selects the Database's home with probability `affinity_pct`; the remaining
+/// probability is uniform over every collection, including the home. Thus 0%
+/// has no client-specific preference and 100% isolates every client.
+fn pick_collection(rng: &mut StdRng, home: usize, collections: usize, affinity_pct: u8) -> usize {
+    debug_assert!(home < collections);
+    // Consume both draws at every affinity so paired sweep cells retain the
+    // same subsequent key-selection stream.
+    let choose_home = rng.random_range(0..100u8) < affinity_pct;
+    let uniform = rng.random_range(0..collections);
+    if choose_home { home } else { uniform }
+}
+
 /// Picks `n` distinct pool indices (or the whole pool when `n >= pool_size`).
 fn pick_keys(rng: &mut StdRng, pool_size: usize, n: usize) -> Vec<usize> {
     let n = n.min(pool_size).max(1);
@@ -695,7 +683,9 @@ fn pick_keys(rng: &mut StdRng, pool_size: usize, n: usize) -> Vec<usize> {
     while set.len() < n {
         set.insert(rng.random_range(0..pool_size));
     }
-    set.into_iter().collect()
+    let mut selected: Vec<_> = set.into_iter().collect();
+    selected.sort_unstable();
+    selected
 }
 
 /// Read-modify-write of every key (parallel reads, then a write-back each).
@@ -729,146 +719,137 @@ async fn ro_tx(db: &Database, coll: &Collection, keys: &[Vec<u8>]) -> Result<(),
     .await
 }
 
-/// Seeds the shared collection with `pool_size` keys (batched, unmeasured).
-fn seed_pool(
+async fn open_collections(
+    dbs: &[Database],
+    paths: &[CollectionPath],
+) -> Result<Vec<Arc<[Collection]>>, GError> {
+    let mut all = Vec::with_capacity(dbs.len());
+    for db in dbs {
+        let mut collections = Vec::with_capacity(paths.len());
+        for path in paths {
+            collections.push(db.open_collection(path).await?);
+        }
+        all.push(Arc::from(collections));
+    }
+    Ok(all)
+}
+
+#[derive(Clone, Copy)]
+struct SplitSettlement {
+    completed: u64,
+    elapsed: Duration,
+}
+
+struct SplitQuietTracker {
+    completed: u64,
+    unchanged_since: Instant,
+}
+
+impl SplitQuietTracker {
+    fn new(completed: u64, now: Instant) -> Self {
+        Self {
+            completed,
+            unchanged_since: now,
+        }
+    }
+
+    fn observe(&mut self, completed: u64, now: Instant) {
+        if completed != self.completed {
+            self.completed = completed;
+            self.unchanged_since = now;
+        }
+    }
+
+    fn is_quiet(&self, now: Instant, quiet: Duration) -> bool {
+        now.duration_since(self.unchanged_since) >= quiet
+    }
+}
+
+/// Waits for the only setup signal that matters to measurement: completed
+/// splits have stopped moving for a full quiet period.
+async fn wait_for_split_quiet(
+    db: &Database,
+    quiet: Duration,
+    timeout: Duration,
+) -> Result<SplitSettlement, Box<dyn Error>> {
+    let started = Instant::now();
+    let mut tracker = SplitQuietTracker::new(db.stats().splitter.completed, started);
+    let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
+    loop {
+        let now = Instant::now();
+        tracker.observe(db.stats().splitter.completed, now);
+        if tracker.is_quiet(now, quiet) {
+            return Ok(SplitSettlement {
+                completed: tracker.completed,
+                elapsed: started.elapsed(),
+            });
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "setup splits did not stay quiet for {quiet:?} within {timeout:?} \
+                 (completed={})",
+                tracker.completed
+            )
+            .into());
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Seeds every collection and lets its complete split cascade finish before the
+/// measured Databases open.
+fn seed_collections(
     handle: &Handle,
     backend: Arc<dyn Backend>,
+    database_name: &str,
+    paths: &[CollectionPath],
     pool_size: usize,
-    drain_timeout: Duration,
-) -> Result<(), Box<dyn Error>> {
-    let db = open_db(handle, backend);
+    options: &Options,
+    execution: Execution,
+) -> Result<SplitSettlement, Box<dyn Error>> {
+    let db = open_db(handle, database_name, backend);
     handle.block_on(async {
-        let coll = db
-            .root_collection()
-            .create_collection_if_absent(COLL.as_bytes())
-            .await?;
-        let mut i = 0;
-        while i < pool_size {
-            let end = (i + 100).min(pool_size);
-            let batch: Vec<Vec<u8>> = (i..end).map(key_bytes).collect();
-            let coll = &coll;
-            let batch = &batch;
-            db.tx(|tx| async move {
-                for k in batch {
-                    tx.write(coll, k, &value())?;
-                }
-                Ok(())
-            })
-            .await?;
-            i = end;
+        for path in paths {
+            let name = path
+                .segments()
+                .next()
+                .expect("mixed benchmark collection paths are non-empty");
+            let coll = db
+                .root_collection()
+                .create_collection_if_absent(name)
+                .await?;
+            let mut i = 0;
+            while i < pool_size {
+                let end = (i + 100).min(pool_size);
+                let batch: Vec<Vec<u8>> = (i..end).map(key_bytes).collect();
+                let coll = &coll;
+                let batch = &batch;
+                db.tx(|tx| async move {
+                    for k in batch {
+                        tx.write(coll, k, &value())?;
+                    }
+                    Ok(())
+                })
+                .await?;
+                i = end;
+            }
         }
         Ok::<(), GError>(())
     })?;
+    let settlement = handle.block_on(wait_for_split_quiet(
+        &db,
+        options.split_quiet,
+        options.split_settle_timeout,
+    ))?;
+    eprintln!(
+        "  setup settled after {:?}: {} completed splits, {:?} quiet",
+        settlement.elapsed, settlement.completed, options.split_quiet
+    );
     handle.block_on(shutdown_databases_until(
         std::slice::from_ref(&db),
-        tokio::time::Instant::now() + drain_timeout,
+        tokio::time::Instant::now() + execution.drain_timeout,
     ))?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Text output
-// ---------------------------------------------------------------------------
-
-/// A shape's name, suffixed with `*` when its run was capped before reaching
-/// `--target-ci` (so its throughput should be read as indicative).
-fn shape_label(s: &ShapeResult) -> String {
-    if s.converged {
-        s.shape.clone()
-    } else {
-        format!("{}*", s.shape)
-    }
-}
-
-fn emit_text(args: &Args, cells: &[CellResult]) {
-    println!(
-        "mixbench: duration={:?}..{:?} target-ci={} workers/shape={} clients/shape(K)={} \
-         delays={} scale={} num-keys={} hot-keys={} multi-keys={}",
-        args.duration,
-        args.max_duration,
-        args.target_ci,
-        args.workers_per_shape,
-        args.clients_per_shape,
-        args.delays,
-        args.delay_scale,
-        args.num_keys,
-        args.hot_keys,
-        args.multi_keys,
-    );
-    println!(
-        "(latency & tx/s are simulated-time, compensated for --delay-scale; ops/tx are counts; \
-         ci% is the throughput 95% CI half-width, '*' = capped before target-ci)"
-    );
-    for c in cells {
-        println!();
-        println!(
-            "=== mode={} topology={} (dbs={}) ===",
-            c.mode, c.topology, c.databases
-        );
-        let per_shape_ops = c.shapes.iter().any(|s| s.ops.is_some());
-        if per_shape_ops {
-            println!(
-                "{:<11} {:>10} {:>9} {:>9} {:>7} {:>9} {:>9} {:>9} {:>8} {:>10}",
-                "shape",
-                "tx/s",
-                "p50ms",
-                "p90ms",
-                "ci%",
-                "reads/tx",
-                "writes/tx",
-                "lists/tx",
-                "ops/tx",
-                "retries/tx",
-            );
-            for s in &c.shapes {
-                let o = s.ops.expect("per-shape ops present");
-                println!(
-                    "{:<11} {:>10.2} {:>9.2} {:>9.2} {:>7.1} {:>9.2} {:>9.2} {:>9.2} {:>8.2} {:>10.3}",
-                    shape_label(s),
-                    s.tx_per_sec,
-                    s.p50_ms,
-                    s.p90_ms,
-                    s.rel_ci * 100.0,
-                    o.obj_reads_per_tx,
-                    o.obj_writes_per_tx,
-                    o.obj_lists_per_tx,
-                    o.total_ops_per_tx,
-                    o.retries_per_tx,
-                );
-            }
-        } else {
-            println!(
-                "{:<11} {:>10} {:>9} {:>9} {:>7}",
-                "shape", "tx/s", "p50ms", "p90ms", "ci%"
-            );
-            for s in &c.shapes {
-                println!(
-                    "{:<11} {:>10.2} {:>9.2} {:>9.2} {:>7.1}",
-                    shape_label(s),
-                    s.tx_per_sec,
-                    s.p50_ms,
-                    s.p90_ms,
-                    s.rel_ci * 100.0
-                );
-            }
-            if let Some(o) = c.aggregate_ops {
-                println!(
-                    "aggregate ops/tx: reads={:.2} writes={:.2} lists={:.2} total={:.2} \
-                     retries/tx={:.3} (logical-txn={} attempted-txn={})",
-                    o.obj_reads_per_tx,
-                    o.obj_writes_per_tx,
-                    o.obj_lists_per_tx,
-                    o.total_ops_per_tx,
-                    o.retries_per_tx,
-                    o.txn,
-                    o.attempted_txn,
-                );
-            }
-        }
-        if c.failures > 0 {
-            println!("WARNING: {} transaction failures in this cell", c.failures);
-        }
-    }
+    Ok(settlement)
 }
 
 #[cfg(test)]
@@ -890,5 +871,36 @@ mod tests {
         assert_eq!(ops.attempted_txn, 3);
         assert_eq!(ops.total_ops_per_tx, 6.0);
         assert_eq!(ops.retries_per_tx, 1.0);
+    }
+
+    #[test]
+    fn affinity_extremes_are_uniform_or_home_only() {
+        let mut isolated = StdRng::seed_from_u64(7);
+        assert!((0..100).all(|_| pick_collection(&mut isolated, 2, 4, 100) == 2));
+
+        let mut uniform = StdRng::seed_from_u64(7);
+        let selected: HashSet<_> = (0..100)
+            .map(|_| pick_collection(&mut uniform, 2, 4, 0))
+            .collect();
+        assert_eq!(selected, HashSet::from([0, 1, 2, 3]));
+
+        let mut no_affinity = StdRng::seed_from_u64(11);
+        let mut full_affinity = StdRng::seed_from_u64(11);
+        pick_collection(&mut no_affinity, 2, 4, 0);
+        pick_collection(&mut full_affinity, 2, 4, 100);
+        assert_eq!(no_affinity.random::<u64>(), full_affinity.random::<u64>());
+    }
+
+    #[test]
+    fn split_quiet_period_restarts_when_the_counter_moves() {
+        let start = Instant::now();
+        let quiet = Duration::from_secs(2);
+        let mut tracker = SplitQuietTracker::new(3, start);
+
+        assert!(!tracker.is_quiet(start + Duration::from_secs(1), quiet));
+        tracker.observe(4, start + Duration::from_millis(1500));
+        assert!(!tracker.is_quiet(start + Duration::from_secs(3), quiet));
+        tracker.observe(4, start + Duration::from_millis(3200));
+        assert!(tracker.is_quiet(start + Duration::from_millis(3500), quiet));
     }
 }

@@ -44,7 +44,7 @@ Off-limits - never modify these (they define the metric, the rules, and the
 correctness contract; changing them invalidates the experiment):
 
 - `crates/glassdb-bench-score/**` (the `autoresearch` scoring harness - this
-  defines the metric) and `crates/glassdb-bench-scale/**` (the `rtbench`/`backendbench`
+  defines the metric) and `crates/glassdb-bench-scale/**` (the `perfbench`/`backendbench`
   scale tools)
 - `hack/autoresearch/check.sh` (the correctness gate)
 - `hack/autoresearch/evaluate.sh` and `hack/autoresearch/evaluator.md` (the

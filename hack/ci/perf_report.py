@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCORE_RUNS = 11
-MIX_RUNS = 3
-DEADLOCK_RUNS = 3
+MIXED_RUNS = 3
+CONTENTION_RUNS = 3
 WORKLOADS = (
     "singleRMW",
     "multiRMW10",
@@ -43,7 +43,7 @@ class ScoreRun:
 
 
 @dataclass(frozen=True)
-class MixShape:
+class MixedShape:
     tx_per_sec: float
     p50_ms: float
     p90_ms: float
@@ -53,14 +53,14 @@ class MixShape:
 
 
 @dataclass(frozen=True)
-class MixRun:
-    shapes: dict[str, MixShape]
+class MixedRun:
+    shapes: dict[str, MixedShape]
     total_ops_per_tx: float
     retries_per_tx: float
 
 
 @dataclass(frozen=True)
-class DeadlockRun:
+class ContentionRun:
     completed: int
     tx_per_sec: float | None
     p50_ms: float
@@ -156,20 +156,45 @@ def load_score_runs(path: Path) -> list[ScoreRun]:
     return runs
 
 
-def load_mix_runs(path: Path) -> list[MixRun]:
+def load_mixed_runs(path: Path) -> list[MixedRun]:
     runs = []
-    for result_path in _result_files(path, MIX_RUNS):
-        cells = _array(_read_json(result_path), str(result_path))
+    for result_path in _result_files(path, MIXED_RUNS):
+        raw = _read_json(result_path)
+        if isinstance(raw, dict):
+            report = _object(raw, str(result_path))
+            if report.get("schemaVersion") != 1 or report.get("scenario") != "mixed":
+                raise ReportError(f"{result_path}: incompatible perfbench schema")
+            report_runs = _array(report.get("runs"), f"{result_path}: runs")
+            if len(report_runs) != 1:
+                raise ReportError(f"{result_path}: expected one perfbench run")
+            run = _object(report_runs[0], f"{result_path}: runs[0]")
+            cells = _array(run.get("cells"), f"{result_path}: cells")
+        else:
+            cells = _array(raw, str(result_path))
         if len(cells) != 1:
-            raise ReportError(f"{result_path}: expected one mixbench cell")
+            raise ReportError(f"{result_path}: expected one mixed-workload cell")
         cell = _object(cells[0], f"{result_path}: cell")
-        if cell.get("mode") != "hi" or cell.get("topology") != "shared":
-            raise ReportError(f"{result_path}: expected the hi/shared cell")
+        legacy_layout = cell.get("topology") == "shared"
+        affinity_layout = (
+            cell.get("affinityPct") == 100 and cell.get("databases") == 1
+        )
+        if cell.get("mode") != "hi" or not (legacy_layout or affinity_layout):
+            raise ReportError(
+                f"{result_path}: expected the focused high-contention one-Database cell"
+            )
+        if affinity_layout:
+            _count(cell.get("setupSplits"), f"{result_path}: setupSplits")
+            _nonnegative(
+                cell.get("splitSettleWallMs"),
+                f"{result_path}: splitSettleWallMs",
+            )
         failures = _count(cell.get("failures"), f"{result_path}: failures")
         if failures != 0:
-            raise ReportError(f"{result_path}: mixbench recorded {failures:g} failures")
+            raise ReportError(
+                f"{result_path}: mixed workload recorded {failures:g} failures"
+            )
 
-        shapes: dict[str, MixShape] = {}
+        shapes: dict[str, MixedShape] = {}
         for index, row_value in enumerate(
             _array(cell.get("shapes"), f"{result_path}: shapes")
         ):
@@ -182,7 +207,7 @@ def load_mix_runs(path: Path) -> list[MixRun]:
             converged = row.get("converged")
             if not isinstance(converged, bool):
                 raise ReportError(f"{result_path}: {name}.converged must be boolean")
-            shapes[name] = MixShape(
+            shapes[name] = MixedShape(
                 tx_per_sec=_nonnegative(
                     row.get("txPerSec"), f"{result_path}: {name}.txPerSec"
                 ),
@@ -202,7 +227,7 @@ def load_mix_runs(path: Path) -> list[MixRun]:
             )
         aggregate = _object(cell.get("aggregateOps"), f"{result_path}: aggregateOps")
         runs.append(
-            MixRun(
+            MixedRun(
                 shapes=shapes,
                 total_ops_per_tx=_nonnegative(
                     aggregate.get("totalOpsPerTx"),
@@ -248,16 +273,19 @@ def _csv_number(row: dict[str, str], field: str, path: Path) -> float:
     return _nonnegative(value, f"{path}: {field}")
 
 
-def load_deadlock_runs(path: Path, *, require_stats: bool) -> list[DeadlockRun]:
+def load_contention_runs(path: Path, *, require_stats: bool) -> list[ContentionRun]:
+    json_files = sorted(path.glob("*.json"))
+    if json_files:
+        return _load_current_contention_runs(path, json_files)
     raw_files = sorted(
         result
         for result in path.glob("*.csv")
         if not result.name.endswith("-stats.csv")
     )
-    expected_names = [f"{run:02d}.csv" for run in range(1, DEADLOCK_RUNS + 1)]
+    expected_names = [f"{run:02d}.csv" for run in range(1, CONTENTION_RUNS + 1)]
     if [result.name for result in raw_files] != expected_names:
         raise ReportError(
-            f"{path} must contain paired deadlock runs {expected_names}; "
+            f"{path} must contain paired legacy deadlock runs {expected_names}; "
             f"found {[result.name for result in raw_files]}"
         )
     stats_files = [
@@ -265,9 +293,11 @@ def load_deadlock_runs(path: Path, *, require_stats: bool) -> list[DeadlockRun]:
     ]
     stats_present = [result.exists() for result in stats_files]
     if require_stats and not all(stats_present):
-        raise ReportError(f"{path}: focused deadlock stats are required for every run")
+        raise ReportError(
+            f"{path}: focused legacy deadlock stats are required for every run"
+        )
     if any(stats_present) and not all(stats_present):
-        raise ReportError(f"{path}: focused deadlock stats are incomplete")
+        raise ReportError(f"{path}: focused legacy deadlock stats are incomplete")
 
     runs = []
     for result_path in raw_files:
@@ -338,7 +368,7 @@ def load_deadlock_runs(path: Path, *, require_stats: bool) -> list[DeadlockRun]:
             worker_drain_ms = _csv_number(row, "worker-drain-ms", stats_path)
 
         runs.append(
-            DeadlockRun(
+            ContentionRun(
                 completed=len(latencies),
                 tx_per_sec=tx_per_sec,
                 p50_ms=_percentile_r8(latencies, 0.5),
@@ -347,6 +377,73 @@ def load_deadlock_runs(path: Path, *, require_stats: bool) -> list[DeadlockRun]:
                 direct_candidates_per_tx=direct_candidates_per_tx,
                 direct_land_rate=direct_land_rate,
                 worker_drain_ms=worker_drain_ms,
+            )
+        )
+    return runs
+
+
+def _load_current_contention_runs(
+    path: Path, files: list[Path]
+) -> list[ContentionRun]:
+    expected_names = [f"{run:02d}.json" for run in range(1, CONTENTION_RUNS + 1)]
+    if [result.name for result in files] != expected_names:
+        raise ReportError(
+            f"{path} must contain paired contention runs {expected_names}; "
+            f"found {[result.name for result in files]}"
+        )
+    runs = []
+    for result_path in files:
+        report = _object(_read_json(result_path), str(result_path))
+        if report.get("schemaVersion") != 1 or report.get("scenario") != "contention":
+            raise ReportError(f"{result_path}: incompatible perfbench schema")
+        report_runs = _array(report.get("runs"), f"{result_path}: runs")
+        if len(report_runs) != 1:
+            raise ReportError(f"{result_path}: expected one perfbench run")
+        run = _object(report_runs[0], f"{result_path}: runs[0]")
+        matching = []
+        for value in _array(run.get("cells"), f"{result_path}: cells"):
+            cell = _object(value, f"{result_path}: cell")
+            if cell.get("numKeys") == 1 and cell.get("overlapPct") == 100:
+                matching.append(cell)
+        if len(matching) != 1:
+            raise ReportError(f"{result_path}: expected one one-key full-overlap cell")
+        cell = matching[0]
+        failures = _count(cell.get("failures"), f"{result_path}: failures")
+        if failures:
+            raise ReportError(f"{result_path}: contention recorded {failures} failures")
+        latencies = [
+            _nonnegative(value, f"{result_path}: samplesMs")
+            for value in _array(cell.get("samplesMs"), f"{result_path}: samplesMs")
+        ]
+        completed = _count(cell.get("committed"), f"{result_path}: committed")
+        if not latencies or completed != len(latencies):
+            raise ReportError(
+                f"{result_path}: committed={completed} but has {len(latencies)} samples"
+            )
+        duration_ms = _nonnegative(cell.get("durationMs"), f"{result_path}: durationMs")
+        if duration_ms == 0:
+            raise ReportError(f"{result_path}: durationMs must be positive")
+        candidates = _nonnegative(
+            cell.get("directCandidates"), f"{result_path}: directCandidates"
+        )
+        landed = _nonnegative(cell.get("directLanded"), f"{result_path}: directLanded")
+        if landed > candidates:
+            raise ReportError(f"{result_path}: direct landed count exceeds candidates")
+        runs.append(
+            ContentionRun(
+                completed=completed,
+                tx_per_sec=completed * 1000.0 / duration_ms,
+                p50_ms=_percentile_r8(latencies, 0.5),
+                p90_ms=_percentile_r8(latencies, 0.9),
+                retries_per_tx=_nonnegative(
+                    cell.get("retries"), f"{result_path}: retries"
+                )
+                / completed,
+                direct_candidates_per_tx=candidates / completed,
+                direct_land_rate=landed / candidates if candidates > 0 else None,
+                worker_drain_ms=_nonnegative(
+                    cell.get("workerDrainMs"), f"{result_path}: workerDrainMs"
+                ),
             )
         )
     return runs
@@ -402,13 +499,13 @@ def _escape(value: str) -> str:
 def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str:
     base_scores = load_score_runs(input_dir / "score" / "main")
     candidate_scores = load_score_runs(input_dir / "score" / "pr")
-    base_mix = load_mix_runs(input_dir / "mix" / "main")
-    candidate_mix = load_mix_runs(input_dir / "mix" / "pr")
-    base_deadlock = load_deadlock_runs(
-        input_dir / "deadlock" / "main", require_stats=False
+    base_mix = load_mixed_runs(input_dir / "mixed" / "main")
+    candidate_mix = load_mixed_runs(input_dir / "mixed" / "pr")
+    base_contention = load_contention_runs(
+        input_dir / "contention" / "main", require_stats=False
     )
-    candidate_deadlock = load_deadlock_runs(
-        input_dir / "deadlock" / "pr", require_stats=True
+    candidate_contention = load_contention_runs(
+        input_dir / "contention" / "pr", require_stats=True
     )
 
     base_score_values = _values(base_scores, "score")
@@ -481,7 +578,7 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
     lines.extend(
         [
             "",
-            "One shared Database, eight workers per shape, and eight hot keys. "
+            "One Database, eight workers per shape, and eight hot keys. "
             "Values are medians with min–max ranges; throughput is higher-is-better, "
             "while latency is lower-is-better.",
             "",
@@ -522,7 +619,7 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
             f"{_summary(candidate_retries, 3)} | "
             f"{_change(base_retries, candidate_retries)} |",
             "",
-            "> Mixbench is scheduling-sensitive even after adaptive sampling; use it "
+            "> The mixed scenario is scheduling-sensitive even after adaptive sampling; use it "
             "as a secondary concurrency signal, not a pass/fail verdict.",
             "",
             "## Focused one-key RMW contention",
@@ -536,7 +633,7 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
             "| --- | ---: | ---: | ---: |",
         ]
     )
-    deadlock_metrics = [
+    contention_metrics = [
         ("Successful tx/run", "completed", 0),
         ("Completion tx/s", "tx_per_sec", 2),
         ("p50 latency ms", "p50_ms", 1),
@@ -546,9 +643,9 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
         ("Direct land rate", "direct_land_rate", 3),
         ("Worker drain ms", "worker_drain_ms", 1),
     ]
-    for label, field, digits in deadlock_metrics:
-        base = [getattr(run, field) for run in base_deadlock]
-        candidate = [getattr(run, field) for run in candidate_deadlock]
+    for label, field, digits in contention_metrics:
+        base = [getattr(run, field) for run in base_contention]
+        candidate = [getattr(run, field) for run in candidate_contention]
         lines.append(
             f"| {label} | {_optional_summary(base, digits)} | "
             f"{_optional_summary(candidate, digits)} | "

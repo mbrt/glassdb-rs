@@ -1480,18 +1480,15 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
- "aws-smithy-types",
  "clap",
  "futures",
  "glassdb",
  "glassdb-backend",
  "glassdb-concurr",
- "libc",
  "mimalloc",
  "rand 0.10.1",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
