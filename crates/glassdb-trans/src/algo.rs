@@ -1105,15 +1105,18 @@ impl Algo {
     /// so a write-back failure only delays lazy lock cleanup, never the result.
     /// It is spawned in the background so commit returns immediately rather than
     /// waiting for the pointer publishes and lock releases; a shutdown drains
-    /// the spawned task (`Background::spawn_waited`). Without a background
-    /// executor (unit tests, or after shutdown dropped it) it releases inline so
-    /// locks are not left to lazy reclaim.
+    /// the spawned task (`Background::spawn_waited`). A live holder defers that
+    /// cleanup rather than making the task wait. Without a background executor
+    /// (unit tests, or after shutdown dropped it) it releases inline so locks are
+    /// not left to lazy reclaim.
     async fn write_back(&self, id: &TxId, locked: LockedTx) {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
                 let locker = self.locker.clone();
                 let gc = self.gc.clone();
                 let id = id.clone();
+                // Cancelling a dedup driver may need to spawn a successor for
+                // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
                     let superseded = locker.keys().write_back(&id, &locked).await;
                     feed_gc_hints(&gc, superseded);

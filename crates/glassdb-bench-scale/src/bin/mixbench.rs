@@ -484,8 +484,8 @@ fn run_cell(
     let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
     run?;
     shutdown?;
-    // Shutdown drains write-back, so collect counters only after all protocol
-    // work belonging to the measured cell has finished.
+    // Collect after shutdown so finite write-back passes and task joining have
+    // settled. Counters exclude cleanup deferred by a live structural holder.
     let deltas: Vec<Stats> = dbs
         .iter()
         .enumerate()

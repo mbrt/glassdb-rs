@@ -643,9 +643,10 @@ The validate-and-commit sequence:
    release locks. A committed value is published as an `External` pointer to the
    transaction object, and a delete as a `Tombstone`
    ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
-   can happen asynchronously because the transaction log is the source of
-   truth. If the client crashes, another transaction can read the log and
-   complete the write-back (or just observe the committed values from the log).
+   can happen asynchronously because the transaction log is the source of truth.
+   If the client crashes, another transaction can read the log and complete the
+   write-back (or just observe the committed values from the log). A live
+   structural holder defers to lazy recovery.
 
 ### Optimizations
 

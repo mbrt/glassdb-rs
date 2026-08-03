@@ -543,6 +543,7 @@ struct WritebackStaged {
 enum WriteBackOutcome {
     Released(Vec<TxId>),
     Reroute,
+    Deferred,
 }
 
 /// Resolves the holders of an entry (help-forward committed, drop aborted,
@@ -769,6 +770,17 @@ pub(crate) struct KeyLocker {
     calls: Arc<AtomicU64>,
 }
 
+struct TxLocksCleanup<'a> {
+    locker: &'a KeyLocker,
+    id: &'a TxId,
+}
+
+impl Drop for TxLocksCleanup<'_> {
+    fn drop(&mut self) {
+        self.locker.clear_tx_locks(self.id);
+    }
+}
+
 impl Locker {
     /// Creates data and collection locking over their shared coordination
     /// dependencies.
@@ -877,12 +889,20 @@ impl KeyLocker {
     /// transaction's locks across the leaves it touched. Every CAS is
     /// idempotent; errors are best-effort (a failure leaves the locks to be
     /// reclaimed lazily by the next contender or lease expiry), so this never
-    /// fails an already-committed transaction.
+    /// fails an already-committed transaction. A live structural holder defers
+    /// the affected leaf rather than making post-commit cleanup wait.
+    /// Cancellation can leave a partial pass, but the committed log remains
+    /// authoritative and every landed CAS is safe to repeat.
     ///
     /// Returns the transaction ids each published pointer *superseded* (the
     /// former `current_writer` an overwrite replaced): these just lost a
     /// reference and are GC write-back hint candidates (ADR-022).
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
+        // Publication is already recoverable from the committed log. Keep the
+        // process-local diagnostic state equally safe if this future is dropped.
+        let _cleanup = TxLocksCleanup { locker: self, id };
+        // A cancelled partial pass may lose these hints; GC's paged scan is
+        // complete without them.
         let mut superseded = Vec::new();
         for group in locked.groups.values() {
             // The lock-install CAS is the write-back's freshness barrier. Its
@@ -905,7 +925,6 @@ impl KeyLocker {
                 superseded.append(&mut s);
             }
         }
-        self.clear_tx_locks(id);
         superseded
     }
 
@@ -1104,6 +1123,9 @@ impl KeyLocker {
                         (group.path, Arc::new(intents))
                     }));
                 }
+                // A gate on one routed leaf does not prevent independent leaves
+                // from completing their best-effort cleanup in this pass.
+                WriteBackOutcome::Deferred => {}
             }
         }
         Ok(superseded)
@@ -1121,39 +1143,29 @@ impl KeyLocker {
             id: id.clone(),
             intents,
         });
-        let mut backoff = self.retry.backoff();
-        loop {
-            match self
-                .coord
-                .submit_shard(path, id, resolver.clone(), requirement)
-                .await?
-            {
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Released { superseded },
-                    ..
-                }) => return Ok(WriteBackOutcome::Released(superseded)),
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Reroute,
-                    ..
-                }) => return Ok(WriteBackOutcome::Reroute),
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Wait(holder),
-                    ..
-                }) => {
-                    let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
-                        backoff = self.retry.backoff();
-                    }
-                }
-                Some(_) => {
-                    return Err(TransError::other(
-                        "write-back produced a non-cleanup outcome",
-                    ));
-                }
-                None => {
-                    return Err(TransError::other("coordinator shut down during write-back"));
-                }
-            }
+        match self
+            .coord
+            .submit_shard(path, id, resolver, requirement)
+            .await?
+        {
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Released { superseded },
+                ..
+            }) => Ok(WriteBackOutcome::Released(superseded)),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Reroute,
+                ..
+            }) => Ok(WriteBackOutcome::Reroute),
+            // The log is already committed, so a structural gate delays only
+            // publication and lock cleanup. Later access or GC can help it.
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Wait(_),
+                ..
+            }) => Ok(WriteBackOutcome::Deferred),
+            Some(_) => Err(TransError::other(
+                "write-back produced a non-cleanup outcome",
+            )),
+            None => Err(TransError::other("coordinator shut down during write-back")),
         }
     }
 
@@ -1935,6 +1947,50 @@ mod tests {
         assert!(locker.tx_locks_snapshot().is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn write_back_defers_at_a_live_structural_gate() {
+        let (locker, ctx) = init_tl_test().await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+
+        let writer = mk_tid(2, "writer");
+        let locked = lock_commit(&locker, &ctx, &writer, key).await;
+        let gate = mk_tid(1, "gate");
+        ctx.monitor.begin_tx(&gate);
+        let loaded = ctx
+            .shards
+            .load_leaf(
+                &paths::tree_root(COLL),
+                Requirement::AtLeast(ctx.timeline.now()),
+            )
+            .await
+            .unwrap();
+        let mut node = loaded.node().clone();
+        node.set_structural_gate(gate.clone());
+        replace_root(&ctx, &node).await;
+
+        let superseded = tokio::time::timeout(
+            Duration::from_secs(1),
+            locker.keys().write_back(&writer, &locked),
+        )
+        .await
+        .expect("post-commit write-back waited on a structural gate");
+        assert!(superseded.is_empty());
+
+        let loaded = ctx
+            .shards
+            .load_leaf(
+                &paths::tree_root(COLL),
+                Requirement::AtLeast(ctx.timeline.now()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.node().structural_gate().holders(), &[gate]);
+        let entry = loaded.entries.lookup(key).unwrap();
+        assert_eq!(entry.locked_by, vec![writer]);
+        assert_eq!(entry.current.writer(), Some(&mk_tid(0, "seed")));
+    }
+
     // Write-back over an existing key returns the `current_writer` it overwrote:
     // that txid just lost its reference and is the GC candidate hint (ADR-022).
     #[tokio::test]
@@ -2255,30 +2311,52 @@ mod tests {
 
     // --- ADR-025: cross-transaction lock-acquisition deduplication ----------
 
-    /// Test hook that, while **armed**, blocks the next read on a gate until
-    /// released — so a test can park the dedup driver mid-load while other
-    /// contenders queue, forcing them into one merged CAS round. Every other call
-    /// passes through. Arming is deferred (`arm`) so a test can run un-gated setup
-    /// first, then gate only the phase under test.
+    /// Test hook that, while **armed**, blocks the next configured backend
+    /// operation until released. Every other call passes through. Arming is
+    /// deferred so setup can finish before the phase under test is gated.
+    #[derive(Clone, Copy)]
+    enum GateKind {
+        Read,
+        Write,
+    }
+
     struct Gate {
         gate: Arc<Notify>,
         armed: AtomicBool,
+        kind: GateKind,
     }
 
     impl Gate {
         fn wrap(inner: Arc<dyn Backend>, armed: bool) -> (Arc<HookBackend>, Arc<Self>) {
+            Self::wrap_kind(inner, armed, GateKind::Read)
+        }
+
+        fn wrap_writes(inner: Arc<dyn Backend>, armed: bool) -> (Arc<HookBackend>, Arc<Self>) {
+            Self::wrap_kind(inner, armed, GateKind::Write)
+        }
+
+        fn wrap_kind(
+            inner: Arc<dyn Backend>,
+            armed: bool,
+            kind: GateKind,
+        ) -> (Arc<HookBackend>, Arc<Self>) {
             let gate = Arc::new(Gate {
                 gate: Arc::new(Notify::new()),
                 armed: AtomicBool::new(armed),
+                kind,
             });
             let backend = HookBackend::new(inner);
             backend.set_before({
                 let gate = gate.clone();
                 move |op| {
-                    let wait = matches!(
-                        op,
-                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                    ) && gate.armed.swap(false, Ordering::SeqCst);
+                    let matches = match gate.kind {
+                        GateKind::Read => matches!(
+                            op,
+                            BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                        ),
+                        GateKind::Write => matches!(op, BackendOp::WriteIf { .. }),
+                    };
+                    let wait = matches && gate.armed.swap(false, Ordering::SeqCst);
                     let notify = gate.gate.clone();
                     let future: HookFuture = Box::pin(async move {
                         if wait {
@@ -2291,11 +2369,11 @@ mod tests {
             });
             (backend, gate)
         }
-        /// Gate the next read until [`Self::release`].
+        /// Gates the next configured operation until [`Self::release`].
         fn arm(&self) {
             self.armed.store(true, Ordering::SeqCst);
         }
-        /// Wake the read parked by the gate.
+        /// Wakes the operation parked by the gate.
         fn release(&self) {
             self.gate.notify_one();
         }
@@ -2310,8 +2388,19 @@ mod tests {
     /// the start (gate acquisition) or deferred until `arm` (gate a later phase,
     /// e.g. write-back, after un-gated setup).
     async fn gated_locker_with(armed: bool) -> (Locker, TlCtx, OpLog, Arc<Gate>) {
+        gated_locker_for(armed, GateKind::Read).await
+    }
+
+    async fn write_gated_locker() -> (Locker, TlCtx, OpLog, Arc<Gate>) {
+        gated_locker_for(false, GateKind::Write).await
+    }
+
+    async fn gated_locker_for(armed: bool, kind: GateKind) -> (Locker, TlCtx, OpLog, Arc<Gate>) {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (backend, gate) = Gate::wrap(mem, armed);
+        let (backend, gate) = match kind {
+            GateKind::Read => Gate::wrap(mem, armed),
+            GateKind::Write => Gate::wrap_writes(mem, armed),
+        };
         let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
         let (locker, ctx) = new_test_locker(recorder).await;
@@ -2583,6 +2672,136 @@ mod tests {
             Some(&tx1)
         );
         assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![tx2]);
+    }
+
+    // Cancelling the inline write-back driver must hand a merged live acquire
+    // to a new dedup owner. The committed write remains recoverable and a later
+    // idempotent write-back can finish it.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_write_back_hands_off_a_merged_acquire() {
+        let (locker, ctx, _log, gate) = write_gated_locker().await;
+        let written_key = b"key-a".to_vec();
+        let acquired_key = same_shard_sibling(&written_key);
+        seed_committed(&ctx, &written_key, b"old-a").await;
+        seed_committed(&ctx, &acquired_key, b"old-b").await;
+
+        let writer = mk_tid(1, "writer");
+        let locked = Arc::new(lock_commit(&locker, &ctx, &writer, &written_key).await);
+        let acquirer = mk_tid(2, "acquirer");
+        ctx.monitor.begin_tx(&acquirer);
+        let acquire_group = group_of(&acquired_key, put_intent(&acquired_key));
+
+        gate.arm();
+        let write_locker = locker.clone();
+        let write_id = writer.clone();
+        let write_locked = locked.clone();
+        let write_back = tokio::spawn(async move {
+            write_locker
+                .keys()
+                .write_back(&write_id, &write_locked)
+                .await
+        });
+        rt::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !write_back.is_finished(),
+            "write-back must be the gated driver"
+        );
+
+        let acquire_locker = locker.clone();
+        let acquire_id = acquirer.clone();
+        let acquire = tokio::spawn(async move {
+            acquire_locker
+                .keys()
+                .lock_shards_at(&acquire_id, &acquire_group, false, Requirement::Any)
+                .await
+        });
+        rt::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !acquire.is_finished(),
+            "the acquire must be queued behind write-back"
+        );
+
+        write_back.abort();
+        assert!(write_back.await.unwrap_err().is_cancelled());
+        gate.release();
+
+        let acquired = tokio::time::timeout(Duration::from_secs(1), acquire)
+            .await
+            .expect("cancelling write-back orphaned the merged acquire")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(acquired, ShardsOutcome::Locked(_)));
+
+        let written = entry_of(&ctx, &written_key).await.unwrap();
+        assert_eq!(written.locked_by, vec![writer.clone()]);
+        assert_ne!(written.current.writer(), Some(&writer));
+        assert_eq!(
+            entry_of(&ctx, &acquired_key).await.unwrap().locked_by,
+            vec![acquirer]
+        );
+
+        locker.keys().write_back(&writer, &locked).await;
+        let written = entry_of(&ctx, &written_key).await.unwrap();
+        assert!(written.locked_by.is_empty());
+        assert_eq!(written.current.writer(), Some(&writer));
+    }
+
+    // A write-back CAS can land immediately before its future is cancelled.
+    // CachedStore must discard uncertain local knowledge, and replaying the
+    // idempotent write-back must converge on the landed committed state.
+    #[tokio::test]
+    async fn cancelled_landed_write_back_is_recoverable() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hook = HookBackend::new(memory);
+        let (locker, ctx) = new_test_locker(hook.clone()).await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+
+        let writer = mk_tid(1, "writer");
+        let locked = Arc::new(lock_commit(&locker, &ctx, &writer, key).await);
+        let landed = Arc::new(Notify::new());
+        let leaf_path = paths::tree_root(COLL);
+        hook.set_after({
+            let landed = landed.clone();
+            move |operation, outcome| {
+                let park = matches!(operation, BackendOp::WriteIf { path, .. }
+                    if *path == leaf_path)
+                    && outcome.is_success();
+                let landed = landed.clone();
+                Box::pin(async move {
+                    if park {
+                        landed.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+
+        let task_locker = locker.clone();
+        let task_writer = writer.clone();
+        let task_locked = locked.clone();
+        let write_back = tokio::spawn(async move {
+            task_locker
+                .keys()
+                .write_back(&task_writer, &task_locked)
+                .await
+        });
+        landed.notified().await;
+        write_back.abort();
+        assert!(write_back.await.unwrap_err().is_cancelled());
+        assert!(locker.tx_locks_snapshot().is_empty());
+        hook.clear_after();
+
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert!(entry.locked_by.is_empty());
+        assert_eq!(entry.current.writer(), Some(&writer));
+
+        locker.keys().write_back(&writer, &locked).await;
+        assert!(locker.tx_locks_snapshot().is_empty());
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert!(entry.locked_by.is_empty());
+        assert_eq!(entry.current.writer(), Some(&writer));
     }
 
     // Two transactions releasing disjoint keys of one shard (the serial-fallback

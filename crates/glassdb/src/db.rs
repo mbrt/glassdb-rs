@@ -191,8 +191,10 @@ impl Database {
 
     /// Gracefully shuts the database down: refuses new public asynchronous
     /// operations (they return [`Error::ShuttingDown`]) and awaits admitted
-    /// operations and background protocol work. Idempotent; safe to call from
-    /// multiple [`Database`] clones concurrently.
+    /// operations and background protocol work. Post-commit key write-back is
+    /// drained as a finite pass; a leaf blocked by a live structural holder is
+    /// deferred to lazy recovery rather than waited on.
+    /// Idempotent; safe to call from multiple [`Database`] clones concurrently.
     ///
     /// Dropping the last [`Database`] still aborts background work, but
     /// `shutdown` additionally waits for those tasks to stop. It cannot wait for
