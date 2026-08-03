@@ -1185,8 +1185,8 @@ fn read_write_9010_all_dbs(
     run?;
     shutdown?;
 
-    // Shutdown drains write-back, so only now are the per-Database counters a
-    // complete account of the cell's protocol work.
+    // Collect after shutdown so finite write-back passes and task joining have
+    // settled. Counters exclude cleanup deferred by a live structural holder.
     let mut results = Vec::with_capacity(numdb);
     for (di, db) in dbs.iter().enumerate() {
         results.push(DbResults {

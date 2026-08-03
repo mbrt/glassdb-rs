@@ -21,6 +21,9 @@ const TX_ID_TS_OFF: usize = 8;
 /// A `TxId` can also hold an arbitrary byte sequence (e.g. when decoded from a
 /// storage tag).
 ///
+/// [`Ord`] compares the complete ID bytes for identity-keyed collections and is
+/// not wound-wait priority order; use [`TxId::older`] for priority decisions.
+///
 /// The bytes are stored behind an `Arc` so that cloning an id - which happens
 /// pervasively (lockers, last-writer versions, cache entries, every commit) -
 /// is a refcount bump rather than a heap allocation and copy.
@@ -294,6 +297,7 @@ mod tests {
         let older = TxId::with_priority(1_000_000_000, &[0xff; 8]);
         let younger = TxId::with_priority(2_000_000_000, &[0x00; 8]);
         assert!(older.older(&younger));
+        assert!(younger < older, "byte order is intentionally not priority");
     }
 
     #[test]

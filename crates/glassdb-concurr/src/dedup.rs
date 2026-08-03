@@ -516,7 +516,7 @@ where
         let owner = rt::spawn(async move {
             inner.run_owner(&shard, key).await;
             if inner.active_owners.fetch_sub(1, Ordering::SeqCst) == 1 {
-                inner.owners_idle.notify_one();
+                inner.owners_idle.notify_waiters();
             }
         });
         drop(owner);
@@ -749,8 +749,12 @@ where
     /// when the owning component shuts down.
     pub async fn close(&self) {
         self.inner.shutdown.cancel();
-        while self.inner.active_owners.load(Ordering::SeqCst) > 0 {
-            self.inner.owners_idle.notified().await;
+        loop {
+            let owners_idle = self.inner.owners_idle.notified();
+            if self.inner.active_owners.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            owners_idle.await;
         }
     }
 
@@ -947,6 +951,33 @@ mod tests {
         d.close().await;
         let err = d.run("key", mergeable(0)).await;
         assert!(matches!(err, Err(DedupError::Cancelled)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_wakes_every_waiter() {
+        let d = Arc::new(Dedup::new(GatedWorker::new()));
+
+        let mut driver = Box::pin(d.run("key", unmergeable(1)));
+        assert!(futures::poll!(driver.as_mut()).is_pending());
+        let mut queued = Box::pin(d.run("key", unmergeable(2)));
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+
+        // Cancelling the inline driver hands the queued call to a spawned owner.
+        drop(driver);
+        assert_eq!(d.active_owners(), 1);
+
+        // Register both close callers before the owner observes shutdown.
+        let mut first = Box::pin(d.close());
+        let mut second = Box::pin(d.close());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(first, second);
+        })
+        .await
+        .expect("one concurrent close caller remained asleep");
+        assert!(matches!(queued.await, Err(DedupError::Cancelled)));
     }
 
     #[tokio::test]
