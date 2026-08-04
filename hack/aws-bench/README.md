@@ -38,7 +38,7 @@ time are included in each result.
 
 ```bash
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-  --backend=memory --delays=s3 --delay-scale=0.02 \
+  --backend=memory --delays=s3 --delay-scale=0.2 \
   --drain-timeout=90s --output=/tmp/mixed.json mixed \
   --modes=lo,hi --affinities=0,25,50,75,100 \
   --databases=4 --workers-per-shape=8 \
@@ -47,7 +47,9 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 
 Every shape runs until all shapes reach the requested throughput confidence
 interval, or the cell reaches `--max-duration`. Capped shapes are marked
-unconverged.
+unconverged. Whole-cell results include backend operations and transaction
+retries plus coordinator submissions, rounds, CAS retries, fold width, and
+direct-path coverage, all derived from the public `Database::stats()` counters.
 
 ## Focused scenarios
 
@@ -57,7 +59,7 @@ keys and every overlap width.
 
 ```bash
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-  --backend=memory --delays=s3 --delay-scale=0.02 \
+  --backend=memory --delays=s3 --delay-scale=0.2 \
   --output=/tmp/contention.json contention --keys=1 --duration=2s
 ```
 
@@ -67,13 +69,17 @@ pressure-specific split outcomes per phase.
 
 ```bash
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-  --backend=memory --delays=s3 --delay-scale=0.02 \
+  --backend=memory --delays=s3 --delay-scale=0.2 \
   --output=/tmp/inline-pressure.json inline-pressure --settle-timeout=5s
 ```
 
 All subcommands support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
-the bucket in `$BUCKET`; simulated backends compensate reported throughput and
-latency for `--delay-scale`.
+the bucket in `$BUCKET` and always run at real time. For `memory` and `fakes3`,
+`--delay-scale` selects the inverse process-wide model-time speedup: backend
+latency, rate limits, SDK and engine retries, leases, and background cadence
+advance coherently, while measurement windows and drain deadlines remain wall
+time. The `0.2` default keeps S3-profile sleeps above timer granularity; smaller
+scales are useful only as explicitly approximate probes.
 
 ## Comparing references
 
@@ -97,7 +103,9 @@ Current references use `perfbench`. Historical references are run through their
 retired `mixbench` and `rtbench` binaries, and `compare.py` retains readers for
 their JSON and CSV artifacts. The mixed grid is compared only when both sides
 support the same affinity workload; the old `shared/per-shape` grid is not
-silently paired with it.
+silently paired with it. When only one side supports process-wide model time,
+the script requires `DELAY_SCALE=1`; it never compares different timing models
+under acceleration.
 
 Common knobs include `MIX_MODES`, `MIX_AFFINITIES`, `MIX_DATABASES`,
 `MIX_WORKERS`, `MIX_NUM_KEYS`, `MIX_HOT_KEYS`, `MIX_MULTI_KEYS`,

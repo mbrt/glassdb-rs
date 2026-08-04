@@ -105,7 +105,7 @@ fn run_cell(
     seed(handle, &db, &collection, &all_keys)?;
 
     let base = db.stats();
-    let bench = Arc::new(Bench::with_time_scale(duration, execution.time_scale));
+    let bench = Arc::new(Bench::new(duration));
     let wall_start = Instant::now();
     bench.start();
     let deadline = tokio::time::Instant::now() + duration + execution.drain_timeout;

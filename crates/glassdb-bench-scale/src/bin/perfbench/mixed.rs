@@ -111,9 +111,9 @@ pub(super) struct Options {
     #[arg(long, value_delimiter = ',', default_value = "0,25,50,75,100")]
     affinities: Vec<u8>,
     /// Required time with no change to the setup Database's completed-split
-    /// counter before measurement clients are opened. This is real wall time
-    /// because the background split sweep is not compressed by `--delay-scale`.
-    #[arg(long, default_value = "2s", value_parser = glassdb_bench_scale::parse_duration)]
+    /// counter before measurement clients are opened. This is real wall time;
+    /// model-time acceleration also compresses the background split cadence.
+    #[arg(long, default_value = "10s", value_parser = glassdb_bench_scale::parse_duration)]
     split_quiet: Duration,
     /// Maximum wall time allowed for setup splits to become quiet.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
@@ -207,7 +207,20 @@ struct OpsPerTx {
     retries_per_tx: f64,
 }
 
-/// Raw counter deltas summed across a shape's Databases.
+/// Coordinator and direct-path counters for the whole mixed cell.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtocolPerTx {
+    coordinator_submissions_per_tx: f64,
+    coordinator_rounds_per_tx: f64,
+    coordinator_members_per_round: f64,
+    coordinator_cas_retries_per_tx: f64,
+    direct_candidates_per_tx: f64,
+    direct_landed_per_tx: f64,
+    direct_land_rate: f64,
+}
+
+/// Raw backend and transaction deltas summed across a cell's Databases.
 #[derive(Default, Clone, Copy)]
 struct RawOps {
     reads: u64,
@@ -252,6 +265,62 @@ impl RawOps {
     }
 }
 
+/// Raw protocol counter deltas summed across a cell's Databases.
+#[derive(Default, Clone, Copy)]
+struct RawProtocol {
+    coordinator_submissions: u64,
+    coordinator_rounds: u64,
+    coordinator_cas_retries: u64,
+    direct_candidates: u64,
+    direct_landed: u64,
+}
+
+impl RawProtocol {
+    fn of(delta: Stats) -> Self {
+        Self {
+            coordinator_submissions: delta.coordinator.submissions,
+            coordinator_rounds: delta.coordinator.rounds,
+            coordinator_cas_retries: delta.coordinator.cas_retries,
+            direct_candidates: delta.direct_commit.candidates,
+            direct_landed: delta.direct_commit.landed,
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            coordinator_submissions: self.coordinator_submissions + other.coordinator_submissions,
+            coordinator_rounds: self.coordinator_rounds + other.coordinator_rounds,
+            coordinator_cas_retries: self.coordinator_cas_retries + other.coordinator_cas_retries,
+            direct_candidates: self.direct_candidates + other.direct_candidates,
+            direct_landed: self.direct_landed + other.direct_landed,
+        }
+    }
+
+    fn per_tx(self, logical_txn: u64) -> ProtocolPerTx {
+        let txn = logical_txn.max(1) as f64;
+        ProtocolPerTx {
+            coordinator_submissions_per_tx: self.coordinator_submissions as f64 / txn,
+            coordinator_rounds_per_tx: self.coordinator_rounds as f64 / txn,
+            coordinator_members_per_round: ratio(
+                self.coordinator_submissions,
+                self.coordinator_rounds,
+            ),
+            coordinator_cas_retries_per_tx: self.coordinator_cas_retries as f64 / txn,
+            direct_candidates_per_tx: self.direct_candidates as f64 / txn,
+            direct_landed_per_tx: self.direct_landed as f64 / txn,
+            direct_land_rate: ratio(self.direct_landed, self.direct_candidates),
+        }
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShapeResult {
@@ -279,6 +348,7 @@ struct CellResult {
     failures: u64,
     shapes: Vec<ShapeResult>,
     aggregate_ops: OpsPerTx,
+    aggregate_protocol: ProtocolPerTx,
 }
 
 #[derive(Serialize)]
@@ -412,10 +482,7 @@ fn run_cell(
         .into_iter()
         .map(|shape| ShapePlan {
             shape,
-            bench: Arc::new(Bench::with_time_scale(
-                options.max_duration,
-                execution.time_scale,
-            )),
+            bench: Arc::new(Bench::new(options.max_duration)),
             slots: slots.clone(),
         })
         .collect();
@@ -504,10 +571,18 @@ fn run_cell(
         });
     }
 
-    let raw = deltas
-        .into_iter()
+    let logical_txn = shapes.iter().map(|s| s.committed as u64).sum();
+    let raw_ops = deltas
+        .iter()
+        .copied()
         .fold(RawOps::default(), |acc, stats| acc.add(RawOps::of(stats)));
-    let aggregate_ops = raw.per_tx(shapes.iter().map(|s| s.committed as u64).sum());
+    let aggregate_ops = raw_ops.per_tx(logical_txn);
+    let raw_protocol = deltas
+        .into_iter()
+        .fold(RawProtocol::default(), |acc, stats| {
+            acc.add(RawProtocol::of(stats))
+        });
+    let aggregate_protocol = raw_protocol.per_tx(logical_txn);
     Ok(CellResult {
         mode: mode.label().to_string(),
         affinity_pct,
@@ -521,6 +596,7 @@ fn run_cell(
         failures: 0,
         shapes,
         aggregate_ops,
+        aggregate_protocol,
     })
 }
 
@@ -871,6 +947,30 @@ mod tests {
         assert_eq!(ops.attempted_txn, 3);
         assert_eq!(ops.total_ops_per_tx, 6.0);
         assert_eq!(ops.retries_per_tx, 1.0);
+    }
+
+    #[test]
+    fn protocol_counters_expose_coalescing_and_direct_coverage() {
+        let protocol = RawProtocol {
+            coordinator_submissions: 12,
+            coordinator_rounds: 4,
+            coordinator_cas_retries: 2,
+            direct_candidates: 5,
+            direct_landed: 3,
+        }
+        .per_tx(6);
+
+        assert_eq!(protocol.coordinator_submissions_per_tx, 2.0);
+        assert_eq!(protocol.coordinator_rounds_per_tx, 2.0 / 3.0);
+        assert_eq!(protocol.coordinator_members_per_round, 3.0);
+        assert_eq!(protocol.coordinator_cas_retries_per_tx, 1.0 / 3.0);
+        assert_eq!(protocol.direct_candidates_per_tx, 5.0 / 6.0);
+        assert_eq!(protocol.direct_landed_per_tx, 0.5);
+        assert_eq!(protocol.direct_land_rate, 0.6);
+
+        let empty = RawProtocol::default().per_tx(0);
+        assert_eq!(empty.coordinator_members_per_round, 0.0);
+        assert_eq!(empty.direct_land_rate, 0.0);
     }
 
     #[test]

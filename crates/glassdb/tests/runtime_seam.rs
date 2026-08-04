@@ -69,8 +69,6 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
     path.ends_with("crates/glassdb-concurr/src/rt.rs")
-        || (path.ends_with("crates/glassdb-concurr/src/clock.rs")
-            && pattern.contains("SystemTime::now("))
         || (path.ends_with("crates/glassdb-concurr/src/exec.rs")
             && matches!(pattern, "tokio::task" | "tokio::runtime"))
         || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
@@ -128,6 +126,7 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let roots = [
         workspace.join("crates/glassdb/src"),
+        workspace.join("crates/glassdb-backend/src"),
         workspace.join("crates/glassdb-trans/src"),
         workspace.join("crates/glassdb-storage/src"),
         workspace.join("crates/glassdb-concurr/src"),
@@ -186,6 +185,46 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
     assert!(
         violations.is_empty(),
         "sim-controlled code must use simulation-aware runtime/I/O seams:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn synthetic_s3_time_uses_the_model_time_seam() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let files = [
+        workspace.join("crates/glassdb-backend-s3/src/lib.rs"),
+        workspace.join("crates/glassdb-backend-s3/src/fake_server.rs"),
+    ];
+    let timing = [
+        "tokio::time",
+        "SystemTime::now(",
+        "std::time::SystemTime::now(",
+        "std::time::Instant::now(",
+    ];
+    let mut violations = Vec::new();
+    for path in files {
+        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("read source file {}: {e}", path.display());
+        });
+        for (idx, line) in contents.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some(pattern) = timing.iter().find(|pattern| trimmed.contains(**pattern)) {
+                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
+                violations.push(format!(
+                    "{}:{} contains `{pattern}`",
+                    rel.display(),
+                    idx + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "synthetic S3 timing must use process-wide model time:\n{}",
         violations.join("\n")
     );
 }

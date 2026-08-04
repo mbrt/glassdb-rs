@@ -23,8 +23,8 @@ pub(super) struct Options {
     /// Override the simulated prefix partition depth; zero uses the profile.
     #[arg(long, default_value_t = 0, global = true)]
     prefix_depth: usize,
-    /// Compress simulated latency and rate limits by this positive factor.
-    #[arg(long, default_value_t = 0.02, global = true)]
+    /// Compress process-wide model time for synthetic backends.
+    #[arg(long, default_value_t = 0.2, global = true)]
     delay_scale: f64,
     /// S3 connection-pool strategy. `churn` applies only to fakes3.
     #[arg(long, default_value = "tuned", value_parser = ["default", "tuned", "churn"], global = true)]
@@ -73,17 +73,32 @@ impl Options {
         &self.backend
     }
 
-    pub(super) fn time_scale(&self) -> f64 {
+    /// Returns the model-time speedup for a synthetic backend. Real providers
+    /// stay on live wall time because their clocks cannot share this process's
+    /// model-time anchor.
+    pub(super) fn model_time_speedup(&self) -> Result<Option<f64>, Box<dyn Error>> {
         match self.backend.as_str() {
-            "memory" | "fakes3" => 1.0 / self.delay_scale,
-            _ => 1.0,
+            "memory" | "fakes3" => {
+                if !(self.delay_scale > 0.0 && self.delay_scale.is_finite()) {
+                    return Err(
+                        format!("--delay-scale must be > 0, got {}", self.delay_scale).into(),
+                    );
+                }
+                let speedup = 1.0 / self.delay_scale;
+                if !speedup.is_finite() {
+                    return Err(format!(
+                        "--delay-scale is too small to represent a model-time speedup: {}",
+                        self.delay_scale
+                    )
+                    .into());
+                }
+                Ok(Some(speedup))
+            }
+            _ => Ok(None),
         }
     }
 
     fn delay_profile(&self) -> Result<DelayOptions, Box<dyn Error>> {
-        if !(self.delay_scale > 0.0 && self.delay_scale.is_finite()) {
-            return Err(format!("--delay-scale must be > 0, got {}", self.delay_scale).into());
-        }
         let mut delays = match self.delays.as_str() {
             "gcs" => gcs_delays(),
             "s3" => s3_delays(),
@@ -97,7 +112,6 @@ impl Options {
         if self.prefix_depth > 0 {
             delays.prefix_depth = self.prefix_depth;
         }
-        delays.scale = self.delay_scale;
         Ok(delays)
     }
 

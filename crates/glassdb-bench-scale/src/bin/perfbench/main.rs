@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use glassdb_concurr::rt;
 use serde::Serialize;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -57,6 +58,7 @@ struct Report<T> {
     schema_version: u32,
     scenario: &'static str,
     backend: String,
+    model_time_speedup: f64,
     runs: Vec<T>,
 }
 
@@ -65,32 +67,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     if cli.runs == 0 {
         return Err("--runs must be greater than zero".into());
     }
+    let configured_speedup = cli.backend.model_time_speedup()?;
+    if let Some(speedup) = configured_speedup {
+        rt::set_model_time_speedup(speedup)?;
+    }
+    let model_time_speedup = configured_speedup.unwrap_or(1.0);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let factory = runtime.block_on(cli.backend.initialize())?;
     let handle = runtime.handle();
     let backend = cli.backend.label().to_string();
-    let time_scale = cli.backend.time_scale();
-    let execution = execution(&cli, time_scale);
+    let execution = execution(&cli);
 
     let value = match &cli.command {
         Command::Mixed(options) => serde_json::to_value(Report {
             schema_version: SCHEMA_VERSION,
             scenario: "mixed",
             backend: backend.clone(),
+            model_time_speedup,
             runs: mixed::run(handle, &factory, options, execution)?,
         })?,
         Command::Contention(options) => serde_json::to_value(Report {
             schema_version: SCHEMA_VERSION,
             scenario: "contention",
             backend: backend.clone(),
+            model_time_speedup,
             runs: contention::run(handle, &factory, options, execution)?,
         })?,
         Command::InlinePressure(options) => serde_json::to_value(Report {
             schema_version: SCHEMA_VERSION,
             scenario: "inline-pressure",
             backend,
+            model_time_speedup,
             runs: inline_pressure::run(handle, &factory, options, execution)?,
         })?,
     };
@@ -102,15 +111,13 @@ struct Execution {
     runs: usize,
     run_cooldown: Duration,
     drain_timeout: Duration,
-    time_scale: f64,
 }
 
-fn execution(cli: &Cli, time_scale: f64) -> Execution {
+fn execution(cli: &Cli) -> Execution {
     Execution {
         runs: cli.runs,
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
-        time_scale,
     }
 }
 

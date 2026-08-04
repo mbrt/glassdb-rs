@@ -30,10 +30,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_sdk_s3::config::{
-    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+    AsyncSleep, BehaviorVersion, Credentials, Region, RequestChecksumCalculation,
+    ResponseChecksumValidation, Sleep,
 };
+use aws_smithy_async::time::TimeSource;
 use bytes::Bytes;
 use glassdb_backend::middleware::{DelayOptions, Latency};
+use glassdb_concurr::rt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -59,8 +62,8 @@ const LISTEN_BACKLOG: u32 = 8192;
 pub struct FakeS3Options {
     /// When set, every served operation sleeps for a simulated duration derived
     /// from this profile (e.g. [`s3_delays`](glassdb_backend::middleware::s3_delays)),
-    /// honoring its `scale`. `None` serves with no added latency (the default,
-    /// used by the unit tests).
+    /// in model time. `None` serves with no added latency (the default, used by
+    /// the unit tests).
     pub latency: Option<DelayOptions>,
     /// When set, every accepted TCP connection increments this counter. Lets a
     /// caller observe server-side connection churn across a measurement window.
@@ -193,6 +196,8 @@ impl FakeS3 {
             .force_path_style(true)
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            .sleep_impl(ModelTimeSleep)
+            .time_source(ModelTimeSource)
     }
 
     /// A ready [`aws_sdk_s3::Client`] wired to this fake with the SDK's default
@@ -204,6 +209,24 @@ impl FakeS3 {
     /// A ready [`S3Backend`](crate::S3Backend) over this fake and `bucket`.
     pub fn backend(&self, bucket: impl Into<String>) -> crate::S3Backend {
         crate::S3Backend::new(self.client(), bucket)
+    }
+}
+
+#[derive(Debug)]
+struct ModelTimeSleep;
+
+impl AsyncSleep for ModelTimeSleep {
+    fn sleep(&self, duration: Duration) -> Sleep {
+        Sleep::new(rt::sleep(duration))
+    }
+}
+
+#[derive(Debug)]
+struct ModelTimeSource;
+
+impl TimeSource for ModelTimeSource {
+    fn now(&self) -> std::time::SystemTime {
+        rt::system_now()
     }
 }
 
@@ -655,19 +678,16 @@ struct LatencyModel {
     put: Lognormal,
     delete: Lognormal,
     list: Lognormal,
-    scale: f64,
 }
 
 impl LatencyModel {
     fn from_opts(o: DelayOptions) -> Self {
-        let scale = if o.scale == 0.0 { 1.0 } else { o.scale };
         LatencyModel {
             get: Lognormal::from_latency(o.obj_read),
             head: Lognormal::from_latency(o.meta_read),
             put: Lognormal::from_latency(o.obj_write),
             delete: Lognormal::from_latency(o.obj_write),
             list: Lognormal::from_latency(o.list),
-            scale,
         }
     }
 
@@ -683,9 +703,9 @@ impl LatencyModel {
                 _ => return,
             }
         };
-        let secs = ln.sample_ms() * self.scale / 1_000.0;
+        let secs = ln.sample_ms() / 1_000.0;
         if secs.is_finite() && secs > 0.0 {
-            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+            rt::sleep(Duration::from_secs_f64(secs)).await;
         }
     }
 }

@@ -63,14 +63,15 @@ sleeps are several milliseconds. It is the smallest practical scale supported
 by this calibration. `0.5` or uncompressed runs remain the confirmation tier
 for a contentious decision.
 
-The benchmark now defaults to `0.2` for simulated backends. One shared
-`perfbench` Database-builder path derives retry intervals from
-`RetryConfig::default()` and the selected time scale for every scenario. The
-reported time scale therefore controls both backend and engine retry timing.
-Protocol-liveness timing, the deadlock budget, split cadence, and
-split-settlement quiet time remain real wall time. A historical reference
-comparison whose older binary cannot scale retries must use `delay-scale=1`;
-the harness rejects a compressed comparison with mismatched timing models.
+The benchmark now defaults to `0.2` for simulated backends. ADR-057 replaced
+the temporary per-builder correction with one immutable process-wide
+model-time speedup. Nominal backend latency and rate limits, SDK and engine
+retries, protocol-liveness timing, deadlock budgets, and background cadence now
+advance together. Reported latency and throughput use that model time;
+measurement windows, settlement quiet periods, cooldowns, and drain deadlines
+remain real wall time. A historical reference comparison whose older binary
+lacks process-wide model time must use `delay-scale=1`; the harness rejects an
+accelerated comparison with mismatched timing models.
 
 The first corrected sweep also showed why the settlement window cannot remain
 at two seconds. Identical 5,000-key spread cells reported 108 and 56 completed

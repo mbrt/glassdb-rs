@@ -2,12 +2,12 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 This extends the simulation-aware runtime seam from
 [ADR-011](011-guided-interleaving-executor.md) and its enforcement in
-[ADR-013](013-deterministic-scheduling-test-coverage.md). If accepted, it
-replaces the separate `Clock` abstraction described by
+[ADR-013](013-deterministic-scheduling-test-coverage.md). It replaces the
+separate `Clock` abstraction described by
 [ADR-002](002-wound-wait-locking.md),
 [ADR-021](021-wound-wait-leases-shard.md), and
 [ADR-022](022-garbage-collection-mark-sweep.md) without changing their ordering,

@@ -110,7 +110,7 @@ fn run_once(
     run: usize,
 ) -> Result<Vec<PhaseResult>, Box<dyn Error>> {
     let name = format!("perfbenchinlinepressure{invocation}{run}");
-    seed_collection(handle, backend, &name, execution.drain_timeout)?;
+    seed_collection(handle, backend, &name, execution)?;
 
     let db = open_database(handle, backend, &name)?;
     let collection = handle.block_on(db.open_collection("inline-pressure"))?;
@@ -119,19 +119,13 @@ fn run_once(
     let total_wall_start = Instant::now();
     let mut phases = Vec::new();
 
-    let measured = handle.block_on(measure_keys(
-        &db,
-        &collection,
-        SATURATION_KEYS,
-        execution.time_scale,
-    ))?;
+    let measured = handle.block_on(measure_keys(&db, &collection, SATURATION_KEYS))?;
     phases.push(cursor.record("saturation", measured, &db, backend_stats));
 
     let measured = handle.block_on(measure_keys(
         &db,
         &collection,
         std::iter::once(ROOT_PRESSURED_KEY),
-        execution.time_scale,
     ))?;
     phases.push(cursor.record("root-trigger", measured, &db, backend_stats));
 
@@ -147,7 +141,6 @@ fn run_once(
         &db,
         &collection,
         std::iter::once(LEAF_PRESSURED_KEY),
-        execution.time_scale,
     ))?;
     phases.push(cursor.record("leaf-trigger", measured, &db, backend_stats));
 
@@ -158,12 +151,7 @@ fn run_once(
     ))?;
     phases.push(cursor.record("leaf-settle", Measured::idle(wall), &db, backend_stats));
 
-    let measured = handle.block_on(measure_keys(
-        &db,
-        &collection,
-        recovery_keys(),
-        execution.time_scale,
-    ))?;
+    let measured = handle.block_on(measure_keys(&db, &collection, recovery_keys()))?;
     phases.push(cursor.record("recovery", measured, &db, backend_stats));
 
     handle.block_on(shutdown_databases_until(
@@ -187,7 +175,7 @@ fn seed_collection(
     handle: &Handle,
     backend: &Arc<dyn Backend>,
     name: &str,
-    drain_timeout: Duration,
+    execution: Execution,
 ) -> Result<(), Box<dyn Error>> {
     let db = open_database(handle, backend, name)?;
     let collection =
@@ -201,7 +189,7 @@ fn seed_collection(
     }))?;
     handle.block_on(shutdown_databases_until(
         std::slice::from_ref(&db),
-        tokio::time::Instant::now() + drain_timeout,
+        tokio::time::Instant::now() + execution.drain_timeout,
     ))?;
     Ok(())
 }
@@ -222,9 +210,8 @@ async fn measure_keys(
     db: &Database,
     collection: &Collection,
     keys: impl IntoIterator<Item = usize>,
-    time_scale: f64,
 ) -> Result<Measured, GError> {
-    let bench = Bench::with_time_scale(Duration::from_secs(1), time_scale);
+    let bench = Bench::new(Duration::from_secs(1));
     let wall_start = Instant::now();
     bench.start();
     for index in keys {

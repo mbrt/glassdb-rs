@@ -5,7 +5,6 @@
 //! wherever an outside caller needs to drop a specific in-flight future (sim
 //! `JoinHandle::abort`, `Dedup::close`, simulation-harness crash nemesis).
 mod background;
-mod clock;
 mod dedup;
 #[cfg(sim)]
 mod exec;
@@ -16,7 +15,6 @@ pub mod shard;
 mod tape;
 
 pub use background::Background;
-pub use clock::Clock;
 pub use dedup::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, DedupStats, MergeRequest, Worker,
 };

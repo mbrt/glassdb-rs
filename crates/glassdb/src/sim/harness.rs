@@ -89,8 +89,8 @@ impl<'a> Arbitrary<'a> for FaultConfig {
         })
     }
 }
-/// Opens a simulation database with deterministic time, the given split policy,
-/// and optional persistent-cache media.
+/// Opens a simulation database with the given split policy and optional
+/// persistent-cache media.
 pub(crate) async fn open_det_db(
     backend: &Arc<dyn Backend>,
     split_policy: SplitPolicy,
@@ -98,7 +98,6 @@ pub(crate) async fn open_det_db(
     media: Option<SimMedia>,
 ) -> Result<Database, Error> {
     let builder = Database::builder(DB_NAME, backend.clone())
-        .deterministic_time(true)
         .split_policy(split_policy)
         .inline_policy(inline_policy)
         .protocol_timing(ProtocolTiming::simulation());

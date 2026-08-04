@@ -301,7 +301,7 @@ mod tests {
     use std::sync::Arc;
 
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_concurr::{Background, Clock, RetryConfig};
+    use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::CollectionAddress;
     use glassdb_storage::{CachedStore, TLogger, Timeline, TxLog, TxWrite};
 
@@ -322,7 +322,6 @@ mod tests {
             transactions,
             timeline,
             Arc::downgrade(&background),
-            Clock::real(),
             RetryConfig::default(),
             ProtocolTiming::default(),
         );

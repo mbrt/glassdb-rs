@@ -64,17 +64,6 @@ impl DatabaseBuilder {
         self
     }
 
-    /// When true, wall-clock reads are anchored to a fixed base plus the
-    /// runtime's (mockable/virtual) elapsed time instead of the real system
-    /// clock. Combined with the simulation executor this makes transaction-id
-    /// timestamps — and thus the transaction-log object keys derived from them —
-    /// a deterministic function of the simulation seed. Intended for the
-    /// deterministic fuzzer; leave false in production.
-    pub fn deterministic_time(mut self, enabled: bool) -> Self {
-        self.engine_config.set_deterministic_time(enabled);
-        self
-    }
-
     /// Overrides the node sizing policy, including split triggers and hard cap.
     /// Every client of one database should use the same policy because splits
     /// durably reshape shared topology.

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{Background, Backoff, RetryConfig, rt, shard::Sharded};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     Observation, Requirement, SequencePoint, StorageError, TLogger, TValue, Timeline,
@@ -175,7 +175,6 @@ struct Inner {
     // the [`Background`] alive across DB shutdown. The single strong owner
     // is `DbInner::background`.
     background: Weak<Background>,
-    clock: Clock,
     retry: RetryConfig,
     timing: ProtocolTiming,
     // The transaction-tracking maps are partitioned into independent shards
@@ -228,16 +227,13 @@ pub(crate) struct KeyCommitStatus {
 }
 
 impl Monitor {
-    /// Creates a monitor with a custom clock (used in tests for deterministic
-    /// expiry/refresh timing), retry-backoff configuration, and transaction
-    /// liveness timing. The retry config tunes the backoff used when polling a
-    /// peer transaction's commit status and when writing a transaction's final
-    /// log.
+    /// Creates a monitor with retry-backoff and transaction-liveness timing.
+    /// The retry config tunes the backoff used when polling a peer
+    /// transaction's commit status and when writing a transaction's final log.
     pub fn with_config(
         tl: TLogger,
         timeline: Timeline,
         background: Weak<Background>,
-        clock: Clock,
         retry: RetryConfig,
         timing: ProtocolTiming,
     ) -> Self {
@@ -247,7 +243,6 @@ impl Monitor {
                 timeline,
                 final_status: Mutex::new(FinalStatusCache::new(FINAL_STATUS_CACHE_SIZE)),
                 background,
-                clock,
                 retry,
                 timing,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
@@ -727,7 +722,7 @@ impl Monitor {
                 (entry.last_observation.clone(), entry.recovery.clone())
             };
             let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
-            log.timestamp = Some(self.inner.clock.now());
+            log.timestamp = Some(rt::system_now());
             log.locks = recovery.locks;
             log.collection_changes = recovery.collection_changes;
             log.prepared_collections = recovery.prepared_collections;
@@ -1000,7 +995,7 @@ impl Monitor {
     ) -> Result<TxCommitStatus, TransError> {
         match status.status {
             TxCommitStatus::Pending => {
-                let now = self.inner.clock.now();
+                let now = rt::system_now();
                 // Absolute lease check (foreign clock — skew applies): a holder
                 // whose last refresh is already ancient is reclaimed at once.
                 // Observer-relative progress check (one clock — no skew): a
@@ -1071,7 +1066,7 @@ impl Monitor {
     }
 
     async fn handle_unknown_tx(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let now = self.inner.clock.now();
+        let now = rt::system_now();
         let first_check = {
             let mut st = self.shard_for(tid).lock().unwrap();
             match st.unknown_tx.get(tid) {
@@ -1202,7 +1197,7 @@ impl Monitor {
                 return;
             }
 
-            let start = self.inner.clock.now();
+            let start = rt::system_now();
             let mut tl = TxLog::new(tid.clone(), TxCommitStatus::Pending);
             tl.timestamp = Some(start);
             // Stamp the currently-held lock set (read synchronously before the
@@ -1308,9 +1303,6 @@ mod tests {
 
     struct TestCtx {
         tl: TLogger,
-        // The clock the monitor was built with, so tests can stamp tx logs with
-        // the monitor's own notion of "now".
-        clock: Clock,
         // The strong `Arc<Background>` lives here so refresh tasks can be
         // spawned for the duration of the test; the `Monitor` only stores a
         // `Weak`.
@@ -1318,10 +1310,13 @@ mod tests {
     }
 
     fn new_test_monitor(b: Arc<dyn Backend>) -> (Monitor, TestCtx) {
-        new_test_monitor_clock(b, Clock::real())
+        new_test_monitor_with_timing(b, ProtocolTiming::default())
     }
 
-    fn new_test_monitor_clock(b: Arc<dyn Backend>, clock: Clock) -> (Monitor, TestCtx) {
+    fn new_test_monitor_with_timing(
+        b: Arc<dyn Backend>,
+        timing: ProtocolTiming,
+    ) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b, 1024, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), "test");
@@ -1330,11 +1325,10 @@ mod tests {
             tl.clone(),
             timeline,
             Arc::downgrade(&bg),
-            clock.clone(),
             RetryConfig::default(),
-            ProtocolTiming::default(),
+            timing,
         );
-        (mon, TestCtx { tl, clock, _bg: bg })
+        (mon, TestCtx { tl, _bg: bg })
     }
 
     async fn wait_for_waiters(mon: &Monitor, tid: &TxId, count: usize) {
@@ -1535,7 +1529,7 @@ mod tests {
             .unwrap();
         let pending = racer_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
         let mut refreshed = pending.value().unwrap().as_ref().clone();
-        refreshed.timestamp = Some(racer_ctx.clock.now());
+        refreshed.timestamp = Some(rt::system_now());
 
         let refresh = Arc::new(Mutex::new(Some((racer_ctx.tl.clone(), refreshed, pending))));
         let fail_next_read = Arc::new(AtomicBool::new(false));
@@ -1883,7 +1877,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refresh_keeps_pending() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let (mon, t) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"tx1".to_vec());
         mon.begin_tx(&tx);
         mon.start_refresh_tx(&tx);
@@ -1895,7 +1889,7 @@ mod tests {
         assert_eq!(st.status, TxCommitStatus::Pending);
 
         // A separate monitor should still see it as pending (not expired).
-        let (mon2, _t2) = new_test_monitor_clock(b, Clock::anchored());
+        let (mon2, _t2) = new_test_monitor(b);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
         mon.abort_tx(&tx).await.unwrap();
@@ -1908,7 +1902,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refresh_records_locks() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let (mon, t) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"tx1".to_vec());
         let locks = vec![TxLock::Entry {
             key: key_ref(b"k"),
@@ -1938,8 +1932,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn live_holder_not_reclaimed_across_long_wait() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (mon, _t) = new_test_monitor_clock(b.clone(), Clock::anchored());
-        let (observer, _o) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let (mon, _t) = new_test_monitor(b.clone());
+        let (observer, _o) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"live".to_vec());
         mon.begin_tx(&tx);
         mon.start_refresh_tx(&tx);
@@ -1967,21 +1961,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn dead_holder_reclaimed_by_relative_progress() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (mon, t) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let timing = ProtocolTiming::new(Duration::from_nanos(1), Duration::from_secs(30));
+        let (mon, t) = new_test_monitor_with_timing(b.clone(), timing);
         let tx = TxId::from_bytes(b"dead".to_vec());
 
         // A pending object stamped "now" that never refreshes (a crashed
         // holder). Its absolute lease includes both the pending timeout and
         // skew allowance, so only the relative check can reclaim it sooner.
         let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Pending);
-        tl.timestamp = Some(t.clock.now());
+        tl.timestamp = Some(rt::system_now());
         t.tl.set(&tl).await.unwrap();
 
         // First sight records the progress baseline; still pending.
         assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
         // No progress for longer than the timeout on the observer's own clock.
-        tokio::time::sleep(mon.protocol_timing().pending_timeout() + Duration::from_secs(1)).await;
+        rt::yield_now().await;
 
         // The stalled holder is reclaimed (aborted), well before its absolute
         // lease would have expired.
@@ -1991,16 +1986,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unknown_recheck_preserves_a_concurrent_commit() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (observer, _o) = new_test_monitor_clock(b.clone(), Clock::anchored());
-        let (_owner, owner) = new_test_monitor_clock(b.clone(), Clock::anchored());
+        let timing = ProtocolTiming::new(Duration::from_nanos(1), Duration::ZERO);
+        let (observer, _o) = new_test_monitor_with_timing(b.clone(), timing);
+        let (_owner, owner) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"committed-during-unknown-grace".to_vec());
 
         assert_eq!(
             observer.tx_status(&tx).await.unwrap(),
             TxCommitStatus::Pending
         );
-        tokio::time::sleep(observer.protocol_timing().pending_timeout() + Duration::from_secs(1))
-            .await;
+        rt::yield_now().await;
 
         owner
             .tl

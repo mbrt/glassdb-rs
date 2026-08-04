@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
+      PERF_DELAY_SCALE: "0.2"
     steps:
 
     - name: Initialize result artifact
@@ -129,7 +130,7 @@ jobs:
           local result="$PERF_RESULTS/mixed/$side/$repetition.json"
           if [[ -x "$PERF_BIN/$side-perfbench" ]]; then
             "$PERF_BIN/$side-perfbench" \
-              --backend=memory --delays=s3 --delay-scale=0.02 \
+              --backend=memory --delays=s3 --delay-scale="$PERF_DELAY_SCALE" \
               --drain-timeout=30s --output="$result" mixed \
               --duration=1s --max-duration=20s --target-ci=0.15 \
               --modes=hi --affinities=100 --databases=1 \
@@ -152,7 +153,7 @@ jobs:
             layout=(--topologies=shared)
           fi
           "$binary" \
-            --delays=s3 --delay-scale=0.02 --drain-timeout=30s \
+            --delays=s3 --delay-scale="$PERF_DELAY_SCALE" --drain-timeout=30s \
             --duration=1s --max-duration=20s --target-ci=0.15 \
             --modes=hi --workers-per-shape=8 --hot-keys=8 --multi-keys=8 \
             --json "${layout[@]}" > "$result"
@@ -179,7 +180,7 @@ jobs:
           local side="$1" repetition="$2"
           if [[ -x "$PERF_BIN/$side-perfbench" ]]; then
             "$PERF_BIN/$side-perfbench" \
-              --backend=memory --delays=s3 --delay-scale=0.02 \
+              --backend=memory --delays=s3 --delay-scale="$PERF_DELAY_SCALE" \
               --drain-timeout=30s \
               --output="$PERF_RESULTS/contention/$side/$repetition.json" \
               contention --keys=1 --duration=1s
@@ -200,7 +201,7 @@ jobs:
           "$binary" \
             --backend=memory \
             --delays=s3 \
-            --delay-scale=0.02 \
+            --delay-scale="$PERF_DELAY_SCALE" \
             --test-name=deadlock \
             --duration=1s \
             --drain-timeout=30s \

@@ -49,7 +49,7 @@
 #   MIX_DURATION     minimum measured cell window    (default: 5s)
 #   MIX_MAX_DURATION maximum measured cell window    (default: 120s)
 #   MIX_TARGET_CI    throughput CI relative half-width (default: 0.1)
-#   MIX_SPLIT_QUIET  required stable split interval  (default: 2s)
+#   MIX_SPLIT_QUIET  required stable split interval  (default: 10s)
 #   MIX_SPLIT_SETTLE_TIMEOUT setup convergence limit (default: 120s)
 #
 # Focused scenarios:
@@ -91,7 +91,7 @@ MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
 MIX_DURATION="${MIX_DURATION:-5s}"
 MIX_MAX_DURATION="${MIX_MAX_DURATION:-120s}"
 MIX_TARGET_CI="${MIX_TARGET_CI:-0.1}"
-MIX_SPLIT_QUIET="${MIX_SPLIT_QUIET:-2s}"
+MIX_SPLIT_QUIET="${MIX_SPLIT_QUIET:-10s}"
 MIX_SPLIT_SETTLE_TIMEOUT="${MIX_SPLIT_SETTLE_TIMEOUT:-120s}"
 CONTENTION_KEYS="${CONTENTION_KEYS:-1,2,3,4,5,6}"
 CONTENTION_DURATION="${CONTENTION_DURATION:-20s}"

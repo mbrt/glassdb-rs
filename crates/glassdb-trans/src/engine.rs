@@ -1,10 +1,10 @@
 //! The transaction-engine façade and its runtime assembly.
 
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
-use glassdb_concurr::{Background, Clock, DedupKeySnapshot, RetryConfig};
+use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, TxId, paths};
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
@@ -31,9 +31,6 @@ use crate::tlocker::{Locker, LockerStats, TxLockSnapshot};
 /// Balances backend traffic and memory use for a default production client.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 
-/// A fixed anchor makes transaction IDs byte-identical across simulation replays.
-const DETERMINISTIC_EPOCH_SECS: u64 = 1_700_000_000;
-
 #[derive(Clone)]
 struct PersistentCacheSetup {
     config: PersistentCacheConfig,
@@ -45,7 +42,6 @@ struct PersistentCacheSetup {
 pub struct EngineConfig {
     cache_size: usize,
     persistent_cache: Option<PersistentCacheSetup>,
-    deterministic_time: bool,
     retry: RetryConfig,
     split_policy: SplitPolicy,
     inline_policy: InlinePolicy,
@@ -65,11 +61,6 @@ impl EngineConfig {
         media: Option<PersistentCacheMedia>,
     ) {
         self.persistent_cache = Some(PersistentCacheSetup { config, media });
-    }
-
-    /// Selects deterministic transaction timestamps for simulation.
-    pub fn set_deterministic_time(&mut self, enabled: bool) {
-        self.deterministic_time = enabled;
     }
 
     /// Sets the initial coordination retry delay.
@@ -103,7 +94,6 @@ impl Default for EngineConfig {
         Self {
             cache_size: DEFAULT_CACHE_SIZE,
             persistent_cache: None,
-            deterministic_time: false,
             retry: RetryConfig::default(),
             split_policy: SplitPolicy::default(),
             inline_policy: InlinePolicy::default(),
@@ -173,7 +163,6 @@ impl Engine {
         let EngineConfig {
             cache_size,
             persistent_cache,
-            deterministic_time,
             retry,
             split_policy,
             inline_policy,
@@ -198,17 +187,11 @@ impl Engine {
 
         let tlogger = TLogger::new(objects.clone(), name);
         let background = Arc::new(Background::new());
-        let clock = if deterministic_time {
-            Clock::anchored_at(UNIX_EPOCH + Duration::from_secs(DETERMINISTIC_EPOCH_SECS))
-        } else {
-            Clock::real()
-        };
         let background_weak = Arc::downgrade(&background);
         let monitor = Monitor::with_config(
             tlogger.clone(),
             timeline.clone(),
             background_weak.clone(),
-            clock.clone(),
             retry,
             protocol_timing,
         );
@@ -225,7 +208,6 @@ impl Engine {
             timeline.clone(),
             monitor.clone(),
             key_state,
-            clock.clone(),
             retry,
             name,
             split_policy,
@@ -253,7 +235,6 @@ impl Engine {
             locker.clone(),
             collection_lifecycle.clone(),
             monitor.clone(),
-            clock.clone(),
         );
         gc.start();
         splitter.start();
@@ -270,7 +251,6 @@ impl Engine {
             coord.clone(),
             monitor,
             collection_commit,
-            clock,
             gc,
             Some(background_weak),
             resolver.clone(),

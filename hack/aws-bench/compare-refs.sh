@@ -43,8 +43,8 @@
 #   BASE=main               base ref (the "v1" side), built in a worktree
 #   TARGET=<current>        target ref (the "v2" side); empty = current worktree
 #   LABEL_A=v1 LABEL_B=v2   labels for the base / target sides
-#   DELAY_SCALE=0.05 / 0.02 compress simulated latency + rate limits (preserves
-#                           the throttle shape); 1.0 = real time
+#   DELAY_SCALE=0.2         compress process-wide model time for simulated
+#                           backends; 1.0 = real time
 #   NUM_RUNS=1 / 2          paired contention/inline repetitions (order alternates)
 #   CONTENTION_DURATION=8s / 3s duration per contention configuration
 #   INLINE_PROFILES=s3,gcs  latency profiles for the inline-pressure scenario
@@ -61,7 +61,7 @@
 #   MIX_NUM_KEYS=5000       mixed lo-mode key pool per collection
 #   MIX_HOT_KEYS=8          mixed hi-mode hot-key pool
 #   MIX_MULTI_KEYS=10       mixed keys per multi-key shape
-#   MIX_SPLIT_QUIET=2s      unchanged completed-split interval before measuring
+#   MIX_SPLIT_QUIET=10s     unchanged completed-split interval before measuring
 #   MIX_SPLIT_SETTLE_TIMEOUT=60s setup split convergence deadline
 #   DRAIN_TIMEOUT=90s / 30s per-cell completion grace for benchmark binaries
 #                           that support --drain-timeout
@@ -96,7 +96,7 @@ LABEL_B="${LABEL_B:-v2}"
 # dominate wall time (duration, concurrency points, repeats); everything still
 # runs, so every summary.md section is produced.
 if [ "$SUMMARY" = "1" ]; then
-  DELAY_SCALE="${DELAY_SCALE:-0.02}"
+  DELAY_SCALE="${DELAY_SCALE:-0.2}"
   CONTENTION_DURATION="${CONTENTION_DURATION:-${DEADLOCK_DURATION:-3s}}"
   INLINE_SETTLE_TIMEOUT="${INLINE_SETTLE_TIMEOUT:-3s}"
   # Mixbench self-terminates at its target CI; a looser CI and shorter cap keep
@@ -108,7 +108,7 @@ if [ "$SUMMARY" = "1" ]; then
   MIX_TARGET_CI="${MIX_TARGET_CI:-0.2}"
   DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30s}"
 else
-  DELAY_SCALE="${DELAY_SCALE:-0.05}"
+  DELAY_SCALE="${DELAY_SCALE:-0.2}"
   CONTENTION_DURATION="${CONTENTION_DURATION:-${DEADLOCK_DURATION:-8s}}"
   INLINE_SETTLE_TIMEOUT="${INLINE_SETTLE_TIMEOUT:-5s}"
   COUNT="${COUNT:-5}"
@@ -128,7 +128,7 @@ MIX_DATABASES="${MIX_DATABASES:-4}"
 MIX_NUM_KEYS="${MIX_NUM_KEYS:-5000}"
 MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
 MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
-MIX_SPLIT_QUIET="${MIX_SPLIT_QUIET:-2s}"
+MIX_SPLIT_QUIET="${MIX_SPLIT_QUIET:-10s}"
 MIX_SPLIT_SETTLE_TIMEOUT="${MIX_SPLIT_SETTLE_TIMEOUT:-60s}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-15m}"
 OUT="${OUT:-$SCRIPT_DIR/out-refs}"
@@ -261,6 +261,11 @@ build_bins() {
 
 uses_perfbench() {
   [ -x "$1/perfbench" ]
+}
+
+supports_process_model_time() {
+  uses_perfbench "$1" \
+    && "$1/perfbench" --help 2>&1 | grep -q -- "process-wide model time"
 }
 
 supports_drain_timeout() {
@@ -497,6 +502,7 @@ if [ "$BASE_TIME_FACTOR" != "1" ] || [ "$TARGET_TIME_FACTOR" != "1" ]; then
 fi
 
 A_DRAIN=0; B_DRAIN=0; A_INLINE=0; B_INLINE=0; RUN_MIX=0
+A_MODEL_TIME=0; B_MODEL_TIME=0
 if uses_perfbench "$BASE_BIN"; then
   A_DRAIN=1
   A_INLINE=1
@@ -510,6 +516,15 @@ if uses_perfbench "$TARGET_BIN"; then
 elif [ -x "$TARGET_BIN/rtbench" ]; then
   supports_drain_timeout "$TARGET_BIN/rtbench" && B_DRAIN=1
   supports_inline_pressure "$TARGET_BIN/rtbench" && B_INLINE=1
+fi
+supports_process_model_time "$BASE_BIN" && A_MODEL_TIME=1
+supports_process_model_time "$TARGET_BIN" && B_MODEL_TIME=1
+if [ "$A_MODEL_TIME" != "$B_MODEL_TIME" ]; then
+  case "$DELAY_SCALE" in
+    1|1.0) ;;
+    *) die "one side predates process-wide model time; rerun with DELAY_SCALE=1" ;;
+  esac
+  log "NOTE: one side predates process-wide model time; DELAY_SCALE=1 keeps timing aligned"
 fi
 if { uses_perfbench "$BASE_BIN" || [ -x "$BASE_BIN/mixbench" ]; } \
    && { uses_perfbench "$TARGET_BIN" || [ -x "$TARGET_BIN/mixbench" ]; } \
@@ -598,6 +613,7 @@ mkdir -p "$OUT"
   echo "- base: $BASE ($LABEL_A)"
   echo "- target: $TARGET_DESC ($LABEL_B)"
   echo "- ratio = $LABEL_B / $LABEL_A (throughput >1 good; latency/ops/cost <1 good)"
+  echo "- synthetic model-time delay scale: $DELAY_SCALE"
   if [ "$BASE_TIME_FACTOR" != "1" ] || [ "$TARGET_TIME_FACTOR" != "1" ]; then
     echo "- legacy rtbench time normalization: $LABEL_A=${BASE_TIME_FACTOR}x; $LABEL_B=${TARGET_TIME_FACTOR}x"
   fi
