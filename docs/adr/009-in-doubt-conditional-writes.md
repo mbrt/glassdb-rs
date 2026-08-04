@@ -7,7 +7,10 @@ Accepted
 The conditional mutation surface is refined by
 [ADR-042](042-conditional-only-backend-mutations.md), and post-dispatch
 cancellation and cache reconciliation are refined by
-[ADR-043](043-causally-coordinated-backend-operations.md).
+[ADR-043](043-causally-coordinated-backend-operations.md). The
+garbage-collection interaction below — and with it the claim that the logged
+commit path always recovers an in-doubt log write — is refined by
+[ADR-057](057-bounded-in-doubt-commit-recovery.md).
 
 ## Context
 

@@ -524,8 +524,8 @@ impl Monitor {
             .await
     }
 
-    /// Writes a transaction's final (committed or aborted) log object with
-    /// create-if-absent + CAS and in-doubt robustness (ADR-009).
+    /// Writes a transaction's final log and resolves ambiguous outcomes while
+    /// its durable record can still be read back (ADR-009, ADR-057).
     pub(crate) async fn set_final_log(&self, tlog: &TxLog) -> Result<(), TransError> {
         let tid = &tlog.id;
         if tid.is_unset() {
@@ -540,58 +540,72 @@ impl Monitor {
 
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let r = match &last_observation {
+            let attempt_started = rt::Instant::now();
+            let attempt = match &last_observation {
                 Some(observed) => self.inner.tl.set_if(tlog, observed).await,
                 None => self.inner.tl.set(tlog).await,
             };
-            match r {
+            let write_may_have_landed = match attempt {
                 Ok(observed) => {
                     self.remember_final(tid, &observed);
                     return Ok(());
                 }
-                Err(StorageError::Precondition) => {
-                    // The version moved under us. Possible races: our own
-                    // `refresh_pending` advancing the pending log, a wound
-                    // from another client writing `aborted`, or our own
-                    // previously-landed write (e.g. an `Unavailable` retry
-                    // below). Re-read and decide:
-                    //   - Status still `Pending`: it's a non-final race; it is
-                    //     always safe to refresh `last_v` and retry.
-                    //   - Status matches what we are writing: either us (only
-                    //     we write `committed` for our own tx id) or a wound
-                    //     that converged to the same outcome we wanted (only
-                    //     possible for `aborted`). Either way the desired
-                    //     final state is durable -> success.
-                    //   - Status final but mismatched (we wanted `committed`,
-                    //     found `aborted`): a wound landed first -> surface as
-                    //     `AlreadyFinalized` so the commit path treats it as a
-                    //     wound.
-                    // The CAS conflict established that our observation is
-                    // stale, but a failed read says nothing about which
-                    // terminal outcome won. Keep reconciling instead of
-                    // stranding the local transaction as pending.
-                    let st = self
-                        .read_tx_status_retrying_unavailable(tid, &mut backoff)
-                        .await?;
-                    if st.status == tlog.status {
-                        self.remember_final(tid, &st.observation);
-                        return Ok(());
-                    }
-                    if st.status.is_final() {
-                        self.remember_final(tid, &st.observation);
-                        return Err(TransError::AlreadyFinalized);
-                    }
-                    last_observation = Some(st.observation);
-                }
-                // In-doubt outcome: the log write may or may not have landed.
-                // It is always safe to retry as long as the log status was not
-                // final: a not-yet-final log can only become final by a write
-                // that converges on our intent (us or a wound to `aborted`),
-                // and the precondition branch above resolves the matching /
-                // mismatched final outcomes correctly.
-                Err(StorageError::Unavailable(_)) => {}
-                Err(e) => return Err(e.into()),
+                // A conflict proves our observation is stale; an in-doubt
+                // outcome leaves open that the write already landed. Both are
+                // resolved the same way: re-read the durable status and
+                // reconcile it against our intent, because neither says which
+                // terminal outcome won, and re-applying a not-yet-final log is
+                // idempotent and convergent (ADR-009). Resolving an in-doubt
+                // outcome by reading rather than by blindly re-issuing the CAS
+                // also recognizes our own landed write while its object is
+                // still there to be read.
+                Err(StorageError::Precondition) => false,
+                Err(StorageError::Unavailable(_)) => true,
+                Err(error) => return Err(error.into()),
+            };
+            let status = if write_may_have_landed {
+                self.read_tx_status_before_reclaim(tid, &mut backoff, attempt_started)
+                    .await?
+            } else {
+                self.read_tx_status_retrying_unavailable(tid, &mut backoff)
+                    .await?
+            };
+            if status.status == tlog.status {
+                // Either us (only we write `committed` under our own tx id) or
+                // a wound that converged on the outcome we wanted (possible
+                // only for `aborted`). The desired state is durable.
+                self.remember_final(tid, &status.observation);
+                return Ok(());
             }
+            if status.status.is_final() {
+                // We wanted `committed` and found `aborted`: a wound landed
+                // first. Surfaced as `AlreadyFinalized` so the commit path
+                // treats it as a wound.
+                self.remember_final(tid, &status.observation);
+                return Err(TransError::AlreadyFinalized);
+            }
+            if status.observation.is_absent() {
+                // The durable record is gone. GC only ever deletes a *final*
+                // object, so the transaction did reach a terminal state that
+                // can no longer be read back.
+                return Err(if write_may_have_landed {
+                    // Our own terminal write may have been the one reclaimed,
+                    // making the outcome irreducibly unknown (ADR-057).
+                    in_doubt(format!(
+                        "transaction {tid} record was reclaimed while its outcome was in doubt"
+                    ))
+                } else {
+                    // This attempt lost with a definite conflict, so our
+                    // terminal write did not land. Only a peer's wound writes
+                    // under our tx id, and it only ever writes `aborted`.
+                    TransError::AlreadyFinalized
+                });
+            }
+            // A durable `pending` status proves the last attempt did not land,
+            // because a final object is immutable and could not have reverted.
+            // That resolves any in-doubt outcome; a fresh write gets its own
+            // recovery budget because it stamps a fresh reclamation horizon.
+            last_observation = Some(status.observation);
             rt::sleep(backoff.next_delay()).await;
         }
     }
@@ -676,6 +690,44 @@ impl Monitor {
         }
     }
 
+    /// Reads back an ambiguous terminal write before its record can become
+    /// reclaimable.
+    ///
+    /// GC reclaims a final transaction object once its lease horizon has
+    /// elapsed since the timestamp that write stamped (ADR-022), and that
+    /// timestamp is never earlier than the attempt that may have landed it.
+    /// Measuring from the attempt and omitting the skew allowance (which is
+    /// exactly what GC's own check adds to tolerate a foreign clock) therefore
+    /// leaves at least GC's skew allowance after this recovery budget expires.
+    async fn read_tx_status_before_reclaim(
+        &self,
+        tid: &TxId,
+        backoff: &mut Backoff,
+        attempt_started: rt::Instant,
+    ) -> Result<TxStatus, TransError> {
+        // The deadline starts with the write because time spent waiting for its
+        // ambiguous response also consumes the record's retention horizon.
+        let deadline = attempt_started + self.inner.timing.pending_timeout();
+        loop {
+            match self
+                .inner
+                .tl
+                .commit_status_at(tid, self.current_requirement())
+                .await
+            {
+                Ok(status) => return Ok(status),
+                Err(StorageError::Unavailable(reason)) => {
+                    let remaining = deadline.saturating_duration_since(rt::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(in_doubt(reason));
+                    }
+                    rt::sleep(backoff.next_delay().min(remaining)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     async fn read_tx_status_retrying_unavailable(
         &self,
         tid: &TxId,
@@ -744,7 +796,12 @@ impl Monitor {
                         .tl
                         .commit_status_at(tid, self.current_requirement())
                         .await?;
-                    if status.status.is_final() {
+                    // An absent object was reclaimed rather than never written,
+                    // and GC only deletes a final one. This write only ever
+                    // stamps `pending`, so it cannot have been the reclaimed
+                    // terminal state: the transaction is durably dead and must
+                    // not be re-created over its own tombstone.
+                    if status.status.is_final() || status.observation.is_absent() {
                         return Err(TransError::AlreadyFinalized);
                     }
                     if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
@@ -1238,6 +1295,12 @@ impl Monitor {
                             self.mark_local_aborted(&tid, st.status);
                             return;
                         }
+                        // Reclaimed: the object went final and was collected,
+                        // so this lease is over. There is nothing left to
+                        // refresh and re-creating it would resurrect a dead
+                        // transaction, so stop and let the owner's own commit
+                        // establish the outcome.
+                        Ok(st) if st.observation.is_absent() => return,
                         Ok(st) => last_observation = Some(st.observation),
                         // Couldn't read it back; retry on the next cycle.
                         Err(_) => {}
@@ -1250,6 +1313,12 @@ impl Monitor {
             }
         }
     }
+}
+
+/// Builds the error that reports a transaction outcome as irreducibly unknown,
+/// which the public surface classifies as `Error::InDoubt`.
+fn in_doubt(reason: impl Into<String>) -> TransError {
+    TransError::Storage(StorageError::Unavailable(reason.into()))
 }
 
 fn notify_waiters(st: &mut State, tid: &TxId) {
@@ -1505,6 +1574,187 @@ mod tests {
             owner.await_tx_final(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
+    }
+
+    // Regression: GC reclaiming a wound's tombstone leaves the commit path with
+    // a stale CAS expectation whose re-read comes back absent. Absence must
+    // never be used as the expected side of a CAS, and it must not be
+    // re-created either. Since only the owner writes `committed` under its own
+    // tx id, a reclaimed record that the owner never finalized proves the wound
+    // won, so this resolves definitively rather than as an in-doubt outcome.
+    #[tokio::test]
+    async fn commit_over_a_reclaimed_wound_resolves_as_finalized() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (owner, _owner_ctx) = new_test_monitor(b.clone());
+        let (wounder, wounder_ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"reclaimed-wound".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(wounder.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+
+        let aborted = wounder_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        wounder_ctx.tl.delete(&aborted).await.unwrap();
+
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        log.locks.push(lock);
+        assert!(matches!(
+            owner.commit_tx(log).await,
+            Err(TransError::AlreadyFinalized)
+        ));
+    }
+
+    // Regression (ADR-057): a commit write that landed while its acknowledgement
+    // was lost, and whose committed object GC then reclaimed, cannot establish
+    // its own outcome from storage — the durable evidence is gone. That must
+    // surface as the irreducible in-doubt outcome rather than an internal error,
+    // and the record must not be re-created, which would claim a commit that a
+    // peer's wound may equally have decided.
+    #[tokio::test(start_paused = true)]
+    async fn commit_reports_in_doubt_when_its_landed_write_was_reclaimed() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let b: Arc<dyn Backend> = backend.clone();
+        let (owner, _owner_ctx) = new_test_monitor(b.clone());
+        let (_collector, collector_ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"reclaimed-in-doubt".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let reclaim = Arc::new(Mutex::new(Some((collector_ctx.tl.clone(), tx.clone()))));
+        backend.set_after(move |operation, _outcome| {
+            let reclaim = is_commit_write(operation)
+                .then(|| reclaim.lock().unwrap().take())
+                .flatten();
+            let future: HookFuture = Box::pin(async move {
+                let Some((tl, tx)) = reclaim else {
+                    return Ok(());
+                };
+                let committed = tl
+                    .get_at(&tx, Requirement::Any)
+                    .await
+                    .expect("the commit write landed before its ack was lost");
+                tl.delete(&committed)
+                    .await
+                    .expect("the committed object is reclaimable");
+                Err(BackendError::Unavailable(
+                    "injected lost ack (landed, ack lost)".into(),
+                ))
+            });
+            future
+        });
+
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        log.locks.push(lock);
+        let error = owner.commit_tx(log).await.unwrap_err();
+        assert!(
+            matches!(error, TransError::Storage(StorageError::Unavailable(_))),
+            "expected an in-doubt outcome, got {error:?}"
+        );
+    }
+
+    // Regression (ADR-057): retrying an in-doubt commit is only useful while the
+    // record it would read is still there. GC may reclaim a landed write once
+    // the lease horizon has elapsed since that write, so the commit loop must
+    // give up within that horizon instead of retrying into a window where its
+    // own record has been erased.
+    //
+    // Deliberately runs on the default production clock, which is a real wall
+    // clock that no test can advance. The horizon must therefore be measured on
+    // the runtime clock: measuring it in wall-clock time makes the budget
+    // effectively unbounded here, because the retry sleeps only move simulated
+    // time forward while the wall clock barely moves.
+    #[tokio::test(start_paused = true)]
+    async fn commit_gives_up_in_doubt_within_the_reclaim_horizon() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let b: Arc<dyn Backend> = backend.clone();
+        let (owner, _owner_ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"unconfirmable".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The commit write's ack is lost and every later read fails, so the
+        // owner can never confirm whether the write landed.
+        backend.set_after(|operation, _outcome| {
+            let outage = is_commit_write(operation)
+                || matches!(
+                    operation,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                );
+            let future: HookFuture = Box::pin(async move {
+                if outage {
+                    return Err(BackendError::Unavailable("injected outage".into()));
+                }
+                Ok(())
+            });
+            future
+        });
+
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        log.locks.push(lock);
+        let started = tokio::time::Instant::now();
+        let error = owner.commit_tx(log).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, TransError::Storage(StorageError::Unavailable(_))),
+            "expected an in-doubt outcome, got {error:?}"
+        );
+        // The recovery read is bounded directly, so it cannot run a whole
+        // backoff interval past the horizon.
+        let horizon = owner.protocol_timing().pending_timeout();
+        assert!(
+            elapsed <= horizon + Duration::from_millis(100),
+            "gave up after {elapsed:?}, past the {horizon:?} reclaim horizon"
+        );
+        assert!(
+            elapsed > horizon / 2,
+            "gave up after {elapsed:?}, far short of the {horizon:?} reclaim horizon"
+        );
+    }
+
+    /// Whether `operation` is the conditional write that flips a transaction
+    /// object to `committed`, which is the commit point a lost acknowledgement
+    /// makes ambiguous.
+    fn is_commit_write(operation: &BackendOp<'_>) -> bool {
+        matches!(
+            operation,
+            BackendOp::WriteIf { value, .. }
+                if glassdb_storage::txobject::status(value)
+                    .map(|status| status == TxCommitStatus::Ok)
+                    .unwrap_or(false)
+        )
     }
 
     #[tokio::test(start_paused = true)]
