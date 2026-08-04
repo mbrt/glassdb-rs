@@ -396,20 +396,17 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 }
 
 /// The logged (multi-write) path: when the *committed* transaction-log write —
-/// the commit point — lands but loses its ack, the engine must retry the log
-/// write transparently and recognize the landed log as its own previously
-/// successful attempt. The log is keyed by tx id and only this client writes
-/// its own log, so the conditional write is idempotent: a transparent retry
-/// cannot double-apply.
+/// the commit point — lands but loses its ack, the engine must recover the
+/// outcome transparently instead of surfacing the uncertainty.
 ///
-/// The retry's `write_if_not_exists` sees the landed log and is rejected by a
-/// real `Precondition`. The engine then reads the log status, sees the final
-/// `committed` matching its own intent, and returns success. We observe two
-/// attempts at the committed-log path (the original lost-ack one + a single
-/// retry that fails with `Precondition`), but the writes themselves are
-/// applied exactly once.
+/// It recovers by reading the log status back. The log is keyed by tx id and
+/// only this client writes `committed` under it, so a final `committed` status
+/// is necessarily its own landed write and resolves to success. Reading rather
+/// than re-issuing the conditional write keeps the commit point driven exactly
+/// once, so no extra attempt widens the window in which GC could reclaim the
+/// very record the engine needs to read (ADR-057).
 #[tokio::test(start_paused = true)]
-async fn logged_commit_lost_ack_retries_transparently() {
+async fn logged_commit_lost_ack_recovers_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -438,21 +435,19 @@ async fn logged_commit_lost_ack_retries_transparently() {
         tx.write(coll, b"b", &incremented_value(b"b", b)?)
     })
     .await
-    .expect("the logged commit must retry the in-doubt log write transparently");
+    .expect("the logged commit must recover the in-doubt log write transparently");
 
     // Each write applied exactly once — the safety invariant.
     assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
     assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 1);
 
-    // Bound the retry: the engine drives the commit point exactly twice (the
-    // original lost-ack write, then a single retry that observes the landed
-    // log via `Precondition` and resolves to success). A bound above 2 would
-    // mean the engine kept hammering the committed-log path instead of
-    // recognizing its own landed write.
+    // The commit point is driven exactly once — the lost-ack write itself.
+    // Anything above one would mean the engine re-issued the conditional write
+    // instead of recognizing its own landed log by reading the status back.
     assert_eq!(
         committed_log_writes.load(Ordering::SeqCst),
-        2,
-        "expected one original + one retry attempt on the committed-log path",
+        1,
+        "the in-doubt commit point must be resolved by reading, not re-issued",
     );
 }
 

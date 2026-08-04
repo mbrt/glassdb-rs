@@ -5,6 +5,17 @@
 //! otherwise the deterministic executor can be bypassed without an obvious
 //! test failure. Tokio synchronization and future-composition macros are
 //! runtime-agnostic and remain usable directly.
+//!
+//! The two time seams are not interchangeable, and this file can only guard the
+//! coarser half of that rule. `rt::Instant` is monotonic and always tracks the
+//! active clock (virtual under the deterministic executor, tokio's possibly
+//! paused clock otherwise), so it is the seam for *elapsed* time: timeouts,
+//! deadlines, and retry budgets. `Clock` is a wall clock, needed only to compare
+//! against *persisted* timestamps that may come from another node; it is real
+//! time unless a caller anchors it, so measuring elapsed time with it silently
+//! escapes simulated time. Only the latter misuse is greppable here — spending a
+//! wall-clock budget while retries advance virtual time needs a behavioral test
+//! that exercises the timeout under the default (real) clock.
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +52,9 @@ const FORBIDDEN: &[&str] = &[
     "SystemTime::now(",
     "std::time::SystemTime::now(",
     "std::time::Instant::now(",
+    // An unanchored wall clock ignores simulated time, so engine code must take
+    // the one its caller configured instead of minting a real clock in place.
+    "Clock::real(",
 ];
 
 const ALLOWED_TOKIO: &[&str] = &[
@@ -70,7 +84,10 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
     path.ends_with("crates/glassdb-concurr/src/rt.rs")
         || (path.ends_with("crates/glassdb-concurr/src/clock.rs")
-            && pattern.contains("SystemTime::now("))
+            && matches!(pattern, "SystemTime::now(" | "Clock::real("))
+        // The single place that turns the engine's `deterministic_time` switch
+        // into a clock, and therefore the only legitimate real-clock source.
+        || (path.ends_with("crates/glassdb-trans/src/engine.rs") && pattern == "Clock::real(")
         || (path.ends_with("crates/glassdb-concurr/src/exec.rs")
             && matches!(pattern, "tokio::task" | "tokio::runtime"))
         || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
