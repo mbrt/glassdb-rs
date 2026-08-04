@@ -9,7 +9,7 @@ injection). The acked-bounds invariant, the in-doubt reasoning, and the
 `RecordingBackend` op-stream self-check below still apply.
 
 The deterministic-time builder and `Clock` details are superseded by
-[ADR-057](057-process-wide-model-time.md); deterministic wall time now belongs
+[ADR-058](058-process-wide-model-time.md); deterministic wall time now belongs
 to the runtime seam.
 
 ## Context

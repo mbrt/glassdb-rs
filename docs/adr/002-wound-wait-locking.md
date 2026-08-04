@@ -5,7 +5,7 @@
 Accepted
 
 The `Clock`-based time-source detail is superseded by
-[ADR-057](057-process-wide-model-time.md); transaction priority still uses the
+[ADR-058](058-process-wide-model-time.md); transaction priority still uses the
 same wall timestamp and ordering rule.
 
 ## Context

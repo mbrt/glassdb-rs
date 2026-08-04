@@ -20,7 +20,7 @@ The MVP-deviation notes inlined below are retained for history but are
 superseded by ADR-024.
 
 The `Clock`-based time-source detail is superseded by
-[ADR-057](057-process-wide-model-time.md); the lease and expiry decisions are
+[ADR-058](058-process-wide-model-time.md); the lease and expiry decisions are
 unchanged.
 
 ## Context

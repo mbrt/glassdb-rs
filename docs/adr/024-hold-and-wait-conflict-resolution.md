@@ -33,7 +33,7 @@ would return once the engine moved past the MVP. It is now past the MVP. It also
 skew (see "Deciding whether a holder is live" below).
 
 The `Clock`-based time-source detail is superseded by
-[ADR-057](057-process-wide-model-time.md); wait, refresh, and expiry semantics
+[ADR-058](058-process-wide-model-time.md); wait, refresh, and expiry semantics
 are unchanged.
 
 ## Context

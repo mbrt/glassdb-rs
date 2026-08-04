@@ -63,7 +63,7 @@ sleeps are several milliseconds. It is the smallest practical scale supported
 by this calibration. `0.5` or uncompressed runs remain the confirmation tier
 for a contentious decision.
 
-The benchmark now defaults to `0.2` for simulated backends. ADR-057 replaced
+The benchmark now defaults to `0.2` for simulated backends. ADR-058 replaced
 the temporary per-builder correction with one immutable process-wide
 model-time speedup. Nominal backend latency and rate limits, SDK and engine
 retries, protocol-liveness timing, deadlock budgets, and background cadence now

@@ -1679,11 +1679,9 @@ mod tests {
     // give up within that horizon instead of retrying into a window where its
     // own record has been erased.
     //
-    // Deliberately runs on the default production clock, which is a real wall
-    // clock that no test can advance. The horizon must therefore be measured on
-    // the runtime clock: measuring it in wall-clock time makes the budget
-    // effectively unbounded here, because the retry sleeps only move simulated
-    // time forward while the wall clock barely moves.
+    // The horizon must use the same runtime monotonic time as retry sleeps.
+    // Measuring it with a raw wall clock would make the budget effectively
+    // unbounded while this test advances paused runtime time.
     #[tokio::test(start_paused = true)]
     async fn commit_gives_up_in_doubt_within_the_reclaim_horizon() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -1723,7 +1721,7 @@ mod tests {
 
         let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
         log.locks.push(lock);
-        let started = tokio::time::Instant::now();
+        let started = rt::Instant::now();
         let error = owner.commit_tx(log).await.unwrap_err();
         let elapsed = started.elapsed();
 

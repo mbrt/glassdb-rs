@@ -6,16 +6,11 @@
 //! test failure. Tokio synchronization and future-composition macros are
 //! runtime-agnostic and remain usable directly.
 //!
-//! The two time seams are not interchangeable, and this file can only guard the
-//! coarser half of that rule. `rt::Instant` is monotonic and always tracks the
-//! active clock (virtual under the deterministic executor, tokio's possibly
-//! paused clock otherwise), so it is the seam for *elapsed* time: timeouts,
-//! deadlines, and retry budgets. `Clock` is a wall clock, needed only to compare
-//! against *persisted* timestamps that may come from another node; it is real
-//! time unless a caller anchors it, so measuring elapsed time with it silently
-//! escapes simulated time. Only the latter misuse is greppable here — spending a
-//! wall-clock budget while retries advance virtual time needs a behavioral test
-//! that exercises the timeout under the default (real) clock.
+//! Runtime time has two representations with distinct purposes. `rt::Instant`
+//! is monotonic and measures elapsed time for deadlines and retry budgets;
+//! `rt::system_now` supplies wall timestamps for comparisons with persisted
+//! state. Both follow the runtime's active model-time domain. Raw clocks bypass
+//! that domain and can silently escape simulated or accelerated time.
 
 use std::path::{Path, PathBuf};
 
@@ -52,9 +47,6 @@ const FORBIDDEN: &[&str] = &[
     "SystemTime::now(",
     "std::time::SystemTime::now(",
     "std::time::Instant::now(",
-    // An unanchored wall clock ignores simulated time, so engine code must take
-    // the one its caller configured instead of minting a real clock in place.
-    "Clock::real(",
 ];
 
 const ALLOWED_TOKIO: &[&str] = &[
