@@ -25,7 +25,6 @@ pub fn gcs_delays() -> DelayOptions {
         prefix_read_ps: 0,
         prefix_write_ps: 0,
         prefix_depth: 0,
-        scale: 0.0,
     }
 }
 
@@ -50,7 +49,6 @@ pub fn s3_delays() -> DelayOptions {
         prefix_read_ps: 5500,
         prefix_write_ps: 3500,
         prefix_depth: 2,
-        scale: 0.0,
     }
 }
 
@@ -96,9 +94,6 @@ pub struct DelayOptions {
     /// each immediate subtree independently). Ignored when both prefix rates
     /// are zero.
     pub prefix_depth: usize,
-    /// Multiplies all delay durations. A value of `0.0` is treated as `1.0`.
-    /// Use values `< 1` to compress delays (e.g. `0.001` for a 1000x speedup).
-    pub scale: f64,
 }
 
 /// A [`Backend`] decorator that injects simulated network latency, per-object
@@ -106,7 +101,6 @@ pub struct DelayOptions {
 /// to the inner backend.
 pub struct DelayBackend {
     inner: Arc<dyn Backend>,
-    scale: f64,
     obj_read: Lognormal,
     obj_write: Lognormal,
     list: Lognormal,
@@ -123,23 +117,21 @@ impl DelayBackend {
     /// `opts.meta_read` / `opts.meta_write` are unused; they remain in
     /// [`DelayOptions`] only for config-shape stability.
     pub fn new(inner: Arc<dyn Backend>, opts: DelayOptions) -> Self {
-        let scale = if opts.scale == 0.0 { 1.0 } else { opts.scale };
         DelayBackend {
             inner,
-            scale,
             obj_read: Lognormal::from_latency(opts.obj_read),
             obj_write: Lognormal::from_latency(opts.obj_write),
             list: Lognormal::from_latency(opts.list),
-            rlimit: RateLimiter::new(opts.same_obj_write_ps, scale),
-            prefix_reads: PrefixLimiter::new(opts.prefix_read_ps, opts.prefix_depth, scale),
-            prefix_writes: PrefixLimiter::new(opts.prefix_write_ps, opts.prefix_depth, scale),
-            retry_delay: secs_f64_or_zero(opts.obj_write.mean.as_secs_f64() * 2.0 * scale),
+            rlimit: RateLimiter::new(opts.same_obj_write_ps),
+            prefix_reads: PrefixLimiter::new(opts.prefix_read_ps, opts.prefix_depth),
+            prefix_writes: PrefixLimiter::new(opts.prefix_write_ps, opts.prefix_depth),
+            retry_delay: opts.obj_write.mean.saturating_mul(2),
         }
     }
 
     async fn delay(&self, ln: &Lognormal) {
         let ms = ln.rand();
-        rt::sleep(secs_f64_or_zero(ms * self.scale / 1_000.0)).await;
+        rt::sleep(secs_f64_or_zero(ms / 1_000.0)).await;
     }
 
     /// Blocks on the read prefix limiter (a no-op when it is disabled).
@@ -268,11 +260,10 @@ impl Lognormal {
 }
 
 /// A per-object token-bucket rate limiter. Mirrors the Go `rateLimiter`,
-/// including its use of wall-clock time — here `tokio::time::Instant`, so it
-/// stays deterministic under paused time in tests.
+/// including its use of model monotonic time, so it stays coherent with
+/// accelerated latency and deterministic under paused time in tests.
 struct RateLimiter {
     tokens_per_sec: i64,
-    scale: f64,
     buckets: Mutex<HashMap<String, BucketState>>,
 }
 
@@ -283,10 +274,9 @@ struct BucketState {
 }
 
 impl RateLimiter {
-    fn new(tokens_per_sec: i64, scale: f64) -> Self {
+    fn new(tokens_per_sec: i64) -> Self {
         RateLimiter {
             tokens_per_sec,
-            scale,
             buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -295,7 +285,7 @@ impl RateLimiter {
         if self.tokens_per_sec == 0 {
             return false;
         }
-        let window = Duration::from_secs_f64(self.scale);
+        let window = Duration::from_secs(1);
         let now = Instant::now();
         let mut buckets = self.buckets.lock().unwrap();
         let Some(entry) = buckets.get(key).copied() else {
@@ -341,10 +331,10 @@ impl RateLimiter {
 /// infrequent per-object writes), it behaves correctly under thousands of
 /// concurrent acquisitions per second: callers that exceed the rate are told
 /// how long to wait, and that debt accumulates so the long-run rate converges
-/// to the cap. Timekeeping uses `tokio::time::Instant`, so it stays
-/// deterministic under paused time.
+/// to the cap. Timekeeping uses model monotonic time, so it stays coherent with
+/// accelerated latency and deterministic under paused time.
 struct PrefixLimiter {
-    /// Tokens added per wall-clock second.
+    /// Tokens added per model second.
     rate: f64,
     /// Bucket capacity, in tokens.
     burst: f64,
@@ -362,15 +352,12 @@ impl PrefixLimiter {
     /// Builds a per-prefix limiter, or `None` (no throttling) when
     /// `rate_per_sec` is non-positive. `depth` selects how many leading path
     /// segments form the throttled prefix.
-    fn new(rate_per_sec: i64, depth: usize, scale: f64) -> Option<PrefixLimiter> {
+    fn new(rate_per_sec: i64, depth: usize) -> Option<PrefixLimiter> {
         if rate_per_sec <= 0 {
             return None;
         }
-        // Delays are sleep-scaled by `scale` (see `delay`), so a sub-unit scale
-        // compresses wall-clock time; the request rate must grow by the same
-        // factor to keep the simulated rate constant.
         Some(PrefixLimiter {
-            rate: rate_per_sec as f64 / scale,
+            rate: rate_per_sec as f64,
             burst: rate_per_sec as f64,
             depth: depth.max(1),
             buckets: Mutex::new(HashMap::new()),
@@ -443,12 +430,11 @@ mod tests {
         tokio::time::advance(d).await;
     }
 
-    // Ports the Go middleware `TestRateLimiter`, driving the limiter with
-    // paused tokio time. Because the limiter reads `tokio::time::Instant`,
-    // advancing the runtime clock moves its refill window.
+    // Ports the Go middleware `TestRateLimiter`, driving the model-time limiter
+    // with paused Tokio time.
     #[tokio::test(start_paused = true)]
     async fn rate_limiter_token_refill() {
-        let rl = RateLimiter::new(1, 1.0);
+        let rl = RateLimiter::new(1);
 
         // Four requests sneak through within the first second (tokens go
         // negative because the window has not elapsed).
@@ -488,27 +474,26 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_disabled_when_zero() {
-        let rl = RateLimiter::new(0, 1.0);
+        let rl = RateLimiter::new(0);
         assert!(!rl.try_acquire_token("k"));
     }
 
-    // Ports the Go middleware `TestPrefixLimiterScale`. Compressing time by
-    // 1000x must raise the wall-clock rate by 1000x so the simulated rate is
-    // unchanged: the post-burst wait shrinks from 10ms to 10us.
+    // Ports the Go middleware `TestPrefixLimiter` at its nominal model-time
+    // rate. Process-wide acceleration is covered at the runtime seam.
     #[tokio::test(start_paused = true)]
-    async fn prefix_limiter_scale() {
-        let l = PrefixLimiter::new(100, 1, 1.0 / 1000.0).expect("limiter enabled");
+    async fn prefix_limiter_rate() {
+        let l = PrefixLimiter::new(100, 1).expect("limiter enabled");
         let now = Instant::now();
         for _ in 0..100 {
             l.reserve("bench", now);
         }
-        assert_eq!(l.reserve("bench", now), Duration::from_micros(10));
+        assert_eq!(l.reserve("bench", now), Duration::from_millis(10));
     }
 
     #[test]
     fn prefix_limiter_disabled_when_non_positive() {
-        assert!(PrefixLimiter::new(0, 2, 1.0).is_none());
-        assert!(PrefixLimiter::new(-1, 2, 1.0).is_none());
+        assert!(PrefixLimiter::new(0, 2).is_none());
+        assert!(PrefixLimiter::new(-1, 2).is_none());
     }
 
     // Ports the Go middleware `TestPrefixKey`.

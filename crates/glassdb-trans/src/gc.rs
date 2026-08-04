@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
-use glassdb_concurr::{Background, Clock, rt};
+use glassdb_concurr::{Background, rt};
 use glassdb_data::{KeyRef, TxId, paths, shuffle};
 use glassdb_storage::{
     Observation, Requirement, ShardStore, StorageError, TLogger, Timeline, TreeRouter,
@@ -80,7 +80,6 @@ pub struct Gc {
     router: TreeRouter,
     locker: Locker,
     mon: Monitor,
-    clock: Clock,
     timeline: Timeline,
     // Write-back hint feed: txids a fresh commit just superseded (primary
     // candidate source). Deduplicated when drained.
@@ -119,8 +118,8 @@ impl TxScan {
 
 impl Gc {
     /// Creates a collector over the transaction log, shard store, locker, and
-    /// monitor. Freshness barriers use `timeline`; lease horizons use `clock`
-    /// so they remain deterministic under the DST executor.
+    /// monitor. Freshness barriers use `timeline`; lease horizons use model
+    /// time so they remain deterministic under the DST executor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bg: Weak<Background>,
@@ -130,7 +129,6 @@ impl Gc {
         locker: Locker,
         collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
-        clock: Clock,
     ) -> Self {
         let router = TreeRouter::new(shards.clone());
         Gc {
@@ -141,7 +139,6 @@ impl Gc {
             router,
             locker,
             mon,
-            clock,
             timeline,
             hints: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -267,7 +264,7 @@ impl Gc {
         // (ADR-024 materializes the object lazily, after the locks are taken);
         // a recent committed/aborted one is left for a later cycle.
         let ts = log.timestamp.unwrap_or(UNIX_EPOCH);
-        if !self.mon.protocol_timing().is_expired(ts, self.clock.now()) {
+        if !self.mon.protocol_timing().is_expired(ts, rt::system_now()) {
             return Ok(());
         }
 
@@ -586,10 +583,8 @@ mod tests {
         glassdb_data::CollectionAddress::root("db")
     }
 
-    // A fixed wall-clock anchor so the horizon is a pure function of the
-    // offsets the tests choose, independent of the machine's real clock.
     fn base() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        rt::system_now()
     }
 
     // Comfortably past the 45s (timeout + skew) safety horizon.
@@ -628,12 +623,10 @@ mod tests {
                 .unwrap()
         );
         let bg = Arc::new(Background::new());
-        let clock = Clock::anchored_at(base());
         let mon = Monitor::with_config(
             tl.clone(),
             timeline.clone(),
             Arc::downgrade(&bg),
-            clock.clone(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
@@ -673,7 +666,6 @@ mod tests {
                 Arc::new(UnexpectedTopologySettler),
             ),
             mon.clone(),
-            clock,
         );
         Ctx {
             gc,
@@ -1115,12 +1107,11 @@ mod tests {
         let ctx = new_ctx().await;
         let t = tx(1);
         let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
-        log.timestamp = Some(base());
+        log.timestamp = Some(base() - PAST_HORIZON);
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
 
-        tokio::time::sleep(PAST_HORIZON).await;
         ctx.gc.schedule_tx_cleanup(t.clone());
         run_once(&ctx.gc).await;
 

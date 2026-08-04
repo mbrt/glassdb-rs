@@ -8,6 +8,10 @@ engine DST (a minimal in-repo deterministic executor + `Backend`-level fault
 injection). The acked-bounds invariant, the in-doubt reasoning, and the
 `RecordingBackend` op-stream self-check below still apply.
 
+The deterministic-time builder and `Clock` details are superseded by
+[ADR-058](058-process-wide-model-time.md); deterministic wall time now belongs
+to the runtime seam.
+
 ## Context
 
 GlassDB's correctness rests on a serializable concurrency-control protocol.

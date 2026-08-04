@@ -26,6 +26,9 @@ commit-critical direct inline publish. The coordinator invariant remains;
 a same-key round reservation prevents one batched direct commit from erasing
 another's in-doubt recovery evidence.
 
+The `Clock`-based time-source detail is superseded by
+[ADR-058](058-process-wide-model-time.md); coordinator behavior is unchanged.
+
 Generalizes the deduplication **mechanism** of
 [ADR-025](025-dedup-shard-lock-acquisition.md) and
 [ADR-026](026-dedup-shard-release-write-back.md), and **supersedes the bespoke

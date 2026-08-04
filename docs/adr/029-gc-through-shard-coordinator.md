@@ -17,6 +17,9 @@ mark-sweep, the safety horizon, abort-then-release-then-delete, tombstone
 retention) is **unchanged**: this ADR moves _where_ GC's lock reclamation runs,
 not _what_ it decides.
 
+The `Clock`-based time-source detail is superseded by
+[ADR-058](058-process-wide-model-time.md); reclamation behavior is unchanged.
+
 ## Context
 
 [ADR-028](028-shard-mutation-coordinator.md) established a single invariant:

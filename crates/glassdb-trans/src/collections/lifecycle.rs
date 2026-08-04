@@ -496,7 +496,6 @@ mod tests {
             TLogger::new(primary.objects.clone(), "db"),
             primary.timeline.clone(),
             Arc::downgrade(&background),
-            glassdb_concurr::Clock::real(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );

@@ -91,7 +91,7 @@ is absent from normal library builds.
 | `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `shard_store.rs`, `tree_router.rs`, `node.rs`, `shard.rs`, `txobject.rs`, `tlogger.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record and B-link-node CAS stores/codecs, B-link traversal, transaction-log persistence, and generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId`, `TxIdSet`, order-preserving path encoding                                                                                 |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
-| `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `clock.rs`                          | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, the `Clock` abstraction                                      |
+| `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `rt.rs`                             | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, and the process-wide model-time/runtime seam                 |
 
 Only the top-level `glassdb` crate is intended for direct use; the rest are
 implementation detail. Its public API surface is small: `Database`,

@@ -29,7 +29,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{Background, Backoff, Clock, RetryConfig, rt};
+use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafObservationCheck, LockType, NodeLocks, Requirement,
@@ -504,7 +504,6 @@ pub struct Algo {
     coord: ShardCoordinator,
     mon: Monitor,
     gc: Gc,
-    clock: Clock,
     timeline: Timeline,
     split_policy: SplitPolicy,
     inline_policy: InlinePolicy,
@@ -519,8 +518,8 @@ pub struct Algo {
 impl Algo {
     /// Creates a transaction algorithm coordinator.
     ///
-    /// Validation barriers use `timeline`; `clock` must match the monitor's
-    /// clock so transaction priorities and lease timing share one time base.
+    /// Validation barriers use `timeline`; transaction priorities and leases
+    /// share the process-wide model-time domain.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shards: ShardStore,
@@ -529,7 +528,6 @@ impl Algo {
         coord: ShardCoordinator,
         mon: Monitor,
         collection_commit: CollectionCommit,
-        clock: Clock,
         gc: Gc,
         background: Option<Weak<Background>>,
         resolver: KeyResolver,
@@ -544,7 +542,6 @@ impl Algo {
             coord,
             mon,
             gc,
-            clock,
             timeline,
             split_policy,
             inline_policy,
@@ -569,7 +566,7 @@ impl Algo {
     /// Starts a new transaction with its key and collection-management data.
     /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
     pub fn begin(&self, data: Data, collection_data: CollectionData) -> Handle {
-        let id = TxId::new_at(self.clock.now());
+        let id = TxId::new_at(rt::system_now());
         Handle {
             data,
             collections: CollectionAttempt::new(collection_data),
@@ -1559,7 +1556,6 @@ mod tests {
             tlogger.clone(),
             timeline.clone(),
             bg_weak.clone(),
-            Clock::real(),
             RetryConfig::default(),
             ProtocolTiming::simulation(),
         );
@@ -1581,7 +1577,6 @@ mod tests {
             timeline.clone(),
             tmon.clone(),
             key_state,
-            Clock::real(),
             RetryConfig::default(),
             TEST_COLL,
             split_policy,
@@ -1609,7 +1604,6 @@ mod tests {
             locker.clone(),
             collection_lifecycle.clone(),
             tmon.clone(),
-            Clock::real(),
         );
         let collection_commit = CollectionCommit::new(
             CollectionCatalog::new(collection_state),
@@ -1635,7 +1629,6 @@ mod tests {
             coord.clone(),
             tmon.clone(),
             collection_commit,
-            Clock::real(),
             gc,
             None,
             resolver,

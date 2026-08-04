@@ -1336,7 +1336,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_concurr::{Background, Clock, RetryConfig};
+    use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionAddress, paths};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
@@ -1377,7 +1377,6 @@ mod tests {
             tl.clone(),
             timeline.clone(),
             Arc::downgrade(&bg),
-            Clock::real(),
             RetryConfig::default(),
             ProtocolTiming::simulation(),
         );

@@ -7,6 +7,91 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## Current tree: baseline reassessment after inline-policy tuning
+
+### Setup
+
+- target: `40bc6b8d`; canonical base: `v0.1.0`; diagnostic base:
+  `69663dde` (post-ADR-044); inline-default base: `fbdb99f5`
+- ratio = target / base (throughput >1 good; latency/ops/cost <1 good)
+- canonical command: `BASE=v0.1.0 LABEL_A=v010 LABEL_B=current
+  DELAY_SCALE=0.02 DB_LIST=1,10,20 NUM_KEYS=5000 DURATION=5s NUM_RUNS=3
+  DEADLOCK_DURATION=1s COUNT=5 DRAIN_TIMEOUT=90s COMMAND_TIMEOUT=15m
+  hack/aws-bench/compare-refs.sh --summary`
+- the v0.1.0 binary predates simulated-time reporting. Its compressed
+  `rtbench` latency and duration fields are multiplied by `50` before
+  comparison; operation counts and the autoresearch score require no
+  normalization
+- all measured cells report zero transaction failures. Every current-tree
+  worker and shutdown drain completes within its bound; v0.1.0 predates the
+  separate drain fields
+
+### Canonical v0.1.0 baseline
+
+- balanced rw9010 aggregate-throughput ratios are `0.381–0.444` at one
+  Database, `0.010–0.022` at 10 Databases, and `0.017–0.021` at 20 Databases.
+  Across all nine paired cells the geomean is `0.049`; Jain-fairness geomean is
+  `0.86`
+- one-Database worker time remains about five seconds on both refs. At 10 and
+  20 Databases the current worker time is `16.1–29.7 s`, versus `5.1–5.8 s`
+  on v0.1.0, because the current workers need that long to complete their
+  minimum samples after the five-second launch window
+- strong-read p50 ratio has geomean `1.11`; write p50 has geomean `5.26` and
+  median `4.00`. The weak-read ratio is not comparable because v0.1.0 reports
+  a near-zero cached-read p50
+- noisy deadlock p50 and p90 geomeans are `2.00` and `1.78`; the three one-key
+  p50 ratios are `5.24–5.29`
+- backend operations/transaction fall to a `0.47` geomean and retries to
+  `0.14`. The deterministic autoresearch score falls from `403.43` to `98.13`
+  (`0.243`)
+- autoresearch secondary geomeans move to `2.79` allocation bytes/transaction,
+  `2.25` allocations/transaction, `1.65` wall ns/transaction, and `1.25` CPU
+  ns/transaction. `batchWrite100` alone uses `8.65x` the allocation bytes and
+  `5.40x` the CPU time, despite reducing weighted backend cost to `0.011`
+- `readRepeat` weighted cost is `1.82`, while physical calls remain at parity
+  and CPU time falls to `0.54`; the cost ratio reflects reclassification from a
+  metadata read to an object read
+
+### Post-ADR-044 reference
+
+- command: `BASE=69663dde LABEL_A=adr044 LABEL_B=current DELAY_SCALE=0.02
+  DB_LIST=1,10 NUM_KEYS=5000 DURATION=5s NUM_RUNS=3
+  DEADLOCK_DURATION=1s COUNT=5 RW_MIX="balanced readheavy writeheavy"
+  MIX_DURATION=1s MIX_MAX_DURATION=30s MIX_TARGET_CI=0.15 MIX_MODES=hi
+  MIX_TOPOLOGIES=shared,per-shape MIX_WORKERS=8 MIX_CLIENTS=4
+  MIX_HOT_KEYS=8 MIX_MULTI_KEYS=8 DRAIN_TIMEOUT=90s COMMAND_TIMEOUT=15m
+  hack/aws-bench/compare-refs.sh --summary`
+- rw9010 aggregate-throughput geomeans are `1.13` balanced, `0.97` read-heavy,
+  and `1.04` write-heavy. Backend operations/transaction geomeans are `1.15`,
+  `1.14`, and `1.22`, respectively
+- deadlock p50 and p90 geomeans are `0.91` and `0.90`. In the one-key cells,
+  current p50 is `0.51–0.55` and p90 `0.47–0.51` of the reference, with
+  `417–447` completions versus `233–242`
+- mixbench throughput geomeans are `1.83` for `roMulti`, `1.10` for
+  `roSingle`, `2.35` for `rwMany`, and `1.04` for `rwSingle`. The reference
+  `hi/per-shape` `rwMany` cell is unconverged; all other cells converge
+- deterministic autoresearch score improves from `122.89` to `97.48`
+  (`0.793`). Secondary geomeans move to `0.93` allocation bytes/transaction,
+  `0.83` allocations/transaction, `0.67` wall ns/transaction, and `0.61` CPU
+  ns/transaction
+
+### 16 KiB inline-default guardrails
+
+- base `fbdb99f5` differs only by its 64 KiB aggregate inline default. The
+  focused inline-pressure workload remains explicitly pinned to 64 KiB: S3
+  recovery throughput is `1.00`, GCS is `0.97`, backend work is at parity, both
+  sides land `64/64` recovery mutations directly, and both complete exactly two
+  pressure splits
+- deadlock p50 and p90 geomeans are `0.93` and `0.94`; one-key direct outcomes
+  are unchanged. Every cell completes with zero failures and a bounded drain
+- three additional alternating `hi/per-shape` pairs all converge. Throughput
+  geomeans are `1.03` for `roSingle`, `1.00` for `roMulti`, `1.70` for
+  `rwSingle`, and `0.87` for `rwMany`; operations/transaction geomeans are
+  `0.95`, `0.97`, `0.83`, and `1.00`, respectively
+- ten alternating autoresearch pairs put the overall score at a `1.005`
+  geomean. `batchWrite100` cost has a `0.990` geomean; its median object-write
+  counts are `112.5` with 64 KiB and `113.5` with 16 KiB
+
 ## ADR-056: demand-driven inline-pressure splits
 
 [ADR-056](../adr/056-demand-driven-inline-pressure-splits.md) requests a

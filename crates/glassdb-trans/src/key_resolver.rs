@@ -435,7 +435,6 @@ mod tests {
             tl,
             timeline.clone(),
             Arc::downgrade(&bg),
-            glassdb_concurr::Clock::real(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );

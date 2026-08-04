@@ -4,6 +4,10 @@
 
 Accepted
 
+The separate `Clock` detail is superseded by
+[ADR-058](058-process-wide-model-time.md), which makes wall and monotonic model
+time one process-wide runtime property.
+
 Follow-up to [ADR-010](010-fuzzer-coverage-guidance.md) and the runtime side of
 [ADR-008](008-deterministic-simulation-fuzzer.md).
 

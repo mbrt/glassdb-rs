@@ -3,8 +3,8 @@
 //! Each workload runs over three backends, matching the Go suite:
 //! - `memory`: a bare in-memory backend.
 //! - `gcs` / `s3`: the same in-memory backend wrapped in [`DelayBackend`] with
-//!   the GCS/S3 latency profile, compressed 1000x (`scale = 1/1000`) so a
-//!   wall-clock `cargo bench` run stays fast — exactly like the Go benchmarks.
+//!   the GCS/S3 latency profile. Process-wide model time is accelerated 1000x
+//!   so a wall-clock `cargo bench` run stays fast.
 //!
 //! Alongside the criterion timing, each (workload, backend) pair prints the
 //! per-operation backend counters derived from [`glassdb::Stats`] (the analog
@@ -25,6 +25,8 @@ use glassdb::{Backend, Collection, CollectionPath, Database, Error, Transaction}
 const STATS_ITERS: i64 = 30;
 
 fn runtime() -> Runtime {
+    glassdb_concurr::rt::set_model_time_speedup(1000.0)
+        .expect("configure benchmark model time before creating the runtime");
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -32,12 +34,9 @@ fn runtime() -> Runtime {
         .expect("build tokio runtime")
 }
 
-/// Wraps a fresh in-memory backend in a [`DelayBackend`] using `profile`,
-/// compressed 1000x so bench runs stay fast (mirrors the Go bench scaling).
+/// Wraps a fresh in-memory backend in a [`DelayBackend`] using `profile`.
 fn simulated(profile: fn() -> DelayOptions) -> Arc<dyn Backend> {
-    let mut opts = profile();
-    opts.scale = 1.0 / 1000.0;
-    Arc::new(DelayBackend::new(Arc::new(MemoryBackend::new()), opts))
+    Arc::new(DelayBackend::new(Arc::new(MemoryBackend::new()), profile()))
 }
 
 /// The three backends used by every workload, each backed by fresh state.

@@ -137,7 +137,6 @@ mod tests {
             transactions.clone(),
             timeline,
             Arc::downgrade(&background),
-            glassdb_concurr::Clock::real(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );

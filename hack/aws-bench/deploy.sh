@@ -1,53 +1,102 @@
 #!/usr/bin/env bash
 #
-# Deploy (or tear down) the GlassDB S3 benchmark stack.
+# Deploy, inspect, and tear down the private real-S3 perfbench runner.
 #
 # Usage:
-#   deploy.sh deploy        # build binary, create/update stack, upload binary
-#   deploy.sh logs          # stream the live benchmark log over SSM
-#   deploy.sh results [ts]  # download a run's CSVs into out/ (latest by default)
-#   deploy.sh teardown      # empty the bucket and delete the stack
+#   deploy.sh deploy        build perfbench, provision the stack, and upload it
+#   deploy.sh logs          stream the bootstrap and benchmark log over SSM
+#   deploy.sh results [ts]  download one result set (the newest by default)
+#   deploy.sh teardown      empty the bucket and delete the complete stack
 #
-# `logs` needs the AWS Session Manager plugin installed locally:
+# `logs` requires the AWS Session Manager plugin. Every command requires AWS
+# credentials and AWS CLI v2; AWS_REGION is optional when the CLI has a default.
 #   https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
 #
-# `deploy` cross-compiles a statically linked rtbench for the musl target so the
-# binary runs on the bare Amazon Linux 2023 instance with no shared-library or
-# glibc-version dependencies. It needs the target installed once:
+# `deploy` cross-compiles a statically linked perfbench binary so it can run on
+# the bare Amazon Linux 2023 instance. Install the target and a musl C toolchain
+# first, for example:
+#
 #   rustup target add x86_64-unknown-linux-musl
-# and a musl C toolchain (e.g. `musl-tools` on Debian/Ubuntu, `musl-gcc`).
+#   sudo apt install musl-tools
 #
 # Configuration via environment variables (all optional):
-#   STACK_NAME         CloudFormation stack name      (default: glassdb-bench)
-#   AWS_REGION         AWS region                     (default: from aws config)
-#   INSTANCE_TYPE      EC2 instance type              (default: c7i.8xlarge)
-#   TARGET             Rust target triple             (default: x86_64-unknown-linux-musl)
-#   MAX_DBS            rw9010 max concurrent DBs       (default: 50)
-#   NUM_KEYS           rw9010 number of keys           (default: 50000)
-#   RUN_DURATION       rw9010 per-step duration        (default: 60s)
-#   DEADLOCK_DURATION  deadlock per-config duration    (default: 20s)
-#   AUTO_STOP          stop instance when done         (default: true)
 #
-# Each benchmark sweep (rw9010 and deadlock) is repeated 3 times back-to-back
-# with a 60s cool-down between runs (rtbench --num-runs / --run-cooldown). The
-# expensive rw9010 50k-key init is shared across runs; only the measured sweeps
-# are repeated, and every run appends to the same CSVs, so the plot script ends
-# up with tighter percentile bands.
+# Infrastructure and local paths:
+#   STACK_NAME       CloudFormation stack name       (default: glassdb-bench)
+#   AWS_REGION       AWS region                      (default: AWS CLI config)
+#   INSTANCE_TYPE    EC2 instance type               (default: c7i.8xlarge)
+#   RUST_TARGET      Rust target triple
+#                    (default: x86_64-unknown-linux-musl)
+#   AUTO_STOP        stop the instance after the run (default: true)
+#   OUT_DIR          downloaded result directory     (default: hack/aws-bench/out)
+#   BINARY_S3_KEY    uploaded perfbench key           (default: bin/perfbench)
+#   RUNNER_S3_KEY    uploaded runner-script key       (default: bin/run-perfbench)
+#   CONFIG_S3_KEY    uploaded configuration key       (default: bin/perfbench.env)
+#
+# Shared benchmark lifecycle:
+#   RUNS             repetitions of each scenario    (default: 1)
+#   RUN_COOLDOWN     cooldown between repetitions    (default: 60s)
+#   DRAIN_TIMEOUT    worker/shutdown deadline         (default: 90s)
+#
+# Mixed-workload affinity sweep:
+#   MIX_MODES        contention modes                 (default: lo,hi)
+#   MIX_AFFINITIES   home-affinity percentages       (default: 0,25,50,75,100)
+#   MIX_DATABASES    clients and home collections    (default: 4)
+#   MIX_WORKERS      workers per transaction shape   (default: 8)
+#   MIX_NUM_KEYS     keys per low-contention home    (default: 5000)
+#   MIX_HOT_KEYS     keys per high-contention home   (default: 8)
+#   MIX_MULTI_KEYS   keys per multi-key transaction  (default: 10)
+#   MIX_DURATION     minimum measured cell window    (default: 5s)
+#   MIX_MAX_DURATION maximum measured cell window    (default: 120s)
+#   MIX_TARGET_CI    throughput CI relative half-width (default: 0.1)
+#   MIX_SPLIT_QUIET  required stable split interval  (default: 10s)
+#   MIX_SPLIT_SETTLE_TIMEOUT setup convergence limit (default: 120s)
+#
+# Focused scenarios:
+#   CONTENTION_KEYS     key counts to sweep           (default: 1,2,3,4,5,6)
+#   CONTENTION_DURATION measured window per cell      (default: 20s)
+#   RUN_INLINE_PRESSURE run the ADR-056 scenario       (default: false)
+#   INLINE_PRESSURE_SETTLE_TIMEOUT split wait limit   (default: 30s)
+#
+# The provisioned instance polls S3 for the three uploaded artifacts, runs the
+# mixed and contention scenarios (plus inline-pressure when enabled), uploads
+# versioned JSON and its bootstrap log, and optionally stops itself. User data
+# runs only when the instance is first provisioned; tear down a completed stack
+# before starting another run. The bucket and VPC endpoints continue to incur
+# charges until `deploy.sh teardown` completes.
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$DIR/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 STACK_NAME="${STACK_NAME:-glassdb-bench}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c7i.8xlarge}"
-TARGET="${TARGET:-x86_64-unknown-linux-musl}"
-MAX_DBS="${MAX_DBS:-50}"
-NUM_KEYS="${NUM_KEYS:-50000}"
-RUN_DURATION="${RUN_DURATION:-60s}"
-DEADLOCK_DURATION="${DEADLOCK_DURATION:-20s}"
+RUST_TARGET="${RUST_TARGET:-x86_64-unknown-linux-musl}"
 AUTO_STOP="${AUTO_STOP:-true}"
-BINARY_S3_KEY="bin/rtbench"
-OUT_DIR="${OUT_DIR:-$DIR/out}"
+OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/out}"
+BINARY_S3_KEY="${BINARY_S3_KEY:-bin/perfbench}"
+RUNNER_S3_KEY="${RUNNER_S3_KEY:-bin/run-perfbench}"
+CONFIG_S3_KEY="${CONFIG_S3_KEY:-bin/perfbench.env}"
+
+RUNS="${RUNS:-1}"
+RUN_COOLDOWN="${RUN_COOLDOWN:-60s}"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-90s}"
+MIX_MODES="${MIX_MODES:-lo,hi}"
+MIX_AFFINITIES="${MIX_AFFINITIES:-0,25,50,75,100}"
+MIX_DATABASES="${MIX_DATABASES:-4}"
+MIX_WORKERS="${MIX_WORKERS:-8}"
+MIX_NUM_KEYS="${MIX_NUM_KEYS:-5000}"
+MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
+MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
+MIX_DURATION="${MIX_DURATION:-5s}"
+MIX_MAX_DURATION="${MIX_MAX_DURATION:-120s}"
+MIX_TARGET_CI="${MIX_TARGET_CI:-0.1}"
+MIX_SPLIT_QUIET="${MIX_SPLIT_QUIET:-10s}"
+MIX_SPLIT_SETTLE_TIMEOUT="${MIX_SPLIT_SETTLE_TIMEOUT:-120s}"
+CONTENTION_KEYS="${CONTENTION_KEYS:-1,2,3,4,5,6}"
+CONTENTION_DURATION="${CONTENTION_DURATION:-20s}"
+RUN_INLINE_PRESSURE="${RUN_INLINE_PRESSURE:-false}"
+INLINE_PRESSURE_SETTLE_TIMEOUT="${INLINE_PRESSURE_SETTLE_TIMEOUT:-30s}"
 
 region_args=()
 if [[ -n "${AWS_REGION:-}" ]]; then
@@ -61,116 +110,104 @@ stack_output() {
     --output text
 }
 
-bucket_name() {
-  stack_output BucketName
+write_config() {
+  local path="$1" name
+  : >"$path"
+  for name in \
+    RUNS RUN_COOLDOWN DRAIN_TIMEOUT MIX_MODES MIX_AFFINITIES MIX_DATABASES \
+    MIX_WORKERS MIX_NUM_KEYS MIX_HOT_KEYS MIX_MULTI_KEYS MIX_DURATION \
+    MIX_MAX_DURATION MIX_TARGET_CI MIX_SPLIT_QUIET MIX_SPLIT_SETTLE_TIMEOUT \
+    CONTENTION_KEYS CONTENTION_DURATION RUN_INLINE_PRESSURE \
+    INLINE_PRESSURE_SETTLE_TIMEOUT; do
+    printf '%s=%q\n' "$name" "${!name}" >>"$path"
+  done
 }
 
-instance_id() {
-  stack_output InstanceId
-}
+deploy() {
+  local temp_dir binary config bucket
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' EXIT
+  binary="$temp_dir/perfbench"
+  config="$temp_dir/perfbench.env"
 
-cmd_deploy() {
-  local bin
-  bin="$(mktemp)"
-  echo ">> building static rtbench binary for $TARGET"
-  (cd "$REPO_ROOT" && cargo build --release -p glassdb-bench-scale --bin rtbench \
-    --target "$TARGET")
-  cp "$REPO_ROOT/target/$TARGET/release/rtbench" "$bin"
+  echo ">> building static perfbench binary for $RUST_TARGET"
+  cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --package glassdb-bench-scale --bin perfbench --target "$RUST_TARGET"
+  cp "$REPO_ROOT/target/$RUST_TARGET/release/perfbench" "$binary"
+  write_config "$config"
 
   echo ">> deploying stack $STACK_NAME"
   aws cloudformation deploy "${region_args[@]}" \
     --stack-name "$STACK_NAME" \
-    --template-file "$DIR/cloudformation.yaml" \
+    --template-file "$SCRIPT_DIR/cloudformation.yaml" \
     --capabilities CAPABILITY_IAM \
     --parameter-overrides \
     "InstanceType=$INSTANCE_TYPE" \
-    "MaxDBs=$MAX_DBS" \
-    "NumKeys=$NUM_KEYS" \
-    "RunDuration=$RUN_DURATION" \
-    "DeadlockDuration=$DEADLOCK_DURATION" \
     "AutoStop=$AUTO_STOP" \
-    "BinaryS3Key=$BINARY_S3_KEY"
+    "BinaryS3Key=$BINARY_S3_KEY" \
+    "RunnerS3Key=$RUNNER_S3_KEY" \
+    "ConfigS3Key=$CONFIG_S3_KEY"
 
-  local bucket
-  bucket="$(bucket_name)"
-  echo ">> uploading binary to s3://$bucket/$BINARY_S3_KEY"
-  aws s3 cp "${region_args[@]}" "$bin" "s3://$bucket/$BINARY_S3_KEY"
-  rm -f "$bin"
+  bucket="$(stack_output BucketName)"
+  echo ">> uploading perfbench artifacts to s3://$bucket/bin/"
+  aws s3 cp "${region_args[@]}" "$binary" "s3://$bucket/$BINARY_S3_KEY"
+  aws s3 cp "${region_args[@]}" "$SCRIPT_DIR/run-perfbench.sh" \
+    "s3://$bucket/$RUNNER_S3_KEY"
+  aws s3 cp "${region_args[@]}" "$config" "s3://$bucket/$CONFIG_S3_KEY"
 
-  echo
-  echo "Done. The instance will pull the binary, run the benchmark,"
-  echo "upload results to s3://$bucket/results/<timestamp>/, then stop itself."
-  echo "Stream the live log with: $0 logs"
-  echo "Download results when done with: $0 results"
+  rm -rf "$temp_dir"
+  trap - EXIT
+  echo ">> runner started; stream it with: $0 logs"
+  echo ">> download the completed artifacts with: $0 results"
 }
 
-cmd_teardown() {
-  local bucket
-  bucket="$(bucket_name)"
-  if [[ -n "$bucket" && "$bucket" != "None" ]]; then
-    echo ">> emptying s3://$bucket"
-    aws s3 rm "${region_args[@]}" "s3://$bucket" --recursive --only-show-errors || true
-  fi
-  echo ">> deleting stack $STACK_NAME"
-  aws cloudformation delete-stack "${region_args[@]}" --stack-name "$STACK_NAME"
-  aws cloudformation wait stack-delete-complete "${region_args[@]}" \
-    --stack-name "$STACK_NAME"
-  echo ">> done"
-}
-
-cmd_logs() {
-  local iid
-  iid="$(instance_id)"
-  echo ">> streaming /var/log/rtbench-bootstrap.log from $iid (Ctrl-C to stop)"
-  # -F retries until the file appears (the instance may still be booting) and
-  # -n +1 replays the log from the start before following it live.
+logs() {
+  local instance
+  instance="$(stack_output InstanceId)"
   aws ssm start-session "${region_args[@]}" \
-    --target "$iid" \
+    --target "$instance" \
     --document-name AWS-StartInteractiveCommand \
-    --parameters command="sudo tail -n +1 -F /var/log/rtbench-bootstrap.log"
+    --parameters command="sudo tail -n +1 -F /var/log/perfbench-bootstrap.log"
 }
 
-cmd_results() {
-  local bucket latest
-  bucket="$(bucket_name)"
-  # Result timestamps are %Y%m%dT%H%M%S, which sorts chronologically. Use the
-  # one given as the second argument, otherwise pick the most recent.
-  latest="${2:-}"
-  if [[ -z "$latest" ]]; then
-    latest="$(aws s3 ls "${region_args[@]}" "s3://$bucket/results/" \
+results() {
+  local requested="${1:-}" bucket prefix
+  bucket="$(stack_output BucketName)"
+  prefix="$requested"
+  if [[ -z "$prefix" ]]; then
+    prefix="$(aws s3 ls "${region_args[@]}" "s3://$bucket/results/" \
       | awk '/ PRE / {print $2}' | sort | tail -n1)"
   fi
-  latest="${latest%/}"
-  if [[ -z "$latest" ]]; then
-    echo "no results found under s3://$bucket/results/ yet" >&2
-    exit 1
+  prefix="${prefix%/}"
+  if [[ -z "$prefix" ]]; then
+    echo "no benchmark results found" >&2
+    return 1
   fi
   mkdir -p "$OUT_DIR"
-  echo ">> downloading s3://$bucket/results/$latest/ into $OUT_DIR"
-  aws s3 cp "${region_args[@]}" \
-    "s3://$bucket/results/$latest/" "$OUT_DIR/" --recursive
+  aws s3 cp "${region_args[@]}" "s3://$bucket/results/$prefix/" \
+    "$OUT_DIR/" --recursive
+  echo ">> downloaded results to $OUT_DIR"
+}
 
-  # samples.csv is by far the largest file; keep it compressed on disk.
-  # plot.py reads samples.csv or samples.csv.xz transparently.
-  if [[ -f "$OUT_DIR/samples.csv" ]]; then
-    if command -v xz >/dev/null; then
-      echo ">> compressing samples.csv -> samples.csv.xz"
-      xz -f "$OUT_DIR/samples.csv"
-    else
-      echo "note: xz not installed; leaving samples.csv uncompressed" >&2
-    fi
+teardown() {
+  local bucket
+  bucket="$(stack_output BucketName)"
+  if [[ -n "$bucket" && "$bucket" != "None" ]]; then
+    aws s3 rm "${region_args[@]}" "s3://$bucket" \
+      --recursive --only-show-errors || true
   fi
-
-  echo ">> render with: uv run hack/aws-bench/plot.py"
+  aws cloudformation delete-stack "${region_args[@]}" --stack-name "$STACK_NAME"
+  aws cloudformation wait stack-delete-complete \
+    "${region_args[@]}" --stack-name "$STACK_NAME"
 }
 
 case "${1:-deploy}" in
-deploy) cmd_deploy ;;
-logs) cmd_logs ;;
-teardown) cmd_teardown ;;
-results) cmd_results "$@" ;;
-*)
-  echo "usage: $0 {deploy|logs|results|teardown}" >&2
-  exit 2
-  ;;
+  deploy) deploy ;;
+  logs) logs ;;
+  results) results "${2:-}" ;;
+  teardown) teardown ;;
+  *)
+    echo "usage: $0 {deploy|logs|results [timestamp]|teardown}" >&2
+    exit 2
+    ;;
 esac

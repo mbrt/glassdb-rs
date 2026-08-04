@@ -13,71 +13,37 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 /// Error returned when a runtime-seam deadline expires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("operation timed out")]
 pub struct TimedOut;
 
-impl std::fmt::Display for TimedOut {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "operation timed out")
-    }
-}
-
-impl std::error::Error for TimedOut {}
-
 /// Error returned when a dedicated task cannot be started.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
     /// No Tokio runtime is active to drive the dedicated future.
+    #[error("no runtime is available")]
     RuntimeUnavailable,
     /// The operating-system thread could not be created.
-    Thread(std::io::Error),
-}
-
-impl std::fmt::Display for SpawnError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SpawnError::RuntimeUnavailable => write!(f, "no runtime is available"),
-            SpawnError::Thread(error) => {
-                write!(f, "dedicated thread could not be started: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SpawnError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SpawnError::RuntimeUnavailable => None,
-            SpawnError::Thread(error) => Some(error),
-        }
-    }
+    #[error("dedicated thread could not be started: {0}")]
+    Thread(#[source] std::io::Error),
 }
 
 /// Failure reported when joining a dedicated task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DedicatedJoinError {
     /// The task was cooperatively cancelled.
+    #[error("dedicated task was cancelled")]
     Cancelled,
     /// The task panicked while being polled.
+    #[error("dedicated task panicked")]
     Panicked,
 }
-
-impl std::fmt::Display for DedicatedJoinError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DedicatedJoinError::Cancelled => write!(f, "dedicated task was cancelled"),
-            DedicatedJoinError::Panicked => write!(f, "dedicated task panicked"),
-        }
-    }
-}
-
-impl std::error::Error for DedicatedJoinError {}
 
 enum DedicatedOutcome<T> {
     Completed(T),
@@ -165,22 +131,148 @@ where
 
 #[cfg(not(sim))]
 mod imp {
+    use std::ops::Add;
+    use std::sync::OnceLock;
+
     use super::{
-        DedicatedJoinHandle, Duration, Future, SpawnError, TimedOut, spawn_dedicated_native,
+        DedicatedJoinHandle, Duration, Future, SpawnError, SystemTime, TimedOut,
+        spawn_dedicated_native,
     };
 
     pub use tokio::task::JoinHandle;
     pub use tokio::task::yield_now;
-    pub use tokio::time::{Instant, sleep};
+
+    /// Error returned when process-wide model time cannot be configured.
+    #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+    pub enum ModelTimeError {
+        /// The requested speedup cannot represent a coherent time conversion.
+        #[error("model-time speedup must be finite, positive, and representable, got {0}")]
+        InvalidSpeedup(f64),
+        /// Model time was already configured or observed by this process.
+        #[error("model time was already initialized")]
+        AlreadyInitialized,
+    }
+
+    /// Installs an immutable process-wide model-time speedup.
+    ///
+    /// A speedup of `N` makes one wall second advance model time by `N` seconds.
+    /// The setting must be installed before any model-time observation or wait.
+    /// Explicit configuration also anchors wall timestamps to model monotonic time;
+    /// an unconfigured process defaults to live real time at speed `1`.
+    pub fn set_model_time_speedup(speedup: f64) -> Result<(), ModelTimeError> {
+        if !(speedup.is_finite()
+            && speedup > 0.0
+            && Duration::try_from_secs_f64(speedup).is_ok()
+            && Duration::try_from_secs_f64(1.0 / speedup).is_ok())
+        {
+            return Err(ModelTimeError::InvalidSpeedup(speedup));
+        }
+        MODEL_TIME
+            .set(ModelTime {
+                speedup,
+                anchored_wall: true,
+            })
+            .map_err(|_| ModelTimeError::AlreadyInitialized)
+    }
+
+    #[derive(Clone, Copy)]
+    struct ModelTime {
+        speedup: f64,
+        anchored_wall: bool,
+    }
+
+    static MODEL_TIME: OnceLock<ModelTime> = OnceLock::new();
+
+    fn model_time() -> &'static ModelTime {
+        MODEL_TIME.get_or_init(|| ModelTime {
+            speedup: 1.0,
+            anchored_wall: false,
+        })
+    }
+
+    fn scaled_duration(duration: Duration, factor: f64) -> Duration {
+        if duration.is_zero() || factor == 1.0 {
+            return duration;
+        }
+        Duration::try_from_secs_f64(duration.as_secs_f64() * factor).unwrap_or(Duration::MAX)
+    }
+
+    fn model_elapsed(duration: Duration) -> Duration {
+        scaled_duration(duration, model_time().speedup)
+    }
+
+    fn model_wait(duration: Duration) -> Duration {
+        if duration.is_zero() {
+            return duration;
+        }
+        let wait = scaled_duration(duration, 1.0 / model_time().speedup);
+        // Preserve an actual scheduling point even when acceleration rounds a
+        // nominally nonzero duration below the runtime's nanosecond representation.
+        wait.max(Duration::from_nanos(1))
+    }
+
+    /// A monotonic instant whose elapsed durations are expressed in model time.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    pub struct Instant(tokio::time::Instant);
+
+    impl Instant {
+        pub fn now() -> Self {
+            // Observing an instant freezes the process-wide configuration even
+            // though the raw instant itself needs no conversion yet.
+            let _ = model_time();
+            Instant(tokio::time::Instant::now())
+        }
+
+        pub fn elapsed(&self) -> Duration {
+            model_elapsed(self.0.elapsed())
+        }
+
+        pub fn duration_since(&self, earlier: Instant) -> Duration {
+            model_elapsed(self.0.duration_since(earlier.0))
+        }
+
+        pub fn saturating_duration_since(&self, earlier: Instant) -> Duration {
+            model_elapsed(self.0.saturating_duration_since(earlier.0))
+        }
+    }
+
+    impl Add<Duration> for Instant {
+        type Output = Instant;
+
+        fn add(self, rhs: Duration) -> Instant {
+            Instant(self.0 + model_wait(rhs))
+        }
+    }
 
     /// Reports whether the deterministic executor is active.
     pub fn in_sim() -> bool {
         false
     }
 
-    /// The current wall-clock time. In production this is just the real clock.
-    pub fn system_now() -> std::time::SystemTime {
-        std::time::SystemTime::now()
+    struct WallAnchor {
+        system: SystemTime,
+        instant: Instant,
+    }
+
+    /// The current wall-clock time in the process's model-time domain.
+    pub fn system_now() -> SystemTime {
+        if !model_time().anchored_wall {
+            return SystemTime::now();
+        }
+        static ANCHOR: OnceLock<WallAnchor> = OnceLock::new();
+        let anchor = ANCHOR.get_or_init(|| WallAnchor {
+            system: SystemTime::now(),
+            instant: Instant::now(),
+        });
+        anchor
+            .system
+            .checked_add(anchor.instant.elapsed())
+            .expect("model wall time exceeded SystemTime's range")
+    }
+
+    /// Sleeps for `duration` in model time.
+    pub async fn sleep(duration: Duration) {
+        tokio::time::sleep(model_wait(duration)).await;
     }
 
     /// Returns the host's available parallelism.
@@ -217,7 +309,7 @@ mod imp {
     where
         F: Future,
     {
-        tokio::time::timeout(duration, future)
+        tokio::time::timeout(model_wait(duration), future)
             .await
             .map_err(|_| TimedOut)
     }
@@ -233,7 +325,7 @@ mod imp {
     use crate::exec;
 
     use super::{
-        DedicatedJoinHandle, Duration, Future, SpawnError, TimedOut, drive_dedicated,
+        DedicatedJoinHandle, Duration, Future, SpawnError, SystemTime, TimedOut, drive_dedicated,
         spawn_dedicated_native,
     };
 
@@ -289,7 +381,8 @@ mod imp {
     impl Add<Duration> for Instant {
         type Output = Instant;
         fn add(self, rhs: Duration) -> Instant {
-            Instant(self.0.saturating_add(rhs.as_nanos() as u64))
+            let nanos = rhs.as_nanos().min(u64::MAX as u128) as u64;
+            Instant(self.0.saturating_add(nanos))
         }
     }
 
@@ -297,17 +390,15 @@ mod imp {
     /// fixed epoch plus virtual time, so persisted timestamps (e.g. transaction
     /// logs) are a pure function of the seed and schedule and replays are
     /// byte-identical. Outside the executor it is the real clock.
-    pub fn system_now() -> std::time::SystemTime {
-        use std::time::{SystemTime, UNIX_EPOCH};
+    pub fn system_now() -> SystemTime {
+        use std::time::UNIX_EPOCH;
         if exec::in_sim() {
-            // Matches the harness's `deterministic_time` anchor
-            // (`db.rs` `DETERMINISTIC_EPOCH_SECS`) so log timestamps and the
-            // monitor's anchored clock share one timeline.
             const SIM_WALL_BASE_SECS: u64 = 1_700_000_000;
-            UNIX_EPOCH + Duration::from_secs(SIM_WALL_BASE_SECS) + Duration::from_nanos(now_nanos())
-        } else {
-            SystemTime::now()
+            return UNIX_EPOCH
+                + Duration::from_secs(SIM_WALL_BASE_SECS)
+                + Duration::from_nanos(now_nanos());
         }
+        SystemTime::now()
     }
 
     /// Returns one in simulation builds so shard geometry is independent of
@@ -356,15 +447,9 @@ mod imp {
 
     /// Error returned when a joined task did not produce a value (it was dropped
     /// or aborted).
-    #[derive(Debug)]
+    #[derive(Debug, thiserror::Error)]
+    #[error("joined task failed to complete")]
     pub struct JoinError;
-
-    impl std::fmt::Display for JoinError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "joined task failed to complete")
-        }
-    }
-    impl std::error::Error for JoinError {}
 
     use tokio_util::sync::CancellationToken;
 

@@ -23,6 +23,10 @@ Candidate-driven listing and reverse reference checks remain unchanged.
 Deferred to a follow-up: subcollection teardown (reclaiming orphaned child roots
 and shards), and persisting a wound victim's locks into the aborted object.
 
+The `Clock`-based time-source detail is superseded by
+[ADR-058](058-process-wide-model-time.md); the GC horizon and retention policy
+are unchanged.
+
 ## Context
 
 In v1 garbage collection is **time-based**

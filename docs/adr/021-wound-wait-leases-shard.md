@@ -19,6 +19,10 @@ thing that can delete a still-referenced object.
 The MVP-deviation notes inlined below are retained for history but are
 superseded by ADR-024.
 
+The `Clock`-based time-source detail is superseded by
+[ADR-058](058-process-wide-model-time.md); the lease and expiry decisions are
+unchanged.
+
 ## Context
 
 [ADR-020](020-commit-write-back-protocol.md) reclaims the locks of _live_

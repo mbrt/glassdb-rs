@@ -32,6 +32,10 @@ would return once the engine moved past the MVP. It is now past the MVP. It also
 **refines ADR-021's expiry predicate** so the observer-relative grace owes no clock
 skew (see "Deciding whether a holder is live" below).
 
+The `Clock`-based time-source detail is superseded by
+[ADR-058](058-process-wide-model-time.md); wait, refresh, and expiry semantics
+are unchanged.
+
 ## Context
 
 [ADR-020](020-commit-write-back-protocol.md) defines the commit protocol and its

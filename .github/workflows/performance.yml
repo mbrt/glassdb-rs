@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
+      PERF_DELAY_SCALE: "0.2"
     steps:
 
     - name: Initialize result artifact
@@ -32,8 +33,8 @@ jobs:
       run: |
         install -d "$PERF_BIN" \
           "$PERF_RESULTS/score/main" "$PERF_RESULTS/score/pr" \
-          "$PERF_RESULTS/mix/main" "$PERF_RESULTS/mix/pr" \
-          "$PERF_RESULTS/deadlock/main" "$PERF_RESULTS/deadlock/pr"
+          "$PERF_RESULTS/mixed/main" "$PERF_RESULTS/mixed/pr" \
+          "$PERF_RESULTS/contention/main" "$PERF_RESULTS/contention/pr"
 
     - uses: actions/checkout@v4
 
@@ -67,25 +68,33 @@ jobs:
         # spurious compile errors against outdated generated types.
         cargo build --release --manifest-path .perf-main/Cargo.toml \
           --target-dir "$CARGO_TARGET_DIR/main" \
-          --package glassdb-bench-score --bin autoresearch \
-          --package glassdb-bench-scale --bin mixbench --bin rtbench
+          --package glassdb-bench-score --bin autoresearch
         install -m 755 "$CARGO_TARGET_DIR/main/release/autoresearch" \
           "$PERF_BIN/main-autoresearch"
-        install -m 755 "$CARGO_TARGET_DIR/main/release/mixbench" \
-          "$PERF_BIN/main-mixbench"
-        install -m 755 "$CARGO_TARGET_DIR/main/release/rtbench" \
-          "$PERF_BIN/main-rtbench"
+        if [[ -f .perf-main/crates/glassdb-bench-scale/src/bin/perfbench/main.rs ]]; then
+          cargo build --release --manifest-path .perf-main/Cargo.toml \
+            --target-dir "$CARGO_TARGET_DIR/main" \
+            --package glassdb-bench-scale --bin perfbench
+          install -m 755 "$CARGO_TARGET_DIR/main/release/perfbench" \
+            "$PERF_BIN/main-perfbench"
+        else
+          cargo build --release --manifest-path .perf-main/Cargo.toml \
+            --target-dir "$CARGO_TARGET_DIR/main" \
+            --package glassdb-bench-scale --bin mixbench --bin rtbench
+          install -m 755 "$CARGO_TARGET_DIR/main/release/mixbench" \
+            "$PERF_BIN/main-mixbench"
+          install -m 755 "$CARGO_TARGET_DIR/main/release/rtbench" \
+            "$PERF_BIN/main-rtbench"
+        fi
 
         cargo build --release \
           --target-dir "$CARGO_TARGET_DIR/pr" \
           --package glassdb-bench-score --bin autoresearch \
-          --package glassdb-bench-scale --bin mixbench --bin rtbench
+          --package glassdb-bench-scale --bin perfbench
         install -m 755 "$CARGO_TARGET_DIR/pr/release/autoresearch" \
           "$PERF_BIN/pr-autoresearch"
-        install -m 755 "$CARGO_TARGET_DIR/pr/release/mixbench" \
-          "$PERF_BIN/pr-mixbench"
-        install -m 755 "$CARGO_TARGET_DIR/pr/release/rtbench" \
-          "$PERF_BIN/pr-rtbench"
+        install -m 755 "$CARGO_TARGET_DIR/pr/release/perfbench" \
+          "$PERF_BIN/pr-perfbench"
 
     - name: Measure backend-operation score
       timeout-minutes: 3
@@ -116,34 +125,48 @@ jobs:
         PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
         PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
       run: |
-        mix_args=(
-          --delays=s3
-          --delay-scale=0.02
-          --duration=1s
-          --max-duration=20s
-          --target-ci=0.15
-          --modes=hi
-          --topologies=shared
-          --workers-per-shape=8
-          --hot-keys=8
-          --multi-keys=8
-          --drain-timeout=30s
-          --json
-        )
         run_mix() {
-          local side="$1" binary="$2" repetition="$3"
-          "$binary" "${mix_args[@]}" \
-            > "$PERF_RESULTS/mix/$side/$repetition.json"
+          local side="$1" repetition="$2"
+          local result="$PERF_RESULTS/mixed/$side/$repetition.json"
+          if [[ -x "$PERF_BIN/$side-perfbench" ]]; then
+            "$PERF_BIN/$side-perfbench" \
+              --backend=memory --delays=s3 --delay-scale="$PERF_DELAY_SCALE" \
+              --drain-timeout=30s --output="$result" mixed \
+              --duration=1s --max-duration=20s --target-ci=0.15 \
+              --modes=hi --affinities=100 --databases=1 \
+              --workers-per-shape=8 --hot-keys=8 --multi-keys=8 \
+              --split-quiet=2s --split-settle-timeout=30s
+            return
+          fi
+          local binary="$PERF_BIN/$side-mixbench"
+          local layout=()
+          if "$binary" --help 2>&1 | grep -q -- "--affinities"; then
+            layout=(
+              --affinities=100
+              --databases=1
+              --split-quiet=2s
+              --split-settle-timeout=30s
+            )
+          else
+            # Transitional equivalence for a baseline before the affinity
+            # schema: one Database and one collection is the old shared cell.
+            layout=(--topologies=shared)
+          fi
+          "$binary" \
+            --delays=s3 --delay-scale="$PERF_DELAY_SCALE" --drain-timeout=30s \
+            --duration=1s --max-duration=20s --target-ci=0.15 \
+            --modes=hi --workers-per-shape=8 --hot-keys=8 --multi-keys=8 \
+            --json "${layout[@]}" > "$result"
         }
 
         for repetition in 1 2 3; do
           printf -v repetition_id '%02d' "$repetition"
           if (( repetition % 2 == 1 )); then
-            run_mix main "$PERF_BIN/main-mixbench" "$repetition_id"
-            run_mix pr "$PERF_BIN/pr-mixbench" "$repetition_id"
+            run_mix main "$repetition_id"
+            run_mix pr "$repetition_id"
           else
-            run_mix pr "$PERF_BIN/pr-mixbench" "$repetition_id"
-            run_mix main "$PERF_BIN/main-mixbench" "$repetition_id"
+            run_mix pr "$repetition_id"
+            run_mix main "$repetition_id"
           fi
         done
 
@@ -153,10 +176,19 @@ jobs:
         PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
         PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
       run: |
-        run_deadlock() {
-          local side="$1" binary="$2" repetition="$3"
-          local samples="$PERF_RESULTS/deadlock/$side/$repetition.csv"
-          local stats="$PERF_RESULTS/deadlock/$side/$repetition-stats.csv"
+        run_contention() {
+          local side="$1" repetition="$2"
+          if [[ -x "$PERF_BIN/$side-perfbench" ]]; then
+            "$PERF_BIN/$side-perfbench" \
+              --backend=memory --delays=s3 --delay-scale="$PERF_DELAY_SCALE" \
+              --drain-timeout=30s \
+              --output="$PERF_RESULTS/contention/$side/$repetition.json" \
+              contention --keys=1 --duration=1s
+            return
+          fi
+          local binary="$PERF_BIN/$side-rtbench"
+          local samples="$PERF_RESULTS/contention/$side/$repetition.csv"
+          local stats="$PERF_RESULTS/contention/$side/$repetition-stats.csv"
           local optional=()
 
           if "$binary" --help 2>&1 | grep -q -- "--deadlock-keys"; then
@@ -169,7 +201,7 @@ jobs:
           "$binary" \
             --backend=memory \
             --delays=s3 \
-            --delay-scale=0.02 \
+            --delay-scale="$PERF_DELAY_SCALE" \
             --test-name=deadlock \
             --duration=1s \
             --drain-timeout=30s \
@@ -181,11 +213,11 @@ jobs:
         for repetition in 1 2 3; do
           printf -v repetition_id '%02d' "$repetition"
           if (( repetition % 2 == 1 )); then
-            run_deadlock main "$PERF_BIN/main-rtbench" "$repetition_id"
-            run_deadlock pr "$PERF_BIN/pr-rtbench" "$repetition_id"
+            run_contention main "$repetition_id"
+            run_contention pr "$repetition_id"
           else
-            run_deadlock pr "$PERF_BIN/pr-rtbench" "$repetition_id"
-            run_deadlock main "$PERF_BIN/main-rtbench" "$repetition_id"
+            run_contention pr "$repetition_id"
+            run_contention main "$repetition_id"
           fi
         done
 

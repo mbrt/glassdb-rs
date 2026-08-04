@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{Background, Clock, RetryConfig, rt};
+use glassdb_concurr::{Background, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
 use glassdb_storage::{
     CollectionStore, IndexNode, InlinePolicy, LeafObservation, LockType, Node, Observation,
@@ -105,7 +105,6 @@ pub(crate) struct PendingSeparator {
 pub(crate) struct SplitCandidates {
     policy: SplitPolicy,
     inline: InlinePolicy,
-    clock: Clock,
     queue: Arc<Mutex<VecDeque<SplitCandidate>>>,
 }
 
@@ -264,18 +263,17 @@ impl Sub for SplitterStats {
 }
 
 impl SplitCandidates {
-    /// Creates an empty candidate feed using `clock` for wound-wait priority.
+    /// Creates an empty candidate feed with the supplied split policy.
     #[cfg(test)]
-    fn with_clock(policy: SplitPolicy, clock: Clock) -> Self {
-        Self::with_policies(policy, InlinePolicy::default(), clock)
+    fn with_policy(policy: SplitPolicy) -> Self {
+        Self::with_policies(policy, InlinePolicy::default())
     }
 
     /// Creates an empty candidate feed with co-wired split and inline policies.
-    fn with_policies(policy: SplitPolicy, inline: InlinePolicy, clock: Clock) -> Self {
+    fn with_policies(policy: SplitPolicy, inline: InlinePolicy) -> Self {
         SplitCandidates {
             policy,
             inline,
-            clock,
             queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -324,7 +322,7 @@ impl SplitCandidates {
 
     /// Mints an operation id at normal transaction priority.
     fn new_id(&self) -> TxId {
-        TxId::new_at(self.clock.now())
+        TxId::new_at(rt::system_now())
     }
 }
 
@@ -419,13 +417,12 @@ impl Splitter {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        clock: Clock,
         retry: RetryConfig,
         db_root: &str,
         policy: SplitPolicy,
         inline: InlinePolicy,
     ) -> (ShardCoordinator, Self) {
-        let candidates = SplitCandidates::with_policies(policy, inline, clock);
+        let candidates = SplitCandidates::with_policies(policy, inline);
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             key_state.clone(),
@@ -722,6 +719,19 @@ impl Splitter {
                 }
             }
         }
+    }
+
+    /// Carries an oversized split output into a later sweep so one hint can
+    /// drive the whole split cascade.
+    fn enqueue_if_over_soft_cap(&self, prefix: &str, token: &str, node: &Node) {
+        if !node.over_soft_cap(self.candidates.policy()) {
+            return;
+        }
+        self.candidates.push(SplitCandidate {
+            path: paths::from_node(prefix, token),
+            priority: self.candidates.new_id(),
+            reason: SplitReason::SoftCap,
+        });
     }
 
     /// Splits the leaf at object `path` if it is still over the soft cap: an
@@ -1228,6 +1238,8 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        self.enqueue_if_over_soft_cap(prefix, token, &node);
+        self.enqueue_if_over_soft_cap(prefix, &right_token, &right);
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
@@ -1447,6 +1459,8 @@ impl Splitter {
             return Err(TransError::Retry);
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        self.enqueue_if_over_soft_cap(prefix, &l_token, &left);
+        self.enqueue_if_over_soft_cap(prefix, &r_token, &right);
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
@@ -2057,11 +2071,7 @@ mod tests {
     }
 
     fn splitter(shards: &TestStore, bg: &Arc<Background>, policy: SplitPolicy) -> Splitter {
-        splitter_with_candidates(
-            shards,
-            bg,
-            SplitCandidates::with_clock(policy, Clock::real()),
-        )
+        splitter_with_candidates(shards, bg, SplitCandidates::with_policy(policy))
     }
 
     fn splitter_with_candidates(
@@ -2074,7 +2084,6 @@ mod tests {
             tl.clone(),
             shards.timeline.clone(),
             Arc::downgrade(bg),
-            Clock::real(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
@@ -2110,25 +2119,22 @@ mod tests {
         )
     }
 
-    fn splitter_at(
+    fn splitter_and_monitor(
         shards: &TestStore,
         bg: &Arc<Background>,
         policy: SplitPolicy,
-        base_secs: u64,
-    ) -> (Splitter, Monitor, u64) {
+    ) -> (Splitter, Monitor) {
         let tl = TLogger::new(shards.objects.clone(), "db");
         let mon = Monitor::with_config(
             tl.clone(),
             shards.timeline.clone(),
             Arc::downgrade(bg),
-            Clock::real(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let clock = Clock::anchored_at(std::time::UNIX_EPOCH + Duration::from_secs(base_secs));
-        let candidates = SplitCandidates::with_clock(policy, clock);
+        let candidates = SplitCandidates::with_policy(policy);
         let splitter = splitter_with_monitor(shards, bg, mon.clone(), candidates);
-        (splitter, mon, base_secs * 1_000_000_000)
+        (splitter, mon)
     }
 
     fn leaf_with_membership_reader(keys: &[&[u8]], holder: &TxId) -> Node {
@@ -2518,7 +2524,7 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
-        let candidates = SplitCandidates::with_clock(tiny(), Clock::real());
+        let candidates = SplitCandidates::with_policy(tiny());
         // Under the cap: not enqueued.
         candidates.observe_leaf(
             &paths::tree_root(COLL),
@@ -2553,6 +2559,49 @@ mod tests {
         assert_eq!(sp.stats_and_reset(), SplitterStats::default());
     }
 
+    // One large mutation can overshoot the soft cap by enough that halving the
+    // leaf once leaves both outputs oversized. The outputs must feed the next
+    // sweep themselves; no later mutation should be needed to finish the tree.
+    #[tokio::test]
+    async fn one_hint_cascades_until_every_leaf_is_under_cap() {
+        let s = store();
+        let keys: [&[u8]; 9] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i"];
+        let root = Node::leaf(Shard::from_entries(keys.iter().map(|key| live(key))));
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let policy = SplitPolicy {
+            leaf_max_entries: 2,
+            leaf_max_bytes: 1 << 20,
+            index_max_children: 100,
+            ..SplitPolicy::default()
+        };
+        let candidates = SplitCandidates::with_policy(policy);
+        candidates.observe_leaf(&paths::tree_root(COLL), root.as_leaf().unwrap());
+        let sp = splitter_with_candidates(&s, &bg, candidates);
+
+        // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
+        for _ in 0..3 {
+            sp.run_once().await;
+        }
+
+        let router = TreeRouter::new(s.shards.clone());
+        let leaves = router
+            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 5);
+        assert!(leaves.iter().all(|leaf| {
+            leaf.node().unwrap().as_leaf().unwrap().len() <= policy.leaf_max_entries
+        }));
+        for key in keys {
+            let located = router
+                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap();
+            assert!(located.node().unwrap().as_leaf().unwrap().exists(key));
+        }
+    }
+
     #[tokio::test]
     async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
         let s = store();
@@ -2568,11 +2617,7 @@ mod tests {
         ]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policies(
-            SplitPolicy::default(),
-            pressure_inline(),
-            Clock::real(),
-        );
+        let candidates = SplitCandidates::with_policies(SplitPolicy::default(), pressure_inline());
         let sp = splitter_with_candidates(&s, &bg, candidates.clone());
         let root_path = paths::tree_root(COLL);
 
@@ -2666,11 +2711,7 @@ mod tests {
         let root = Node::leaf(Shard::from_entries([live(b"a"), live(b"b")]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policies(
-            SplitPolicy::default(),
-            pressure_inline(),
-            Clock::real(),
-        );
+        let candidates = SplitCandidates::with_policies(SplitPolicy::default(), pressure_inline());
         let sp = splitter_with_candidates(&s, &bg, candidates.clone());
         let root_path = paths::tree_root(COLL);
 
@@ -2731,7 +2772,7 @@ mod tests {
         let root = node;
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_clock(tiny(), Clock::real());
+        let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(
             &paths::tree_root(COLL),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
@@ -2792,8 +2833,8 @@ mod tests {
     async fn split_wounds_a_younger_entry_holder_and_lands() {
         let s = store();
         let bg = Arc::new(Background::new());
-        let (sp, mon, split_ts) = splitter_at(&s, &bg, tiny(), 1_000_000);
-        let younger = TxId::with_priority(split_ts + 1_000_000_000, b"young");
+        let (sp, mon) = splitter_and_monitor(&s, &bg, tiny());
+        let younger = TxId::new_at(rt::system_now() + Duration::from_secs(1));
         mon.begin_tx(&younger);
         s.store_node(
             COLL,
@@ -2835,7 +2876,7 @@ mod tests {
         let s = store_with_backend(backend.clone());
         let other = store_with_backend(backend);
         let bg = Arc::new(Background::new());
-        let (sp, mon, _) = splitter_at(&s, &bg, tiny(), 1_000_000);
+        let (sp, mon) = splitter_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
         mon.begin_tx(&holder);
         let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
@@ -2891,7 +2932,6 @@ mod tests {
             other_transactions.clone(),
             other.timeline.clone(),
             Arc::downgrade(&other_bg),
-            Clock::real(),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
@@ -2944,8 +2984,8 @@ mod tests {
     async fn split_defers_to_an_older_membership_reader_then_lands() {
         let s = store();
         let bg = Arc::new(Background::new());
-        let (sp, mon, split_ts) = splitter_at(&s, &bg, tiny(), 1_000_000);
-        let older = TxId::with_priority(split_ts - 1_000_000_000, b"old");
+        let (sp, mon) = splitter_and_monitor(&s, &bg, tiny());
+        let older = TxId::new_at(rt::system_now() - Duration::from_secs(1));
         mon.begin_tx(&older);
         s.store_node(
             COLL,
@@ -3004,7 +3044,7 @@ mod tests {
             index_max_children: 1000,
             ..SplitPolicy::default()
         };
-        let candidates = SplitCandidates::with_clock(policy, Clock::real());
+        let candidates = SplitCandidates::with_policy(policy);
         candidates.observe_leaf(
             &paths::tree_root(COLL),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),

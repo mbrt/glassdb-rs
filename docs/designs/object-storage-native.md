@@ -438,7 +438,7 @@ point; see ADR-018):
 Group D — GC & lifecycle:
 
 - [x] GC trigger cadence, batching, and bounds (LIST/read cost) — a background
-      loop on the `Clock` / `Background` seam whose steady-state cost is
+      loop on the model-time `rt` / `Background` seam whose steady-state cost is
       proportional to _garbage_, not database size: a **candidate-driven reverse**
       check of a `_t/` batch against only the shards/root each candidate records
       (cache-amortized), batched deletes, and **no** database-wide scan — paged,

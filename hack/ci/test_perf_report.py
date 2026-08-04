@@ -12,18 +12,20 @@ class PerfReportTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        for group in ("score", "mix", "deadlock"):
+        for group in ("score", "mixed", "contention"):
             for side in ("main", "pr"):
                 (self.root / group / side).mkdir(parents=True)
         for repetition in range(1, perf_report.SCORE_RUNS + 1):
             self._write_score("main", repetition, 99.0 + repetition)
             self._write_score("pr", repetition, 89.0 + repetition)
-        for repetition in range(1, perf_report.MIX_RUNS + 1):
+        for repetition in range(1, perf_report.MIXED_RUNS + 1):
             self._write_mix("main", repetition, 9.0 + repetition)
             self._write_mix("pr", repetition, 11.0 + repetition)
-        for repetition in range(1, perf_report.DEADLOCK_RUNS + 1):
-            self._write_deadlock("main", repetition, 100.0 + repetition)
-            self._write_deadlock("pr", repetition, 80.0 + repetition)
+        for repetition in range(1, perf_report.CONTENTION_RUNS + 1):
+            self._write_contention("main", repetition, 100.0 + repetition)
+            self._write_contention(
+                "pr", repetition, 80.0 + repetition, current=True
+            )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -54,41 +56,91 @@ class PerfReportTest(unittest.TestCase):
         converged: bool = True,
         failures: int = 0,
     ) -> None:
-        result = [
-            {
-                "mode": "hi",
-                "topology": "shared",
-                "failures": failures,
-                "aggregateOps": {
-                    "totalOpsPerTx": throughput / 10,
-                    "retriesPerTx": throughput / 100,
-                },
-                "shapes": [
-                    {
-                        "shape": name,
-                        "txPerSec": throughput + index,
-                        "p50Ms": 100 - throughput + index,
-                        "p90Ms": 200 - throughput + index,
-                        "converged": converged,
-                        "committed": 1000 + index,
-                        "relCi": 0.1,
-                    }
-                    for index, name in enumerate(perf_report.SHAPES)
-                ],
-            }
-        ]
-        path = self.root / "mix" / side / f"{repetition:02d}.json"
+        result = {
+            "schemaVersion": 1,
+            "scenario": "mixed",
+            "backend": "memory",
+            "runs": [
+                {
+                    "run": 1,
+                    "cells": [
+                        {
+                            "mode": "hi",
+                            "affinityPct": 100,
+                            "databases": 1,
+                            "setupSplits": 0,
+                            "splitSettleWallMs": 2000,
+                            "failures": failures,
+                            "aggregateOps": {
+                                "totalOpsPerTx": throughput / 10,
+                                "retriesPerTx": throughput / 100,
+                            },
+                            "shapes": [
+                                {
+                                    "shape": name,
+                                    "txPerSec": throughput + index,
+                                    "p50Ms": 100 - throughput + index,
+                                    "p90Ms": 200 - throughput + index,
+                                    "converged": converged,
+                                    "committed": 1000 + index,
+                                    "relCi": 0.1,
+                                }
+                                for index, name in enumerate(perf_report.SHAPES)
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        path = self.root / "mixed" / side / f"{repetition:02d}.json"
         path.write_text(json.dumps(result))
 
-    def _write_deadlock(
+    def _write_contention(
         self,
         side: str,
         repetition: int,
         latency: float,
         *,
         with_stats: bool = True,
+        current: bool = False,
     ) -> None:
-        path = self.root / "deadlock" / side / f"{repetition:02d}.csv"
+        if current:
+            samples = [latency + sample for sample in range(10)]
+            path = self.root / "contention" / side / f"{repetition:02d}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "scenario": "contention",
+                        "backend": "memory",
+                        "runs": [
+                            {
+                                "run": 1,
+                                "cells": [
+                                    {
+                                        "numKeys": 1,
+                                        "overlap": 1,
+                                        "overlapPct": 100,
+                                        "committed": len(samples),
+                                        "durationMs": 1000,
+                                        "txPerSec": 10,
+                                        "p50Ms": latency + 4.5,
+                                        "p90Ms": latency + 8.5,
+                                        "samplesMs": samples,
+                                        "retries": 2,
+                                        "directCandidates": 12,
+                                        "directLanded": 10,
+                                        "workerDrainMs": 5,
+                                        "failures": 0,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            )
+            return
+        path = self.root / "contention" / side / f"{repetition:02d}.csv"
         path.write_text(
             "run,num-keys,overlap,overlap-pct,latency-ms\n"
             + "".join(
@@ -97,7 +149,7 @@ class PerfReportTest(unittest.TestCase):
         )
         if not with_stats:
             return
-        stats = self.root / "deadlock" / side / f"{repetition:02d}-stats.csv"
+        stats = self.root / "contention" / side / f"{repetition:02d}-stats.csv"
         stats.write_text(
             "run,num-keys,overlap,overlap-pct,count,cell-duration-ms,num-retries,"
             "direct-candidates,direct-landed,worker-drain-ms\n"
@@ -140,29 +192,43 @@ class PerfReportTest(unittest.TestCase):
         with self.assertRaisesRegex(perf_report.ReportError, "recorded 1 failures"):
             perf_report.render_report(self.root, "main", "PR")
 
+    def test_affinity_result_requires_split_settlement(self) -> None:
+        path = self.root / "mixed" / "pr" / "01.json"
+        result = json.loads(path.read_text())
+        del result["runs"][0]["cells"][0]["splitSettleWallMs"]
+        path.write_text(json.dumps(result))
+
+        with self.assertRaisesRegex(perf_report.ReportError, "splitSettleWallMs"):
+            perf_report.render_report(self.root, "main", "PR")
+
     def test_legacy_baseline_without_deadlock_stats_is_supported(self) -> None:
-        for repetition in range(1, perf_report.DEADLOCK_RUNS + 1):
-            stats = self.root / "deadlock" / "main" / f"{repetition:02d}-stats.csv"
+        for repetition in range(1, perf_report.CONTENTION_RUNS + 1):
+            stats = (
+                self.root
+                / "contention"
+                / "main"
+                / f"{repetition:02d}-stats.csv"
+            )
             stats.unlink()
 
         report = perf_report.render_report(self.root, "main", "PR")
 
         self.assertIn("| Completion tx/s | n/a | 10.00 | n/a |", report)
 
-    def test_candidate_requires_deadlock_stats(self) -> None:
-        stats = self.root / "deadlock" / "pr" / "01-stats.csv"
-        stats.unlink()
+    def test_candidate_requires_contention_metrics(self) -> None:
+        path = self.root / "contention" / "pr" / "01.json"
+        result = json.loads(path.read_text())
+        del result["runs"][0]["cells"][0]["directCandidates"]
+        path.write_text(json.dumps(result))
 
-        with self.assertRaisesRegex(
-            perf_report.ReportError, "focused deadlock stats are required"
-        ):
+        with self.assertRaisesRegex(perf_report.ReportError, "directCandidates"):
             perf_report.render_report(self.root, "main", "PR")
 
-    def test_deadlock_run_identity_must_be_paired(self) -> None:
-        source = self.root / "deadlock" / "pr" / "03.csv"
-        source.rename(source.with_name("04.csv"))
+    def test_contention_run_identity_must_be_paired(self) -> None:
+        source = self.root / "contention" / "pr" / "03.json"
+        source.rename(source.with_name("04.json"))
 
-        with self.assertRaisesRegex(perf_report.ReportError, "paired deadlock runs"):
+        with self.assertRaisesRegex(perf_report.ReportError, "paired contention runs"):
             perf_report.render_report(self.root, "main", "PR")
 
 

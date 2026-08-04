@@ -6,16 +6,11 @@
 //! test failure. Tokio synchronization and future-composition macros are
 //! runtime-agnostic and remain usable directly.
 //!
-//! The two time seams are not interchangeable, and this file can only guard the
-//! coarser half of that rule. `rt::Instant` is monotonic and always tracks the
-//! active clock (virtual under the deterministic executor, tokio's possibly
-//! paused clock otherwise), so it is the seam for *elapsed* time: timeouts,
-//! deadlines, and retry budgets. `Clock` is a wall clock, needed only to compare
-//! against *persisted* timestamps that may come from another node; it is real
-//! time unless a caller anchors it, so measuring elapsed time with it silently
-//! escapes simulated time. Only the latter misuse is greppable here — spending a
-//! wall-clock budget while retries advance virtual time needs a behavioral test
-//! that exercises the timeout under the default (real) clock.
+//! Runtime time has two representations with distinct purposes. `rt::Instant`
+//! is monotonic and measures elapsed time for deadlines and retry budgets;
+//! `rt::system_now` supplies wall timestamps for comparisons with persisted
+//! state. Both follow the runtime's active model-time domain. Raw clocks bypass
+//! that domain and can silently escape simulated or accelerated time.
 
 use std::path::{Path, PathBuf};
 
@@ -52,9 +47,6 @@ const FORBIDDEN: &[&str] = &[
     "SystemTime::now(",
     "std::time::SystemTime::now(",
     "std::time::Instant::now(",
-    // An unanchored wall clock ignores simulated time, so engine code must take
-    // the one its caller configured instead of minting a real clock in place.
-    "Clock::real(",
 ];
 
 const ALLOWED_TOKIO: &[&str] = &[
@@ -83,11 +75,6 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
     path.ends_with("crates/glassdb-concurr/src/rt.rs")
-        || (path.ends_with("crates/glassdb-concurr/src/clock.rs")
-            && matches!(pattern, "SystemTime::now(" | "Clock::real("))
-        // The single place that turns the engine's `deterministic_time` switch
-        // into a clock, and therefore the only legitimate real-clock source.
-        || (path.ends_with("crates/glassdb-trans/src/engine.rs") && pattern == "Clock::real(")
         || (path.ends_with("crates/glassdb-concurr/src/exec.rs")
             && matches!(pattern, "tokio::task" | "tokio::runtime"))
         || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
@@ -145,6 +132,7 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let roots = [
         workspace.join("crates/glassdb/src"),
+        workspace.join("crates/glassdb-backend/src"),
         workspace.join("crates/glassdb-trans/src"),
         workspace.join("crates/glassdb-storage/src"),
         workspace.join("crates/glassdb-concurr/src"),
@@ -203,6 +191,46 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
     assert!(
         violations.is_empty(),
         "sim-controlled code must use simulation-aware runtime/I/O seams:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn synthetic_s3_time_uses_the_model_time_seam() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let files = [
+        workspace.join("crates/glassdb-backend-s3/src/lib.rs"),
+        workspace.join("crates/glassdb-backend-s3/src/fake_server.rs"),
+    ];
+    let timing = [
+        "tokio::time",
+        "SystemTime::now(",
+        "std::time::SystemTime::now(",
+        "std::time::Instant::now(",
+    ];
+    let mut violations = Vec::new();
+    for path in files {
+        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("read source file {}: {e}", path.display());
+        });
+        for (idx, line) in contents.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some(pattern) = timing.iter().find(|pattern| trimmed.contains(**pattern)) {
+                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
+                violations.push(format!(
+                    "{}:{} contains `{pattern}`",
+                    rel.display(),
+                    idx + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "synthetic S3 timing must use process-wide model time:\n{}",
         violations.join("\n")
     );
 }

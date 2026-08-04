@@ -217,7 +217,7 @@ impl S3Backend {
             // raced; this one was not applied, so retrying it is safe and does
             // not taint a later precondition.
             if is_conflict(&e) && attempt < MAX_CONFLICT_RETRIES {
-                tokio::time::sleep(conflict_backoff(attempt)).await;
+                glassdb_concurr::rt::sleep(conflict_backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }
@@ -226,7 +226,7 @@ impl S3Backend {
                 // An ambiguous attempt (timeout/dispatch/5xx) may have applied;
                 // a throttle (503/429) was rejected before applying and is safe.
                 lost = lost || ambiguous;
-                tokio::time::sleep(conflict_backoff(attempt)).await;
+                glassdb_concurr::rt::sleep(conflict_backoff(attempt)).await;
                 attempt += 1;
                 continue;
             }
