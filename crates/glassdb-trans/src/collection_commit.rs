@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use glassdb_data::{CollectionAddress, TxId};
-use glassdb_storage::{Requirement, SplitPolicy, TxCollectionChange, TxCollectionOp, TxLog};
+use glassdb_storage::{Requirement, SplitPolicy, TxCollectionChange, TxCollectionOp, TxLock};
 
 use crate::collection_catalog::CollectionCatalog;
 use crate::collections::{CollectionData, CollectionLifecycle, CollectionOp};
@@ -60,14 +60,18 @@ impl CollectionAttempt {
         Self::new(self.data)
     }
 
-    /// Adds this collection attempt's durable effects to the committed log.
-    pub(crate) fn populate_log(&self, log: &mut TxLog) {
-        log.collection_changes = self.encoded_changes();
-        log.prepared_collections = self.prepared.iter().cloned().collect();
+    /// Returns the complete recovery manifest for the committed transaction.
+    pub(crate) fn committed_manifest(&self, locks: Vec<TxLock>) -> TxRecoveryManifest {
+        TxRecoveryManifest {
+            locks,
+            collection_changes: self.encoded_changes(),
+            prepared_collections: self.prepared.iter().cloned().collect(),
+        }
     }
 
-    fn recovery_manifest(&self) -> TxRecoveryManifest {
-        let prepared_collections = self
+    fn pending_manifest(&self, mut current: TxRecoveryManifest) -> TxRecoveryManifest {
+        current.collection_changes = self.encoded_changes();
+        current.prepared_collections = self
             .prepared
             .iter()
             .cloned()
@@ -75,11 +79,7 @@ impl CollectionAttempt {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        TxRecoveryManifest {
-            locks: Vec::new(),
-            collection_changes: self.encoded_changes(),
-            prepared_collections,
-        }
+        current
     }
 
     fn encoded_changes(&self) -> Vec<TxCollectionChange> {
@@ -162,14 +162,14 @@ impl CollectionCommit {
         attempt: &CollectionAttempt,
     ) -> Result<(), TransError> {
         debug_assert!(attempt.has_writes());
-        let recovery = attempt.recovery_manifest();
         if is_new {
+            let recovery = attempt.pending_manifest(TxRecoveryManifest::default());
             self.monitor.begin_persisted_tx(id, recovery).await
         } else {
             self.monitor
-                .update_pending_tx(id, move |pending| {
-                    pending.collection_changes = recovery.collection_changes;
-                    pending.prepared_collections = recovery.prepared_collections;
+                .update_pending_tx(id, |pending| {
+                    let current = std::mem::take(pending);
+                    *pending = attempt.pending_manifest(current);
                 })
                 .await
         }
@@ -253,7 +253,6 @@ impl CollectionCommit {
 #[cfg(test)]
 mod tests {
     use glassdb_data::CollectionId;
-    use glassdb_storage::TxCommitStatus;
 
     use super::*;
     use crate::collections::CollectionChange;
@@ -303,7 +302,14 @@ mod tests {
         });
         attempt.prepared.insert(earlier.clone());
 
-        let recovery = attempt.recovery_manifest();
+        let retained_lock = TxLock::Topology {
+            collection: CollectionAddress::root("db"),
+        };
+        let recovery = attempt.pending_manifest(TxRecoveryManifest {
+            locks: vec![retained_lock.clone()],
+            ..TxRecoveryManifest::default()
+        });
+        assert_eq!(recovery.locks, vec![retained_lock.clone()]);
         assert_eq!(
             recovery.prepared_collections,
             vec![earlier.clone(), active.clone()]
@@ -311,11 +317,13 @@ mod tests {
         assert_eq!(recovery.collection_changes.len(), 1);
 
         attempt.prepared.insert(active.clone());
-        let id = TxId::from_bytes(vec![1]);
-        let mut log = TxLog::new(id, TxCommitStatus::Ok);
-        attempt.populate_log(&mut log);
-        assert_eq!(log.prepared_collections, vec![earlier, active.clone()]);
-        assert_eq!(log.collection_changes.len(), 1);
-        assert_eq!(log.collection_changes[0].collection, active);
+        let committed = attempt.committed_manifest(vec![retained_lock.clone()]);
+        assert_eq!(committed.locks, vec![retained_lock]);
+        assert_eq!(
+            committed.prepared_collections,
+            vec![earlier, active.clone()]
+        );
+        assert_eq!(committed.collection_changes.len(), 1);
+        assert_eq!(committed.collection_changes[0].collection, active);
     }
 }

@@ -1443,7 +1443,6 @@ impl Algo {
         id: &TxId,
     ) -> Result<(), TransError> {
         let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        tl.locks = locks;
         for w in &data.writes {
             let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
                 WriteOp::Put(value) => (value.clone(), false),
@@ -1456,7 +1455,7 @@ impl Algo {
                 prev_writer: TxId::default(),
             });
         }
-        collections.populate_log(&mut tl);
+        collections.committed_manifest(locks).apply_to(&mut tl);
         // `context` preserves the `AlreadyFinalized` sentinel and any in-doubt
         // outcome instead of collapsing them into a generic error.
         self.mon
@@ -1485,7 +1484,7 @@ mod tests {
     use crate::collection_coordination::CollectionStateResolver;
     use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
     use crate::key_state_resolver::KeyStateResolver;
-    use crate::monitor::ProtocolTiming;
+    use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
     use crate::reader::Reader;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
@@ -1884,6 +1883,55 @@ mod tests {
         assert_eq!(log.prepared_collections, vec![earlier, active.clone()]);
         assert_eq!(log.collection_changes.len(), 1);
         assert_eq!(log.collection_changes[0].collection, active);
+    }
+
+    #[tokio::test]
+    async fn pending_collection_manifest_update_preserves_existing_locks() {
+        let (tm, tctx) = new_algo().await;
+        let created = CollectionAddress::new(
+            TEST_DB,
+            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
+        );
+        let handle = tm.begin(
+            Data::default(),
+            CollectionData {
+                reads: Vec::new(),
+                changes: vec![CollectionChange {
+                    parent: test_collection(),
+                    name: b"created".to_vec(),
+                    collection: created.clone(),
+                    expected: None,
+                    op: CollectionOp::Create,
+                }],
+            },
+        );
+        let id = handle.id().clone();
+        let lock = TxLock::Topology {
+            collection: test_collection(),
+        };
+        tm.mon
+            .begin_persisted_tx(
+                &id,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        tm.collection_commit
+            .persist_manifest(&id, false, &handle.collections)
+            .await
+            .unwrap();
+
+        let log = tctx.tlogger.get_at(&id, Requirement::Any).await.unwrap();
+        let log = log.value().unwrap();
+        assert_eq!(log.status, TxCommitStatus::Pending);
+        assert_eq!(log.locks, vec![lock]);
+        assert_eq!(log.collection_changes.len(), 1);
+        assert_eq!(log.collection_changes[0].collection, created.clone());
+        assert_eq!(log.prepared_collections, vec![created]);
     }
 
     #[tokio::test]
