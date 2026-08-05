@@ -2,6 +2,7 @@
 //! rate limiting. Ported from the Go `middleware.DelayBackend`.
 
 use std::collections::HashMap;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,11 +20,11 @@ pub fn gcs_delays() -> DelayOptions {
         obj_read: Latency::new(57, 7),
         obj_write: Latency::new(70, 15),
         list: Latency::new(10, 3),
-        same_obj_write_ps: 1,
+        same_obj_write_ps: RateLimit::PerSecond(NonZeroU32::new(1).unwrap()),
         // GCS has no documented per-prefix request-rate limit, so the prefix
         // limiter is disabled.
-        prefix_read_ps: 0,
-        prefix_write_ps: 0,
+        prefix_read_ps: RateLimit::Unlimited,
+        prefix_write_ps: RateLimit::Unlimited,
         prefix_depth: 0,
     }
 }
@@ -45,9 +46,9 @@ pub fn s3_delays() -> DelayOptions {
         obj_read: Latency::new(22, 9),
         obj_write: Latency::new(55, 18),
         list: Latency::new(22, 8),
-        same_obj_write_ps: 3500,
-        prefix_read_ps: 5500,
-        prefix_write_ps: 3500,
+        same_obj_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
+        prefix_read_ps: RateLimit::PerSecond(NonZeroU32::new(5500).unwrap()),
+        prefix_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
         prefix_depth: 2,
     }
 }
@@ -69,6 +70,15 @@ impl Latency {
     }
 }
 
+/// Selects whether an operation is unlimited or capped at a positive rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimit {
+    /// Does not apply rate limiting.
+    Unlimited,
+    /// Allows the given positive number of operations per second.
+    PerSecond(NonZeroU32),
+}
+
 /// Configures simulated latency for each type of backend operation.
 #[derive(Debug, Clone, Copy)]
 pub struct DelayOptions {
@@ -77,23 +87,33 @@ pub struct DelayOptions {
     pub obj_read: Latency,
     pub obj_write: Latency,
     pub list: Latency,
-    /// How many writes per second to the same object before being rate limited.
-    pub same_obj_write_ps: i64,
+    /// Caps writes to the same object.
+    pub same_obj_write_ps: RateLimit,
     /// Caps the GET/HEAD request rate against a shared key prefix, modeling
     /// S3's documented per-prefix request-rate limit. A request that would
     /// exceed the rate is delayed (not failed) until the bucket refills, so the
-    /// cap bounds throughput without inflating transaction-retry counts. Zero
-    /// disables the limit.
-    pub prefix_read_ps: i64,
+    /// cap bounds throughput without inflating transaction-retry counts.
+    pub prefix_read_ps: RateLimit,
     /// Caps the PUT/POST/DELETE request rate against a shared key prefix (the
-    /// write analog of [`Self::prefix_read_ps`]). Zero disables the limit.
-    pub prefix_write_ps: i64,
+    /// write analog of [`Self::prefix_read_ps`]).
+    pub prefix_write_ps: RateLimit,
     /// Selects how many leading `/`-separated path segments form a throttled
     /// prefix, i.e. the partition granularity (depth 1 groups every object
     /// under the database root into a single hot partition; depth 2 throttles
-    /// each immediate subtree independently). Ignored when both prefix rates
-    /// are zero.
+    /// each immediate subtree independently). Ignored when both prefix limits
+    /// are unlimited.
     pub prefix_depth: usize,
+}
+
+/// An invalid combination of delay and rate-limit options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DelayOptionsError {
+    /// A prefix limit was enabled without selecting a prefix.
+    #[error("prefix depth must be greater than zero when a prefix rate limit is enabled")]
+    ZeroPrefixDepth,
+    /// Per-object backoff was enabled without a positive retry delay.
+    #[error("object write retry delay must be greater than zero when its rate limit is enabled")]
+    ZeroObjectRetryDelay,
 }
 
 /// A [`Backend`] decorator that injects simulated network latency, per-object
@@ -104,10 +124,9 @@ pub struct DelayBackend {
     obj_read: Lognormal,
     obj_write: Lognormal,
     list: Lognormal,
-    rlimit: RateLimiter,
+    rlimit: Option<RateLimiter>,
     prefix_reads: Option<PrefixLimiter>,
     prefix_writes: Option<PrefixLimiter>,
-    retry_delay: Duration,
 }
 
 impl DelayBackend {
@@ -116,17 +135,27 @@ impl DelayBackend {
     /// The conditional-only trait (ADR-042) has no metadata-only operations, so
     /// `opts.meta_read` / `opts.meta_write` are unused; they remain in
     /// [`DelayOptions`] only for config-shape stability.
-    pub fn new(inner: Arc<dyn Backend>, opts: DelayOptions) -> Self {
-        DelayBackend {
+    pub fn new(inner: Arc<dyn Backend>, opts: DelayOptions) -> Result<Self, DelayOptionsError> {
+        let retry_delay = opts.obj_write.mean.saturating_mul(2);
+        let rlimit = match opts.same_obj_write_ps {
+            RateLimit::Unlimited => None,
+            RateLimit::PerSecond(rate) => {
+                if retry_delay.is_zero() {
+                    return Err(DelayOptionsError::ZeroObjectRetryDelay);
+                }
+                Some(RateLimiter::new(rate, retry_delay))
+            }
+        };
+
+        Ok(DelayBackend {
             inner,
             obj_read: Lognormal::from_latency(opts.obj_read),
             obj_write: Lognormal::from_latency(opts.obj_write),
             list: Lognormal::from_latency(opts.list),
-            rlimit: RateLimiter::new(opts.same_obj_write_ps),
-            prefix_reads: PrefixLimiter::new(opts.prefix_read_ps, opts.prefix_depth),
-            prefix_writes: PrefixLimiter::new(opts.prefix_write_ps, opts.prefix_depth),
-            retry_delay: opts.obj_write.mean.saturating_mul(2),
-        }
+            rlimit,
+            prefix_reads: PrefixLimiter::from_limit(opts.prefix_read_ps, opts.prefix_depth)?,
+            prefix_writes: PrefixLimiter::from_limit(opts.prefix_write_ps, opts.prefix_depth)?,
+        })
     }
 
     async fn delay(&self, ln: &Lognormal) {
@@ -148,18 +177,10 @@ impl DelayBackend {
         }
     }
 
-    /// Blocks until a write token is available for `path`, retrying with
-    /// backoff. Returns when a token is acquired; the caller cancels by
-    /// dropping the surrounding future.
-    async fn backoff(&self, path: &str) {
-        let max = self.retry_delay.saturating_mul(10);
-        let mut interval = self.retry_delay;
-        loop {
-            if self.rlimit.try_acquire_token(path) {
-                return;
-            }
-            rt::sleep(interval).await;
-            interval = std::cmp::min(interval.mul_f64(1.5), max);
+    /// Blocks on the object limiter when one is enabled.
+    async fn object_write_wait(&self, path: &str) {
+        if let Some(l) = &self.rlimit {
+            l.wait(path).await;
         }
     }
 }
@@ -189,7 +210,7 @@ impl Backend for DelayBackend {
         expected: &Version,
     ) -> Result<Version, BackendError> {
         self.prefix_write_wait(path).await;
-        self.backoff(path).await;
+        self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;
         self.inner.write_if(path, value, expected).await
     }
@@ -200,14 +221,14 @@ impl Backend for DelayBackend {
         value: Vec<u8>,
     ) -> Result<Version, BackendError> {
         self.prefix_write_wait(path).await;
-        self.backoff(path).await;
+        self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;
         self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         self.prefix_write_wait(path).await;
-        self.backoff(path).await;
+        self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;
         self.inner.delete_if(path, expected).await
     }
@@ -264,6 +285,7 @@ impl Lognormal {
 /// accelerated latency and deterministic under paused time in tests.
 struct RateLimiter {
     tokens_per_sec: i64,
+    retry_delay: Duration,
     buckets: Mutex<HashMap<String, BucketState>>,
 }
 
@@ -274,17 +296,28 @@ struct BucketState {
 }
 
 impl RateLimiter {
-    fn new(tokens_per_sec: i64) -> Self {
+    fn new(tokens_per_sec: NonZeroU32, retry_delay: Duration) -> Self {
         RateLimiter {
-            tokens_per_sec,
+            tokens_per_sec: i64::from(tokens_per_sec.get()),
+            retry_delay,
             buckets: Mutex::new(HashMap::new()),
         }
     }
 
-    fn try_acquire_token(&self, key: &str) -> bool {
-        if self.tokens_per_sec == 0 {
-            return false;
+    /// Blocks until a write token is available for `key`.
+    async fn wait(&self, key: &str) {
+        let max = self.retry_delay.saturating_mul(10);
+        let mut interval = self.retry_delay;
+        loop {
+            if self.try_acquire_token(key) {
+                return;
+            }
+            rt::sleep(interval).await;
+            interval = std::cmp::min(interval.mul_f64(1.5), max);
         }
+    }
+
+    fn try_acquire_token(&self, key: &str) -> bool {
         let window = Duration::from_secs(1);
         let now = Instant::now();
         let mut buckets = self.buckets.lock().unwrap();
@@ -338,7 +371,7 @@ struct PrefixLimiter {
     rate: f64,
     /// Bucket capacity, in tokens.
     burst: f64,
-    depth: usize,
+    depth: NonZeroUsize,
     buckets: Mutex<HashMap<String, TokenBucket>>,
 }
 
@@ -349,25 +382,28 @@ struct TokenBucket {
 }
 
 impl PrefixLimiter {
-    /// Builds a per-prefix limiter, or `None` (no throttling) when
-    /// `rate_per_sec` is non-positive. `depth` selects how many leading path
-    /// segments form the throttled prefix.
-    fn new(rate_per_sec: i64, depth: usize) -> Option<PrefixLimiter> {
-        if rate_per_sec <= 0 {
-            return None;
-        }
-        Some(PrefixLimiter {
-            rate: rate_per_sec as f64,
-            burst: rate_per_sec as f64,
-            depth: depth.max(1),
+    /// Builds the optional limiter selected by `limit`.
+    fn from_limit(
+        limit: RateLimit,
+        depth: usize,
+    ) -> Result<Option<PrefixLimiter>, DelayOptionsError> {
+        let RateLimit::PerSecond(rate_per_sec) = limit else {
+            return Ok(None);
+        };
+        let depth = NonZeroUsize::new(depth).ok_or(DelayOptionsError::ZeroPrefixDepth)?;
+        let rate = f64::from(rate_per_sec.get());
+        Ok(Some(PrefixLimiter {
+            rate,
+            burst: rate,
+            depth,
             buckets: Mutex::new(HashMap::new()),
-        })
+        }))
     }
 
     /// Blocks until a request token for `path`'s prefix is available. The
     /// caller cancels by dropping the surrounding future.
     async fn wait(&self, path: &str) {
-        let d = self.reserve(prefix_key(path, self.depth), Instant::now());
+        let d = self.reserve(prefix_key(path, self.depth.get()), Instant::now());
         if d.is_zero() {
             return;
         }
@@ -434,7 +470,7 @@ mod tests {
     // with paused Tokio time.
     #[tokio::test(start_paused = true)]
     async fn rate_limiter_token_refill() {
-        let rl = RateLimiter::new(1);
+        let rl = RateLimiter::new(NonZeroU32::new(1).unwrap(), Duration::from_millis(1));
 
         // Four requests sneak through within the first second (tokens go
         // negative because the window has not elapsed).
@@ -472,17 +508,13 @@ mod tests {
         assert!(rl.try_acquire_token("k"));
     }
 
-    #[tokio::test]
-    async fn rate_limiter_disabled_when_zero() {
-        let rl = RateLimiter::new(0);
-        assert!(!rl.try_acquire_token("k"));
-    }
-
     // Ports the Go middleware `TestPrefixLimiter` at its nominal model-time
     // rate. Process-wide acceleration is covered at the runtime seam.
     #[tokio::test(start_paused = true)]
     async fn prefix_limiter_rate() {
-        let l = PrefixLimiter::new(100, 1).expect("limiter enabled");
+        let l = PrefixLimiter::from_limit(RateLimit::PerSecond(NonZeroU32::new(100).unwrap()), 1)
+            .unwrap()
+            .expect("limiter enabled");
         let now = Instant::now();
         for _ in 0..100 {
             l.reserve("bench", now);
@@ -491,9 +523,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_limiter_disabled_when_non_positive() {
-        assert!(PrefixLimiter::new(0, 2).is_none());
-        assert!(PrefixLimiter::new(-1, 2).is_none());
+    fn prefix_limiter_unlimited() {
+        assert!(
+            PrefixLimiter::from_limit(RateLimit::Unlimited, 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // Ports the Go middleware `TestPrefixKey`.

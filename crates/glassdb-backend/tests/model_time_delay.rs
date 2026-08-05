@@ -12,7 +12,7 @@ async fn delay_backend_uses_process_model_time() {
     rt::set_model_time_speedup(5.0).unwrap();
     let mut options = gcs_delays();
     options.obj_read = Latency::new(50, 0);
-    let backend = DelayBackend::new(Arc::new(MemoryBackend::new()), options);
+    let backend = DelayBackend::new(Arc::new(MemoryBackend::new()), options).unwrap();
 
     let wall_start = tokio::time::Instant::now();
     let model_start = rt::Instant::now();

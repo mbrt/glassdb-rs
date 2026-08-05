@@ -5,7 +5,7 @@ use std::time::Duration;
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use clap::Args;
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
+use glassdb::middleware::{DelayBackend, DelayOptions, RateLimit, gcs_delays, s3_delays};
 use glassdb::s3::{FakeS3, FakeS3Options, tuned_http_client};
 use glassdb_backend::Backend;
 
@@ -105,9 +105,9 @@ impl Options {
             other => return Err(format!("unknown delay profile {other:?}").into()),
         };
         if !self.enable_throttling {
-            delays.same_obj_write_ps = 100_000;
-            delays.prefix_read_ps = 0;
-            delays.prefix_write_ps = 0;
+            delays.same_obj_write_ps = RateLimit::Unlimited;
+            delays.prefix_read_ps = RateLimit::Unlimited;
+            delays.prefix_write_ps = RateLimit::Unlimited;
         }
         if self.prefix_depth > 0 {
             delays.prefix_depth = self.prefix_depth;
@@ -136,9 +136,10 @@ impl Factory {
     /// Creates an independent middleware instance over the selected storage.
     pub(super) fn backend(&self) -> Arc<dyn Backend> {
         match self {
-            Factory::Memory(delays) => {
-                Arc::new(DelayBackend::new(Arc::new(MemoryBackend::new()), *delays))
-            }
+            Factory::Memory(delays) => Arc::new(
+                DelayBackend::new(Arc::new(MemoryBackend::new()), *delays)
+                    .expect("generated delay profile is valid"),
+            ),
             Factory::Gcs { bucket } => Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
             Factory::S3 { client, bucket } => {
                 Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone()))

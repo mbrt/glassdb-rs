@@ -36,7 +36,10 @@ fn runtime() -> Runtime {
 
 /// Wraps a fresh in-memory backend in a [`DelayBackend`] using `profile`.
 fn simulated(profile: fn() -> DelayOptions) -> Arc<dyn Backend> {
-    Arc::new(DelayBackend::new(Arc::new(MemoryBackend::new()), profile()))
+    Arc::new(
+        DelayBackend::new(Arc::new(MemoryBackend::new()), profile())
+            .expect("built-in delay profile is valid"),
+    )
 }
 
 /// The three backends used by every workload, each backed by fresh state.
