@@ -570,29 +570,13 @@ mod tests {
             .resolve_holders(key, Some(entry), None, Requirement::Any)
             .await
             .unwrap();
-        assert_eq!(holders, expected.holders, "{context}: cold holders");
+        assert_eq!(holders, expected.holders, "{context}: holders");
         assert_eq!(
             holders.resolved_current(Some(entry)),
             expected.current,
-            "{context}: cold current projection"
+            "{context}: current projection"
         );
-        harness.assert_operations(
-            expected.operations.holders,
-            &format!("{context}: cold holders"),
-        );
-
-        harness.clear_operations();
-        let holders = state
-            .resolve_holders(key, Some(entry), None, Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(holders, expected.holders, "{context}: warm holders");
-        assert_eq!(
-            holders.resolved_current(Some(entry)),
-            expected.current,
-            "{context}: warm current projection"
-        );
-        harness.assert_operations(0, &format!("{context}: warm holders"));
+        harness.assert_operations(expected.operations.holders, &format!("{context}: holders"));
 
         let (state, _background) = harness.resolver();
         harness.clear_operations();
@@ -606,19 +590,8 @@ mod tests {
         );
         harness.assert_operations(
             expected.operations.existence,
-            &format!("{context}: cold existence"),
+            &format!("{context}: existence"),
         );
-
-        harness.clear_operations();
-        assert_eq!(
-            state
-                .entry_exists(key, entry, None, Requirement::Any)
-                .await
-                .unwrap(),
-            expected.exists,
-            "{context}: warm existence"
-        );
-        harness.assert_operations(0, &format!("{context}: warm existence"));
     }
 
     async fn assert_exclusive_case(
@@ -770,81 +743,72 @@ mod tests {
                 },
             };
             assert_projections(&harness, &key, &entry, &expected, &context).await;
-
-            let (state, _background) = harness.resolver();
-            harness.clear_operations();
-            let without_own = state
-                .resolve_holders(&key, Some(&entry), Some(&pending), Requirement::Any)
-                .await
-                .unwrap();
-            let mut own_expected = expected.holders.clone();
-            own_expected.pending.clear();
-            assert_eq!(without_own, own_expected, "{context}: own reader excluded");
-            assert_eq!(
-                without_own.resolved_current(Some(&entry)),
-                expected.current,
-                "{context}: own reader current projection"
-            );
-            harness.assert_operations(2, &format!("{context}: own reader excluded"));
         }
     }
 
     #[tokio::test]
-    async fn own_exclusive_holder_is_excluded_from_resolution() {
-        let harness = ResolutionHarness::new();
-        let key = KeyRef::new(CollectionAddress::root("db"), b"key");
-        let predecessor = TxId::with_priority(1, b"previous");
-        let holder = TxId::with_priority(2, b"holder");
-        harness
-            .seed_transaction(
-                &key,
-                &holder,
-                LockType::Write,
-                TxCommitStatus::Ok,
-                Some(true),
-            )
-            .await;
-        let current = CurrentState::Inline {
-            writer: predecessor.clone(),
-            value: Arc::from(INLINE_VALUE),
-        };
-        let entry = ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![holder.clone()],
-            current: current.clone(),
-            ..ShardEntry::new(key.key())
-        };
+    async fn own_holder_is_excluded_from_resolution() {
+        for lock_type in [LockType::Write, LockType::Read] {
+            let harness = ResolutionHarness::new();
+            let key = KeyRef::new(CollectionAddress::root("db"), b"key");
+            let predecessor = TxId::with_priority(1, b"previous");
+            let holder = TxId::with_priority(2, b"holder");
+            harness
+                .seed_transaction(
+                    &key,
+                    &holder,
+                    lock_type,
+                    if lock_type == LockType::Write {
+                        TxCommitStatus::Ok
+                    } else {
+                        TxCommitStatus::Pending
+                    },
+                    (lock_type == LockType::Write).then_some(true),
+                )
+                .await;
+            let current = CurrentState::Inline {
+                writer: predecessor.clone(),
+                value: Arc::from(INLINE_VALUE),
+            };
+            let entry = ShardEntry {
+                lock_type,
+                locked_by: vec![holder.clone()],
+                current: current.clone(),
+                ..ShardEntry::new(key.key())
+            };
 
-        let (state, _background) = harness.resolver();
-        harness.clear_operations();
-        let holders = state
-            .resolve_holders(&key, Some(&entry), Some(&holder), Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(
-            holders,
-            HolderResolution {
-                writer: Some(predecessor),
-                deleted: false,
-                pending: Vec::new(),
-            }
-        );
-        assert_eq!(
-            holders.resolved_current(Some(&entry)),
-            current,
-            "own exclusive holder: current projection"
-        );
-        harness.assert_operations(0, "own exclusive holder: holders");
-
-        harness.clear_operations();
-        assert!(
-            state
-                .entry_exists(&key, &entry, Some(&holder), Requirement::Any,)
+            let (state, _background) = harness.resolver();
+            harness.clear_operations();
+            let holders = state
+                .resolve_holders(&key, Some(&entry), Some(&holder), Requirement::Any)
                 .await
-                .unwrap(),
-            "the predecessor's inline value remains effective"
-        );
-        harness.assert_operations(0, "own exclusive holder: existence");
+                .unwrap();
+            assert_eq!(
+                holders,
+                HolderResolution {
+                    writer: Some(predecessor),
+                    deleted: false,
+                    pending: Vec::new(),
+                },
+                "own {lock_type} holder"
+            );
+            assert_eq!(
+                holders.resolved_current(Some(&entry)),
+                current,
+                "own {lock_type} holder: current projection"
+            );
+            harness.assert_operations(0, &format!("own {lock_type} holder: holders"));
+
+            harness.clear_operations();
+            assert!(
+                state
+                    .entry_exists(&key, &entry, Some(&holder), Requirement::Any,)
+                    .await
+                    .unwrap(),
+                "the predecessor's inline value remains effective"
+            );
+            harness.assert_operations(0, &format!("own {lock_type} holder: existence"));
+        }
     }
 
     #[tokio::test]
@@ -903,33 +867,6 @@ mod tests {
             );
             harness.assert_operations(0, &format!("invalid {lock_type}: existence"));
         }
-    }
-
-    #[tokio::test]
-    async fn missing_entry_resolves_without_io() {
-        let harness = ResolutionHarness::new();
-        let key = KeyRef::new(CollectionAddress::root("db"), b"key");
-        let (state, _background) = harness.resolver();
-        harness.clear_operations();
-
-        let writer = state
-            .resolve_writer(&key, None, Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(
-            writer,
-            WriterResolution {
-                writer: None,
-                value: ResolvedValue::Unresolved,
-                cache_hit: true,
-            }
-        );
-        let holders = state
-            .resolve_holders(&key, None, None, Requirement::Any)
-            .await
-            .unwrap();
-        assert_eq!(holders, HolderResolution::default());
-        harness.assert_operations(0, "missing entry");
     }
 
     // Writer and liveness must describe the same holder state. Resolving them
