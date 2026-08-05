@@ -24,15 +24,53 @@ struct Inner<V> {
     map: LinkedHashMap<String, V>,
 }
 
+struct WeightReplacement {
+    size: usize,
+    overflowed: bool,
+}
+
+fn replace_weight(curr_size: usize, old_size: usize, new_size: usize) -> WeightReplacement {
+    let remaining = curr_size
+        .checked_sub(old_size)
+        .expect("cache weight removal exceeds the accounted size");
+    match remaining.checked_add(new_size) {
+        Some(size) => WeightReplacement {
+            size,
+            overflowed: false,
+        },
+        None => WeightReplacement {
+            size: usize::MAX,
+            overflowed: true,
+        },
+    }
+}
+
 impl<V: Weighable + Clone> Inner<V> {
     fn delete_entry(&mut self, key: &str) {
-        if let Some(v) = self.map.remove(key) {
-            self.curr_size = self.curr_size.saturating_sub(v.size());
-        }
+        let Some(old_size) = self.map.get(key).map(Weighable::size) else {
+            return;
+        };
+        self.curr_size = replace_weight(self.curr_size, old_size, 0).size;
+        self.map.remove(key);
     }
 
-    fn remove_oldest(&mut self) {
-        while self.curr_size > self.max_size {
+    fn recompute_weight(&mut self) -> bool {
+        let mut curr_size = 0;
+        let mut overflowed = false;
+        for value in self.map.values() {
+            let replacement = replace_weight(curr_size, 0, value.size());
+            curr_size = replacement.size;
+            overflowed = replacement.overflowed;
+            if overflowed {
+                break;
+            }
+        }
+        self.curr_size = curr_size;
+        overflowed
+    }
+
+    fn remove_oldest(&mut self, mut overflowed: bool) {
+        while overflowed || self.curr_size > self.max_size {
             // Never evict the most-recently-used entry, even if it alone
             // exceeds the shard budget. Otherwise a freshly written value
             // (e.g. one larger than max_size/shards) would be dropped
@@ -40,12 +78,24 @@ impl<V: Weighable + Clone> Inner<V> {
             // back their own writes. Overshoot is bounded to one entry per
             // shard.
             if self.map.len() <= 1 {
+                if overflowed {
+                    let still_overflowed = self.recompute_weight();
+                    assert!(!still_overflowed, "one cache weight must fit in usize");
+                }
                 return;
             }
             let Some((_, v)) = self.map.pop_front() else {
                 return;
             };
-            self.curr_size = self.curr_size.saturating_sub(v.size());
+            if overflowed {
+                // A saturated total is not exact, so subtracting an eviction
+                // could make the cache appear smaller than its survivors.
+                overflowed = self.recompute_weight();
+            } else {
+                let replacement = replace_weight(self.curr_size, v.size(), 0);
+                self.curr_size = replacement.size;
+                overflowed = replacement.overflowed;
+            }
         }
     }
 }
@@ -101,12 +151,12 @@ impl<V: Weighable + Clone> CacheShard<V> {
             }
             Some(newv) => {
                 let new_size = newv.size();
-                inner.curr_size =
-                    (inner.curr_size as i64 + new_size as i64 - old_size as i64) as usize;
+                let replacement = replace_weight(inner.curr_size, old_size, new_size);
+                inner.curr_size = replacement.size;
                 // `insert` appends at the back (most-recently-used) and, for an
                 // existing key, moves it there while replacing the value.
                 inner.map.insert(key.to_string(), newv);
-                inner.remove_oldest();
+                inner.remove_oldest(replacement.overflowed);
             }
         }
         result
@@ -194,6 +244,15 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct WeightedEntry(usize);
+
+    impl Weighable for WeightedEntry {
+        fn size(&self) -> usize {
+            self.0
+        }
+    }
+
     fn e(s: &str) -> TestEntry {
         TestEntry(s.to_string())
     }
@@ -232,6 +291,9 @@ mod tests {
         c.update("a", |_| Some(e("barbaz")));
         assert_eq!(c.get("a"), Some(e("barbaz")));
         assert_eq!(c.size(), 6);
+        c.update("a", |_| Some(e("x")));
+        assert_eq!(c.get("a"), Some(e("x")));
+        assert_eq!(c.size(), 1);
     }
 
     #[test]
@@ -297,6 +359,54 @@ mod tests {
         c.set("a", e("aaaa"));
         assert_eq!(c.get("a"), Some(e("aaaa")));
         assert_eq!(c.size(), 4);
+    }
+
+    #[test]
+    fn accounts_for_usize_max_weight() {
+        let c = CacheShard::new(usize::MAX);
+
+        c.set("a", WeightedEntry(usize::MAX));
+        assert_eq!(c.get("a"), Some(WeightedEntry(usize::MAX)));
+        assert_eq!(c.size(), usize::MAX);
+
+        c.set("a", WeightedEntry(1));
+        assert_eq!(c.size(), 1);
+        c.delete("a");
+        assert_eq!(c.size(), 0);
+    }
+
+    #[test]
+    fn multi_entry_overflow_recomputes_remaining_weight() {
+        let c = CacheShard::new(usize::MAX);
+        c.set("oldest", WeightedEntry(usize::MAX - 2));
+        c.set("middle", WeightedEntry(1));
+
+        c.set("newest", WeightedEntry(2));
+
+        assert_eq!(c.get("oldest"), None);
+        assert_eq!(c.get("middle"), Some(WeightedEntry(1)));
+        assert_eq!(c.get("newest"), Some(WeightedEntry(2)));
+        assert_eq!(c.size(), 3);
+    }
+
+    #[test]
+    fn overflow_keeps_evicting_until_remaining_weight_fits() {
+        let c = CacheShard::new(usize::MAX);
+        c.set("oldest", WeightedEntry(1));
+        c.set("middle", WeightedEntry(usize::MAX - 1));
+
+        c.set("newest", WeightedEntry(2));
+
+        assert_eq!(c.get("oldest"), None);
+        assert_eq!(c.get("middle"), None);
+        assert_eq!(c.get("newest"), Some(WeightedEntry(2)));
+        assert_eq!(c.size(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "cache weight removal exceeds the accounted size")]
+    fn weight_removal_underflow_panics() {
+        replace_weight(0, 1, 0);
     }
 
     // Returns `count` distinct keys that hash to the given shard.
