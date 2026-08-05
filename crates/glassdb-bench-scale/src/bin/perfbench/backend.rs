@@ -105,19 +105,20 @@ impl Options {
             other => return Err(format!("unknown delay profile {other:?}").into()),
         };
         if !self.enable_throttling {
-            delays.same_obj_write_ps = RateLimit::Unlimited;
-            delays.prefix_read_ps = RateLimit::Unlimited;
-            delays.prefix_write_ps = RateLimit::Unlimited;
+            delays.rate_limits.same_obj_write_ps = RateLimit::Unlimited;
+            delays.rate_limits.prefix_read_ps = RateLimit::Unlimited;
+            delays.rate_limits.prefix_write_ps = RateLimit::Unlimited;
         }
         if self.prefix_depth > 0 {
-            delays.prefix_depth = self.prefix_depth;
+            delays.rate_limits.prefix_depth = self.prefix_depth;
         }
         Ok(delays)
     }
 
     async fn initialize_fakes3(&self) -> Result<Factory, Box<dyn Error>> {
+        let delays = self.delay_profile()?;
         let fake = FakeS3::start_with(FakeS3Options {
-            latency: Some(self.delay_profile()?),
+            latency: Some(delays.latency),
             conn_counter: None,
         })
         .await;

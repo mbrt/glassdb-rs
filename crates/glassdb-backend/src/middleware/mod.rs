@@ -10,7 +10,8 @@ mod recording;
 mod scheduled;
 
 pub use delay::{
-    DelayBackend, DelayOptions, DelayOptionsError, Latency, RateLimit, gcs_delays, s3_delays,
+    DelayBackend, DelayOptions, DelayOptionsError, Latency, ProviderLatencyProfile, RateLimit,
+    WriteRateLimits, gcs_delays, s3_delays,
 };
 pub use fault::{FaultBackend, FaultOptions};
 pub use hook::{BackendOp, HookBackend, HookFuture, HookOutcome};

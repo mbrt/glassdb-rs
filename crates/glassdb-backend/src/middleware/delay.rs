@@ -15,17 +15,22 @@ use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, V
 /// Typical latency values observed with Google Cloud Storage.
 pub fn gcs_delays() -> DelayOptions {
     DelayOptions {
-        meta_read: Latency::new(22, 7),
-        meta_write: Latency::new(31, 8),
-        obj_read: Latency::new(57, 7),
-        obj_write: Latency::new(70, 15),
-        list: Latency::new(10, 3),
-        same_obj_write_ps: RateLimit::PerSecond(NonZeroU32::new(1).unwrap()),
-        // GCS has no documented per-prefix request-rate limit, so the prefix
-        // limiter is disabled.
-        prefix_read_ps: RateLimit::Unlimited,
-        prefix_write_ps: RateLimit::Unlimited,
-        prefix_depth: 0,
+        latency: ProviderLatencyProfile {
+            meta_read: Latency::new(22, 7),
+            meta_write: Latency::new(31, 8),
+            obj_read: Latency::new(57, 7),
+            obj_write: Latency::new(70, 15),
+            list: Latency::new(10, 3),
+        },
+        rate_limits: WriteRateLimits {
+            same_obj_write_ps: RateLimit::PerSecond(NonZeroU32::new(1).unwrap()),
+            same_obj_write_retry_delay: Duration::from_millis(140),
+            // GCS has no documented per-prefix request-rate limit, so the
+            // prefix limiter is disabled.
+            prefix_read_ps: RateLimit::Unlimited,
+            prefix_write_ps: RateLimit::Unlimited,
+            prefix_depth: 0,
+        },
     }
 }
 
@@ -41,23 +46,38 @@ pub fn gcs_delays() -> DelayOptions {
 /// partitioned prefix before returning `503 SlowDown`).
 pub fn s3_delays() -> DelayOptions {
     DelayOptions {
-        meta_read: Latency::new(21, 9),
-        meta_write: Latency::new(75, 19),
-        obj_read: Latency::new(22, 9),
-        obj_write: Latency::new(55, 18),
-        list: Latency::new(22, 8),
-        same_obj_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
-        prefix_read_ps: RateLimit::PerSecond(NonZeroU32::new(5500).unwrap()),
-        prefix_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
-        prefix_depth: 2,
+        latency: ProviderLatencyProfile {
+            meta_read: Latency::new(21, 9),
+            meta_write: Latency::new(75, 19),
+            obj_read: Latency::new(22, 9),
+            obj_write: Latency::new(55, 18),
+            list: Latency::new(22, 8),
+        },
+        rate_limits: WriteRateLimits {
+            same_obj_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
+            same_obj_write_retry_delay: Duration::from_millis(110),
+            prefix_read_ps: RateLimit::PerSecond(NonZeroU32::new(5500).unwrap()),
+            prefix_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
+            prefix_depth: 2,
+        },
     }
 }
 
 /// The mean and standard deviation of an operation's duration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Latency {
     pub mean: Duration,
     pub std_dev: Duration,
+}
+
+/// Latencies observed for each type of provider operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderLatencyProfile {
+    pub meta_read: Latency,
+    pub meta_write: Latency,
+    pub obj_read: Latency,
+    pub obj_write: Latency,
+    pub list: Latency,
 }
 
 impl Latency {
@@ -79,16 +99,13 @@ pub enum RateLimit {
     PerSecond(NonZeroU32),
 }
 
-/// Configures simulated latency for each type of backend operation.
-#[derive(Debug, Clone, Copy)]
-pub struct DelayOptions {
-    pub meta_read: Latency,
-    pub meta_write: Latency,
-    pub obj_read: Latency,
-    pub obj_write: Latency,
-    pub list: Latency,
+/// Configures provider write and shared-prefix request-rate limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteRateLimits {
     /// Caps writes to the same object.
     pub same_obj_write_ps: RateLimit,
+    /// Delay before retrying when the same-object write limit is exceeded.
+    pub same_obj_write_retry_delay: Duration,
     /// Caps the GET/HEAD request rate against a shared key prefix, modeling
     /// S3's documented per-prefix request-rate limit. A request that would
     /// exceed the rate is delayed (not failed) until the bucket refills, so the
@@ -103,6 +120,13 @@ pub struct DelayOptions {
     /// each immediate subtree independently). Ignored when both prefix limits
     /// are unlimited.
     pub prefix_depth: usize,
+}
+
+/// Configures simulated provider latency and rate limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelayOptions {
+    pub latency: ProviderLatencyProfile,
+    pub rate_limits: WriteRateLimits,
 }
 
 /// An invalid combination of delay and rate-limit options.
@@ -133,11 +157,15 @@ impl DelayBackend {
     /// Wraps `inner`, simulating the latencies described by `opts`.
     ///
     /// The conditional-only trait (ADR-042) has no metadata-only operations, so
-    /// `opts.meta_read` / `opts.meta_write` are unused; they remain in
-    /// [`DelayOptions`] only for config-shape stability.
+    /// `opts.latency.meta_read` / `opts.latency.meta_write` are unused here;
+    /// fake provider servers consume them from the shared latency profile.
     pub fn new(inner: Arc<dyn Backend>, opts: DelayOptions) -> Result<Self, DelayOptionsError> {
-        let retry_delay = opts.obj_write.mean.saturating_mul(2);
-        let rlimit = match opts.same_obj_write_ps {
+        let DelayOptions {
+            latency,
+            rate_limits,
+        } = opts;
+        let retry_delay = rate_limits.same_obj_write_retry_delay;
+        let rlimit = match rate_limits.same_obj_write_ps {
             RateLimit::Unlimited => None,
             RateLimit::PerSecond(rate) => {
                 if retry_delay.is_zero() {
@@ -149,12 +177,18 @@ impl DelayBackend {
 
         Ok(DelayBackend {
             inner,
-            obj_read: Lognormal::from_latency(opts.obj_read),
-            obj_write: Lognormal::from_latency(opts.obj_write),
-            list: Lognormal::from_latency(opts.list),
+            obj_read: Lognormal::from_latency(latency.obj_read),
+            obj_write: Lognormal::from_latency(latency.obj_write),
+            list: Lognormal::from_latency(latency.list),
             rlimit,
-            prefix_reads: PrefixLimiter::from_limit(opts.prefix_read_ps, opts.prefix_depth)?,
-            prefix_writes: PrefixLimiter::from_limit(opts.prefix_write_ps, opts.prefix_depth)?,
+            prefix_reads: PrefixLimiter::from_limit(
+                rate_limits.prefix_read_ps,
+                rate_limits.prefix_depth,
+            )?,
+            prefix_writes: PrefixLimiter::from_limit(
+                rate_limits.prefix_write_ps,
+                rate_limits.prefix_depth,
+            )?,
         })
     }
 
