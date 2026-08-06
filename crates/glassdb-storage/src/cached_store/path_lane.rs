@@ -7,8 +7,8 @@ use glassdb_concurr::shard::Sharded;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::knowledge::FetchResult;
+use super::persistent_bridge::PersistentPath;
 use super::{Requirement, satisfies};
-use crate::disk_cache::PathFence;
 use crate::error::StorageError;
 use crate::timeline::SequencePoint;
 
@@ -73,7 +73,7 @@ impl PathCoordinator {
             coordinator: Arc::downgrade(&self.paths),
             gate: Arc::new(Semaphore::new(1)),
             flight: Mutex::new(None),
-            l2_fence: Arc::new(PathFence::default()),
+            persistent: PersistentPath::default(),
         });
         paths.insert(path.clone(), Arc::downgrade(&state));
         state
@@ -129,12 +129,12 @@ pub(super) struct PathState {
     coordinator: Weak<PathMap>,
     gate: Arc<Semaphore>,
     flight: Mutex<Option<Arc<InFlight>>>,
-    l2_fence: Arc<PathFence>,
+    persistent: PersistentPath,
 }
 
 impl PathState {
-    pub(super) fn l2_fence(&self) -> &Arc<PathFence> {
-        &self.l2_fence
+    pub(super) fn persistent(&self) -> &PersistentPath {
+        &self.persistent
     }
 }
 

@@ -30,23 +30,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use glassdb_backend::{self as backend, Backend, BackendError};
-use glassdb_concurr::rt;
-
 use crate::cache_stats::{CacheMetrics, CacheStats};
-use crate::disk_cache::{EncodedBody, FenceGuard, PersistentCache};
+use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
 use crate::timeline::{SequencePoint, Timeline};
+use glassdb_backend::{self as backend, Backend, BackendError};
 
 mod knowledge;
 mod mutation;
 mod path_lane;
+mod persistent_bridge;
 
 use knowledge::{FetchResult, Knowledge, PresentSeed};
 use mutation::{MutationOutcome, MutationRound};
 use path_lane::{FlightOutcome, PathCoordinator, PathState, ReadAdmission};
-
-const PERSISTENT_CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+use persistent_bridge::PersistentBridge;
 
 /// Encoding, decoding, and decoded-size accounting for one physical object type.
 ///
@@ -274,7 +272,7 @@ pub struct CachedStore {
     body_reads: Arc<AtomicU64>,
     coordinator: PathCoordinator,
     metrics: Arc<CacheMetrics>,
-    persistent: Option<PersistentCache>,
+    persistent: PersistentBridge,
 }
 
 impl CachedStore {
@@ -289,9 +287,9 @@ impl CachedStore {
         timeline: Timeline,
         persistent: Option<PersistentCache>,
     ) -> Self {
+        let persistent = PersistentBridge::new(persistent);
         let metrics = persistent
-            .as_ref()
-            .map(PersistentCache::metrics)
+            .metrics()
             .unwrap_or_else(|| Arc::new(CacheMetrics::new()));
         CachedStore {
             backend,
@@ -319,9 +317,7 @@ impl CachedStore {
 
     /// Drains and syncs the persistent cache, when configured.
     pub async fn shutdown(&self) {
-        if let Some(persistent) = &self.persistent {
-            persistent.shutdown().await;
-        }
+        self.persistent.shutdown().await;
     }
 
     pub(crate) fn typed<C: Codec>(&self) -> TypedCachedStore<C> {
@@ -544,11 +540,9 @@ impl CachedStore {
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
         let observed = self.knowledge.peek::<C>(path, req)?;
-        if observed.as_ref().is_some_and(Observation::exists)
-            && let Some(persistent) = &self.persistent
-        {
+        if observed.as_ref().is_some_and(Observation::exists) && self.persistent.is_configured() {
             let state = self.coordinator.state(path);
-            persistent.record_present_hit(path, state.l2_fence(), state.clone());
+            self.persistent.record_present_hit(path, &state);
         }
         Ok(observed)
     }
@@ -580,7 +574,10 @@ impl CachedStore {
                     let state = permit.state().clone();
                     let mut seed = self.knowledge.present_seed::<C>(path, fallback)?;
                     if seed.is_none()
-                        && let Some(persistent_seed) = self.load_l2::<C>(path, &state).await
+                        && let Some(persistent_seed) = self
+                            .persistent
+                            .load::<C>(&self.knowledge, path, &state)
+                            .await
                     {
                         if req == Requirement::Any {
                             return Ok(self.knowledge.result_from_seed(persistent_seed, true));
@@ -598,75 +595,6 @@ impl CachedStore {
                 }
             }
         }
-    }
-
-    async fn load_l2<C: Codec>(
-        &self,
-        path: &Arc<str>,
-        state: &Arc<PathState>,
-    ) -> Option<PresentSeed> {
-        let persistent = self.persistent.clone()?;
-        if state.l2_fence().is_active() || !persistent.is_enabled() {
-            return None;
-        }
-        let encoded = match rt::timeout(
-            PERSISTENT_CACHE_LOOKUP_TIMEOUT,
-            persistent.lookup(path.clone()),
-        )
-        .await
-        {
-            Ok(encoded) => encoded?,
-            Err(_) => {
-                persistent.disable_slow_lookup();
-                return None;
-            }
-        };
-        self.decode_l2::<C>(path, state, persistent, encoded)
-    }
-
-    fn decode_l2<C: Codec>(
-        &self,
-        path: &Arc<str>,
-        state: &Arc<PathState>,
-        persistent: PersistentCache,
-        encoded: EncodedBody,
-    ) -> Option<PresentSeed> {
-        let token = match String::from_utf8(encoded.revision) {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::warn!(path = %path, %error, "discarding invalid persistent-cache revision");
-                persistent.reject_corrupt_candidate(
-                    path.clone(),
-                    state.l2_fence().clone(),
-                    state.clone(),
-                );
-                return None;
-            }
-        };
-        let decoded = match C::decode(path, &encoded.body) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::warn!(path = %path, %error, "discarding undecodable persistent-cache body");
-                persistent.reject_corrupt_candidate(
-                    path.clone(),
-                    state.l2_fence().clone(),
-                    state.clone(),
-                );
-                return None;
-            }
-        };
-        let size = C::size(&decoded);
-        let value = Arc::new(decoded);
-        let revision = Revision(backend::Version::new(token));
-        let seed = self.knowledge.install_persistent::<C>(
-            path,
-            value,
-            size,
-            revision,
-            encoded.current_after,
-        );
-        persistent.record_present_hit(path, state.l2_fence(), state.clone());
-        Some(seed)
     }
 
     /// Runs one backend read for a path: a version-conditional check when
@@ -714,28 +642,20 @@ impl CachedStore {
         let decoded = match C::decode(path, &bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
-                let fence = self.begin_read_fence(state);
+                let change = self.persistent.begin_change(state);
                 self.knowledge.invalidate(path);
-                self.invalidate_read_l2(Arc::from(path), fence);
+                change.invalidate(Arc::from(path));
                 return Err(error);
             }
         };
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
         let revision = Revision(version);
-        let fence = self.begin_read_fence(state);
+        let change = self.persistent.begin_change(state);
         let fetched =
             self.knowledge
                 .install_fetched::<C>(path, value, size, revision.clone(), invoked);
-        if let (Some(persistent), Some(fence)) = (&self.persistent, fence) {
-            persistent.replace(
-                Arc::from(path),
-                revision.serialize().as_bytes().to_vec(),
-                bytes,
-                invoked,
-                fence,
-            );
-        }
+        change.replace(Arc::from(path), &revision, bytes, invoked);
         Ok(fetched)
     }
 
@@ -757,22 +677,10 @@ impl CachedStore {
         invoked: SequencePoint,
         state: &Arc<PathState>,
     ) -> FetchResult {
-        let fence = self.begin_read_fence(state);
+        let change = self.persistent.begin_change(state);
         let fetched = self.knowledge.install_absent_result(path, invoked);
-        self.invalidate_read_l2(Arc::from(path), fence);
+        change.invalidate(Arc::from(path));
         fetched
-    }
-
-    fn begin_read_fence(&self, state: &Arc<PathState>) -> Option<FenceGuard> {
-        self.persistent
-            .as_ref()?
-            .begin_fence(state.l2_fence().clone(), state.clone())
-    }
-
-    fn invalidate_read_l2(&self, path: Arc<str>, fence: Option<FenceGuard>) {
-        if let (Some(persistent), Some(fence)) = (&self.persistent, fence) {
-            persistent.invalidate(path, fence);
-        }
     }
 }
 
@@ -912,6 +820,8 @@ mod tests {
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
+    #[cfg(sim)]
+    use glassdb_concurr::rt;
     use glassdb_data::DatabaseId;
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -920,7 +830,6 @@ mod tests {
     #[cfg(sim)]
     use crate::disk_cache::PathFence;
     use crate::disk_cache::PersistentCacheConfig;
-    #[cfg(sim)]
     use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
     use crate::timeline::TimeSource;
 
@@ -1115,7 +1024,6 @@ mod tests {
         (store, timeline)
     }
 
-    #[cfg(sim)]
     async fn simulated_persistent_store(
         directory: &TempDir,
         backend: Arc<dyn Backend>,
@@ -1183,12 +1091,7 @@ mod tests {
                 .unwrap();
             let erased: Arc<dyn Backend> = backend;
             let (store, _) = simulated_persistent_store(&directory, erased, media).await;
-            assert!(
-                store
-                    .persistent
-                    .as_ref()
-                    .is_some_and(|persistent| !persistent.is_enabled())
-            );
+            assert!(!store.persistent.is_enabled());
 
             let typed: TypedCachedStore<Bytes> = store.typed();
             let loaded = typed.read("p", Requirement::Any).await.unwrap();
@@ -1196,6 +1099,58 @@ mod tests {
             drop(typed);
             store.shutdown().await;
         });
+    }
+
+    #[cfg(not(sim))]
+    #[tokio::test]
+    async fn slow_persistent_lookup_falls_back_to_one_backend_read() {
+        let directory = TempDir::new().unwrap();
+        let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 0);
+        let backend = Arc::new(MemoryBackend::new());
+        backend
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
+        let recorded = Arc::new(RecordingBackend::new(backend));
+        let log = recorded.log();
+        let erased: Arc<dyn Backend> = recorded;
+
+        let (first, _) =
+            simulated_persistent_store(&directory, erased.clone(), media.clone()).await;
+        let first_typed: TypedCachedStore<Bytes> = first.typed();
+        first_typed.read("p", Requirement::Any).await.unwrap();
+        drop(first_typed);
+        first.shutdown().await;
+        drop(first);
+        clear(&log);
+
+        let (reopened, _) = simulated_persistent_store(&directory, erased, media.clone()).await;
+        assert!(reopened.persistent.is_enabled());
+        let typed: TypedCachedStore<Bytes> = reopened.typed();
+        let mut pause = media.pause_next_operation();
+        let mut read = tokio::spawn({
+            let typed = typed.clone();
+            async move { typed.read("p", Requirement::Any).await }
+        });
+        tokio::select! {
+            () = pause.wait_until_entered() => {}
+            result = &mut read => panic!("read completed before media pause: {result:?}"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let loaded = read.await.unwrap().unwrap();
+        assert_eq!(loaded.value().unwrap().as_slice(), b"one");
+        assert_eq!(reopened.body_reads(), 1);
+        assert_eq!(count(&log, "read"), 1);
+        assert_eq!(count(&log, "read_if_modified"), 0);
+        assert!(!reopened.persistent.is_enabled());
+        let stats = reopened.cache_stats_and_reset();
+        assert_eq!(stats.l2_errors, 1, "cache stats: {stats:?}");
+
+        pause.resume();
+        drop(typed);
+        reopened.shutdown().await;
     }
 
     #[cfg(sim)]
@@ -1209,6 +1164,8 @@ mod tests {
                 .write_if_not_exists("p", b"backend".to_vec())
                 .await
                 .unwrap();
+            let recorded = Arc::new(RecordingBackend::new(backend));
+            let log = recorded.log();
             let opened = PersistentCache::open_with_sim_media(
                 PersistentCacheConfig {
                     directory: directory.path().to_path_buf(),
@@ -1221,7 +1178,7 @@ mod tests {
             .await;
             let persistent = opened.cache;
             let guard = persistent
-                .begin_fence(Arc::new(PathFence::default()), Arc::new(()))
+                .begin_fence(Arc::new(PathFence::default()))
                 .unwrap();
             persistent.replace(
                 Arc::from("p"),
@@ -1231,7 +1188,7 @@ mod tests {
                 guard,
             );
 
-            let erased: Arc<dyn Backend> = backend;
+            let erased: Arc<dyn Backend> = recorded;
             let store = CachedStore::new(
                 erased,
                 1 << 20,
@@ -1241,6 +1198,9 @@ mod tests {
             let typed: TypedCachedStore<Bytes> = store.typed();
             let loaded = typed.read("p", Requirement::Any).await.unwrap();
             assert_eq!(loaded.value().unwrap().as_slice(), b"backend");
+            assert_eq!(store.body_reads(), 1);
+            assert_eq!(count(&log, "read"), 1);
+            assert_eq!(count(&log, "read_if_modified"), 0);
             assert!(store.cache_stats_and_reset().l2_errors >= 1);
             drop(typed);
             store.shutdown().await;

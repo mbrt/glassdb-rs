@@ -6,7 +6,7 @@ use glassdb_backend::BackendError;
 
 use super::knowledge::{Expected, Knowledge};
 use super::path_lane::PathPermit;
-use crate::disk_cache::{FenceGuard, PersistentCache};
+use super::persistent_bridge::{PersistentBridge, PersistentChange};
 use crate::error::StorageError;
 use crate::timeline::SequencePoint;
 
@@ -43,18 +43,18 @@ impl<T> MutationOutcome<T> {
 /// Owns one admitted mutation until its knowledge and persistent state agree.
 pub(super) struct MutationRound {
     knowledge: Knowledge,
-    persistent: Option<PersistentCache>,
+    persistent: PersistentBridge,
     path: Arc<str>,
     expected: Expected,
     permit: Option<PathPermit>,
-    l2_fence: Option<FenceGuard>,
+    persistent_change: Option<PersistentChange>,
     armed: bool,
 }
 
 impl MutationRound {
     pub(super) fn new(
         knowledge: Knowledge,
-        persistent: Option<PersistentCache>,
+        persistent: PersistentBridge,
         path: Arc<str>,
         mut expected: Expected,
         permit: PathPermit,
@@ -66,7 +66,7 @@ impl MutationRound {
             path,
             expected,
             permit: Some(permit),
-            l2_fence: None,
+            persistent_change: None,
             armed: true,
         }
     }
@@ -111,25 +111,21 @@ impl MutationRound {
     }
 
     fn begin_path_change(&mut self) {
-        if self.l2_fence.is_some() {
+        if self.persistent_change.is_some() {
             return;
         }
-        let Some(persistent) = &self.persistent else {
-            return;
-        };
         let permit = self
             .permit
             .as_ref()
             .expect("an active mutation retains its path permit");
-        let state = permit.state();
-        self.l2_fence = persistent.begin_fence(state.l2_fence().clone(), state.clone());
+        self.persistent_change = Some(self.persistent.begin_change(permit.state()));
     }
 
     fn invalidate_l2(&mut self) {
-        let (Some(persistent), Some(fence)) = (&self.persistent, self.l2_fence.take()) else {
+        let Some(change) = self.persistent_change.take() else {
             return;
         };
-        persistent.invalidate(self.path.clone(), fence);
+        change.invalidate(self.path.clone());
     }
 
     fn complete(&mut self) {
