@@ -12,10 +12,10 @@
 //! Two knobs make it useful beyond unit tests (see [`FakeS3Options`]):
 //!
 //! * **Simulated latency** — each served operation sleeps for a lognormally
-//!   distributed time derived from a [`DelayOptions`] profile (e.g.
-//!   [`s3_delays`](glassdb_backend::middleware::s3_delays)). Without it a
-//!   loopback server answers in microseconds and the connection pool is never
-//!   stressed, so the transport effects under study never appear.
+//!   distributed time derived from a [`ProviderLatencyProfile`] (e.g. the
+//!   latency in [`s3_delays`](glassdb_backend::middleware::s3_delays)). Without
+//!   it a loopback server answers in microseconds and the connection pool is
+//!   never stressed, so the transport effects under study never appear.
 //! * **Connection counting** — every accepted TCP connection bumps an optional
 //!   shared counter, giving the server-side connection-churn signal the Rust
 //!   SDK does not surface on the client side.
@@ -35,7 +35,7 @@ use aws_sdk_s3::config::{
 };
 use aws_smithy_async::time::TimeSource;
 use bytes::Bytes;
-use glassdb_backend::middleware::{DelayOptions, Latency};
+use glassdb_backend::middleware::{Latency, ProviderLatencyProfile};
 use glassdb_concurr::rt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -61,10 +61,10 @@ const LISTEN_BACKLOG: u32 = 8192;
 #[derive(Default)]
 pub struct FakeS3Options {
     /// When set, every served operation sleeps for a simulated duration derived
-    /// from this profile (e.g. [`s3_delays`](glassdb_backend::middleware::s3_delays)),
-    /// in model time. `None` serves with no added latency (the default, used by
-    /// the unit tests).
-    pub latency: Option<DelayOptions>,
+    /// from this profile (e.g. the latency in
+    /// [`s3_delays`](glassdb_backend::middleware::s3_delays)), in model time.
+    /// `None` serves with no added latency (the default, used by the unit tests).
+    pub latency: Option<ProviderLatencyProfile>,
     /// When set, every accepted TCP connection increments this counter. Lets a
     /// caller observe server-side connection churn across a measurement window.
     pub conn_counter: Option<Arc<AtomicU64>>,
@@ -131,7 +131,7 @@ impl FakeS3 {
             objects: Mutex::new(HashMap::new()),
             slow: Mutex::new(SlowDown::default()),
             lost_ack: Mutex::new(LostAck::default()),
-            latency: opts.latency.map(LatencyModel::from_opts),
+            latency: opts.latency.map(LatencyModel::from_profile),
         });
         let st = state.clone();
         let conns = opts.conn_counter.clone();
@@ -669,7 +669,7 @@ fn xml_escape(s: &str) -> String {
 // Simulated latency
 // ---------------------------------------------------------------------------
 
-/// Per-operation lognormal latency, derived from a [`DelayOptions`] profile.
+/// Per-operation lognormal latency, derived from a [`ProviderLatencyProfile`].
 /// HTTP methods are mapped to the backend operation they implement so the
 /// served latencies match the simulated `DelayBackend`.
 struct LatencyModel {
@@ -681,13 +681,13 @@ struct LatencyModel {
 }
 
 impl LatencyModel {
-    fn from_opts(o: DelayOptions) -> Self {
+    fn from_profile(profile: ProviderLatencyProfile) -> Self {
         LatencyModel {
-            get: Lognormal::from_latency(o.obj_read),
-            head: Lognormal::from_latency(o.meta_read),
-            put: Lognormal::from_latency(o.obj_write),
-            delete: Lognormal::from_latency(o.obj_write),
-            list: Lognormal::from_latency(o.list),
+            get: Lognormal::from_latency(profile.obj_read),
+            head: Lognormal::from_latency(profile.meta_read),
+            put: Lognormal::from_latency(profile.obj_write),
+            delete: Lognormal::from_latency(profile.obj_write),
+            list: Lognormal::from_latency(profile.list),
         }
     }
 

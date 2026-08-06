@@ -814,12 +814,11 @@ async fn diagnostics_returns_typed_snapshot() {
     );
 }
 
-// A committed read-write transaction returns before its write-back runs (it is
-// spawned in the background), but a graceful shutdown drains that spawned task,
-// so afterwards no transaction still holds locks — the write-back published its
-// pointers and released them.
+// Committed read-write transactions return before their write-back runs (it is
+// spawned in the background), but a graceful shutdown drains the live tasks, so
+// afterwards no transaction still holds locks.
 #[tokio::test(start_paused = true)]
-async fn shutdown_drains_background_write_back() {
+async fn shutdown_after_many_commits_drains_background_write_back() {
     let db = init_db(mem()).await;
     let coll = db
         .root_collection()
@@ -827,13 +826,15 @@ async fn shutdown_drains_background_write_back() {
         .await
         .unwrap();
 
-    let coll_ref = &coll;
-    db.tx(|tx| async move {
-        tx.write(coll_ref, b"k1", b"v1")?;
-        Ok(())
-    })
-    .await
-    .unwrap();
+    for _ in 0..256 {
+        let coll_ref = &coll;
+        db.tx(|tx| async move {
+            tx.write(coll_ref, b"k1", b"v1")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 
     db.shutdown().await;
 

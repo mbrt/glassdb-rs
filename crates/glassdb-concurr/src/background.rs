@@ -5,9 +5,10 @@
 //! drains work spawned with [`Background::spawn_waited`]. Dropping `Background`
 //! aborts every spawned task regardless of lane.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::rt;
 use tokio::sync::Notify;
@@ -20,14 +21,18 @@ struct TrackedTask {
 }
 
 impl TrackedTask {
-    fn spawn<F>(future: F) -> Self
+    fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            completion: Arc::new(TaskCompletion::new()),
+        }
+    }
+
+    fn launch<F>(&self, future: F, guard: CompletionGuard)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let cancel = CancellationToken::new();
-        let completion = Arc::new(TaskCompletion::new());
-        let guard = CompletionGuard(completion.clone());
-        let task_cancel = cancel.clone();
+        let task_cancel = self.cancel.clone();
         drop(rt::spawn(async move {
             let _guard = guard;
             tokio::select! {
@@ -36,7 +41,6 @@ impl TrackedTask {
                 _ = future => {}
             }
         }));
-        Self { cancel, completion }
     }
 
     fn cancel(&self) {
@@ -70,40 +74,94 @@ impl TaskCompletion {
             notified.await;
         }
     }
+
+    fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
-struct CompletionGuard(Arc<TaskCompletion>);
+type TaskId = u64;
+
+#[derive(Clone, Copy)]
+enum TaskLane {
+    BestEffort,
+    Waited,
+}
+
+struct CompletionGuard {
+    completion: Arc<TaskCompletion>,
+    registry: Weak<Mutex<Inner>>,
+    lane: TaskLane,
+    id: TaskId,
+}
 
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
-        self.0.done.store(true, Ordering::Release);
-        self.0.notify.notify_waiters();
+        let Some(registry) = self.registry.upgrade() else {
+            self.completion.finish();
+            return;
+        };
+
+        let mut inner = registry.lock().unwrap();
+        inner.remove(self.lane, self.id);
+        // Publishing completion under the registry lock makes removal atomic
+        // with a shutdown snapshot: shutdown either sees and waits for this task,
+        // or observes it fully completed and absent.
+        self.completion.finish();
     }
 }
 
 /// Manages a set of background tasks. When the `Background` is dropped, every
 /// tracked task is aborted; the abort fires at the task's next `.await`.
 pub struct Background {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
-    best_effort: Vec<TrackedTask>,
-    waited: Vec<TrackedTask>,
+    best_effort: BTreeMap<TaskId, TrackedTask>,
+    waited: BTreeMap<TaskId, TrackedTask>,
+    next_task_id: TaskId,
     shutting_down: bool,
     complete: bool,
+}
+
+impl Inner {
+    fn register(&mut self, lane: TaskLane, task: TrackedTask) -> TaskId {
+        let id = self.next_task_id;
+        self.next_task_id = self
+            .next_task_id
+            .checked_add(1)
+            .expect("background task ID exhausted");
+        let previous = self.tasks_mut(lane).insert(id, task);
+        debug_assert!(previous.is_none());
+        id
+    }
+
+    fn remove(&mut self, lane: TaskLane, id: TaskId) {
+        let removed = self.tasks_mut(lane).remove(&id);
+        debug_assert!(removed.is_some());
+    }
+
+    fn tasks_mut(&mut self, lane: TaskLane) -> &mut BTreeMap<TaskId, TrackedTask> {
+        match lane {
+            TaskLane::BestEffort => &mut self.best_effort,
+            TaskLane::Waited => &mut self.waited,
+        }
+    }
 }
 
 impl Background {
     /// Creates a new background task manager.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                best_effort: Vec::new(),
-                waited: Vec::new(),
+            inner: Arc::new(Mutex::new(Inner {
+                best_effort: BTreeMap::new(),
+                waited: BTreeMap::new(),
+                next_task_id: 0,
                 shutting_down: false,
                 complete: false,
-            }),
+            })),
         }
     }
 
@@ -113,11 +171,7 @@ impl Background {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.shutting_down {
-            return;
-        }
-        inner.best_effort.push(TrackedTask::spawn(f));
+        self.spawn_tracked(TaskLane::BestEffort, f);
     }
 
     /// Spawns `f` as clean-shutdown work. The task runs to completion and
@@ -127,11 +181,7 @@ impl Background {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.shutting_down {
-            return;
-        }
-        inner.waited.push(TrackedTask::spawn(f));
+        self.spawn_tracked(TaskLane::Waited, f);
     }
 
     /// Closes task admission, aborts and joins best-effort tasks, and waits for
@@ -144,7 +194,10 @@ impl Background {
             if inner.complete {
                 return;
             }
-            (inner.best_effort.clone(), inner.waited.clone())
+            (
+                inner.best_effort.values().cloned().collect::<Vec<_>>(),
+                inner.waited.values().cloned().collect::<Vec<_>>(),
+            )
         };
 
         for task in &best_effort {
@@ -157,7 +210,38 @@ impl Background {
             task.wait().await;
         }
 
-        self.inner.lock().unwrap().complete = true;
+        let mut inner = self.inner.lock().unwrap();
+        debug_assert!(inner.best_effort.is_empty());
+        debug_assert!(inner.waited.is_empty());
+        inner.complete = true;
+    }
+
+    fn spawn_tracked<F>(&self, lane: TaskLane, f: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (id, task) = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.shutting_down {
+                return;
+            }
+            let task = TrackedTask::new();
+            let id = inner.register(lane, task.clone());
+            (id, task)
+        };
+        let guard = CompletionGuard {
+            completion: task.completion.clone(),
+            registry: Arc::downgrade(&self.inner),
+            lane,
+            id,
+        };
+        task.launch(f, guard);
+    }
+
+    #[cfg(test)]
+    fn live_task_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.best_effort.len(), inner.waited.len())
     }
 }
 
@@ -169,8 +253,8 @@ impl Default for Background {
 
 impl Drop for Background {
     fn drop(&mut self) {
-        let inner = self.inner.get_mut().unwrap();
-        for task in inner.best_effort.iter().chain(inner.waited.iter()) {
+        let inner = self.inner.lock().unwrap();
+        for task in inner.best_effort.values().chain(inner.waited.values()) {
             task.cancel();
         }
     }
@@ -181,6 +265,30 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tokio::sync::oneshot;
+
+    const TASKS_PER_LANE: usize = 2_048;
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    async fn wait_for_live_task_counts(background: &Background, expected: (usize, usize)) {
+        for _ in 0..100 {
+            if background.live_task_counts() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(background.live_task_counts(), expected);
+    }
 
     #[tokio::test]
     async fn spawned_task_runs() {
@@ -198,6 +306,20 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(ran.load(Ordering::SeqCst));
+        wait_for_live_task_counts(&b, (0, 0)).await;
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_are_pruned_from_both_lanes() {
+        let b = Background::new();
+
+        for _ in 0..TASKS_PER_LANE {
+            b.spawn(async {});
+            wait_for_live_task_counts(&b, (0, 0)).await;
+
+            b.spawn_waited(async {});
+            wait_for_live_task_counts(&b, (0, 0)).await;
+        }
     }
 
     #[tokio::test]
@@ -213,6 +335,7 @@ mod tests {
         b.shutdown().await;
 
         assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(b.live_task_counts(), (0, 0));
     }
 
     #[tokio::test]
@@ -239,6 +362,7 @@ mod tests {
 
         assert!(!done.load(Ordering::SeqCst));
         assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(b.live_task_counts(), (0, 0));
     }
 
     #[tokio::test]
@@ -260,30 +384,84 @@ mod tests {
         });
 
         assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(b.live_task_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn shutdown_handles_completion_before_during_and_after_start() {
+        let b = Arc::new(Background::new());
+
+        let (before_finished, before_done) = oneshot::channel();
+        b.spawn_waited(async move {
+            let _ = before_finished.send(());
+        });
+        before_done.await.unwrap();
+        wait_for_live_task_counts(&b, (0, 0)).await;
+
+        let (best_effort_entered, best_effort_started) = oneshot::channel();
+        let (best_effort_dropped, best_effort_cancelled) = oneshot::channel();
+        b.spawn(async move {
+            let _drop_signal = DropSignal(Some(best_effort_dropped));
+            let _ = best_effort_entered.send(());
+            std::future::pending::<()>().await;
+        });
+        best_effort_started.await.unwrap();
+
+        let (waited_entered, waited_started) = oneshot::channel();
+        let (release_waited, waited_release) = oneshot::channel();
+        let (waited_finished, waited_done) = oneshot::channel();
+        b.spawn_waited(async move {
+            let _ = waited_entered.send(());
+            let _ = waited_release.await;
+            let _ = waited_finished.send(());
+        });
+        waited_started.await.unwrap();
+        assert_eq!(b.live_task_counts(), (1, 1));
+
+        let shutdown = tokio::spawn({
+            let b = b.clone();
+            async move { b.shutdown().await }
+        });
+
+        best_effort_cancelled.await.unwrap();
+        wait_for_live_task_counts(&b, (0, 1)).await;
+        assert!(!shutdown.is_finished());
+
+        release_waited.send(()).unwrap();
+        waited_done.await.unwrap();
+        shutdown.await.unwrap();
+        assert_eq!(b.live_task_counts(), (0, 0));
     }
 
     #[tokio::test]
     async fn cancelled_shutdown_can_be_resumed() {
         let b = Arc::new(Background::new());
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        b.spawn_waited({
-            let entered = entered.clone();
-            let release = release.clone();
-            async move {
-                entered.notify_one();
-                release.notified().await;
-            }
+        let (best_effort_entered, best_effort_started) = oneshot::channel();
+        let (best_effort_dropped, best_effort_cancelled) = oneshot::channel();
+        b.spawn(async move {
+            let _drop_signal = DropSignal(Some(best_effort_dropped));
+            let _ = best_effort_entered.send(());
+            std::future::pending::<()>().await;
         });
-        entered.notified().await;
+        best_effort_started.await.unwrap();
+
+        let (waited_entered, waited_started) = oneshot::channel();
+        let (release_waited, waited_release) = oneshot::channel();
+        b.spawn_waited(async move {
+            let _ = waited_entered.send(());
+            let _ = waited_release.await;
+        });
+        waited_started.await.unwrap();
 
         let first = tokio::spawn({
             let b = b.clone();
             async move { b.shutdown().await }
         });
-        tokio::task::yield_now().await;
+        best_effort_cancelled.await.unwrap();
+        wait_for_live_task_counts(&b, (0, 1)).await;
         first.abort();
         let _ = first.await;
+        assert_eq!(b.live_task_counts(), (0, 1));
 
         let resumed = tokio::spawn({
             let b = b.clone();
@@ -293,8 +471,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!resumed.is_finished());
-        release.notify_one();
+        release_waited.send(()).unwrap();
         resumed.await.unwrap();
+        assert_eq!(b.live_task_counts(), (0, 0));
     }
 
     #[tokio::test]

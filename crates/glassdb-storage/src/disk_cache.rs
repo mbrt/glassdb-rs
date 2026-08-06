@@ -1,6 +1,5 @@
 //! Best-effort persistent encoded-body disk cache (ADR-045, ADR-048).
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
@@ -315,11 +314,7 @@ impl PersistentCache {
         }
     }
 
-    pub(crate) fn begin_fence(
-        &self,
-        fence: Arc<PathFence>,
-        keepalive: Arc<dyn Any + Send + Sync>,
-    ) -> Option<FenceGuard> {
+    pub(crate) fn begin_fence(&self, context: Arc<dyn FenceContext>) -> Option<FenceGuard> {
         let inner = self.inner.as_ref()?;
         if !inner.shared.enabled.load(Ordering::Acquire) {
             return None;
@@ -333,12 +328,11 @@ impl PersistentCache {
             inner.disable_message("persistent-cache path-fence capacity exhausted");
             return None;
         }
-        let epoch = fence.begin();
+        let epoch = context.fence().begin();
         Some(FenceGuard {
-            fence,
+            context,
             epoch,
             active_fences: inner.shared.active_fences.clone(),
-            _keepalive: keepalive,
         })
     }
 
@@ -348,14 +342,9 @@ impl PersistentCache {
         }
     }
 
-    pub(crate) fn reject_corrupt_candidate(
-        &self,
-        path: Arc<str>,
-        fence: Arc<PathFence>,
-        keepalive: Arc<dyn Any + Send + Sync>,
-    ) {
+    pub(crate) fn reject_corrupt_candidate(&self, path: Arc<str>, context: Arc<dyn FenceContext>) {
         self.metrics.l2_error();
-        if let Some(guard) = self.begin_fence(fence, keepalive) {
+        if let Some(guard) = self.begin_fence(context) {
             self.invalidate(path, guard);
         }
     }
@@ -412,15 +401,11 @@ impl PersistentCache {
         inner.enqueue_required(Work::Invalidate { path, fence });
     }
 
-    pub(crate) fn record_present_hit(
-        &self,
-        path: &Arc<str>,
-        fence: &Arc<PathFence>,
-        keepalive: Arc<dyn Any + Send + Sync>,
-    ) {
+    pub(crate) fn record_present_hit(&self, path: &Arc<str>, context: Arc<dyn FenceContext>) {
         let Some(inner) = &self.inner else {
             return;
         };
+        let fence = context.fence();
         if !inner.shared.enabled.load(Ordering::Acquire)
             || fence.is_active()
             || u32::try_from(path.len()).is_err()
@@ -447,9 +432,8 @@ impl PersistentCache {
         }
         let _ = inner.enqueue_optional(Work::Promote {
             path: path.clone(),
-            fence: fence.clone(),
+            context,
             epoch,
-            keepalive,
         });
     }
 
@@ -659,6 +643,18 @@ pub(crate) struct PathFence {
     state: Mutex<FenceState>,
 }
 
+/// Provides the path fence and retains its semantic owner while queued L2 work
+/// can still refer to it.
+pub(crate) trait FenceContext: Send + Sync {
+    fn fence(&self) -> &PathFence;
+}
+
+impl FenceContext for PathFence {
+    fn fence(&self) -> &PathFence {
+        self
+    }
+}
+
 #[derive(Default)]
 struct FenceState {
     epoch: u64,
@@ -694,23 +690,20 @@ impl PathFence {
 }
 
 pub(crate) struct FenceGuard {
-    fence: Arc<PathFence>,
+    context: Arc<dyn FenceContext>,
     epoch: u64,
     active_fences: Arc<AtomicUsize>,
-    // Path coordination is weakly indexed. Retaining its state ensures a later
-    // operation finds this same fence until the queued change is complete.
-    _keepalive: Arc<dyn Any + Send + Sync>,
 }
 
 impl FenceGuard {
     fn is_current(&self) -> bool {
-        self.fence.snapshot() == (self.epoch, true)
+        self.context.fence().snapshot() == (self.epoch, true)
     }
 }
 
 impl Drop for FenceGuard {
     fn drop(&mut self) {
-        self.fence.finish(self.epoch);
+        self.context.fence().finish(self.epoch);
         self.active_fences.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -979,10 +972,8 @@ enum Work {
     },
     Promote {
         path: Arc<str>,
-        fence: Arc<PathFence>,
+        context: Arc<dyn FenceContext>,
         epoch: u64,
-        // Promotions need the same weak-map lifetime rule as required fences.
-        keepalive: Arc<dyn Any + Send + Sync>,
     },
     Shutdown,
 }
@@ -1753,19 +1744,17 @@ async fn run_worker(
             }
             Work::Promote {
                 path,
-                fence,
+                context,
                 epoch,
-                keepalive,
             } => {
                 shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
                 let result = if shared.enabled.load(Ordering::Acquire) {
-                    promote(&shared, &mut writer, &path, &fence, epoch).await
+                    promote(&shared, &mut writer, &path, context.fence(), epoch).await
                 } else {
                     Ok(())
                 };
                 disable_after_work_error(&shared, &result);
                 shared.promotions.lock().unwrap().remove(path.as_ref());
-                drop(keepalive);
                 result
             }
             Work::Shutdown => {
@@ -2028,7 +2017,7 @@ mod tests {
         current_after: SequencePoint,
     ) {
         let fence = Arc::new(PathFence::default());
-        let guard = cache.begin_fence(fence, Arc::new(())).unwrap();
+        let guard = cache.begin_fence(fence).unwrap();
         cache.replace(
             Arc::from(path),
             revision.to_vec(),
@@ -2342,12 +2331,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fence_guard_retains_its_semantic_context_until_release() {
+        struct TestContext {
+            fence: PathFence,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl FenceContext for TestContext {
+            fn fence(&self) -> &PathFence {
+                &self.fence
+            }
+        }
+
+        impl Drop for TestContext {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let context = Arc::new(TestContext {
+            fence: PathFence::default(),
+            dropped: dropped.clone(),
+        });
+        let guard = cache.begin_fence(context.clone()).unwrap();
+
+        drop(context);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(dropped.load(Ordering::SeqCst));
+
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn newer_path_epoch_cancels_an_older_admission() {
         let dir = TempDir::new().unwrap();
         let cache = open(&dir, id(1)).await;
         let fence = Arc::new(PathFence::default());
-        let older = cache.begin_fence(fence.clone(), Arc::new(())).unwrap();
-        let newer = cache.begin_fence(fence.clone(), Arc::new(())).unwrap();
+        let older = cache.begin_fence(fence.clone()).unwrap();
+        let newer = cache.begin_fence(fence.clone()).unwrap();
 
         cache.replace(
             Arc::from("db/object"),

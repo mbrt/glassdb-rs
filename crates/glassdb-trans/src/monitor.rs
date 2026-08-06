@@ -200,6 +200,24 @@ pub(crate) struct TxRecoveryManifest {
     pub(crate) prepared_collections: Vec<CollectionAddress>,
 }
 
+impl TxRecoveryManifest {
+    /// Extracts the durable recovery backreferences from a transaction log.
+    pub(crate) fn from_log(log: &TxLog) -> Self {
+        Self {
+            locks: log.locks.clone(),
+            collection_changes: log.collection_changes.clone(),
+            prepared_collections: log.prepared_collections.clone(),
+        }
+    }
+
+    /// Applies the durable recovery backreferences to a transaction log.
+    pub(crate) fn apply_to(self, log: &mut TxLog) {
+        log.locks = self.locks;
+        log.collection_changes = self.collection_changes;
+        log.prepared_collections = self.prepared_collections;
+    }
+}
+
 /// A transaction status known to be durable and terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxFinalStatus {
@@ -391,9 +409,7 @@ impl Monitor {
 
         let mut log = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
         if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
-            log.locks = entry.recovery.locks.clone();
-            log.collection_changes = entry.recovery.collection_changes.clone();
-            log.prepared_collections = entry.recovery.prepared_collections.clone();
+            entry.recovery.clone().apply_to(&mut log);
         }
         let res = self.set_final_log(&log).await;
 
@@ -638,9 +654,7 @@ impl Monitor {
             let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
             if let Some(current) = expected.value() {
                 tlog.writes = current.writes.clone();
-                tlog.locks = current.locks.clone();
-                tlog.collection_changes = current.collection_changes.clone();
-                tlog.prepared_collections = current.prepared_collections.clone();
+                TxRecoveryManifest::from_log(current).apply_to(&mut tlog);
             }
             let r = if expected.is_absent() {
                 self.inner.tl.set(&tlog).await
@@ -775,9 +789,7 @@ impl Monitor {
             };
             let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
             log.timestamp = Some(rt::system_now());
-            log.locks = recovery.locks;
-            log.collection_changes = recovery.collection_changes;
-            log.prepared_collections = recovery.prepared_collections;
+            recovery.apply_to(&mut log);
             let result = match last_observation.as_ref() {
                 Some(observed) => self.inner.tl.set_if(&log, observed).await,
                 None => self.inner.tl.set(&log).await,
@@ -1257,13 +1269,10 @@ impl Monitor {
             let start = rt::system_now();
             let mut tl = TxLog::new(tid.clone(), TxCommitStatus::Pending);
             tl.timestamp = Some(start);
-            // Stamp the currently-held lock set (read synchronously before the
-            // write) so the materialized pending object records its own
-            // back-references for GC (ADR-022).
+            // Stamp the current recovery back-references so the materialized
+            // pending object remains sufficient for GC (ADR-022).
             if let Some(entry) = self.shard_for(&tid).lock().unwrap().local_tx.get(&tid) {
-                tl.locks = entry.recovery.locks.clone();
-                tl.collection_changes = entry.recovery.collection_changes.clone();
-                tl.prepared_collections = entry.recovery.prepared_collections.clone();
+                entry.recovery.clone().apply_to(&mut tl);
             }
             let r = if let Some(observed) = &last_observation {
                 self.inner.tl.set_if(&tl, observed).await
@@ -1357,6 +1366,38 @@ mod tests {
         let boundary = refreshed + simulation.pending_timeout() + simulation.max_clock_skew();
         assert!(!simulation.is_expired(refreshed, boundary));
         assert!(simulation.is_expired(refreshed, boundary + Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn recovery_manifest_round_trip_preserves_non_recovery_log_fields() {
+        let id = TxId::from_bytes(b"manifest".to_vec());
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
+        let parent = CollectionAddress::root("test");
+        let created = collection_address(1);
+        let manifest = TxRecoveryManifest {
+            locks: vec![TxLock::Topology {
+                collection: parent.clone(),
+            }],
+            collection_changes: vec![TxCollectionChange {
+                parent,
+                name: b"created".to_vec(),
+                collection: created.clone(),
+                op: TxCollectionOp::Create,
+            }],
+            prepared_collections: vec![created],
+        };
+        let writes = vec![TxWriteForTest::w(&key_ref(b"key"), b"value")];
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.timestamp = Some(timestamp);
+        log.writes = writes.clone();
+
+        manifest.clone().apply_to(&mut log);
+
+        assert_eq!(TxRecoveryManifest::from_log(&log), manifest);
+        assert_eq!(log.id, id);
+        assert_eq!(log.status, TxCommitStatus::Ok);
+        assert_eq!(log.timestamp, Some(timestamp));
+        assert_eq!(log.writes, writes);
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {

@@ -113,8 +113,7 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
             }
             1 => {
                 if let Some(current) = cache.as_ref()
-                    && let Some(guard) =
-                        current.begin_fence(Arc::new(PathFence::default()), Arc::new(()))
+                    && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
                 {
                     let sequence_point = next_sequence_point;
                     next_sequence_point = next_sequence_point.saturating_add(1);
@@ -172,8 +171,7 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
             }
             3 => {
                 if let Some(current) = cache.as_ref()
-                    && let Some(guard) =
-                        current.begin_fence(Arc::new(PathFence::default()), Arc::new(()))
+                    && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
                 {
                     current.invalidate(path(command.path), guard);
                 }

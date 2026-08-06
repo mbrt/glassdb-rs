@@ -68,7 +68,7 @@ async fn init_backend(kind: &str) -> Result<Arc<dyn Backend>, Box<dyn Error>> {
         "memory" => Ok(Arc::new(DelayBackend::new(
             Arc::new(MemoryBackend::new()),
             gcs_delays(),
-        ))),
+        )?)),
         "s3" => {
             let bucket = env_var("BUCKET")?;
             let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
