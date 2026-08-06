@@ -35,8 +35,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore, SplitPolicy,
-    StorageError,
+    LeafObservation, LoadedLeaf, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
+    SplitPolicy, StorageError,
 };
 
 use crate::error::TransError;
@@ -376,7 +376,284 @@ fn shard_members(batch: &BatchHandle<CasReq, TransError>) -> BTreeMap<TxId, Shar
     batch.merged().members
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Participation {
+    Skipped,
+    Staged,
+}
+
+struct MemberFold {
+    id: TxId,
+    outcome: FoldOutcome,
+    participation: Participation,
+}
+
+struct FoldPlan {
+    entries: BTreeMap<Vec<u8>, ShardEntry>,
+    locks: NodeLocks,
+    members: Vec<MemberFold>,
+}
+
+impl FoldPlan {
+    fn staged_ids(&self) -> impl Iterator<Item = &TxId> {
+        self.members.iter().filter_map(|member| {
+            (member.participation == Participation::Staged).then_some(&member.id)
+        })
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.participation == Participation::Staged)
+    }
+}
+
+struct ProposedStage {
+    entries: Vec<(Vec<u8>, ShardEntry)>,
+    locks: NodeLocks,
+    admission: StageAdmission,
+    outcome: FoldOutcome,
+}
+
+enum CapacityDecision {
+    Admitted(ProposedStage),
+    Rejected(FoldOutcome),
+}
+
+enum PersistResult {
+    Landed,
+    PreconditionMiss,
+    InDoubt(BTreeSet<TxId>),
+}
+
 impl CasWorker {
+    /// Builds the ordered mutation plan for one loaded shard attempt.
+    async fn fold_round(
+        &self,
+        path: &str,
+        loaded: &LoadedLeaf,
+        members: &BTreeMap<TxId, ShardMember>,
+        requirement: Requirement,
+        reloaded: bool,
+        in_doubt: &BTreeSet<TxId>,
+    ) -> Result<FoldPlan, TransError> {
+        let mut plan = FoldPlan {
+            entries: loaded
+                .entries
+                .entries()
+                .cloned()
+                .map(|e| (e.key.clone(), e))
+                .collect(),
+            locks: loaded.locks.clone(),
+            members: Vec::with_capacity(members.len()),
+        };
+
+        // Oldest-first ordering makes the fold monotonic: a later member cannot
+        // wound a member whose stage it has already observed (ADR-028).
+        let mut ordered: Vec<(&TxId, &ShardMember)> = members.iter().collect();
+        ordered.sort_by(|(a, _), (b, _)| fold_order(a, b));
+        // A logless stage is its commit's only evidence, so another member may
+        // not overwrite it before the shared CAS (ADR-051).
+        let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for (tx, member) in ordered {
+            let member_in_doubt = in_doubt.contains(tx);
+            let ctx = ResolveCtx {
+                key_state: &self.core.key_state,
+                tmon: &self.core.tmon,
+                requirement,
+                cause: if reloaded {
+                    ReloadCause::Reloaded {
+                        in_doubt: member_in_doubt,
+                    }
+                } else {
+                    ReloadCause::Fresh
+                },
+            };
+
+            let needs_reroute = member
+                .resolver
+                .owned_keys()
+                .iter()
+                .any(|&key| !loaded.owns(key));
+            if needs_reroute {
+                plan.members.push(MemberFold {
+                    id: tx.clone(),
+                    outcome: member.resolver.reroute_outcome(member_in_doubt),
+                    participation: Participation::Skipped,
+                });
+                continue;
+            }
+            let logless_conflict = member
+                .resolver
+                .logless_keys()
+                .iter()
+                .any(|&key| logless.contains(key));
+            if logless_conflict {
+                plan.members.push(MemberFold {
+                    id: tx.clone(),
+                    outcome: member.resolver.excluded_outcome(member_in_doubt),
+                    participation: Participation::Skipped,
+                });
+                continue;
+            }
+
+            let step = member
+                .resolver
+                .resolve(&ctx, &plan.entries, &plan.locks)
+                .await?;
+            match step {
+                Step::Stage {
+                    entries: changes,
+                    locks,
+                    admission,
+                    outcome,
+                } => {
+                    let proposed = ProposedStage {
+                        entries: changes,
+                        locks,
+                        admission,
+                        outcome,
+                    };
+                    match self.capacity_decision(
+                        path,
+                        loaded,
+                        member.resolver.as_ref(),
+                        member_in_doubt,
+                        &plan.entries,
+                        proposed,
+                    )? {
+                        CapacityDecision::Admitted(proposed) => {
+                            for (key, entry) in proposed.entries {
+                                plan.entries.insert(key, entry);
+                            }
+                            logless.extend(
+                                member
+                                    .resolver
+                                    .logless_keys()
+                                    .into_iter()
+                                    .map(<[u8]>::to_vec),
+                            );
+                            plan.locks = proposed.locks;
+                            plan.members.push(MemberFold {
+                                id: tx.clone(),
+                                outcome: proposed.outcome,
+                                participation: Participation::Staged,
+                            });
+                        }
+                        CapacityDecision::Rejected(outcome) => {
+                            plan.members.push(MemberFold {
+                                id: tx.clone(),
+                                outcome,
+                                participation: Participation::Skipped,
+                            });
+                        }
+                    }
+                }
+                Step::Skip { outcome } => plan.members.push(MemberFold {
+                    id: tx.clone(),
+                    outcome,
+                    participation: Participation::Skipped,
+                }),
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Classifies whether one proposed member stage fits the loaded leaf.
+    fn capacity_decision(
+        &self,
+        path: &str,
+        loaded: &LoadedLeaf,
+        resolver: &dyn ShardResolver,
+        in_doubt: bool,
+        entries: &BTreeMap<Vec<u8>, ShardEntry>,
+        proposed: ProposedStage,
+    ) -> Result<CapacityDecision, TransError> {
+        let mut candidate_entries = entries.clone();
+        for (key, entry) in &proposed.entries {
+            candidate_entries.insert(key.clone(), entry.clone());
+        }
+        let candidate_shard = Shard::from_entries(
+            candidate_entries
+                .values()
+                .filter(|entry| !entry.is_vestigial())
+                .cloned(),
+        );
+        let mut candidate_node = loaded.node().clone();
+        candidate_node.set_leaf(candidate_shard.clone())?;
+        candidate_node.set_locks(proposed.locks.clone());
+        let create_full = proposed.admission == StageAdmission::AddsKey
+            && candidate_node.content_encoded_len() > self.core.policy.content_limit();
+        let inline_entry_full = proposed.admission == StageAdmission::InlinePublication
+            && proposed
+                .entries
+                .iter()
+                .any(|(_, entry)| !self.core.policy.entry_fits_split_budget(entry));
+        if candidate_node.encoded_len() <= self.core.policy.node_max_bytes
+            && !create_full
+            && !inline_entry_full
+        {
+            return Ok(CapacityDecision::Admitted(proposed));
+        }
+
+        // Splitting cannot make an intrinsically oversized entry fit. The
+        // direct publisher falls back to an external value instead.
+        if !inline_entry_full {
+            self.core.hinter.observe_leaf(path, &candidate_shard);
+        }
+        let outcome = if proposed.admission == StageAdmission::AddsKey {
+            FoldOutcome::LeafFull
+        } else if in_doubt {
+            resolver.exhausted_outcome(true)
+        } else {
+            FoldOutcome::Conflict
+        };
+        Ok(CapacityDecision::Rejected(outcome))
+    }
+
+    /// Persists one fold plan and classifies what happened to its staged members.
+    async fn persist(
+        &self,
+        path: &str,
+        loaded: &LoadedLeaf,
+        plan: &mut FoldPlan,
+    ) -> Result<PersistResult, TransError> {
+        if !plan.is_dirty() {
+            return Ok(PersistResult::Landed);
+        }
+
+        // Drop entries a member left vestigial (no holder, no
+        // `current_writer`): they name no transaction and are
+        // indistinguishable from absent, so pruning them here — in the
+        // same CAS that clears the last holder — keeps shards tidy on
+        // every path (acquire / write-back / release, ADR-029) instead
+        // of leaving dead entries for a later GC cycle.
+        let new_shard = Shard::from_entries(
+            std::mem::take(&mut plan.entries)
+                .into_values()
+                .filter(|entry| !entry.is_vestigial()),
+        );
+        match self
+            .core
+            .shards
+            .store_leaf(path, &new_shard, &plan.locks, &loaded.observation)
+            .await
+        {
+            // Hint the background splitter if this write left the leaf
+            // over the soft cap (ADR-031); the splitter reloads and
+            // re-checks, so a spurious hint only costs one load.
+            Ok(true) => {
+                self.core.hinter.observe_leaf(path, &new_shard);
+                Ok(PersistResult::Landed)
+            }
+            Ok(false) => Ok(PersistResult::PreconditionMiss),
+            Err(StorageError::Unavailable(_)) => {
+                Ok(PersistResult::InDoubt(plan.staged_ids().cloned().collect()))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Drives one merged shard round: load once, fold every member's resolver
     /// (threading the staged entries), CAS once, and deposit each member's
     /// outcome. A member that stages nothing (e.g. it must wait) is delivered its
@@ -452,177 +729,32 @@ impl CasWorker {
             // one. A cache-served first attempt still folds every current member
             // over the cached leaf; the CAS arbitrates if that leaf was stale.
             let members = shard_members(batch);
-            let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-                .entries
-                .entries()
-                .cloned()
-                .map(|e| (e.key.clone(), e))
-                .collect();
-            let mut locks = loaded.locks.clone();
+            let mut plan = self
+                .fold_round(
+                    path,
+                    &loaded,
+                    &members,
+                    first_requirement,
+                    reloaded,
+                    &in_doubt,
+                )
+                .await?;
 
-            // Fold every member's resolver over the shared entry set, threading
-            // the staged changes: resolver N observes the entries as staged by
-            // resolvers 1..N (ADR-028 contract 1/2). Members are visited in
-            // monotonic wound-wait order (oldest first, byte tiebreak) so that on
-            // a same-key conflict the older member stages its lock and the
-            // younger, observing that live staged holder it cannot wound, emits
-            // `Wait` — never backtracking (ADR-028 contract 1).
-            let mut ordered: Vec<(&TxId, &ShardMember)> = members.iter().collect();
-            ordered.sort_by(|(a, _), (b, _)| fold_order(a, b));
-            let mut results: Vec<(TxId, FoldOutcome, bool)> = Vec::with_capacity(members.len());
-            let mut staged = false;
-            // Keys already claimed by a logless commit staged this round
-            // (ADR-051). Reset per attempt: a re-fold re-runs every member.
-            let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
-            for (tx, m) in ordered {
-                let ctx = ResolveCtx {
-                    key_state: &self.core.key_state,
-                    tmon: &self.core.tmon,
-                    // Resolver dependencies belong to the logical round, not the
-                    // cache seed used after a failed CAS. Preserve the submitters'
-                    // bound even when the leaf reload itself may use `Any`.
-                    requirement: first_requirement,
-                    cause: if reloaded {
-                        ReloadCause::Reloaded {
-                            in_doubt: in_doubt.contains(tx),
-                        }
-                    } else {
-                        ReloadCause::Fresh
-                    },
-                };
-                // Ownership re-check (ADR-031): a split may have moved one of this
-                // member's keys to a right sibling after it was routed here.
-                // Mutating this leaf would strand the key, so deliver the
-                // member's re-route outcome — the same signal it uses to
-                // re-descend after exhausting the CAS budget (an acquirer's
-                // `Conflict` release-and-relock, a direct commit's `Moved`) —
-                // and fold nothing for it. Its caller re-resolves through the
-                // directory and re-submits on the leaf that now owns the key.
-                if m.resolver.owned_keys().iter().any(|&k| !loaded.owns(k)) {
-                    let outcome = m.resolver.reroute_outcome(in_doubt.contains(tx));
-                    results.push((tx.clone(), outcome, false));
+            let persist_result = self.persist(path, &loaded, &mut plan).await?;
+            match persist_result {
+                PersistResult::Landed => {}
+                // This CAS definitely did not land, but an earlier in-doubt CAS
+                // might have, so leave the members it carried marked.
+                PersistResult::PreconditionMiss => {
+                    reloaded = true;
                     continue;
                 }
-                // A logless commit's staged entry is the only evidence it ever
-                // ran, so a second one on the same key would erase the first
-                // within one uncertain write (ADR-051). Fold nothing for it: it
-                // learns it did not land, and because the claim proves it staged
-                // nothing this attempt, it learns that definitively (ADR-053).
-                if m.resolver
-                    .logless_keys()
-                    .iter()
-                    .any(|&k| logless.contains(k))
-                {
-                    let outcome = m.resolver.excluded_outcome(in_doubt.contains(tx));
-                    results.push((tx.clone(), outcome, false));
+                // Re-folding over a freshly-read shard is idempotent. Only the
+                // members this uncertain CAS actually carried inherit its doubt.
+                PersistResult::InDoubt(staged_ids) => {
+                    in_doubt.extend(staged_ids);
+                    reloaded = true;
                     continue;
-                }
-                match m.resolver.resolve(&ctx, &entries, &locks).await? {
-                    Step::Stage {
-                        entries: changes,
-                        locks: changed_locks,
-                        admission,
-                        outcome,
-                    } => {
-                        let mut candidate_entries = entries.clone();
-                        for (key, entry) in &changes {
-                            candidate_entries.insert(key.clone(), entry.clone());
-                        }
-                        let candidate_shard = Shard::from_entries(
-                            candidate_entries
-                                .values()
-                                .filter(|entry| !entry.is_vestigial())
-                                .cloned(),
-                        );
-                        let mut candidate_node = loaded.node().clone();
-                        candidate_node.set_leaf(candidate_shard.clone())?;
-                        candidate_node.set_locks(changed_locks.clone());
-                        let create_full = admission == StageAdmission::AddsKey
-                            && candidate_node.content_encoded_len()
-                                > self.core.policy.content_limit();
-                        let inline_entry_full = admission == StageAdmission::InlinePublication
-                            && changes
-                                .iter()
-                                .any(|(_, entry)| !self.core.policy.entry_fits_split_budget(entry));
-                        if candidate_node.encoded_len() > self.core.policy.node_max_bytes
-                            || create_full
-                            || inline_entry_full
-                        {
-                            // Splitting cannot make an intrinsically oversized
-                            // entry fit. The direct publisher falls back to an
-                            // external value, which shrinks it instead.
-                            if !inline_entry_full {
-                                self.core.hinter.observe_leaf(path, &candidate_shard);
-                            }
-                            let outcome = if admission == StageAdmission::AddsKey {
-                                FoldOutcome::LeafFull
-                            } else if in_doubt.contains(tx) {
-                                // Capacity can become the first visible reason
-                                // to abandon a member after its earlier CAS was
-                                // uncertain. Preserve that member's ambiguity.
-                                m.resolver.exhausted_outcome(true)
-                            } else {
-                                FoldOutcome::Conflict
-                            };
-                            results.push((tx.clone(), outcome, false));
-                            continue;
-                        }
-                        for (key, entry) in changes {
-                            entries.insert(key, entry);
-                        }
-                        logless.extend(m.resolver.logless_keys().into_iter().map(<[u8]>::to_vec));
-                        locks = changed_locks;
-                        staged = true;
-                        results.push((tx.clone(), outcome, true));
-                    }
-                    Step::Skip { outcome } => results.push((tx.clone(), outcome, false)),
-                }
-            }
-
-            if staged {
-                // Drop entries a member left vestigial (no holder, no
-                // `current_writer`): they name no transaction and are
-                // indistinguishable from absent, so pruning them here — in the
-                // same CAS that clears the last holder — keeps shards tidy on
-                // every path (acquire / write-back / release, ADR-029) instead
-                // of leaving dead entries for a later GC cycle.
-                let new_shard = glassdb_storage::Shard::from_entries(
-                    entries.into_values().filter(|e| !e.is_vestigial()),
-                );
-                match self
-                    .core
-                    .shards
-                    .store_leaf(path, &new_shard, &locks, &loaded.observation)
-                    .await
-                {
-                    // Hint the background splitter if this write left the leaf
-                    // over the soft cap (ADR-031); the splitter reloads and
-                    // re-checks, so a spurious hint only costs one load.
-                    Ok(true) => self.core.hinter.observe_leaf(path, &new_shard),
-                    // Precondition: the shard changed under us; reload and
-                    // re-fold. This CAS definitely did not land, but an *earlier*
-                    // in-doubt CAS this round might have, so leave the members it
-                    // carried marked rather than clearing them.
-                    Ok(false) => {
-                        reloaded = true;
-                        continue;
-                    }
-                    // In-doubt lock CAS (ADR-009): re-folding our own resolvers
-                    // over a freshly-read shard is idempotent, so recover in place
-                    // by reloading and re-folding. A direct commit must treat a
-                    // subsequent move as irreducibly in-doubt (ADR-051) — but only
-                    // the members this CAS actually carried.
-                    Err(StorageError::Unavailable(_)) => {
-                        in_doubt.extend(
-                            results
-                                .iter()
-                                .filter(|(_, _, member_staged)| *member_staged)
-                                .map(|(tx, _, _)| tx.clone()),
-                        );
-                        reloaded = true;
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -631,11 +763,12 @@ impl CasWorker {
             // happens-before the dedup delivers to the caller. Recording the held
             // lock is the caller's job (the [`Locker`](crate::tlocker::Locker)), done when
             // it observes its own `Locked` outcome.
-            for (tx, outcome, member_staged) in results {
-                if let Some(m) = members.get(&tx) {
+            for member in plan.members {
+                if let Some(m) = members.get(&member.id) {
                     *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                        outcome,
-                        cas_precondition: member_staged.then(|| loaded.observation.clone()),
+                        outcome: member.outcome,
+                        cas_precondition: (member.participation == Participation::Staged)
+                            .then(|| loaded.observation.clone()),
                     });
                 }
             }
@@ -976,6 +1109,26 @@ mod tests {
             .entries
     }
 
+    fn test_member(resolver: Arc<dyn ShardResolver>) -> ShardMember {
+        ShardMember {
+            resolver,
+            slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn cas_worker(coord: &ShardCoordinator) -> CasWorker {
+        CasWorker {
+            core: coord.inner.core.clone(),
+        }
+    }
+
+    fn planned_member<'a>(plan: &'a FoldPlan, id: &TxId) -> &'a MemberFold {
+        plan.members
+            .iter()
+            .find(|member| &member.id == id)
+            .expect("the fold plans every member")
+    }
+
     // Stages a write lock for `tx` on `key`, preserving any fields already staged.
     struct StageLock {
         key: Vec<u8>,
@@ -1148,6 +1301,223 @@ mod tests {
         fn observe_leaf(&self, _path: &str, _shard: &Shard) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    // A fold plan records the physical participation separately from the policy
+    // outcome, so only an admitted stage dirties the plan and earns a receipt.
+    #[tokio::test]
+    async fn fold_plan_distinguishes_staged_and_skipped_members() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let (coord, shards, _timeline, _bg) = coord_over(backend).await;
+        let loaded = shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        log.lock().unwrap().clear();
+
+        let staged = TxId::with_priority(1, b"staged");
+        let skipped = TxId::with_priority(2, b"skipped");
+        let members = BTreeMap::from([
+            (
+                staged.clone(),
+                test_member(Arc::new(StageLock {
+                    key: b"k".to_vec(),
+                    tx: staged.clone(),
+                    admission: StageAdmission::ExistingKeys,
+                })),
+            ),
+            (skipped.clone(), test_member(Arc::new(SkipRelease))),
+        ]);
+
+        let plan = cas_worker(&coord)
+            .fold_round(
+                &leaf(),
+                &loaded,
+                &members,
+                Requirement::Any,
+                false,
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "fold planning performs no backend I/O"
+        );
+        assert!(plan.is_dirty());
+        assert_eq!(
+            plan.staged_ids().cloned().collect::<Vec<_>>(),
+            vec![staged.clone()]
+        );
+        assert!(matches!(
+            planned_member(&plan, &staged),
+            MemberFold {
+                outcome: FoldOutcome::Locked { .. },
+                participation: Participation::Staged,
+                ..
+            }
+        ));
+        assert!(matches!(
+            planned_member(&plan, &skipped),
+            MemberFold {
+                outcome: FoldOutcome::Released { .. },
+                participation: Participation::Skipped,
+                ..
+            }
+        ));
+        assert_eq!(
+            plan.entries.get(b"k".as_slice()).unwrap().locked_by,
+            vec![staged]
+        );
+        coord.close().await;
+    }
+
+    // The first logless stage claims its key inside the plan; a later claimant
+    // is excluded before resolution so it cannot erase the first commit marker.
+    #[tokio::test]
+    async fn fold_plan_excludes_a_second_same_key_logless_member() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (coord, shards, _timeline, _bg) = coord_over(backend).await;
+        let loaded = shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+        let members = BTreeMap::from([
+            (
+                first.clone(),
+                test_member(Arc::new(StageInline::logless(b"k", &first, b"first"))),
+            ),
+            (
+                second.clone(),
+                test_member(Arc::new(StageInline::logless(b"k", &second, b"second"))),
+            ),
+        ]);
+
+        let plan = cas_worker(&coord)
+            .fold_round(
+                &leaf(),
+                &loaded,
+                &members,
+                Requirement::Any,
+                false,
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            planned_member(&plan, &first),
+            MemberFold {
+                outcome: FoldOutcome::Landed,
+                participation: Participation::Staged,
+                ..
+            }
+        ));
+        assert!(matches!(
+            planned_member(&plan, &second),
+            MemberFold {
+                outcome: FoldOutcome::Conflict,
+                participation: Participation::Skipped,
+                ..
+            }
+        ));
+        assert_eq!(plan.staged_ids().cloned().collect::<Vec<_>>(), vec![first]);
+        assert_eq!(
+            plan.entries
+                .get(b"k".as_slice())
+                .unwrap()
+                .current
+                .inline()
+                .map(|value| &**value),
+            Some(b"first".as_slice())
+        );
+        coord.close().await;
+    }
+
+    // Capacity rejection is member-local: an admitted overwrite remains in the
+    // plan when a later create crosses the reserved content limit.
+    #[tokio::test]
+    async fn fold_plan_keeps_an_admitted_stage_when_a_later_member_is_full() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let writer = TxId::with_priority(0, b"writer");
+        let staged = TxId::with_priority(1, b"staged");
+        let rejected = TxId::with_priority(2, b"rejected");
+        let seed = entry(b"a", LockType::None, None, Some(&writer));
+        let mut overwritten = seed.clone();
+        overwritten.lock_type = LockType::Write;
+        overwritten.locked_by = vec![staged.clone()];
+        let created = entry(b"z", LockType::Create, Some(&rejected), None);
+        let overwrite_len =
+            Node::leaf(Shard::from_entries([overwritten.clone()])).content_encoded_len();
+        let full_node = Node::leaf(Shard::from_entries([overwritten, created]));
+        let content_limit = overwrite_len - 1;
+        let node_max_bytes = full_node.encoded_len() + 64;
+        let policy = SplitPolicy {
+            node_max_bytes,
+            split_headroom_bytes: node_max_bytes - content_limit,
+            ..SplitPolicy::default()
+        };
+        let hints = Arc::new(HintCounter::default());
+        let (coord, shards, _timeline, _bg) = coord_over_with(backend, policy, hints.clone()).await;
+        store_shard_entries(&shards, &leaf(), vec![seed]).await;
+        let loaded = shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        log.lock().unwrap().clear();
+        let members = BTreeMap::from([
+            (
+                staged.clone(),
+                test_member(Arc::new(StageLock {
+                    key: b"a".to_vec(),
+                    tx: staged.clone(),
+                    admission: StageAdmission::ExistingKeys,
+                })),
+            ),
+            (
+                rejected.clone(),
+                test_member(Arc::new(StageLock {
+                    key: b"z".to_vec(),
+                    tx: rejected.clone(),
+                    admission: StageAdmission::AddsKey,
+                })),
+            ),
+        ]);
+
+        let plan = cas_worker(&coord)
+            .fold_round(
+                &leaf(),
+                &loaded,
+                &members,
+                Requirement::Any,
+                false,
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "capacity admission performs no shard-store work"
+        );
+        assert!(matches!(
+            planned_member(&plan, &staged),
+            MemberFold {
+                participation: Participation::Staged,
+                ..
+            }
+        ));
+        assert!(matches!(
+            planned_member(&plan, &rejected),
+            MemberFold {
+                outcome: FoldOutcome::LeafFull,
+                participation: Participation::Skipped,
+                ..
+            }
+        ));
+        assert_eq!(plan.staged_ids().cloned().collect::<Vec<_>>(), vec![staged]);
+        assert!(plan.entries.contains_key(b"a".as_slice()));
+        assert!(!plan.entries.contains_key(b"z".as_slice()));
+        assert_eq!(hints.calls.load(Ordering::SeqCst), 1);
+        coord.close().await;
     }
 
     // A resolver that stages entries drives one CAS, receives its exact
@@ -1660,6 +2030,40 @@ mod tests {
             future
         });
         backend
+    }
+
+    // A member that never stages, but exposes whether the coordinator attributed
+    // an earlier uncertain CAS to it through its final outcome.
+    struct SkipCauseProbe;
+
+    #[async_trait::async_trait]
+    impl ShardResolver for SkipCauseProbe {
+        async fn resolve(
+            &self,
+            ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            let outcome = if in_doubt {
+                FoldOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
+            } else {
+                FoldOutcome::Moved
+            };
+            Ok(Step::Skip { outcome })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt {
+                FoldOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
+            } else {
+                FoldOutcome::Moved
+            }
+        }
     }
 
     // Regression: an uncertain CAS clouds the members it carried, not the whole
@@ -2236,13 +2640,13 @@ mod tests {
         }
     }
 
-    // Removing the generic re-fold-without-inline path must not erase a direct
-    // commit's sticky uncertainty. If its first CAS is in-doubt and a later
-    // fold no longer fits, capacity admission abandons it through the
-    // resolver's in-doubt outcome rather than reporting an ordinary conflict.
-    #[tokio::test]
+    // Capacity rejection must preserve uncertainty only for the member carried
+    // by the failed CAS; clouding a co-batched member that never staged would
+    // manufacture ambiguity for a write it never issued.
+    #[tokio::test(start_paused = true)]
     async fn capacity_rejection_after_in_doubt_preserves_uncertainty() {
         let tx = TxId::with_priority(1, b"t");
+        let skipped = TxId::with_priority(2, b"skipped");
         let small = ShardEntry {
             current: CurrentState::Inline {
                 writer: tx.clone(),
@@ -2266,7 +2670,9 @@ mod tests {
             ..SplitPolicy::default()
         };
 
-        let hooked = Arc::new(HookBackend::new(Arc::new(MemoryBackend::new())));
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (gated, gate) = Gate::wrap(mem);
+        let hooked = Arc::new(HookBackend::new(gated as Arc<dyn Backend>));
         let backend: Arc<dyn Backend> = hooked.clone();
         let (coord, _shards, _timeline, _bg) =
             coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
@@ -2290,23 +2696,50 @@ mod tests {
             }
         });
 
-        let outcome = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(CapacityAfterInDoubt {
-                    key: b"k".to_vec(),
-                    tx: tx.clone(),
-                    folds: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                Requirement::Any,
-            )
-            .await
-            .unwrap();
+        gate.arm();
+        let (driver_coord, driver_tx) = (coord.clone(), tx.clone());
+        let driver = tokio::spawn(async move {
+            driver_coord
+                .submit_shard(
+                    &leaf(),
+                    &driver_tx,
+                    Arc::new(CapacityAfterInDoubt {
+                        key: b"k".to_vec(),
+                        tx: driver_tx.clone(),
+                        folds: std::sync::atomic::AtomicUsize::new(0),
+                    }),
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (joiner_coord, joiner_tx) = (coord.clone(), skipped.clone());
+        let joiner = tokio::spawn(async move {
+            joiner_coord
+                .submit_shard(
+                    &leaf(),
+                    &joiner_tx,
+                    Arc::new(SkipCauseProbe),
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        let outcome = driver.await.unwrap().unwrap();
+        let skipped_outcome = joiner.await.unwrap().unwrap();
         assert!(matches!(
             outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::InDoubt(_),
+                cas_precondition: None,
+            })
+        ));
+        assert!(matches!(
+            skipped_outcome,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Moved,
                 cas_precondition: None,
             })
         ));
@@ -2428,17 +2861,17 @@ mod tests {
     // non-idempotent write a peer already observed — breaking the
     // `final <= started` serializability bound.
     //
-    // This pins the coordinator half of the fix in isolation: the exact `cause`
-    // state transition, driven with a stubbed member so no concurrent scheduling
-    // is needed. The *end-to-end* manifestation (a real commit being abandoned
-    // and double-applying under the true 3-way co-batched interleaving)
-    // is covered deterministically by the committed fuzz reproducer
+    // This pins the coordinator half of the fix in isolation, including exact
+    // attribution alongside a co-batched member that never staged. The
+    // *end-to-end* manifestation (a real commit being abandoned and
+    // double-applying under the true 3-way co-batched interleaving) is covered
+    // deterministically by the committed fuzz reproducer
     // `fuzz/corpus/concurrent_tx/crash-95084997…`, which the corpus-replay test
     // (`crates/glassdb/tests/fuzz_corpus.rs`) replays through the sim scheduler.
     // That interleaving cannot be forced by the plain-tokio in-doubt harness
     // (`crates/glassdb/tests/in_doubt.rs`), whose 2-step lost-ack→moved case
     // classifies in-doubt without ever hitting the resetting precondition-miss.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn in_doubt_cas_stays_in_doubt_across_a_later_precondition_miss() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         // The leaf must exist so the round's CAS is a `write_if` (the faulted op),
@@ -2450,26 +2883,48 @@ mod tests {
             vec![entry(b"seed", LockType::None, None, Some(&seed))],
         )
         .await;
-        let backend: Arc<dyn Backend> = in_doubt_then_miss(mem);
+        let (gated, gate) = Gate::wrap(mem);
+        let backend: Arc<dyn Backend> = in_doubt_then_miss(gated as Arc<dyn Backend>);
         let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
 
         let tx = TxId::with_priority(2, b"install");
+        let skipped = TxId::with_priority(3, b"skipped");
         let seen_in_doubt = Arc::new(Mutex::new(None));
-        let out = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(StickyCommitProbe {
-                    key: b"k".to_vec(),
-                    tx: tx.clone(),
-                    folds: std::sync::atomic::AtomicUsize::new(0),
-                    seen_in_doubt: seen_in_doubt.clone(),
-                }),
-                Requirement::Any,
-            )
-            .await
-            .unwrap();
-        coord.close().await;
+        gate.arm();
+        let (driver_coord, driver_tx, driver_seen) =
+            (coord.clone(), tx.clone(), seen_in_doubt.clone());
+        let driver = tokio::spawn(async move {
+            driver_coord
+                .submit_shard(
+                    &leaf(),
+                    &driver_tx,
+                    Arc::new(StickyCommitProbe {
+                        key: b"k".to_vec(),
+                        tx: driver_tx.clone(),
+                        folds: std::sync::atomic::AtomicUsize::new(0),
+                        seen_in_doubt: driver_seen,
+                    }),
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (joiner_coord, joiner_tx) = (coord.clone(), skipped.clone());
+        let joiner = tokio::spawn(async move {
+            joiner_coord
+                .submit_shard(
+                    &leaf(),
+                    &joiner_tx,
+                    Arc::new(SkipCauseProbe),
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        let out = driver.await.unwrap().unwrap();
+        let skipped_outcome = joiner.await.unwrap().unwrap();
 
         assert_eq!(
             *seen_in_doubt.lock().unwrap(),
@@ -2487,6 +2942,17 @@ mod tests {
             "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
              not Moved (else the caller abandons and double-applies)"
         );
+        assert!(
+            matches!(
+                skipped_outcome,
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Moved,
+                    cas_precondition: None,
+                })
+            ),
+            "the member that never staged must not inherit either failed CAS"
+        );
+        coord.close().await;
     }
 
     // A commit-shaped resolver that keeps staging until the round's retry budget
