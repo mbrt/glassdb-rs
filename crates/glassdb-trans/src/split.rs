@@ -96,6 +96,76 @@ pub(crate) struct PendingSeparator {
     new_token: String,
 }
 
+/// Owns deferred separator work and derives the unpublished edges of a leaf chain.
+#[derive(Clone)]
+struct SeparatorPublisher {
+    shards: ShardStore,
+    pending: Arc<Mutex<VecDeque<PendingSeparator>>>,
+}
+
+impl SeparatorPublisher {
+    fn new(shards: ShardStore) -> Self {
+        Self {
+            shards,
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Queues a separator whose parent insert must be re-driven by a later
+    /// sweep. The oldest is dropped when full because descent remains correct
+    /// through right-links.
+    fn defer(&self, separator: PendingSeparator) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= CANDIDATE_QUEUE_CAP {
+            pending.pop_front();
+        }
+        pending.push_back(separator);
+    }
+
+    /// Drains the deferred separators for one publication sweep.
+    fn drain_pending(&self) -> Vec<PendingSeparator> {
+        self.pending.lock().unwrap().drain(..).collect()
+    }
+
+    /// Returns the unpublished right-link edges through `split_key` in chain order.
+    async fn missing_separators(
+        &self,
+        prefix: &str,
+        parent: &Node,
+        split_key: &[u8],
+        requirement: Requirement,
+    ) -> Result<Vec<(Vec<u8>, String)>, TransError> {
+        let Some(index) = parent.as_index() else {
+            return Ok(Vec::new());
+        };
+        let Some(start) = index.child_for(split_key) else {
+            return Ok(Vec::new());
+        };
+        let mut missing = Vec::new();
+        let (mut cur, _) = self.shards.load_node(prefix, start, requirement).await?;
+        for _ in 0..MAX_RECONCILE_HOPS {
+            let (Some(right), Some(boundary)) = (cur.right_sibling(), cur.high_key()) else {
+                break;
+            };
+            if boundary > split_key {
+                break;
+            }
+            let right = right.to_string();
+            let boundary = boundary.to_vec();
+            if index.child_for(&boundary) != Some(right.as_str()) {
+                missing.push((boundary.clone(), right.clone()));
+            }
+            let reached_target = boundary.as_slice() == split_key;
+            let (next, _) = self.shards.load_node(prefix, &right, requirement).await?;
+            cur = next;
+            if reached_target {
+                break;
+            }
+        }
+        Ok(missing)
+    }
+}
+
 /// The feed of leaves that may need splitting (ADR-031), owned by the
 /// [`Splitter`]. The coordinator observes stored leaf size through
 /// [`SplitHinter`], while direct-commit admission reports inline pressure
@@ -681,10 +751,7 @@ pub struct Splitter {
     // clone for stored-leaf capacity; direct resolvers receive lightweight hint
     // sinks for inline-pressure observations.
     candidates: SplitCandidates,
-    // Separators a split could not publish on the first try; re-driven each
-    // sweep so the parent index eventually learns them (ADR-031). Purely
-    // splitter-internal — the coordinator never sees it.
-    pending: Arc<Mutex<VecDeque<PendingSeparator>>>,
+    publisher: SeparatorPublisher,
     // Wakes the independent recovery loop when a local split leaves `_s` work.
     recovery_wake: Arc<Notify>,
     // Co-wired with this splitter over the candidate feed at construction.
@@ -785,6 +852,7 @@ impl Splitter {
         retry: RetryConfig,
     ) -> Self {
         let router = TreeRouter::new(shards.clone());
+        let publisher = SeparatorPublisher::new(shards.clone());
         Splitter {
             bg,
             records,
@@ -795,28 +863,12 @@ impl Splitter {
             timeline,
             db_root: db_root.to_string(),
             candidates,
-            pending: Arc::new(Mutex::new(VecDeque::new())),
+            publisher,
             recovery_wake: Arc::new(Notify::new()),
             coord,
             retry,
             stats: Arc::new(Stats::default()),
         }
-    }
-
-    /// Queues a separator whose parent insert must be re-driven by a later
-    /// sweep. The oldest is dropped when full: descent still works via
-    /// right-links, so a dropped retry only defers directory compaction.
-    fn push_pending_separator(&self, sep: PendingSeparator) {
-        let mut p = self.pending.lock().unwrap();
-        if p.len() >= CANDIDATE_QUEUE_CAP {
-            p.pop_front();
-        }
-        p.push_back(sep);
-    }
-
-    /// Drains the pending separators queued for re-driving this cycle.
-    fn drain_pending(&self) -> Vec<PendingSeparator> {
-        self.pending.lock().unwrap().drain(..).collect()
     }
 
     /// Starts independent split-candidate and structural-recovery loops.
@@ -886,7 +938,7 @@ impl Splitter {
         }
         // Re-drive separators a previous cycle could not publish, so the parent
         // index eventually learns them and descent stops relying on right-links.
-        for sep in self.drain_pending() {
+        for sep in self.publisher.drain_pending() {
             if let Err(e) = self
                 .publish_separators(&sep.prefix, &sep.split_key, &sep.new_token, None)
                 .await
@@ -1981,6 +2033,7 @@ impl Splitter {
                 return Ok(()); // already published
             }
             let missing = match self
+                .publisher
                 .missing_separators(
                     prefix,
                     &locked_parent,
@@ -2064,54 +2117,12 @@ impl Splitter {
         }
         // Exhausted the retries: re-queue so a later sweep re-drives the
         // publication. Descent keeps working through right-links meanwhile.
-        self.push_pending_separator(PendingSeparator {
+        self.publisher.defer(PendingSeparator {
             prefix: prefix.to_string(),
             split_key: split_key.to_vec(),
             new_token: new_token.to_string(),
         });
         Err(TransError::Retry)
-    }
-
-    /// The separators the parent `index` is missing along the leaf right-link
-    /// chain up to `split_key`: starting from the child the parent routes
-    /// `split_key` to, each `(boundary, right_token)` edge whose separator the
-    /// parent does not yet record. Every collected separator is `<= split_key`,
-    /// which the parent owns, so they all belong in this index.
-    async fn missing_separators(
-        &self,
-        prefix: &str,
-        parent: &Node,
-        split_key: &[u8],
-        requirement: Requirement,
-    ) -> Result<Vec<(Vec<u8>, String)>, TransError> {
-        let Some(index) = parent.as_index() else {
-            return Ok(Vec::new());
-        };
-        let Some(start) = index.child_for(split_key) else {
-            return Ok(Vec::new());
-        };
-        let mut missing = Vec::new();
-        let (mut cur, _) = self.shards.load_node(prefix, start, requirement).await?;
-        for _ in 0..MAX_RECONCILE_HOPS {
-            let (Some(right), Some(boundary)) = (cur.right_sibling(), cur.high_key()) else {
-                break;
-            };
-            if boundary > split_key {
-                break; // this sibling belongs beyond the target separator
-            }
-            let right = right.to_string();
-            let boundary = boundary.to_vec();
-            if index.child_for(&boundary) != Some(right.as_str()) {
-                missing.push((boundary.clone(), right.clone()));
-            }
-            let reached_target = boundary.as_slice() == split_key;
-            let (next, _) = self.shards.load_node(prefix, &right, requirement).await?;
-            cur = next;
-            if reached_target {
-                break;
-            }
-        }
-        Ok(missing)
     }
 }
 
@@ -2372,6 +2383,90 @@ mod tests {
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
             phase: StructuralLogPhase::Ready,
         }
+    }
+
+    #[test]
+    fn separator_queue_preserves_fifo_order_when_bounded() {
+        let s = store();
+        let publisher = SeparatorPublisher::new(s.shards.clone());
+        for ordinal in 0..=CANDIDATE_QUEUE_CAP {
+            publisher.defer(PendingSeparator {
+                prefix: COLL.to_string(),
+                split_key: ordinal.to_be_bytes().to_vec(),
+                new_token: ordinal.to_string(),
+            });
+        }
+
+        let pending = publisher.clone().drain_pending();
+        assert_eq!(pending.len(), CANDIDATE_QUEUE_CAP);
+        assert_eq!(pending[0].split_key, 1usize.to_be_bytes());
+        assert_eq!(
+            pending.last().unwrap().split_key,
+            CANDIDATE_QUEUE_CAP.to_be_bytes()
+        );
+        assert!(publisher.drain_pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn separator_publisher_returns_only_missing_edges_in_chain_order() {
+        let s = store();
+        s.store_node(COLL, "L", &leaf_node(&[b"a"], Some(b"m"), Some("M")), None)
+            .await
+            .unwrap();
+        s.store_node(COLL, "M", &leaf_node(&[b"m"], Some(b"t"), Some("T")), None)
+            .await
+            .unwrap();
+        s.store_node(COLL, "T", &leaf_node(&[b"t"], None, None), None)
+            .await
+            .unwrap();
+        let publisher = SeparatorPublisher::new(s.shards.clone());
+        let requirement = Requirement::AtLeast(s.timeline.now());
+
+        let missing = publisher
+            .missing_separators(
+                COLL,
+                &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
+                b"t",
+                requirement,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing,
+            vec![
+                (b"m".to_vec(), "M".to_string()),
+                (b"t".to_vec(), "T".to_string()),
+            ]
+        );
+
+        let missing = publisher
+            .missing_separators(
+                COLL,
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), "L".to_string()),
+                    (b"m".to_vec(), "M".to_string()),
+                ])),
+                b"t",
+                requirement,
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing, vec![(b"t".to_vec(), "T".to_string())]);
+
+        let missing = publisher
+            .missing_separators(
+                COLL,
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), "L".to_string()),
+                    (b"m".to_vec(), "M".to_string()),
+                    (b"t".to_vec(), "T".to_string()),
+                ])),
+                b"t",
+                requirement,
+            )
+            .await
+            .unwrap();
+        assert!(missing.is_empty());
     }
 
     // ADR-051: an inline value may be a key's only copy, so a split has to move
