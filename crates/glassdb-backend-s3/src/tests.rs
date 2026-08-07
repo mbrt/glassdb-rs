@@ -2,12 +2,24 @@
 //! fake S3 server in [`crate::fake_server`] (the analog of the Go tests'
 //! `gofakes3` + `httptest.Server`).
 
+use std::io;
+use std::time::Duration;
+
 use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::error::{ConnectorError, ErrorMetadata, SdkError};
+use aws_sdk_s3::operation::put_object::PutObjectError;
+use aws_sdk_s3::primitives::SdkBody;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::http::StatusCode;
 use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, Version};
 use hyper::Method;
 
 use crate::fake_server::FakeS3;
-use crate::{Builder, S3Backend};
+use crate::{
+    Builder, ConditionalPutAction, ConditionalPutEvent, ConditionalPutState, DEFAULT_MAX_ATTEMPTS,
+    MAX_CONFLICT_RETRIES, ProviderFact, ProviderFailure, S3Backend, annotate, annotate_list,
+    annotate_read, conflict_backoff,
+};
 
 // ---------------------------------------------------------------------------
 // Backend construction
@@ -28,6 +40,473 @@ fn fast_retry() -> RetryConfig {
         .with_max_attempts(5)
         .with_initial_backoff(std::time::Duration::from_millis(1))
         .with_max_backoff(std::time::Duration::from_millis(1))
+}
+
+fn raw_response(status: u16) -> HttpResponse {
+    HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty())
+}
+
+fn service_failure(code: Option<&str>, status: u16) -> SdkError<PutObjectError> {
+    let mut metadata = ErrorMetadata::builder();
+    if let Some(code) = code {
+        metadata = metadata.code(code);
+    }
+    SdkError::service_error(
+        PutObjectError::generic(metadata.build()),
+        raw_response(status),
+    )
+}
+
+fn test_io_error() -> io::Error {
+    io::Error::other("test failure")
+}
+
+fn timeout_failure() -> SdkError<PutObjectError> {
+    SdkError::timeout_error(test_io_error())
+}
+
+fn dispatch_failure() -> SdkError<PutObjectError> {
+    SdkError::dispatch_failure(ConnectorError::io(Box::new(test_io_error())))
+}
+
+fn response_failure() -> SdkError<PutObjectError> {
+    SdkError::response_error(test_io_error(), raw_response(400))
+}
+
+fn construction_failure() -> SdkError<PutObjectError> {
+    SdkError::construction_failure(test_io_error())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicError {
+    Precondition,
+    NotFound,
+    Unavailable,
+    InvalidCursor,
+    Other,
+}
+
+fn public_error(error: &BackendError) -> PublicError {
+    match error {
+        BackendError::Precondition => PublicError::Precondition,
+        BackendError::NotFound => PublicError::NotFound,
+        BackendError::Unavailable(_) => PublicError::Unavailable,
+        BackendError::InvalidCursor => PublicError::InvalidCursor,
+        BackendError::Other { .. } => PublicError::Other,
+    }
+}
+
+#[test]
+fn http_status_provider_facts_preserve_public_errors() {
+    for (status, fact, definitive, read) in [
+        (
+            304,
+            ProviderFact::Precondition,
+            PublicError::Precondition,
+            PublicError::Precondition,
+        ),
+        (
+            400,
+            ProviderFact::Other,
+            PublicError::Other,
+            PublicError::Other,
+        ),
+        (
+            404,
+            ProviderFact::NotFound,
+            PublicError::NotFound,
+            PublicError::NotFound,
+        ),
+        (
+            409,
+            ProviderFact::Conflict,
+            PublicError::Precondition,
+            PublicError::Precondition,
+        ),
+        (
+            412,
+            ProviderFact::Precondition,
+            PublicError::Precondition,
+            PublicError::Precondition,
+        ),
+        (
+            429,
+            ProviderFact::Throttle,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            500,
+            ProviderFact::Ambiguous,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            502,
+            ProviderFact::Ambiguous,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            503,
+            ProviderFact::Throttle,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            504,
+            ProviderFact::Ambiguous,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+    ] {
+        let failure = ProviderFailure::from(service_failure(None, status));
+        assert_eq!(failure.fact, fact, "status {status}");
+        assert_eq!(
+            public_error(&annotate("Test", "path", failure)),
+            definitive,
+            "definitive status {status}"
+        );
+        assert_eq!(
+            public_error(&annotate_read(
+                "Test",
+                "path",
+                service_failure(None, status)
+            )),
+            read,
+            "read status {status}"
+        );
+    }
+}
+
+#[test]
+fn service_code_provider_facts_preserve_public_errors() {
+    for (code, fact, definitive, read) in [
+        (
+            "PreconditionFailed",
+            ProviderFact::Precondition,
+            PublicError::Precondition,
+            PublicError::Precondition,
+        ),
+        (
+            "ConditionalRequestConflict",
+            ProviderFact::Conflict,
+            PublicError::Precondition,
+            PublicError::Precondition,
+        ),
+        (
+            "SlowDown",
+            ProviderFact::Throttle,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            "ThrottlingException",
+            ProviderFact::Throttle,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            "NoSuchKey",
+            ProviderFact::NotFound,
+            PublicError::NotFound,
+            PublicError::NotFound,
+        ),
+        (
+            "NotFound",
+            ProviderFact::NotFound,
+            PublicError::NotFound,
+            PublicError::NotFound,
+        ),
+        (
+            "NoSuchBucket",
+            ProviderFact::NotFound,
+            PublicError::NotFound,
+            PublicError::NotFound,
+        ),
+        (
+            "AccessDenied",
+            ProviderFact::Other,
+            PublicError::Other,
+            PublicError::Other,
+        ),
+    ] {
+        let failure = ProviderFailure::from(service_failure(Some(code), 400));
+        assert_eq!(failure.fact, fact, "code {code}");
+        assert_eq!(
+            public_error(&annotate("Test", "path", failure)),
+            definitive,
+            "definitive code {code}"
+        );
+        assert_eq!(
+            public_error(&annotate_read(
+                "Test",
+                "path",
+                service_failure(Some(code), 400)
+            )),
+            read,
+            "read code {code}"
+        );
+    }
+}
+
+#[test]
+fn transport_provider_facts_preserve_public_errors() {
+    type FailureFactory = fn() -> SdkError<PutObjectError>;
+    for (name, failure, fact, definitive, read) in [
+        (
+            "timeout",
+            timeout_failure as FailureFactory,
+            ProviderFact::Ambiguous,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            "dispatch",
+            dispatch_failure as FailureFactory,
+            ProviderFact::Ambiguous,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            "response",
+            response_failure as FailureFactory,
+            ProviderFact::Ambiguous,
+            PublicError::Other,
+            PublicError::Unavailable,
+        ),
+        (
+            "construction",
+            construction_failure as FailureFactory,
+            ProviderFact::Other,
+            PublicError::Other,
+            PublicError::Other,
+        ),
+    ] {
+        let normalized = ProviderFailure::from(failure());
+        assert_eq!(normalized.fact, fact, "transport {name}");
+        assert_eq!(
+            public_error(&annotate("Test", "path", normalized)),
+            definitive,
+            "definitive transport {name}"
+        );
+        assert_eq!(
+            public_error(&annotate_read("Test", "path", failure())),
+            read,
+            "read transport {name}"
+        );
+    }
+}
+
+#[test]
+fn list_cursor_errors_use_normalized_metadata() {
+    for code in [
+        "InvalidArgument",
+        "InvalidToken",
+        "InvalidContinuationToken",
+    ] {
+        assert_eq!(
+            public_error(&annotate_list(
+                "prefix/",
+                true,
+                service_failure(Some(code), 403)
+            )),
+            PublicError::InvalidCursor,
+            "code {code}"
+        );
+        assert_eq!(
+            public_error(&annotate_list(
+                "prefix/",
+                false,
+                service_failure(Some(code), 403)
+            )),
+            PublicError::Other,
+            "code {code} without cursor"
+        );
+    }
+    assert_eq!(
+        public_error(&annotate_list("prefix/", true, service_failure(None, 400))),
+        PublicError::InvalidCursor,
+        "status 400"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PutEvent {
+    Applied,
+    AppliedWithoutVersion,
+    Failed(ProviderFact),
+}
+
+impl PutEvent {
+    fn into_event(self) -> ConditionalPutEvent<PutObjectError> {
+        match self {
+            PutEvent::Applied => ConditionalPutEvent::Applied(Version::new("\"version\"")),
+            PutEvent::AppliedWithoutVersion => ConditionalPutEvent::AppliedWithoutVersion,
+            PutEvent::Failed(fact) => {
+                let (code, status) = match fact {
+                    ProviderFact::Precondition => (Some("PreconditionFailed"), 412),
+                    ProviderFact::Conflict => (Some("ConditionalRequestConflict"), 409),
+                    ProviderFact::Throttle => (Some("SlowDown"), 503),
+                    ProviderFact::Ambiguous => (None, 500),
+                    ProviderFact::NotFound => (Some("NoSuchKey"), 404),
+                    ProviderFact::Other => (Some("AccessDenied"), 403),
+                };
+                ConditionalPutEvent::Failed(Box::new(ProviderFailure::from(service_failure(
+                    code, status,
+                ))))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PutAction {
+    Return,
+    Retry(Duration),
+    Precondition,
+    InDoubt,
+    Terminal(ProviderFact),
+}
+
+fn put_action(action: ConditionalPutAction<PutObjectError>) -> PutAction {
+    match action {
+        ConditionalPutAction::Return(_) => PutAction::Return,
+        ConditionalPutAction::Retry(after) => PutAction::Retry(after),
+        ConditionalPutAction::Precondition => PutAction::Precondition,
+        ConditionalPutAction::InDoubt => PutAction::InDoubt,
+        ConditionalPutAction::Terminal(failure) => PutAction::Terminal(failure.fact),
+    }
+}
+
+#[test]
+fn conditional_put_transition_table() {
+    for (name, events, actions, may_have_applied) in [
+        (
+            "success",
+            &[PutEvent::Applied][..],
+            &[PutAction::Return][..],
+            false,
+        ),
+        (
+            "success without version",
+            &[PutEvent::AppliedWithoutVersion],
+            &[PutAction::InDoubt],
+            false,
+        ),
+        (
+            "clean precondition",
+            &[PutEvent::Failed(ProviderFact::Precondition)],
+            &[PutAction::Precondition],
+            false,
+        ),
+        (
+            "ambiguity followed by precondition",
+            &[
+                PutEvent::Failed(ProviderFact::Ambiguous),
+                PutEvent::Failed(ProviderFact::Precondition),
+            ],
+            &[PutAction::Retry(conflict_backoff(0)), PutAction::InDoubt],
+            true,
+        ),
+        (
+            "throttle followed by precondition",
+            &[
+                PutEvent::Failed(ProviderFact::Throttle),
+                PutEvent::Failed(ProviderFact::Precondition),
+            ],
+            &[
+                PutAction::Retry(conflict_backoff(0)),
+                PutAction::Precondition,
+            ],
+            false,
+        ),
+        (
+            "terminal failure",
+            &[PutEvent::Failed(ProviderFact::Other)],
+            &[PutAction::Terminal(ProviderFact::Other)],
+            false,
+        ),
+        (
+            "terminal failure after ambiguity",
+            &[
+                PutEvent::Failed(ProviderFact::Ambiguous),
+                PutEvent::Failed(ProviderFact::Other),
+            ],
+            &[PutAction::Retry(conflict_backoff(0)), PutAction::InDoubt],
+            true,
+        ),
+    ] {
+        let mut state = ConditionalPutState::default();
+        let actual: Vec<_> = events
+            .iter()
+            .map(|event| put_action(state.transition(event.into_event())))
+            .collect();
+
+        assert_eq!(actual, actions, "{name}");
+        assert_eq!(state.attempts, events.len() as u32, "{name}");
+        assert_eq!(state.may_have_applied, may_have_applied, "{name}");
+    }
+}
+
+#[test]
+fn conditional_put_retry_exhaustion_table() {
+    for (name, fact, retries, exhausted, may_have_applied) in [
+        (
+            "conflict",
+            ProviderFact::Conflict,
+            MAX_CONFLICT_RETRIES,
+            PutAction::Precondition,
+            false,
+        ),
+        (
+            "throttle",
+            ProviderFact::Throttle,
+            DEFAULT_MAX_ATTEMPTS,
+            PutAction::Terminal(ProviderFact::Throttle),
+            false,
+        ),
+        (
+            "ambiguity",
+            ProviderFact::Ambiguous,
+            DEFAULT_MAX_ATTEMPTS,
+            PutAction::InDoubt,
+            true,
+        ),
+    ] {
+        let mut state = ConditionalPutState::default();
+        for retry in 0..retries {
+            assert_eq!(
+                put_action(state.transition(PutEvent::Failed(fact).into_event())),
+                PutAction::Retry(conflict_backoff(retry)),
+                "{name} retry {retry}"
+            );
+        }
+        assert_eq!(
+            put_action(state.transition(PutEvent::Failed(fact).into_event())),
+            exhausted,
+            "{name} exhausted"
+        );
+        assert_eq!(state.attempts, retries + 1, "{name}");
+        assert_eq!(state.may_have_applied, may_have_applied, "{name}");
+    }
+}
+
+#[test]
+fn conditional_put_retry_budget_is_shared_across_provider_facts() {
+    let mut state = ConditionalPutState::default();
+    for retry in 0..DEFAULT_MAX_ATTEMPTS {
+        assert_eq!(
+            put_action(state.transition(PutEvent::Failed(ProviderFact::Throttle).into_event())),
+            PutAction::Retry(conflict_backoff(retry))
+        );
+    }
+
+    assert_eq!(
+        put_action(state.transition(PutEvent::Failed(ProviderFact::Ambiguous).into_event())),
+        PutAction::Terminal(ProviderFact::Ambiguous)
+    );
+    assert!(!state.may_have_applied);
 }
 
 // ---------------------------------------------------------------------------

@@ -136,15 +136,15 @@ impl S3Backend {
         fut.await.map_err(|e| annotate_read(op, path, e))
     }
 
-    /// Issues a single PutObject with the given retryer, returning the new
-    /// version on success or the raw SDK error to be classified by the caller.
+    /// Issues one PutObject and reports the event observed by the conditional
+    /// mutation state machine.
     async fn send_put(
         &self,
         path: &str,
         payload: &[u8],
         conds: &PutConds,
         retry: RetryConfig,
-    ) -> PutAttempt {
+    ) -> ConditionalPutEvent<PutObjectError> {
         let mut op = self
             .client
             .put_object()
@@ -160,10 +160,10 @@ impl S3Backend {
         let cfg = aws_sdk_s3::config::Builder::default().retry_config(retry);
         match op.customize().config_override(cfg).send().await {
             Ok(out) => match out.e_tag().filter(|etag| !etag.is_empty()) {
-                Some(etag) => PutAttempt::Ok(Version::new(etag)),
-                None => PutAttempt::AppliedWithoutVersion,
+                Some(etag) => ConditionalPutEvent::Applied(Version::new(etag)),
+                None => ConditionalPutEvent::AppliedWithoutVersion,
             },
-            Err(e) => PutAttempt::Err(Box::new(e)),
+            Err(e) => ConditionalPutEvent::Failed(Box::new(ProviderFailure::from(e))),
         }
     }
 
@@ -190,62 +190,85 @@ impl S3Backend {
         // such a precondition as in-doubt instead of reporting a confident
         // conflict (which the engine would retry into a double-apply). See
         // ADR-009.
-        let mut lost = false;
-        let mut attempt: u32 = 0;
+        let mut state = ConditionalPutState::default();
         loop {
-            let e = match self
+            let event = self
                 .send_put(path, &value, &conds, RetryConfig::disabled())
-                .await
-            {
-                PutAttempt::Ok(version) => {
-                    return Ok(version);
+                .await;
+            match state.transition(event) {
+                ConditionalPutAction::Return(version) => return Ok(version),
+                ConditionalPutAction::Retry(after) => glassdb_concurr::rt::sleep(after).await,
+                ConditionalPutAction::Precondition => return Err(BackendError::Precondition),
+                ConditionalPutAction::InDoubt => return Err(in_doubt("Write", path)),
+                ConditionalPutAction::Terminal(failure) => {
+                    return Err(annotate("Write", path, *failure));
                 }
-                PutAttempt::AppliedWithoutVersion => return Err(in_doubt("Write", path)),
-                PutAttempt::Err(e) => *e,
-            };
-
-            if is_precondition(&e) {
-                // If an earlier attempt may have applied, this precondition could
-                // be our own landed write rather than a competitor's: in doubt.
-                return Err(if lost {
-                    in_doubt("Write", path)
-                } else {
-                    BackendError::Precondition
-                });
             }
-            // 409 ConditionalRequestConflict: concurrent conditional writes
-            // raced; this one was not applied, so retrying it is safe and does
-            // not taint a later precondition.
-            if is_conflict(&e) && attempt < MAX_CONFLICT_RETRIES {
-                glassdb_concurr::rt::sleep(conflict_backoff(attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            let ambiguous = is_ambiguous(&e);
-            if (ambiguous || is_throttle(&e)) && attempt < DEFAULT_MAX_ATTEMPTS {
-                // An ambiguous attempt (timeout/dispatch/5xx) may have applied;
-                // a throttle (503/429) was rejected before applying and is safe.
-                lost = lost || ambiguous;
-                glassdb_concurr::rt::sleep(conflict_backoff(attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            // Terminal error, or the retry budget is exhausted. If any attempt
-            // may have applied, the final outcome is unknown.
-            return Err(if lost {
-                in_doubt("Write", path)
-            } else {
-                annotate("Write", path, e)
-            });
         }
     }
 }
 
-/// The outcome of a single PutObject attempt.
-enum PutAttempt {
-    Ok(Version),
+/// An observation produced by one conditional PutObject attempt.
+enum ConditionalPutEvent<E> {
+    Applied(Version),
     AppliedWithoutVersion,
-    Err(Box<SdkError<PutObjectError>>),
+    Failed(Box<ProviderFailure<E>>),
+}
+
+/// The next effect required by conditional PutObject policy.
+enum ConditionalPutAction<E> {
+    Return(Version),
+    Retry(Duration),
+    Precondition,
+    InDoubt,
+    Terminal(Box<ProviderFailure<E>>),
+}
+
+/// Evidence accumulated while resolving one conditional PutObject operation.
+#[derive(Default)]
+struct ConditionalPutState {
+    attempts: u32,
+    may_have_applied: bool,
+}
+
+impl ConditionalPutState {
+    /// Advances conditional-write policy from one provider event.
+    fn transition<E>(&mut self, event: ConditionalPutEvent<E>) -> ConditionalPutAction<E> {
+        let attempt = self.attempts;
+        self.attempts += 1;
+
+        let failure = match event {
+            ConditionalPutEvent::Applied(version) => {
+                return ConditionalPutAction::Return(version);
+            }
+            ConditionalPutEvent::AppliedWithoutVersion => {
+                return ConditionalPutAction::InDoubt;
+            }
+            ConditionalPutEvent::Failed(failure) => failure,
+        };
+
+        match failure.fact {
+            ProviderFact::Precondition if self.may_have_applied => ConditionalPutAction::InDoubt,
+            ProviderFact::Precondition => ConditionalPutAction::Precondition,
+            // A 409 confirms this attempt did not apply, so retrying does not
+            // taint a later precondition.
+            ProviderFact::Conflict if attempt < MAX_CONFLICT_RETRIES => {
+                ConditionalPutAction::Retry(conflict_backoff(attempt))
+            }
+            // A timeout, dispatch failure, or non-throttle 5xx may have applied.
+            ProviderFact::Ambiguous if attempt < DEFAULT_MAX_ATTEMPTS => {
+                self.may_have_applied = true;
+                ConditionalPutAction::Retry(conflict_backoff(attempt))
+            }
+            // A throttle was rejected before applying and is safe to retry.
+            ProviderFact::Throttle if attempt < DEFAULT_MAX_ATTEMPTS => {
+                ConditionalPutAction::Retry(conflict_backoff(attempt))
+            }
+            _ if self.may_have_applied => ConditionalPutAction::InDoubt,
+            ProviderFact::Conflict => ConditionalPutAction::Precondition,
+            _ => ConditionalPutAction::Terminal(failure),
+        }
+    }
 }
 
 /// The optional conditional headers for a PutObject.
@@ -374,10 +397,17 @@ impl Backend for S3Backend {
             .await
         {
             Ok(_) => Ok(()),
-            Err(error) if is_ambiguous(&error) || is_throttle(&error) => {
-                Err(in_doubt("DeleteIf", path))
+            Err(error) => {
+                let failure = ProviderFailure::from(error);
+                if matches!(
+                    failure.fact,
+                    ProviderFact::Ambiguous | ProviderFact::Throttle
+                ) {
+                    Err(in_doubt("DeleteIf", path))
+                } else {
+                    Err(annotate("DeleteIf", path, failure))
+                }
             }
-            Err(error) => Err(annotate("DeleteIf", path, error)),
         }
     }
 
@@ -457,7 +487,7 @@ impl S3RequestError {
     /// Flattens the structured S3 error into the shared catch-all: the message
     /// is the structured `Display`, and the typed error (with the SDK error in
     /// its chain) is kept via [`std::error::Error::source`].
-    fn into_backend_error(self) -> BackendError {
+    fn into_other(self) -> BackendError {
         // This is an inherent method rather than a `From` impl on purpose:
         // adding another `From<_> for BackendError` would make `?`/`Ok(())`
         // inference ambiguous at call sites that rely on `BackendError` being
@@ -466,6 +496,93 @@ impl S3RequestError {
             msg: self.to_string(),
             source: Some(Cause::new(self)),
         }
+    }
+}
+
+/// A provider-level fact extracted from one failed S3 request.
+///
+/// This classification deliberately contains no retry policy. Reads,
+/// conditional mutations, and listings interpret the same fact according to
+/// their own safety contracts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderFact {
+    Precondition,
+    Conflict,
+    Throttle,
+    Ambiguous,
+    NotFound,
+    Other,
+}
+
+/// One SDK failure together with its normalized provider fact and diagnostics.
+struct ProviderFailure<E> {
+    fact: ProviderFact,
+    code: Option<String>,
+    status: Option<u16>,
+    source: SdkError<E>,
+}
+
+impl<E> From<SdkError<E>> for ProviderFailure<E>
+where
+    E: ProvideErrorMetadata,
+{
+    fn from(source: SdkError<E>) -> Self {
+        let code = source.code().map(str::to_string);
+        let status = source
+            .raw_response()
+            .map(|response| response.status().as_u16());
+        let fact = match (code.as_deref(), status, &source) {
+            (Some("PreconditionFailed"), _, _) | (_, Some(304 | 412), _) => {
+                ProviderFact::Precondition
+            }
+            (Some("ConditionalRequestConflict"), _, _) | (_, Some(409), _) => {
+                ProviderFact::Conflict
+            }
+            (_, _, SdkError::TimeoutError(_))
+            | (_, _, SdkError::DispatchFailure(_))
+            | (_, _, SdkError::ResponseError(_)) => ProviderFact::Ambiguous,
+            (_, Some(status @ 500..=599), _) if status != 503 => ProviderFact::Ambiguous,
+            (Some("SlowDown" | "ThrottlingException"), _, _) | (_, Some(429 | 503), _) => {
+                ProviderFact::Throttle
+            }
+            (Some("NoSuchKey" | "NotFound" | "NoSuchBucket"), _, _) | (_, Some(404), _) => {
+                ProviderFact::NotFound
+            }
+            _ => ProviderFact::Other,
+        };
+        ProviderFailure {
+            fact,
+            code,
+            status,
+            source,
+        }
+    }
+}
+
+impl<E> ProviderFailure<E> {
+    /// Reports whether this failure rejects a listing continuation token.
+    fn is_invalid_cursor(&self) -> bool {
+        matches!(
+            self.code.as_deref(),
+            Some("InvalidArgument" | "InvalidToken" | "InvalidContinuationToken")
+        ) || self.status == Some(400)
+    }
+}
+
+impl<E> ProviderFailure<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Preserves the SDK failure as a structured [`BackendError::Other`].
+    fn into_other(self, op: &'static str, path: &str) -> BackendError {
+        S3RequestError {
+            op,
+            path: path.to_string(),
+            code: self.code,
+            status: self.status,
+            source: Box::new(self.source),
+        }
+        .into_other()
     }
 }
 
@@ -483,12 +600,27 @@ fn annotate_read<E>(op: &'static str, path: &str, e: SdkError<E>) -> BackendErro
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    if is_throttle(&e) || is_ambiguous(&e) {
+    annotate_read_failure(op, path, ProviderFailure::from(e))
+}
+
+/// Applies idempotent-read policy to one normalized provider failure.
+fn annotate_read_failure<E>(
+    op: &'static str,
+    path: &str,
+    failure: ProviderFailure<E>,
+) -> BackendError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if matches!(
+        failure.fact,
+        ProviderFact::Throttle | ProviderFact::Ambiguous
+    ) {
         return BackendError::Unavailable(format!(
             "{op}({path}): transient backend failure, retryable"
         ));
     }
-    annotate(op, path, e)
+    annotate(op, path, failure)
 }
 
 /// Maps a paginated listing failure, distinguishing a rejected continuation
@@ -497,102 +629,25 @@ fn annotate_list<E>(prefix: &str, had_cursor: bool, e: SdkError<E>) -> BackendEr
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    let invalid_code = matches!(
-        e.code(),
-        Some("InvalidArgument" | "InvalidToken" | "InvalidContinuationToken")
-    );
-    let bad_request = e.raw_response().map(|r| r.status().as_u16()) == Some(400);
-    if had_cursor && (invalid_code || bad_request) {
+    let failure = ProviderFailure::from(e);
+    if had_cursor && failure.is_invalid_cursor() {
         return BackendError::InvalidCursor;
     }
-    annotate_read("List", prefix, e)
+    annotate_read_failure("List", prefix, failure)
 }
 
-/// Maps an S3 SDK error onto a [`BackendError`].
-fn annotate<E>(op: &'static str, path: &str, e: SdkError<E>) -> BackendError
+/// Maps a normalized provider failure onto a [`BackendError`].
+fn annotate<E>(op: &'static str, path: &str, failure: ProviderFailure<E>) -> BackendError
 where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    let code = e.code().map(str::to_string);
-    let status = e.raw_response().map(|r| r.status().as_u16());
-    if let Some(c) = code.as_deref() {
-        match c {
-            "PreconditionFailed" | "ConditionalRequestConflict" => {
-                return BackendError::Precondition;
-            }
-            "NoSuchKey" | "NotFound" | "NoSuchBucket" => return BackendError::NotFound,
-            _ => {}
+    match failure.fact {
+        ProviderFact::Precondition | ProviderFact::Conflict => BackendError::Precondition,
+        ProviderFact::NotFound => BackendError::NotFound,
+        ProviderFact::Throttle | ProviderFact::Ambiguous | ProviderFact::Other => {
+            failure.into_other(op, path)
         }
     }
-    match status {
-        Some(404) => BackendError::NotFound,
-        // 304 Not Modified answers a conditional GET (`read_if_modified`):
-        // the caller's cached copy is still current.
-        Some(304) => BackendError::Precondition,
-        Some(412) | Some(409) => BackendError::Precondition,
-        _ => S3RequestError {
-            op,
-            path: path.to_string(),
-            code,
-            status,
-            source: Box::new(e),
-        }
-        .into_backend_error(),
-    }
-}
-
-/// Reports whether `e` is a 409 `ConditionalRequestConflict`, which S3 returns
-/// when concurrent conditional writes race. Distinct from a 412 and retryable.
-fn is_conflict<E>(e: &SdkError<E>) -> bool
-where
-    E: ProvideErrorMetadata,
-{
-    if e.code() == Some("ConditionalRequestConflict") {
-        return true;
-    }
-    e.raw_response().map(|r| r.status().as_u16()) == Some(409)
-}
-
-/// Reports whether `e` is a 412 precondition failure (an `If-Match`/
-/// `If-None-Match` that did not hold). Kept distinct from a 409 conflict.
-fn is_precondition<E>(e: &SdkError<E>) -> bool
-where
-    E: ProvideErrorMetadata,
-{
-    if e.code() == Some("PreconditionFailed") {
-        return true;
-    }
-    e.raw_response().map(|r| r.status().as_u16()) == Some(412)
-}
-
-/// Reports whether `e` is a throttle (`503 SlowDown` / `429`). The request was
-/// rejected *before* being applied, so retrying it does not risk a double-apply.
-fn is_throttle<E>(e: &SdkError<E>) -> bool
-where
-    E: ProvideErrorMetadata,
-{
-    if matches!(e.code(), Some("SlowDown") | Some("ThrottlingException")) {
-        return true;
-    }
-    matches!(
-        e.raw_response().map(|r| r.status().as_u16()),
-        Some(503) | Some(429)
-    )
-}
-
-/// Reports whether `e`'s outcome is ambiguous: the request may have reached S3
-/// and been applied before the failure. Covers transport timeouts, dispatch
-/// failures, undecodable responses, and server errors that are not a throttle.
-fn is_ambiguous<E>(e: &SdkError<E>) -> bool {
-    if matches!(
-        e,
-        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
-    ) {
-        return true;
-    }
-    e.raw_response()
-        .map(|response| response.status().as_u16())
-        .is_some_and(|status| (500..=599).contains(&status) && status != 503)
 }
 
 /// Builds the in-doubt error returned when a conditional mutation's outcome
