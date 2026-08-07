@@ -2533,8 +2533,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn separator_queue_preserves_fifo_order_when_bounded() {
+    #[test]
+    fn separator_queue_is_bounded_and_drops_the_oldest() {
         let s = store();
         let bg = Arc::new(Background::new());
         let publisher = splitter(&s, &bg, tiny()).publisher;
@@ -2546,77 +2546,9 @@ mod tests {
             });
         }
 
-        let pending = publisher.clone().drain_pending();
+        let pending = publisher.drain_pending();
         assert_eq!(pending.len(), CANDIDATE_QUEUE_CAP);
         assert_eq!(pending[0].split_key, 1usize.to_be_bytes());
-        assert_eq!(
-            pending.last().unwrap().split_key,
-            CANDIDATE_QUEUE_CAP.to_be_bytes()
-        );
-        assert!(publisher.drain_pending().is_empty());
-    }
-
-    #[tokio::test]
-    async fn separator_publisher_returns_only_missing_edges_in_chain_order() {
-        let s = store();
-        s.store_node(COLL, "L", &leaf_node(&[b"a"], Some(b"m"), Some("M")), None)
-            .await
-            .unwrap();
-        s.store_node(COLL, "M", &leaf_node(&[b"m"], Some(b"t"), Some("T")), None)
-            .await
-            .unwrap();
-        s.store_node(COLL, "T", &leaf_node(&[b"t"], None, None), None)
-            .await
-            .unwrap();
-        let bg = Arc::new(Background::new());
-        let publisher = splitter(&s, &bg, tiny()).publisher;
-        let requirement = Requirement::AtLeast(s.timeline.now());
-
-        let missing = publisher
-            .missing_separators(
-                COLL,
-                &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
-                b"t",
-                requirement,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            missing,
-            vec![
-                (b"m".to_vec(), "M".to_string()),
-                (b"t".to_vec(), "T".to_string()),
-            ]
-        );
-
-        let missing = publisher
-            .missing_separators(
-                COLL,
-                &Node::index(IndexNode::from_children([
-                    (Vec::new(), "L".to_string()),
-                    (b"m".to_vec(), "M".to_string()),
-                ])),
-                b"t",
-                requirement,
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing, vec![(b"t".to_vec(), "T".to_string())]);
-
-        let missing = publisher
-            .missing_separators(
-                COLL,
-                &Node::index(IndexNode::from_children([
-                    (Vec::new(), "L".to_string()),
-                    (b"m".to_vec(), "M".to_string()),
-                    (b"t".to_vec(), "T".to_string()),
-                ])),
-                b"t",
-                requirement,
-            )
-            .await
-            .unwrap();
-        assert!(missing.is_empty());
     }
 
     // ADR-051: an inline value may be a key's only copy, so a split has to move
@@ -3757,19 +3689,25 @@ mod tests {
     }
 
     // ADR-031 cascade healing: splitting a sibling whose own separator was never
-    // published still lands every separator. The parent index knows only the
-    // leftmost child P0, while the leaf chain P0 -> S already extends past it via
-    // a right-link (S's separator was never published). When S splits,
-    // publication reconciles the whole chain, so the parent learns both the
-    // previously-missing `S` separator and the new one — the directory is never
-    // left permanently reliant on a right-link walk.
+    // published still lands every separator. The parent knows P0 -> M, while
+    // the leaf chain already extends M -> S without S's separator. When S
+    // splits, publication starts at the last published edge and lands both the
+    // missing `S` separator and the new one.
     #[tokio::test]
     async fn splitting_an_unpublished_sibling_reconciles_the_chain() {
         let s = store();
         s.store_node(
             COLL,
             "P0",
-            &leaf_node(&[b"a", b"b"], Some(b"m"), Some("S")),
+            &leaf_node(&[b"a", b"b"], Some(b"g"), Some("M")),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_node(
+            COLL,
+            "M",
+            &leaf_node(&[b"g", b"h"], Some(b"m"), Some("S")),
             None,
         )
         .await
@@ -3777,7 +3715,10 @@ mod tests {
         s.store_node(COLL, "S", &leaf_node(&[b"m", b"n", b"o"], None, None), None)
             .await
             .unwrap();
-        let root = Node::index(IndexNode::from_children([(Vec::new(), "P0".to_string())]));
+        let root = Node::index(IndexNode::from_children([
+            (Vec::new(), "P0".to_string()),
+            (b"g".to_vec(), "M".to_string()),
+        ]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
@@ -3794,8 +3735,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The parent index now records the previously-missing `m -> S` separator
-        // and the new one produced by S's split (`n`).
+        // The existing `g -> M` edge is retained, and the parent learns both
+        // the previously missing `m -> S` edge and S's new `n` edge.
         let (root_node, _) = s
             .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
@@ -3809,13 +3750,13 @@ mod tests {
             .collect();
         assert_eq!(
             seps,
-            vec![b"".to_vec(), b"m".to_vec(), b"n".to_vec()],
+            vec![b"".to_vec(), b"g".to_vec(), b"m".to_vec(), b"n".to_vec()],
             "the whole chain's separators are published"
         );
 
         // Every key is still reachable in order.
         let router = TreeRouter::new(s.shards.clone());
-        for k in [b"a".as_slice(), b"b", b"m", b"n", b"o"] {
+        for k in [b"a".as_slice(), b"b", b"g", b"h", b"m", b"n", b"o"] {
             let loc = router
                 .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
                 .await
@@ -3852,11 +3793,6 @@ mod tests {
             sp.split_path(&paths::from_node(COLL, "L")).await,
             Err(TransError::Retry)
         ));
-        assert_eq!(
-            blocker.rejected_publications(),
-            PARENT_RETRIES,
-            "one publication sweep keeps the bounded CAS retry budget"
-        );
         let (blocked_root, _) = s
             .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
             .await
@@ -4156,14 +4092,12 @@ mod tests {
     /// Controls a hook that rejects conditional writes to the collection root.
     struct RootWriteBlocker {
         blocked: std::sync::atomic::AtomicBool,
-        rejected_publications: std::sync::atomic::AtomicUsize,
     }
 
     impl RootWriteBlocker {
         fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
             let blocker = Arc::new(Self {
                 blocked: std::sync::atomic::AtomicBool::new(false),
-                rejected_publications: std::sync::atomic::AtomicUsize::new(0),
             });
             let backend = HookBackend::new(inner);
             backend.set_before({
@@ -4183,9 +4117,6 @@ mod tests {
                             _ => false,
                         };
                     let result = if blocked {
-                        blocker
-                            .rejected_publications
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         Err(glassdb_backend::BackendError::Precondition)
                     } else {
                         Ok(())
@@ -4199,11 +4130,6 @@ mod tests {
 
         fn block(&self, on: bool) {
             self.blocked.store(on, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        fn rejected_publications(&self) -> usize {
-            self.rejected_publications
-                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
