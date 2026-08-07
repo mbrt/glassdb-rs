@@ -3,6 +3,7 @@
 //! `gofakes3` + `httptest.Server`).
 
 use std::io;
+use std::time::Duration;
 
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ConnectorError, ErrorMetadata, SdkError};
@@ -15,7 +16,9 @@ use hyper::Method;
 
 use crate::fake_server::FakeS3;
 use crate::{
-    Builder, ProviderFact, ProviderFailure, S3Backend, annotate, annotate_list, annotate_read,
+    Builder, ConditionalPutAction, ConditionalPutEvent, ConditionalPutState, DEFAULT_MAX_ATTEMPTS,
+    MAX_CONFLICT_RETRIES, ProviderFact, ProviderFailure, S3Backend, annotate, annotate_list,
+    annotate_read, conflict_backoff,
 };
 
 // ---------------------------------------------------------------------------
@@ -326,6 +329,184 @@ fn list_cursor_errors_use_normalized_metadata() {
         PublicError::InvalidCursor,
         "status 400"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PutEvent {
+    Applied,
+    AppliedWithoutVersion,
+    Failed(ProviderFact),
+}
+
+impl PutEvent {
+    fn into_event(self) -> ConditionalPutEvent<PutObjectError> {
+        match self {
+            PutEvent::Applied => ConditionalPutEvent::Applied(Version::new("\"version\"")),
+            PutEvent::AppliedWithoutVersion => ConditionalPutEvent::AppliedWithoutVersion,
+            PutEvent::Failed(fact) => {
+                let (code, status) = match fact {
+                    ProviderFact::Precondition => (Some("PreconditionFailed"), 412),
+                    ProviderFact::Conflict => (Some("ConditionalRequestConflict"), 409),
+                    ProviderFact::Throttle => (Some("SlowDown"), 503),
+                    ProviderFact::Ambiguous => (None, 500),
+                    ProviderFact::NotFound => (Some("NoSuchKey"), 404),
+                    ProviderFact::Other => (Some("AccessDenied"), 403),
+                };
+                ConditionalPutEvent::Failed(Box::new(ProviderFailure::from(service_failure(
+                    code, status,
+                ))))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PutAction {
+    Return,
+    Retry(Duration),
+    Precondition,
+    InDoubt,
+    Terminal(ProviderFact),
+}
+
+fn put_action(action: ConditionalPutAction<PutObjectError>) -> PutAction {
+    match action {
+        ConditionalPutAction::Return(_) => PutAction::Return,
+        ConditionalPutAction::Retry(after) => PutAction::Retry(after),
+        ConditionalPutAction::Precondition => PutAction::Precondition,
+        ConditionalPutAction::InDoubt => PutAction::InDoubt,
+        ConditionalPutAction::Terminal(failure) => PutAction::Terminal(failure.fact),
+    }
+}
+
+#[test]
+fn conditional_put_transition_table() {
+    for (name, events, actions, may_have_applied) in [
+        (
+            "success",
+            &[PutEvent::Applied][..],
+            &[PutAction::Return][..],
+            false,
+        ),
+        (
+            "success without version",
+            &[PutEvent::AppliedWithoutVersion],
+            &[PutAction::InDoubt],
+            false,
+        ),
+        (
+            "clean precondition",
+            &[PutEvent::Failed(ProviderFact::Precondition)],
+            &[PutAction::Precondition],
+            false,
+        ),
+        (
+            "ambiguity followed by precondition",
+            &[
+                PutEvent::Failed(ProviderFact::Ambiguous),
+                PutEvent::Failed(ProviderFact::Precondition),
+            ],
+            &[PutAction::Retry(conflict_backoff(0)), PutAction::InDoubt],
+            true,
+        ),
+        (
+            "throttle followed by precondition",
+            &[
+                PutEvent::Failed(ProviderFact::Throttle),
+                PutEvent::Failed(ProviderFact::Precondition),
+            ],
+            &[
+                PutAction::Retry(conflict_backoff(0)),
+                PutAction::Precondition,
+            ],
+            false,
+        ),
+        (
+            "terminal failure",
+            &[PutEvent::Failed(ProviderFact::Other)],
+            &[PutAction::Terminal(ProviderFact::Other)],
+            false,
+        ),
+        (
+            "terminal failure after ambiguity",
+            &[
+                PutEvent::Failed(ProviderFact::Ambiguous),
+                PutEvent::Failed(ProviderFact::Other),
+            ],
+            &[PutAction::Retry(conflict_backoff(0)), PutAction::InDoubt],
+            true,
+        ),
+    ] {
+        let mut state = ConditionalPutState::default();
+        let actual: Vec<_> = events
+            .iter()
+            .map(|event| put_action(state.transition(event.into_event())))
+            .collect();
+
+        assert_eq!(actual, actions, "{name}");
+        assert_eq!(state.attempts, events.len() as u32, "{name}");
+        assert_eq!(state.may_have_applied, may_have_applied, "{name}");
+    }
+}
+
+#[test]
+fn conditional_put_retry_exhaustion_table() {
+    for (name, fact, retries, exhausted, may_have_applied) in [
+        (
+            "conflict",
+            ProviderFact::Conflict,
+            MAX_CONFLICT_RETRIES,
+            PutAction::Precondition,
+            false,
+        ),
+        (
+            "throttle",
+            ProviderFact::Throttle,
+            DEFAULT_MAX_ATTEMPTS,
+            PutAction::Terminal(ProviderFact::Throttle),
+            false,
+        ),
+        (
+            "ambiguity",
+            ProviderFact::Ambiguous,
+            DEFAULT_MAX_ATTEMPTS,
+            PutAction::InDoubt,
+            true,
+        ),
+    ] {
+        let mut state = ConditionalPutState::default();
+        for retry in 0..retries {
+            assert_eq!(
+                put_action(state.transition(PutEvent::Failed(fact).into_event())),
+                PutAction::Retry(conflict_backoff(retry)),
+                "{name} retry {retry}"
+            );
+        }
+        assert_eq!(
+            put_action(state.transition(PutEvent::Failed(fact).into_event())),
+            exhausted,
+            "{name} exhausted"
+        );
+        assert_eq!(state.attempts, retries + 1, "{name}");
+        assert_eq!(state.may_have_applied, may_have_applied, "{name}");
+    }
+}
+
+#[test]
+fn conditional_put_retry_budget_is_shared_across_provider_facts() {
+    let mut state = ConditionalPutState::default();
+    for retry in 0..DEFAULT_MAX_ATTEMPTS {
+        assert_eq!(
+            put_action(state.transition(PutEvent::Failed(ProviderFact::Throttle).into_event())),
+            PutAction::Retry(conflict_backoff(retry))
+        );
+    }
+
+    assert_eq!(
+        put_action(state.transition(PutEvent::Failed(ProviderFact::Ambiguous).into_event())),
+        PutAction::Terminal(ProviderFact::Ambiguous)
+    );
+    assert!(!state.may_have_applied);
 }
 
 // ---------------------------------------------------------------------------

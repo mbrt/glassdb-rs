@@ -136,15 +136,15 @@ impl S3Backend {
         fut.await.map_err(|e| annotate_read(op, path, e))
     }
 
-    /// Issues a single PutObject with the given retryer, returning the new
-    /// version on success or the normalized provider failure.
+    /// Issues one PutObject and reports the event observed by the conditional
+    /// mutation state machine.
     async fn send_put(
         &self,
         path: &str,
         payload: &[u8],
         conds: &PutConds,
         retry: RetryConfig,
-    ) -> PutAttempt {
+    ) -> ConditionalPutEvent<PutObjectError> {
         let mut op = self
             .client
             .put_object()
@@ -160,10 +160,10 @@ impl S3Backend {
         let cfg = aws_sdk_s3::config::Builder::default().retry_config(retry);
         match op.customize().config_override(cfg).send().await {
             Ok(out) => match out.e_tag().filter(|etag| !etag.is_empty()) {
-                Some(etag) => PutAttempt::Ok(Version::new(etag)),
-                None => PutAttempt::AppliedWithoutVersion,
+                Some(etag) => ConditionalPutEvent::Applied(Version::new(etag)),
+                None => ConditionalPutEvent::AppliedWithoutVersion,
             },
-            Err(e) => PutAttempt::Err(Box::new(ProviderFailure::from(e))),
+            Err(e) => ConditionalPutEvent::Failed(Box::new(ProviderFailure::from(e))),
         }
     }
 
@@ -190,64 +190,85 @@ impl S3Backend {
         // such a precondition as in-doubt instead of reporting a confident
         // conflict (which the engine would retry into a double-apply). See
         // ADR-009.
-        let mut lost = false;
-        let mut attempt: u32 = 0;
+        let mut state = ConditionalPutState::default();
         loop {
-            let e = match self
+            let event = self
                 .send_put(path, &value, &conds, RetryConfig::disabled())
-                .await
-            {
-                PutAttempt::Ok(version) => {
-                    return Ok(version);
+                .await;
+            match state.transition(event) {
+                ConditionalPutAction::Return(version) => return Ok(version),
+                ConditionalPutAction::Retry(after) => glassdb_concurr::rt::sleep(after).await,
+                ConditionalPutAction::Precondition => return Err(BackendError::Precondition),
+                ConditionalPutAction::InDoubt => return Err(in_doubt("Write", path)),
+                ConditionalPutAction::Terminal(failure) => {
+                    return Err(annotate("Write", path, *failure));
                 }
-                PutAttempt::AppliedWithoutVersion => return Err(in_doubt("Write", path)),
-                PutAttempt::Err(e) => *e,
-            };
-
-            if e.fact == ProviderFact::Precondition {
-                // If an earlier attempt may have applied, this precondition could
-                // be our own landed write rather than a competitor's: in doubt.
-                return Err(if lost {
-                    in_doubt("Write", path)
-                } else {
-                    BackendError::Precondition
-                });
             }
-            // 409 ConditionalRequestConflict: concurrent conditional writes
-            // raced; this one was not applied, so retrying it is safe and does
-            // not taint a later precondition.
-            if e.fact == ProviderFact::Conflict && attempt < MAX_CONFLICT_RETRIES {
-                glassdb_concurr::rt::sleep(conflict_backoff(attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            let ambiguous = e.fact == ProviderFact::Ambiguous;
-            if matches!(e.fact, ProviderFact::Ambiguous | ProviderFact::Throttle)
-                && attempt < DEFAULT_MAX_ATTEMPTS
-            {
-                // An ambiguous attempt (timeout/dispatch/5xx) may have applied;
-                // a throttle (503/429) was rejected before applying and is safe.
-                lost = lost || ambiguous;
-                glassdb_concurr::rt::sleep(conflict_backoff(attempt)).await;
-                attempt += 1;
-                continue;
-            }
-            // Terminal error, or the retry budget is exhausted. If any attempt
-            // may have applied, the final outcome is unknown.
-            return Err(if lost {
-                in_doubt("Write", path)
-            } else {
-                annotate("Write", path, e)
-            });
         }
     }
 }
 
-/// The outcome of a single PutObject attempt.
-enum PutAttempt {
-    Ok(Version),
+/// An observation produced by one conditional PutObject attempt.
+enum ConditionalPutEvent<E> {
+    Applied(Version),
     AppliedWithoutVersion,
-    Err(Box<ProviderFailure<PutObjectError>>),
+    Failed(Box<ProviderFailure<E>>),
+}
+
+/// The next effect required by conditional PutObject policy.
+enum ConditionalPutAction<E> {
+    Return(Version),
+    Retry(Duration),
+    Precondition,
+    InDoubt,
+    Terminal(Box<ProviderFailure<E>>),
+}
+
+/// Evidence accumulated while resolving one conditional PutObject operation.
+#[derive(Default)]
+struct ConditionalPutState {
+    attempts: u32,
+    may_have_applied: bool,
+}
+
+impl ConditionalPutState {
+    /// Advances conditional-write policy from one provider event.
+    fn transition<E>(&mut self, event: ConditionalPutEvent<E>) -> ConditionalPutAction<E> {
+        let attempt = self.attempts;
+        self.attempts += 1;
+
+        let failure = match event {
+            ConditionalPutEvent::Applied(version) => {
+                return ConditionalPutAction::Return(version);
+            }
+            ConditionalPutEvent::AppliedWithoutVersion => {
+                return ConditionalPutAction::InDoubt;
+            }
+            ConditionalPutEvent::Failed(failure) => failure,
+        };
+
+        match failure.fact {
+            ProviderFact::Precondition if self.may_have_applied => ConditionalPutAction::InDoubt,
+            ProviderFact::Precondition => ConditionalPutAction::Precondition,
+            // A 409 confirms this attempt did not apply, so retrying does not
+            // taint a later precondition.
+            ProviderFact::Conflict if attempt < MAX_CONFLICT_RETRIES => {
+                ConditionalPutAction::Retry(conflict_backoff(attempt))
+            }
+            // A timeout, dispatch failure, or non-throttle 5xx may have applied.
+            ProviderFact::Ambiguous if attempt < DEFAULT_MAX_ATTEMPTS => {
+                self.may_have_applied = true;
+                ConditionalPutAction::Retry(conflict_backoff(attempt))
+            }
+            // A throttle was rejected before applying and is safe to retry.
+            ProviderFact::Throttle if attempt < DEFAULT_MAX_ATTEMPTS => {
+                ConditionalPutAction::Retry(conflict_backoff(attempt))
+            }
+            _ if self.may_have_applied => ConditionalPutAction::InDoubt,
+            ProviderFact::Conflict => ConditionalPutAction::Precondition,
+            _ => ConditionalPutAction::Terminal(failure),
+        }
+    }
 }
 
 /// The optional conditional headers for a PutObject.
