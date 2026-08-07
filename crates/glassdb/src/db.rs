@@ -9,7 +9,9 @@ use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, TxId};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
-use glassdb_trans::{Engine, EngineConfig, ProtocolTiming, TransError};
+use glassdb_trans::{
+    CollectionData, Data, Engine, EngineConfig, EngineTransaction, ProtocolTiming, TransError,
+};
 use tokio::sync::Notify;
 
 use crate::collection::{Collection, CollectionPath};
@@ -470,14 +472,7 @@ impl DbInner {
         T: Send,
     {
         let tx = Transaction::new(self.clone());
-        let mut handle = None;
-        // RAII safety net: if this future is dropped between begin and end
-        // (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
-        // the guard's `Drop` schedules an abort so the engine-side tx is
-        // marked aborted promptly instead of lingering until lease expiry.
-        // Updated to the current tx id after every `begin`/`rebegin`; cleared
-        // once `end` has run.
-        let mut abort_guard = TransactionAbortGuard::new(&self.engine);
+        let mut driver = AttemptDriver::new(&self.engine);
 
         let result: Result<T, Error> = loop {
             // Hand a fresh handle to the user closure (which consumes it); `tx`
@@ -497,48 +492,20 @@ impl DbInner {
 
             let value = match fn_res {
                 Ok(v) => {
-                    // Hand the full access (reads and writes) to the handle. The
-                    // handle owns the data from here on; the wound path below
-                    // recovers it from the handle, so no separate clone is kept.
-                    match handle.as_mut() {
-                        None => {
-                            let h = self.engine.begin_transaction(access, collection_access);
-                            abort_guard.arm(h.id().clone());
-                            handle = Some(h);
-                        }
-                        Some(h) => self.engine.reset_transaction(h, access, collection_access),
-                    }
+                    driver.install_accesses(access, collection_access);
                     v
                 }
                 Err(ferr) => {
                     // The user function returned an error. It might be the
                     // result of a spurious read, so validate only the reads.
-                    let mut ro = access;
-                    ro.writes.clear();
-                    let collection_ro = collection_access.into_read_only();
-                    match handle.as_mut() {
-                        None => {
-                            let h = self.engine.begin_transaction(ro, collection_ro);
-                            abort_guard.arm(h.id().clone());
-                            handle = Some(h);
-                        }
-                        Some(h) => self.engine.reset_transaction(h, ro, collection_ro),
-                    }
-                    let h = handle.as_mut().unwrap();
-                    match self.engine.validate_reads(h).await {
+                    match driver.validate_body_error(access, collection_access).await {
                         Err(TransError::Retry) => {
                             tx.reset();
                             stats.retries += 1;
                             continue;
                         }
                         Err(TransError::Wounded) => {
-                            if let Some(h) = handle.as_mut() {
-                                let _ = self.engine.end(h).await;
-                            }
-                            let old = handle.take().unwrap();
-                            let new = self.engine.rebegin_transaction(old);
-                            abort_guard.arm(new.id().clone());
-                            handle = Some(new);
+                            driver.restart_after_wound().await;
                             tx.reset();
                             stats.retries += 1;
                             continue;
@@ -548,27 +515,13 @@ impl DbInner {
                 }
             };
 
-            // Try to commit.
-            let commit_res = {
-                let h = handle.as_mut().unwrap();
-                self.engine.commit(h).await
-            };
-            match commit_res {
+            match driver.commit().await {
                 Ok(()) => break Ok(value),
                 Err(TransError::Wounded) => {
                     // A higher-priority transaction aborted us. Release whatever
                     // we held and restart with a fresh id that preserves our
                     // priority, so we are not starved on the retry.
-                    if let Some(h) = handle.as_mut() {
-                        let _ = self.engine.end(h).await;
-                    }
-                    let old = handle.take().unwrap();
-                    let new = self.engine.rebegin_transaction(old);
-                    // Refresh the cancellation safety net with the new id so a
-                    // drop after the rebegin aborts the retry's tx, not the
-                    // (already-ended) original.
-                    abort_guard.arm(new.id().clone());
-                    handle = Some(new);
+                    driver.restart_after_wound().await;
                     tx.reset();
                     stats.retries += 1;
                     continue;
@@ -582,21 +535,116 @@ impl DbInner {
             }
         };
 
-        // Always finalize the handle (a committed handle is a no-op). The
-        // safety-net guard is disarmed either way so its `Drop` does not fire
-        // a redundant async abort for an already-finalized tx.
-        let end_result = if let Some(h) = handle.as_mut() {
-            self.engine.end(h).await
-        } else {
-            Ok(())
-        };
-        abort_guard.disarm();
+        let end_result = driver.finish().await;
         if let Err(e) = end_result
             && result.is_ok()
         {
             return Err(e.into());
         }
         result
+    }
+}
+
+/// Drives the engine-side transitions for one public transaction.
+struct AttemptDriver<'a> {
+    engine: &'a Engine,
+    resources: Option<AttemptResources<'a>>,
+}
+
+impl<'a> AttemptDriver<'a> {
+    fn new(engine: &'a Engine) -> Self {
+        Self {
+            engine,
+            resources: None,
+        }
+    }
+
+    /// Installs the accesses collected from the latest closure execution.
+    fn install_accesses(&mut self, access: Data, collection_access: CollectionData) {
+        match self.resources.as_mut() {
+            Some(resources) => {
+                self.engine
+                    .reset_transaction(&mut resources.handle, access, collection_access)
+            }
+            None => {
+                let handle = self.engine.begin_transaction(access, collection_access);
+                self.resources = Some(AttemptResources::new(self.engine, handle));
+            }
+        }
+    }
+
+    /// Validates the reads that led the transaction body to return an error.
+    async fn validate_body_error(
+        &mut self,
+        mut access: Data,
+        collection_access: CollectionData,
+    ) -> Result<(), TransError> {
+        access.writes.clear();
+        self.install_accesses(access, collection_access.into_read_only());
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("body-error validation installs attempt resources");
+        self.engine.validate_reads(&mut resources.handle).await
+    }
+
+    /// Restarts an attempt that a higher-priority transaction wounded.
+    async fn restart_after_wound(&mut self) {
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("a wound is reported only for an active attempt");
+        let _ = self.engine.end(&mut resources.handle).await;
+        let resources = self
+            .resources
+            .take()
+            .expect("the ended attempt remains active until it is renewed");
+        self.resources = Some(resources.rebegin());
+    }
+
+    /// Commits the accesses installed for the latest closure execution.
+    async fn commit(&mut self) -> Result<(), TransError> {
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("commit follows access installation");
+        self.engine.commit(&mut resources.handle).await
+    }
+
+    /// Finalizes any active engine attempt.
+    async fn finish(mut self) -> Result<(), TransError> {
+        let Some(resources) = self.resources.as_mut() else {
+            return Ok(());
+        };
+        let result = self.engine.end(&mut resources.handle).await;
+        resources.abort_guard.disarm();
+        result
+    }
+}
+
+/// Engine state for one active attempt and its cancellation safety net.
+///
+/// Storing this as one optional value ensures the handle and armed guard exist
+/// together or not at all.
+struct AttemptResources<'a> {
+    handle: EngineTransaction,
+    abort_guard: TransactionAbortGuard<'a>,
+}
+
+impl<'a> AttemptResources<'a> {
+    fn new(engine: &'a Engine, handle: EngineTransaction) -> Self {
+        let tx_id = handle.id().clone();
+        Self {
+            handle,
+            abort_guard: TransactionAbortGuard::new(engine, tx_id),
+        }
+    }
+
+    fn rebegin(mut self) -> Self {
+        let engine = self.abort_guard.engine;
+        self.abort_guard.disarm();
+        let handle = engine.rebegin_transaction(self.handle);
+        Self::new(engine, handle)
     }
 }
 
@@ -615,17 +663,11 @@ struct TransactionAbortGuard<'a> {
 }
 
 impl<'a> TransactionAbortGuard<'a> {
-    fn new(engine: &'a Engine) -> Self {
+    fn new(engine: &'a Engine, tx_id: TxId) -> Self {
         Self {
             engine,
-            armed: None,
+            armed: Some(tx_id),
         }
-    }
-
-    /// Arms the guard for `tx_id`. Replaces any prior id (e.g. after a wound
-    /// retry that gets a fresh id from the engine).
-    fn arm(&mut self, tx_id: TxId) {
-        self.armed = Some(tx_id);
     }
 
     /// Disarms the guard once the attempt has ended so `Drop` is a no-op.
@@ -639,5 +681,41 @@ impl Drop for TransactionAbortGuard<'_> {
         if let Some(id) = self.armed.take() {
             self.engine.async_abort(&id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glassdb_backend::memory::MemoryBackend;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn wound_restart_renews_the_attempt_and_remains_finishable() {
+        let db = Database::open("attempts", MemoryBackend::new())
+            .await
+            .unwrap();
+        let mut driver = AttemptDriver::new(&db.inner.engine);
+        driver.install_accesses(Data::default(), CollectionData::default());
+
+        let original_id = driver
+            .resources
+            .as_ref()
+            .expect("access installation starts an attempt")
+            .handle
+            .id()
+            .clone();
+        driver.restart_after_wound().await;
+        let renewed_id = driver
+            .resources
+            .as_ref()
+            .expect("wound restart keeps an active attempt")
+            .handle
+            .id()
+            .clone();
+
+        assert_ne!(renewed_id, original_id);
+        driver.finish().await.unwrap();
+        db.shutdown().await;
     }
 }

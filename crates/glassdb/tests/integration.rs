@@ -1164,8 +1164,8 @@ async fn listing_hides_keys_from_aborted_transactions() {
 
     // A transaction creates two brand-new keys and reaches the commit-log write
     // (so its create locks are already installed in the leaf), then is cancelled
-    // mid-commit. The `TxAbortGuard` asynchronously marks it aborted: the ghost
-    // keys were "added" by a transaction that never committed.
+    // mid-commit. The attempt cancellation guard asynchronously marks it
+    // aborted: the ghost keys were "added" by a transaction that never committed.
     let arrived = pause.arm("/_t/");
     let stalled = tokio::spawn({
         let db = db.clone();
@@ -1412,7 +1412,7 @@ async fn builder_custom_options() {
 /// Dropping a `Database::tx` future mid-flight (e.g. via `tokio::time::timeout`)
 /// must not corrupt anything and must not leave the database unusable. The
 /// next transaction observes the committed state (or the absence of one) and
-/// completes promptly, exercising the `TxAbortGuard` cleanup hook end-to-end.
+/// completes promptly.
 #[tokio::test(start_paused = true)]
 async fn cancelled_tx_future_does_not_block_followups() {
     use std::time::Duration;
@@ -1427,9 +1427,9 @@ async fn cancelled_tx_future_does_not_block_followups() {
 
     let coll_ref = &coll;
     // The closure stages a write and then blocks forever; the outer timeout
-    // drops the entire `Database::tx` future. With the `Tx`-drop safety net in
-    // place this releases all attached state synchronously and schedules an
-    // async abort of whatever engine-side tx may have been registered.
+    // drops the entire `Database::tx` future. Because engine attempts begin only
+    // after a closure returns, cancelling here discards the staged state without
+    // requiring engine cleanup.
     let r = tokio::time::timeout(Duration::from_millis(50), async {
         db.tx(|tx| async move {
             let _ = read_int_from_tx(&tx, coll_ref, b"k").await?;
@@ -1678,7 +1678,7 @@ fn is_aborted_tx_log(body: &[u8]) -> bool {
 
 /// When a `Database::tx` future is dropped *during* its commit (after
 /// `algo.begin` registered the engine-side transaction, before `algo.end`
-/// ran), the `TxAbortGuard` must schedule an async abort so peer
+/// ran), the attempt cancellation guard must schedule an async abort so peer
 /// transactions see the abort marker promptly instead of waiting for the
 /// 15-second lock lease. We exercise the exact mid-commit cancel path by
 /// trapping the first `write_if_not_exists` on a transaction-log path (the
@@ -1722,12 +1722,11 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     // Wait until the spawned tx has reached the commit-log trap. From here
     // the engine-side tx is registered (`algo.begin` ran), the locks have
     // been acquired, but the commit log hasn't been written yet. This is
-    // exactly the window the `TxAbortGuard` exists for.
+    // exactly the window the attempt cancellation guard exists for.
     arrived.await.unwrap();
 
-    // Drop the future. `TxAbortGuard::drop` fires here, calling
-    // `Algo::async_abort` which spawns a background task that writes the
-    // Aborted marker to the tx log via the (now-disarmed) backend.
+    // Dropping the future schedules an async abort, whose background task writes
+    // the Aborted marker to the transaction log via the now-unblocked backend.
     stalled.abort();
     let _ = stalled.await;
 
