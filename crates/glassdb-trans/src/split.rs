@@ -298,6 +298,176 @@ impl SplitAttemptOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StructuralSplitTarget<'a> {
+    Root,
+    NonRoot(&'a str),
+}
+
+impl<'a> StructuralSplitTarget<'a> {
+    fn for_path(path: &str, token: &'a str) -> Self {
+        if paths::is_tree_root(path) {
+            Self::Root
+        } else {
+            Self::NonRoot(token)
+        }
+    }
+
+    fn source_token(self) -> Option<&'a str> {
+        match self {
+            Self::Root => None,
+            Self::NonRoot(token) => Some(token),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StructuralSplitTopology<'a> {
+    Owned,
+    Joined(&'a TxId),
+}
+
+/// One root or non-root split with a single outer lifecycle.
+struct StructuralSplitAttempt<'a> {
+    splitter: &'a Splitter,
+    prefix: &'a str,
+    target: StructuralSplitTarget<'a>,
+    worker: TxId,
+    reason: &'a SplitReason,
+}
+
+impl<'a> StructuralSplitAttempt<'a> {
+    fn new(
+        splitter: &'a Splitter,
+        prefix: &'a str,
+        target: StructuralSplitTarget<'a>,
+        worker: TxId,
+        reason: &'a SplitReason,
+    ) -> Self {
+        Self {
+            splitter,
+            prefix,
+            target,
+            worker,
+            reason,
+        }
+    }
+
+    async fn run(self, topology: StructuralSplitTopology<'_>) -> Result<(), TransError> {
+        let result = match topology {
+            StructuralSplitTopology::Owned => {
+                match self
+                    .splitter
+                    .begin_topology_tx(self.prefix, &self.worker)
+                    .await
+                {
+                    Ok(()) => self.run_prepared(topology).await,
+                    Err(error) => Err(error),
+                }
+            }
+            StructuralSplitTopology::Joined(_) => {
+                self.splitter.mon.begin_tx(&self.worker);
+                self.run_prepared(topology).await
+            }
+        };
+
+        match topology {
+            StructuralSplitTopology::Owned => {
+                self.splitter
+                    .finalize_topology_split(self.prefix, &self.worker)
+                    .await;
+            }
+            StructuralSplitTopology::Joined(_) => {
+                self.splitter.finalize_split(&self.worker).await;
+            }
+        }
+        if result.is_err() {
+            self.splitter.recovery_wake.notify_one();
+        }
+        result
+    }
+
+    async fn run_prepared(&self, topology: StructuralSplitTopology<'_>) -> Result<(), TransError> {
+        let participant = match topology {
+            StructuralSplitTopology::Owned => &self.worker,
+            StructuralSplitTopology::Joined(participant) => participant,
+        };
+        let prepared = self
+            .splitter
+            .prepare_structural_intent(self.prefix, self.target.source_token(), participant)
+            .await?;
+        let observed = prepared.observed.clone();
+        let outcome = match topology {
+            StructuralSplitTopology::Owned => {
+                match self.splitter.join_topology(self.prefix, &self.worker).await {
+                    Ok(()) => self.coordinate(prepared).await,
+                    Err(error) => SplitAttemptOutcome::retry_cleanly(Err(error)),
+                }
+            }
+            StructuralSplitTopology::Joined(_) => self.coordinate(prepared).await,
+        };
+        self.finish(outcome, &observed, topology).await
+    }
+
+    async fn coordinate(&self, prepared: PreparedSplit) -> SplitAttemptOutcome {
+        match self.target {
+            StructuralSplitTarget::Root => {
+                self.splitter
+                    .coordinate_root_split(self.prefix, &self.worker, self.reason, prepared)
+                    .await
+            }
+            StructuralSplitTarget::NonRoot(token) => {
+                self.splitter
+                    .coordinate_nonroot_split(
+                        self.prefix,
+                        token,
+                        &self.worker,
+                        self.reason,
+                        prepared,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn finish(
+        &self,
+        outcome: SplitAttemptOutcome,
+        prepared: &Observation<StructuralLog>,
+        topology: StructuralSplitTopology<'_>,
+    ) -> Result<(), TransError> {
+        let SplitAttemptOutcome { result, state } = outcome;
+        match state {
+            SplitAttemptResult::Completed => match topology {
+                StructuralSplitTopology::Owned => result.and(
+                    self.splitter
+                        .leave_topology(self.prefix, &self.worker)
+                        .await,
+                ),
+                StructuralSplitTopology::Joined(_) => result,
+            },
+            SplitAttemptResult::RetryCleanly => {
+                let cleanup = match self.splitter.shards.delete_structural_log(prepared).await {
+                    Ok(()) => match topology {
+                        StructuralSplitTopology::Owned => {
+                            self.splitter
+                                .leave_topology(self.prefix, &self.worker)
+                                .await
+                        }
+                        StructuralSplitTopology::Joined(_) => Ok(()),
+                    },
+                    Err(error) => Err(error.into()),
+                };
+                result.and(cleanup)
+            }
+            SplitAttemptResult::RecoveryRequired(ready) => {
+                debug_assert_eq!(ready.record().phase, StructuralLogPhase::Ready);
+                result
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     candidates: AtomicU64,
@@ -871,13 +1041,12 @@ impl Splitter {
         id: TxId,
         reason: &SplitReason,
     ) -> Result<(), TransError> {
-        let pr = paths::parse(path)
+        let parsed = paths::parse(path)
             .map_err(|e| StorageError::with_source("parsing candidate path", e))?;
-        if paths::is_tree_root(path) {
-            self.split_root(&pr.prefix, id, reason).await
-        } else {
-            self.split_nonroot(&pr.prefix, &pr.suffix, id, reason).await
-        }
+        let target = StructuralSplitTarget::for_path(path, &parsed.suffix);
+        StructuralSplitAttempt::new(self, &parsed.prefix, target, id, reason)
+            .run(StructuralSplitTopology::Owned)
+            .await
     }
 
     async fn begin_topology_tx(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
@@ -943,50 +1112,11 @@ impl Splitter {
         // finalized. A fresh structural identity prevents ordinary lock
         // helping from mistaking this in-flight recursive split for stale work.
         let worker = self.candidates.new_id();
-        self.mon.begin_tx(&worker);
         let reason = SplitReason::SoftCap;
-        let source_token = (!paths::is_tree_root(path)).then_some(parsed.suffix.as_str());
-        let result = match self
-            .prepare_structural_intent(&parsed.prefix, source_token, topology_participant)
+        let target = StructuralSplitTarget::for_path(path, &parsed.suffix);
+        StructuralSplitAttempt::new(self, &parsed.prefix, target, worker, &reason)
+            .run(StructuralSplitTopology::Joined(topology_participant))
             .await
-        {
-            Ok(intent) => {
-                let prepared = intent.observed.clone();
-                let attempt = if paths::is_tree_root(path) {
-                    self.coordinate_root_split(&parsed.prefix, &worker, &reason, intent)
-                        .await
-                } else {
-                    self.coordinate_nonroot_split(
-                        &parsed.prefix,
-                        &parsed.suffix,
-                        &worker,
-                        &reason,
-                        intent,
-                    )
-                    .await
-                };
-                let SplitAttemptOutcome { result, state } = attempt;
-                match state {
-                    SplitAttemptResult::Completed => result,
-                    SplitAttemptResult::RetryCleanly => result.and(
-                        self.shards
-                            .delete_structural_log(&prepared)
-                            .await
-                            .map_err(TransError::from),
-                    ),
-                    SplitAttemptResult::RecoveryRequired(ready) => {
-                        debug_assert_eq!(ready.record().phase, StructuralLogPhase::Ready);
-                        result
-                    }
-                }
-            }
-            Err(error) => Err(error),
-        };
-        self.finalize_split(&worker).await;
-        if result.is_err() {
-            self.recovery_wake.notify_one();
-        }
-        result
     }
 
     /// Acquires a source node's structure-write lock under wound-wait. A leaf
@@ -1219,57 +1349,6 @@ impl Splitter {
         Err(TransError::Retry)
     }
 
-    /// Halves a standalone node and finalizes its wound-wait participant.
-    async fn split_nonroot(
-        &self,
-        prefix: &str,
-        token: &str,
-        id: TxId,
-        reason: &SplitReason,
-    ) -> Result<(), TransError> {
-        let result = match self.begin_topology_tx(prefix, &id).await {
-            Ok(()) => match self
-                .prepare_structural_intent(prefix, Some(token), &id)
-                .await
-            {
-                Ok(intent) => {
-                    let prepared = intent.observed.clone();
-                    let attempt = match self.join_topology(prefix, &id).await {
-                        Ok(()) => {
-                            self.coordinate_nonroot_split(prefix, token, &id, reason, intent)
-                                .await
-                        }
-                        Err(error) => SplitAttemptOutcome::retry_cleanly(Err(error)),
-                    };
-                    let SplitAttemptOutcome { result, state } = attempt;
-                    match state {
-                        SplitAttemptResult::Completed => {
-                            result.and(self.leave_topology(prefix, &id).await)
-                        }
-                        SplitAttemptResult::RetryCleanly => {
-                            let cleanup = match self.shards.delete_structural_log(&prepared).await {
-                                Ok(()) => self.leave_topology(prefix, &id).await,
-                                Err(error) => Err(error.into()),
-                            };
-                            result.and(cleanup)
-                        }
-                        SplitAttemptResult::RecoveryRequired(ready) => {
-                            debug_assert_eq!(ready.record().phase, StructuralLogPhase::Ready);
-                            result
-                        }
-                    }
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        self.finalize_topology_split(prefix, &id).await;
-        if result.is_err() {
-            self.recovery_wake.notify_one();
-        }
-        result
-    }
-
     /// Performs the write-ahead, sibling creation, shrink, and publication.
     async fn coordinate_nonroot_split(
         &self,
@@ -1406,53 +1485,6 @@ impl Splitter {
             return SplitAttemptOutcome::recovery_required(ready, error.into());
         }
         SplitAttemptOutcome::completed()
-    }
-
-    /// Grows an overflowing collection root into a two-child index.
-    async fn split_root(
-        &self,
-        prefix: &str,
-        id: TxId,
-        reason: &SplitReason,
-    ) -> Result<(), TransError> {
-        let result = match self.begin_topology_tx(prefix, &id).await {
-            Ok(()) => match self.prepare_structural_intent(prefix, None, &id).await {
-                Ok(intent) => {
-                    let prepared = intent.observed.clone();
-                    let attempt = match self.join_topology(prefix, &id).await {
-                        Ok(()) => {
-                            self.coordinate_root_split(prefix, &id, reason, intent)
-                                .await
-                        }
-                        Err(error) => SplitAttemptOutcome::retry_cleanly(Err(error)),
-                    };
-                    let SplitAttemptOutcome { result, state } = attempt;
-                    match state {
-                        SplitAttemptResult::Completed => {
-                            result.and(self.leave_topology(prefix, &id).await)
-                        }
-                        SplitAttemptResult::RetryCleanly => {
-                            let cleanup = match self.shards.delete_structural_log(&prepared).await {
-                                Ok(()) => self.leave_topology(prefix, &id).await,
-                                Err(error) => Err(error.into()),
-                            };
-                            result.and(cleanup)
-                        }
-                        SplitAttemptResult::RecoveryRequired(ready) => {
-                            debug_assert_eq!(ready.record().phase, StructuralLogPhase::Ready);
-                            result
-                        }
-                    }
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        self.finalize_topology_split(prefix, &id).await;
-        if result.is_err() {
-            self.recovery_wake.notify_one();
-        }
-        result
     }
 
     async fn join_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
