@@ -1,14 +1,18 @@
 # ADR-052: Backend server-time observation
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md), and a prerequisite for
 [ADR-038](038-hlc-snapshot-cuts.md).
 
-Extends [ADR-023](023-slimmed-backend-trait.md) with one additional observation
+Extends [ADR-023](../../../adr/023-slimmed-backend-trait.md) with one additional observation
 on successful operations. Its operation set, opaque content versions, and
 version-conditional read are unchanged.
 

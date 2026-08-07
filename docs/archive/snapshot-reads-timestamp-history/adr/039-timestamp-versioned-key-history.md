@@ -1,8 +1,12 @@
 # ADR-039: Timestamp-versioned key history
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md). Versions are ordered by
@@ -11,8 +15,8 @@ the commit timestamps [ADR-038](038-hlc-snapshot-cuts.md) assigns.
 On acceptance, this supersedes ADR-019's unified value-placement decision, the
 corresponding ADR-020 clauses that make the committed transaction body the only
 durable home of every value, and
-[ADR-051](051-inline-latest-values.md)'s logless direct-commit guarantee. It
-also refines [ADR-031](031-dynamic-range-sharding.md)'s soft split cap to count
+[ADR-051](../../../adr/051-inline-latest-values.md)'s logless direct-commit guarantee. It
+also refines [ADR-031](../../../adr/031-dynamic-range-sharding.md)'s soft split cap to count
 live entries only; its split protocol, right-link traversal, and hard object cap
 are unchanged.
 ADR-051's inline current state remains a latest-read optimization, but every
@@ -87,7 +91,7 @@ two ordered streams; a snapshot point read consults it only for a key the leaf
 does not have. It splits with its leaf, is a GC root for the history it names,
 and is reclaimed as a whole once its newest entry leaves the window.
 
-Count only live entries toward [ADR-031](031-dynamic-range-sharding.md)'s soft
+Count only live entries toward [ADR-031](../../../adr/031-dynamic-range-sharding.md)'s soft
 split cap, so reclaimable residue can never trigger a split. This refines that
 trigger rather than replacing it: a leaf still splits when its encoded size
 threatens the hard object cap, which is a limit rather than a policy choice.

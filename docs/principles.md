@@ -12,3 +12,5 @@ These are the principles from which GlassDB is founded:
 - Conflicts and inconsistencies cannot be exposed to user code. If they are, the
   user code must be transparently retried.
 - Correctness over speed. We prefer to be correct and slow than fast and wrong.
+- The user doesn't pay for what they don't use. Expensive background work should
+  happen only if the user's workload justifies it.

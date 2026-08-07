@@ -1,8 +1,12 @@
 # ADR-040: Snapshot history retention
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md).
@@ -14,7 +18,7 @@ delayed artifacts. Pending-lock reclamation remains, extended by
 
 Because [ADR-039](039-timestamp-versioned-key-history.md) requires certified
 history from every writer, a writer ID again implies durable outcome evidence.
-[ADR-051](051-inline-latest-values.md)'s logless IDs, which have no such
+[ADR-051](../../../adr/051-inline-latest-values.md)'s logless IDs, which have no such
 evidence, do not occur in this format. Inline current bytes still do, and they
 are part of the leaf rather than a reclaimable object, so they neither act as a
 GC root nor satisfy a retention obligation.

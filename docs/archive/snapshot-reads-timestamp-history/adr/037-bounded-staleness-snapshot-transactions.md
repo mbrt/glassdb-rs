@@ -1,8 +1,12 @@
 # ADR-037: Bounded-staleness snapshot transactions
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Umbrella ADR for the living
 [snapshot-reads design](../designs/snapshot-reads.md).
@@ -120,7 +124,7 @@ particular execution produces no writes.
   [performance gate](../designs/snapshot-reads.md#performance-acceptance-gate).
   The logged commit paths are unchanged, so that gate mostly covers the cost of
   writing and retaining history. The exception is the small single-key
-  overwrite, which loses [ADR-051](051-inline-latest-values.md)'s one-CAS commit
+  overwrite, which loses [ADR-051](../../../adr/051-inline-latest-values.md)'s one-CAS commit
   to mandatory history and is measured as its own cell.
 
 ## Alternatives considered

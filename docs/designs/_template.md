@@ -1,13 +1,13 @@
-# <Design / epic name>
+# <Design name>
 
 ## Status
 
 Proposed | In progress | Shipped | Superseded by <link>
 
 One or two sentences: what this redesign is, and the single umbrella ADR that
-records the top-level decision (if any). A design doc is the **living** companion
-to the **frozen** ADRs it indexes — it may be edited freely as the effort
-progresses; the ADRs it links must not.
+records the top-level decision (if any). Before implementation is scheduled, a
+design may remain a self-contained exploration with no ADRs. A design doc is
+**living** and may be edited freely; accepted ADRs it links remain frozen.
 
 ## Goal & scope
 
@@ -17,12 +17,16 @@ explicitly out of scope / deferred.
 ## Design at a glance
 
 A compact overview of the resulting shape (objects, protocol, invariants). Deep
-rationale lives in the constituent ADRs; keep this a map, not a copy.
+rationale and unresolved trade-offs may remain here while the design is an
+exploration. After decisions are extracted into ADRs, keep this section as a
+map rather than copying their detail.
 
-## Constituent ADRs
+## Decision records
 
-The decision index for this effort — every significant decision is a frozen ADR,
-listed here with its status so the whole redesign can be tracked in one place.
+For a pre-implementation exploration, state explicitly that there are no ADRs
+yet and what evidence is needed before extracting them. Otherwise, index every
+significant accepted or proposed decision with its status so the whole redesign
+can be tracked in one place.
 
 - **[ADR-NNN](../adr/NNN-title.md) — Title.** Status. One-line summary.
 - ...

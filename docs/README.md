@@ -7,7 +7,7 @@ the **living narrative** that indexes and explains them (architecture + designs)
 | ------------------- | -------------------------------------------------------------------- | --------- |
 | [`architecture.md`](architecture.md) | The high-level architecture and design of GlassDB. | Living — kept current. |
 | [`adr/`](adr/)      | Architecture Decision Records: one significant decision each, in sequence. | Frozen — only status/links change after acceptance. |
-| [`designs/`](designs/) | Design overviews for redesigns that span **multiple ADRs** ("epics"): each is the umbrella narrative + decision index for its ADRs. | Living — edited as the effort progresses. |
+| [`designs/`](designs/) | Design explorations and overviews for significant work. A design may precede ADR extraction or serve as an umbrella narrative and decision index. | Living — edited as the effort progresses. |
 | [`guides/`](guides/) | Process and how-to: releasing, reviewing, performance tracking, testing. | Living. |
 | [`archive/`](archive/) | Superseded / obsolete documents, preserved for reference. | Frozen — banner-marked, not updated. |
 
@@ -30,20 +30,28 @@ independent of the Go original, so they were not ported; only the
 design-relevant records (001, 002, 007) were carried over before the sequence
 diverged.
 
-## Designs / epics (`designs/`)
+**Archived, unaccepted records.** ADR numbers 037–041, 052, and 055 belong to
+the discarded timestamp-history snapshot proposal. They were never accepted or
+implemented, have moved to the
+[`snapshot-reads-timestamp-history`](archive/snapshot-reads-timestamp-history/README.md)
+archive, and remain reserved for link stability rather than being reused.
 
-Living overviews that track a redesign spanning many ADRs. Each states the
-umbrella goal, gives a design-at-a-glance, and indexes its constituent ADRs with
+## Designs (`designs/`)
+
+Living documents that explore or track significant redesigns. Before
+implementation, a design may remain self-contained so speculative choices do
+not leave a trail of proposed, unimplemented ADRs. Once decisions are accepted,
+the design becomes the umbrella narrative and indexes its focused ADRs with
 status. Designs are **named by topic, not numbered** (unlike ADRs): they are a
 small, living set referenced by subject rather than a decision sequence. New
-epics use [`designs/_template.md`](designs/_template.md).
+designs use [`designs/_template.md`](designs/_template.md).
 
 - [`designs/object-storage-native.md`](designs/object-storage-native.md) — the
   content-CAS transaction and storage layout.
 - [`designs/dynamic-range-sharding.md`](designs/dynamic-range-sharding.md) — the
   order-preserving B-link coordination directory.
 - [`designs/snapshot-reads.md`](designs/snapshot-reads.md) — proposed
-  bounded-staleness, long-lived read-only snapshots.
+  always-on, dependency-consistent, long-lived read-only snapshots.
 
 ## Guides (`guides/`)
 
@@ -61,3 +69,5 @@ epics use [`designs/_template.md`](designs/_template.md).
 
 - [`porting-go.md`](archive/porting-go.md) — the original Go→Rust port decisions.
   Frozen; the engine is now independent of the Go version.
+- [`snapshot-reads-timestamp-history/`](archive/snapshot-reads-timestamp-history/README.md)
+  — discarded timestamp-versioned snapshot design, review, and unaccepted ADRs.

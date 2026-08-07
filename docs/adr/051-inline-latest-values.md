@@ -186,14 +186,6 @@ if the CAS handles membership coordination. These extensions require set-wide
 validation, capacity admission, split-aware recovery, and membership rules, so
 they are not part of the initial path.
 
-Snapshot history is also outside this decision. ADR-039's future snapshot
-protocol always emits immutable history and certification for every writer,
-even while new snapshot admission is operationally disabled. It retains inline
-current values as a latest-read optimization but supersedes this ADR's guarantee
-that an eligible commit needs only one CAS and no external record. Preserving a
-specialized one-CAS path while emitting mandatory history remains a research
-goal, not a runtime latest-only database mode.
-
 ## Consequences
 
 - An inline latest-value read needs only the leaf object and benefits directly

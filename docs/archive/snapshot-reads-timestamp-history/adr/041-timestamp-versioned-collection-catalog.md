@@ -1,19 +1,23 @@
 # ADR-041: Timestamp-versioned collection catalog
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md).
 
-[ADR-046](046-incarnation-addressed-collections.md) defines the authoritative
+[ADR-046](../../../adr/046-incarnation-addressed-collections.md) defines the authoritative
 model for collection identity and path resolution, and [ADR-047] defines its
 ordinary-transaction semantics. This ADR versions those ID-based parent
 directories; the earlier reusable name-derived `_i` tombstone model does not
 carry forward.
 
-[ADR-047]: 047-transactional-collection-management.md
+[ADR-047]: ../../../adr/047-transactional-collection-management.md
 
 On acceptance, this supersedes the ADR-016, ADR-018, and ADR-031 clauses that
 make the physical `_i` root authoritative for collection existence and

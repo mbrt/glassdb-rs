@@ -27,10 +27,6 @@ Backend mutations retain the conditional boundary of
 [ADR-044](044-cas-fenced-structural-gate.md) to quiesce each node before
 fencing it.
 
-[ADR-041](041-timestamp-versioned-collection-catalog.md) versions these
-transactional ID-based directories. Snapshot semantics are otherwise outside
-this ADR.
-
 ## Context
 
 ADR-046 separates logical names from physical collection identity, but its

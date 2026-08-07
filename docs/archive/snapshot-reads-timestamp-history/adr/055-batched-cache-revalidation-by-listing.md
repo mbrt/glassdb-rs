@@ -1,17 +1,21 @@
 # ADR-055: Batched cache revalidation by listing
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md).
 
-Extends [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md)'s
+Extends [ADR-035](../../../adr/035-paginated-listing-and-sharded-transaction-logs.md)'s
 `ListPage` with one field per reported object. Its pagination contract, opaque
 cursor, unspecified result order, and explicitly non-snapshot traversal are
-unchanged. [ADR-023](023-slimmed-backend-trait.md)'s opaque `Version` and
-[ADR-036](036-decoded-object-cache-with-bounded-freshness.md)'s watermark rule
+unchanged. [ADR-023](../../../adr/023-slimmed-backend-trait.md)'s opaque `Version` and
+[ADR-036](../../../adr/036-decoded-object-cache-with-bounded-freshness.md)'s watermark rule
 are used as they stand.
 
 ## Context
@@ -53,7 +57,7 @@ obsolete, but only when the observation's watermark precedes the list's
 `started-at`; otherwise the page is older news than the cache already holds.
 
 Equivalent content stays equivalent.
-[ADR-042](042-conditional-only-backend-mutations.md) and ADR-036 already define
+[ADR-042](../../../adr/042-conditional-only-backend-mutations.md) and ADR-036 already define
 a revision as a content validator rather than a mutation identifier, so a rewrite
 that produces identical bytes is indistinguishable from no rewrite and needs no
 special handling here. A watermark asserts that the held content is current,

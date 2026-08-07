@@ -1,8 +1,12 @@
 # ADR-038: Hybrid-logical-clock snapshot cuts
 
+> **Archived — discarded before acceptance.** Preserved with the rejected
+> timestamp-history proposal. See the active
+> [snapshot design](../../../designs/snapshot-reads.md).
+
 ## Status
 
-Proposed.
+Discarded — never accepted or implemented.
 
 Constituent decision of the
 [snapshot-reads design](../designs/snapshot-reads.md). Requires
@@ -12,9 +16,9 @@ This number previously carried a cooperative sealed-epoch proposal. That model
 was rejected before acceptance; see
 [Cut definition](../designs/snapshot-reads.md#cut-definition) for the
 comparison. Unlike that proposal, this decision leaves ADR-020's commit
-sequence and [ADR-027](027-single-rw-parallel-lock-publish.md)'s parallel
+sequence and [ADR-027](../../../adr/027-single-rw-parallel-lock-publish.md)'s parallel
 single read-write path unchanged.
-[ADR-051](051-inline-latest-values.md)'s logless one-CAS commit is the one
+[ADR-051](../../../adr/051-inline-latest-values.md)'s logless one-CAS commit is the one
 exception, and it is lost to
 [ADR-039](039-timestamp-versioned-key-history.md)'s mandatory history rather
 than to anything decided here.
