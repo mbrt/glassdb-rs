@@ -5,14 +5,13 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(test)]
-use std::collections::BTreeSet;
-
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, TxId};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
-use glassdb_trans::{Engine, EngineConfig, ProtocolTiming, TransError};
+use glassdb_trans::{
+    CollectionData, Data, Engine, EngineConfig, EngineTransaction, ProtocolTiming, TransError,
+};
 use tokio::sync::Notify;
 
 use crate::collection::{Collection, CollectionPath};
@@ -119,8 +118,6 @@ impl DatabaseBuilder {
             engine,
             stats: Mutex::new(Stats::default()),
             operations: OperationLifecycle::new(),
-            #[cfg(test)]
-            attempt_lifecycle: AttemptLifecycleProbe::default(),
         });
         Ok(Database { inner })
     }
@@ -152,9 +149,6 @@ pub(crate) struct DbInner {
     // Admission and drain cover every public asynchronous operation, including
     // the few APIs that do not run through a transaction.
     operations: OperationLifecycle,
-    // Temporary F07-A characterization state; remove with F07-C.
-    #[cfg(test)]
-    attempt_lifecycle: AttemptLifecycleProbe,
 }
 
 /// An open GlassDB database instance.
@@ -478,19 +472,7 @@ impl DbInner {
         T: Send,
     {
         let tx = Transaction::new(self.clone());
-        let mut handle = None;
-        // RAII safety net: if this future is dropped between begin and end
-        // (e.g. by `tokio::time::timeout` or `JoinHandle::abort`),
-        // the guard's `Drop` schedules an abort so the engine-side tx is
-        // marked aborted promptly instead of lingering until lease expiry.
-        // Updated to the current tx id after every `begin`/`rebegin`; cleared
-        // once `end` has run.
-        // The test-only constructor is temporary F07-A instrumentation and is
-        // removed with the probe in F07-C.
-        #[cfg(not(test))]
-        let mut abort_guard = TransactionAbortGuard::new(&self.engine);
-        #[cfg(test)]
-        let mut abort_guard = TransactionAbortGuard::new(&self.engine, &self.attempt_lifecycle);
+        let mut driver = AttemptDriver::new(&self.engine);
 
         let result: Result<T, Error> = loop {
             // Hand a fresh handle to the user closure (which consumes it); `tx`
@@ -510,71 +492,20 @@ impl DbInner {
 
             let value = match fn_res {
                 Ok(v) => {
-                    // Hand the full access (reads and writes) to the handle. The
-                    // handle owns the data from here on; the wound path below
-                    // recovers it from the handle, so no separate clone is kept.
-                    match handle.as_mut() {
-                        None => {
-                            let h = self.engine.begin_transaction(access, collection_access);
-                            let id = h.id().clone();
-                            #[cfg(test)]
-                            self.attempt_lifecycle.began(&id);
-                            abort_guard.arm(id);
-                            handle = Some(h);
-                        }
-                        Some(h) => self.engine.reset_transaction(h, access, collection_access),
-                    }
+                    driver.install_accesses(access, collection_access);
                     v
                 }
                 Err(ferr) => {
                     // The user function returned an error. It might be the
                     // result of a spurious read, so validate only the reads.
-                    let mut ro = access;
-                    ro.writes.clear();
-                    let collection_ro = collection_access.into_read_only();
-                    match handle.as_mut() {
-                        None => {
-                            let h = self.engine.begin_transaction(ro, collection_ro);
-                            let id = h.id().clone();
-                            #[cfg(test)]
-                            self.attempt_lifecycle.began(&id);
-                            abort_guard.arm(id);
-                            handle = Some(h);
-                        }
-                        Some(h) => self.engine.reset_transaction(h, ro, collection_ro),
-                    }
-                    let h = handle.as_mut().unwrap();
-                    // Temporary F07-A cancellation gate; remove with F07-C.
-                    #[cfg(test)]
-                    self.attempt_lifecycle
-                        .pause_at(AttemptAwait::ReadValidation)
-                        .await;
-                    match self.engine.validate_reads(h).await {
+                    match driver.validate_body_error(access, collection_access).await {
                         Err(TransError::Retry) => {
                             tx.reset();
                             stats.retries += 1;
                             continue;
                         }
                         Err(TransError::Wounded) => {
-                            // Temporary F07-A cancellation gate; remove with F07-C.
-                            #[cfg(test)]
-                            self.attempt_lifecycle
-                                .pause_at(AttemptAwait::WoundRestart)
-                                .await;
-                            if let Some(h) = handle.as_mut() {
-                                #[cfg(test)]
-                                let id = h.id().clone();
-                                let _ = self.engine.end(h).await;
-                                #[cfg(test)]
-                                self.attempt_lifecycle.ended(&id);
-                            }
-                            let old = handle.take().unwrap();
-                            let new = self.engine.rebegin_transaction(old);
-                            let id = new.id().clone();
-                            #[cfg(test)]
-                            self.attempt_lifecycle.began(&id);
-                            abort_guard.arm(id);
-                            handle = Some(new);
+                            driver.restart_after_wound().await;
                             tx.reset();
                             stats.retries += 1;
                             continue;
@@ -584,50 +515,13 @@ impl DbInner {
                 }
             };
 
-            // Try to commit.
-            // Temporary F07-A cancellation/result seam; remove with F07-C.
-            #[cfg(test)]
-            self.attempt_lifecycle.pause_at(AttemptAwait::Commit).await;
-            #[cfg(not(test))]
-            let commit_res = {
-                let h = handle.as_mut().unwrap();
-                self.engine.commit(h).await
-            };
-            #[cfg(test)]
-            let commit_res = if self.attempt_lifecycle.take_forced_wound() {
-                Err(TransError::Wounded)
-            } else {
-                let h = handle.as_mut().unwrap();
-                self.engine.commit(h).await
-            };
-            match commit_res {
+            match driver.commit().await {
                 Ok(()) => break Ok(value),
                 Err(TransError::Wounded) => {
                     // A higher-priority transaction aborted us. Release whatever
                     // we held and restart with a fresh id that preserves our
                     // priority, so we are not starved on the retry.
-                    // Temporary F07-A cancellation gate; remove with F07-C.
-                    #[cfg(test)]
-                    self.attempt_lifecycle
-                        .pause_at(AttemptAwait::WoundRestart)
-                        .await;
-                    if let Some(h) = handle.as_mut() {
-                        #[cfg(test)]
-                        let id = h.id().clone();
-                        let _ = self.engine.end(h).await;
-                        #[cfg(test)]
-                        self.attempt_lifecycle.ended(&id);
-                    }
-                    let old = handle.take().unwrap();
-                    let new = self.engine.rebegin_transaction(old);
-                    // Refresh the cancellation safety net with the new id so a
-                    // drop after the rebegin aborts the retry's tx, not the
-                    // (already-ended) original.
-                    let id = new.id().clone();
-                    #[cfg(test)]
-                    self.attempt_lifecycle.began(&id);
-                    abort_guard.arm(id);
-                    handle = Some(new);
+                    driver.restart_after_wound().await;
                     tx.reset();
                     stats.retries += 1;
                     continue;
@@ -641,26 +535,116 @@ impl DbInner {
             }
         };
 
-        // Always finalize the handle (a committed handle is a no-op). The
-        // safety-net guard is disarmed either way so its `Drop` does not fire
-        // a redundant async abort for an already-finalized tx.
-        let end_result = if let Some(h) = handle.as_mut() {
-            #[cfg(test)]
-            let id = h.id().clone();
-            let result = self.engine.end(h).await;
-            #[cfg(test)]
-            self.attempt_lifecycle.ended(&id);
-            result
-        } else {
-            Ok(())
-        };
-        abort_guard.disarm();
+        let end_result = driver.finish().await;
         if let Err(e) = end_result
             && result.is_ok()
         {
             return Err(e.into());
         }
         result
+    }
+}
+
+/// Drives the engine-side transitions for one public transaction.
+struct AttemptDriver<'a> {
+    engine: &'a Engine,
+    resources: Option<AttemptResources<'a>>,
+}
+
+impl<'a> AttemptDriver<'a> {
+    fn new(engine: &'a Engine) -> Self {
+        Self {
+            engine,
+            resources: None,
+        }
+    }
+
+    /// Installs the accesses collected from the latest closure execution.
+    fn install_accesses(&mut self, access: Data, collection_access: CollectionData) {
+        match self.resources.as_mut() {
+            Some(resources) => {
+                self.engine
+                    .reset_transaction(&mut resources.handle, access, collection_access)
+            }
+            None => {
+                let handle = self.engine.begin_transaction(access, collection_access);
+                self.resources = Some(AttemptResources::new(self.engine, handle));
+            }
+        }
+    }
+
+    /// Validates the reads that led the transaction body to return an error.
+    async fn validate_body_error(
+        &mut self,
+        mut access: Data,
+        collection_access: CollectionData,
+    ) -> Result<(), TransError> {
+        access.writes.clear();
+        self.install_accesses(access, collection_access.into_read_only());
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("body-error validation installs attempt resources");
+        self.engine.validate_reads(&mut resources.handle).await
+    }
+
+    /// Restarts an attempt that a higher-priority transaction wounded.
+    async fn restart_after_wound(&mut self) {
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("a wound is reported only for an active attempt");
+        let _ = self.engine.end(&mut resources.handle).await;
+        let resources = self
+            .resources
+            .take()
+            .expect("the ended attempt remains active until it is renewed");
+        self.resources = Some(resources.rebegin());
+    }
+
+    /// Commits the accesses installed for the latest closure execution.
+    async fn commit(&mut self) -> Result<(), TransError> {
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("commit follows access installation");
+        self.engine.commit(&mut resources.handle).await
+    }
+
+    /// Finalizes any active engine attempt.
+    async fn finish(mut self) -> Result<(), TransError> {
+        let Some(resources) = self.resources.as_mut() else {
+            return Ok(());
+        };
+        let result = self.engine.end(&mut resources.handle).await;
+        resources.abort_guard.disarm();
+        result
+    }
+}
+
+/// Engine state for one active attempt and its cancellation safety net.
+///
+/// Storing this as one optional value ensures the handle and armed guard exist
+/// together or not at all.
+struct AttemptResources<'a> {
+    handle: EngineTransaction,
+    abort_guard: TransactionAbortGuard<'a>,
+}
+
+impl<'a> AttemptResources<'a> {
+    fn new(engine: &'a Engine, handle: EngineTransaction) -> Self {
+        let tx_id = handle.id().clone();
+        Self {
+            handle,
+            abort_guard: TransactionAbortGuard::new(engine, tx_id),
+        }
+    }
+
+    fn rebegin(mut self) -> Self {
+        let engine = self.abort_guard.engine;
+        self.abort_guard.disarm();
+        let handle = engine.rebegin_transaction(self.handle);
+        Self::new(engine, handle)
     }
 }
 
@@ -676,32 +660,14 @@ impl DbInner {
 struct TransactionAbortGuard<'a> {
     engine: &'a Engine,
     armed: Option<TxId>,
-    #[cfg(test)]
-    attempt_lifecycle: &'a AttemptLifecycleProbe,
 }
 
 impl<'a> TransactionAbortGuard<'a> {
-    #[cfg(not(test))]
-    fn new(engine: &'a Engine) -> Self {
+    fn new(engine: &'a Engine, tx_id: TxId) -> Self {
         Self {
             engine,
-            armed: None,
+            armed: Some(tx_id),
         }
-    }
-
-    #[cfg(test)]
-    fn new(engine: &'a Engine, attempt_lifecycle: &'a AttemptLifecycleProbe) -> Self {
-        Self {
-            engine,
-            armed: None,
-            attempt_lifecycle,
-        }
-    }
-
-    /// Arms the guard for `tx_id`. Replaces any prior id (e.g. after a wound
-    /// retry that gets a fresh id from the engine).
-    fn arm(&mut self, tx_id: TxId) {
-        self.armed = Some(tx_id);
     }
 
     /// Disarms the guard once the attempt has ended so `Drop` is a no-op.
@@ -713,153 +679,43 @@ impl<'a> TransactionAbortGuard<'a> {
 impl Drop for TransactionAbortGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.armed.take() {
-            #[cfg(test)]
-            self.attempt_lifecycle.abandoned(&id);
             self.engine.async_abort(&id);
         }
     }
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptAwait {
-    ReadValidation,
-    WoundRestart,
-    Commit,
-}
+mod tests {
+    use glassdb_backend::memory::MemoryBackend;
 
-/// Temporary F07-A attempt-lifecycle characterization.
-///
-/// F07-C removes this probe and its exact event accounting after the driver is
-/// protected by lightweight behavior-level regressions.
-#[cfg(test)]
-#[derive(Default)]
-struct AttemptLifecycleProbe {
-    state: Mutex<AttemptLifecycleState>,
-    gate: Mutex<Option<AttemptGate>>,
-}
+    use super::*;
 
-#[cfg(test)]
-#[derive(Default)]
-struct AttemptLifecycleState {
-    active: BTreeSet<TxId>,
-    begun: usize,
-    ended: usize,
-    abandoned: usize,
-    force_next_commit_wound: bool,
-}
+    #[tokio::test]
+    async fn wound_restart_renews_the_attempt_and_remains_finishable() {
+        let db = Database::open("attempts", MemoryBackend::new())
+            .await
+            .unwrap();
+        let mut driver = AttemptDriver::new(&db.inner.engine);
+        driver.install_accesses(Data::default(), CollectionData::default());
 
-#[cfg(test)]
-struct AttemptGate {
-    phase: AttemptAwait,
-    arrived: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
-}
+        let original_id = driver
+            .resources
+            .as_ref()
+            .expect("access installation starts an attempt")
+            .handle
+            .id()
+            .clone();
+        driver.restart_after_wound().await;
+        let renewed_id = driver
+            .resources
+            .as_ref()
+            .expect("wound restart keeps an active attempt")
+            .handle
+            .id()
+            .clone();
 
-#[cfg(test)]
-#[derive(Debug)]
-struct AttemptLifecycleSnapshot {
-    active: Vec<TxId>,
-    begun: usize,
-    ended: usize,
-    abandoned: usize,
-}
-
-#[cfg(test)]
-impl AttemptLifecycleProbe {
-    fn began(&self, id: &TxId) {
-        let mut state = self.state.lock().unwrap();
-        assert!(
-            state.active.insert(id.clone()),
-            "attempt {id} began more than once"
-        );
-        state.begun += 1;
-    }
-
-    fn ended(&self, id: &TxId) {
-        let mut state = self.state.lock().unwrap();
-        assert!(
-            state.active.remove(id),
-            "attempt {id} ended without being active"
-        );
-        state.ended += 1;
-    }
-
-    fn abandoned(&self, id: &TxId) {
-        let mut state = self.state.lock().unwrap();
-        assert!(
-            state.active.remove(id),
-            "attempt {id} was abandoned without being active"
-        );
-        state.abandoned += 1;
-    }
-
-    fn force_next_commit_wound(&self) {
-        self.state.lock().unwrap().force_next_commit_wound = true;
-    }
-
-    fn take_forced_wound(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        std::mem::take(&mut state.force_next_commit_wound)
-    }
-
-    fn pause_next(
-        &self,
-        phase: AttemptAwait,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let previous = self.gate.lock().unwrap().replace(AttemptGate {
-            phase,
-            arrived: arrived_tx,
-            release: release_rx,
-        });
-        assert!(previous.is_none(), "attempt lifecycle gate already armed");
-        (arrived_rx, release_tx)
-    }
-
-    async fn pause_at(&self, phase: AttemptAwait) {
-        let gate = {
-            let mut slot = self.gate.lock().unwrap();
-            if slot.as_ref().is_some_and(|gate| gate.phase == phase) {
-                slot.take()
-            } else {
-                None
-            }
-        };
-        if let Some(gate) = gate {
-            let _ = gate.arrived.send(());
-            let _ = gate.release.await;
-        }
-    }
-
-    fn reset(&self) {
-        let mut state = self.state.lock().unwrap();
-        assert!(
-            state.active.is_empty(),
-            "cannot reset active attempts: {:?}",
-            state.active
-        );
-        *state = AttemptLifecycleState::default();
-        assert!(
-            self.gate.lock().unwrap().is_none(),
-            "cannot reset with a lifecycle gate armed"
-        );
-    }
-
-    fn snapshot(&self) -> AttemptLifecycleSnapshot {
-        let state = self.state.lock().unwrap();
-        AttemptLifecycleSnapshot {
-            active: state.active.iter().cloned().collect(),
-            begun: state.begun,
-            ended: state.ended,
-            abandoned: state.abandoned,
-        }
+        assert_ne!(renewed_id, original_id);
+        driver.finish().await.unwrap();
+        db.shutdown().await;
     }
 }
-
-#[cfg(test)]
-mod tests;
