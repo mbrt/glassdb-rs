@@ -5,6 +5,9 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::collections::BTreeSet;
+
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, TxId};
@@ -116,6 +119,8 @@ impl DatabaseBuilder {
             engine,
             stats: Mutex::new(Stats::default()),
             operations: OperationLifecycle::new(),
+            #[cfg(test)]
+            attempt_lifecycle: AttemptLifecycleProbe::default(),
         });
         Ok(Database { inner })
     }
@@ -147,6 +152,9 @@ pub(crate) struct DbInner {
     // Admission and drain cover every public asynchronous operation, including
     // the few APIs that do not run through a transaction.
     operations: OperationLifecycle,
+    // Temporary F07-A characterization state; remove with F07-C.
+    #[cfg(test)]
+    attempt_lifecycle: AttemptLifecycleProbe,
 }
 
 /// An open GlassDB database instance.
@@ -477,7 +485,12 @@ impl DbInner {
         // marked aborted promptly instead of lingering until lease expiry.
         // Updated to the current tx id after every `begin`/`rebegin`; cleared
         // once `end` has run.
+        // The test-only constructor is temporary F07-A instrumentation and is
+        // removed with the probe in F07-C.
+        #[cfg(not(test))]
         let mut abort_guard = TransactionAbortGuard::new(&self.engine);
+        #[cfg(test)]
+        let mut abort_guard = TransactionAbortGuard::new(&self.engine, &self.attempt_lifecycle);
 
         let result: Result<T, Error> = loop {
             // Hand a fresh handle to the user closure (which consumes it); `tx`
@@ -503,7 +516,10 @@ impl DbInner {
                     match handle.as_mut() {
                         None => {
                             let h = self.engine.begin_transaction(access, collection_access);
-                            abort_guard.arm(h.id().clone());
+                            let id = h.id().clone();
+                            #[cfg(test)]
+                            self.attempt_lifecycle.began(&id);
+                            abort_guard.arm(id);
                             handle = Some(h);
                         }
                         Some(h) => self.engine.reset_transaction(h, access, collection_access),
@@ -519,12 +535,20 @@ impl DbInner {
                     match handle.as_mut() {
                         None => {
                             let h = self.engine.begin_transaction(ro, collection_ro);
-                            abort_guard.arm(h.id().clone());
+                            let id = h.id().clone();
+                            #[cfg(test)]
+                            self.attempt_lifecycle.began(&id);
+                            abort_guard.arm(id);
                             handle = Some(h);
                         }
                         Some(h) => self.engine.reset_transaction(h, ro, collection_ro),
                     }
                     let h = handle.as_mut().unwrap();
+                    // Temporary F07-A cancellation gate; remove with F07-C.
+                    #[cfg(test)]
+                    self.attempt_lifecycle
+                        .pause_at(AttemptAwait::ReadValidation)
+                        .await;
                     match self.engine.validate_reads(h).await {
                         Err(TransError::Retry) => {
                             tx.reset();
@@ -532,12 +556,24 @@ impl DbInner {
                             continue;
                         }
                         Err(TransError::Wounded) => {
+                            // Temporary F07-A cancellation gate; remove with F07-C.
+                            #[cfg(test)]
+                            self.attempt_lifecycle
+                                .pause_at(AttemptAwait::WoundRestart)
+                                .await;
                             if let Some(h) = handle.as_mut() {
+                                #[cfg(test)]
+                                let id = h.id().clone();
                                 let _ = self.engine.end(h).await;
+                                #[cfg(test)]
+                                self.attempt_lifecycle.ended(&id);
                             }
                             let old = handle.take().unwrap();
                             let new = self.engine.rebegin_transaction(old);
-                            abort_guard.arm(new.id().clone());
+                            let id = new.id().clone();
+                            #[cfg(test)]
+                            self.attempt_lifecycle.began(&id);
+                            abort_guard.arm(id);
                             handle = Some(new);
                             tx.reset();
                             stats.retries += 1;
@@ -549,7 +585,18 @@ impl DbInner {
             };
 
             // Try to commit.
+            // Temporary F07-A cancellation/result seam; remove with F07-C.
+            #[cfg(test)]
+            self.attempt_lifecycle.pause_at(AttemptAwait::Commit).await;
+            #[cfg(not(test))]
             let commit_res = {
+                let h = handle.as_mut().unwrap();
+                self.engine.commit(h).await
+            };
+            #[cfg(test)]
+            let commit_res = if self.attempt_lifecycle.take_forced_wound() {
+                Err(TransError::Wounded)
+            } else {
                 let h = handle.as_mut().unwrap();
                 self.engine.commit(h).await
             };
@@ -559,15 +606,27 @@ impl DbInner {
                     // A higher-priority transaction aborted us. Release whatever
                     // we held and restart with a fresh id that preserves our
                     // priority, so we are not starved on the retry.
+                    // Temporary F07-A cancellation gate; remove with F07-C.
+                    #[cfg(test)]
+                    self.attempt_lifecycle
+                        .pause_at(AttemptAwait::WoundRestart)
+                        .await;
                     if let Some(h) = handle.as_mut() {
+                        #[cfg(test)]
+                        let id = h.id().clone();
                         let _ = self.engine.end(h).await;
+                        #[cfg(test)]
+                        self.attempt_lifecycle.ended(&id);
                     }
                     let old = handle.take().unwrap();
                     let new = self.engine.rebegin_transaction(old);
                     // Refresh the cancellation safety net with the new id so a
                     // drop after the rebegin aborts the retry's tx, not the
                     // (already-ended) original.
-                    abort_guard.arm(new.id().clone());
+                    let id = new.id().clone();
+                    #[cfg(test)]
+                    self.attempt_lifecycle.began(&id);
+                    abort_guard.arm(id);
                     handle = Some(new);
                     tx.reset();
                     stats.retries += 1;
@@ -586,7 +645,12 @@ impl DbInner {
         // safety-net guard is disarmed either way so its `Drop` does not fire
         // a redundant async abort for an already-finalized tx.
         let end_result = if let Some(h) = handle.as_mut() {
-            self.engine.end(h).await
+            #[cfg(test)]
+            let id = h.id().clone();
+            let result = self.engine.end(h).await;
+            #[cfg(test)]
+            self.attempt_lifecycle.ended(&id);
+            result
         } else {
             Ok(())
         };
@@ -612,13 +676,25 @@ impl DbInner {
 struct TransactionAbortGuard<'a> {
     engine: &'a Engine,
     armed: Option<TxId>,
+    #[cfg(test)]
+    attempt_lifecycle: &'a AttemptLifecycleProbe,
 }
 
 impl<'a> TransactionAbortGuard<'a> {
+    #[cfg(not(test))]
     fn new(engine: &'a Engine) -> Self {
         Self {
             engine,
             armed: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(engine: &'a Engine, attempt_lifecycle: &'a AttemptLifecycleProbe) -> Self {
+        Self {
+            engine,
+            armed: None,
+            attempt_lifecycle,
         }
     }
 
@@ -637,7 +713,153 @@ impl<'a> TransactionAbortGuard<'a> {
 impl Drop for TransactionAbortGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.armed.take() {
+            #[cfg(test)]
+            self.attempt_lifecycle.abandoned(&id);
             self.engine.async_abort(&id);
         }
     }
 }
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptAwait {
+    ReadValidation,
+    WoundRestart,
+    Commit,
+}
+
+/// Temporary F07-A attempt-lifecycle characterization.
+///
+/// F07-C removes this probe and its exact event accounting after the driver is
+/// protected by lightweight behavior-level regressions.
+#[cfg(test)]
+#[derive(Default)]
+struct AttemptLifecycleProbe {
+    state: Mutex<AttemptLifecycleState>,
+    gate: Mutex<Option<AttemptGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AttemptLifecycleState {
+    active: BTreeSet<TxId>,
+    begun: usize,
+    ended: usize,
+    abandoned: usize,
+    force_next_commit_wound: bool,
+}
+
+#[cfg(test)]
+struct AttemptGate {
+    phase: AttemptAwait,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct AttemptLifecycleSnapshot {
+    active: Vec<TxId>,
+    begun: usize,
+    ended: usize,
+    abandoned: usize,
+}
+
+#[cfg(test)]
+impl AttemptLifecycleProbe {
+    fn began(&self, id: &TxId) {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            state.active.insert(id.clone()),
+            "attempt {id} began more than once"
+        );
+        state.begun += 1;
+    }
+
+    fn ended(&self, id: &TxId) {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            state.active.remove(id),
+            "attempt {id} ended without being active"
+        );
+        state.ended += 1;
+    }
+
+    fn abandoned(&self, id: &TxId) {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            state.active.remove(id),
+            "attempt {id} was abandoned without being active"
+        );
+        state.abandoned += 1;
+    }
+
+    fn force_next_commit_wound(&self) {
+        self.state.lock().unwrap().force_next_commit_wound = true;
+    }
+
+    fn take_forced_wound(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        std::mem::take(&mut state.force_next_commit_wound)
+    }
+
+    fn pause_next(
+        &self,
+        phase: AttemptAwait,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let previous = self.gate.lock().unwrap().replace(AttemptGate {
+            phase,
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        assert!(previous.is_none(), "attempt lifecycle gate already armed");
+        (arrived_rx, release_tx)
+    }
+
+    async fn pause_at(&self, phase: AttemptAwait) {
+        let gate = {
+            let mut slot = self.gate.lock().unwrap();
+            if slot.as_ref().is_some_and(|gate| gate.phase == phase) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.arrived.send(());
+            let _ = gate.release.await;
+        }
+    }
+
+    fn reset(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            state.active.is_empty(),
+            "cannot reset active attempts: {:?}",
+            state.active
+        );
+        *state = AttemptLifecycleState::default();
+        assert!(
+            self.gate.lock().unwrap().is_none(),
+            "cannot reset with a lifecycle gate armed"
+        );
+    }
+
+    fn snapshot(&self) -> AttemptLifecycleSnapshot {
+        let state = self.state.lock().unwrap();
+        AttemptLifecycleSnapshot {
+            active: state.active.iter().cloned().collect(),
+            begun: state.begun,
+            ended: state.ended,
+            abandoned: state.abandoned,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
