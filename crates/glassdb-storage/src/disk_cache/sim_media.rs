@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use glassdb_concurr::{Tape, rt};
 use tokio::sync::{Notify, oneshot};
 
+use super::PersistentCacheMedia;
+use super::format::COMPACT_GEOMETRY;
 use super::media::{CacheFile, CacheMedia};
-use super::{PersistentCacheMedia, compact};
 
 /// Breadth of media faults selected from the independent media tape.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,7 +35,7 @@ impl From<SimMedia> for PersistentCacheMedia {
     fn from(media: SimMedia) -> Self {
         Self {
             media: Arc::new(media),
-            geometry: compact::GEOMETRY,
+            geometry: COMPACT_GEOMETRY,
         }
     }
 }
