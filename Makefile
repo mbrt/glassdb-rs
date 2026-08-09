@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score flamegraph
+.PHONY: test test-sim test-all lint format build verify-formal fuzz fuzz-min bench bench-score flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -20,6 +20,11 @@ lint:
 
 format:
 	cargo fmt --all
+
+# Exhaustively check the bounded formal transaction-core pilot. This is kept
+# separate from test-all because it requires Java and a pinned TLC artifact.
+verify-formal:
+	hack/verify-formal.sh
 
 # Run the Criterion transaction microbenchmarks (memory + simulated S3/GCS).
 # The concurrency/throughput "scale" benchmarks (real or simulated cloud

@@ -10,6 +10,11 @@ the pilot must demonstrate useful counterexamples, a maintainable abstraction,
 and an acceptable CI cost before the toolchain becomes an accepted project
 requirement.
 
+The initial Stage 0/1 logged-transaction safety pilot is implemented under
+[`formal/`](../../formal/README.md). It remains a manually invoked exploration:
+direct commits, implementation-history checking, liveness, independent review,
+and any CI gate are still pending.
+
 ## Goal & scope
 
 GlassDB promises strict serializability over a protocol whose logical commit can
