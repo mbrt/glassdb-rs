@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::timeline::SequencePoint;
 
-use super::{Record, Slot};
+use super::disk::{Record, Slot};
 
 const SLOT_BYTES: u64 = 40;
 const RECORD_HEADER_BYTES: u64 = 48;
