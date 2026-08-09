@@ -52,6 +52,9 @@ designs use [`designs/_template.md`](designs/_template.md).
   order-preserving B-link coordination directory.
 - [`designs/snapshot-reads.md`](designs/snapshot-reads.md) — proposed
   always-on, dependency-consistent, long-lived read-only snapshots.
+- [`designs/formal-protocol-verification.md`](designs/formal-protocol-verification.md)
+  — proposed layered verification with an independent TLA+/TLC model, exact
+  implementation-history checking, and targeted Rust proofs.
 
 ## Guides (`guides/`)
 
