@@ -51,7 +51,7 @@ designs use [`designs/_template.md`](designs/_template.md).
 - [`designs/dynamic-range-sharding.md`](designs/dynamic-range-sharding.md) — the
   order-preserving B-link coordination directory.
 - [`designs/snapshot-reads.md`](designs/snapshot-reads.md) — proposed
-  always-on, dependency-consistent, long-lived read-only snapshots.
+  demand-activated, dependency-consistent, long-lived read-only snapshots.
 
 ## Guides (`guides/`)
 
