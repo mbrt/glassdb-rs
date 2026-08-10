@@ -844,10 +844,10 @@ mod tests {
         log.lock().unwrap().clear();
 
         let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        assert_eq!(out.last_writer(), Some(&writer));
         let value = out.value.expect("inline value is present");
         assert_eq!(value.value.as_ref(), b"hello");
         assert_eq!(value.version.writer, writer);
-        assert_eq!(out.last_writer, Some(writer));
         assert_eq!(
             count_tx_reads(&log),
             0,
@@ -872,7 +872,7 @@ mod tests {
 
         let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
         assert!(out.value.is_none());
-        assert_eq!(out.last_writer, Some(writer));
+        assert_eq!(out.last_writer(), Some(&writer));
         assert_eq!(
             count_tx_reads(&log),
             0,

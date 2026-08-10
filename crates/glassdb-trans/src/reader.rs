@@ -15,6 +15,7 @@ use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{LeafObservation, Requirement, StorageError, Timeline, Version};
 
+use crate::access::ReadEvidence;
 use crate::error::trans_to_storage;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::ResolvedValue;
@@ -44,11 +45,43 @@ pub struct ReadOutcome {
     /// The resolved value, or `None` when the key is absent or deleted.
     pub value: Option<ReadValue>,
     /// Effective writer resolved for the key, including a tombstone writer.
+    #[deprecated(note = "carry validation evidence with ReadOutcome::into_parts")]
     pub last_writer: Option<TxId>,
     /// Whether every physical dependency was served locally.
     pub cache_hit: bool,
     /// Exact leaf state used to derive this logical value.
+    #[deprecated(note = "carry validation evidence with ReadOutcome::into_parts")]
     pub leaf: LeafObservation,
+}
+
+impl ReadOutcome {
+    /// Creates a read outcome carrying opaque validation evidence.
+    #[allow(deprecated)]
+    pub fn new(value: Option<ReadValue>, cache_hit: bool, evidence: ReadEvidence) -> Self {
+        let (last_writer, leaf) = evidence.into_parts();
+        Self {
+            value,
+            last_writer,
+            cache_hit,
+            leaf,
+        }
+    }
+
+    /// Consumes the outcome into its value, cache status, and validation evidence.
+    #[allow(deprecated)]
+    pub fn into_parts(self) -> (Option<ReadValue>, bool, ReadEvidence) {
+        (
+            self.value,
+            self.cache_hit,
+            ReadEvidence::new(self.last_writer, self.leaf),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(deprecated)]
+    pub(crate) fn last_writer(&self) -> Option<&TxId> {
+        self.last_writer.as_ref()
+    }
 }
 
 /// Reads values by resolving a key's shard entry to its effective committed
@@ -129,12 +162,11 @@ impl Reader {
             cache_hit &= resolved.cache_hit;
             let leaf = leaf.observation;
             let Some(writer) = resolved.writer else {
-                return Ok(ReadOutcome {
-                    value: None,
-                    last_writer: None,
+                return Ok(ReadOutcome::new(
+                    None,
                     cache_hit,
-                    leaf,
-                });
+                    ReadEvidence::new(None, leaf),
+                ));
             };
             let last_writer = Some(writer.clone());
             // An inline value or tombstone in the leaf is the writer's own
@@ -142,23 +174,21 @@ impl Reader {
             // (ADR-051).
             match resolved.value {
                 ResolvedValue::Inline(value) => {
-                    return Ok(ReadOutcome {
-                        value: Some(ReadValue {
+                    return Ok(ReadOutcome::new(
+                        Some(ReadValue {
                             value,
                             version: Version { writer },
                         }),
-                        last_writer,
                         cache_hit,
-                        leaf,
-                    });
+                        ReadEvidence::new(last_writer, leaf),
+                    ));
                 }
                 ResolvedValue::Tombstone => {
-                    return Ok(ReadOutcome {
-                        value: None,
-                        last_writer,
+                    return Ok(ReadOutcome::new(
+                        None,
                         cache_hit,
-                        leaf,
-                    });
+                        ReadEvidence::new(last_writer, leaf),
+                    ));
                 }
                 ResolvedValue::External | ResolvedValue::Unresolved => {}
             }
@@ -185,22 +215,20 @@ impl Reader {
                     refreshed = true;
                     continue;
                 }
-                return Ok(ReadOutcome {
-                    value: None,
-                    last_writer,
-                    cache_hit: false,
-                    leaf,
-                });
+                return Ok(ReadOutcome::new(
+                    None,
+                    false,
+                    ReadEvidence::new(last_writer, leaf),
+                ));
             }
             if cv.value.not_written {
                 // The writer committed but wrote no value for this key: a genuine
                 // absence, independent of freshness.
-                return Ok(ReadOutcome {
-                    value: None,
-                    last_writer,
-                    cache_hit: false,
-                    leaf,
-                });
+                return Ok(ReadOutcome::new(
+                    None,
+                    false,
+                    ReadEvidence::new(last_writer, leaf),
+                ));
             }
             cache_hit &= cv.cache_hit;
             let version = Version { writer };
@@ -208,12 +236,11 @@ impl Reader {
                 value: cv.value.value,
                 version,
             });
-            return Ok(ReadOutcome {
+            return Ok(ReadOutcome::new(
                 value,
-                last_writer,
                 cache_hit,
-                leaf,
-            });
+                ReadEvidence::new(last_writer, leaf),
+            ));
         }
     }
 }

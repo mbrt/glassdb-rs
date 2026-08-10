@@ -12,14 +12,56 @@ use std::sync::Arc;
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::LeafObservation;
 
+/// Opaque validation evidence retained by a transactional point read.
+#[derive(Debug, Clone)]
+pub struct ReadEvidence {
+    last_writer: Option<TxId>,
+    leaf: LeafObservation,
+}
+
+impl ReadEvidence {
+    pub(crate) fn new(last_writer: Option<TxId>, leaf: LeafObservation) -> Self {
+        Self { last_writer, leaf }
+    }
+
+    pub(crate) fn into_parts(self) -> (Option<TxId>, LeafObservation) {
+        (self.last_writer, self.leaf)
+    }
+}
+
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
     pub key: KeyRef,
     /// Effective writer observed by the read, including a tombstone writer.
+    #[deprecated(note = "construct point-read access with ReadAccess::new")]
     pub last_writer: Option<TxId>,
     /// Exact leaf state from which the writer was resolved.
+    #[deprecated(note = "construct point-read access with ReadAccess::new")]
     pub leaf: LeafObservation,
+}
+
+impl ReadAccess {
+    /// Creates point-read access from its logical key and opaque validation evidence.
+    #[allow(deprecated)]
+    pub fn new(key: KeyRef, evidence: ReadEvidence) -> Self {
+        let (last_writer, leaf) = evidence.into_parts();
+        Self {
+            key,
+            last_writer,
+            leaf,
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn last_writer(&self) -> Option<&TxId> {
+        self.last_writer.as_ref()
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn observation(&self) -> &LeafObservation {
+        &self.leaf
+    }
 }
 
 /// A single key write within a transaction.
