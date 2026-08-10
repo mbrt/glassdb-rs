@@ -43,9 +43,45 @@ struct KnownRecord {
     sequence_point: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum CommandKind {
+    Open = 0,
+    Replace = 1,
+    Lookup = 2,
+    Invalidate = 3,
+    Close = 4,
+    Crash = 5,
+    Detach = 6,
+    Reattach = 7,
+    Corrupt = 8,
+    MakePermanentlyUnavailable = 9,
+}
+
+impl CommandKind {
+    const fn from_byte(byte: u8) -> Self {
+        match byte % 10 {
+            0 => Self::Open,
+            1 => Self::Replace,
+            2 => Self::Lookup,
+            3 => Self::Invalidate,
+            4 => Self::Close,
+            5 => Self::Crash,
+            6 => Self::Detach,
+            7 => Self::Reattach,
+            8 => Self::Corrupt,
+            _ => Self::MakePermanentlyUnavailable,
+        }
+    }
+
+    const fn operation_code(self) -> u8 {
+        self as u8
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Command {
-    operation: u8,
+    kind: CommandKind,
     path: u8,
     identity: u8,
     argument: u16,
@@ -83,8 +119,8 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
     let mut events = Vec::with_capacity(commands.len());
 
     for command in commands {
-        match command.operation {
-            0 => {
+        match command.kind {
+            CommandKind::Open => {
                 close(&mut cache).await;
                 identity = command.identity;
                 let opened = PersistentCache::open(
@@ -111,7 +147,7 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                 });
                 cache = Some(opened.cache);
             }
-            1 => {
+            CommandKind::Replace => {
                 if let Some(current) = cache.as_ref()
                     && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
                 {
@@ -136,9 +172,9 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                         guard,
                     );
                 }
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            2 => {
+            CommandKind::Lookup => {
                 let record = if let Some(current) = cache.as_ref() {
                     match rt::timeout(Duration::from_secs(6), current.lookup(path(command.path)))
                         .await
@@ -169,33 +205,33 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                     record_digest,
                 });
             }
-            3 => {
+            CommandKind::Invalidate => {
                 if let Some(current) = cache.as_ref()
                     && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
                 {
                     current.invalidate(path(command.path), guard);
                 }
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            4 => {
+            CommandKind::Close => {
                 close(&mut cache).await;
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            5 => {
+            CommandKind::Crash => {
                 cache = None;
                 media.crash();
                 rt::yield_now().await;
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            6 => {
+            CommandKind::Detach => {
                 media.detach();
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            7 => {
+            CommandKind::Reattach => {
                 media.reattach();
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            8 => {
+            CommandKind::Corrupt => {
                 let durable_len = media.durable_bytes().map_or(0, |bytes| bytes.len() as u64);
                 if durable_len != 0 {
                     let scaled = u64::from(command.argument)
@@ -203,11 +239,11 @@ async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<Disk
                         .wrapping_add(u64::from(command.path));
                     let _ = media.corrupt(scaled % durable_len, command.pattern | 1);
                 }
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
-            _ => {
+            CommandKind::MakePermanentlyUnavailable => {
                 media.make_permanently_unavailable();
-                events.push(state_event(command.operation, cache.as_ref()));
+                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
             }
         }
     }
@@ -249,7 +285,7 @@ fn decode(data: &[u8]) -> DecodedInput {
             break;
         }
         commands.push(Command {
-            operation: bytes[0] % 10,
+            kind: CommandKind::from_byte(bytes[0]),
             path: bytes[1] % PATH_COUNT,
             identity: bytes[2],
             argument: u16::from_le_bytes([bytes[3], bytes[4]]),
@@ -307,4 +343,31 @@ fn digest_record(revision: &[u8], body: &[u8], sequence_point: u64) -> [u8; 32] 
     digest.update(body);
     digest.update(sequence_point.to_le_bytes());
     digest.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandKind;
+
+    #[test]
+    fn command_kind_preserves_byte_mapping() {
+        const KINDS: [CommandKind; 10] = [
+            CommandKind::Open,
+            CommandKind::Replace,
+            CommandKind::Lookup,
+            CommandKind::Invalidate,
+            CommandKind::Close,
+            CommandKind::Crash,
+            CommandKind::Detach,
+            CommandKind::Reattach,
+            CommandKind::Corrupt,
+            CommandKind::MakePermanentlyUnavailable,
+        ];
+
+        for byte in u8::MIN..=u8::MAX {
+            let kind = CommandKind::from_byte(byte);
+            assert_eq!(kind, KINDS[usize::from(byte % 10)], "byte {byte}");
+            assert_eq!(kind.operation_code(), byte % 10, "byte {byte}");
+        }
+    }
 }
