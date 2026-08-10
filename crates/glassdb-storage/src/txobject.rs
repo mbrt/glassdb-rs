@@ -128,6 +128,21 @@ mod tests {
     }
 
     #[test]
+    fn wounded_round_trip() {
+        let obj = TxLog {
+            id: TxId::from_bytes(vec![8]),
+            timestamp: Some(UNIX_EPOCH + Duration::from_secs(2)),
+            status: TxCommitStatus::Wounded,
+            writes: Vec::new(),
+            locks: Vec::new(),
+            collection_changes: Vec::new(),
+            prepared_collections: Vec::new(),
+        };
+        let decoded = decode("db", &obj.id, &encode(&obj).unwrap()).unwrap();
+        assert_eq!(decoded.status, TxCommitStatus::Wounded);
+    }
+
+    #[test]
     fn encode_requires_timestamp() {
         let mut obj = committed_object();
         obj.timestamp = None;

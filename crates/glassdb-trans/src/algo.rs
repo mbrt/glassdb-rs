@@ -44,7 +44,7 @@ use crate::error::TransError;
 use crate::gc::Gc;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
@@ -459,7 +459,7 @@ fn eligible_writer(
     read_version: Option<&TxId>,
 ) -> Result<TxId, Ineligible> {
     // A live holder is a genuine conflict: defer to the full locked path so it
-    // can wound-wait. Committed/aborted holders never reach `pending`.
+    // can wound-wait. Terminal holders never reach `pending`.
     if !res.pending.is_empty() {
         return Err(Ineligible::Locked);
     }
@@ -605,6 +605,114 @@ impl Algo {
     /// certified logless loss leaves it holding nothing at all (ADR-053). CAS
     /// contention and suspected deadlocks are handled internally.
     pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
+        let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let result = self.commit_inner(tx).await;
+        owner_operation.complete();
+        result
+    }
+
+    /// Validates the reads and range scans of a read-only transaction (the
+    /// error-recovery path in the db retry loop), returning [`TransError::Retry`]
+    /// if any was invalidated. The first attempt is optimistic; after a failure,
+    /// the next attempt validates with point and predicate read locks.
+    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
+        let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let result = self.validate_attempt_reads(tx).await;
+        owner_operation.complete();
+        result
+    }
+
+    /// Replaces the transaction's data. Allowed before commit (the db retry loop
+    /// resets accesses between attempts).
+    pub fn reset(&self, tx: &mut Handle, data: Data) {
+        assert!(
+            tx.status != Status::Committed,
+            "cannot reset a committed transaction"
+        );
+        tx.data = data;
+    }
+
+    /// Replaces both key and collection-management accesses before commit.
+    pub fn reset_with_collections(
+        &self,
+        tx: &mut Handle,
+        data: Data,
+        collection_data: CollectionData,
+    ) {
+        self.reset(tx, data);
+        tx.collections.replace_data(collection_data);
+    }
+
+    /// Aborts a non-committed, engaged transaction, acknowledging it when safe
+    /// and releasing its locks lazily. An optimistic read-only attempt never
+    /// engaged, so there is nothing to abort.
+    pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
+        if tx.status == Status::Committed || !tx.engaged {
+            return Ok(());
+        }
+        match self.mon.abort_owned_tx(&tx.id).await? {
+            OwnerAbortOutcome::Acknowledged => {
+                self.gc.schedule_tx_cleanup(tx.id.clone());
+                self.collection_commit.abort(&tx.id, &tx.collections).await
+            }
+            // A dropped or otherwise unresolved owner operation was pinned as
+            // `Wounded`. Its durable manifest and repeated GC passes own
+            // cleanup; local rollback must not race an effect that may land
+            // after this future returns.
+            OwnerAbortOutcome::Pinned => {
+                self.gc.schedule_tx_cleanup(tx.id.clone());
+                Ok(())
+            }
+            // The commit point won before cleanup observed its result. Its
+            // collection objects and delete fences now belong to the committed
+            // log and must be left for write-back/recovery.
+            OwnerAbortOutcome::Committed => {
+                tx.status = Status::Committed;
+                Ok(())
+            }
+            // The terminal write was dispatched but its result is no longer
+            // abortable. Preserve its resources exactly as for an observed
+            // committed winner.
+            OwnerAbortOutcome::CommitOutcomePreserved => {
+                tx.status = Status::Committed;
+                Ok(())
+            }
+            // Another local path already finished this identity. Without its
+            // owner record this handle must not attempt collection rollback.
+            OwnerAbortOutcome::AlreadyFinished => {
+                tx.status = Status::Committed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Schedules cancellation recovery for `tx_id` when a transaction future is
+    /// dropped before [`Algo::end`] runs. The waited background task pins a safe
+    /// pre-dispatch attempt as wounded and returns immediately; idempotent.
+    ///
+    /// A no-op unless the transaction still holds a live logged identity. An
+    /// attempt that never took one — an optimistic read-only validation, or a
+    /// logless one-CAS commit (ADR-051) — is invisible to peers, so an aborted
+    /// object for its id would invent a transaction that never existed (and,
+    /// after a dispatched logless CAS, would not even be true).
+    pub fn async_abort(&self, tx_id: &TxId) {
+        if !self.mon.is_tracked_local(tx_id) {
+            return;
+        }
+        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let mon = self.mon.clone();
+        let gc = self.gc.clone();
+        let tx_id = tx_id.clone();
+        bg.spawn_waited(async move {
+            if mon.abort_owned_tx(&tx_id).await.is_ok() {
+                gc.schedule_tx_cleanup(tx_id);
+            }
+        });
+    }
+
+    async fn commit_inner(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.data.writes.is_empty() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.data)?;
@@ -632,11 +740,7 @@ impl Algo {
         self.commit_locked(tx).await
     }
 
-    /// Validates the reads and range scans of a read-only transaction (the
-    /// error-recovery path in the db retry loop), returning [`TransError::Retry`]
-    /// if any was invalidated. The first attempt is optimistic; after a failure,
-    /// the next attempt validates with point and predicate read locks.
-    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn validate_attempt_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
         if !tx.data.writes.is_empty() || tx.collections.has_writes() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
@@ -664,71 +768,6 @@ impl Algo {
         }
         tx.lock_reads_on_retry = true;
         Err(TransError::Retry)
-    }
-
-    /// Replaces the transaction's data. Allowed before commit (the db retry loop
-    /// resets accesses between attempts).
-    pub fn reset(&self, tx: &mut Handle, data: Data) {
-        assert!(
-            tx.status != Status::Committed,
-            "cannot reset a committed transaction"
-        );
-        tx.data = data;
-    }
-
-    /// Replaces both key and collection-management accesses before commit.
-    pub fn reset_with_collections(
-        &self,
-        tx: &mut Handle,
-        data: Data,
-        collection_data: CollectionData,
-    ) {
-        self.reset(tx, data);
-        tx.collections.replace_data(collection_data);
-    }
-
-    /// Aborts a non-committed, engaged transaction, releasing its locks (lazily,
-    /// by marking its transaction object aborted). An optimistic read-only
-    /// attempt never engaged, so there is nothing to abort.
-    pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::Committed || !tx.engaged {
-            return Ok(());
-        }
-        match self.mon.abort_tx(&tx.id).await {
-            Ok(()) => {}
-            // The commit point won before cleanup observed its result. Its
-            // collection objects and delete fences now belong to the committed
-            // log and must be left for write-back/recovery.
-            Err(TransError::AlreadyFinalized) => {
-                tx.status = Status::Committed;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-        self.collection_commit.abort(&tx.id, &tx.collections).await
-    }
-
-    /// Clean-shutdown asynchronous abort of `tx_id`, used when a transaction's
-    /// future is dropped mid-flight so [`Algo::end`] never ran. Schedules a
-    /// spawned task and returns immediately; idempotent.
-    ///
-    /// A no-op unless the transaction still holds a live logged identity. An
-    /// attempt that never took one — an optimistic read-only validation, or a
-    /// logless one-CAS commit (ADR-051) — is invisible to peers, so an aborted
-    /// object for its id would invent a transaction that never existed (and,
-    /// after a dispatched logless CAS, would not even be true).
-    pub fn async_abort(&self, tx_id: &TxId) {
-        if !self.mon.is_pending_local(tx_id) {
-            return;
-        }
-        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
-            return;
-        };
-        let mon = self.mon.clone();
-        let tx_id = tx_id.clone();
-        bg.spawn_waited(async move {
-            let _ = mon.abort_tx(&tx_id).await;
-        });
     }
 
     /// Rejects keys that can never fit before the transaction has side effects.
@@ -873,8 +912,7 @@ impl Algo {
             .await
         {
             if matches!(e, TransError::AlreadyFinalized) {
-                // The log was finalized as `aborted` out from under us: a wound
-                // landed between locking and commit.
+                // An abort-side terminal status won between locking and commit.
                 return self.restart(tx).await;
             }
             return Err(e.context(format!("committing writes for tx {}", tx.id)));
@@ -1128,7 +1166,7 @@ impl Algo {
 
     /// Signals the read-write restart after a genuine wound by returning
     /// [`TransError::Wounded`] so the caller renews the id and re-runs.
-    /// Does not back off: the wound already aborted us (its locks are
+    /// Does not back off: the wound already made the identity terminal (its locks are
     /// immediately reclaimable), the locker's CAS loop backs off real lock
     /// contention, and a delay here would only slow the renewed retry.
     async fn restart(&self, _tx: &mut Handle) -> Result<(), TransError> {
@@ -1256,7 +1294,7 @@ impl Algo {
     async fn was_wounded(&self, tx: &Handle) -> bool {
         matches!(
             self.mon.tx_status(&tx.id).await,
-            Ok(TxCommitStatus::Aborted)
+            Ok(TxCommitStatus::Aborted | TxCommitStatus::Wounded)
         )
     }
 
@@ -2230,7 +2268,7 @@ mod tests {
 
         // Finalizing the holder releases the younger, which commits under its
         // original id without ever surfacing `LockTimeout`.
-        tctx.tmon.abort_tx(&holder).await.unwrap();
+        tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         let (mut h, res) = committing.await.unwrap();
         res.expect("younger commits once the holder releases");
         assert_eq!(
@@ -3943,7 +3981,7 @@ mod tests {
         // Aborting the holder leaves the previously observed writer effective.
         // The exclusive holder prevents a physical shortcut, then writer
         // resolution at the validation watermark accepts the unchanged value.
-        tctx.tmon.abort_tx(&holder).await.unwrap();
+        tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         assert!(
             !tm.validate_read_observations(&data, validation_start, None)
                 .await

@@ -26,12 +26,92 @@ pub enum TxCommitStatus {
     Ok,
     Aborted,
     Pending,
+    Wounded,
 }
 
 impl TxCommitStatus {
-    /// Reports whether the status is terminal (committed or aborted).
+    /// Reports whether the transaction can still commit under this identity.
     pub fn is_final(self) -> bool {
+        matches!(
+            self,
+            TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded
+        )
+    }
+
+    /// Reports whether the persisted status can no longer change.
+    pub fn is_immutable(self) -> bool {
         matches!(self, TxCommitStatus::Ok | TxCommitStatus::Aborted)
+    }
+}
+
+/// The normalized durable state of a transaction-log record.
+///
+/// Missing records are represented explicitly; [`TxCommitStatus::Unknown`] is
+/// never a persisted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRecordState {
+    Missing,
+    Pending,
+    Wounded,
+    Committed,
+    Aborted,
+}
+
+/// The semantic relationship between two transaction-record states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxLifecycleRelation {
+    /// Both sides describe the same semantic state.
+    Same,
+    /// The durable lifecycle permits advancing from the first state to the second.
+    CanAdvance,
+    /// Advancing would contradict an existing durable decision.
+    Blocks,
+}
+
+impl TxRecordState {
+    /// Normalizes an optional persisted status, rejecting `Unknown`.
+    pub fn try_from_status(status: Option<TxCommitStatus>) -> Result<Self, StorageError> {
+        match status {
+            None => Ok(TxRecordState::Missing),
+            Some(TxCommitStatus::Pending) => Ok(TxRecordState::Pending),
+            Some(TxCommitStatus::Wounded) => Ok(TxRecordState::Wounded),
+            Some(TxCommitStatus::Ok) => Ok(TxRecordState::Committed),
+            Some(TxCommitStatus::Aborted) => Ok(TxRecordState::Aborted),
+            Some(TxCommitStatus::Unknown) => Err(StorageError::other(
+                "unknown is not a persisted transaction status",
+            )),
+        }
+    }
+
+    /// Returns the normalized state represented by an exact observation.
+    pub fn try_from_observation(observed: &Observation<TxLog>) -> Result<Self, StorageError> {
+        Self::try_from_status(observed.value().map(|log| log.status))
+    }
+
+    /// Relates this state to a desired durable state using the transaction
+    /// lifecycle graph.
+    pub fn relation_to(self, desired: TxRecordState) -> TxLifecycleRelation {
+        if self == desired {
+            return TxLifecycleRelation::Same;
+        }
+        match (self, desired) {
+            (
+                TxRecordState::Missing,
+                TxRecordState::Pending
+                | TxRecordState::Wounded
+                | TxRecordState::Committed
+                | TxRecordState::Aborted,
+            )
+            | (
+                TxRecordState::Pending,
+                TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted,
+            )
+            | (TxRecordState::Wounded, TxRecordState::Aborted)
+            | (TxRecordState::Committed | TxRecordState::Aborted, TxRecordState::Missing) => {
+                TxLifecycleRelation::CanAdvance
+            }
+            _ => TxLifecycleRelation::Blocks,
+        }
     }
 }
 
@@ -279,10 +359,10 @@ impl TLogger {
         }
     }
 
-    /// Transitions a pending log if its current version matches `expected`.
+    /// Transitions a mutable log if its current version matches `expected`.
     ///
-    /// Final logs are immutable: attempting to replace one fails locally with
-    /// [`StorageError::Precondition`] and issues no backend operation.
+    /// Immutable logs are not replaceable. A wounded log has one permitted
+    /// transition to aborted when its owner acknowledges retirement.
     pub async fn set_if(
         &self,
         l: &TxLog,
@@ -325,10 +405,10 @@ impl TLogger {
         })
     }
 
-    /// Removes an exact final log during GC, converging if it is missing.
+    /// Removes an exact immutable log during GC, converging if it is missing.
     ///
-    /// Pending logs must first transition to aborted; deleting one directly
-    /// fails locally with [`StorageError::Precondition`].
+    /// Pending and wounded logs must first transition to aborted; deleting one
+    /// directly fails locally with [`StorageError::Precondition`].
     pub async fn delete(&self, expected: &Observation<TxLog>) -> Result<(), StorageError> {
         let current = expected.value().ok_or_else(|| {
             StorageError::other("transaction log deletion requires a present value")
@@ -339,47 +419,40 @@ impl TLogger {
     }
 
     fn cached_final(&self, path: &str) -> Result<Option<Observation<TxLog>>, StorageError> {
-        Ok(self
-            .logs
-            .peek(path)?
-            .filter(|observation| observation.value().is_some_and(|log| log.status.is_final())))
+        Ok(self.logs.peek(path)?.filter(|observation| {
+            observation
+                .value()
+                .is_some_and(|log| log.status.is_immutable())
+        }))
     }
 }
 
 /// Validates the durable transaction lifecycle before any backend operation.
 ///
-/// Final objects are cached indefinitely, so replacing one would invalidate
-/// knowledge held by every database instance that has observed it. GC deletion
-/// is different: after its safety horizon, removing the physical object does
-/// not change the transaction's semantic final state.
+/// Immutable objects are cached indefinitely, so replacing one would invalidate
+/// knowledge held by every database instance that has observed it. `Wounded`
+/// is terminal for transaction semantics but remains mutable until its owner
+/// acknowledges it as `Aborted`.
 fn validate_lifecycle_transition(
     current: Option<TxCommitStatus>,
     next: Option<TxCommitStatus>,
 ) -> Result<(), StorageError> {
-    if current == Some(TxCommitStatus::Unknown) || next == Some(TxCommitStatus::Unknown) {
+    let current = TxRecordState::try_from_status(current)?;
+    let next = TxRecordState::try_from_status(next)?;
+    if current == TxRecordState::Missing && next == TxRecordState::Missing {
         return Err(StorageError::other(
-            "unknown is not a persisted transaction status",
+            "transaction lifecycle transition has no source or destination",
         ));
     }
 
-    match (current, next) {
-        (
-            None | Some(TxCommitStatus::Pending),
-            Some(TxCommitStatus::Pending | TxCommitStatus::Ok | TxCommitStatus::Aborted),
-        ) => Ok(()),
-        (Some(TxCommitStatus::Ok | TxCommitStatus::Aborted), None) => Ok(()),
-        (Some(TxCommitStatus::Pending), None)
-        | (Some(TxCommitStatus::Ok | TxCommitStatus::Aborted), Some(_)) => {
-            Err(StorageError::Precondition)
+    match current.relation_to(next) {
+        TxLifecycleRelation::CanAdvance => Ok(()),
+        TxLifecycleRelation::Same
+            if current == TxRecordState::Pending && next == TxRecordState::Pending =>
+        {
+            Ok(())
         }
-        (None, None) => Err(StorageError::other(
-            "transaction lifecycle transition has no source or destination",
-        )),
-        // Unknown statuses are rejected above, but keep this match exhaustive
-        // if the status enum gains another non-persisted variant.
-        _ => Err(StorageError::other(
-            "invalid transaction lifecycle transition",
-        )),
+        TxLifecycleRelation::Same | TxLifecycleRelation::Blocks => Err(StorageError::Precondition),
     }
 }
 
@@ -405,6 +478,7 @@ pub(crate) fn decode_tx_status(buf: &[u8]) -> Result<TxCommitStatus, StorageErro
         pb::transaction_log::Status::Committed => Ok(TxCommitStatus::Ok),
         pb::transaction_log::Status::Aborted => Ok(TxCommitStatus::Aborted),
         pb::transaction_log::Status::Pending => Ok(TxCommitStatus::Pending),
+        pb::transaction_log::Status::Wounded => Ok(TxCommitStatus::Wounded),
         pb::transaction_log::Status::Default => Err(StorageError::other("unknown commit status")),
     }
 }
@@ -426,6 +500,7 @@ fn decode_tx_log_from_proto(
         pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
         pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
         pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
+        pb::transaction_log::Status::Wounded => TxCommitStatus::Wounded,
         pb::transaction_log::Status::Default => {
             return Err(StorageError::other("unknown commit status"));
         }
@@ -560,6 +635,7 @@ pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageE
         TxCommitStatus::Ok => pb::transaction_log::Status::Committed,
         TxCommitStatus::Aborted => pb::transaction_log::Status::Aborted,
         TxCommitStatus::Pending => pb::transaction_log::Status::Pending,
+        TxCommitStatus::Wounded => pb::transaction_log::Status::Wounded,
         TxCommitStatus::Unknown => {
             return Err(StorageError::other("unsupported commit status"));
         }
@@ -774,6 +850,39 @@ mod tests {
         operations.clear();
     }
 
+    #[test]
+    fn lifecycle_relation_defines_the_complete_state_graph() {
+        use TxLifecycleRelation::{Blocks, CanAdvance, Same};
+        use TxRecordState::{Aborted, Committed, Missing, Pending, Wounded};
+
+        let states = [Missing, Pending, Wounded, Committed, Aborted];
+        let advances = [
+            (Missing, Pending),
+            (Missing, Wounded),
+            (Missing, Committed),
+            (Missing, Aborted),
+            (Pending, Wounded),
+            (Pending, Committed),
+            (Pending, Aborted),
+            (Wounded, Aborted),
+            (Committed, Missing),
+            (Aborted, Missing),
+        ];
+
+        for current in states {
+            for desired in states {
+                let expected = if current == desired {
+                    Same
+                } else if advances.contains(&(current, desired)) {
+                    CanAdvance
+                } else {
+                    Blocks
+                };
+                assert_eq!(current.relation_to(desired), expected);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn allowed_lifecycle_transitions_add_no_backend_reads() {
         let (logger, operations) = new_recording_tlogger();
@@ -782,11 +891,12 @@ mod tests {
             (1, TxCommitStatus::Pending),
             (2, TxCommitStatus::Ok),
             (3, TxCommitStatus::Aborted),
+            (7, TxCommitStatus::Wounded),
         ] {
             let id = TxId::from_bytes(vec![9, suffix]);
             let observed = logger.set(&TxLog::new(id, status)).await.unwrap();
             assert_operations(&operations, &["write_if_not_exists"]);
-            if status.is_final() {
+            if status.is_immutable() {
                 logger.delete(&observed).await.unwrap();
                 assert_operations(&operations, &["delete_if"]);
             }
@@ -825,6 +935,28 @@ mod tests {
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
+
+        let wounded_id = TxId::from_bytes(vec![9, 6]);
+        let pending = logger
+            .set(&TxLog::new(wounded_id.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+        let wounded = logger
+            .set_if(
+                &TxLog::new(wounded_id.clone(), TxCommitStatus::Wounded),
+                &pending,
+            )
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if"]);
+        let aborted = logger
+            .set_if(&TxLog::new(wounded_id, TxCommitStatus::Aborted), &wounded)
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if"]);
+        logger.delete(&aborted).await.unwrap();
+        assert_operations(&operations, &["delete_if"]);
     }
 
     #[tokio::test]
@@ -839,6 +971,7 @@ mod tests {
                 TxCommitStatus::Pending,
                 TxCommitStatus::Ok,
                 TxCommitStatus::Aborted,
+                TxCommitStatus::Wounded,
             ] {
                 assert!(matches!(
                     logger
@@ -870,6 +1003,31 @@ mod tests {
             Err(StorageError::Precondition)
         ));
         assert_operations(&operations, &[]);
+
+        let wounded_id = TxId::from_bytes(vec![10, 4]);
+        let wounded = logger
+            .set(&TxLog::new(wounded_id.clone(), TxCommitStatus::Wounded))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+        assert!(matches!(
+            logger.delete(&wounded).await,
+            Err(StorageError::Precondition)
+        ));
+        assert_operations(&operations, &[]);
+        for next in [
+            TxCommitStatus::Pending,
+            TxCommitStatus::Ok,
+            TxCommitStatus::Wounded,
+        ] {
+            assert!(matches!(
+                logger
+                    .set_if(&TxLog::new(wounded_id.clone(), next), &wounded)
+                    .await,
+                Err(StorageError::Precondition)
+            ));
+            assert_operations(&operations, &[]);
+        }
         assert_eq!(
             logger
                 .commit_status_at(&pending_id, Requirement::Any)
@@ -1169,6 +1327,38 @@ mod tests {
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        operations.lock().unwrap().clear();
+
+        logger
+            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .await
+            .unwrap();
+        logger
+            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .await
+            .unwrap();
+
+        let conditional_reads = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.op == "read_if_modified")
+            .count();
+        assert_eq!(conditional_reads, 2);
+    }
+
+    #[tokio::test]
+    async fn wounded_logs_are_not_cached_as_immutable() {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
+        let logger = TLogger::new(objects, "db");
+        let id = TxId::from_bytes(vec![4, 3, 2, 3]);
+        logger
+            .set(&TxLog::new(id.clone(), TxCommitStatus::Wounded))
             .await
             .unwrap();
         operations.lock().unwrap().clear();

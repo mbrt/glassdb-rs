@@ -51,8 +51,8 @@ pub use shard_store::{LeafObservation, LeafObservationCheck, LoadedLeaf, ShardSt
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use timeline::{SequencePoint, Timeline};
 pub use tlogger::{
-    TLogger, TValue, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxLog,
-    TxStatus, TxWrite,
+    TLogger, TValue, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLifecycleRelation,
+    TxListPage, TxLock, TxLog, TxRecordState, TxStatus, TxWrite,
 };
 pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};
 pub use version::Version;

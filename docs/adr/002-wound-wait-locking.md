@@ -8,6 +8,10 @@ The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); transaction priority still uses the
 same wall timestamp and ordering rule.
 
+[ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) refines the durable
+victim state. The current implementation entry point is `Monitor::preempt_tx`;
+the accepted text below retains its historical `Monitor::wound_tx` name.
+
 ## Context
 
 GlassDB acquires locks during the validate-and-commit phase of a transaction.

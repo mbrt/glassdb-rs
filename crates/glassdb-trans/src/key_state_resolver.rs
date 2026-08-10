@@ -281,19 +281,14 @@ impl KeyStateResolver {
             return Ok(resolved);
         }
 
-        let (status, status_cache_hit) = self
+        let committed = self
             .monitor
-            .tx_status_at_with_cache(holder, requirement)
+            .committed_value_at(key, holder, requirement)
             .await?;
-        resolved.cache_hit &= status_cache_hit;
-        match status {
+        resolved.cache_hit &= committed.cache_hit;
+        match committed.status {
             TxCommitStatus::Ok => {
-                let committed = self
-                    .monitor
-                    .committed_value_at(key, holder, requirement)
-                    .await?;
-                resolved.cache_hit &= committed.cache_hit;
-                if committed.status == TxCommitStatus::Ok && !committed.value.not_written {
+                if !committed.value.not_written {
                     resolved.writer = Some(holder.clone());
                     resolved.value = ResolvedValue::Unresolved;
                     resolved.deleted = committed.value.deleted;
@@ -302,7 +297,7 @@ impl KeyStateResolver {
             TxCommitStatus::Pending | TxCommitStatus::Unknown => {
                 resolved.pending.push(holder.clone());
             }
-            TxCommitStatus::Aborted => {}
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
         }
         Ok(resolved)
     }
@@ -481,14 +476,16 @@ mod tests {
         CommittedLive,
         CommittedDeleted,
         Aborted,
+        Wounded,
     }
 
     impl ExclusiveCase {
-        const ALL: [Self; 4] = [
+        const ALL: [Self; 5] = [
             Self::Pending,
             Self::CommittedLive,
             Self::CommittedDeleted,
             Self::Aborted,
+            Self::Wounded,
         ];
 
         fn name(self) -> &'static str {
@@ -497,6 +494,7 @@ mod tests {
                 Self::CommittedLive => "committed-live",
                 Self::CommittedDeleted => "committed-deleted",
                 Self::Aborted => "aborted",
+                Self::Wounded => "wounded",
             }
         }
 
@@ -505,6 +503,7 @@ mod tests {
                 Self::Pending => TxCommitStatus::Pending,
                 Self::CommittedLive | Self::CommittedDeleted => TxCommitStatus::Ok,
                 Self::Aborted => TxCommitStatus::Aborted,
+                Self::Wounded => TxCommitStatus::Wounded,
             }
         }
 
@@ -512,7 +511,7 @@ mod tests {
             match self {
                 Self::CommittedLive => Some(false),
                 Self::CommittedDeleted => Some(true),
-                Self::Pending | Self::Aborted => None,
+                Self::Pending | Self::Aborted | Self::Wounded => None,
             }
         }
 
@@ -702,10 +701,12 @@ mod tests {
             let pending = TxId::with_priority(2, b"pending");
             let committed = TxId::with_priority(3, b"committed");
             let aborted = TxId::with_priority(4, b"aborted");
+            let wounded = TxId::with_priority(5, b"wounded");
             for (holder, status) in [
                 (&pending, TxCommitStatus::Pending),
                 (&committed, TxCommitStatus::Ok),
                 (&aborted, TxCommitStatus::Aborted),
+                (&wounded, TxCommitStatus::Wounded),
             ] {
                 harness
                     .seed_transaction(&key, holder, LockType::Read, status, None)
@@ -715,7 +716,7 @@ mod tests {
             let current = current_case.current(&predecessor);
             let entry = ShardEntry {
                 lock_type: LockType::Read,
-                locked_by: vec![pending.clone(), committed, aborted],
+                locked_by: vec![pending.clone(), committed, aborted, wounded],
                 current: current.clone(),
                 ..ShardEntry::new(key.key())
             };
@@ -738,7 +739,7 @@ mod tests {
                 exists: current_case.exists(),
                 operations: ProjectionOperations {
                     writer: 0,
-                    holders: 3,
+                    holders: 4,
                     existence: 0,
                 },
             };

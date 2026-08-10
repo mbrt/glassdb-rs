@@ -4,7 +4,7 @@
 //!
 //! A transaction groups its accessed keys by shard and locks each shard with a
 //! single read-modify-write CAS: resolve every touched key's holders
-//! (help-forward committed holders, drop aborted ones, wound-wait the live
+//! (help-forward committed holders, drop abort-side terminal ones, wound-wait the live
 //! pending ones), install this transaction's locks, then CAS the shard back.
 //! Create/delete additionally take the owning leaf's membership-write lock.
 //! Every node rewrite proves the exclusive structural gate absent in the state
@@ -283,7 +283,7 @@ async fn build_groups(
 // --- Shard resolvers (the locking policy the Locker installs, ADR-028) ------
 
 /// Acquires locks on its keys: resolve every key's holders (help-forward
-/// committed, drop aborted, wound-wait the live pending ones) and install this
+/// committed, drop abort-side terminal, wound-wait the live pending ones) and install this
 /// transaction's lock (ADR-024).
 struct AcquireResolver {
     id: TxId,
@@ -1790,7 +1790,7 @@ mod tests {
         assert_eq!(e.locked_by, vec![old.clone()]);
         assert_eq!(
             ctx.monitor.tx_status(&young).await.unwrap(),
-            TxCommitStatus::Aborted
+            TxCommitStatus::Wounded
         );
     }
 
@@ -1829,7 +1829,7 @@ mod tests {
         );
 
         // Finalizing `old` releases `young`, which reloads and takes the lock.
-        ctx.monitor.abort_tx(&old).await.unwrap();
+        ctx.monitor.abort_owned_tx(&old).await.unwrap();
         let outcome = waiting.await.unwrap().unwrap();
         assert!(
             matches!(outcome, ShardsOutcome::Locked(_)),
@@ -2553,7 +2553,7 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished());
 
-        ctx.monitor.abort_tx(&old).await.unwrap();
+        ctx.monitor.abort_owned_tx(&old).await.unwrap();
         assert!(matches!(
             waiting.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)

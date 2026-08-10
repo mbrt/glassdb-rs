@@ -544,7 +544,7 @@ mod tests {
                 .unwrap()
         );
         monitor.begin_tx(&split_id);
-        monitor.abort_tx(&split_id).await.unwrap();
+        monitor.abort_owned_tx(&split_id).await.unwrap();
 
         gate.arm();
         let shrink_landed = if fence_waits {

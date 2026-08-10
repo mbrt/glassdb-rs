@@ -31,9 +31,10 @@ tags. No object tags anywhere.
   - _Shard_ (`_s/<i>`, `C` per collection): lock table + MVCC version index +
     per-shard key directory; the unit of CAS (`If-Match`). Read/write of an
     existing key touches only its shard.
-  - _Transaction_ (`_t/<ss>/<txid>`): unified; pending (small: lease + lock
-    intentions) → committed (fat: value map) → aborted. The first two encoded
-    txid symbols select one of 4,096 deterministic listing shards.
+  - _Transaction_ (`_t/<ss>/<txid>`): unified; `Pending` (small: lease + lock
+    intentions), `Committed` (fat: value map), `Wounded` (terminal but pinned),
+    or `Aborted` (owner-retired and GC-eligible). The first two encoded txid
+    symbols select one of 4,096 deterministic listing shards.
 - **Protocol** — execute → lock (one shard GET + one CAS per shard) → validate
   reads (re-resolve effective writers in `Algo`, post-lock) → commit (CAS the
   transaction object to committed, attaching values) → async per-shard write-back
@@ -104,7 +105,7 @@ serial order, with a load-bearing lease refresher keeping its held locks alive.
 - **Parallel by default** — all touched shards are locked concurrently (then the
   root last). An older transaction wounds a younger holder and proceeds; a
   younger-or-equal one **waits** for the holder to finalize, then re-resolves and
-  proceeds (committed → help-forward, aborted → drop). Reads are validated in
+  proceeds (committed → help-forward, wounded/aborted → drop). Reads are validated in
   `Algo` **after** locking; a read whose value moved before it was locked re-runs
   the body **holding its locks** (`Retry`), not via a released-and-renewed
   restart. Deadlock-/livelock-free for distinct priorities.
@@ -131,9 +132,10 @@ serial order, with a load-bearing lease refresher keeping its held locks alive.
 The lease refresher is now **load-bearing (ADR-021/024)**: under hold-and-wait a
 live transaction can hold locks far longer than `PENDING_TX_TIMEOUT`, so the
 background refresher keeps its lease alive. Its first write _creates_ the pending
-object (create-if-absent), so it can never resurrect itself over a wound; expiry
-combines an absolute (skew-padded) lease check with an observer-relative
-(no-skew) no-progress check.
+object with create-if-absent. A foreign wound creates or conditionally installs
+the pinned `Wounded` status, so the lazy owner cannot resurrect after an
+unbounded pause; expiry combines an absolute (skew-padded) lease check with an
+observer-relative (no-skew) no-progress check (ADR-059).
 
 **GC ([ADR-022](../adr/022-garbage-collection-mark-sweep.md))** is implemented: a
 candidate-driven reverse mark-sweep whose live set is `current-writer ∪ locked-by`
@@ -201,8 +203,10 @@ Every design decision is captured in its own ADR.
   transaction objects.** ✅ Written & implemented (data layer + engine). Values
   live only in the `_t/<ss>/<txid>` object
   (shards point via `current_writer`); the object is unified (status + values, no
-  split), with a pending (lease + lock intentions) → committed (fat value map) →
-  aborted lifecycle whose commit point is the single flip-to-committed CAS.
+  split), with `Pending` (lease + lock intentions), `Committed` (fat value map),
+  `Wounded` (pinned terminal), and `Aborted` (acknowledged terminal) states. The
+  commit point is the single transition to `Committed`; ADR-059 later adds
+  `Wounded → Aborted`.
   Encoding evolves `TransactionLog`. Sequencing deferred to ADR-020, lease to
   ADR-021.
 - **[ADR-020](../adr/020-commit-write-back-protocol.md) — Commit & write-back
@@ -226,7 +230,7 @@ Every design decision is captured in its own ADR.
   conflicting `locked-by` entry combines wound-wait priority with the lease (wound
   if older _or_ expired), uniformly for shard entries and the root membership lock.
   Discovery is lazy via `locked-by` (no pending registry); reads never consult the
-  lease; abort CAS keeps ADR-009 in-doubt parity. Re-frames
+  lease; wound/abort CAS keeps ADR-009 in-doubt parity. Re-frames
   [ADR-002](../adr/002-wound-wait-locking.md) for the new layout. Two MVP-era
   simplifications are both made load-bearing again by **hold-and-wait
   ([ADR-024](../adr/024-hold-and-wait-conflict-resolution.md))**: the **background
@@ -248,17 +252,14 @@ Every design decision is captured in its own ADR.
   and prunes their own stale locks. Paged, shuffled walks over the 4,096
   `_t/<ss>/` prefixes make the candidate set complete (no forward scan), with a
   bounded number of listing requests per GC cycle; a committed object is freed
-  only once proven unreferenced, while a finalized valueless object is reclaimed
-  past the horizon regardless (a residual stale lock degrades to a missing-object
-  reference the `handle_unknown_tx` grace absorbs). Pruning/deletion touch
-  **only finalized** transactions: a dead _pending_ one is first **force-aborted**
-  (`pending → aborted` CAS, the ADR-021 reclaim) — which loses the race to a
-  slow-but-live owner's commit — then has its known locks released, then is deleted,
-  so an observing client never sees a lock vanish from under a live owner. An
-  **aborted object is a tombstone**, deleted only a full safety lease _after the
-  abort_ (the abort stamps a fresh `timestamp`), so a stuck owner cannot be
-  resurrected by its own create-if-absent refresher (ADR-024) and a late lock it
-  installs resolves against a present aborted object rather than a missing one.
+  only once proven unreferenced, while an acknowledged `Aborted` object is
+  reclaimed past its cleanup horizon. A dead `Pending` object is conditionally changed
+  to `Wounded`, which loses the race to a slow-but-live refresh or commit.
+  `Wounded` is terminal to resolvers and GC may repeatedly clean effects named by
+  it, but no collector may delete it. The live owner changes it to `Aborted` only
+  after proving its identity retired; ordinary finite cleanup and deletion then
+  apply. A quiescent local victim can go directly to `Aborted` without a
+  `Wounded` intermediate (ADR-059).
   Proactive stale-lock / empty-entry pruning
   (the
   uncontended-dead-lock case ADR-021 left to GC); subcollection teardown
@@ -282,7 +283,8 @@ Every design decision is captured in its own ADR.
   of aborting-and-retrying, with the lease refresher (ADR-021) made load-bearing.
   The pending object **stays lazily created** (no upfront prepare); a held lock is
   bridged by the `handle_unknown_tx` grace period until the refresher
-  materializes it (create-if-absent, so a wound is never resurrected). A
+  materializes it. A foreign wound pins the same path as `Wounded`, so the lazy
+  create cannot resurrect the identity even after an unbounded suspension. A
   **deadlock timeout** (`MAX_DEADLOCK_TIMEOUT` = 5s) bounds the wait and is broken
   **inside `Algo`** (v1's `serial_validate`): on timeout it releases its locks
   (`Locker::release_locks`) and re-acquires them in the serial sorted-by-path
@@ -300,6 +302,14 @@ Every design decision is captured in its own ADR.
   `timestamp`-vs-`now` check does. Activated the dormant `wait_for_tx` /
   `refresh_pending` machinery and added `Locker::release_locks` for the serial
   fallback's release step.
+- **[ADR-059](../adr/059-pin-foreign-wounds-until-owner-retirement.md) — Pin
+  foreign wounds until owner retirement.** ✅ Implemented. Adds a terminal but
+  mutable `Wounded` status. Foreign, expired, and unresolved-local wounds pin
+  that status before holders are reused; GC can repeat cleanup but cannot delete
+  the marker. An owner with an atomic retirement proof acknowledges
+  `Wounded → Aborted`, while a quiescent local victim writes `Aborted` directly.
+  This preserves ADR-024's lazy pending-object path without relying on any finite
+  tombstone lifetime.
 - **[ADR-025](../adr/025-dedup-shard-lock-acquisition.md) — Deduplicated
   shard-batched lock acquisition.** ✅ Implemented. Re-introduces v1's request
   **deduplication** in the `Locker`, re-keyed from per-key objects onto the v2
@@ -403,9 +413,11 @@ Group B — protocol details:
       timeout constants — lease is the object `timestamp`, reclaim if older-or-
       expired past `PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW` (ADR-021). The background
       refresher is **load-bearing** under hold-and-wait (ADR-024): it lazily
-      _creates_ the pending object (create-if-absent, wound-safe) and CAS-bumps the
-      `timestamp` every `PENDING_TX_TIMEOUT / 2`. Expiry combines the absolute
-      (skew-padded) check with an observer-relative (no-skew) no-progress check.
+      _creates_ the pending object and CAS-bumps the `timestamp` every
+      `PENDING_TX_TIMEOUT / 2`. A missing or pending foreign victim is pinned as
+      `Wounded`, which closes the lazy-create resurrection gap without a finite
+      tombstone assumption (ADR-059). Expiry combines the absolute (skew-padded)
+      check with an observer-relative (no-skew) no-progress check.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
       (ADR-020). The single-RW commit CAS is a further in-doubt site (see below):
