@@ -122,10 +122,31 @@ struct OwnerActivity {
     terminal_commit_started: bool,
 }
 
-enum OwnerAbortPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortTransition {
     Acknowledge,
-    Pin,
-    RaceTerminalCommit,
+    EnsureWounded,
+    WoundIfPresent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortObservationAction {
+    Settled,
+    Write(TxCommitStatus),
+}
+
+#[derive(Clone, Copy)]
+enum CommitWriteFailure {
+    Conflict,
+    Ambiguous { started_at: rt::Instant },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitResolution {
+    Committed,
+    Retry,
+    AlreadyFinalized,
+    InDoubt,
 }
 
 #[derive(Clone, Copy)]
@@ -433,15 +454,16 @@ impl Monitor {
     /// Marks the transaction committed, writing the final transaction object
     /// (if it produced any writes or held any locks), updating local storage,
     /// and notifying waiters.
-    pub(crate) async fn commit_tx(&self, mut tl: TxLog) -> Result<(), TransError> {
+    pub(crate) async fn commit_tx(&self, tl: TxLog) -> Result<(), TransError> {
+        let tid = tl.id.clone();
         // In v2 the transaction object is the value store: it must be persisted
         // whenever the transaction has writes (the committed values readers
         // help-forward) or recorded lock intentions. A read-only transaction
         // carries neither, so it skips the write entirely — its in-memory
         // bookkeeping is simply cleared below. This is the create-or-flip commit
-        // point: `set_final_log` creates the committed object when no pending
-        // one was written (the short-transaction case where the lazy refresh
-        // never fired), or CASes pending -> committed otherwise.
+        // point: `persist_committed_log` creates the committed object when no
+        // pending one was written (the short-transaction case where the lazy
+        // refresh never fired), or CASes pending -> committed otherwise.
         if !tl.locks.is_empty()
             || !tl.writes.is_empty()
             || !tl.collection_changes.is_empty()
@@ -450,20 +472,20 @@ impl Monitor {
             // This handshake shares the owner-state lock with local wounding.
             // Either the wound closes admission first, or the commit is marked
             // as dispatched before a local task can claim safe retirement.
-            self.start_terminal_commit(&tl.id)?;
-            self.stop_tx_refresh(&tl.id);
-            tl.status = TxCommitStatus::Ok;
+            self.start_terminal_commit(&tid)?;
+            self.stop_tx_refresh(&tid);
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
             // path can recognize an abort-side terminal winner, as well as any
             // classification of an escaping error.
-            // In-doubt outcomes are normally retried inside `set_final_log`
-            // because the log is keyed by tx id and the write is idempotent.
-            self.set_final_log(&tl)
+            // In-doubt outcomes are normally retried inside
+            // `persist_committed_log` because the log is keyed by tx id and
+            // the write is idempotent.
+            self.persist_committed_log(tl)
                 .await
                 .map_err(|error| error.context("writing tx log"))?;
         }
 
-        self.finish_local_tx(&tl.id);
+        self.finish_local_tx(&tid);
         Ok(())
     }
 
@@ -474,13 +496,8 @@ impl Monitor {
     /// pinned as `Wounded`. An unresolved terminal commit preserves ADR-057
     /// ambiguity instead of manufacturing an abort-side object.
     pub(crate) async fn abort_owned_tx(&self, tid: &TxId) -> Result<OwnerAbortOutcome, TransError> {
-        let Some(plan) = self.owner_abort_plan(tid) else {
+        let Some(transition) = self.owner_abort_transition(tid) else {
             return Ok(OwnerAbortOutcome::AlreadyFinished);
-        };
-        let (target, allow_create, absent_is_in_doubt) = match plan {
-            OwnerAbortPlan::Acknowledge => (TxCommitStatus::Aborted, true, false),
-            OwnerAbortPlan::Pin => (TxCommitStatus::Wounded, true, false),
-            OwnerAbortPlan::RaceTerminalCommit => (TxCommitStatus::Wounded, false, true),
         };
         let mut status = self
             .inner
@@ -489,18 +506,26 @@ impl Monitor {
             .await?;
         let mut backoff = self.inner.retry.backoff();
         loop {
-            if absent_is_in_doubt && status.observation.is_absent() {
+            if transition == AbortTransition::WoundIfPresent && status.observation.is_absent() {
                 return Err(in_doubt(format!(
                     "transaction {tid} owner operation was dropped after terminal commit dispatch"
                 )));
             }
-            status = self
-                .try_retire_observed(tid, &status.observation, target, allow_create)
-                .await?;
+            status = match transition {
+                AbortTransition::Acknowledge => {
+                    self.acknowledge_abort(tid, &status.observation).await?
+                }
+                AbortTransition::EnsureWounded => {
+                    self.ensure_wounded(tid, &status.observation).await?
+                }
+                AbortTransition::WoundIfPresent => {
+                    self.wound_if_present(tid, &status.observation).await?
+                }
+            };
             let outcome = match status.status {
                 TxCommitStatus::Ok => Some(OwnerAbortOutcome::Committed),
                 TxCommitStatus::Aborted => Some(OwnerAbortOutcome::Acknowledged),
-                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
+                TxCommitStatus::Wounded if transition != AbortTransition::Acknowledge => {
                     Some(OwnerAbortOutcome::Pinned)
                 }
                 TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
@@ -520,7 +545,7 @@ impl Monitor {
     /// defeat a wound: the refreshed observation is retried until either the
     /// abort lands or the owner commits.
     pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
-        let target = self.preemption_target(tid);
+        let transition = self.preemption_transition(tid);
         let mut status = self
             .inner
             .tl
@@ -531,13 +556,21 @@ impl Monitor {
             })?;
         let mut backoff = self.inner.retry.backoff();
         loop {
-            status = self
-                .try_retire_observed(tid, &status.observation, target, true)
-                .await?;
+            status = match transition {
+                AbortTransition::Acknowledge => {
+                    self.acknowledge_abort(tid, &status.observation).await?
+                }
+                AbortTransition::EnsureWounded => {
+                    self.ensure_wounded(tid, &status.observation).await?
+                }
+                AbortTransition::WoundIfPresent => {
+                    self.wound_if_present(tid, &status.observation).await?
+                }
+            };
             match status.status {
                 TxCommitStatus::Ok => return Ok(TxFinalStatus::Committed),
                 TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
-                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
+                TxCommitStatus::Wounded if transition != AbortTransition::Acknowledge => {
                     return Ok(TxFinalStatus::Aborted);
                 }
                 TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
@@ -643,14 +676,24 @@ impl Monitor {
             .await
     }
 
-    /// Writes a transaction's final log and resolves ambiguous outcomes while
-    /// its durable record can still be read back (ADR-009, ADR-057).
-    pub(crate) async fn set_final_log(&self, tlog: &TxLog) -> Result<(), TransError> {
+    /// Conditionally pins an exact foreign transaction observation as wounded.
+    pub(crate) async fn try_wound_observed(
+        &self,
+        tid: &TxId,
+        expected: &Observation<TxLog>,
+    ) -> Result<TxStatus, TransError> {
+        self.ensure_wounded(tid, expected).await
+    }
+
+    /// Persists the commit decision and resolves ambiguous outcomes while its
+    /// durable record can still be read back (ADR-009, ADR-057).
+    async fn persist_committed_log(&self, mut tlog: TxLog) -> Result<(), TransError> {
         let tid = &tlog.id;
         if tid.is_unset() {
             return Err(TransError::other("missing required tlog ID"));
         }
-        let mut last_observation = {
+        tlog.status = TxCommitStatus::Ok;
+        let mut expected = {
             let st = self.shard_for(tid).lock().unwrap();
             st.local_tx
                 .get(tid)
@@ -659,143 +702,115 @@ impl Monitor {
 
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let attempt_started = rt::Instant::now();
-            let attempt = match &last_observation {
-                Some(observed) => self.inner.tl.set_if(tlog, observed).await,
-                None => self.inner.tl.set(tlog).await,
+            let started_at = rt::Instant::now();
+            let attempt = match &expected {
+                Some(observed) => self.inner.tl.set_if(&tlog, observed).await,
+                None => self.inner.tl.set(&tlog).await,
             };
-            let write_may_have_landed = match attempt {
+            let failure = match attempt {
                 Ok(observed) => {
                     self.record_durable_observation(tid, &observed);
                     return Ok(());
                 }
-                // A conflict proves our observation is stale; an in-doubt
-                // outcome leaves open that the write already landed. Both are
-                // resolved the same way: re-read the durable status and
-                // reconcile it against our intent, because neither says which
-                // terminal outcome won, and re-applying a not-yet-final log is
-                // idempotent and convergent (ADR-009). Resolving an in-doubt
-                // outcome by reading rather than by blindly re-issuing the CAS
-                // also recognizes our own landed write while its object is
-                // still there to be read.
-                Err(StorageError::Precondition) => false,
-                Err(StorageError::Unavailable(_)) => true,
+                // A clean conflict proves this write did not land. An
+                // unavailable result does not, so its read-back is bounded by
+                // the record's reclamation horizon.
+                Err(StorageError::Precondition) => CommitWriteFailure::Conflict,
+                Err(StorageError::Unavailable(_)) => CommitWriteFailure::Ambiguous { started_at },
                 Err(error) => return Err(error.into()),
             };
-            let status = if write_may_have_landed {
-                self.read_tx_status_before_reclaim(tid, &mut backoff, attempt_started)
-                    .await?
-            } else {
-                self.read_tx_status_retrying_unavailable(tid, &mut backoff)
-                    .await?
-            };
-            if status.status == tlog.status {
-                // Either us (only we write `committed` under our own tx id) or
-                // a wound that converged on the outcome we wanted (possible
-                // only for `aborted`). The desired state is durable.
-                self.record_durable_observation(tid, &status.observation);
-                return Ok(());
-            }
-            if status.status == TxCommitStatus::Wounded {
-                self.record_durable_observation(tid, &status.observation);
-                if tlog.status == TxCommitStatus::Aborted {
-                    // Owner acknowledgement is the sole mutable terminal
-                    // transition. Preserve the exact wound observation and
-                    // retry it as `Wounded -> Aborted`.
-                    last_observation = Some(status.observation);
-                    rt::sleep(backoff.next_delay()).await;
-                    continue;
+            let status = match failure {
+                CommitWriteFailure::Conflict => {
+                    self.read_tx_status_retrying_unavailable(tid, &mut backoff)
+                        .await?
                 }
-                return Err(TransError::AlreadyFinalized);
-            }
-            if status.status.is_immutable() {
-                // We wanted `committed` and found an immutable abort: it landed
-                // first. Surface `AlreadyFinalized` so the commit path retries
-                // under a new identity.
-                self.record_durable_observation(tid, &status.observation);
-                return Err(TransError::AlreadyFinalized);
-            }
-            if status.observation.is_absent() {
-                // The durable record is gone. GC only ever deletes a *final*
-                // object, so the transaction did reach a terminal state that
-                // can no longer be read back.
-                return Err(if write_may_have_landed {
-                    // Our own terminal write may have been the one reclaimed,
-                    // making the outcome irreducibly unknown (ADR-057).
-                    in_doubt(format!(
+                CommitWriteFailure::Ambiguous { started_at } => {
+                    self.read_ambiguous_commit_before_reclaim(tid, &mut backoff, started_at)
+                        .await?
+                }
+            };
+
+            match classify_commit_observation(
+                failure,
+                status.status,
+                status.observation.is_absent(),
+            )? {
+                CommitResolution::Committed => {
+                    self.record_durable_observation(tid, &status.observation);
+                    return Ok(());
+                }
+                CommitResolution::AlreadyFinalized => {
+                    self.record_durable_observation(tid, &status.observation);
+                    return Err(TransError::AlreadyFinalized);
+                }
+                CommitResolution::InDoubt => {
+                    return Err(in_doubt(format!(
                         "transaction {tid} record was reclaimed while its outcome was in doubt"
-                    ))
-                } else {
-                    // This attempt lost with a definite conflict, so our
-                    // terminal write did not land. Only a peer's wound writes
-                    // under our tx id, and it only ever writes `aborted`.
-                    TransError::AlreadyFinalized
-                });
+                    )));
+                }
+                CommitResolution::Retry => {
+                    // Pending proves the preceding attempt did not land. The
+                    // next write receives a fresh reclamation budget.
+                    expected = Some(status.observation);
+                    rt::sleep(backoff.next_delay()).await;
+                }
             }
-            // A durable `pending` status proves the last attempt did not land,
-            // because a final object is immutable and could not have reverted.
-            // That resolves any in-doubt outcome; a fresh write gets its own
-            // recovery budget because it stamps a fresh reclamation horizon.
-            last_observation = Some(status.observation);
-            rt::sleep(backoff.next_delay()).await;
         }
     }
 
-    /// Conditionally pins an exact foreign transaction observation as wounded.
-    pub(crate) async fn try_wound_observed(
+    /// Durably acknowledges that the owner has retired the transaction.
+    async fn acknowledge_abort(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,
     ) -> Result<TxStatus, TransError> {
-        self.try_retire_observed(tid, expected, TxCommitStatus::Wounded, true)
+        self.advance_abort_transition(tid, expected, AbortTransition::Acknowledge)
             .await
     }
 
-    /// Conditionally installs one abort-side status and returns the durable
-    /// status observed after the attempt.
-    async fn try_retire_observed(
+    /// Ensures that the transaction identity is durably pinned as wounded.
+    async fn ensure_wounded(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,
-        target: TxCommitStatus,
-        allow_create: bool,
     ) -> Result<TxStatus, TransError> {
-        debug_assert!(matches!(
-            target,
-            TxCommitStatus::Aborted | TxCommitStatus::Wounded
-        ));
-        if let Some(current) = expected.value() {
-            match current.status {
-                TxCommitStatus::Ok | TxCommitStatus::Aborted => {
-                    self.record_durable_observation(tid, expected);
-                    return Ok(TxStatus::from_observation(expected.clone()));
-                }
-                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
-                    self.record_durable_observation(tid, expected);
-                    return Ok(TxStatus::from_observation(expected.clone()));
-                }
-                TxCommitStatus::Wounded | TxCommitStatus::Pending => {}
-                TxCommitStatus::Unknown => {
-                    return Err(TransError::other(format!(
-                        "transaction {tid} has an invalid persisted status"
-                    )));
-                }
-            }
-        }
+        self.advance_abort_transition(tid, expected, AbortTransition::EnsureWounded)
+            .await
+    }
 
+    /// Wounds the transaction only while its durable record remains present.
+    async fn wound_if_present(
+        &self,
+        tid: &TxId,
+        expected: &Observation<TxLog>,
+    ) -> Result<TxStatus, TransError> {
+        self.advance_abort_transition(tid, expected, AbortTransition::WoundIfPresent)
+            .await
+    }
+
+    /// Advances an abort-side lifecycle transition from an exact observation.
+    async fn advance_abort_transition(
+        &self,
+        tid: &TxId,
+        expected: &Observation<TxLog>,
+        transition: AbortTransition,
+    ) -> Result<TxStatus, TransError> {
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
-            if expected.is_absent() && !allow_create {
-                return Ok(TxStatus::from_observation(expected));
-            }
-            let mut tlog = TxLog::new(tid.clone(), target);
-            if let Some(current) = expected.value() {
-                tlog.writes = current.writes.clone();
-                TxRecoveryManifest::from_log(current).apply_to(&mut tlog);
-            } else if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
-                entry.recovery.clone().apply_to(&mut tlog);
-            }
+            let current = TxStatus::from_observation(expected.clone());
+            let target = match classify_abort_observation(
+                transition,
+                current.status,
+                current.observation.is_absent(),
+            )? {
+                AbortObservationAction::Settled => {
+                    self.record_durable_observation(tid, &current.observation);
+                    return Ok(current);
+                }
+                AbortObservationAction::Write(target) => target,
+            };
+            let tlog = self.build_abort_log(tid, &expected, target);
             let r = if expected.is_absent() {
                 self.inner.tl.set(&tlog).await
             } else {
@@ -818,28 +833,25 @@ impl Monitor {
                     self.record_durable_observation(tid, &st.observation);
                     return Ok(st);
                 }
-                // In-doubt: the abort write may or may not have landed. Just
-                // like `set_final_log`, forcing a not-yet-final log to
-                // `aborted` is idempotent and convergent, so it is always safe
-                // to retry (ADR-009). This is what keeps a lost ack on a wound
-                // (or on an expired-tx abort) from escaping the locker as a
-                // `failed locking` error: a pre-commit outcome must be
-                // recovered in place, never surfaced to the caller. Re-read to
-                // decide: a final status resolves it (our own landed abort, a
-                // peer's, or a commit that won the race); a still-pending
-                // status means retry the CAS over the refreshed version.
+                // In-doubt: the abort write may or may not have landed. Forcing
+                // a not-yet-final log to an abort-side state is idempotent and
+                // convergent, so it is always safe to retry (ADR-009). This is
+                // what keeps a lost ack on a wound (or on an expired-tx abort)
+                // from escaping the locker as a `failed locking` error: a
+                // pre-commit outcome must be recovered in place, never surfaced
+                // to the caller. The observation table decides whether the
+                // read-back is settled or should be retried.
                 Err(StorageError::Unavailable(_)) => {
                     let st = self
                         .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
-                    let settled = st.status.is_immutable()
-                        || (target == TxCommitStatus::Wounded
-                            && st.status == TxCommitStatus::Wounded);
                     self.record_durable_observation(tid, &st.observation);
-                    if settled {
-                        return Ok(st);
-                    }
-                    if st.observation.is_absent() && !allow_create {
+                    if classify_abort_observation(
+                        transition,
+                        st.status,
+                        st.observation.is_absent(),
+                    )? == AbortObservationAction::Settled
+                    {
                         return Ok(st);
                     }
                     expected = st.observation;
@@ -848,6 +860,27 @@ impl Monitor {
             }
             rt::sleep(backoff.next_delay()).await;
         }
+    }
+
+    /// Builds an abort-side transaction log that retains recovery ownership.
+    fn build_abort_log(
+        &self,
+        tid: &TxId,
+        expected: &Observation<TxLog>,
+        target: TxCommitStatus,
+    ) -> TxLog {
+        debug_assert!(matches!(
+            target,
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded
+        ));
+        let mut tlog = TxLog::new(tid.clone(), target);
+        if let Some(current) = expected.value() {
+            tlog.writes = current.writes.clone();
+            TxRecoveryManifest::from_log(current).apply_to(&mut tlog);
+        } else if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
+            entry.recovery.clone().apply_to(&mut tlog);
+        }
+        tlog
     }
 
     /// Reads back an ambiguous terminal write before its record can become
@@ -859,7 +892,7 @@ impl Monitor {
     /// Measuring from the attempt and omitting the skew allowance (which is
     /// exactly what GC's own check adds to tolerate a foreign clock) therefore
     /// leaves at least GC's skew allowance after this recovery budget expires.
-    async fn read_tx_status_before_reclaim(
+    async fn read_ambiguous_commit_before_reclaim(
         &self,
         tid: &TxId,
         backoff: &mut Backoff,
@@ -922,9 +955,9 @@ impl Monitor {
         }
     }
 
-    /// Closes local admission and selects the strongest status justified
+    /// Closes local admission and selects the strongest transition justified
     /// without waiting for owner work to finish.
-    fn preemption_target(&self, tid: &TxId) -> TxCommitStatus {
+    fn preemption_transition(&self, tid: &TxId) -> AbortTransition {
         let mut st = self.shard_for(tid).lock().unwrap();
         let already_wounded = if let Some(entry) = st.local_tx.get_mut(tid) {
             entry.refresh_state = RefreshState::Stopped;
@@ -941,16 +974,16 @@ impl Monitor {
             && (!activity.terminal_commit_started || already_wounded);
         activity.admission_closed = true;
         if can_acknowledge {
-            TxCommitStatus::Aborted
+            AbortTransition::Acknowledge
         } else {
-            TxCommitStatus::Wounded
+            AbortTransition::EnsureWounded
         }
     }
 
-    /// Closes owner admission and derives the strongest safe abort plan from
-    /// facts recorded by [`OwnerOperation`]. Untracked internal protocols call
-    /// this only after their own mutation sequence has quiesced.
-    fn owner_abort_plan(&self, tid: &TxId) -> Option<OwnerAbortPlan> {
+    /// Closes owner admission and derives the strongest safe abort transition
+    /// from facts recorded by [`OwnerOperation`]. Untracked internal protocols
+    /// call this only after their own mutation sequence has quiesced.
+    fn owner_abort_transition(&self, tid: &TxId) -> Option<AbortTransition> {
         let mut st = self.shard_for(tid).lock().unwrap();
         let entry = st.local_tx.get_mut(tid)?;
         entry.refresh_state = RefreshState::Stopped;
@@ -967,15 +1000,15 @@ impl Monitor {
             }
             // A dropped terminal mutation may still commit. Only an observed
             // object may be preempted; absence remains ADR-057 in-doubt.
-            return Some(OwnerAbortPlan::RaceTerminalCommit);
+            return Some(AbortTransition::WoundIfPresent);
         }
 
-        let plan = if activity.active == 0 && (!activity.unresolved || !activity.tracked) {
-            OwnerAbortPlan::Acknowledge
+        let transition = if activity.active == 0 && (!activity.unresolved || !activity.tracked) {
+            AbortTransition::Acknowledge
         } else {
-            OwnerAbortPlan::Pin
+            AbortTransition::EnsureWounded
         };
-        Some(plan)
+        Some(transition)
     }
 
     fn start_terminal_commit(&self, tid: &TxId) -> Result<(), TransError> {
@@ -1573,6 +1606,70 @@ impl Monitor {
     }
 }
 
+/// Selects the abort-side action justified by one durable observation.
+fn classify_abort_observation(
+    transition: AbortTransition,
+    status: TxCommitStatus,
+    absent: bool,
+) -> Result<AbortObservationAction, TransError> {
+    match (status, absent) {
+        (TxCommitStatus::Ok | TxCommitStatus::Aborted, false) => {
+            Ok(AbortObservationAction::Settled)
+        }
+        (TxCommitStatus::Wounded, false) => Ok(match transition {
+            AbortTransition::Acknowledge => AbortObservationAction::Write(TxCommitStatus::Aborted),
+            AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent => {
+                AbortObservationAction::Settled
+            }
+        }),
+        (TxCommitStatus::Pending, false) => Ok(AbortObservationAction::Write(match transition {
+            AbortTransition::Acknowledge => TxCommitStatus::Aborted,
+            AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent => {
+                TxCommitStatus::Wounded
+            }
+        })),
+        (TxCommitStatus::Unknown, true) => Ok(match transition {
+            AbortTransition::Acknowledge => AbortObservationAction::Write(TxCommitStatus::Aborted),
+            AbortTransition::EnsureWounded => {
+                AbortObservationAction::Write(TxCommitStatus::Wounded)
+            }
+            AbortTransition::WoundIfPresent => AbortObservationAction::Settled,
+        }),
+        (TxCommitStatus::Unknown, false) => Err(TransError::other(
+            "transaction has an invalid persisted status",
+        )),
+        (_, true) => Err(TransError::other(
+            "transaction status disagrees with its absent observation",
+        )),
+    }
+}
+
+/// Classifies what a durable read proves after a committed-log write did not
+/// return success.
+fn classify_commit_observation(
+    failure: CommitWriteFailure,
+    status: TxCommitStatus,
+    absent: bool,
+) -> Result<CommitResolution, TransError> {
+    match (status, absent) {
+        (TxCommitStatus::Ok, false) => Ok(CommitResolution::Committed),
+        (TxCommitStatus::Aborted | TxCommitStatus::Wounded, false) => {
+            Ok(CommitResolution::AlreadyFinalized)
+        }
+        (TxCommitStatus::Pending, false) => Ok(CommitResolution::Retry),
+        (TxCommitStatus::Unknown, true) => Ok(match failure {
+            CommitWriteFailure::Conflict => CommitResolution::AlreadyFinalized,
+            CommitWriteFailure::Ambiguous { .. } => CommitResolution::InDoubt,
+        }),
+        (TxCommitStatus::Unknown, false) => Err(TransError::other(
+            "transaction has an invalid persisted status",
+        )),
+        (_, true) => Err(TransError::other(
+            "transaction status disagrees with its absent observation",
+        )),
+    }
+}
+
 /// Builds the error that reports a transaction outcome as irreducibly unknown,
 /// which the public surface classifies as `Error::InDoubt`.
 fn in_doubt(reason: impl Into<String>) -> TransError {
@@ -1598,6 +1695,99 @@ mod tests {
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_data::{CollectionAddress, CollectionId};
     use glassdb_storage::{CachedStore, LockType, Timeline, TxCollectionOp, TxWrite};
+
+    #[test]
+    fn abort_observation_classification_matches_the_protocol() {
+        let acknowledge = AbortTransition::Acknowledge;
+        let ensure_wounded = AbortTransition::EnsureWounded;
+        let wound_if_present = AbortTransition::WoundIfPresent;
+
+        for transition in [acknowledge, ensure_wounded, wound_if_present] {
+            assert_eq!(
+                classify_abort_observation(transition, TxCommitStatus::Ok, false).unwrap(),
+                AbortObservationAction::Settled
+            );
+            assert_eq!(
+                classify_abort_observation(transition, TxCommitStatus::Aborted, false).unwrap(),
+                AbortObservationAction::Settled
+            );
+        }
+
+        assert_eq!(
+            classify_abort_observation(acknowledge, TxCommitStatus::Wounded, false).unwrap(),
+            AbortObservationAction::Write(TxCommitStatus::Aborted)
+        );
+        for transition in [ensure_wounded, wound_if_present] {
+            assert_eq!(
+                classify_abort_observation(transition, TxCommitStatus::Wounded, false).unwrap(),
+                AbortObservationAction::Settled
+            );
+        }
+
+        assert_eq!(
+            classify_abort_observation(acknowledge, TxCommitStatus::Pending, false).unwrap(),
+            AbortObservationAction::Write(TxCommitStatus::Aborted)
+        );
+        for transition in [ensure_wounded, wound_if_present] {
+            assert_eq!(
+                classify_abort_observation(transition, TxCommitStatus::Pending, false).unwrap(),
+                AbortObservationAction::Write(TxCommitStatus::Wounded)
+            );
+        }
+
+        assert_eq!(
+            classify_abort_observation(acknowledge, TxCommitStatus::Unknown, true).unwrap(),
+            AbortObservationAction::Write(TxCommitStatus::Aborted)
+        );
+        assert_eq!(
+            classify_abort_observation(ensure_wounded, TxCommitStatus::Unknown, true).unwrap(),
+            AbortObservationAction::Write(TxCommitStatus::Wounded)
+        );
+        assert_eq!(
+            classify_abort_observation(wound_if_present, TxCommitStatus::Unknown, true).unwrap(),
+            AbortObservationAction::Settled
+        );
+        assert!(classify_abort_observation(acknowledge, TxCommitStatus::Unknown, false).is_err());
+        assert!(classify_abort_observation(acknowledge, TxCommitStatus::Pending, true).is_err());
+    }
+
+    #[test]
+    fn commit_observation_classification_matches_the_protocol() {
+        let conflict = CommitWriteFailure::Conflict;
+        let ambiguous = CommitWriteFailure::Ambiguous {
+            started_at: rt::Instant::now(),
+        };
+
+        for failure in [conflict, ambiguous] {
+            assert_eq!(
+                classify_commit_observation(failure, TxCommitStatus::Ok, false).unwrap(),
+                CommitResolution::Committed
+            );
+            assert_eq!(
+                classify_commit_observation(failure, TxCommitStatus::Aborted, false).unwrap(),
+                CommitResolution::AlreadyFinalized
+            );
+            assert_eq!(
+                classify_commit_observation(failure, TxCommitStatus::Wounded, false).unwrap(),
+                CommitResolution::AlreadyFinalized
+            );
+            assert_eq!(
+                classify_commit_observation(failure, TxCommitStatus::Pending, false).unwrap(),
+                CommitResolution::Retry
+            );
+        }
+
+        assert_eq!(
+            classify_commit_observation(conflict, TxCommitStatus::Unknown, true).unwrap(),
+            CommitResolution::AlreadyFinalized
+        );
+        assert_eq!(
+            classify_commit_observation(ambiguous, TxCommitStatus::Unknown, true).unwrap(),
+            CommitResolution::InDoubt
+        );
+        assert!(classify_commit_observation(conflict, TxCommitStatus::Unknown, false).is_err());
+        assert!(classify_commit_observation(conflict, TxCommitStatus::Pending, true).is_err());
+    }
 
     #[test]
     fn protocol_timing_profiles_preserve_liveness_boundaries() {
