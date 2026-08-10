@@ -1,9 +1,8 @@
 //! Best-effort persistent encoded-body disk cache (ADR-045, ADR-048).
 
-use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +14,9 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::cache_stats::CacheMetrics;
 use crate::timeline::SequencePoint;
 
+mod admission;
 mod disk;
+mod fence;
 mod file_media;
 mod format;
 mod media;
@@ -24,18 +25,16 @@ pub(crate) mod sim_harness;
 #[cfg(any(test, feature = "sim"))]
 pub(crate) mod sim_media;
 
+use admission::{Admission, PayloadReservation};
 use disk::{Disk, WriterState, open_disk};
+use fence::FenceTracker;
+pub(crate) use fence::{FenceContext, FenceGuard, PathFence};
 use file_media::FileMedia;
 use format::{CacheGeometry, PRODUCTION_GEOMETRY};
 use media::CacheMedia;
 
 const CACHE_FILE: &str = "l2.cache";
-const FILTER_BYTES: usize = 4 * 1024 * 1024;
-const FILTER_HIT_EPOCH: u64 = 1 << 20;
 const WORK_QUEUE_ITEMS: usize = 4096;
-const OPTIONAL_QUEUE_ITEMS: usize = 3072;
-const MAX_ACTIVE_FENCES: usize = 4096;
-const MAX_QUEUED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -180,21 +179,11 @@ impl PersistentCache {
         if !inner.shared.enabled.load(Ordering::Acquire) {
             return None;
         }
-        let reserved = inner.shared.active_fences.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| (current < MAX_ACTIVE_FENCES).then_some(current + 1),
-        );
-        if reserved.is_err() {
+        let Some(guard) = inner.shared.fences.begin(context) else {
             inner.disable_message("persistent-cache path-fence capacity exhausted");
             return None;
-        }
-        let epoch = context.fence().begin();
-        Some(FenceGuard {
-            context,
-            epoch,
-            active_fences: inner.shared.active_fences.clone(),
-        })
+        };
+        Some(guard)
     }
 
     pub(crate) fn disable_slow_lookup(&self) {
@@ -233,7 +222,7 @@ impl PersistentCache {
                 return;
             }
         };
-        let Some(payload) = PayloadReservation::reserve(&inner.shared, size) else {
+        let Some(payload) = inner.shared.admission.reserve_payload(size) else {
             self.invalidate(path, fence);
             return;
         };
@@ -269,22 +258,15 @@ impl PersistentCache {
             return;
         }
         let fingerprint = inner.shared.disk.path_fingerprint(path);
-        if !inner.shared.filter.observe(fingerprint) {
+        if !inner.shared.admission.observe_hit(fingerprint) {
             return;
         }
         let (epoch, active) = fence.snapshot();
         if active {
             return;
         }
-        {
-            let mut queued = inner.shared.promotions.lock().unwrap();
-            if queued.contains(path.as_ref()) {
-                return;
-            }
-            if queued.len() >= OPTIONAL_QUEUE_ITEMS {
-                return;
-            }
-            queued.insert(path.clone());
+        if !inner.shared.admission.reserve_promotion(path) {
+            return;
         }
         let _ = inner.enqueue_optional(Work::Promote {
             path: path.clone(),
@@ -494,76 +476,6 @@ impl PersistentCache {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct PathFence {
-    state: Mutex<FenceState>,
-}
-
-/// Provides the path fence and retains its semantic owner while queued L2 work
-/// can still refer to it.
-pub(crate) trait FenceContext: Send + Sync {
-    fn fence(&self) -> &PathFence;
-}
-
-impl FenceContext for PathFence {
-    fn fence(&self) -> &PathFence {
-        self
-    }
-}
-
-#[derive(Default)]
-struct FenceState {
-    epoch: u64,
-    active: bool,
-}
-
-impl PathFence {
-    pub(crate) fn is_active(&self) -> bool {
-        self.state.lock().unwrap().active
-    }
-
-    fn begin(&self) -> u64 {
-        let mut state = self.state.lock().unwrap();
-        state.epoch = state.epoch.wrapping_add(1);
-        if state.epoch == 0 {
-            state.epoch = 1;
-        }
-        state.active = true;
-        state.epoch
-    }
-
-    fn snapshot(&self) -> (u64, bool) {
-        let state = self.state.lock().unwrap();
-        (state.epoch, state.active)
-    }
-
-    fn finish(&self, epoch: u64) {
-        let mut state = self.state.lock().unwrap();
-        if state.epoch == epoch {
-            state.active = false;
-        }
-    }
-}
-
-pub(crate) struct FenceGuard {
-    context: Arc<dyn FenceContext>,
-    epoch: u64,
-    active_fences: Arc<AtomicUsize>,
-}
-
-impl FenceGuard {
-    fn is_current(&self) -> bool {
-        self.context.fence().snapshot() == (self.epoch, true)
-    }
-}
-
-impl Drop for FenceGuard {
-    fn drop(&mut self) {
-        self.context.fence().finish(self.epoch);
-        self.active_fences.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 struct CacheInner {
     shared: Arc<Shared>,
     sender: mpsc::Sender<Work>,
@@ -587,11 +499,8 @@ impl CacheInner {
             disk,
             enabled: AtomicBool::new(true),
             metrics,
-            filter: writer.filter.clone(),
-            promotions: Mutex::new(HashSet::new()),
-            active_fences: Arc::new(AtomicUsize::new(0)),
-            queued_payload_bytes: AtomicU64::new(0),
-            optional_queued: AtomicUsize::new(0),
+            admission: Arc::new(Admission::new(writer.filter.clone())),
+            fences: FenceTracker::new(),
             shutdown_requested: AtomicBool::new(false),
         });
         (
@@ -658,26 +567,21 @@ impl CacheInner {
         if self.shared.shutdown_requested.load(Ordering::Acquire)
             || !self.shared.enabled.load(Ordering::Acquire)
         {
-            work.remove_promotion(&self.shared);
+            work.remove_promotion(&self.shared.admission);
             return false;
         }
-        let reserved = self.shared.optional_queued.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| (current < OPTIONAL_QUEUE_ITEMS).then_some(current + 1),
-        );
-        if reserved.is_err() {
-            work.remove_promotion(&self.shared);
+        if !self.shared.admission.reserve_optional() {
+            work.remove_promotion(&self.shared.admission);
             return false;
         }
         match self.sender.try_send(work) {
             Ok(()) => true,
             Err(error) => {
-                self.shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
+                self.shared.admission.release_optional();
                 let work = match error {
                     TrySendError::Full(work) | TrySendError::Closed(work) => work,
                 };
-                work.remove_promotion(&self.shared);
+                work.remove_promotion(&self.shared.admission);
                 false
             }
         }
@@ -721,11 +625,8 @@ struct Shared {
     disk: Arc<Disk>,
     enabled: AtomicBool,
     metrics: Arc<CacheMetrics>,
-    filter: Arc<HitFilter>,
-    promotions: Mutex<HashSet<Arc<str>>>,
-    active_fences: Arc<AtomicUsize>,
-    queued_payload_bytes: AtomicU64,
-    optional_queued: AtomicUsize,
+    admission: Arc<Admission>,
+    fences: FenceTracker,
     shutdown_requested: AtomicBool,
 }
 
@@ -737,36 +638,6 @@ impl Shared {
         } else {
             false
         }
-    }
-}
-
-struct PayloadReservation {
-    shared: Arc<Shared>,
-    bytes: u64,
-}
-
-impl PayloadReservation {
-    fn reserve(shared: &Arc<Shared>, bytes: u64) -> Option<Self> {
-        shared
-            .queued_payload_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(bytes)
-                    .filter(|next| *next <= MAX_QUEUED_PAYLOAD_BYTES)
-            })
-            .ok()?;
-        Some(Self {
-            shared: shared.clone(),
-            bytes,
-        })
-    }
-}
-
-impl Drop for PayloadReservation {
-    fn drop(&mut self) {
-        self.shared
-            .queued_payload_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -835,94 +706,10 @@ enum Work {
 }
 
 impl Work {
-    fn remove_promotion(&self, shared: &Shared) {
+    fn remove_promotion(&self, admission: &Admission) {
         if let Work::Promote { path, .. } = self {
-            shared.promotions.lock().unwrap().remove(path.as_ref());
+            admission.remove_promotion(path);
         }
-    }
-}
-
-struct HitFilter {
-    cells: Box<[AtomicU8]>,
-    hits: AtomicU64,
-    segment_reinitializations: AtomicUsize,
-    resetting: AtomicBool,
-}
-
-impl HitFilter {
-    fn new() -> Self {
-        let cells = std::iter::repeat_with(|| AtomicU8::new(0))
-            .take(FILTER_BYTES)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            cells,
-            hits: AtomicU64::new(0),
-            segment_reinitializations: AtomicUsize::new(0),
-            resetting: AtomicBool::new(false),
-        }
-    }
-
-    fn observe(&self, fingerprint: u64) -> bool {
-        let counters = FILTER_BYTES * 4;
-        let first = fingerprint as usize % counters;
-        let second = mix64(fingerprint ^ 0x9e37_79b9_7f4a_7c15) as usize % counters;
-        let first_before = self.increment(first);
-        let second_before = if first == second {
-            first_before
-        } else {
-            self.increment(second)
-        };
-        let before = first_before.min(second_before);
-        let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
-        if hits >= FILTER_HIT_EPOCH {
-            self.reset();
-        }
-        before == 1
-    }
-
-    fn note_segment_reinitialized(&self, segment_count: usize) {
-        let threshold = segment_count.div_ceil(2);
-        let count = self
-            .segment_reinitializations
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        if count >= threshold {
-            self.reset();
-        }
-    }
-
-    fn increment(&self, counter: usize) -> u8 {
-        let byte_index = counter / 4;
-        let shift = (counter % 4) * 2;
-        let mask = 0b11 << shift;
-        let cell = &self.cells[byte_index];
-        let mut current = cell.load(Ordering::Relaxed);
-        loop {
-            let before = (current & mask) >> shift;
-            let after = before.saturating_add(1).min(2);
-            let next = (current & !mask) | (after << shift);
-            match cell.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return before,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    fn reset(&self) {
-        if self
-            .resetting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        for cell in &self.cells {
-            cell.store(0, Ordering::Relaxed);
-        }
-        self.hits.store(0, Ordering::Relaxed);
-        self.segment_reinitializations.store(0, Ordering::Relaxed);
-        self.resetting.store(false, Ordering::Release);
     }
 }
 
@@ -984,7 +771,7 @@ async fn run_worker(
         };
         let result = match work {
             Work::Lookup { path, completion } => {
-                shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
+                shared.admission.release_optional();
                 let _ = completion.send(lookup(&shared, &path).await);
                 Ok(())
             }
@@ -1027,14 +814,14 @@ async fn run_worker(
                 context,
                 epoch,
             } => {
-                shared.optional_queued.fetch_sub(1, Ordering::AcqRel);
+                shared.admission.release_optional();
                 let result = if shared.enabled.load(Ordering::Acquire) {
                     promote(&shared, &mut writer, &path, context.fence(), epoch).await
                 } else {
                     Ok(())
                 };
                 disable_after_work_error(&shared, &result);
-                shared.promotions.lock().unwrap().remove(path.as_ref());
+                shared.admission.remove_promotion(&path);
                 result
             }
             Work::Shutdown => {
@@ -1132,14 +919,6 @@ async fn promote(
         .await?;
     writer.promotion_tokens -= promoted.record_bytes;
     Ok(())
-}
-
-fn mix64(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 #[cfg(test)]
@@ -1752,18 +1531,5 @@ mod tests {
             old_slot.record_offset + old_slot.record_bytes
         );
         assert_eq!(recovered_slot.record_offset, 307_200);
-    }
-
-    #[test]
-    fn second_chance_filter_emits_once_on_the_second_hit_and_resets() {
-        let filter = HitFilter::new();
-        assert!(!filter.observe(42));
-        assert!(filter.observe(42));
-        assert!(!filter.observe(42));
-
-        filter.note_segment_reinitialized(4);
-        filter.note_segment_reinitialized(4);
-        assert!(!filter.observe(42));
-        assert!(filter.observe(42));
     }
 }

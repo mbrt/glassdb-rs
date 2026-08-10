@@ -9,9 +9,10 @@ use glassdb_data::DatabaseId;
 use crate::cache_stats::CacheMetrics;
 use crate::timeline::SequencePoint;
 
+use super::admission::HitFilter;
 use super::format::{CacheFormat, CacheGeometry};
 use super::media::{CacheFile, CacheMedia};
-use super::{CACHE_FILE, HitFilter, PersistentCacheConfig};
+use super::{CACHE_FILE, PersistentCacheConfig};
 
 const INDEX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_BYTES: u64 = 64 * 1024 * 1024;
