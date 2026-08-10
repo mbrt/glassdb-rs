@@ -3,7 +3,8 @@
 //! every input the fuzzer has ever found interesting must still satisfy its
 //! invariant (the serializability bound for `concurrent_tx`, the ring invariant
 //! for `cycle`, the sorted-listing + membership bound for `membership`, and
-//! the modeled key and collection-lifecycle states for `api_correctness`), both
+//! the modeled key and collection-lifecycle states for `api_correctness`, and
+//! exact point/group-and-range transaction serializability for `history`), both
 //! without and with the persistent cache enabled.
 //!
 //! Like the other simulation self-checks, this only builds under the in-repo
@@ -17,7 +18,9 @@
 use std::path::{Path, PathBuf};
 
 use glassdb::middleware::{OpRecord, first_divergence};
-use glassdb::sim::{ApiWorkload, CycleWorkload, MembershipWorkload, RmwWorkload, record_input};
+use glassdb::sim::{
+    ApiWorkload, CycleWorkload, HistoryWorkload, MembershipWorkload, RmwWorkload, record_input,
+};
 use rayon::prelude::*;
 
 type ReplayFn = fn(&[u8]) -> Vec<OpRecord>;
@@ -95,4 +98,9 @@ fn replays_committed_membership_corpus() {
 #[test]
 fn replays_committed_api_correctness_corpus() {
     replay_committed_corpus("api_correctness", record_input::<ApiWorkload>);
+}
+
+#[test]
+fn replays_committed_history_corpus() {
+    replay_committed_corpus("history", record_input::<HistoryWorkload>);
 }
