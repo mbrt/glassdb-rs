@@ -5,8 +5,8 @@
 This directory contains the bounded verification suite described in
 [the formal protocol verification design](../docs/designs/formal-protocol-verification.md).
 It implements the Stage 0 semantic inventory, the Stage 1 logged transaction
-core, Stage 2 direct/coordinator behavior, the recovery interfaces that the
-first slice reduced away, and the Stage 4 composed subprotocol models. The
+core, Stage 2 direct/coordinator behavior, focused recovery interfaces, and the
+Stage 4 composition seams that benefit from exhaustive interleaving. The
 Stage 3 implementation-history checker lives in
 [`crates/glassdb/src/sim/history.rs`](../crates/glassdb/src/sim/history.rs).
 The manual Stage 5 Kani harnesses are colocated with the production lifecycle,
@@ -20,21 +20,43 @@ owner acknowledgement protocol. The intended graph now excludes resurrection;
 a historical mutant that writes a foreign wound directly as GC-eligible
 `Aborted` still reproduces the original failure.
 
-The checked boundary is split into deliberately small, exhaustive models:
+The checked boundary is split into deliberately focused, exhaustive models:
 
-- logged transactions over two keys and same- or cross-leaf locking, including
-  read-only validation, validated body errors, wound-wait, lease races,
-  cancellation, ambiguous finalization, and write-back;
+- logged transactions over selected two-operation causal pairs and same- or
+  cross-leaf locking, including read-only validation, validated body errors,
+  wound-wait, lease races, cancellation, ambiguous finalization, and write-back;
 - two- and three-member direct-commit coordinator rounds, including same-key
   exclusion, oldest-first folding, replay/fallback, per-member uncertainty,
   post-notification remote effects, and fair healthy convergence;
 - explicit delayed lock requests, revision-token reuse, attempt renewal with
   stable priority, observer-relative missing/pending grace, crash cleanup, and
   a fair eventually-healthy recovery run; and
-- separate B-link split, collection lifecycle, cache-evidence, and
-  transaction-object reclamation models with named transaction-core
-  assumption/guarantee boundaries; plus a focused owner/wound/GC composition
-  check for the pinned-wound anti-resurrection boundary.
+- shared-state TxCore/B-link split composition, collection drop fencing, and a
+  focused owner/wound/reference/GC composition for the pinned-wound
+  anti-resurrection boundary.
+
+The pilot deliberately does not give every correctness claim its own TLA+
+state machine. Each claim has one primary evidence owner:
+
+| Evidence owner | Primary responsibility |
+| --- | --- |
+| TLA+/TLC | Internal concurrency and composition seams: logged/direct commit, recovery, split references, collection drop fencing, wound/GC. |
+| Implementation-history checker | Public strict serializability, scans, validated errors, and conservative optional completion. |
+| Kani | Pure production kernels: transaction-record lifecycle, median policy, and split metadata. |
+| Deterministic Rust tests | Concrete collection incarnation, cache cancellation/evidence, data-structure, and async implementation behavior. |
+
+This ownership cut removes broad standalone collection-lifecycle and cache
+models. Their implementation-specific contracts already have directed tests;
+the one collection race those tests did not exhaust remains as the narrow
+`CollectionDropFence` model.
+
+The resulting catalog has 17 TLA+ modules and 39 discovered configurations
+(11 safety, 5 liveness, and 23 expected counterexamples), down from 20 modules
+and 47 configurations. TLA+ source/configuration footprint falls from
+4,656/1,385 to 3,902/1,173 lines. On the reference host the complete runner now
+finishes in 113 seconds instead of roughly 376 seconds. Most of the runtime win
+comes from replacing the logged transaction Cartesian workloads with explicit
+causal pairs; deleting tiny models alone would not have achieved it.
 
 The proposed long-lived snapshot-read protocol is intentionally excluded. The
 models and history checker cover only strong latest-value transactions.
@@ -63,12 +85,16 @@ liveness entries name their wrapper module; expected-counterexample entries
 additionally name the exact invariant and seeded action their trace must
 contain. Adding an unannotated or malformed configuration fails the run
 instead of silently omitting it. Log and metadata names are the configuration
-basename converted from CamelCase to kebab-case.
+basename converted from CamelCase to kebab-case. `target/formal/` is
+runner-owned and is cleared only after the catalog and tool preflight succeed.
+Once a run starts, every retained log therefore belongs to the current file
+listing; a preflight failure deliberately preserves the prior run and its logs
+must not be treated as fresh evidence.
 
 ```tla
 \* @verify-formal safety MC_TxCore
 \* @verify-formal liveness MC_TxCoreLiveness
-\* @verify-formal mutant MC_TxCoreMutants S1_TerminalState ReverseCommitted
+\* @verify-formal mutant MC_TxCoreMutants S4_Refinement PublishBeforeCommit
 ```
 
 The command intentionally remains separate from `make test-all`: the suite is
@@ -157,20 +183,17 @@ Like `make verify-formal`, `make verify-kani` remains separate from
 | `tla/MC_TxCore.tla` | The finite two-transaction workload and topology mappings. |
 | `tla/MC_TxCoreLiveness.tla` | Fair cleanup and equal-priority convergence wrappers for the logged path. |
 | `tla/WoundWait.tla` | Explicit distinct-priority wait/wound decisions and wait-graph acyclicity. |
-| `tla/MC_TxCoreMutants.tla` | Isolated, deliberately invalid transitions used by seven negative controls. |
-| `tla/TxCore*.cfg` | Required safety and expected-counterexample configurations. |
+| `tla/MC_TxCoreMutants.tla` | Isolated, deliberately invalid transitions used by six negative-control configurations. |
+| `tla/TxCore*.cfg` | Required safety, liveness, and expected-counterexample configurations. |
 | `tla/DirectCore.tla` | Direct/logless commit, coordinator folding, unresolved requests, fallback, and liveness. |
 | `tla/MC_DirectCore*.tla` | Two-/three-member workloads and direct-path negative controls. |
 | `tla/DirectCore*.cfg` | Direct safety, liveness, and expected-counterexample configurations. |
 | `tla/RecoveryLifecycle.tla` | Delayed CAS, ABA-capable revision tokens, renewal, observer grace, expiry, and crash cleanup. |
 | `tla/MC_Recovery*.tla` | Focused recovery safety/liveness workloads and negative controls. |
 | `tla/RecoveryLifecycle*.cfg` | Delayed-request, observer, renewal, liveness, and mutant configurations. |
-| `tla/BLinkSplit.tla` | Non-root split publication, right-link routing, and reference preservation. |
-| `tla/CollectionLifecycle.tla` | Incarnation binding, participant fencing, topology settlement, and drop. |
-| `tla/CacheEvidence.tla` | Path-lane ownership, freshness evidence, cancellation, and detached mutation effects. |
-| `tla/GarbageCollection.tla` | Reference/horizon eligibility, pending abort, lock release, and final-object deletion. |
-| `tla/WoundRetirement.tla` | ADR-059 composition of lazy holder publication, pinned foreign wounds, owner retirement, acknowledgement, and GC. |
-| `tla/TxBLinkComposition.tla` | Shared-state TxCore/B-link split-gate composition and its mismatch mutant. |
+| `tla/TxBLinkComposition.tla` | Split publication/routing plus the shared TxCore gate and live-reference boundary. |
+| `tla/CollectionDropFence.tla` | Freeze, topology-participant drain, node fencing, and final collection drop. |
+| `tla/WoundRetirement.tla` | ADR-059 owner/wound protocol plus reference, retention, and transaction-object reclamation hazards. |
 
 The model imports no Rust types or implementation code.
 
@@ -269,7 +292,8 @@ pre-commit CAS detail:
   overwrite intentionally share one exclusive lock mode because their
   compatibility table is identical in this domain. Key membership/phantom
   behavior is checked by normalized scans in the implementation history
-  workload; catalog incarnation creation is checked in `CollectionLifecycle`.
+  workload. Collection incarnation/rebinding is checked through the production
+  API, while `CollectionDropFence` retains the concurrent drop-ordering seam.
 - The reclamation clock is not modeled in `TxCore`. `WoundRetirement` adds one
   saturating age class and checks that elapsed time never deletes `Wounded`,
   while owner acknowledgement resets the ordinary `Aborted` retention horizon.
@@ -398,12 +422,15 @@ and read-back recovery. Equivalent leaf rewrites can cycle the token back to
 the request value before a delayed effect. An applied request is nevertheless
 counted at most once and every local receipt names a physical lock.
 
-The same model represents lazy absent/pending objects, absolute pending leases,
-observer-relative no-progress grace, crash, terminal lock release, and a wound
-renewing the attempt ID while preserving public priority. Its liveness wrapper
-stops injecting failures, applies weak fairness only after the environment
-becomes healthy, and checks that a crashed holder's lock is eventually
-released and an observing waiter eventually consumes the final state.
+The same semantic module represents lazy absent/pending objects, absolute
+pending leases, observer-relative no-progress grace, crash, terminal lock
+release, and a wound renewing the attempt ID while preserving public priority.
+Its model-checking wrappers deliberately select one causal slice apiece:
+delayed request/revision reuse, one holder and observer, one old/fresh renewal
+path, and fair crashed-holder cleanup. Each configuration asserts only
+properties whose antecedents occur in that slice. This avoids paying for
+irrelevant identity/action products and avoids counting vacuous invariants as
+evidence.
 
 `RecoveryLifecycle` deliberately has no final-object deletion and makes the
 victim observe an atomic wound before renewal. `WoundRetirement` supplies the
@@ -423,45 +450,41 @@ a foreign wound until it retires and acknowledges that identity.
 
 ### Composed subprotocols
 
-The later protocol models remain separate to avoid multiplying unrelated state
-spaces. Each module names both the facts it assumes from `TxCore` and the
-`TxCore*Guarantee` it exports back:
+The retained models correspond to shared-state seams rather than protocol
+names:
 
-- `BLinkSplit` models copy, atomic source-shrink/right-link publication, and
-  parent separator publication. `TxCoreSplitGuarantee` preserves exactly one
-  authoritative owner, stale-parent routing, every entry/reference, prepared
-  sibling invisibility, and the source high-key bound.
-- `CollectionLifecycle` models prepare/publish, incarnation-bound handles,
-  ordinary data/topology participants, freeze, per-node fence, abortable drop,
-  final parent removal, and name rebinding. `TxCoreLifecycleGuarantee` makes the
-  parent binding authoritative and rejects commits through a stale incarnation.
-- `CacheEvidence` models one path lane, lower-bound sequence points, definitive
-  reads/mutations, clean conflicts, unavailable responses, cancellation, and a
-  detached mutation that can apply remotely after lane ownership ends.
-  `TxCoreCacheGuarantee` allows reuse only for definitive evidence newer than
-  every invalidation.
-- `GarbageCollection` models ordinary logged objects, lock/value references,
-  recent/old horizons, forced pending abort, lock release, and final deletion.
-  `TxCoreGcGuarantee` preserves referenced/recent objects and forbids guessed
-  recreation of a deleted final decision. Its normal graph reduces away the
-  lazy holder-before-object window and relies on ADR-059's pinned-wound contract.
-- `WoundRetirement` composes that contract explicitly. It preserves the original
-  owner across lazy holder publication and arbitrary bounded delay, permits
-  cleanup while `Wounded` remains present, requires retirement before
-  acknowledgement as `Aborted`, and permits deletion only after the fresh abort
-  horizon. Same-identity resurrection remains unreachable.
+- `TxBLinkComposition` owns split preparation, atomic source shrink/right-link
+  publication, stale-parent routing, authoritative entry/value/reference
+  preservation, and the structural gate shared with lock installation and
+  write-back. It subsumes the useful checks from the former four-state split
+  script. Separate gate-bypass and missing-right-link mutants preserve both
+  causal failures.
+- `WoundRetirement` owns lazy holder publication, pinned foreign wounds, owner
+  retirement/acknowledgement, physical lock and current-writer references,
+  pending-before-release, retention horizons, final deletion, and
+  non-recreation. Integrating these rules removes the standalone GC model that
+  had abstracted away the holder-before-object window responsible for the real
+  resurrection defect.
+- `CollectionDropFence` owns only the concurrency-sensitive collection seam:
+  freeze new topology admission, drain admitted topology participants before
+  enumeration, then fence each settled node after its admitted data operations
+  drain and publish the drop. Its negative control exposes a node published
+  after the topology-drain/enumeration boundary. The enumerated set contains
+  topology-published nodes; unreachable provider objects from abandoned creates
+  and their cleanup remain an implementation contract.
 
-These are separate assume/guarantee contract checks, not one monolithic state
-graph.
+Collection incarnation/rebinding and cache/path-lane behavior still matter,
+but their state is implementation-specific and already exercised through the
+production APIs. The collection suite rejects reads and writes through an old
+incarnation after rebinding. The cached-store protocol matrices and directed
+cancellation tests check definitive evidence, lower bounds, conflicts,
+unavailable results, and invalidation before lane release. The public history
+checker owns any serializability consequence. This is an evidence-owner change,
+not a relaxation of either production contract.
+
 Root B-link height growth, arbitrary directory fanout, multiple cache paths,
-and wall-clock horizon magnitudes are data-independent reductions documented in
-the individual modules. `TxBLinkComposition` additionally couples the highest
-risk adjacent boundary through shared leaf-entry/reference state: the split
-gate must exclude lock installation and write-back between sibling copy and
-atomic source shrink/right-link publication. `WoundRetirement` is the focused
-composition check for the lazy-owner/GC boundary; its fixed graph
-now exhausts cleanly, while the superseded foreign-`Aborted` behavior remains a
-negative control.
+and exact wall-clock horizon magnitudes remain explicit finite-domain or
+implementation boundaries rather than claims of the retained compositions.
 
 ### Implementation-history refinement
 
@@ -487,23 +510,27 @@ Long-lived snapshot reads remain outside this checker.
 
 ## Finite configurations and baseline
 
-The required runs differ along the two dimensions that affect locking:
+The logged safety runs enumerate explicit causal pairs rather than allowing
+every operation to choose from the full program set independently:
 
-| Configuration | Leaf mapping | Priorities | Generated states | Distinct states | Pilot runtime |
-| --- | --- | --- | ---: | ---: | ---: |
-| `TxCoreSameLeafDistinct.cfg` | Both keys on one leaf | older/younger | 3,726,164 | 981,944 | 57 s |
-| `TxCoreSameLeafEqual.cfg` | Both keys on one leaf | equal | 1,087,463 | 284,869 | 21 s |
-| `TxCoreCrossLeafDistinct.cfg` | One key per leaf | older/younger | 6,846,744 | 1,566,901 | 2 min 6 s |
-| `TxCoreCrossLeafEqual.cfg` | One key per leaf | equal | 5,233,832 | 1,228,624 | 1 min 48 s |
+| Configuration | Causal coverage | Generated states | Distinct states | Pilot runtime |
+| --- | --- | ---: | ---: | ---: |
+| `TxCoreSameLeafDistinct.cfg` | write/write in both priority orders; write/read-only; write/validated-error; write/abort | 341,312 | 97,114 | 6 s |
+| `TxCoreCrossLeafDistinct.cfg` | write/mixed-RMW in both priority orders; two shared readers followed by write contention | 1,767,032 | 419,254 | 34 s |
 
 These measurements were recorded on 2026-08-10 with TLC 1.7.4, OpenJDK 21,
 one TLC worker, fingerprint polynomial 0, and no depth bound. Counts are stable;
-runtime is a local reference rather than a budget guarantee. The same-leaf
-distinct run includes multi-key writers, a mixed transaction with a shared
-read lock and one write lock, read-only validation, a validated error with
-discarded staged writes, and explicit abort. The other configurations use one
-multi-key writer plus the mixed read/write program because the public outcome
-classes add no topology behavior.
+runtime is a local reference rather than a budget guarantee. Same-value initial
+data forces the same-leaf graph to validate writer identity rather than value
+equality. The cross-leaf graph retains partial acquisition, timeout/fallback,
+multi-key atomicity, and genuine shared-read compatibility. Together the two
+graphs reach all 27 logged `Next` actions. The former full equal-priority
+Cartesian safety grids are gone; their unique contention policy and the same
+safety invariants are checked in the focused equal-priority graph.
+
+This changes the logged safety total from 16,894,203 generated states and about
+312 seconds to 2,108,344 states and about 40 seconds on the reference host, an
+87% reduction without removing an action or causal outcome class.
 
 The extension configurations use the same TLC/JVM settings:
 
@@ -517,15 +544,18 @@ The extension configurations use the same TLC/JVM settings:
 | `DirectCore3Safety.cfg` | Three mixed members over two keys | 1,536,235 | 585,662 |
 | `DirectCore2Liveness.cfg` | Fair eventually-healthy direct convergence | 92,849 | 40,548 |
 | `RecoveryLifecycle.cfg` | One delayed request with revision reuse | 109 | 44 |
-| `RecoveryLifecycleObserver.cfg` | Two-attempt observation, crash, grace, and cleanup | 30,379 | 10,288 |
-| `RecoveryLifecycleRenewal.cfg` | Wound, renewal, and superseded-attempt safety | 298 | 153 |
-| `RecoveryLifecycleLiveness.cfg` | Fair reclamation and final-state observation | 901 | 374 |
-| `BLinkSplitSafety.cfg` | One non-root split publication | 4 | 4 |
-| `CollectionLifecycleSafety.cfg` | Two incarnations and two nodes | 11,825 | 2,795 |
-| `CacheEvidenceSafety.cfg` | Two operations on one cache/path lane | 4,822 | 2,742 |
-| `GarbageCollectionSafety.cfg` | Two logged objects and two reference kinds | 1,157 | 289 |
-| `WoundRetirementSafety.cfg` | Pinned foreign wound, owner acknowledgement, and GC | 39 | 26 |
+| `RecoveryLifecycleObserver.cfg` | Fixed holder/observer, crash, grace, and cleanup | 1,037 | 432 |
+| `RecoveryLifecycleRenewal.cfg` | One old/fresh attempt renewal and supersession path | 35 | 24 |
+| `RecoveryLifecycleLiveness.cfg` | Fair reclamation and final-state observation | 104 | 58 |
+| `CollectionDropFenceSafety.cfg` | Freeze, participant drain, node enumeration, fencing, and drop | 487 | 116 |
+| `WoundRetirementSafety.cfg` | Pinned wound plus reference, retention, and reclamation hazards | 72 | 41 |
 | `TxBLinkCompositionSafety.cfg` | Shared leaf/reference state across TxCore and split | 57 | 40 |
+
+The original eight recovery configurations generated 31,899 states with 11,004
+distinct states. The retained four intended graphs and three mutants generate
+1,347 states with 609 distinct states. Delayed-request, observer, renewal, and
+liveness actions remain in separate graphs; the expiry graph reaches both
+absent- and pending-holder evidence branches.
 
 Every row exhausted its complete finite graph with zero states left on the
 queue. Temporal rows additionally completed TLC's full liveness pass. These
@@ -540,7 +570,6 @@ action, or unexpectedly successful mutant fails the runner.
 
 | Mutant | Required violation | Counterexample |
 | --- | --- | --- |
-| `TerminalReversalSpec` | `S1_TerminalState` | Replaces a committed record with aborted. |
 | `EarlyPublicationSpec` | `S4_Refinement` | Publishes one logged leaf value while the transaction is still non-final. |
 | `MissingValidationSpec` | `S9_PostLockValidation` | Commits observations made stale before lock acquisition. |
 | `MissingValidationSpec` with same-value input | `S9_PostLockValidation` | Changes only the writer token, then commits without revalidating it. |
@@ -559,29 +588,38 @@ The direct/coordinator controls exercise the Stage 2 boundaries:
 | `FoldOrderSpec` | `S6_DirectAtomicityAndExclusion` | Folds youngest-first and breaks the stable serial witness. |
 | `PendingFallbackSpec` | `S6_DirectAtomicityAndExclusion` | Starts logged fallback while a detached direct request can still apply, producing the same public operation twice. |
 
-The recovery controls check terminality, delayed effects, renewal, and grace:
+The recovery controls check delayed effects, renewal, and grace:
 
 | Mutant | Required violation | Counterexample |
 | --- | --- | --- |
-| `TerminalMutantSpec` | `R1_TerminalImmutable` | Reverses a committed attempt to aborted. |
 | `RequestReplayMutantSpec` | `R2_DelayedRequestAtMostOnce` | Applies one captured backend request twice; revision reuse is explored by the normal delayed-request graph. |
 | `RenewalPriorityMutantSpec` | `R4_RenewalPreservesPublicPriority` | Gives a renewed attempt a different wound-wait priority. |
 | `PrematureExpiryMutantSpec` | `R5_ExpiryHasObserverEvidence` | Aborts an absent/pending holder before observer grace or lease evidence exists. |
 
-The composed contracts, GC phases, and wound-wait policy have focused negative
-controls:
+The former generic committed-to-aborted mutants in both abstract models are
+retired. Kani now exhausts the exact production lifecycle relation and
+transition validator; `S1` and `R1` remain checked as structural invariants.
+The expiry mutant stays because it tests the concurrent stale-lease/commit
+composition, which the pure lifecycle kernel does not own.
+
+The composition seams and wound-wait policy have focused negative controls:
 
 | Mutant action | Required violation | Counterexample |
 | --- | --- | --- |
-| `ShrinkWithoutRightLink` | `BS2_RoutingReachesOwner` | Shrinks the source before installing the sibling link. |
-| `CommitThroughStaleHandle` | `CL4_StaleIncarnationCannotCommit` | Uses an old handle after its name is rebound to a fresh collection ID. |
-| `AbandonWithoutInvalidation` | `CE3_UncertainKnowledgeNotReusable` | Releases a cache lane but retains knowledge older than a detached mutation. |
-| `GuessDeletedObjectCommitted` | `GC4_DeletedFinalNeverRecreated` | Recreates a reclaimed final object by guessing that it committed. |
-| `ReleasePendingLocks` | `GC3_PendingAbortedBeforeRelease` | Removes a lock reference before the pending decision is durably aborted. |
-| `DeleteReferencedFinal` | `GC1_ReferencedObjectsRemainPresent` | Deletes a final transaction object while a physical lock still references it. |
-| `ForeignAbortWound` | `WR1_NoResurrectionAfterForeignWound` | Uses the superseded foreign-`Aborted` transition, allowing finite GC and same-identity resurrection. |
+| `ShrinkWithoutRightLink` | `TCBS2_RoutingReachesOwner` | Shrinks the source before installing the sibling link. |
 | `AcquireWhileSplitGateHeld` | `TCBS4_LiveTxReferenceReachable` | Installs a lock after sibling copy, so source shrink loses the live transaction reference. |
+| `StartFencingBeforeTopologyDrained` | `CDF1_EnumerationCoversPublishedNodes` | Enumerates nodes before an admitted topology participant publishes its node. |
+| `ReleasePendingLock` | `WR6_PendingDurablyTerminalBeforeRelease` | Removes a lock reference before the pending decision is durably terminal. |
+| `DeleteReferencedFinal` | `WR4_MaterializedReferencesRemainPresent` | Deletes a final transaction object while a physical lock or current value still references it. |
+| `GuessDeletedObjectCommitted` | `WR7_DeletedFinalNeverRecreated` | Recreates a reclaimed final object by guessing that it committed. |
+| `ForeignAbortWound` | `WR1_NoResurrectionAfterForeignWound` | Uses the superseded foreign-`Aborted` transition, allowing finite GC and same-identity resurrection. |
 | `WaitInsteadOfWound` | `WW1_WaitGraphAcyclic` | Makes the older requester wait after the younger already waits, creating a two-node cycle. |
+
+The retired cache and stale-incarnation TLA mutants have directed production
+replacements: `cancelling_invoked_mutation_makes_cache_uncertain` checks that
+knowledge is invalidated before a cancelled invoked mutation releases its
+lane, and `drop_is_non_recursive_and_fences_obsolete_handles` rejects both a
+read and a write through an old collection incarnation after rebinding.
 
 The deterministic mutant traces are retained in
 `target/formal/*mutant*.log`. They are separate wrapper actions rather than a
@@ -596,8 +634,9 @@ returns, it first establishes retirement, then acknowledges
 `Wounded -> Aborted`; that transition resets the age before ordinary GC may
 delete the record. A dropped/unresolved owner leaves `Wounded` pinned.
 
-TLC exhausts this graph with 39 generated states, 26 distinct states, and zero
-queued states at depth 10. The log is retained in
+The same graph now includes the folded reference and reclamation hazards. TLC
+exhausts it with 72 generated states, 41 distinct states, and zero queued
+states. The log is retained in
 `target/formal/wound-retirement-safety.log`.
 
 `WoundRetirementMutantForeignAbort.cfg` restores the superseded foreign wound
@@ -609,11 +648,11 @@ transition. Its trace is:
 4. `ReleaseTerminalLock` removes the durable holder.
 5. `AdvanceMarkerAge` reaches the finite retention horizon.
 6. `ResumeOwner` returns the original operation under the same identity.
-7. `DeleteExpiredAbort` returns the physical path to `Absent`.
+7. `DeleteExpiredFinal` returns the physical path to `Absent`.
 8. `LateOwnerCommit` recreates it as committed.
 
 The final action violates `WR1_NoResurrectionAfterForeignWound`. TLC generates
-60 states, finds 38 distinct states, and leaves one queued state at depth 9.
+103 states and finds 56 distinct states before the expected counterexample.
 The trace is retained in
 `target/formal/wound-retirement-mutant-foreign-abort.log`.
 
@@ -740,19 +779,21 @@ following remain explicit trust or scale boundaries rather than hidden claims:
   mappings, but this command does not contact live cloud services.
 - The composed models check named assumption/guarantee interfaces instead of a
   state-space product of every protocol and production data size. The
-  TxCore/B-link split-gate seam has a clean shared-state composition check.
-  Collection and cache retain standalone contracts. The focused lazy-owner/GC
-  composition checks ADR-059's pinned-wound handoff directly.
+  TxCore/B-link split-gate seam has a clean shared-state composition check,
+  collection drop retains its participant/fence seam, and the focused
+  lazy-owner/GC composition checks ADR-059's pinned-wound handoff directly.
 - DirectCore reduces logged fallback to one atomic transition rather than
   composing it with all TxCore phases. Mixed coordinator rounds containing
   acquisition, direct, write-back, release, and GC resolvers are covered by
   production simulation, not by one formal state-space product.
-- CacheEvidence covers one volatile path lane. Persistent-L2 session chains,
-  write-behind, and multiple simultaneously open database instances are sampled
-  by existing cache-mode tests but are not an exhaustive formal product.
-- Collection preparation/seed/catalog publication and GC candidate-feed,
-  back-reference completeness, and cleanup liveness remain implementation
-  contracts around their checked lifecycle and eligibility state machines.
+- Cache evidence is owned by the production cached-store protocol matrices and
+  cancellation regressions, not a TLA+ state machine. Persistent-L2 session
+  chains, write-behind, and multiple simultaneously open database instances are
+  sampled by existing cache-mode tests but are not exhaustively explored.
+- Collection preparation/seed/catalog publication and incarnation rebinding are
+  production-test contracts around the focused drop-fence model. GC
+  candidate-feed fairness and back-reference completeness remain implementation
+  contracts around the reference/retention rules checked in `WoundRetirement`.
   `WoundRetirement` reduces the production owner-operation accounting and
   unresolved-mutation proof to one explicit retirement transition; the Rust
   lifecycle regressions cover the implementation detail behind that transition.

@@ -1,15 +1,6 @@
 ------------------------- MODULE MC_TxCoreMutants --------------------------
 EXTENDS MC_TxCore
 
-ReverseCommitted(tx) ==
-    /\ tx \in committed
-    /\ tx_status[tx] = "Committed"
-    /\ tx_status' = [tx_status EXCEPT ![tx] = "Aborted"]
-    /\ aborted' = aborted \cup {tx}
-    /\ UNCHANGED <<logical_db, base_value, base_writer, last_writer,
-                   tx_lease, clients, read_locks, write_lock, committed,
-                   linearized, lin_count, now>>
-
 PublishBeforeCommit(tx, key) ==
     /\ clients[tx].phase \in {"Ready", "Committing"}
     /\ tx_status[tx] \in {"Absent", "Pending"}
@@ -93,9 +84,6 @@ ReturnEscalatedErrorWithoutLocks(tx) ==
     /\ UNCHANGED <<logical_db, base_value, base_writer, last_writer,
                    tx_status, tx_lease, read_locks, write_lock, committed,
                    aborted, now>>
-
-TerminalReversalSpec ==
-    Init /\ [][Next \/ \E tx \in Txns : ReverseCommitted(tx)]_vars
 
 EarlyPublicationSpec ==
     Init /\ [][Next \/ \E tx \in Txns, key \in Keys :

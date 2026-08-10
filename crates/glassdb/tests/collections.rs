@@ -586,6 +586,11 @@ async fn drop_is_non_recursive_and_fences_obsolete_handles() {
         child.read(b"k").await,
         Err(Error::StaleCollection)
     ));
+    assert!(matches!(
+        child.write(b"stale", b"must-not-commit").await,
+        Err(Error::StaleCollection)
+    ));
+    assert_eq!(replacement.read(b"stale").await.unwrap(), None);
     assert_eq!(replacement.read(b"k").await.unwrap().unwrap(), b"new");
 }
 

@@ -59,40 +59,35 @@ DelayedRequestNext ==
 DelayedRequestSpec == Init /\ [][DelayedRequestNext]_vars
 
 ObserverNext ==
-    \/ \E attempt \in Attempts : DispatchAcquire(attempt)
-    \/ \E attempt \in Attempts : ApplyAcquire(attempt)
-    \/ \E attempt \in Attempts : AcknowledgeAcquire(attempt)
-    \/ \E attempt \in Attempts : RecoverInstalledAcquire(attempt)
-    \/ \E attempt \in Attempts : MaterializePending(attempt)
-    \/ \E attempt \in Attempts : RefreshPending(attempt)
-    \/ \E attempt \in Attempts : Crash(attempt)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ObserveConflict(observer, holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ObserveProgress(observer, holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           AdvanceObserverAge(observer, holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ExpireObserved(observer, holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ObserveFinal(observer, holder)
-    \/ \E attempt \in Attempts, key \in Keys :
-           ReleaseTerminalLock(attempt, key)
+    \* Fixing the observer and holder breaks identity symmetry without removing
+    \* either the absent-record or pending-record expiry path.
+    \/ DispatchAcquire(A1)
+    \/ ApplyAcquire(A1)
+    \/ MaterializePending(A1)
+    \/ RefreshPending(A1)
+    \/ Crash(A1)
+    \/ ObserveConflict(A2, A1)
+    \/ ObserveProgress(A2, A1)
+    \/ AdvanceObserverAge(A2, A1)
+    \/ ExpireObserved(A2, A1)
     \/ AdvanceTime
 
 ObserverSpec == Init /\ [][ObserverNext]_vars
 
 RenewalNext ==
-    \/ \E attempt \in Attempts : DispatchAcquire(attempt)
-    \/ \E attempt \in Attempts : ApplyAcquire(attempt)
-    \/ \E attempt \in Attempts : AcknowledgeAcquire(attempt)
-    \/ \E attempt \in Attempts : RecoverInstalledAcquire(attempt)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           Wound(observer, holder)
-    \/ \E op \in Ops : RenewPublic(op)
-    \/ \E attempt \in Attempts : Commit(attempt)
-    \/ \E attempt \in Attempts, key \in Keys :
-           ReleaseTerminalLock(attempt, key)
+    \* One explicit old/fresh path retains the supersession boundary while
+    \* acquisition recovery remains owned by DelayedRequestNext.
+    \/ DispatchAcquire(A1)
+    \/ ApplyAcquire(A1)
+    \/ AcknowledgeAcquire(A1)
+    \/ Commit(A1)
+    \/ Wound(A2, A1)
+    \/ RenewPublic(O1)
+    \/ ReleaseTerminalLock(A1, K1)
+    \/ DispatchAcquire(A1R)
+    \/ ApplyAcquire(A1R)
+    \/ AcknowledgeAcquire(A1R)
+    \/ Commit(A1R)
 
 RenewalSpec == Init /\ [][RenewalNext]_vars
 

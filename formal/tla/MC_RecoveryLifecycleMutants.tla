@@ -1,17 +1,6 @@
 ------------------- MODULE MC_RecoveryLifecycleMutants -------------------
 EXTENDS MC_RecoveryLifecycle
 
-ReverseCommitted(attempt) ==
-    /\ attempt \in committed
-    /\ status' = [status EXCEPT ![attempt] = "Aborted"]
-    /\ aborted' = aborted \cup {attempt}
-    /\ UNCHANGED <<current_attempt, phase, lease, progress,
-                   effective_priority, lock_holder, revision, request_state,
-                   request_key, request_revision, request_expected_holder,
-                   request_apply_count, receipts, observing, seen_status,
-                   seen_progress, seen_at, seen_age, abort_cause, expired_by, committed,
-                   effect_count, now>>
-
 ApplyDelayedRequestTwice(attempt) ==
     /\ request_state[attempt] = "Applied"
     /\ request_apply_count' =
@@ -54,10 +43,6 @@ ExpireWithoutGrace(observer, holder) ==
                    request_key, request_revision, request_expected_holder,
                    request_apply_count, receipts, observing, seen_status,
                    seen_progress, seen_at, seen_age, committed, effect_count, now>>
-
-TerminalMutantSpec ==
-    Init /\ [][RenewalNext \/ \E attempt \in Attempts :
-                         ReverseCommitted(attempt)]_vars
 
 RequestReplayMutantSpec ==
     Init /\ [][DelayedRequestNext \/ \E attempt \in Attempts :

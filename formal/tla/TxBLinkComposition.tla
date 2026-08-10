@@ -92,6 +92,19 @@ EntryLogicalValue(node, key) ==
 LogicalView(key) ==
     EntryLogicalValue(RoutedLeaf(key), key)
 
+ExpectedEntryRef(key) ==
+    IF /\ key = TargetKey
+       /\ tx_phase \in {"Locked", "Committed", "Aborted"}
+    THEN TxRef
+    ELSE NoRef
+
+ExpectedEntryValue(key) ==
+    IF /\ key = TargetKey
+       /\ tx_phase = "Done"
+       /\ tx_status = "Committed"
+    THEN TxValue
+    ELSE InitialValue
+
 Init ==
     /\ split_phase = "Stable"
     /\ split_gate = FALSE
@@ -253,11 +266,36 @@ TCBS4_LiveTxReferenceReachable ==
     tx_phase \in {"Locked", "Committed", "Aborted"} =>
         entry_ref[RoutedLeaf(TargetKey)][TargetKey] = TxRef
 
+\* While the sibling is private, the structural gate makes the copied image a
+\* stable snapshot.  Once published, TCBS1/2 select that same image as the
+\* authoritative entry rather than treating the copy as a second owner.
+TCBS5_PreparedSiblingPreservesEntries ==
+    split_phase = "Copied" =>
+        /\ Sibling \notin ReachableNodes
+        /\ node_keys[Source] = Keys
+        /\ \A key \in RightKeys :
+            /\ entry_value[Sibling][key] = entry_value[Source][key]
+            /\ entry_ref[Sibling][key] = entry_ref[Source][key]
+
+TCBS6_HighKeyMatchesSourceRange ==
+    (RightKeys \subseteq node_keys[Source]) <=> source_right = NoNode
+
+\* TCBS1/2 establish where an entry lives; this assertion retains the split
+\* model's stronger promise that the authoritative physical value and
+\* transaction reference survive the move.
+TCBS7_AuthoritativeEntryStatePreserved ==
+    \A key \in Keys :
+        /\ entry_value[RoutedLeaf(key)][key] = ExpectedEntryValue(key)
+        /\ entry_ref[RoutedLeaf(key)][key] = ExpectedEntryRef(key)
+
 CompositionGuarantee ==
     /\ TCBS1_OneAuthoritativeOwner
     /\ TCBS2_RoutingReachesOwner
     /\ TCBS3_LogicalViewRefinesDatabase
     /\ TCBS4_LiveTxReferenceReachable
+    /\ TCBS5_PreparedSiblingPreservesEntries
+    /\ TCBS6_HighKeyMatchesSourceRange
+    /\ TCBS7_AuthoritativeEntryStatePreserved
 
 \* Negative control: TxCore ignores the split gate and installs its lock in
 \* Source after Sibling was copied.  Source still owns the key at this point,
@@ -276,5 +314,20 @@ AcquireWhileSplitGateHeld ==
 
 MutantSpec ==
     Init /\ [][Next \/ AcquireWhileSplitGateHeld]_vars
+
+\* Negative control inherited from the standalone split model: shrinking the
+\* source without publishing the right link makes the copied entries
+\* unreachable through a stale parent.
+ShrinkWithoutRightLink ==
+    /\ split_phase = "Copied"
+    /\ split_gate
+    /\ split_phase' = "Linked"
+    /\ split_gate' = FALSE
+    /\ node_keys' = [node_keys EXCEPT ![Source] = LeftKeys]
+    /\ UNCHANGED <<entry_value, entry_ref, source_right,
+                   parent_has_separator, tx_phase, tx_status, logical_db>>
+
+MissingRightLinkMutantSpec ==
+    Init /\ [][Next \/ ShrinkWithoutRightLink]_vars
 
 =============================================================================

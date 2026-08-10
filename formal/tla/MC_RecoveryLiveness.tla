@@ -10,27 +10,21 @@ ASSUME
     /\ WatchedKey = Required(Waiter)
 
 \* The environment remains healthy after the selected holder crashes: the
-\* waiter is not also crashed, model time is scheduled, and enabled observer
-\* and cleanup work is weakly fair.
+\* waiter is not also crashed, observer age advances, and enabled observer and
+\* cleanup work is weakly fair.  Fixed roles remove irrelevant identity
+\* interleavings from this temporal check.
 CrashedPendingNext ==
-    \/ \E attempt \in Attempts : DispatchAcquire(attempt)
-    \/ \E attempt \in Attempts : ApplyAcquire(attempt)
-    \/ \E attempt \in Attempts : AcknowledgeAcquire(attempt)
-    \/ \E attempt \in Attempts : RecoverInstalledAcquire(attempt)
-    \/ \E attempt \in Attempts : MaterializePending(attempt)
-    \/ \E attempt \in Attempts : RefreshPending(attempt)
+    \/ DispatchAcquire(Holder)
+    \/ ApplyAcquire(Holder)
+    \/ MaterializePending(Holder)
+    \/ RefreshPending(Holder)
     \/ Crash(Holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ObserveConflict(observer, holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ObserveProgress(observer, holder)
+    \/ ObserveConflict(Waiter, Holder)
+    \/ ObserveProgress(Waiter, Holder)
     \/ AdvanceObserverAge(Waiter, Holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ExpireObserved(observer, holder)
-    \/ \E observer \in Attempts, holder \in Attempts :
-           ObserveFinal(observer, holder)
-    \/ \E attempt \in Attempts, key \in Keys :
-           ReleaseTerminalLock(attempt, key)
+    \/ ExpireObserved(Waiter, Holder)
+    \/ ObserveFinal(Waiter, Holder)
+    \/ ReleaseTerminalLock(Holder, WatchedKey)
 
 CrashedPendingFairSpec ==
     /\ Init

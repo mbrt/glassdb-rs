@@ -87,8 +87,6 @@ else
     verify_jar "$tlc_jar"
 fi
 
-mkdir -p "$output_dir"
-
 tlc() {
     local module=$1
     local configuration=$2
@@ -287,6 +285,12 @@ for configuration_path in "${configuration_paths[@]}"; do
     expected_invariants+=("$expected_invariant")
     expected_actions+=("$expected_action")
 done
+
+# This directory is owned by this runner.  Starting from an empty directory
+# prevents traces for retired, renamed, or undiscovered configurations from
+# being mistaken for evidence from the current catalog.
+rm -rf -- "$output_dir"
+mkdir -p "$output_dir"
 
 for index in "${!configurations[@]}"; do
     mode=${run_modes[$index]}
