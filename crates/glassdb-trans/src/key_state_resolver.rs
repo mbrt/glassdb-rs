@@ -281,19 +281,14 @@ impl KeyStateResolver {
             return Ok(resolved);
         }
 
-        let (status, status_cache_hit) = self
+        let committed = self
             .monitor
-            .tx_status_at_with_cache(holder, requirement)
+            .committed_value_at(key, holder, requirement)
             .await?;
-        resolved.cache_hit &= status_cache_hit;
-        match status {
+        resolved.cache_hit &= committed.cache_hit;
+        match committed.status {
             TxCommitStatus::Ok => {
-                let committed = self
-                    .monitor
-                    .committed_value_at(key, holder, requirement)
-                    .await?;
-                resolved.cache_hit &= committed.cache_hit;
-                if committed.status == TxCommitStatus::Ok && !committed.value.not_written {
+                if !committed.value.not_written {
                     resolved.writer = Some(holder.clone());
                     resolved.value = ResolvedValue::Unresolved;
                     resolved.deleted = committed.value.deleted;

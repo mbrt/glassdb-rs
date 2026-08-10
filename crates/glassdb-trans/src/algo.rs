@@ -670,6 +670,13 @@ impl Algo {
                 tx.status = Status::Committed;
                 Ok(())
             }
+            // The terminal write was dispatched but its result is no longer
+            // abortable. Preserve its resources exactly as for an observed
+            // committed winner.
+            OwnerAbortOutcome::CommitOutcomePreserved => {
+                tx.status = Status::Committed;
+                Ok(())
+            }
             // Another local path already finished this identity. Without its
             // owner record this handle must not attempt collection rollback.
             OwnerAbortOutcome::AlreadyFinished => {

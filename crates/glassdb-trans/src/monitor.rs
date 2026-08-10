@@ -4,7 +4,7 @@
 //! locks alive, aborts expired remote transactions, and lets callers wait for a
 //! transaction to finalize.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -114,13 +114,233 @@ struct TxStatusEntry {
     recovery: TxRecoveryManifest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OwnerOperations {
+    #[default]
+    Internal,
+    Guarded {
+        active: usize,
+        unresolved: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OwnerAdmission {
+    #[default]
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TerminalCommit {
+    #[default]
+    NotStarted,
+    Started,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct OwnerLifecycle {
+    operations: OwnerOperations,
+    admission: OwnerAdmission,
+    terminal_commit: TerminalCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerCloseReason {
+    Preemption,
+    OwnerAbort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRecordState {
+    NotEngaged,
+    Wounded,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRetirementProof {
+    Internal,
+    Guarded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerClosePlan {
+    Transition(AbortTransition),
+    PreserveCommit,
+    AlreadyFinished,
+}
+
+impl OwnerLifecycle {
+    fn begin_operation(&mut self) -> Result<(), TransError> {
+        if self.admission == OwnerAdmission::Closed {
+            return Err(TransError::Wounded);
+        }
+        match &mut self.operations {
+            OwnerOperations::Internal => {
+                self.operations = OwnerOperations::Guarded {
+                    active: 1,
+                    unresolved: false,
+                };
+            }
+            OwnerOperations::Guarded { active, .. } => *active += 1,
+        }
+        Ok(())
+    }
+
+    fn finish_operation(&mut self, unresolved: bool) {
+        let OwnerOperations::Guarded {
+            active,
+            unresolved: has_unresolved,
+        } = &mut self.operations
+        else {
+            return;
+        };
+        debug_assert!(*active > 0, "owner operation finished more than once");
+        *active = active.saturating_sub(1);
+        *has_unresolved |= unresolved;
+    }
+
+    fn start_terminal_commit(&mut self) -> Result<(), TransError> {
+        if self.admission == OwnerAdmission::Closed {
+            return Err(TransError::AlreadyFinalized);
+        }
+        self.terminal_commit = TerminalCommit::Started;
+        Ok(())
+    }
+
+    fn close(&mut self, reason: OwnerCloseReason, record: OwnerRecordState) -> OwnerClosePlan {
+        self.admission = OwnerAdmission::Closed;
+        if reason == OwnerCloseReason::OwnerAbort && record == OwnerRecordState::NotEngaged {
+            return OwnerClosePlan::AlreadyFinished;
+        }
+
+        let retirement = match self.operations {
+            OwnerOperations::Internal => OwnerRetirementProof::Internal,
+            OwnerOperations::Guarded {
+                active: 0,
+                unresolved: false,
+            } => OwnerRetirementProof::Guarded,
+            OwnerOperations::Guarded { .. } => OwnerRetirementProof::Unavailable,
+        };
+        let terminal_commit_started = self.terminal_commit == TerminalCommit::Started;
+
+        match reason {
+            OwnerCloseReason::Preemption => {
+                if record != OwnerRecordState::NotEngaged
+                    && retirement == OwnerRetirementProof::Guarded
+                    && (!terminal_commit_started || record == OwnerRecordState::Wounded)
+                {
+                    OwnerClosePlan::Transition(AbortTransition::Acknowledge)
+                } else {
+                    OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
+                }
+            }
+            OwnerCloseReason::OwnerAbort
+                if terminal_commit_started && record != OwnerRecordState::Wounded =>
+            {
+                if retirement != OwnerRetirementProof::Unavailable {
+                    OwnerClosePlan::PreserveCommit
+                } else {
+                    OwnerClosePlan::Transition(AbortTransition::WoundIfPresent)
+                }
+            }
+            OwnerCloseReason::OwnerAbort => {
+                if retirement != OwnerRetirementProof::Unavailable {
+                    OwnerClosePlan::Transition(AbortTransition::Acknowledge)
+                } else {
+                    OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
+                }
+            }
+        }
+    }
+
+    fn has_active_operations(&self) -> bool {
+        matches!(
+            self.operations,
+            OwnerOperations::Guarded { active, .. } if active > 0
+        )
+    }
+}
+
+struct OwnedTxRuntime {
+    record: Option<TxStatusEntry>,
+    lifecycle: OwnerLifecycle,
+}
+
+impl OwnedTxRuntime {
+    fn new(record: Option<TxStatusEntry>) -> Self {
+        Self {
+            record,
+            lifecycle: OwnerLifecycle::default(),
+        }
+    }
+
+    fn close(&mut self, reason: OwnerCloseReason) -> OwnerClosePlan {
+        let record = match self.record.as_mut() {
+            Some(record) => {
+                record.refresh_state = RefreshState::Stopped;
+                if record.status == TxCommitStatus::Wounded {
+                    OwnerRecordState::Wounded
+                } else {
+                    OwnerRecordState::Other
+                }
+            }
+            None => OwnerRecordState::NotEngaged,
+        };
+        self.lifecycle.close(reason, record)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RemoteLiveness {
+    #[default]
+    Unobserved,
+    MissingSince {
+        since: SystemTime,
+    },
+    PendingUnchanged {
+        last_refresh: SystemTime,
+        since: SystemTime,
+    },
+}
+
+enum RemoteLivenessDecision {
+    Live,
+    Expired,
+    Owned(TxStatusEvidence),
+}
+
 #[derive(Default)]
-struct OwnerActivity {
-    active: usize,
-    unresolved: bool,
-    tracked: bool,
-    admission_closed: bool,
-    terminal_commit_started: bool,
+struct ForeignTxRuntime {
+    liveness: RemoteLiveness,
+}
+
+enum TxRuntimeRole {
+    Owned(OwnedTxRuntime),
+    Foreign(ForeignTxRuntime),
+}
+
+struct TxRuntimeEntry {
+    role: TxRuntimeRole,
+    waiters: Vec<oneshot::Sender<()>>,
+}
+
+impl TxRuntimeEntry {
+    fn owned(record: Option<TxStatusEntry>) -> Self {
+        Self {
+            role: TxRuntimeRole::Owned(OwnedTxRuntime::new(record)),
+            waiters: Vec::new(),
+        }
+    }
+
+    fn foreign() -> Self {
+        Self {
+            role: TxRuntimeRole::Foreign(ForeignTxRuntime::default()),
+            waiters: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +368,11 @@ enum CommitResolution {
     Retry,
     AlreadyFinalized,
     InDoubt,
+}
+
+struct PendingWrite {
+    log: TxLog,
+    expected: Option<Observation<TxLog>>,
 }
 
 #[derive(Clone, Copy)]
@@ -181,28 +406,9 @@ impl FinalStatusCache {
     }
 }
 
-struct WaitRequest {
-    tx: oneshot::Sender<()>,
-}
-
-/// Observer-relative liveness tracker for a watched remote pending transaction
-/// (ADR-024). Remembers the last lease `timestamp` seen on the holder's object
-/// and the observer-clock time it was first seen at that value; if the value
-/// does not advance within the configured pending timeout of `observed_at` (no
-/// skew, since both endpoints are the observer's own clock) the holder has
-/// stopped making progress and is treated as dead.
-struct PendingProgress {
-    last_seen: SystemTime,
-    observed_at: SystemTime,
-}
-
 #[derive(Default)]
 struct State {
-    local_tx: HashMap<TxId, TxStatusEntry>,
-    owner_activity: HashMap<TxId, OwnerActivity>,
-    waiters: HashMap<TxId, Vec<WaitRequest>>,
-    unknown_tx: HashMap<TxId, SystemTime>,
-    pending_progress: HashMap<TxId, PendingProgress>,
+    transactions: HashMap<TxId, TxRuntimeEntry>,
 }
 
 struct Inner {
@@ -215,10 +421,10 @@ struct Inner {
     background: Weak<Background>,
     retry: RetryConfig,
     timing: ProtocolTiming,
-    // The transaction-tracking maps are partitioned into independent shards
-    // keyed by tid. Grouping the three maps under one lock per shard keeps
-    // their cross-map updates (e.g. removing a tx and notifying its waiters)
-    // atomic for a given transaction.
+    // Runtime entries are partitioned into independent shards keyed by tid.
+    // One lock keeps ownership, liveness, and waiter updates atomic for a given
+    // transaction while the role enum prevents owned and foreign state from
+    // coexisting.
     shards: Sharded<Mutex<State>>,
 }
 
@@ -263,6 +469,8 @@ pub(crate) enum OwnerAbortOutcome {
     Pinned,
     /// The transaction committed before owner-side closure won.
     Committed,
+    /// A terminal commit was dispatched, so cleanup must preserve its outcome.
+    CommitOutcomePreserved,
     /// The Monitor had already stopped tracking the transaction.
     AlreadyFinished,
 }
@@ -307,6 +515,63 @@ pub(crate) struct KeyCommitStatus {
     pub status: TxCommitStatus,
     pub value: TValue,
     pub cache_hit: bool,
+}
+
+/// Transaction status together with the exact evidence used to resolve it.
+struct TxStatusEvidence {
+    state: TxRecordState,
+    observation: Option<Observation<TxLog>>,
+    cache_hit: bool,
+}
+
+impl TxStatusEvidence {
+    fn local(record: Option<&TxStatusEntry>) -> Result<Self, TransError> {
+        match record {
+            Some(record) => Ok(Self {
+                state: TxRecordState::try_from_status(Some(record.status))?,
+                observation: record.last_observation.clone(),
+                cache_hit: true,
+            }),
+            // An owner operation may precede entry into the logged protocol.
+            // Like a freshly observed absent foreign record, it is not yet
+            // terminal and is exposed as pending.
+            None => Ok(Self {
+                state: TxRecordState::Missing,
+                observation: None,
+                cache_hit: true,
+            }),
+        }
+    }
+
+    fn observed(status: TxStatus) -> Result<Self, TransError> {
+        let state = TxRecordState::try_from_observation(&status.observation)?;
+        let cache_hit = status.observation.cache_hit();
+        Ok(Self {
+            state,
+            observation: Some(status.observation),
+            cache_hit,
+        })
+    }
+
+    fn cached_final(status: TxCommitStatus) -> Result<Self, TransError> {
+        Ok(Self {
+            state: TxRecordState::try_from_status(Some(status))?,
+            observation: None,
+            cache_hit: true,
+        })
+    }
+
+    fn status(&self) -> TxCommitStatus {
+        match self.state {
+            // Missing is exposed as pending only during the observer-relative
+            // appearance grace. Once the grace expires, resolution first pins
+            // the identity as wounded and returns that exact observation.
+            TxRecordState::Missing | TxRecordState::Pending => TxCommitStatus::Pending,
+            TxRecordState::Wounded => TxCommitStatus::Wounded,
+            TxRecordState::Committed => TxCommitStatus::Ok,
+            TxRecordState::Aborted => TxCommitStatus::Aborted,
+        }
+    }
 }
 
 impl Monitor {
@@ -363,10 +628,19 @@ impl Monitor {
         {
             let mut st = self.shard_for(tid).lock().unwrap();
             let entry = st
-                .local_tx
+                .transactions
                 .get_mut(tid)
                 .ok_or_else(|| TransError::other("pending transaction was not begun"))?;
-            update(&mut entry.recovery);
+            let TxRuntimeRole::Owned(owned) = &mut entry.role else {
+                return Err(TransError::other(
+                    "pending transaction is tracked as foreign",
+                ));
+            };
+            let record = owned
+                .record
+                .as_mut()
+                .ok_or_else(|| TransError::other("pending transaction was not begun"))?;
+            update(&mut record.recovery);
         }
         self.persist_pending_tx(tid).await
     }
@@ -378,12 +652,24 @@ impl Monitor {
     /// operation and any later wound must remain pinned.
     pub(crate) fn begin_owner_operation(&self, tid: &TxId) -> Result<OwnerOperation, TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let activity = st.owner_activity.entry(tid.clone()).or_default();
-        if activity.admission_closed {
-            return Err(TransError::Wounded);
-        }
-        activity.tracked = true;
-        activity.active += 1;
+        let owned = match st.transactions.entry(tid.clone()) {
+            Entry::Vacant(entry) => {
+                let entry = entry.insert(TxRuntimeEntry::owned(None));
+                let TxRuntimeRole::Owned(owned) = &mut entry.role else {
+                    unreachable!();
+                };
+                owned
+            }
+            Entry::Occupied(entry) => match &mut entry.into_mut().role {
+                TxRuntimeRole::Owned(owned) => owned,
+                TxRuntimeRole::Foreign(_) => {
+                    return Err(TransError::other(
+                        "transaction identity is already tracked as foreign",
+                    ));
+                }
+            },
+        };
+        owned.lifecycle.begin_operation()?;
         Ok(OwnerOperation {
             monitor: self.clone(),
             tid: tid.clone(),
@@ -399,8 +685,11 @@ impl Monitor {
         self.shard_for(tid)
             .lock()
             .unwrap()
-            .local_tx
-            .contains_key(tid)
+            .transactions
+            .get(tid)
+            .is_some_and(|entry| {
+                matches!(&entry.role, TxRuntimeRole::Owned(owned) if owned.record.is_some())
+            })
     }
 
     /// Records the lock set a transaction currently holds, so the refresher can
@@ -409,8 +698,13 @@ impl Monitor {
     /// transaction is no longer tracked (already finalized).
     pub(crate) fn record_tx_locks(&self, tid: &TxId, locks: Vec<TxLock>) {
         let mut st = self.shard_for(tid).lock().unwrap();
-        if let Some(e) = st.local_tx.get_mut(tid) {
-            e.recovery.locks = locks;
+        if let Some(TxRuntimeEntry {
+            role: TxRuntimeRole::Owned(owned),
+            ..
+        }) = st.transactions.get_mut(tid)
+            && let Some(record) = owned.record.as_mut()
+        {
+            record.recovery.locks = locks;
         }
     }
 
@@ -420,18 +714,21 @@ impl Monitor {
     pub(crate) fn start_refresh_tx(&self, tid: &TxId) {
         let need_start = {
             let mut st = self.shard_for(tid).lock().unwrap();
-            let admission_closed = st
-                .owner_activity
-                .get(tid)
-                .is_some_and(|activity| activity.admission_closed);
-            match st.local_tx.get_mut(tid) {
-                Some(e)
-                    if e.status == TxCommitStatus::Pending
-                        && e.refresh_state == RefreshState::NotStarted
-                        && !admission_closed =>
-                {
-                    e.refresh_state = RefreshState::Running;
-                    true
+            match st.transactions.get_mut(tid) {
+                Some(TxRuntimeEntry {
+                    role: TxRuntimeRole::Owned(owned),
+                    ..
+                }) if owned.lifecycle.admission == OwnerAdmission::Open => {
+                    match owned.record.as_mut() {
+                        Some(record)
+                            if record.status == TxCommitStatus::Pending
+                                && record.refresh_state == RefreshState::NotStarted =>
+                        {
+                            record.refresh_state = RefreshState::Running;
+                            true
+                        }
+                        _ => false,
+                    }
                 }
                 _ => false,
             }
@@ -497,8 +794,12 @@ impl Monitor {
     /// pinned as `Wounded`. An unresolved terminal commit preserves ADR-057
     /// ambiguity instead of manufacturing an abort-side object.
     pub(crate) async fn abort_owned_tx(&self, tid: &TxId) -> Result<OwnerAbortOutcome, TransError> {
-        let Some(transition) = self.owner_abort_transition(tid) else {
-            return Ok(OwnerAbortOutcome::AlreadyFinished);
+        let transition = match self.owner_close_plan(tid) {
+            OwnerClosePlan::Transition(transition) => transition,
+            OwnerClosePlan::PreserveCommit => {
+                return Ok(OwnerAbortOutcome::CommitOutcomePreserved);
+            }
+            OwnerClosePlan::AlreadyFinished => return Ok(OwnerAbortOutcome::AlreadyFinished),
         };
         let mut status = self
             .inner
@@ -512,17 +813,9 @@ impl Monitor {
                     "transaction {tid} owner operation was dropped after terminal commit dispatch"
                 )));
             }
-            status = match transition {
-                AbortTransition::Acknowledge => {
-                    self.acknowledge_abort(tid, &status.observation).await?
-                }
-                AbortTransition::EnsureWounded => {
-                    self.ensure_wounded(tid, &status.observation).await?
-                }
-                AbortTransition::WoundIfPresent => {
-                    self.wound_if_present(tid, &status.observation).await?
-                }
-            };
+            status = self
+                .advance_abort_transition(tid, &status.observation, transition)
+                .await?;
             let outcome = match status.status {
                 TxCommitStatus::Ok => Some(OwnerAbortOutcome::Committed),
                 TxCommitStatus::Aborted => Some(OwnerAbortOutcome::Acknowledged),
@@ -546,7 +839,7 @@ impl Monitor {
     /// defeat a wound: the refreshed observation is retried until either the
     /// abort lands or the owner commits.
     pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
-        let transition = self.preemption_transition(tid);
+        let transition = self.preemption_plan(tid);
         let mut status = self
             .inner
             .tl
@@ -557,17 +850,9 @@ impl Monitor {
             })?;
         let mut backoff = self.inner.retry.backoff();
         loop {
-            status = match transition {
-                AbortTransition::Acknowledge => {
-                    self.acknowledge_abort(tid, &status.observation).await?
-                }
-                AbortTransition::EnsureWounded => {
-                    self.ensure_wounded(tid, &status.observation).await?
-                }
-                AbortTransition::WoundIfPresent => {
-                    self.wound_if_present(tid, &status.observation).await?
-                }
-            };
+            status = self
+                .advance_abort_transition(tid, &status.observation, transition)
+                .await?;
             match status.status {
                 TxCommitStatus::Ok => return Ok(TxFinalStatus::Committed),
                 TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
@@ -585,16 +870,10 @@ impl Monitor {
 
     /// Returns the commit status, checking locally first then remote storage.
     pub(crate) async fn tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        {
-            let st = self.shard_for(tid).lock().unwrap();
-            if let Some(e) = st.local_tx.get(tid) {
-                return Ok(e.status);
-            }
-        }
-        if let Some(status) = self.cached_final_status(tid) {
-            return Ok(status);
-        }
-        self.fetch_remote_tx_status(tid).await
+        Ok(self
+            .resolve_tx_status_at(tid, self.current_requirement())
+            .await?
+            .status())
     }
 
     /// Returns the commit status using a caller-provided observation bound.
@@ -603,7 +882,7 @@ impl Monitor {
         tid: &TxId,
         requirement: Requirement,
     ) -> Result<TxCommitStatus, TransError> {
-        Ok(self.tx_status_at_with_cache(tid, requirement).await?.0)
+        Ok(self.resolve_tx_status_at(tid, requirement).await?.status())
     }
 
     /// Returns whether `tid` is committed using transaction-state evidence no
@@ -614,27 +893,6 @@ impl Monitor {
         at: SequencePoint,
     ) -> Result<bool, TransError> {
         Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
-    }
-
-    /// Returns status at the requested bound and whether resolving it reused
-    /// cached transaction state.
-    pub(crate) async fn tx_status_at_with_cache(
-        &self,
-        tid: &TxId,
-        requirement: Requirement,
-    ) -> Result<(TxCommitStatus, bool), TransError> {
-        {
-            let st = self.shard_for(tid).lock().unwrap();
-            if let Some(e) = st.local_tx.get(tid) {
-                return Ok((e.status, true));
-            }
-        }
-        if let Some(status) = self.cached_final_status(tid) {
-            return Ok((status, true));
-        }
-        let status = self.inner.tl.commit_status_at(tid, requirement).await?;
-        let cache_hit = status.observation.cache_hit();
-        Ok((self.resolve_remote_tx_status(tid, status).await?, cache_hit))
     }
 
     /// Waits for and returns a transaction's durable final status.
@@ -683,7 +941,24 @@ impl Monitor {
         tid: &TxId,
         expected: &Observation<TxLog>,
     ) -> Result<TxStatus, TransError> {
-        self.ensure_wounded(tid, expected).await
+        self.advance_abort_transition(tid, expected, AbortTransition::EnsureWounded)
+            .await
+    }
+
+    /// Resolves status at the requested bound together with its exact evidence.
+    async fn resolve_tx_status_at(
+        &self,
+        tid: &TxId,
+        requirement: Requirement,
+    ) -> Result<TxStatusEvidence, TransError> {
+        if let Some(evidence) = self.owned_status_evidence(tid)? {
+            return Ok(evidence);
+        }
+        if let Some(status) = self.cached_final_status(tid) {
+            return TxStatusEvidence::cached_final(status);
+        }
+        let status = self.inner.tl.commit_status_at(tid, requirement).await?;
+        self.resolve_remote_tx_status(tid, status).await
     }
 
     /// Persists the commit decision and resolves ambiguous outcomes while its
@@ -696,9 +971,15 @@ impl Monitor {
         tlog.status = TxCommitStatus::Ok;
         let mut expected = {
             let st = self.shard_for(tid).lock().unwrap();
-            st.local_tx
+            st.transactions
                 .get(tid)
-                .and_then(|entry| entry.last_observation.clone())
+                .and_then(|entry| match &entry.role {
+                    TxRuntimeRole::Owned(owned) => owned
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.last_observation.clone()),
+                    TxRuntimeRole::Foreign(_) => None,
+                })
         };
 
         let mut backoff = self.inner.retry.backoff();
@@ -754,36 +1035,6 @@ impl Monitor {
                 }
             }
         }
-    }
-
-    /// Durably acknowledges that the owner has retired the transaction.
-    async fn acknowledge_abort(
-        &self,
-        tid: &TxId,
-        expected: &Observation<TxLog>,
-    ) -> Result<TxStatus, TransError> {
-        self.advance_abort_transition(tid, expected, AbortTransition::Acknowledge)
-            .await
-    }
-
-    /// Ensures that the transaction identity is durably pinned as wounded.
-    async fn ensure_wounded(
-        &self,
-        tid: &TxId,
-        expected: &Observation<TxLog>,
-    ) -> Result<TxStatus, TransError> {
-        self.advance_abort_transition(tid, expected, AbortTransition::EnsureWounded)
-            .await
-    }
-
-    /// Wounds the transaction only while its durable record remains present.
-    async fn wound_if_present(
-        &self,
-        tid: &TxId,
-        expected: &Observation<TxLog>,
-    ) -> Result<TxStatus, TransError> {
-        self.advance_abort_transition(tid, expected, AbortTransition::WoundIfPresent)
-            .await
     }
 
     /// Advances an abort-side lifecycle transition from an exact observation.
@@ -870,8 +1121,13 @@ impl Monitor {
         if let Some(current) = expected.value() {
             tlog.writes = current.writes.clone();
             TxRecoveryManifest::from_log(current).apply_to(&mut tlog);
-        } else if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
-            entry.recovery.clone().apply_to(&mut tlog);
+        } else if let Some(TxRuntimeEntry {
+            role: TxRuntimeRole::Owned(owned),
+            ..
+        }) = self.shard_for(tid).lock().unwrap().transactions.get(tid)
+            && let Some(record) = owned.record.as_ref()
+        {
+            record.recovery.clone().apply_to(&mut tlog);
         }
         tlog
     }
@@ -937,129 +1193,161 @@ impl Monitor {
 
     fn finish_owner_operation(&self, tid: &TxId, unresolved: bool) {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let keep = st.local_tx.contains_key(tid);
-        let Some(activity) = st.owner_activity.get_mut(tid) else {
+        let Some(entry) = st.transactions.get_mut(tid) else {
             return;
         };
-        activity.active = activity.active.saturating_sub(1);
-        activity.unresolved |= unresolved;
-        if activity.active == 0 && !keep {
-            st.owner_activity.remove(tid);
+        let TxRuntimeRole::Owned(owned) = &mut entry.role else {
+            return;
+        };
+        owned.lifecycle.finish_operation(unresolved);
+        let remove = owned.record.is_none() && !owned.lifecycle.has_active_operations();
+        if remove && let Some(mut entry) = st.transactions.remove(tid) {
+            notify_waiters(&mut entry.waiters);
         }
     }
 
     /// Closes local admission and selects the strongest transition justified
     /// without waiting for owner work to finish.
-    fn preemption_transition(&self, tid: &TxId) -> AbortTransition {
+    fn preemption_plan(&self, tid: &TxId) -> AbortTransition {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let already_wounded = if let Some(entry) = st.local_tx.get_mut(tid) {
-            entry.refresh_state = RefreshState::Stopped;
-            entry.status == TxCommitStatus::Wounded
-        } else {
-            false
+        let Some(entry) = st.transactions.get_mut(tid) else {
+            return AbortTransition::EnsureWounded;
         };
-        let has_local_entry = st.local_tx.contains_key(tid);
-        let activity = st.owner_activity.entry(tid.clone()).or_default();
-        let can_acknowledge = has_local_entry
-            && activity.tracked
-            && activity.active == 0
-            && !activity.unresolved
-            && (!activity.terminal_commit_started || already_wounded);
-        activity.admission_closed = true;
-        if can_acknowledge {
-            AbortTransition::Acknowledge
-        } else {
-            AbortTransition::EnsureWounded
+        let TxRuntimeRole::Owned(owned) = &mut entry.role else {
+            return AbortTransition::EnsureWounded;
+        };
+        match owned.close(OwnerCloseReason::Preemption) {
+            OwnerClosePlan::Transition(transition) => transition,
+            OwnerClosePlan::PreserveCommit | OwnerClosePlan::AlreadyFinished => {
+                debug_assert!(false, "preemption must select an abort transition");
+                AbortTransition::EnsureWounded
+            }
         }
     }
 
     /// Closes owner admission and derives the strongest safe abort transition
     /// from facts recorded by [`OwnerOperation`]. Untracked internal protocols
     /// call this only after their own mutation sequence has quiesced.
-    fn owner_abort_transition(&self, tid: &TxId) -> Option<AbortTransition> {
+    fn owner_close_plan(&self, tid: &TxId) -> OwnerClosePlan {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let entry = st.local_tx.get_mut(tid)?;
-        entry.refresh_state = RefreshState::Stopped;
-        let already_wounded = entry.status == TxCommitStatus::Wounded;
-        let activity = st.owner_activity.entry(tid.clone()).or_default();
-        activity.admission_closed = true;
-
-        if activity.terminal_commit_started && !already_wounded {
-            if activity.active == 0 && !activity.unresolved {
-                // Once a joined commit was dispatched, owner-side cleanup must
-                // preserve its outcome. The commit path has already reconciled
-                // any readable durable status.
-                return None;
-            }
-            // A dropped terminal mutation may still commit. Only an observed
-            // object may be preempted; absence remains ADR-057 in-doubt.
-            return Some(AbortTransition::WoundIfPresent);
-        }
-
-        let transition = if activity.active == 0 && (!activity.unresolved || !activity.tracked) {
-            AbortTransition::Acknowledge
-        } else {
-            AbortTransition::EnsureWounded
+        let Some(entry) = st.transactions.get_mut(tid) else {
+            return OwnerClosePlan::AlreadyFinished;
         };
-        Some(transition)
+        let TxRuntimeRole::Owned(owned) = &mut entry.role else {
+            return OwnerClosePlan::AlreadyFinished;
+        };
+        owned.close(OwnerCloseReason::OwnerAbort)
     }
 
     fn start_terminal_commit(&self, tid: &TxId) -> Result<(), TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        if st
-            .local_tx
-            .get(tid)
-            .is_some_and(|entry| entry.status != TxCommitStatus::Pending)
+        let owned = match st.transactions.entry(tid.clone()) {
+            Entry::Vacant(entry) => {
+                let entry = entry.insert(TxRuntimeEntry::owned(None));
+                let TxRuntimeRole::Owned(owned) = &mut entry.role else {
+                    unreachable!();
+                };
+                owned
+            }
+            Entry::Occupied(entry) => match &mut entry.into_mut().role {
+                TxRuntimeRole::Owned(owned) => owned,
+                TxRuntimeRole::Foreign(_) => return Err(TransError::AlreadyFinalized),
+            },
+        };
+        if owned
+            .record
+            .as_ref()
+            .is_some_and(|record| record.status != TxCommitStatus::Pending)
         {
             return Err(TransError::AlreadyFinalized);
         }
-        let activity = st.owner_activity.entry(tid.clone()).or_default();
-        if activity.admission_closed {
-            return Err(TransError::AlreadyFinalized);
-        }
-        activity.terminal_commit_started = true;
-        Ok(())
+        owned.lifecycle.start_terminal_commit()
     }
 
     fn finish_local_tx(&self, tid: &TxId) {
         let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.remove(tid);
-        st.owner_activity.remove(tid);
-        notify_waiters(&mut st, tid);
+        let remove = st
+            .transactions
+            .get(tid)
+            .is_some_and(|entry| matches!(entry.role, TxRuntimeRole::Owned(_)));
+        if remove && let Some(mut entry) = st.transactions.remove(tid) {
+            notify_waiters(&mut entry.waiters);
+        }
     }
 
     fn register_tx(&self, tid: &TxId, recovery: TxRecoveryManifest) {
         let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.insert(
-            tid.clone(),
-            TxStatusEntry {
-                status: TxCommitStatus::Pending,
-                last_observation: None,
-                refresh_state: RefreshState::NotStarted,
-                recovery,
+        let record = TxStatusEntry {
+            status: TxCommitStatus::Pending,
+            last_observation: None,
+            refresh_state: RefreshState::NotStarted,
+            recovery,
+        };
+        match st.transactions.entry(tid.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(TxRuntimeEntry::owned(Some(record)));
+            }
+            Entry::Occupied(entry) => match &mut entry.into_mut().role {
+                TxRuntimeRole::Owned(owned) => owned.record = Some(record),
+                TxRuntimeRole::Foreign(_) => {
+                    panic!("cannot register a foreign transaction identity as owned")
+                }
             },
-        );
+        }
+    }
+
+    /// Builds the next pending-log mutation from current owner state.
+    fn pending_write_snapshot(
+        &self,
+        tid: &TxId,
+        require_running_refresh: bool,
+    ) -> Result<Option<PendingWrite>, TransError> {
+        let st = self.shard_for(tid).lock().unwrap();
+        let entry = st
+            .transactions
+            .get(tid)
+            .ok_or_else(|| TransError::other("pending transaction disappeared"))?;
+        let TxRuntimeRole::Owned(owned) = &entry.role else {
+            return Err(TransError::other(
+                "pending transaction is tracked as foreign",
+            ));
+        };
+        let record = owned
+            .record
+            .as_ref()
+            .ok_or_else(|| TransError::other("pending transaction was not begun"))?;
+        if record.status != TxCommitStatus::Pending
+            || (require_running_refresh && record.refresh_state != RefreshState::Running)
+        {
+            return Ok(None);
+        }
+
+        let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
+        log.timestamp = Some(rt::system_now());
+        record.recovery.clone().apply_to(&mut log);
+        Ok(Some(PendingWrite {
+            log,
+            expected: record.last_observation.clone(),
+        }))
+    }
+
+    async fn write_pending(
+        &self,
+        write: &PendingWrite,
+    ) -> Result<Observation<TxLog>, StorageError> {
+        match &write.expected {
+            Some(observed) => self.inner.tl.set_if(&write.log, observed).await,
+            None => self.inner.tl.set(&write.log).await,
+        }
     }
 
     async fn persist_pending_tx(&self, tid: &TxId) -> Result<(), TransError> {
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let (last_observation, recovery) = {
-                let st = self.shard_for(tid).lock().unwrap();
-                let entry = st
-                    .local_tx
-                    .get(tid)
-                    .ok_or_else(|| TransError::other("pending transaction disappeared"))?;
-                (entry.last_observation.clone(), entry.recovery.clone())
-            };
-            let mut log = TxLog::new(tid.clone(), TxCommitStatus::Pending);
-            log.timestamp = Some(rt::system_now());
-            recovery.apply_to(&mut log);
-            let result = match last_observation.as_ref() {
-                Some(observed) => self.inner.tl.set_if(&log, observed).await,
-                None => self.inner.tl.set(&log).await,
-            };
-            match result {
+            let write = self
+                .pending_write_snapshot(tid, false)?
+                .ok_or(TransError::AlreadyFinalized)?;
+            match self.write_pending(&write).await {
                 Ok(observed) => {
                     self.record_durable_observation(tid, &observed);
                     self.start_refresh_tx(tid);
@@ -1080,9 +1368,7 @@ impl Monitor {
                         self.record_durable_observation(tid, &status.observation);
                         return Err(TransError::AlreadyFinalized);
                     }
-                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
-                        entry.last_observation = Some(status.observation);
-                    }
+                    self.record_durable_observation(tid, &status.observation);
                 }
                 Err(StorageError::Unavailable(_)) => {}
                 Err(error) => return Err(error.into()),
@@ -1097,35 +1383,26 @@ impl Monitor {
         tid: &TxId,
         requirement: Option<Requirement>,
     ) -> Result<KeyCommitStatus, TransError> {
-        let status_cache_hit = {
-            let local = self
-                .shard_for(tid)
-                .lock()
-                .unwrap()
-                .local_tx
-                .contains_key(tid);
-            local
-                || self
-                    .inner
-                    .final_status
-                    .lock()
-                    .unwrap()
-                    .entries
-                    .contains_key(tid)
+        let evidence = match requirement {
+            Some(requirement) => self.resolve_tx_status_at(tid, requirement).await?,
+            None => {
+                self.resolve_tx_status_at(tid, self.current_requirement())
+                    .await?
+            }
         };
-        let status = match requirement {
-            Some(requirement) => self.tx_status_at(tid, requirement).await?,
-            None => self.tx_status(tid).await?,
-        };
+        let status = evidence.status();
         if status != TxCommitStatus::Ok {
             return Ok(KeyCommitStatus {
                 status,
                 value: TValue::default(),
-                cache_hit: false,
+                cache_hit: evidence.cache_hit,
             });
         }
 
-        let tl = self.final_log(tid, status, requirement).await?;
+        let status_cache_hit = evidence.cache_hit;
+        let tl = self
+            .final_log(tid, status, requirement, evidence.observation)
+            .await?;
         let cache_hit = status_cache_hit && tl.cache_hit();
         let tl = tl
             .value()
@@ -1158,7 +1435,15 @@ impl Monitor {
         tid: &TxId,
         expected_status: TxCommitStatus,
         requirement: Option<Requirement>,
+        known: Option<Observation<TxLog>>,
     ) -> Result<Observation<TxLog>, TransError> {
+        if let Some(observed) = known
+            && observed
+                .value()
+                .is_some_and(|log| log.status == expected_status)
+        {
+            return Ok(observed);
+        }
         let cached = self.inner.final_status.lock().unwrap().get(tid);
         let mut observed = match requirement {
             Some(requirement) => {
@@ -1203,6 +1488,17 @@ impl Monitor {
         Requirement::AtLeast(self.inner.timeline.now())
     }
 
+    fn owned_status_evidence(&self, tid: &TxId) -> Result<Option<TxStatusEvidence>, TransError> {
+        let st = self.shard_for(tid).lock().unwrap();
+        let Some(entry) = st.transactions.get(tid) else {
+            return Ok(None);
+        };
+        match &entry.role {
+            TxRuntimeRole::Owned(owned) => TxStatusEvidence::local(owned.record.as_ref()).map(Some),
+            TxRuntimeRole::Foreign(_) => Ok(None),
+        }
+    }
+
     fn cached_final_status(&self, tid: &TxId) -> Option<TxCommitStatus> {
         self.inner
             .final_status
@@ -1238,18 +1534,33 @@ impl Monitor {
         self.remember_final(tid, observed);
 
         let mut st = self.shard_for(tid).lock().unwrap();
-        let Some(entry) = st.local_tx.get_mut(tid) else {
+        let foreign_final = log.status.is_final()
+            && st
+                .transactions
+                .get(tid)
+                .is_some_and(|entry| matches!(entry.role, TxRuntimeRole::Foreign(_)));
+        if foreign_final {
+            if let Some(mut entry) = st.transactions.remove(tid) {
+                notify_waiters(&mut entry.waiters);
+            }
+            return;
+        }
+        let Some(TxRuntimeEntry {
+            role: TxRuntimeRole::Owned(owned),
+            waiters,
+        }) = st.transactions.get_mut(tid)
+        else {
             return;
         };
-        entry.status = log.status;
-        entry.last_observation = Some(observed.clone());
+        let Some(record) = owned.record.as_mut() else {
+            return;
+        };
+        record.status = log.status;
+        record.last_observation = Some(observed.clone());
         if log.status.is_final() {
-            entry.refresh_state = RefreshState::Stopped;
-            st.owner_activity
-                .entry(tid.clone())
-                .or_default()
-                .admission_closed = true;
-            notify_waiters(&mut st, tid);
+            record.refresh_state = RefreshState::Stopped;
+            owned.lifecycle.admission = OwnerAdmission::Closed;
+            notify_waiters(waiters);
         }
     }
 
@@ -1272,32 +1583,43 @@ impl Monitor {
         let (tx, rx) = oneshot::channel();
 
         let mut st = self.shard_for(tid).lock().unwrap();
-        let entry = st.local_tx.get(tid);
-        let is_local = entry.is_some();
-        let status = entry.map(|e| e.status).unwrap_or(TxCommitStatus::Unknown);
-
-        if is_local && status.is_final() {
-            let _ = tx.send(());
-            return rx;
-        }
-
-        if let Some(ws) = st.waiters.get_mut(tid) {
-            ws.push(WaitRequest { tx });
-            return rx;
-        }
-
-        if is_local {
-            // Local transition: no worker needed; we'll be notified by
-            // commit_tx/abort_owned_tx.
-            st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
-            return rx;
-        }
-
-        // Remote transaction: spawn a poller. Waiter liveness is checked
-        // between polls so the poller exits promptly once every caller has
-        // dropped its `await_tx_final` future.
-        st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
+        let should_spawn = match st.transactions.entry(tid.clone()) {
+            Entry::Vacant(entry) => {
+                let entry = entry.insert(TxRuntimeEntry::foreign());
+                entry.waiters.push(tx);
+                true
+            }
+            Entry::Occupied(entry) => {
+                let entry = entry.into_mut();
+                match &entry.role {
+                    TxRuntimeRole::Owned(owned)
+                        if owned
+                            .record
+                            .as_ref()
+                            .is_some_and(|record| record.status.is_final()) =>
+                    {
+                        let _ = tx.send(());
+                        return rx;
+                    }
+                    TxRuntimeRole::Owned(_) => {
+                        // Local transition: no worker is needed; commit or
+                        // owner closure will notify these waiters.
+                        entry.waiters.push(tx);
+                        false
+                    }
+                    TxRuntimeRole::Foreign(_) => {
+                        let should_spawn = entry.waiters.is_empty();
+                        entry.waiters.push(tx);
+                        should_spawn
+                    }
+                }
+            }
+        };
         drop(st);
+
+        if !should_spawn {
+            return rx;
+        }
 
         let m = self.clone();
         let tid = tid.clone();
@@ -1306,149 +1628,168 @@ impl Monitor {
         // `await_tx_final` future.
         rt::spawn(async move {
             m.poll_tx_status_with_liveness(&tid).await;
-            let mut st = m.shard_for(&tid).lock().unwrap();
-            notify_waiters(&mut st, &tid);
         });
 
         rx
     }
 
-    async fn fetch_remote_tx_status(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let status = self
-            .inner
-            .tl
-            .commit_status_at(tid, self.current_requirement())
-            .await?;
-        self.resolve_remote_tx_status(tid, status).await
+    async fn fetch_remote_tx_status(&self, tid: &TxId) -> Result<TxStatusEvidence, TransError> {
+        self.resolve_tx_status_at(tid, self.current_requirement())
+            .await
     }
 
     async fn resolve_remote_tx_status(
         &self,
         tid: &TxId,
         status: TxStatus,
-    ) -> Result<TxCommitStatus, TransError> {
-        if status.status == TxCommitStatus::Unknown {
-            return self.handle_unknown_tx(tid).await;
+    ) -> Result<TxStatusEvidence, TransError> {
+        // The backend read is outside the runtime-state lock. A local owner may
+        // have registered the identity while it was in flight; ownership takes
+        // precedence over foreign liveness tracking.
+        if let Some(evidence) = self.owned_status_evidence(tid)? {
+            return Ok(evidence);
         }
-        self.resolve_present_tx_status(tid, status).await
+
+        match TxRecordState::try_from_observation(&status.observation)? {
+            TxRecordState::Missing => self.resolve_missing_tx(tid, status).await,
+            TxRecordState::Pending => self.resolve_pending_tx(tid, status).await,
+            TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted => {
+                self.record_durable_observation(tid, &status.observation);
+                TxStatusEvidence::observed(status)
+            }
+        }
     }
 
-    async fn resolve_present_tx_status(
+    async fn resolve_pending_tx(
         &self,
         tid: &TxId,
         status: TxStatus,
-    ) -> Result<TxCommitStatus, TransError> {
-        match status.status {
-            TxCommitStatus::Pending => {
-                let now = rt::system_now();
-                // Absolute lease check (foreign clock — skew applies): a holder
-                // whose last refresh is already ancient is reclaimed at once.
-                // Observer-relative progress check (one clock — no skew): a
-                // holder that stops bumping its lease `timestamp` while a waiter
-                // watches it is dead within the configured pending timeout
-                // (ADR-024).
-                if self.inner.timing.is_expired(status.last_update, now)
-                    || self.pending_no_progress(tid, status.last_update, now)
-                {
-                    self.clear_pending_progress(tid);
-                    Ok(self
-                        .try_wound_observed(tid, &status.observation)
-                        .await?
-                        .status)
-                } else {
-                    Ok(TxCommitStatus::Pending)
-                }
+    ) -> Result<TxStatusEvidence, TransError> {
+        let now = rt::system_now();
+        // Absolute lease check (foreign clock — skew applies) and relative
+        // progress check (one observer clock — no skew) jointly decide whether
+        // the holder must be pinned as wounded.
+        let observation = if self.inner.timing.is_expired(status.last_update, now) {
+            RemoteLivenessDecision::Expired
+        } else {
+            self.observe_remote_pending(tid, status.last_update, now)?
+        };
+        match observation {
+            RemoteLivenessDecision::Owned(evidence) => Ok(evidence),
+            RemoteLivenessDecision::Live => TxStatusEvidence::observed(status),
+            RemoteLivenessDecision::Expired => {
+                let wounded = self.try_wound_observed(tid, &status.observation).await?;
+                TxStatusEvidence::observed(wounded)
             }
-            s @ (TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded) => {
-                // Finalized: drop the observer-relative progress tracking.
-                self.clear_pending_progress(tid);
-                self.record_durable_observation(tid, &status.observation);
-                Ok(s)
-            }
-            TxCommitStatus::Unknown => Err(TransError::other(format!(
-                "transaction {tid} has an invalid persisted status"
-            ))),
         }
     }
 
-    /// Observer-relative no-progress check (ADR-024). Records the lease
-    /// `timestamp` seen on the holder's pending object and when (observer clock)
-    /// it was first seen at that value. Returns `true` only if the value has not
-    /// advanced within the pending timeout of that first sight — comparing two
-    /// values from the *same* observer clock, so no clock-skew allowance is owed.
-    fn pending_no_progress(&self, tid: &TxId, last_update: SystemTime, now: SystemTime) -> bool {
+    /// Records a foreign pending lease and reports whether it stopped making
+    /// progress for one observer-relative timeout.
+    fn observe_remote_pending(
+        &self,
+        tid: &TxId,
+        last_refresh: SystemTime,
+        now: SystemTime,
+    ) -> Result<RemoteLivenessDecision, TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        match st.pending_progress.get_mut(tid) {
-            None => {
-                st.pending_progress.insert(
-                    tid.clone(),
-                    PendingProgress {
-                        last_seen: last_update,
-                        observed_at: now,
-                    },
-                );
+        let entry = st
+            .transactions
+            .entry(tid.clone())
+            .or_insert_with(TxRuntimeEntry::foreign);
+        let foreign = match &mut entry.role {
+            TxRuntimeRole::Owned(owned) => {
+                return TxStatusEvidence::local(owned.record.as_ref())
+                    .map(RemoteLivenessDecision::Owned);
+            }
+            TxRuntimeRole::Foreign(foreign) => foreign,
+        };
+        let expired = match foreign.liveness {
+            RemoteLiveness::PendingUnchanged {
+                last_refresh: previous,
+                since,
+            } if previous == last_refresh => self.inner.timing.is_expired_no_skew(since, now),
+            _ => {
+                foreign.liveness = RemoteLiveness::PendingUnchanged {
+                    last_refresh,
+                    since: now,
+                };
                 false
             }
-            Some(p) => {
-                if p.last_seen != last_update {
-                    // The lease advanced: progress. Reset the window.
-                    p.last_seen = last_update;
-                    p.observed_at = now;
-                    false
-                } else {
-                    self.inner.timing.is_expired_no_skew(p.observed_at, now)
-                }
+        };
+        Ok(if expired {
+            RemoteLivenessDecision::Expired
+        } else {
+            RemoteLivenessDecision::Live
+        })
+    }
+
+    async fn resolve_missing_tx(
+        &self,
+        tid: &TxId,
+        status: TxStatus,
+    ) -> Result<TxStatusEvidence, TransError> {
+        match self.observe_remote_missing(tid, rt::system_now())? {
+            RemoteLivenessDecision::Owned(evidence) => return Ok(evidence),
+            RemoteLivenessDecision::Live => return TxStatusEvidence::observed(status),
+            RemoteLivenessDecision::Expired => {}
+        }
+
+        // The object must appear within one observer-relative timeout. Re-read
+        // at the boundary so a concurrently created pending or final object is
+        // never used as the expected side of an absence-based wound.
+        let refreshed = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
+        if refreshed.observation.is_absent() {
+            let wounded = self.try_wound_observed(tid, &refreshed.observation).await?;
+            return TxStatusEvidence::observed(wounded);
+        }
+        match TxRecordState::try_from_observation(&refreshed.observation)? {
+            TxRecordState::Pending => self.resolve_pending_tx(tid, refreshed).await,
+            TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted => {
+                self.record_durable_observation(tid, &refreshed.observation);
+                TxStatusEvidence::observed(refreshed)
             }
+            TxRecordState::Missing => Err(TransError::other(
+                "present transaction read normalized to a missing record",
+            )),
         }
     }
 
-    fn clear_pending_progress(&self, tid: &TxId) {
-        self.shard_for(tid)
-            .lock()
-            .unwrap()
-            .pending_progress
-            .remove(tid);
-    }
-
-    async fn handle_unknown_tx(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
-        let now = rt::system_now();
-        let first_check = {
-            let mut st = self.shard_for(tid).lock().unwrap();
-            match st.unknown_tx.get(tid) {
-                Some(fc) => *fc,
-                None => {
-                    st.unknown_tx.insert(tid.clone(), now);
-                    return Ok(TxCommitStatus::Pending);
-                }
+    fn observe_remote_missing(
+        &self,
+        tid: &TxId,
+        now: SystemTime,
+    ) -> Result<RemoteLivenessDecision, TransError> {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let entry = st
+            .transactions
+            .entry(tid.clone())
+            .or_insert_with(TxRuntimeEntry::foreign);
+        let foreign = match &mut entry.role {
+            TxRuntimeRole::Owned(owned) => {
+                return TxStatusEvidence::local(owned.record.as_ref())
+                    .map(RemoteLivenessDecision::Owned);
+            }
+            TxRuntimeRole::Foreign(foreign) => foreign,
+        };
+        let expired = match foreign.liveness {
+            RemoteLiveness::MissingSince { since } => {
+                self.inner.timing.is_expired_no_skew(since, now)
+            }
+            RemoteLiveness::Unobserved | RemoteLiveness::PendingUnchanged { .. } => {
+                foreign.liveness = RemoteLiveness::MissingSince { since: now };
+                false
             }
         };
-
-        // Observer-relative grace: the object must *appear* within
-        // the pending timeout of first sight. Both endpoints are the observer's
-        // own clock, so this owes no skew allowance (ADR-024 refines ADR-021,
-        // which over-granted this window by reusing the skew-padded check).
-        if self.inner.timing.is_expired_no_skew(first_check, now) {
-            let status = self
-                .inner
-                .tl
-                .commit_status_at(tid, self.current_requirement())
-                .await?;
-            let res = match status.status {
-                TxCommitStatus::Unknown => Ok(self
-                    .try_wound_observed(tid, &status.observation)
-                    .await?
-                    .status),
-                // Appearance is progress. Re-enter ordinary status resolution
-                // so a fresh pending lease remains live and a final object can
-                // never be used as the expected side of an abort CAS.
-                _ => self.resolve_present_tx_status(tid, status).await,
-            };
-            if res.is_ok() {
-                self.shard_for(tid).lock().unwrap().unknown_tx.remove(tid);
-            }
-            return res;
-        }
-        Ok(TxCommitStatus::Pending)
+        Ok(if expired {
+            RemoteLivenessDecision::Expired
+        } else {
+            RemoteLivenessDecision::Live
+        })
     }
 
     /// Polls the remote tx status until it finalizes, a fetch fails, or every
@@ -1456,58 +1797,79 @@ impl Monitor {
     /// `oneshot::Sender`s in the waiters list). The latter is the future-drop
     /// equivalent of the per-call cancellation contexts the Go original used.
     ///
-    /// Returns the last status seen: the final status on success, or
-    /// [`TxCommitStatus::Unknown`] / the last pending status on a fetch error or
-    /// abandoned poll. [`Monitor::await_tx_final`] re-resolves after every wake,
-    /// so a transient fetch error is retried and a persistent one resurfaces
-    /// there — the poll itself reports no error.
-    async fn poll_tx_status_with_liveness(&self, tid: &TxId) -> TxCommitStatus {
+    /// [`Monitor::await_tx_final`] re-resolves after every wake, so the poller
+    /// only needs to wake its waiters when it stops.
+    async fn poll_tx_status_with_liveness(&self, tid: &TxId) {
         let mut backoff = self.inner.retry.backoff();
-        loop {
-            let s = match self.fetch_remote_tx_status(tid).await {
-                Err(_) => return TxCommitStatus::Unknown,
-                Ok(s) => s,
+        let finalized = loop {
+            let evidence = match self.fetch_remote_tx_status(tid).await {
+                Err(_) => break false,
+                Ok(evidence) => evidence,
             };
-            if s.is_final() {
-                return s;
+            if evidence.status().is_final() {
+                break true;
             }
-            let alive = {
-                let mut st = self.shard_for(tid).lock().unwrap();
-                match st.waiters.get_mut(tid) {
-                    Some(ws) => {
-                        ws.retain(|w| !w.tx.is_closed());
-                        if ws.is_empty() {
-                            st.waiters.remove(tid);
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    None => false,
-                }
-            };
-            if !alive {
-                return s;
+            if !self.retain_live_waiters(tid) {
+                break false;
             }
             rt::sleep(backoff.next_delay()).await;
+        };
+        self.finish_status_poll(tid, finalized);
+    }
+
+    fn retain_live_waiters(&self, tid: &TxId) -> bool {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let Some(entry) = st.transactions.get_mut(tid) else {
+            return false;
+        };
+        entry.waiters.retain(|waiter| !waiter.is_closed());
+        !entry.waiters.is_empty()
+    }
+
+    fn finish_status_poll(&self, tid: &TxId, finalized: bool) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let remove = st
+            .transactions
+            .get(tid)
+            .is_some_and(|entry| finalized && matches!(entry.role, TxRuntimeRole::Foreign(_)));
+        if remove {
+            if let Some(mut entry) = st.transactions.remove(tid) {
+                notify_waiters(&mut entry.waiters);
+            }
+            return;
+        }
+        if let Some(entry) = st.transactions.get_mut(tid) {
+            notify_waiters(&mut entry.waiters);
         }
     }
 
     fn should_refresh(&self, tid: &TxId) -> bool {
         let st = self.shard_for(tid).lock().unwrap();
         matches!(
-            st.local_tx.get(tid),
-            Some(e)
-                if e.status == TxCommitStatus::Pending
-                    && e.refresh_state == RefreshState::Running
+            st.transactions.get(tid),
+            Some(TxRuntimeEntry {
+                role: TxRuntimeRole::Owned(OwnedTxRuntime {
+                    record: Some(record),
+                    ..
+                }),
+                ..
+            }) if record.status == TxCommitStatus::Pending
+                && record.refresh_state == RefreshState::Running
         )
     }
 
     fn stop_tx_refresh(&self, tid: &TxId) -> bool {
         let mut st = self.shard_for(tid).lock().unwrap();
-        match st.local_tx.get_mut(tid) {
-            Some(e) if e.refresh_state == RefreshState::Running => {
-                e.refresh_state = RefreshState::Stopped;
+        match st.transactions.get_mut(tid) {
+            Some(TxRuntimeEntry {
+                role:
+                    TxRuntimeRole::Owned(OwnedTxRuntime {
+                        record: Some(record),
+                        ..
+                    }),
+                ..
+            }) if record.refresh_state == RefreshState::Running => {
+                record.refresh_state = RefreshState::Stopped;
                 true
             }
             _ => false,
@@ -1518,10 +1880,11 @@ impl Monitor {
     /// transaction can block while holding locks for far longer than the
     /// configured pending timeout, so this loop keeps its lease fresh until the
     /// transaction commits or aborts (`should_refresh` flips). It is
-    /// load-bearing: its **first** write *creates* the pending transaction
-    /// object with create-if-absent semantics, materializing the lazily-created
-    /// object (ADR-024); thereafter it CAS-bumps the `timestamp` over the
-    /// object's version halfway through each pending interval.
+    /// load-bearing: when no pending object has been observed, its first write
+    /// creates one with create-if-absent semantics (ADR-024). If another owner
+    /// path already persisted the object, the refresher reuses that exact
+    /// observation and starts directly with a CAS. Every later refresh
+    /// CAS-bumps the `timestamp` halfway through each pending interval.
     ///
     /// Create-if-absent is what keeps lazy materialization wound-safe: if an
     /// older peer already wounded this transaction (wrote a `wounded` object)
@@ -1536,32 +1899,15 @@ impl Monitor {
         if !self.should_refresh(&tid) {
             return;
         }
-        let mut last_observation: Option<Observation<TxLog>> = None;
 
         loop {
             rt::sleep(self.inner.timing.refresh_interval()).await;
-            if !self.should_refresh(&tid) {
-                return;
-            }
-
-            let start = rt::system_now();
-            let mut tl = TxLog::new(tid.clone(), TxCommitStatus::Pending);
-            tl.timestamp = Some(start);
-            // Stamp the current recovery back-references so the materialized
-            // pending object remains sufficient for GC (ADR-022).
-            if let Some(entry) = self.shard_for(&tid).lock().unwrap().local_tx.get(&tid) {
-                entry.recovery.clone().apply_to(&mut tl);
-            }
-            let r = if let Some(observed) = &last_observation {
-                self.inner.tl.set_if(&tl, observed).await
-            } else {
-                // First materialization: create-if-absent so a pre-existing
-                // abort-side object (an older peer's wound) wins.
-                self.inner.tl.set(&tl).await
+            let write = match self.pending_write_snapshot(&tid, true) {
+                Ok(Some(write)) => write,
+                Ok(None) | Err(_) => return,
             };
-            match r {
+            match self.write_pending(&write).await {
                 Ok(observed) => {
-                    last_observation = Some(observed.clone());
                     self.record_durable_observation(&tid, &observed);
                 }
                 // The create lost (object already exists) or the CAS version
@@ -1585,7 +1931,7 @@ impl Monitor {
                         // transaction, so stop and let the owner's own commit
                         // establish the outcome.
                         Ok(st) if st.observation.is_absent() => return,
-                        Ok(st) => last_observation = Some(st.observation),
+                        Ok(st) => self.record_durable_observation(&tid, &st.observation),
                         // Couldn't read it back; retry on the next cycle.
                         Err(_) => {}
                     }
@@ -1647,13 +1993,11 @@ fn in_doubt(reason: impl Into<String>) -> TransError {
     TransError::Storage(StorageError::Unavailable(reason.into()))
 }
 
-fn notify_waiters(st: &mut State, tid: &TxId) {
-    if let Some(ws) = st.waiters.remove(tid) {
-        for w in ws {
-            // `send` silently fails if the receiver has been dropped,
-            // which is the new "waiter cancelled" signal.
-            let _ = w.tx.send(());
-        }
+fn notify_waiters(waiters: &mut Vec<oneshot::Sender<()>>) {
+    for waiter in waiters.drain(..) {
+        // `send` silently fails if the receiver has been dropped, which is the
+        // waiter-cancelled signal.
+        let _ = waiter.send(());
     }
 }
 
@@ -1757,6 +2101,76 @@ mod tests {
     }
 
     #[test]
+    fn owner_lifecycle_close_plans_match_retirement_proof() {
+        let mut internal = OwnerLifecycle::default();
+        assert_eq!(
+            internal.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Other),
+            OwnerClosePlan::Transition(AbortTransition::Acknowledge)
+        );
+
+        let mut unengaged_preemption = OwnerLifecycle::default();
+        assert_eq!(
+            unengaged_preemption.close(OwnerCloseReason::Preemption, OwnerRecordState::NotEngaged,),
+            OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
+        );
+
+        let mut quiescent = OwnerLifecycle::default();
+        quiescent.begin_operation().unwrap();
+        quiescent.finish_operation(false);
+        assert_eq!(
+            quiescent.close(OwnerCloseReason::Preemption, OwnerRecordState::Other),
+            OwnerClosePlan::Transition(AbortTransition::Acknowledge)
+        );
+
+        let mut active = OwnerLifecycle::default();
+        active.begin_operation().unwrap();
+        assert_eq!(
+            active.close(OwnerCloseReason::Preemption, OwnerRecordState::Other),
+            OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
+        );
+
+        let mut dropped = OwnerLifecycle::default();
+        dropped.begin_operation().unwrap();
+        dropped.finish_operation(true);
+        assert_eq!(
+            dropped.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Other),
+            OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
+        );
+
+        let mut dispatched = OwnerLifecycle::default();
+        dispatched.begin_operation().unwrap();
+        dispatched.finish_operation(false);
+        dispatched.start_terminal_commit().unwrap();
+        assert_eq!(
+            dispatched.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Other),
+            OwnerClosePlan::PreserveCommit
+        );
+
+        let mut unresolved_dispatch = OwnerLifecycle::default();
+        unresolved_dispatch.begin_operation().unwrap();
+        unresolved_dispatch.start_terminal_commit().unwrap();
+        assert_eq!(
+            unresolved_dispatch.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Other),
+            OwnerClosePlan::Transition(AbortTransition::WoundIfPresent)
+        );
+
+        let mut observed_wound = OwnerLifecycle::default();
+        observed_wound.begin_operation().unwrap();
+        observed_wound.finish_operation(false);
+        observed_wound.start_terminal_commit().unwrap();
+        assert_eq!(
+            observed_wound.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Wounded),
+            OwnerClosePlan::Transition(AbortTransition::Acknowledge)
+        );
+
+        let mut never_engaged = OwnerLifecycle::default();
+        assert_eq!(
+            never_engaged.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::NotEngaged,),
+            OwnerClosePlan::AlreadyFinished
+        );
+    }
+
+    #[test]
     fn protocol_timing_profiles_preserve_liveness_boundaries() {
         let production = ProtocolTiming::default();
         assert_eq!(production.pending_timeout(), Duration::from_secs(15));
@@ -1853,9 +2267,9 @@ mod tests {
                 .shard_for(tid)
                 .lock()
                 .unwrap()
-                .waiters
+                .transactions
                 .get(tid)
-                .map_or(0, Vec::len);
+                .map_or(0, |entry| entry.waiters.len());
             if waiting == count {
                 return;
             }
@@ -1915,6 +2329,34 @@ mod tests {
         assert_eq!(log.locks, recovery.locks);
         assert_eq!(log.collection_changes, recovery.collection_changes);
         assert_eq!(log.prepared_collections, recovery.prepared_collections);
+
+        mon.abort_owned_tx(&tx).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_refresh_reuses_its_exact_observation() {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let b: Arc<dyn Backend> = Arc::new(backend);
+        let (mon, _t) = new_test_monitor_with_timing(b, ProtocolTiming::simulation());
+        let tx = TxId::from_bytes(b"persisted-refresh".to_vec());
+
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+        operations.lock().unwrap().clear();
+
+        // Let the spawned refresher begin its sleep before advancing virtual
+        // time through exactly one refresh interval.
+        rt::yield_now().await;
+        tokio::time::sleep(ProtocolTiming::simulation().refresh_interval()).await;
+        rt::yield_now().await;
+
+        {
+            let operations = operations.lock().unwrap();
+            assert_eq!(operations.len(), 1, "one refresh should issue one CAS");
+            assert_eq!(operations[0].op, "write_if");
+        }
 
         mon.abort_owned_tx(&tx).await.unwrap();
     }
@@ -2749,13 +3191,19 @@ mod tests {
             mon.shard_for(&tx)
                 .lock()
                 .unwrap()
-                .waiters
+                .transactions
                 .get(&tx)
-                .is_some_and(|waiters| waiters.iter().all(|waiter| waiter.tx.is_closed()))
+                .is_some_and(|entry| entry.waiters.iter().all(|waiter| waiter.is_closed()))
         );
 
         mon.abort_owned_tx(&tx).await.unwrap();
-        assert!(!mon.shard_for(&tx).lock().unwrap().waiters.contains_key(&tx));
+        assert!(
+            !mon.shard_for(&tx)
+                .lock()
+                .unwrap()
+                .transactions
+                .contains_key(&tx)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2887,10 +3335,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            observer.handle_unknown_tx(&tx).await.unwrap(),
-            TxCommitStatus::Ok
-        );
+        assert_eq!(observer.tx_status(&tx).await.unwrap(), TxCommitStatus::Ok);
         let (_verify, verify) = new_test_monitor(b);
         assert_eq!(
             verify
