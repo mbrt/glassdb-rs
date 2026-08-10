@@ -18,46 +18,27 @@ use crate::monitor::KeyCommitStatus;
 /// leaves' membership dependencies, and the effective page frontier.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
-    #[deprecated(note = "use ScanResult::keys and ScanResult::into_access")]
-    pub keys: Vec<Vec<u8>>,
-    #[deprecated(note = "use ScanResult::into_access")]
-    pub covered: Vec<LeafCoverage>,
-    /// Inclusive validation/locking frontier; `None` means positive infinity.
-    #[deprecated(note = "use ScanResult::into_access")]
-    pub frontier: Option<Vec<u8>>,
+    evidence: ScanEvidence,
 }
 
 impl ScanResult {
     /// Returns the live keys surfaced by the scan.
-    #[allow(deprecated)]
     pub fn keys(&self) -> &[Vec<u8>] {
-        &self.keys
+        self.evidence.keys()
     }
 
     /// Converts this result into the access record required for validation.
-    #[allow(deprecated)]
     pub fn into_access(
         self,
         collection: CollectionAddress,
         range: ScanRange,
         overlay: Vec<ScanMutation>,
     ) -> ScanAccess {
-        ScanAccess::new(
-            collection,
-            range,
-            overlay,
-            ScanEvidence::new(self.keys, self.covered, self.frontier),
-        )
+        ScanAccess::new(collection, range, overlay, self.evidence)
     }
 
-    #[allow(deprecated)]
     pub(crate) fn new(evidence: ScanEvidence) -> Self {
-        let (keys, covered, frontier) = evidence.into_parts();
-        Self {
-            keys,
-            covered,
-            frontier,
-        }
+        Self { evidence }
     }
 }
 

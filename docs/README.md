@@ -62,6 +62,8 @@ designs use [`designs/_template.md`](designs/_template.md).
 - [`reviewing-changes.md`](guides/reviewing-changes.md) — what to look for when
   reviewing a change (policy vs. mechanism, ownership).
 - [`perf.md`](guides/perf.md) — running log of performance-affecting changes.
+- [`opaque-validation-evidence-migration.md`](guides/opaque-validation-evidence-migration.md)
+  — migration from the removed physical transaction-evidence APIs.
 - [`testing-dst.md`](guides/testing-dst.md) — the deterministic-simulation testing
   approach and its trade-offs vs. alternatives.
 

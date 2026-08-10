@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{KeyRef, TxId};
+use glassdb_data::KeyRef;
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{LeafObservation, Requirement, StorageError, Timeline, Version};
+use glassdb_storage::{Requirement, StorageError, Timeline, Version};
 
 use crate::access::ReadEvidence;
 use crate::error::trans_to_storage;
@@ -44,43 +44,29 @@ pub struct ReadValue {
 pub struct ReadOutcome {
     /// The resolved value, or `None` when the key is absent or deleted.
     pub value: Option<ReadValue>,
-    /// Effective writer resolved for the key, including a tombstone writer.
-    #[deprecated(note = "carry validation evidence with ReadOutcome::into_parts")]
-    pub last_writer: Option<TxId>,
     /// Whether every physical dependency was served locally.
     pub cache_hit: bool,
-    /// Exact leaf state used to derive this logical value.
-    #[deprecated(note = "carry validation evidence with ReadOutcome::into_parts")]
-    pub leaf: LeafObservation,
+    evidence: ReadEvidence,
 }
 
 impl ReadOutcome {
     /// Creates a read outcome carrying opaque validation evidence.
-    #[allow(deprecated)]
     pub fn new(value: Option<ReadValue>, cache_hit: bool, evidence: ReadEvidence) -> Self {
-        let (last_writer, leaf) = evidence.into_parts();
         Self {
             value,
-            last_writer,
             cache_hit,
-            leaf,
+            evidence,
         }
     }
 
     /// Consumes the outcome into its value, cache status, and validation evidence.
-    #[allow(deprecated)]
     pub fn into_parts(self) -> (Option<ReadValue>, bool, ReadEvidence) {
-        (
-            self.value,
-            self.cache_hit,
-            ReadEvidence::new(self.last_writer, self.leaf),
-        )
+        (self.value, self.cache_hit, self.evidence)
     }
 
     #[cfg(test)]
-    #[allow(deprecated)]
-    pub(crate) fn last_writer(&self) -> Option<&TxId> {
-        self.last_writer.as_ref()
+    pub(crate) fn last_writer(&self) -> Option<&glassdb_data::TxId> {
+        self.evidence.last_writer()
     }
 }
 

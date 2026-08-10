@@ -1517,7 +1517,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::access::{ScanAccess, ScanRange, WriteAccess};
+    use crate::access::{ScanRange, WriteAccess};
     use crate::collection_catalog::CollectionCatalog;
     use crate::collection_coordination::CollectionStateResolver;
     use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
@@ -3878,53 +3878,36 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
-    async fn opaque_and_legacy_point_read_evidence_validate_equivalently() {
+    async fn opaque_point_read_evidence_tracks_validation() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
         let outcome = read_outcome(&tctx, &keyp).await;
-        let legacy_outcome = outcome.clone();
         let (_, _, evidence) = outcome.into_parts();
-        let opaque = ReadAccess::new(keyp.clone(), evidence);
-        let legacy = ReadAccess {
-            key: keyp.clone(),
-            last_writer: legacy_outcome.last_writer,
-            leaf: legacy_outcome.leaf,
+        let data = Data {
+            reads: vec![ReadAccess::new(keyp.clone(), evidence)],
+            writes: Vec::new(),
+            scans: Vec::new(),
         };
 
         let validation_start = tctx.timeline.now();
-        for read in [&opaque, &legacy] {
-            let data = Data {
-                reads: vec![read.clone()],
-                writes: Vec::new(),
-                scans: Vec::new(),
-            };
-            assert!(
-                tm.validate(&data, ValidationContext::Optimistic, validation_start)
-                    .await
-                    .unwrap(),
-                "both construction paths accept current evidence"
-            );
-        }
+        assert!(
+            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence accepts its current value"
+        );
 
         let (peer, _peer_ctx) = new_algo_from_backend(tctx.backend.clone()).await;
         commit_writes(&peer, vec![wa(&keyp, b"v2")]).await;
         let validation_start = tctx.timeline.now();
-        for read in [&opaque, &legacy] {
-            let data = Data {
-                reads: vec![read.clone()],
-                writes: Vec::new(),
-                scans: Vec::new(),
-            };
-            assert!(
-                !tm.validate(&data, ValidationContext::Optimistic, validation_start)
-                    .await
-                    .unwrap(),
-                "both construction paths reject superseded evidence"
-            );
-        }
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence rejects a superseded value"
+        );
     }
 
     #[tokio::test]
@@ -4424,8 +4407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
-    async fn opaque_and_legacy_scan_evidence_validate_equivalently() {
+    async fn opaque_scan_evidence_tracks_validation() {
         let (tm, tctx) = new_algo().await;
         seed_live_keys(&tctx, &[b"a", b"c"]).await;
 
@@ -4438,47 +4420,28 @@ mod tests {
             .scan_keys(&test_collection(), &range, &[], None, None)
             .await
             .unwrap();
-        let legacy_result = result.clone();
-        let opaque = result.into_access(test_collection(), range.clone(), Vec::new());
-        let legacy = ScanAccess {
-            collection: test_collection(),
-            range,
-            overlay: Vec::new(),
-            keys: legacy_result.keys,
-            frontier: legacy_result.frontier,
-            covered: legacy_result.covered,
+        let data = Data {
+            reads: Vec::new(),
+            writes: Vec::new(),
+            scans: vec![result.into_access(test_collection(), range, Vec::new())],
         };
 
         let validation_start = tctx.timeline.now();
-        for scan in [&opaque, &legacy] {
-            let data = Data {
-                reads: Vec::new(),
-                writes: Vec::new(),
-                scans: vec![scan.clone()],
-            };
-            assert!(
-                tm.validate(&data, ValidationContext::Optimistic, validation_start)
-                    .await
-                    .unwrap(),
-                "both construction paths accept current evidence"
-            );
-        }
+        assert!(
+            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence accepts its current membership"
+        );
 
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
         let validation_start = tctx.timeline.now();
-        for scan in [&opaque, &legacy] {
-            let data = Data {
-                reads: Vec::new(),
-                writes: Vec::new(),
-                scans: vec![scan.clone()],
-            };
-            assert!(
-                !tm.validate(&data, ValidationContext::Optimistic, validation_start)
-                    .await
-                    .unwrap(),
-                "both construction paths reject a changed membership"
-            );
-        }
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence rejects a changed membership"
+        );
     }
 
     // ADR-031 phantom prevention: a listing whose covered leaves are unchanged

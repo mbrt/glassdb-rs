@@ -308,21 +308,6 @@ impl Engine {
             .await
     }
 
-    /// Scans with legacy resolver controls for a holder and validation frontier.
-    #[deprecated(note = "use Engine::scan; holder and cap controls are resolver-internal")]
-    pub async fn scan_keys(
-        &self,
-        collection: &CollectionAddress,
-        range: &ScanRange,
-        overlay: &[ScanMutation],
-        own_lock_holder: Option<&TxId>,
-        cap: Option<&[u8]>,
-    ) -> Result<ScanResult, StorageError> {
-        self.resolver
-            .scan_keys(collection, range, overlay, own_lock_holder, cap)
-            .await
-    }
-
     /// Loads a logical snapshot of a collection's direct-child directory.
     pub async fn collection_snapshot(
         &self,

@@ -24,8 +24,12 @@ impl ReadEvidence {
         Self { last_writer, leaf }
     }
 
-    pub(crate) fn into_parts(self) -> (Option<TxId>, LeafObservation) {
-        (self.last_writer, self.leaf)
+    pub(crate) fn last_writer(&self) -> Option<&TxId> {
+        self.last_writer.as_ref()
+    }
+
+    pub(crate) fn observation(&self) -> &LeafObservation {
+        &self.leaf
     }
 }
 
@@ -33,34 +37,21 @@ impl ReadEvidence {
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
     pub key: KeyRef,
-    /// Effective writer observed by the read, including a tombstone writer.
-    #[deprecated(note = "construct point-read access with ReadAccess::new")]
-    pub last_writer: Option<TxId>,
-    /// Exact leaf state from which the writer was resolved.
-    #[deprecated(note = "construct point-read access with ReadAccess::new")]
-    pub leaf: LeafObservation,
+    evidence: ReadEvidence,
 }
 
 impl ReadAccess {
     /// Creates point-read access from its logical key and opaque validation evidence.
-    #[allow(deprecated)]
     pub fn new(key: KeyRef, evidence: ReadEvidence) -> Self {
-        let (last_writer, leaf) = evidence.into_parts();
-        Self {
-            key,
-            last_writer,
-            leaf,
-        }
+        Self { key, evidence }
     }
 
-    #[allow(deprecated)]
     pub(crate) fn last_writer(&self) -> Option<&TxId> {
-        self.last_writer.as_ref()
+        self.evidence.last_writer()
     }
 
-    #[allow(deprecated)]
     pub(crate) fn observation(&self) -> &LeafObservation {
-        &self.leaf
+        self.evidence.observation()
     }
 }
 
@@ -115,8 +106,16 @@ impl ScanEvidence {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<Vec<u8>>, Vec<LeafCoverage>, Option<Vec<u8>>) {
-        (self.keys, self.covered, self.frontier)
+    pub(crate) fn keys(&self) -> &[Vec<u8>] {
+        &self.keys
+    }
+
+    pub(crate) fn frontier(&self) -> Option<&[u8]> {
+        self.frontier.as_deref()
+    }
+
+    pub(crate) fn covered(&self) -> &[LeafCoverage] {
+        &self.covered
     }
 }
 
@@ -132,49 +131,34 @@ pub struct ScanAccess {
     pub range: ScanRange,
     /// Staged membership mutations visible when the scan ran.
     pub overlay: Vec<ScanMutation>,
-    /// Keys surfaced to the transaction body.
-    #[deprecated(note = "construct scan access with ScanResult::into_access")]
-    pub keys: Vec<Vec<u8>>,
-    /// Inclusive validation/locking frontier; `None` means positive infinity.
-    #[deprecated(note = "construct scan access with ScanResult::into_access")]
-    pub frontier: Option<Vec<u8>>,
-    /// The leaves the scan covered, in key order, with membership dependencies.
-    #[deprecated(note = "construct scan access with ScanResult::into_access")]
-    pub covered: Vec<LeafCoverage>,
+    evidence: ScanEvidence,
 }
 
 impl ScanAccess {
-    #[allow(deprecated)]
     pub(crate) fn new(
         collection: CollectionAddress,
         range: ScanRange,
         overlay: Vec<ScanMutation>,
         evidence: ScanEvidence,
     ) -> Self {
-        let (keys, covered, frontier) = evidence.into_parts();
         Self {
             collection,
             range,
             overlay,
-            keys,
-            frontier,
-            covered,
+            evidence,
         }
     }
 
-    #[allow(deprecated)]
     pub(crate) fn keys(&self) -> &[Vec<u8>] {
-        &self.keys
+        self.evidence.keys()
     }
 
-    #[allow(deprecated)]
     pub(crate) fn frontier(&self) -> Option<&[u8]> {
-        self.frontier.as_deref()
+        self.evidence.frontier()
     }
 
-    #[allow(deprecated)]
     pub(crate) fn covered(&self) -> &[LeafCoverage] {
-        &self.covered
+        self.evidence.covered()
     }
 }
 
@@ -232,10 +216,10 @@ pub struct ScanMutation {
 
 /// One leaf a scan covered and its membership-only validation dependencies.
 #[derive(Debug, Clone)]
-pub struct LeafCoverage {
-    pub path: Arc<str>,
-    pub membership_version: u64,
-    pub pending_membership: Vec<TxId>,
+pub(crate) struct LeafCoverage {
+    pub(crate) path: Arc<str>,
+    pub(crate) membership_version: u64,
+    pub(crate) pending_membership: Vec<TxId>,
     pub(crate) observation: LeafObservation,
 }
 
