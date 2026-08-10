@@ -18,7 +18,6 @@ pub use background::Background;
 pub use dedup::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, DedupStats, MergeRequest, Worker,
 };
-pub use retry::{Backoff, RetryConfig, RetryErr, retry, retry_with_backoff};
+pub use retry::{Backoff, RetryConfig};
 pub use rng::Rng;
-pub use shard::Sharded;
 pub use tape::Tape;

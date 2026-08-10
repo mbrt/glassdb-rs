@@ -19,7 +19,8 @@
 
 use std::fmt;
 
-pub use glassdb_trans::{DedupKeySnapshot, HeldLeafSnapshot, TxLockSnapshot};
+pub use glassdb_concurr::DedupKeySnapshot;
+pub use glassdb_trans::{HeldLeafSnapshot, TxLockSnapshot};
 
 /// A snapshot of the shard coordinator's and locker's live state. Returned by
 /// [`crate::Database::diagnostics`].

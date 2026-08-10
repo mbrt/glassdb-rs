@@ -35,8 +35,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{KeyRef, LeafRef, TxId, paths};
+use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
-    CurrentState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TreeRouter, TxLock,
+    CurrentState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TreeRouter,
 };
 
 use crate::access::{Data, WriteOp};
@@ -1338,9 +1339,10 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionAddress, paths};
+    use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
-        SplitPolicy, TLogger, Timeline, TreeRouter, TxCommitStatus,
+        SplitPolicy, Timeline, TreeRouter,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1620,7 +1622,10 @@ mod tests {
         assert!(!waiting.is_finished());
 
         ctx.monitor
-            .commit_tx(glassdb_storage::TxLog::new(gate, TxCommitStatus::Ok))
+            .commit_tx(glassdb_storage::transaction::TxLog::new(
+                gate,
+                TxCommitStatus::Ok,
+            ))
             .await
             .unwrap();
         assert!(matches!(
@@ -1845,7 +1850,7 @@ mod tests {
     // committed value.
     #[tokio::test(start_paused = true)]
     async fn younger_proceeds_after_older_holder_commits() {
-        use glassdb_storage::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxLog, TxWrite};
         let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"v0").await;
@@ -2021,7 +2026,7 @@ mod tests {
     // pointers. Logged values are not copied into leaf entries (ADR-054).
     #[tokio::test]
     async fn committed_logged_values_are_help_forwarded_as_external() {
-        use glassdb_storage::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxLog, TxWrite};
         let (locker, ctx) = init_tl_test().await;
         let first = b"key-a".to_vec();
         let second = same_shard_sibling(&first);
@@ -2267,7 +2272,7 @@ mod tests {
     // Helper: commit a value for `key` so the shard records a `current_writer`,
     // making the key exist (so subsequent writes take a Write, not Create, lock).
     async fn seed_committed(ctx: &TlCtx, key: &[u8], value: &[u8]) {
-        use glassdb_storage::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxLog, TxWrite};
         let writer = mk_tid(0, "seed");
         ctx.monitor.begin_tx(&writer);
         let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
@@ -2564,7 +2569,7 @@ mod tests {
     // Locks + commits `key` for `tx`, leaving the shard entry holding the write
     // lock, so a later `write_back` publishes it. Returns the acquired handle.
     async fn lock_commit(locker: &Locker, ctx: &TlCtx, tx: &TxId, key: &[u8]) -> LockedTx {
-        use glassdb_storage::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxLog, TxWrite};
         ctx.monitor.begin_tx(tx);
         let groups = group_of(key, put_intent(key));
         lock_ok(locker, tx, &groups).await;

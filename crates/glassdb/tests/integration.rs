@@ -12,7 +12,8 @@ use glassdb::{
     SplitPolicy, Transaction,
 };
 use glassdb_data::TxId;
-use glassdb_storage::{CurrentState, LockType, Node, Shard, ShardEntry, TxCommitStatus};
+use glassdb_storage::transaction::TxCommitStatus;
+use glassdb_storage::{CurrentState, LockType, Node, Shard, ShardEntry};
 use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {

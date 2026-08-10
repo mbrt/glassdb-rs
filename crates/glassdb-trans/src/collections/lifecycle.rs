@@ -6,9 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId};
+use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionRecord, CollectionStore, Node, Requirement, Shard, ShardStore, StorageError,
-    TxCommitStatus,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -387,7 +387,8 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::Background;
     use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, CurrentState, Shard, ShardEntry, TLogger, Timeline};
+    use glassdb_storage::transaction::TLogger;
+    use glassdb_storage::{CachedStore, CurrentState, Shard, ShardEntry, Timeline};
     use tokio::sync::Notify;
 
     use super::*;

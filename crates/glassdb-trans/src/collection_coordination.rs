@@ -4,9 +4,11 @@ use std::collections::BTreeMap;
 
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId};
+use glassdb_storage::transaction::{
+    TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock,
+};
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, LockType, Observation, Requirement, StorageError, TLogger,
-    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock,
+    CollectionRecord, CollectionStore, LockType, Observation, Requirement, StorageError,
 };
 
 use crate::collections::{CollectionChange, CollectionOp, DirectoryRead};

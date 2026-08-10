@@ -3,7 +3,7 @@
 use crate::entropy::fill_random;
 
 /// Number of bytes in a collection ID.
-pub const COLLECTION_ID_BYTES: usize = 16;
+const COLLECTION_ID_BYTES: usize = 16;
 
 /// Maximum number of raw bytes in one logical collection name.
 pub const MAX_COLLECTION_NAME_BYTES: usize = 255;

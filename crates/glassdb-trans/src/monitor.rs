@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime};
 
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt, shard::Sharded};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
-use glassdb_storage::{
-    Observation, Requirement, SequencePoint, StorageError, TLogger, Timeline, TxCollectionChange,
-    TxCommitStatus, TxLifecycleRelation, TxLock, TxLog, TxRecordState, TxStatus,
+use glassdb_storage::transaction::{
+    TLogger, TxCollectionChange, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog, TxRecordState,
+    TxStatus,
 };
+use glassdb_storage::{Observation, Requirement, SequencePoint, StorageError, Timeline};
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
 
@@ -2017,7 +2018,8 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_data::{CollectionAddress, CollectionId};
-    use glassdb_storage::{CachedStore, LockType, Timeline, TxCollectionOp, TxWrite};
+    use glassdb_storage::transaction::{TxCollectionOp, TxWrite};
+    use glassdb_storage::{CachedStore, LockType, Timeline};
 
     #[test]
     fn abort_observation_classification_matches_the_protocol() {

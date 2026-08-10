@@ -36,7 +36,3 @@ pub use reader::{ReadOutcome, ReadValue};
 pub use shard_coord::ShardCoordinatorStats;
 pub use split::{InlinePressureStats, SplitterStats};
 pub use tlocker::{HeldLeafSnapshot, LockerStats, TxLockSnapshot};
-
-// Re-exported so the public diagnostics surface does not force callers to pull
-// in `glassdb-concurr` directly.
-pub use glassdb_concurr::DedupKeySnapshot;

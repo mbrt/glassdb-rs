@@ -1,7 +1,7 @@
 //! Shared wound-wait policy for transaction lock holders.
 
 use glassdb_data::TxId;
-use glassdb_storage::TxCommitStatus;
+use glassdb_storage::transaction::TxCommitStatus;
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, TxFinalStatus};

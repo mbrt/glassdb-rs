@@ -3,9 +3,8 @@
 use std::sync::Arc;
 
 use glassdb_data::{KeyRef, TxId};
-use glassdb_storage::{
-    CurrentState, LockType, Node, Requirement, ShardEntry, StorageError, TxCommitStatus,
-};
+use glassdb_storage::transaction::TxCommitStatus;
+use glassdb_storage::{CurrentState, LockType, Node, Requirement, ShardEntry, StorageError};
 
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
@@ -312,7 +311,8 @@ mod tests {
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::CollectionAddress;
-    use glassdb_storage::{CachedStore, TLogger, Timeline, TxLock, TxLog, TxWrite};
+    use glassdb_storage::transaction::{TLogger, TxLock, TxLog, TxWrite};
+    use glassdb_storage::{CachedStore, Timeline};
 
     use super::*;
     use crate::monitor::ProtocolTiming;
