@@ -10,7 +10,7 @@ the pilot must demonstrate useful counterexamples, a maintainable abstraction,
 and an acceptable CI cost before the toolchain becomes an accepted project
 requirement.
 
-The bounded Stage 0-4 pilot is implemented under
+The bounded Stage 0-5 pilot is implemented under
 [`formal/`](../../formal/README.md), with the implementation-history checker in
 `crates/glassdb/src/sim/history.rs`. It includes direct/coordinator behavior,
 explicit recovery interfaces, safety and fair eventually-healthy liveness
@@ -23,9 +23,14 @@ acknowledges it as `Aborted`. Its intended safety graph exhausts cleanly, while
 a synthetic mutant retains the superseded foreign-`Aborted` transition and
 still reproduces the original resurrection failure. The Stage 4 boundaries are
 therefore covered for the implemented scope. The suite remains a manually
-invoked exploration with no formal CI job or accepted architecture gate. Stage
-5 tooling was evaluated but not adopted for the pilot, as permitted by its exit
-rule.
+invoked exploration with no formal CI job or accepted architecture gate. The
+Stage 5 code-level pilot uses pinned Kani 0.67.0 against production-used
+transaction-lifecycle, median-policy, and split-finalization kernels, with three
+positive proofs, three seeded expected-panic mutants, and an upper-median
+maintenance check.
+The final pinned run and its per-harness time/memory measurements are recorded
+in the formal-suite README. Loom and Verus/Creusot were evaluated and declined
+for the concrete reasons recorded below.
 
 ## Goal & scope
 
@@ -124,9 +129,11 @@ physical cleanup, owner retirement, acknowledgement, and finite GC. Its
 superseded foreign-`Aborted` mutant preserves the causal counterexample that
 motivated the repair without representing it as current protocol behavior. The
 history checker closes part of the model-to-code gap over the many real
-executions explored by the existing deterministic executor. Targeted Kani,
-Verus/Creusot, or Loom work may later close specific remaining gaps, but is not
-required for the first pilot.
+executions explored by the existing deterministic executor. Kani closes a
+smaller code-level gap for the production transaction-lifecycle relation and
+the pure median and split-finalization metadata kernels. It is not an end-to-end
+protocol proof: Loom was not adopted for the mixed standard-library/Tokio
+synchronization seams, and no Verus or Creusot protocol core was introduced.
 
 No verification code participates in a production build, changes the public
 API, or adds work to a database operation.
@@ -738,42 +745,78 @@ justifies it.
 
 ### Kani bounded proofs
 
-After the model and history checker stabilize the specifications, Kani proof
-harnesses are evaluated for pure, bounded transition code. Candidate targets
-are:
+The Stage 5 pilot pins Kani 0.67.0 and verifies production-used pure kernels in
+`glassdb-storage`. Three positive harnesses cover:
 
-- transaction lifecycle transition validation;
-- `CurrentState` and lock structural validity;
-- node and shard median split: key conservation, ordering, disjoint ownership,
-  and link bounds;
-- a factored pure coordinator admission/fold kernel: same-key exclusion,
-  skipped-member noninterference, and in-doubt attribution; and
-- a pure GC eligibility predicate: referenced and recent objects are never
-  reclaimable.
+- the exact lifecycle relation over all 25 normalized-state pairs, plus the
+  transition validator over all 36 encoded source/destination pairs: absent or
+  persisted `Unknown`, `Pending`, `Wounded`, `Committed`, and `Aborted`,
+  including the pairs normalization rejects;
+- the shared median-index policy for every `usize` cardinality from 2 upward,
+  proving that both halves are nonempty, conserve the cardinality, and differ
+  in size by at most one; and
+- `finish_split_metadata`, the production kernel called by
+  `Node::finish_split` after a body has already been partitioned. Presence of
+  its prior high-key, right link, and delete intent is symbolic, as is the
+  membership version. It proves B-link inheritance, complete source-lock
+  preservation, and removal of transient lock holders from the new sibling.
+
+The initial pilot also attempted direct Kani harnesses for
+`Shard::split_off_median`, `IndexNode::split_off_median`, and their composition
+through `Node::split`. A four-entry `std::collections::BTreeMap::split_off`
+harness exceeded the 300-second cutoff, and a reduced fixed ordered three-entry
+harness still produced no result in a 90-second feasibility run. Those Kani
+targets were declined rather than weakened into shadow container
+implementations. The
+production content-conservation, ordering, disjoint-ownership,
+promoted-boundary, and index-routing behavior remains exercised by deterministic
+Rust tests. A timeout is an unknown result, not evidence that any of those
+properties holds or fails.
 
 Proof harnesses are colocated under `#[cfg(kani)]` so they can reach private
-functions without widening production visibility. Async I/O, Tokio scheduling,
-and trait-object resolver calls are stubbed at a contract boundary; Kani is not
-used to claim an end-to-end concurrency proof.
+functions without widening production visibility. The `proof-mutants` feature
+adds only Kani-gated stubs. One stub selects the upper median for odd sizes as a
+representative maintenance check; the unchanged nonempty, balanced-cardinality
+contract must still prove. Three `#[kani::should_panic]` harnesses seed local
+defects—direct `Wounded` reclamation, an empty lower split half, and inherited
+transient sibling lock holders in split metadata—and require the
+corresponding named assertion to fail. Positive proofs never stub an async
+dependency or replace a production kernel with a proof-only implementation.
 
-A transition should be factored into a pure production kernel only when that
-also clarifies ownership and policy. The verification effort must not introduce
-a shadow implementation used only by proofs.
+General `CurrentState` and lock structural validity, a pure coordinator
+admission/fold kernel, and a pure GC eligibility predicate remain possible Kani
+extensions. They were not factored merely to create proof targets. A transition
+should move into a pure production kernel only when doing so also clarifies
+ownership and policy.
+
+Kani is not used to claim an end-to-end concurrency or storage proof. The
+harnesses do not execute async I/O, Tokio scheduling, conditional object-store
+mutations, container partitioning, split recovery, arbitrary tree sizes, or
+arbitrary deployments.
 
 ### Loom local-concurrency checks
 
 The deterministic executor controls async poll order on one thread but does not
 explore the C11 shared-memory model of a production multi-threaded Tokio runtime.
-Focused Loom tests may therefore cover:
+Loom was evaluated and declined for Stage 5. The most interesting candidate,
+`Dedup`, combines standard mutexes and atomics with Tokio notification,
+oneshot, selection, and spawning plus `tokio-util` cancellation. Cache lanes,
+coordinator publication, and background shutdown have the same mixed-runtime
+shape. Faithful Loom coverage would therefore require a broad production
+synchronization/runtime adapter; copying the logic into a Loom-only harness
+would create the shadow implementation this design rejects.
+
+The unclosed memory-model gap is explicit. A future narrow production adapter
+could justify focused Loom tests for:
 
 - `Dedup` request ownership, cancellation, and delivery;
 - per-path cache lane admission and mutation guards;
 - shard-coordinator outcome-slot publication; and
 - background shutdown/abort races.
 
-These tests require narrow synchronization adapters and bounded scenarios. They
-do not model object-store CAS, transaction serializability, or lease time and
-must not be presented as protocol proofs.
+Any such tests would require bounded scenarios. They would not model
+object-store CAS, transaction serializability, or lease time and must not be
+presented as protocol proofs.
 
 ### Deductive verification gate
 
@@ -792,6 +835,12 @@ proof is required. Creusot is a viable alternative for functional contracts on
 safe, sequential kernels. The project will choose at most one primary
 deductive verifier; maintaining equivalent proof annotations in two systems is
 out of scope.
+
+Neither tool is adopted in Stage 5. The finite lifecycle relation is exhausted
+directly by Kani, while an unbounded B-link refinement would first require a
+production-used pure protocol core and verified container abstractions. Adding
+duplicate maps, vectors, or protocol wrappers solely to fit either verifier
+would fail the gate above.
 
 ## Tooling and CI
 
@@ -816,6 +865,41 @@ No JAR or generated model output is committed. A container image is avoided for
 the initial toolchain because Java plus one checksummed artifact is the smaller
 and more transparent dependency.
 
+### Reproducible Kani setup
+
+The implementation adds `make verify-kani`, backed by
+`hack/verify-kani.sh`. Kani is deliberately not downloaded by the runner. A
+maintainer installs the pinned release and its supporting tools explicitly:
+
+```bash
+cargo install --locked kani-verifier --version 0.67.0
+cargo kani setup
+make verify-kani
+```
+
+The runner:
+
+- rejects a missing or incomplete Kani setup and any version other than 0.67.0
+  before an ordinary proxy invocation can perform first-run setup;
+- requires GNU `timeout` (or `gtimeout`), serializes invocations, checks that the
+  source catalog still contains exactly seven proofs, and selects each harness
+  by its exact fully-qualified name;
+- applies a process-group 300-second per-harness cutoff plus a 10-second kill
+  grace by default, and treats a timeout as a failed, unknown result rather
+  than a pass;
+- enables unstable stubbing and `proof-mutants` only for the isolated
+  maintenance and negative-control harnesses;
+- requires every coverage point, exact ordinary/expected-panic success mode,
+  and the one exact named mutant assertion;
+- clears stale evidence before writing complete output under `target/kani/`;
+  and
+- records elapsed time and peak resident memory in each log when GNU
+  `/usr/bin/time` is available.
+
+The final Kani 0.67.0 per-harness elapsed-time and peak-RSS measurements are
+recorded in
+[`formal/README.md`](../../formal/README.md#stage-5-kani-metrics).
+
 ### CI tiers
 
 The intended future verification tiers are split by cost:
@@ -824,9 +908,10 @@ The intended future verification tiers are split by cost:
   run through `make test-all` with the rest of the Rust suite.
 - **Formal PR gate:** a dedicated job installs Java and runs the exhaustive
   safety configurations through `make verify-formal`.
-- **Main/scheduled deep gate:** larger same-leaf/cross-leaf configurations,
-  liveness checks, and any later Kani or Loom suites run with explicit timeouts
-  and upload counterexample artifacts on failure.
+- **Main/scheduled deep gate:** larger same-leaf/cross-leaf configurations and
+  liveness checks run with explicit timeouts and upload counterexample artifacts
+  on failure. Kani could join this tier only after the manual pilot has measured
+  stable cost; no Loom suite currently exists.
 
 No formal job is currently wired into CI. The pilot would begin non-required
 while state-space size is measured and become required only after it runs
@@ -835,9 +920,11 @@ explosion, or checker error is a failed verification job, never a passing
 unknown result.
 
 `make test-all` remains the complete Rust format/lint/test command. It does not
-silently download Java tooling. Review documentation lists
-`make verify-formal` as an additional requirement once an accepted ADR makes the
-model a gate for protocol changes.
+silently download Java or Kani tooling. `make verify-formal` and
+`make verify-kani` remain additional manual commands; neither is invoked by CI.
+Review documentation lists `make verify-formal` as an additional requirement
+once an accepted ADR makes the model a gate for protocol changes. Kani would
+require its own measured gate decision.
 
 ### Change policy
 
@@ -922,17 +1009,31 @@ sensitive to removing the pinned marker.
 
 ### Stage 5: code-level proof pilot
 
-- Run Kani on lifecycle and split kernels first.
-- Measure proof annotation, execution time, and maintenance under a representative
-  change.
-- Add Loom only for local synchronization seams not already covered by the
-  deterministic executor.
-- Evaluate Verus only if a production-used pure protocol core warrants an
+- Pin Kani 0.67.0 and add a manual `make verify-kani` runner without changing
+  `make test-all` or CI.
+- Check three positive harnesses over the production lifecycle relation,
+  full-cardinality median policy, and the production split-metadata kernel used
+  by `Node::finish_split`.
+- Reuse the median-cardinality contract under an upper-median stub as the
+  representative maintenance change.
+- Require three expected-panic mutants to expose direct `Wounded` reclamation,
+  an empty split half, and inherited transient sibling lock holders.
+- Decline Kani proofs of the production Shard/Index `BTreeMap::split_off`
+  transforms after bounded feasibility runs fail the pilot cost test; retain
+  their content invariants in deterministic Rust tests.
+- Record exact per-harness elapsed time, peak RSS, and proof footprint after the
+  pinned run.
+- Decline Loom until a narrow production synchronization adapter exists, and
+  decline Verus/Creusot until a production-used pure protocol core warrants an
   unbounded refinement proof.
 
-**Exit:** accept only tools whose proofs exercise production code, catch a
-seeded local defect, and remain maintainable. Declining a tool at this stage does
-not invalidate the TLA+/history-checking layers.
+**Exit:** met for the bounded manual Kani pilot. The harnesses exercise
+production code rather than a proof-only shadow, all seven configured checks
+finish under Kani 0.67.0, and the three negative controls make local property
+sensitivity explicit. The upper-median maintenance change preserves the proof
+without changing its assertions. No Stage 5 tool becomes a CI or architecture
+gate in this change. Declining the `BTreeMap` target, Loom, and deductive
+verification does not invalidate the TLA+/history-checking layers.
 
 ### Pilot success criteria
 

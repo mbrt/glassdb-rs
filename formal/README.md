@@ -9,6 +9,8 @@ core, Stage 2 direct/coordinator behavior, the recovery interfaces that the
 first slice reduced away, and the Stage 4 composed subprotocol models. The
 Stage 3 implementation-history checker lives in
 [`crates/glassdb/src/sim/history.rs`](../crates/glassdb/src/sim/history.rs).
+The manual Stage 5 Kani harnesses are colocated with the production lifecycle,
+median-policy, and split-finalization kernels under `#[cfg(kani)]`.
 
 This remains an exploration rather than an accepted architecture gate. It is
 manually invoked and is not run by CI.
@@ -38,6 +40,8 @@ The proposed long-lived snapshot-read protocol is intentionally excluded. The
 models and history checker cover only strong latest-value transactions.
 
 ## Running the pilot
+
+### TLA+/TLC
 
 The runner requires Java 11 or newer. It uses TLA+ tools 1.7.4 and verifies the
 JAR against the pinned SHA-256 before executing it. With an existing offline
@@ -69,6 +73,79 @@ basename converted from CamelCase to kebab-case.
 
 The command intentionally remains separate from `make test-all`: the suite is
 not yet a required project toolchain or CI check.
+
+### Kani
+
+The Stage 5 runner requires exactly Kani 0.67.0. Installation is explicit
+because Kani and its supporting tools are not part of the normal Rust
+toolchain:
+
+```bash
+cargo install --locked kani-verifier --version 0.67.0
+cargo kani setup
+make verify-kani
+```
+
+`hack/verify-kani.sh` rejects a missing, incomplete, or different Kani version
+before invoking the Kani proxy, so the proxy cannot trigger first-run setup.
+The runner requires GNU `timeout` (named `timeout` or `gtimeout`), serializes
+invocations, and checks the complete seven-harness catalog. It invokes one exact
+fully-qualified harness at a time, requires every coverage point and the exact
+success mode, and requires each `#[kani::should_panic]` negative control to
+report its one named failed assertion. Complete logs live under `target/kani/`;
+stale logs are removed at the start of a run. When GNU `/usr/bin/time` is
+available, elapsed time and peak resident memory are included in each log.
+
+The production-used kernels checked by this pilot are:
+
+- the exact transaction-record lifecycle relation over all 25 normalized-state
+  pairs, plus transition validation over all 36 encoded input pairs including
+  invalid persisted `Unknown`;
+- the shared median-index policy for every machine cardinality representable by
+  `usize` from 2 upward; and
+- `finish_split_metadata`, the production kernel called by
+  `Node::finish_split` after a body has already been partitioned. Presence of
+  the old high-key, right link, and delete intent is symbolic, as is the
+  membership version. It checks B-link inheritance, complete source-lock
+  preservation, and removal of transient holders from the new sibling without
+  invoking a container split.
+
+Kani 0.67.0 did not make `std::collections::BTreeMap::split_off` a maintainable
+pilot target: a four-entry harness exceeded the 300-second cutoff, and a
+reduced fixed ordered three-entry harness still produced no result in a
+90-second feasibility run. Those content-conservation, ordering, disjoint
+ownership, promoted-boundary, and routing properties remain covered by the
+deterministic Rust tests for `Shard::split_off_median`,
+`IndexNode::split_off_median`, and `Node::split`. They are an explicitly
+declined Kani target, not a proof result; a timeout provides no evidence that
+the property holds or fails.
+
+An upper-median stub is a representative policy-maintenance check: the same
+nonempty, balanced-cardinality contract must hold without editing the proof.
+Three negative controls stub the production kernels to permit direct `Wounded`
+reclamation, create an empty lower split half, or retain transient lock holders
+in split metadata. These stubs exist only under both `cfg(kani)` and the
+`proof-mutants` feature; they are not production alternatives.
+
+#### Stage 5 Kani metrics
+
+These local reference measurements come from a clean verifier build in the
+final Kani 0.67.0 run on 2026-08-10. Elapsed time is the complete per-harness
+command measured by GNU `time`; peak RSS is reported in KiB. The colocated Kani
+modules contain 268 lines, plus 238 lines in the fail-closed runner.
+
+| Harness | Role | Elapsed time | Peak RSS |
+| --- | --- | ---: | ---: |
+| `lifecycle_transition_validation_matches_policy` | positive lifecycle proof | 9.78 s | 393,664 KiB |
+| `median_split_index_keeps_bounded_halves_balanced` | positive full-cardinality median policy proof | 1.70 s | 329,580 KiB |
+| `node_finish_split_preserves_b_link_bounds_and_lock_ownership` | positive split-finalization metadata proof | 13.91 s | 577,468 KiB |
+| `median_split_contract_survives_upper_bias` | upper-median maintenance check | 1.65 s | 329,132 KiB |
+| `lifecycle_rejects_direct_wounded_reclamation_mutant` | expected-panic lifecycle mutant | 1.90 s | 361,600 KiB |
+| `median_split_contract_rejects_empty_lower_mutant` | expected-panic split mutant | 1.44 s | 328,884 KiB |
+| `node_finish_split_rejects_inherited_lock_holders_mutant` | expected-panic split-finalization mutant | 10.88 s | 600,340 KiB |
+
+Like `make verify-formal`, `make verify-kani` remains separate from
+`make test-all` and is not invoked by CI.
 
 ## Modules
 
@@ -635,8 +712,10 @@ unconditional per-client starvation freedom.
 
 ## Acceptance status and exclusions
 
-The bounded Stage 0-4 exploration is executable end to end. It remains a manual
-finite-state exploration rather than an accepted project gate:
+The bounded Stage 0-4 formal and history-checking exploration is executable end
+to end. The Stage 5 Kani harnesses and manual runner also execute successfully
+with the pinned verifier and have measured local cost. The combined pilot
+remains a manual exploration rather than an accepted project gate:
 
 - every intended-safe graph listed above exhausts with no error and no depth
   bound;
@@ -680,13 +759,27 @@ following remain explicit trust or scale boundaries rather than hidden claims:
 - The Rust checker samples deterministic schedules and faults; TLC exhausts
   only the recorded finite domains. Neither is a deductive proof of Tokio,
   Rust, the object-store clients, or arbitrary user-closure side effects.
-- Kani was evaluated but not adopted for this pilot: no installed verifier or
-  stable production-used pure coordinator/lifecycle kernel justified adding an
-  unexecuted proof-only shadow. The design explicitly permits declining Stage 5
-  tooling without weakening the independent TLA+/history layers. Loom was
-  likewise not added because the selected protocol claims are exercised at the
-  deterministic executor and backend-CAS boundaries, not presented as C11
-  memory-model proofs.
+- The Stage 5 Kani harnesses execute the production lifecycle relation,
+  transition validator, full-cardinality median-index policy, and the split
+  metadata kernel called by `Node::finish_split`. Prior B-link field presence,
+  delete-intent presence, and the membership version are symbolic; concrete
+  field values are fixed. Kani 0.67.0 did not make the production
+  `BTreeMap::split_off`
+  transforms tractable within the pilot budget, so Shard/Index content
+  conservation remains in deterministic Rust tests and is not claimed here.
+  The accepted proofs also do not cover arbitrary-size trees, split
+  persistence, crash recovery, async I/O, Tokio scheduling, or object-store
+  behavior. Test-only stubs are used only for three seeded defects and the
+  upper-median maintenance check, never to replace a dependency in a positive
+  production proof.
+- Loom was declined for this pilot because the candidate synchronization seams
+  combine standard mutexes and atomics with Tokio notification, channel,
+  selection, spawning, and cancellation primitives. Covering that code would
+  require a broad production synchronization adapter; a separate Loom-only copy
+  would be an untrustworthy shadow implementation. Verus and Creusot were also
+  declined: the finite lifecycle graph is covered directly by Kani, while an
+  unbounded topology proof would first require a justified production protocol
+  core and verified container abstractions.
 - Long-lived snapshot reads, their history retention, and their checkpoint
   cache semantics are excluded by request. Ordinary latest-value point reads,
   concurrent read groups, and normalized transaction scans are included.

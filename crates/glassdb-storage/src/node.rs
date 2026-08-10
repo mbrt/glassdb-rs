@@ -25,7 +25,7 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::LockType;
-use crate::shard::{CurrentState, Shard, ShardEntry};
+use crate::shard::{CurrentState, Shard, ShardEntry, median_split_index};
 use glassdb_data::TxId;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
@@ -98,7 +98,7 @@ impl IndexNode {
             self.children.len() >= 2,
             "cannot split an index with fewer than two children"
         );
-        let mid = self.children.len() / 2;
+        let mid = median_split_index(self.children.len());
         let separator = self
             .children
             .keys()
@@ -637,23 +637,7 @@ impl Node {
                 (NodeBody::Index(upper), separator)
             }
         };
-        // The right sibling takes over the upper range: the old high-key and the
-        // old right-sibling link now bound and follow it.
-        let right = Node {
-            high_key: self.high_key.take(),
-            right_sibling: self.right_sibling.take(),
-            body: right_body,
-            locks: {
-                let mut locks = self.locks.clone();
-                locks.clear_holders();
-                locks
-            },
-        };
-        // The retained lower half is now bounded by the split key and links to
-        // the new sibling.
-        self.high_key = Some(split_key.clone());
-        self.right_sibling = Some(right_token.to_string());
-        Some((right, split_key))
+        Some(self.finish_split(right_body, split_key, right_token))
     }
 
     /// Encodes the node to its canonical protobuf body (the CAS unit).
@@ -721,6 +705,46 @@ impl Node {
             },
         })
     }
+
+    /// Installs B-link bounds and isolates transient lock ownership after a body split.
+    fn finish_split(
+        &mut self,
+        right_body: NodeBody,
+        split_key: Vec<u8>,
+        right_token: &str,
+    ) -> (Node, Vec<u8>) {
+        let (right_high_key, right_sibling, right_locks) = finish_split_metadata(
+            &mut self.high_key,
+            &mut self.right_sibling,
+            &self.locks,
+            &split_key,
+            right_token,
+        );
+        let right = Node {
+            high_key: right_high_key,
+            right_sibling,
+            body: right_body,
+            locks: right_locks,
+        };
+        (right, split_key)
+    }
+}
+
+/// Publishes split bounds while isolating transient lock ownership.
+fn finish_split_metadata(
+    lower_high_key: &mut Option<Vec<u8>>,
+    lower_right_sibling: &mut Option<NodeToken>,
+    source_locks: &NodeLocks,
+    split_key: &[u8],
+    right_token: &str,
+) -> (Option<Vec<u8>>, Option<NodeToken>, NodeLocks) {
+    let right_high_key = lower_high_key.take();
+    let right_sibling = lower_right_sibling.take();
+    let mut right_locks = source_locks.clone();
+    right_locks.clear_holders();
+    *lower_high_key = Some(split_key.to_vec());
+    *lower_right_sibling = Some(right_token.to_string());
+    (right_high_key, right_sibling, right_locks)
 }
 
 fn validate_structural_gate(gate: &NodeLock) -> Result<(), StorageError> {
@@ -1107,5 +1131,88 @@ mod tests {
         ];
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "index node encoding drifted: {got:02x?}");
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const NEW_RIGHT: &str = "new-right";
+    const SPLIT_KEY: [u8; 1] = [0x20];
+
+    fn bounded_split_locks() -> NodeLocks {
+        let mut locks = NodeLocks::default();
+        // A completed membership write supplies nonzero durable coordination
+        // metadata without creating an invalid simultaneous holder.
+        let membership_holder = TxId::from_bytes(vec![0x11]);
+        locks.set_membership_writer(membership_holder.clone());
+        assert!(locks.remove_membership_holder(&membership_holder));
+        locks.set_structural_gate(TxId::from_bytes(vec![0x22]));
+        if kani::any() {
+            locks.set_delete_intent(TxId::from_bytes(vec![0x33]));
+        }
+        locks.membership_version = kani::any();
+        locks
+    }
+
+    fn verify_finish_split_contract() {
+        let mut lower_high_key = kani::any::<bool>().then(|| vec![0x50]);
+        let mut lower_right_sibling = kani::any::<bool>().then(|| "old-right".to_string());
+        let original_locks = bounded_split_locks();
+        let mut expected_right_locks = original_locks.clone();
+        expected_right_locks.clear_holders();
+        let original_high_key = lower_high_key.clone();
+        let original_right = lower_right_sibling.clone();
+        let structural_holder = TxId::from_bytes(vec![0x22]);
+
+        let (right_high_key, right_sibling, right_locks) = finish_split_metadata(
+            &mut lower_high_key,
+            &mut lower_right_sibling,
+            &original_locks,
+            &SPLIT_KEY,
+            NEW_RIGHT,
+        );
+
+        kani::cover!(original_high_key.is_none());
+        kani::cover!(original_high_key.is_some());
+        kani::cover!(original_right.is_none());
+        kani::cover!(original_right.is_some());
+        kani::cover!(original_locks.delete_intent().is_none());
+        kani::cover!(original_locks.delete_intent().is_some());
+
+        assert_eq!(lower_high_key.as_deref(), Some(SPLIT_KEY.as_slice()));
+        assert_eq!(lower_right_sibling.as_deref(), Some(NEW_RIGHT));
+        assert_eq!(right_high_key, original_high_key);
+        assert_eq!(right_sibling, original_right);
+        assert!(
+            original_locks
+                .structural_gate()
+                .contains(&structural_holder)
+        );
+        assert!(
+            right_locks.structural_gate().holders().is_empty(),
+            "a split sibling inherited transient node-lock holders"
+        );
+        assert_eq!(right_locks, expected_right_locks);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn node_finish_split_preserves_b_link_bounds_and_lock_ownership() {
+        verify_finish_split_contract();
+    }
+
+    #[cfg(feature = "proof-mutants")]
+    #[allow(dead_code)]
+    fn keep_split_node_lock_holders(_locks: &mut NodeLocks) {}
+
+    #[cfg(feature = "proof-mutants")]
+    #[kani::proof]
+    #[kani::should_panic]
+    #[kani::unwind(16)]
+    #[kani::stub(NodeLocks::clear_holders, keep_split_node_lock_holders)]
+    fn node_finish_split_rejects_inherited_lock_holders_mutant() {
+        verify_finish_split_contract();
     }
 }

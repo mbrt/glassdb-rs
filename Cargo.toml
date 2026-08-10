@@ -25,10 +25,11 @@ repository = "https://github.com/mbrt/glassdb-rs"
 homepage = "https://github.com/mbrt/glassdb-rs"
 
 # `--cfg sim` activates the in-repo deterministic simulation executor (see
-# ADR-011). Declaring it here keeps `#[cfg(sim)]` attributes from tripping the
-# `unexpected_cfgs` lint in normal builds (where the cfg is simply never set).
+# ADR-011). Kani injects `cfg(kani)` while checking colocated proof harnesses.
+# Declaring both keeps inactive verification code from tripping the
+# `unexpected_cfgs` lint in normal builds.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sim)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sim)', 'cfg(kani)'] }
 
 [workspace.dependencies]
 glassdb-data = { path = "crates/glassdb-data", version = "0.1.0" }

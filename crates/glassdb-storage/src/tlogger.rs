@@ -456,6 +456,138 @@ fn validate_lifecycle_transition(
     }
 }
 
+#[cfg(kani)]
+mod lifecycle_proofs {
+    use super::*;
+
+    fn expected_relation(current: TxRecordState, desired: TxRecordState) -> TxLifecycleRelation {
+        if current == desired {
+            return TxLifecycleRelation::Same;
+        }
+        match (current, desired) {
+            (
+                TxRecordState::Missing,
+                TxRecordState::Pending
+                | TxRecordState::Wounded
+                | TxRecordState::Committed
+                | TxRecordState::Aborted,
+            )
+            | (
+                TxRecordState::Pending,
+                TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted,
+            )
+            | (TxRecordState::Wounded, TxRecordState::Aborted)
+            | (TxRecordState::Committed | TxRecordState::Aborted, TxRecordState::Missing) => {
+                TxLifecycleRelation::CanAdvance
+            }
+            _ => TxLifecycleRelation::Blocks,
+        }
+    }
+
+    fn any_status() -> Option<TxCommitStatus> {
+        let choice: u8 = kani::any();
+        kani::assume(choice < 6);
+        match choice {
+            0 => None,
+            1 => Some(TxCommitStatus::Unknown),
+            2 => Some(TxCommitStatus::Pending),
+            3 => Some(TxCommitStatus::Wounded),
+            4 => Some(TxCommitStatus::Ok),
+            _ => Some(TxCommitStatus::Aborted),
+        }
+    }
+
+    fn expected_state(status: Option<TxCommitStatus>) -> Option<TxRecordState> {
+        match status {
+            None => Some(TxRecordState::Missing),
+            Some(TxCommitStatus::Pending) => Some(TxRecordState::Pending),
+            Some(TxCommitStatus::Wounded) => Some(TxRecordState::Wounded),
+            Some(TxCommitStatus::Ok) => Some(TxRecordState::Committed),
+            Some(TxCommitStatus::Aborted) => Some(TxRecordState::Aborted),
+            Some(TxCommitStatus::Unknown) => None,
+        }
+    }
+
+    /// Checks every encoded source/destination pair against the durable
+    /// lifecycle policy, including missing records and invalid `Unknown`.
+    #[kani::proof]
+    fn lifecycle_transition_validation_matches_policy() {
+        use TxCommitStatus::{Aborted, Pending, Wounded};
+
+        let current = any_status();
+        let next = any_status();
+        kani::cover!(
+            current.is_none() && next == Some(Wounded),
+            "a missing record can be wounded"
+        );
+        kani::cover!(
+            current == Some(Wounded) && next == Some(Aborted),
+            "an owner can acknowledge a wound"
+        );
+        kani::cover!(
+            current == Some(Wounded) && next.is_none(),
+            "direct wounded reclamation is checked"
+        );
+        kani::cover!(
+            current == Some(TxCommitStatus::Unknown),
+            "invalid persisted Unknown is checked"
+        );
+        kani::cover!(
+            current == Some(Pending) && next == Some(Pending),
+            "the permitted Pending self-transition is checked"
+        );
+
+        let normalized_current = TxRecordState::try_from_status(current);
+        let normalized_next = TxRecordState::try_from_status(next);
+        let expected_current = expected_state(current);
+        let expected_next = expected_state(next);
+        assert_eq!(normalized_current.as_ref().ok().copied(), expected_current);
+        assert_eq!(normalized_next.as_ref().ok().copied(), expected_next);
+
+        let permitted = match (expected_current, expected_next) {
+            (Some(current), Some(next)) => {
+                let expected = expected_relation(current, next);
+                assert_eq!(current.relation_to(next), expected);
+                (current != TxRecordState::Missing || next != TxRecordState::Missing)
+                    && (expected == TxLifecycleRelation::CanAdvance
+                        || current == TxRecordState::Pending && next == TxRecordState::Pending)
+            }
+            _ => false,
+        };
+        assert_eq!(
+            validate_lifecycle_transition(current, next).is_ok(),
+            permitted
+        );
+    }
+
+    // This is the smallest seeded mutation that invalidates the pinned wound:
+    // GC may delete Wounded without waiting for owner acknowledgement.
+    #[cfg(feature = "proof-mutants")]
+    #[allow(dead_code)]
+    fn allow_direct_wounded_reclamation(
+        current: TxRecordState,
+        desired: TxRecordState,
+    ) -> TxLifecycleRelation {
+        if current == TxRecordState::Wounded && desired == TxRecordState::Missing {
+            TxLifecycleRelation::CanAdvance
+        } else {
+            expected_relation(current, desired)
+        }
+    }
+
+    /// Demonstrates that the positive proof detects direct wound reclamation.
+    #[cfg(feature = "proof-mutants")]
+    #[kani::proof]
+    #[kani::should_panic]
+    #[kani::stub(TxRecordState::relation_to, allow_direct_wounded_reclamation)]
+    fn lifecycle_rejects_direct_wounded_reclamation_mutant() {
+        assert!(
+            validate_lifecycle_transition(Some(TxCommitStatus::Wounded), None).is_err(),
+            "a pinned wound became directly reclaimable"
+        );
+    }
+}
+
 fn write_value(w: &pb::Write) -> Arc<[u8]> {
     match &w.val_delete {
         Some(pb::write::ValDelete::Value(v)) => Arc::from(v.as_slice()),

@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build verify-formal fuzz fuzz-min bench bench-score flamegraph
+.PHONY: test test-sim test-all lint format build verify-formal verify-kani fuzz fuzz-min bench bench-score flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -26,6 +26,12 @@ format:
 # artifact, and is not yet a required project gate.
 verify-formal:
 	hack/verify-formal.sh
+
+# Check bounded properties of production-used Rust lifecycle and split kernels.
+# Kept out of test-all and CI because it requires the separately installed,
+# pinned Kani toolchain and remains an exploratory proof pilot.
+verify-kani:
+	hack/verify-kani.sh
 
 # Run the Criterion transaction microbenchmarks (memory + simulated S3/GCS).
 # The concurrency/throughput "scale" benchmarks (real or simulated cloud

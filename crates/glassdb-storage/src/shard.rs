@@ -132,6 +132,12 @@ pub struct Shard {
     entries: BTreeMap<Vec<u8>, ShardEntry>,
 }
 
+/// Returns the boundary position for a balanced node half-split.
+pub(crate) fn median_split_index(len: usize) -> usize {
+    debug_assert!(len >= 2, "cannot split fewer than two items");
+    len / 2
+}
+
 impl Shard {
     /// Creates an empty shard.
     pub fn new() -> Self {
@@ -182,7 +188,7 @@ impl Shard {
             self.entries.len() >= 2,
             "cannot split a shard with fewer than two entries"
         );
-        let mid = self.entries.len() / 2;
+        let mid = median_split_index(self.entries.len());
         let split_key = self
             .entries
             .keys()
@@ -660,5 +666,61 @@ mod tests {
             0x02, 0x03, 0x04, 0x22, 0x08, 0x0a, 0x02, 0xaa, 0xbb, 0x1a, 0x02, 0x68, 0x69,
         ];
         assert_eq!(got, want, "inline shard encoding drifted: {got:02x?}");
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn verify_median_policy_contract() {
+        let len: usize = kani::any();
+        kani::assume(len >= 2);
+
+        let lower_len = median_split_index(len);
+        let upper_len = len - lower_len;
+
+        kani::cover!(len == 2);
+        kani::cover!(len == 3);
+        kani::cover!(len == usize::MAX);
+        assert!(lower_len > 0, "a split produced an empty lower half");
+        assert!(upper_len > 0);
+        assert_eq!(lower_len + upper_len, len);
+        assert!(lower_len.abs_diff(upper_len) <= 1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn median_split_index_keeps_bounded_halves_balanced() {
+        verify_median_policy_contract();
+    }
+
+    #[cfg(feature = "proof-mutants")]
+    #[allow(dead_code)]
+    fn upper_biased_median_split_index(len: usize) -> usize {
+        len.div_ceil(2)
+    }
+
+    #[cfg(feature = "proof-mutants")]
+    #[kani::proof]
+    #[kani::unwind(1)]
+    #[kani::stub(median_split_index, upper_biased_median_split_index)]
+    fn median_split_contract_survives_upper_bias() {
+        verify_median_policy_contract();
+    }
+
+    #[cfg(feature = "proof-mutants")]
+    #[allow(dead_code)]
+    fn empty_lower_split_index(_len: usize) -> usize {
+        0
+    }
+
+    #[cfg(feature = "proof-mutants")]
+    #[kani::proof]
+    #[kani::should_panic]
+    #[kani::unwind(1)]
+    #[kani::stub(median_split_index, empty_lower_split_index)]
+    fn median_split_contract_rejects_empty_lower_mutant() {
+        verify_median_policy_contract();
     }
 }

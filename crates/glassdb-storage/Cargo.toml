@@ -27,6 +27,9 @@ tracing = "0.1.44"
 [features]
 default = []
 sim = []
+# Enables Kani-only negative controls. It never changes a normal Rust build;
+# every use is additionally guarded by `cfg(kani)`.
+proof-mutants = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
