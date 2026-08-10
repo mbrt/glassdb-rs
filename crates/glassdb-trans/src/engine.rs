@@ -297,16 +297,14 @@ impl Engine {
     }
 
     /// Scans one logical key range and returns its validation evidence.
-    pub async fn scan_keys(
+    pub async fn scan(
         &self,
         collection: &CollectionAddress,
         range: &ScanRange,
         overlay: &[ScanMutation],
-        own_lock_holder: Option<&TxId>,
-        cap: Option<&[u8]>,
     ) -> Result<ScanResult, StorageError> {
         self.resolver
-            .scan_keys(collection, range, overlay, own_lock_holder, cap)
+            .scan_keys(collection, range, overlay, None, None)
             .await
     }
 

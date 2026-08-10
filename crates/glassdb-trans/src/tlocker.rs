@@ -258,7 +258,7 @@ async fn build_groups(
             .leaves_through(
                 &scan.collection.physical_prefix(),
                 &scan.range.start,
-                scan.frontier.as_deref(),
+                scan.frontier(),
                 scan_requirement,
             )
             .await

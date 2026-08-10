@@ -422,7 +422,7 @@ fn single_rw_shape(data: &Data) -> Option<SingleRw> {
         if r.key != write.key {
             return None;
         }
-        read_version = Some(r.last_writer.clone()?);
+        read_version = Some(r.last_writer().cloned()?);
     }
     Some(SingleRw {
         key: write.key.clone(),
@@ -481,7 +481,7 @@ fn eligible_writer(
 /// state can change the effective writer without rewriting the leaf.
 fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
     let raw_key = read.key.key();
-    let Some(node) = read.leaf.value().map(AsRef::as_ref) else {
+    let Some(node) = read.observation().value().map(AsRef::as_ref) else {
         return Ok(false);
     };
     let leaf = node
@@ -1339,10 +1339,10 @@ impl Algo {
     ) -> Result<bool, TransError> {
         for read in &data.reads {
             let leaf_unchanged = match lock_validation {
-                Some(locked) => locked.validated(&read.leaf),
+                Some(locked) => locked.validated(read.observation()),
                 None => matches!(
                     self.shards
-                        .check_leaf_current(&read.leaf, validation_start)
+                        .check_leaf_current(read.observation(), validation_start)
                         .await?,
                     LeafObservationCheck::Current
                 ),
@@ -1363,7 +1363,7 @@ impl Algo {
         validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for coverage in data.scans.iter().flat_map(|scan| &scan.covered) {
+        for coverage in data.scans.iter().flat_map(|scan| scan.covered()) {
             let leaf_unchanged = match lock_validation {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
@@ -1400,7 +1400,7 @@ impl Algo {
         let keys: Vec<KeyRef> = data.reads.iter().map(|read| read.key.clone()).collect();
         let current = self.resolver.effective_writers(&keys, requirement).await?;
         for r in &data.reads {
-            if current.get(&r.key).and_then(Option::as_ref) != r.last_writer.as_ref() {
+            if current.get(&r.key).and_then(Option::as_ref) != r.last_writer() {
                 return Ok(false);
             }
         }
@@ -1426,19 +1426,19 @@ impl Algo {
                 .scan_coverage(
                     &scan.collection,
                     &scan.range,
-                    scan.frontier.as_deref(),
+                    scan.frontier(),
                     own_lock_holder,
                     requirement,
                 )
                 .await?;
-            let mut fast = current.len() == scan.covered.len()
-                && !current.iter().zip(&scan.covered).any(|(now, observed)| {
+            let mut fast = current.len() == scan.covered().len()
+                && !current.iter().zip(scan.covered()).any(|(now, observed)| {
                     now.path != observed.path
                         || now.membership_version != observed.membership_version
                 });
             if fast {
                 for holder in scan
-                    .covered
+                    .covered()
                     .iter()
                     .flat_map(|leaf| &leaf.pending_membership)
                 {
@@ -1459,11 +1459,11 @@ impl Algo {
                     &scan.range,
                     &scan.overlay,
                     own_lock_holder,
-                    scan.frontier.as_deref(),
+                    scan.frontier(),
                     requirement,
                 )
                 .await?;
-            if resolved.keys != scan.keys {
+            if resolved.keys() != scan.keys() {
                 return Ok(false);
             }
         }
@@ -1517,7 +1517,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::access::{ScanAccess, ScanRange, WriteAccess};
+    use crate::access::{ScanRange, WriteAccess};
     use crate::collection_catalog::CollectionCatalog;
     use crate::collection_coordination::CollectionStateResolver;
     use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
@@ -1698,11 +1698,8 @@ mod tests {
 
     async fn do_read(tctx: &Tctx, key: &KeyRef) -> ReadAccess {
         let outcome = read_outcome(tctx, key).await;
-        ReadAccess {
-            key: key.clone(),
-            last_writer: outcome.last_writer,
-            leaf: outcome.leaf,
-        }
+        let (_, _, evidence) = outcome.into_parts();
+        ReadAccess::new(key.clone(), evidence)
     }
 
     async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
@@ -2100,7 +2097,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer.as_ref().unwrap(), h.id());
+        assert_eq!(r.last_writer().unwrap(), h.id());
     }
 
     // Full path (ADR-024): a read whose value moved before it was locked does not
@@ -2182,7 +2179,7 @@ mod tests {
         // The stale write never committed: v2 is still current (the abandoned
         // attempt's object is unreferenced, so help-forward cannot promote it).
         assert_eq!(
-            do_read(&tctx, &keyp).await.last_writer.unwrap(),
+            do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
             *h2.id(),
             "the stale write did not commit; v2 is still current"
         );
@@ -2199,7 +2196,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            do_read(&tctx, &keyp).await.last_writer.unwrap(),
+            do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
             *h3.id(),
             "the renewed attempt commits"
         );
@@ -2924,7 +2921,7 @@ mod tests {
             .unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer.unwrap(), tid);
+        assert_eq!(r.last_writer().cloned().unwrap(), tid);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2978,7 +2975,7 @@ mod tests {
             "an observed gate bypasses the direct commit"
         );
         assert_eq!(
-            do_read(&tctx, &keyp).await.last_writer,
+            do_read(&tctx, &keyp).await.last_writer().cloned(),
             Some(handle.id().clone())
         );
     }
@@ -3104,7 +3101,7 @@ mod tests {
         // The window is observably at the committed holder H1 (v2), not the
         // lagging pointer H0: the shared resolver already help-forwards it.
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer.clone().unwrap(), h1);
+        assert_eq!(r.last_writer().cloned().unwrap(), h1);
 
         // Eligibility mirrors that resolution: given the reconciled lock state,
         // an RMW that read H1 and a blind put are both committable and build on
@@ -3154,7 +3151,10 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&h2));
         assert!(e.locked_by.is_empty());
-        assert_eq!(do_read(&tctx, &keyp).await.last_writer.unwrap(), h2);
+        assert_eq!(
+            do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
+            h2
+        );
     }
 
     // ADR-051: an eligible small overwrite commits in a single conditional leaf
@@ -3194,7 +3194,14 @@ mod tests {
             }
         );
         assert!(e.locked_by.is_empty(), "no lock was ever installed");
-        assert_eq!(read_outcome(&tctx, &keyp).await.last_writer.unwrap(), tid);
+        assert_eq!(
+            read_outcome(&tctx, &keyp)
+                .await
+                .last_writer()
+                .cloned()
+                .unwrap(),
+            tid
+        );
     }
 
     // ADR-051 regression: a direct commit lands on an entry whose write lock is
@@ -3265,7 +3272,7 @@ mod tests {
             "the superseded holder was replaced, not preserved"
         );
         let outcome = read_outcome(&tctx, &keyp).await;
-        assert_eq!(outcome.last_writer.unwrap(), h2);
+        assert_eq!(outcome.last_writer().cloned().unwrap(), h2);
         assert_eq!(&*outcome.value.unwrap().value, b"v3");
     }
 
@@ -3871,6 +3878,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opaque_point_read_evidence_tracks_validation() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = key_ref(b"k");
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+
+        let outcome = read_outcome(&tctx, &keyp).await;
+        let (_, _, evidence) = outcome.into_parts();
+        let data = Data {
+            reads: vec![ReadAccess::new(keyp.clone(), evidence)],
+            writes: Vec::new(),
+            scans: Vec::new(),
+        };
+
+        let validation_start = tctx.timeline.now();
+        assert!(
+            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence accepts its current value"
+        );
+
+        let (peer, _peer_ctx) = new_algo_from_backend(tctx.backend.clone()).await;
+        commit_writes(&peer, vec![wa(&keyp, b"v2")]).await;
+        let validation_start = tctx.timeline.now();
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence rejects a superseded value"
+        );
+    }
+
+    #[tokio::test]
     async fn point_read_re_resolves_writer_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
@@ -3903,7 +3943,7 @@ mod tests {
         };
 
         let read = do_read(&tctx, &keyp).await;
-        assert_eq!(read.last_writer.as_ref(), Some(&previous));
+        assert_eq!(read.last_writer(), Some(&previous));
         let data = Data {
             reads: vec![read],
             writes: Vec::new(),
@@ -3971,7 +4011,7 @@ mod tests {
         }
 
         let read = do_read(&tctx, &keyp).await;
-        assert_eq!(read.last_writer.as_ref(), Some(&previous));
+        assert_eq!(read.last_writer(), Some(&previous));
         let data = Data {
             reads: vec![read],
             writes: Vec::new(),
@@ -4020,7 +4060,7 @@ mod tests {
         assert!(settled, "setup write-back must settle before receipt test");
 
         let read = do_read(&tctx, &ka).await;
-        let observed = read.leaf.clone();
+        let observed = read.observation().clone();
         let validation_start = tctx.timeline.now();
 
         // Another transaction's disjoint lock CAS validates the same pre-CAS
@@ -4248,7 +4288,7 @@ mod tests {
 
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer.as_ref(), Some(&deleted_by));
+        assert_eq!(r.last_writer(), Some(&deleted_by));
         let mut h = begin_data(
             &tm,
             Data {
@@ -4281,7 +4321,7 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert!(e.current.is_tombstone());
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer.as_ref(), Some(h.id()));
+        assert_eq!(r.last_writer(), Some(h.id()));
     }
 
     #[tokio::test]
@@ -4352,24 +4392,56 @@ mod tests {
             .scan_keys(&test_collection(), &range, &[], None, None)
             .await
             .unwrap();
-        let keys = scan.keys.clone();
+        let keys = scan.keys().to_vec();
+        let access = scan.into_access(test_collection(), range, Vec::new());
         let data = Data {
             reads: Vec::new(),
             writes: Vec::new(),
-            scans: vec![ScanAccess {
-                collection: test_collection(),
-                range,
-                overlay: Vec::new(),
-                keys: keys.clone(),
-                frontier: scan.frontier,
-                covered: scan.covered,
-            }],
+            scans: vec![access],
         };
         (data, keys)
     }
 
     async fn scan_data(tctx: &Tctx) -> (Data, Vec<Vec<u8>>) {
         scan_data_for_range(tctx, ScanRange::all()).await
+    }
+
+    #[tokio::test]
+    async fn opaque_scan_evidence_tracks_validation() {
+        let (tm, tctx) = new_algo().await;
+        seed_live_keys(&tctx, &[b"a", b"c"]).await;
+
+        let range = ScanRange::all();
+        let resolver = KeyResolver::new(
+            TreeRouter::new(tctx.shards.clone()),
+            KeyStateResolver::new(tctx.tmon.clone()),
+        );
+        let result = resolver
+            .scan_keys(&test_collection(), &range, &[], None, None)
+            .await
+            .unwrap();
+        let data = Data {
+            reads: Vec::new(),
+            writes: Vec::new(),
+            scans: vec![result.into_access(test_collection(), range, Vec::new())],
+        };
+
+        let validation_start = tctx.timeline.now();
+        assert!(
+            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence accepts its current membership"
+        );
+
+        commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
+        let validation_start = tctx.timeline.now();
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "opaque evidence rejects a changed membership"
+        );
     }
 
     // ADR-031 phantom prevention: a listing whose covered leaves are unchanged
@@ -4512,7 +4584,7 @@ mod tests {
         };
         let (mut stale, keys) = scan_data_for_range(&tctx, range.clone()).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(stale.scans[0].frontier.as_deref(), Some(b"b".as_slice()));
+        assert_eq!(stale.scans[0].frontier(), Some(b"b".as_slice()));
         stale.writes.push(wa(&key_ref(b"a"), b"updated"));
 
         // Removing the old frontier means the refreshed two-key page reaches
@@ -4526,7 +4598,7 @@ mod tests {
         // the next validation adds S1 before committing.
         let (mut fresh, keys) = scan_data_for_range(&tctx, range).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"m".to_vec()]);
-        assert_eq!(fresh.scans[0].frontier.as_deref(), Some(b"m".as_slice()));
+        assert_eq!(fresh.scans[0].frontier(), Some(b"m".as_slice()));
         fresh.writes.push(wa(&key_ref(b"a"), b"updated"));
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();

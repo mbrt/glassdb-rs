@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{LeafLocator, Requirement, ShardEntry, StorageError, TreeRouter};
 
-use crate::access::{LeafCoverage, ScanMutation, ScanRange};
+use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
 use crate::key_state_resolver::{HolderResolution, KeyStateResolver, WriterResolution};
 use crate::monitor::KeyCommitStatus;
@@ -18,10 +18,28 @@ use crate::monitor::KeyCommitStatus;
 /// leaves' membership dependencies, and the effective page frontier.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
-    pub keys: Vec<Vec<u8>>,
-    pub covered: Vec<LeafCoverage>,
-    /// Inclusive validation/locking frontier; `None` means positive infinity.
-    pub frontier: Option<Vec<u8>>,
+    evidence: ScanEvidence,
+}
+
+impl ScanResult {
+    /// Returns the live keys surfaced by the scan.
+    pub fn keys(&self) -> &[Vec<u8>] {
+        self.evidence.keys()
+    }
+
+    /// Converts this result into the access record required for validation.
+    pub fn into_access(
+        self,
+        collection: CollectionAddress,
+        range: ScanRange,
+        overlay: Vec<ScanMutation>,
+    ) -> ScanAccess {
+        ScanAccess::new(collection, range, overlay, self.evidence)
+    }
+
+    pub(crate) fn new(evidence: ScanEvidence) -> Self {
+        Self { evidence }
+    }
 }
 
 /// Resolves logical keys and ranges through the B-link tree.
@@ -93,11 +111,11 @@ impl KeyResolver {
         };
 
         if range.is_empty() {
-            return Ok(ScanResult {
-                keys: Vec::new(),
-                covered: Vec::new(),
-                frontier: Some(range.start.clone()),
-            });
+            return Ok(ScanResult::new(ScanEvidence::new(
+                Vec::new(),
+                Vec::new(),
+                Some(range.start.clone()),
+            )));
         }
 
         let mut overlay: BTreeMap<Vec<u8>, bool> = overlay
@@ -160,11 +178,8 @@ impl KeyResolver {
                 keys.push(key);
                 if range.limit.is_some_and(|limit| keys.len() == limit) {
                     covered.push(coverage);
-                    return Ok(ScanResult {
-                        frontier: keys.last().cloned(),
-                        keys,
-                        covered,
-                    });
+                    let frontier = keys.last().cloned();
+                    return Ok(ScanResult::new(ScanEvidence::new(keys, covered, frontier)));
                 }
             }
             covered.push(coverage);
@@ -184,11 +199,8 @@ impl KeyResolver {
             loc = next;
         }
 
-        Ok(ScanResult {
-            keys,
-            covered,
-            frontier: cap.map(<[u8]>::to_vec).or_else(|| range.end.clone()),
-        })
+        let frontier = cap.map(<[u8]>::to_vec).or_else(|| range.end.clone());
+        Ok(ScanResult::new(ScanEvidence::new(keys, covered, frontier)))
     }
 
     /// Loads only a scan's physical validation dependencies, without resolving
@@ -844,10 +856,10 @@ mod tests {
         log.lock().unwrap().clear();
 
         let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        assert_eq!(out.last_writer(), Some(&writer));
         let value = out.value.expect("inline value is present");
         assert_eq!(value.value.as_ref(), b"hello");
         assert_eq!(value.version.writer, writer);
-        assert_eq!(out.last_writer, Some(writer));
         assert_eq!(
             count_tx_reads(&log),
             0,
@@ -872,7 +884,7 @@ mod tests {
 
         let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
         assert!(out.value.is_none());
-        assert_eq!(out.last_writer, Some(writer));
+        assert_eq!(out.last_writer(), Some(&writer));
         assert_eq!(
             count_tx_reads(&log),
             0,

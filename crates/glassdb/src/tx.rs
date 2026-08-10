@@ -13,11 +13,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, CollectionId, KeyRef, TxId};
-use glassdb_storage::LeafObservation;
+use glassdb_data::{CollectionAddress, CollectionId, KeyRef};
 use glassdb_trans::{
     CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead, DirectoryReadKind,
-    ReadAccess, ScanAccess, ScanMutation, WriteAccess,
+    ReadAccess, ReadEvidence, ScanAccess, ScanMutation, WriteAccess,
 };
 
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
@@ -107,35 +106,36 @@ impl Transaction {
         }
 
         match self.db.engine.read(&key, std::time::Duration::MAX).await {
-            Ok(outcome) => match outcome.value {
-                None => {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.record_read(
-                        key,
-                        ReadState::NotFound {
-                            last_writer: outcome.last_writer,
-                            cache_hit: outcome.cache_hit,
-                            leaf: outcome.leaf,
-                        },
-                    );
-                    Ok(None)
+            Ok(outcome) => {
+                let (value, cache_hit, evidence) = outcome.into_parts();
+                match value {
+                    None => {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.record_read(
+                            key,
+                            ReadState::NotFound {
+                                cache_hit,
+                                evidence,
+                            },
+                        );
+                        Ok(None)
+                    }
+                    Some(rv) => {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner
+                            .staged
+                            .insert(key.clone(), StagedValue::Read(rv.value.clone()));
+                        inner.record_read(
+                            key,
+                            ReadState::Found {
+                                cache_hit,
+                                evidence,
+                            },
+                        );
+                        Ok(Some(rv.value.to_vec()))
+                    }
                 }
-                Some(rv) => {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner
-                        .staged
-                        .insert(key.clone(), StagedValue::Read(rv.value.clone()));
-                    inner.record_read(
-                        key,
-                        ReadState::Found {
-                            last_writer: rv.version.writer,
-                            cache_hit: outcome.cache_hit,
-                            leaf: outcome.leaf,
-                        },
-                    );
-                    Ok(Some(rv.value.to_vec()))
-                }
-            },
+            }
             // A read is side-effect-free; `from_read` centralizes the mapping
             // (notably a sustained outage becomes the retry-safe
             // `Error::Unavailable` rather than `InDoubt`).
@@ -191,18 +191,12 @@ impl Transaction {
         let result = self
             .db
             .engine
-            .scan_keys(c.address(), &range, &overlay, None, None)
+            .scan(c.address(), &range, &overlay)
             .await
             .map_err(Error::from_read)?;
-        let keys = result.keys;
-        self.inner.lock().unwrap().scans.push(ScanAccess {
-            collection: c.address().clone(),
-            range,
-            overlay,
-            keys: keys.clone(),
-            frontier: result.frontier,
-            covered: result.covered,
-        });
+        let keys = result.keys().to_vec();
+        let access = result.into_access(c.address().clone(), range, overlay);
+        self.inner.lock().unwrap().scans.push(access);
         Ok(KeyPage::new(keys, limit))
     }
 
@@ -552,19 +546,12 @@ impl Transaction {
         }
         let mut reads = Vec::new();
         for (k, v) in &inner.reads {
-            let (last_writer, leaf) = match v {
-                ReadState::Found {
-                    last_writer, leaf, ..
-                } => (Some(last_writer.clone()), leaf.clone()),
-                ReadState::NotFound {
-                    last_writer, leaf, ..
-                } => (last_writer.clone(), leaf.clone()),
+            let evidence = match v {
+                ReadState::Found { evidence, .. } | ReadState::NotFound { evidence, .. } => {
+                    evidence.clone()
+                }
             };
-            reads.push(ReadAccess {
-                key: k.clone(),
-                last_writer,
-                leaf,
-            });
+            reads.push(ReadAccess::new(k.clone(), evidence));
         }
         // Emit accesses in a stable path order so the commit path (transaction
         // log contents, lock acquisition order, validation order) is
@@ -737,14 +724,12 @@ impl StagedValue {
 
 enum ReadState {
     Found {
-        last_writer: TxId,
         cache_hit: bool,
-        leaf: LeafObservation,
+        evidence: ReadEvidence,
     },
     NotFound {
-        last_writer: Option<TxId>,
         cache_hit: bool,
-        leaf: LeafObservation,
+        evidence: ReadEvidence,
     },
 }
 

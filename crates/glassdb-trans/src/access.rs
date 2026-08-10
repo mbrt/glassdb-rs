@@ -12,14 +12,47 @@ use std::sync::Arc;
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::LeafObservation;
 
+/// Opaque validation evidence retained by a transactional point read.
+#[derive(Debug, Clone)]
+pub struct ReadEvidence {
+    last_writer: Option<TxId>,
+    leaf: LeafObservation,
+}
+
+impl ReadEvidence {
+    pub(crate) fn new(last_writer: Option<TxId>, leaf: LeafObservation) -> Self {
+        Self { last_writer, leaf }
+    }
+
+    pub(crate) fn last_writer(&self) -> Option<&TxId> {
+        self.last_writer.as_ref()
+    }
+
+    pub(crate) fn observation(&self) -> &LeafObservation {
+        &self.leaf
+    }
+}
+
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
     pub key: KeyRef,
-    /// Effective writer observed by the read, including a tombstone writer.
-    pub last_writer: Option<TxId>,
-    /// Exact leaf state from which the writer was resolved.
-    pub leaf: LeafObservation,
+    evidence: ReadEvidence,
+}
+
+impl ReadAccess {
+    /// Creates point-read access from its logical key and opaque validation evidence.
+    pub fn new(key: KeyRef, evidence: ReadEvidence) -> Self {
+        Self { key, evidence }
+    }
+
+    pub(crate) fn last_writer(&self) -> Option<&TxId> {
+        self.evidence.last_writer()
+    }
+
+    pub(crate) fn observation(&self) -> &LeafObservation {
+        self.evidence.observation()
+    }
 }
 
 /// A single key write within a transaction.
@@ -52,6 +85,40 @@ impl WriteAccess {
     }
 }
 
+/// Opaque validation evidence retained by a transactional range scan.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanEvidence {
+    keys: Vec<Vec<u8>>,
+    covered: Vec<LeafCoverage>,
+    frontier: Option<Vec<u8>>,
+}
+
+impl ScanEvidence {
+    pub(crate) fn new(
+        keys: Vec<Vec<u8>>,
+        covered: Vec<LeafCoverage>,
+        frontier: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            keys,
+            covered,
+            frontier,
+        }
+    }
+
+    pub(crate) fn keys(&self) -> &[Vec<u8>] {
+        &self.keys
+    }
+
+    pub(crate) fn frontier(&self) -> Option<&[u8]> {
+        self.frontier.as_deref()
+    }
+
+    pub(crate) fn covered(&self) -> &[LeafCoverage] {
+        &self.covered
+    }
+}
+
 /// A range/sorted listing performed within a transaction (ADR-031 phantom
 /// prevention). It records the logical page plus the membership version and
 /// pending membership-write holders of every covered leaf. Commit validates
@@ -64,12 +131,35 @@ pub struct ScanAccess {
     pub range: ScanRange,
     /// Staged membership mutations visible when the scan ran.
     pub overlay: Vec<ScanMutation>,
-    /// Keys surfaced to the transaction body.
-    pub keys: Vec<Vec<u8>>,
-    /// Inclusive validation/locking frontier; `None` means positive infinity.
-    pub frontier: Option<Vec<u8>>,
-    /// The leaves the scan covered, in key order, with membership dependencies.
-    pub covered: Vec<LeafCoverage>,
+    evidence: ScanEvidence,
+}
+
+impl ScanAccess {
+    pub(crate) fn new(
+        collection: CollectionAddress,
+        range: ScanRange,
+        overlay: Vec<ScanMutation>,
+        evidence: ScanEvidence,
+    ) -> Self {
+        Self {
+            collection,
+            range,
+            overlay,
+            evidence,
+        }
+    }
+
+    pub(crate) fn keys(&self) -> &[Vec<u8>] {
+        self.evidence.keys()
+    }
+
+    pub(crate) fn frontier(&self) -> Option<&[u8]> {
+        self.evidence.frontier()
+    }
+
+    pub(crate) fn covered(&self) -> &[LeafCoverage] {
+        self.evidence.covered()
+    }
 }
 
 /// A normalized half-open key range used by the transaction engine.
@@ -126,10 +216,10 @@ pub struct ScanMutation {
 
 /// One leaf a scan covered and its membership-only validation dependencies.
 #[derive(Debug, Clone)]
-pub struct LeafCoverage {
-    pub path: Arc<str>,
-    pub membership_version: u64,
-    pub pending_membership: Vec<TxId>,
+pub(crate) struct LeafCoverage {
+    pub(crate) path: Arc<str>,
+    pub(crate) membership_version: u64,
+    pub(crate) pending_membership: Vec<TxId>,
     pub(crate) observation: LeafObservation,
 }
 
