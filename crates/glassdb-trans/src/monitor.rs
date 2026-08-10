@@ -12,7 +12,8 @@ use glassdb_concurr::{Background, Backoff, RetryConfig, rt, shard::Sharded};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
     Observation, Requirement, SequencePoint, StorageError, TLogger, TValue, Timeline,
-    TxCollectionChange, TxCommitStatus, TxLock, TxLog, TxStatus,
+    TxCollectionChange, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog, TxRecordState,
+    TxStatus,
 };
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
@@ -730,11 +731,8 @@ impl Monitor {
                 }
             };
 
-            match classify_commit_observation(
-                failure,
-                status.status,
-                status.observation.is_absent(),
-            )? {
+            let record_state = TxRecordState::try_from_observation(&status.observation)?;
+            match classify_commit_observation(failure, record_state)? {
                 CommitResolution::Committed => {
                     self.record_durable_observation(tid, &status.observation);
                     return Ok(());
@@ -799,11 +797,8 @@ impl Monitor {
         let mut backoff = self.inner.retry.backoff();
         loop {
             let current = TxStatus::from_observation(expected.clone());
-            let target = match classify_abort_observation(
-                transition,
-                current.status,
-                current.observation.is_absent(),
-            )? {
+            let record_state = TxRecordState::try_from_observation(&current.observation)?;
+            let target = match classify_abort_observation(transition, record_state) {
                 AbortObservationAction::Settled => {
                     self.record_durable_observation(tid, &current.observation);
                     return Ok(current);
@@ -846,11 +841,9 @@ impl Monitor {
                         .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
                     self.record_durable_observation(tid, &st.observation);
-                    if classify_abort_observation(
-                        transition,
-                        st.status,
-                        st.observation.is_absent(),
-                    )? == AbortObservationAction::Settled
+                    let record_state = TxRecordState::try_from_observation(&st.observation)?;
+                    if classify_abort_observation(transition, record_state)
+                        == AbortObservationAction::Settled
                     {
                         return Ok(st);
                     }
@@ -1609,38 +1602,20 @@ impl Monitor {
 /// Selects the abort-side action justified by one durable observation.
 fn classify_abort_observation(
     transition: AbortTransition,
-    status: TxCommitStatus,
-    absent: bool,
-) -> Result<AbortObservationAction, TransError> {
-    match (status, absent) {
-        (TxCommitStatus::Ok | TxCommitStatus::Aborted, false) => {
-            Ok(AbortObservationAction::Settled)
+    current: TxRecordState,
+) -> AbortObservationAction {
+    let (desired, target) = match transition {
+        AbortTransition::Acknowledge => (TxRecordState::Aborted, TxCommitStatus::Aborted),
+        AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent => {
+            (TxRecordState::Wounded, TxCommitStatus::Wounded)
         }
-        (TxCommitStatus::Wounded, false) => Ok(match transition {
-            AbortTransition::Acknowledge => AbortObservationAction::Write(TxCommitStatus::Aborted),
-            AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent => {
-                AbortObservationAction::Settled
-            }
-        }),
-        (TxCommitStatus::Pending, false) => Ok(AbortObservationAction::Write(match transition {
-            AbortTransition::Acknowledge => TxCommitStatus::Aborted,
-            AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent => {
-                TxCommitStatus::Wounded
-            }
-        })),
-        (TxCommitStatus::Unknown, true) => Ok(match transition {
-            AbortTransition::Acknowledge => AbortObservationAction::Write(TxCommitStatus::Aborted),
-            AbortTransition::EnsureWounded => {
-                AbortObservationAction::Write(TxCommitStatus::Wounded)
-            }
-            AbortTransition::WoundIfPresent => AbortObservationAction::Settled,
-        }),
-        (TxCommitStatus::Unknown, false) => Err(TransError::other(
-            "transaction has an invalid persisted status",
-        )),
-        (_, true) => Err(TransError::other(
-            "transaction status disagrees with its absent observation",
-        )),
+    };
+    if transition == AbortTransition::WoundIfPresent && current == TxRecordState::Missing {
+        return AbortObservationAction::Settled;
+    }
+    match current.relation_to(desired) {
+        TxLifecycleRelation::Same | TxLifecycleRelation::Blocks => AbortObservationAction::Settled,
+        TxLifecycleRelation::CanAdvance => AbortObservationAction::Write(target),
     }
 }
 
@@ -1648,24 +1623,20 @@ fn classify_abort_observation(
 /// return success.
 fn classify_commit_observation(
     failure: CommitWriteFailure,
-    status: TxCommitStatus,
-    absent: bool,
+    current: TxRecordState,
 ) -> Result<CommitResolution, TransError> {
-    match (status, absent) {
-        (TxCommitStatus::Ok, false) => Ok(CommitResolution::Committed),
-        (TxCommitStatus::Aborted | TxCommitStatus::Wounded, false) => {
+    match (current.relation_to(TxRecordState::Committed), current) {
+        (TxLifecycleRelation::Same, TxRecordState::Committed) => Ok(CommitResolution::Committed),
+        (TxLifecycleRelation::Blocks, TxRecordState::Aborted | TxRecordState::Wounded) => {
             Ok(CommitResolution::AlreadyFinalized)
         }
-        (TxCommitStatus::Pending, false) => Ok(CommitResolution::Retry),
-        (TxCommitStatus::Unknown, true) => Ok(match failure {
+        (TxLifecycleRelation::CanAdvance, TxRecordState::Pending) => Ok(CommitResolution::Retry),
+        (TxLifecycleRelation::CanAdvance, TxRecordState::Missing) => Ok(match failure {
             CommitWriteFailure::Conflict => CommitResolution::AlreadyFinalized,
             CommitWriteFailure::Ambiguous { .. } => CommitResolution::InDoubt,
         }),
-        (TxCommitStatus::Unknown, false) => Err(TransError::other(
-            "transaction has an invalid persisted status",
-        )),
-        (_, true) => Err(TransError::other(
-            "transaction status disagrees with its absent observation",
+        _ => Err(TransError::other(
+            "transaction lifecycle relation cannot resolve a commit",
         )),
     }
 }
@@ -1704,51 +1675,49 @@ mod tests {
 
         for transition in [acknowledge, ensure_wounded, wound_if_present] {
             assert_eq!(
-                classify_abort_observation(transition, TxCommitStatus::Ok, false).unwrap(),
+                classify_abort_observation(transition, TxRecordState::Committed),
                 AbortObservationAction::Settled
             );
             assert_eq!(
-                classify_abort_observation(transition, TxCommitStatus::Aborted, false).unwrap(),
-                AbortObservationAction::Settled
-            );
-        }
-
-        assert_eq!(
-            classify_abort_observation(acknowledge, TxCommitStatus::Wounded, false).unwrap(),
-            AbortObservationAction::Write(TxCommitStatus::Aborted)
-        );
-        for transition in [ensure_wounded, wound_if_present] {
-            assert_eq!(
-                classify_abort_observation(transition, TxCommitStatus::Wounded, false).unwrap(),
+                classify_abort_observation(transition, TxRecordState::Aborted),
                 AbortObservationAction::Settled
             );
         }
 
         assert_eq!(
-            classify_abort_observation(acknowledge, TxCommitStatus::Pending, false).unwrap(),
+            classify_abort_observation(acknowledge, TxRecordState::Wounded),
             AbortObservationAction::Write(TxCommitStatus::Aborted)
         );
         for transition in [ensure_wounded, wound_if_present] {
             assert_eq!(
-                classify_abort_observation(transition, TxCommitStatus::Pending, false).unwrap(),
+                classify_abort_observation(transition, TxRecordState::Wounded),
+                AbortObservationAction::Settled
+            );
+        }
+
+        assert_eq!(
+            classify_abort_observation(acknowledge, TxRecordState::Pending),
+            AbortObservationAction::Write(TxCommitStatus::Aborted)
+        );
+        for transition in [ensure_wounded, wound_if_present] {
+            assert_eq!(
+                classify_abort_observation(transition, TxRecordState::Pending),
                 AbortObservationAction::Write(TxCommitStatus::Wounded)
             );
         }
 
         assert_eq!(
-            classify_abort_observation(acknowledge, TxCommitStatus::Unknown, true).unwrap(),
+            classify_abort_observation(acknowledge, TxRecordState::Missing),
             AbortObservationAction::Write(TxCommitStatus::Aborted)
         );
         assert_eq!(
-            classify_abort_observation(ensure_wounded, TxCommitStatus::Unknown, true).unwrap(),
+            classify_abort_observation(ensure_wounded, TxRecordState::Missing),
             AbortObservationAction::Write(TxCommitStatus::Wounded)
         );
         assert_eq!(
-            classify_abort_observation(wound_if_present, TxCommitStatus::Unknown, true).unwrap(),
+            classify_abort_observation(wound_if_present, TxRecordState::Missing),
             AbortObservationAction::Settled
         );
-        assert!(classify_abort_observation(acknowledge, TxCommitStatus::Unknown, false).is_err());
-        assert!(classify_abort_observation(acknowledge, TxCommitStatus::Pending, true).is_err());
     }
 
     #[test]
@@ -1760,33 +1729,31 @@ mod tests {
 
         for failure in [conflict, ambiguous] {
             assert_eq!(
-                classify_commit_observation(failure, TxCommitStatus::Ok, false).unwrap(),
+                classify_commit_observation(failure, TxRecordState::Committed).unwrap(),
                 CommitResolution::Committed
             );
             assert_eq!(
-                classify_commit_observation(failure, TxCommitStatus::Aborted, false).unwrap(),
+                classify_commit_observation(failure, TxRecordState::Aborted).unwrap(),
                 CommitResolution::AlreadyFinalized
             );
             assert_eq!(
-                classify_commit_observation(failure, TxCommitStatus::Wounded, false).unwrap(),
+                classify_commit_observation(failure, TxRecordState::Wounded).unwrap(),
                 CommitResolution::AlreadyFinalized
             );
             assert_eq!(
-                classify_commit_observation(failure, TxCommitStatus::Pending, false).unwrap(),
+                classify_commit_observation(failure, TxRecordState::Pending).unwrap(),
                 CommitResolution::Retry
             );
         }
 
         assert_eq!(
-            classify_commit_observation(conflict, TxCommitStatus::Unknown, true).unwrap(),
+            classify_commit_observation(conflict, TxRecordState::Missing).unwrap(),
             CommitResolution::AlreadyFinalized
         );
         assert_eq!(
-            classify_commit_observation(ambiguous, TxCommitStatus::Unknown, true).unwrap(),
+            classify_commit_observation(ambiguous, TxRecordState::Missing).unwrap(),
             CommitResolution::InDoubt
         );
-        assert!(classify_commit_observation(conflict, TxCommitStatus::Unknown, false).is_err());
-        assert!(classify_commit_observation(conflict, TxCommitStatus::Pending, true).is_err());
     }
 
     #[test]

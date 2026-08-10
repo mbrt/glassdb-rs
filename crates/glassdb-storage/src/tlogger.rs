@@ -44,6 +44,77 @@ impl TxCommitStatus {
     }
 }
 
+/// The normalized durable state of a transaction-log record.
+///
+/// Missing records are represented explicitly; [`TxCommitStatus::Unknown`] is
+/// never a persisted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRecordState {
+    Missing,
+    Pending,
+    Wounded,
+    Committed,
+    Aborted,
+}
+
+/// The semantic relationship between two transaction-record states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxLifecycleRelation {
+    /// Both sides describe the same semantic state.
+    Same,
+    /// The durable lifecycle permits advancing from the first state to the second.
+    CanAdvance,
+    /// Advancing would contradict an existing durable decision.
+    Blocks,
+}
+
+impl TxRecordState {
+    /// Normalizes an optional persisted status, rejecting `Unknown`.
+    pub fn try_from_status(status: Option<TxCommitStatus>) -> Result<Self, StorageError> {
+        match status {
+            None => Ok(TxRecordState::Missing),
+            Some(TxCommitStatus::Pending) => Ok(TxRecordState::Pending),
+            Some(TxCommitStatus::Wounded) => Ok(TxRecordState::Wounded),
+            Some(TxCommitStatus::Ok) => Ok(TxRecordState::Committed),
+            Some(TxCommitStatus::Aborted) => Ok(TxRecordState::Aborted),
+            Some(TxCommitStatus::Unknown) => Err(StorageError::other(
+                "unknown is not a persisted transaction status",
+            )),
+        }
+    }
+
+    /// Returns the normalized state represented by an exact observation.
+    pub fn try_from_observation(observed: &Observation<TxLog>) -> Result<Self, StorageError> {
+        Self::try_from_status(observed.value().map(|log| log.status))
+    }
+
+    /// Relates this state to a desired durable state using the transaction
+    /// lifecycle graph.
+    pub fn relation_to(self, desired: TxRecordState) -> TxLifecycleRelation {
+        if self == desired {
+            return TxLifecycleRelation::Same;
+        }
+        match (self, desired) {
+            (
+                TxRecordState::Missing,
+                TxRecordState::Pending
+                | TxRecordState::Wounded
+                | TxRecordState::Committed
+                | TxRecordState::Aborted,
+            )
+            | (
+                TxRecordState::Pending,
+                TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted,
+            )
+            | (TxRecordState::Wounded, TxRecordState::Aborted)
+            | (TxRecordState::Committed | TxRecordState::Aborted, TxRecordState::Missing) => {
+                TxLifecycleRelation::CanAdvance
+            }
+            _ => TxLifecycleRelation::Blocks,
+        }
+    }
+}
+
 /// The full contents of a transaction log entry.
 #[derive(Debug, Clone)]
 pub struct TxLog {
@@ -366,37 +437,22 @@ fn validate_lifecycle_transition(
     current: Option<TxCommitStatus>,
     next: Option<TxCommitStatus>,
 ) -> Result<(), StorageError> {
-    if current == Some(TxCommitStatus::Unknown) || next == Some(TxCommitStatus::Unknown) {
+    let current = TxRecordState::try_from_status(current)?;
+    let next = TxRecordState::try_from_status(next)?;
+    if current == TxRecordState::Missing && next == TxRecordState::Missing {
         return Err(StorageError::other(
-            "unknown is not a persisted transaction status",
+            "transaction lifecycle transition has no source or destination",
         ));
     }
 
-    match (current, next) {
-        (
-            None | Some(TxCommitStatus::Pending),
-            Some(
-                TxCommitStatus::Pending
-                | TxCommitStatus::Ok
-                | TxCommitStatus::Aborted
-                | TxCommitStatus::Wounded,
-            ),
-        ) => Ok(()),
-        (Some(TxCommitStatus::Wounded), Some(TxCommitStatus::Aborted)) => Ok(()),
-        (Some(TxCommitStatus::Ok | TxCommitStatus::Aborted), None) => Ok(()),
-        (Some(TxCommitStatus::Pending | TxCommitStatus::Wounded), None)
-        | (Some(TxCommitStatus::Wounded), Some(_))
-        | (Some(TxCommitStatus::Ok | TxCommitStatus::Aborted), Some(_)) => {
-            Err(StorageError::Precondition)
+    match current.relation_to(next) {
+        TxLifecycleRelation::CanAdvance => Ok(()),
+        TxLifecycleRelation::Same
+            if current == TxRecordState::Pending && next == TxRecordState::Pending =>
+        {
+            Ok(())
         }
-        (None, None) => Err(StorageError::other(
-            "transaction lifecycle transition has no source or destination",
-        )),
-        // Unknown statuses are rejected above, but keep this match exhaustive
-        // if the status enum gains another non-persisted variant.
-        _ => Err(StorageError::other(
-            "invalid transaction lifecycle transition",
-        )),
+        TxLifecycleRelation::Same | TxLifecycleRelation::Blocks => Err(StorageError::Precondition),
     }
 }
 
@@ -792,6 +848,39 @@ mod tests {
         let actual: Vec<_> = operations.iter().map(|operation| operation.op).collect();
         assert_eq!(actual, expected);
         operations.clear();
+    }
+
+    #[test]
+    fn lifecycle_relation_defines_the_complete_state_graph() {
+        use TxLifecycleRelation::{Blocks, CanAdvance, Same};
+        use TxRecordState::{Aborted, Committed, Missing, Pending, Wounded};
+
+        let states = [Missing, Pending, Wounded, Committed, Aborted];
+        let advances = [
+            (Missing, Pending),
+            (Missing, Wounded),
+            (Missing, Committed),
+            (Missing, Aborted),
+            (Pending, Wounded),
+            (Pending, Committed),
+            (Pending, Aborted),
+            (Wounded, Aborted),
+            (Committed, Missing),
+            (Aborted, Missing),
+        ];
+
+        for current in states {
+            for desired in states {
+                let expected = if current == desired {
+                    Same
+                } else if advances.contains(&(current, desired)) {
+                    CanAdvance
+                } else {
+                    Blocks
+                };
+                assert_eq!(current.relation_to(desired), expected);
+            }
+        }
     }
 
     #[tokio::test]
