@@ -15,9 +15,8 @@
 use crate::error::StorageError;
 use glassdb_data::KeyRef;
 
-use crate::tlogger::{
-    TxCommitStatus, TxLog, TxWrite, decode_tx_log, decode_tx_status, marshal_log,
-};
+use crate::tlogger::{decode_tx_log, decode_tx_status, marshal_log};
+use crate::transaction::{TxCommitStatus, TxLog, TxWrite};
 
 /// Encodes a transaction object to its canonical protobuf body (the CAS unit).
 ///
@@ -58,7 +57,7 @@ mod tests {
 
     use super::*;
     use crate::lock::LockType;
-    use crate::tlogger::{TxCommitStatus, TxLock, TxWrite};
+    use crate::transaction::{TxCommitStatus, TxLock, TxWrite};
 
     fn key(key: &[u8]) -> KeyRef {
         KeyRef::new(CollectionAddress::root("db"), key)

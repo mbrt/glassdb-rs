@@ -15,6 +15,7 @@ mod shard_store;
 mod structlog;
 mod timeline;
 mod tlogger;
+mod transaction;
 mod tree_router;
 pub mod txobject;
 mod version;
@@ -50,9 +51,10 @@ pub use shard::{CurrentState, Shard, ShardEntry};
 pub use shard_store::{LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use timeline::{SequencePoint, Timeline};
-pub use tlogger::{
-    TLogger, TValue, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLifecycleRelation,
-    TxListPage, TxLock, TxLog, TxRecordState, TxStatus, TxWrite,
+pub use tlogger::{TLogger, TValue, TxListPage, TxStatus};
+pub use transaction::{
+    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog,
+    TxRecordState, TxWrite,
 };
 pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};
 pub use version::Version;
