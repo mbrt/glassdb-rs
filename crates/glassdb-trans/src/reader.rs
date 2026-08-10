@@ -12,9 +12,8 @@ use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId};
-use glassdb_storage::{
-    LeafObservation, Requirement, StorageError, Timeline, TxCommitStatus, Version,
-};
+use glassdb_storage::transaction::TxCommitStatus;
+use glassdb_storage::{LeafObservation, Requirement, StorageError, Timeline, Version};
 
 use crate::error::trans_to_storage;
 use crate::key_resolver::KeyResolver;

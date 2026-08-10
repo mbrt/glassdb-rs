@@ -397,9 +397,10 @@ mod tests {
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, paths};
+    use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CurrentState, LockType, Node, Shard, ShardEntry, ShardStore, TLogger,
-        Timeline, TreeRouter, TxCommitStatus,
+        CachedStore, CurrentState, LockType, Node, Shard, ShardEntry, ShardStore, Timeline,
+        TreeRouter,
     };
 
     use crate::monitor::Monitor;
@@ -583,7 +584,7 @@ mod tests {
     // Commits `writer`'s value for `key` through the monitor (a tombstone when
     // `deleted`), so a later help-forward of that holder observes it.
     async fn commit_value(mon: &Monitor, key: &[u8], writer: &TxId, deleted: bool) {
-        use glassdb_storage::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxLog, TxWrite};
         mon.begin_tx(writer);
         let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {

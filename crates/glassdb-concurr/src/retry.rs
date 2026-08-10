@@ -1,8 +1,5 @@
 //! Retry-with-backoff utilities. Ported from the Go `concurr` backoff helpers.
-//! A closure returns [`RetryErr::Transient`] to be retried or
-//! [`RetryErr::Permanent`] to stop immediately.
 
-use std::future::Future;
 use std::time::Duration;
 
 const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
@@ -93,62 +90,6 @@ fn jittered(d: Duration) -> Duration {
     let min = base * (1.0 - JITTER_FACTOR);
     let span = base * (2.0 * JITTER_FACTOR);
     Duration::from_secs_f64(min + rand_unit() * span)
-}
-
-/// Classifies a retryable operation's error.
-#[derive(Debug)]
-pub enum RetryErr<E> {
-    /// The operation should be retried after a backoff.
-    Transient(E),
-    /// The operation must not be retried; the inner error is returned as-is.
-    Permanent(E),
-}
-
-impl<E> RetryErr<E> {
-    /// Convenience constructor for a transient error.
-    pub fn transient(e: E) -> Self {
-        RetryErr::Transient(e)
-    }
-
-    /// Convenience constructor for a permanent error.
-    pub fn permanent(e: E) -> Self {
-        RetryErr::Permanent(e)
-    }
-}
-
-/// Retries `f` with default exponential backoff until it succeeds or returns a
-/// permanent error. Callers cancel a retry loop by dropping the returned
-/// future (e.g. via [`tokio::time::timeout`] or [`tokio::select!`]).
-pub async fn retry_with_backoff<T, E, F, Fut>(f: F) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, RetryErr<E>>>,
-{
-    retry(INITIAL_INTERVAL, MAX_INTERVAL, f).await
-}
-
-/// Retries `f` with exponential backoff between `initial` and `max` intervals.
-/// Callers wrap the call in `tokio::time::timeout` to bound the total wait;
-/// dropping the future is the only cancellation mechanism.
-pub async fn retry<T, E, F, Fut>(initial: Duration, max: Duration, mut f: F) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, RetryErr<E>>>,
-{
-    let mut backoff = RetryConfig {
-        initial_interval: initial,
-        max_interval: max,
-    }
-    .backoff();
-    loop {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(RetryErr::Permanent(e)) => return Err(e),
-            Err(RetryErr::Transient(_e)) => {
-                crate::rt::sleep(backoff.next_delay()).await;
-            }
-        }
-    }
 }
 
 #[cfg(test)]

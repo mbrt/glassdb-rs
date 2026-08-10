@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use glassdb_data::{CollectionAddress, TxId};
-use glassdb_storage::{Requirement, SplitPolicy, TxCollectionChange, TxCollectionOp, TxLock};
+use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
+use glassdb_storage::{Requirement, SplitPolicy};
 
 use crate::collection_catalog::CollectionCatalog;
 use crate::collections::{CollectionData, CollectionLifecycle, CollectionOp};

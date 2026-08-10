@@ -114,10 +114,10 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::CollectionId;
-    use glassdb_storage::{
-        CachedStore, CollectionStore, LockType, TLogger, Timeline, TxCollectionChange,
-        TxCollectionOp, TxCommitStatus, TxLock, TxLog,
+    use glassdb_storage::transaction::{
+        TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog,
     };
+    use glassdb_storage::{CachedStore, CollectionStore, LockType, Timeline};
 
     use super::*;
     use crate::monitor::Monitor;

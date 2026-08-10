@@ -49,10 +49,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, rt};
 use glassdb_data::{CollectionAddress, TxId, paths};
+use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
     CollectionStore, IndexNode, InlinePolicy, LeafObservation, LockType, Node, Observation,
     Requirement, Shard, ShardEntry, ShardStore, SplitPolicy, StorageError, StructuralLog,
-    StructuralLogPhase, Timeline, TreeRouter, TxCommitStatus, TxLock, TxLog,
+    StructuralLogPhase, Timeline, TreeRouter,
 };
 use tokio::sync::Notify;
 
@@ -2338,9 +2339,9 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_data::{KeyRef, TxId};
+    use glassdb_storage::transaction::{TLogger, TxWrite};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, ShardEntry,
-        TLogger, TxWrite,
     };
 
     const COLL: &str = "db/_c/0000000000000000000000";

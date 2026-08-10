@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, KeyRef, LeafRef, TxId};
-use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry, TxCommitStatus};
+use glassdb_storage::transaction::TxCommitStatus;
+use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry};
 
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;

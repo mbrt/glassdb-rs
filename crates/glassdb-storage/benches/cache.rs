@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use glassdb_concurr::shard;
-use glassdb_storage::{Cache, Weighable};
+use glassdb_storage::cache::{Cache, Weighable};
 
 const WORKING_SET_SIZES: [usize; 3] = [1_000, 10_000, 100_000];
 const ENTRY_BYTES: usize = 64;

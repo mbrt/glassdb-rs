@@ -56,7 +56,7 @@ use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture, HookOutcome};
 use glassdb::backend::{Backend, BackendError};
 use glassdb::{Collection, CollectionPath, Database, Error, Transaction};
-use glassdb_storage::TxCommitStatus;
+use glassdb_storage::transaction::TxCommitStatus;
 
 type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + Send + Sync>;
 type After = Box<dyn for<'a, 'b> Fn(&BackendOp<'a>, HookOutcome<'b>) -> HookFuture + Send + Sync>;

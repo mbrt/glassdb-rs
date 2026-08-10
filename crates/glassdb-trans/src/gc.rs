@@ -37,10 +37,8 @@ use std::time::UNIX_EPOCH;
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, rt};
 use glassdb_data::{KeyRef, TxId, paths, shuffle};
-use glassdb_storage::{
-    Observation, Requirement, ShardStore, StorageError, TLogger, Timeline, TreeRouter,
-    TxCommitStatus, TxLock, TxLog,
-};
+use glassdb_storage::transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog};
+use glassdb_storage::{Observation, Requirement, ShardStore, StorageError, Timeline, TreeRouter};
 
 use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
@@ -313,13 +311,13 @@ impl Gc {
         let dropped = log
             .collection_changes
             .iter()
-            .filter(|change| change.op == glassdb_storage::TxCollectionOp::Drop)
+            .filter(|change| change.op == TxCollectionOp::Drop)
             .map(|change| change.collection.clone())
             .collect::<Vec<_>>();
         let active_created = log
             .collection_changes
             .iter()
-            .filter(|change| change.op == glassdb_storage::TxCollectionOp::Create)
+            .filter(|change| change.op == TxCollectionOp::Create)
             .map(|change| change.collection.clone())
             .collect::<BTreeSet<_>>();
         let unused_prepared = log
@@ -383,7 +381,7 @@ impl Gc {
         let drops = log
             .collection_changes
             .iter()
-            .filter(|change| change.op == glassdb_storage::TxCollectionOp::Drop)
+            .filter(|change| change.op == TxCollectionOp::Drop)
             .map(|change| change.collection.clone())
             .collect::<Vec<_>>();
         self.collection_lifecycle
@@ -581,9 +579,10 @@ mod tests {
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{CollectionAddress, CollectionId};
+    use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxWrite};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard,
-        ShardEntry, Timeline, TreeRouter, TxCollectionChange, TxCollectionOp, TxWrite,
+        ShardEntry, Timeline, TreeRouter,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};

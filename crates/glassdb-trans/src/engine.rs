@@ -6,10 +6,11 @@ use std::time::Duration;
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, TxId, paths};
+use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
     PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, ShardStore,
-    SplitPolicy, StorageError, TLogger, Timeline, TreeRouter,
+    SplitPolicy, StorageError, Timeline, TreeRouter,
 };
 
 use crate::access::{Data, ScanMutation, ScanRange};

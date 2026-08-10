@@ -941,7 +941,8 @@ mod tests {
     };
     use glassdb_concurr::Background;
     use glassdb_data::paths;
-    use glassdb_storage::{CachedStore, CurrentState, LockType, Node, Shard, TLogger, Timeline};
+    use glassdb_storage::transaction::TLogger;
+    use glassdb_storage::{CachedStore, CurrentState, LockType, Node, Shard, Timeline};
 
     const COLL: &str = "coordp";
 

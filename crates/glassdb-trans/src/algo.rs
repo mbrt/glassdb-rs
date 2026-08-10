@@ -31,10 +31,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId};
+use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafObservationCheck, LockType, NodeLocks, Requirement,
-    SequencePoint, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline, TxCommitStatus,
-    TxLock, TxLog, TxWrite,
+    SequencePoint, ShardEntry, ShardStore, SplitPolicy, StorageError, Timeline,
 };
 
 use crate::access::{Data, ReadAccess, WriteOp};
@@ -1530,9 +1530,10 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionAddress, CollectionId, LeafRef, paths};
+    use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
-        ShardStore, TLogger, TreeRouter, TxCommitStatus,
+        ShardStore, TreeRouter,
     };
 
     const TEST_DB: &str = "testp";
