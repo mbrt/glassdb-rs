@@ -11,9 +11,8 @@ use std::time::{Duration, SystemTime};
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt, shard::Sharded};
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{
-    Observation, Requirement, SequencePoint, StorageError, TLogger, TValue, Timeline,
-    TxCollectionChange, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog, TxRecordState,
-    TxStatus,
+    Observation, Requirement, SequencePoint, StorageError, TLogger, Timeline, TxCollectionChange,
+    TxCommitStatus, TxLifecycleRelation, TxLock, TxLog, TxRecordState, TxStatus,
 };
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
@@ -507,6 +506,15 @@ impl TxRecoveryManifest {
 pub(crate) enum TxFinalStatus {
     Committed,
     Aborted,
+}
+
+/// A value written by a transaction, including whether it was deleted or absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TValue {
+    pub value: Arc<[u8]>,
+    pub deleted: bool,
+    /// True when the transaction committed without writing this value.
+    pub not_written: bool,
 }
 
 /// A transaction's commit status for a specific key, plus the value written.
