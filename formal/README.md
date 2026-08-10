@@ -13,11 +13,10 @@ Stage 3 implementation-history checker lives in
 This remains an exploration rather than an accepted architecture gate. It is
 manually invoked and is not run by CI.
 
-The suite also reproduces a known correctness defect in the current four-status
-protocol: a suspended owner can outlive a foreign wound's finite `Aborted`
-tombstone and recreate its transaction object after GC. A successful runner
-exit means this required counterexample was reproduced alongside the clean
-graphs; it does not mean the wound/GC seam is safe.
+The owner/wound/GC composition includes ADR-059's pinned `Wounded` marker and
+owner acknowledgement protocol. The intended graph now excludes resurrection;
+a historical mutant that writes a foreign wound directly as GC-eligible
+`Aborted` still reproduces the original failure.
 
 The checked boundary is split into deliberately small, exhaustive models:
 
@@ -33,7 +32,7 @@ The checked boundary is split into deliberately small, exhaustive models:
 - separate B-link split, collection lifecycle, cache-evidence, and
   transaction-object reclamation models with named transaction-core
   assumption/guarantee boundaries; plus a focused owner/wound/GC composition
-  witness for the violated anti-resurrection boundary.
+  check for the pinned-wound anti-resurrection boundary.
 
 The proposed long-lived snapshot-read protocol is intentionally excluded. The
 models and history checker cover only strong latest-value transactions.
@@ -56,9 +55,9 @@ Both locations are covered by the repository's existing `target` ignore rule.
 Every top-level `tla/*.cfg` file registers one run through its first-line
 `@verify-formal` comment. The runner discovers the files in deterministic name
 order and validates the complete catalog before starting TLC. Safety and
-liveness entries name their wrapper module; mutants and known-protocol
-witnesses additionally name the exact invariant and seeded action their trace
-must contain. Adding an unannotated or malformed configuration fails the run
+liveness entries name their wrapper module; expected-counterexample entries
+additionally name the exact invariant and seeded action their trace must
+contain. Adding an unannotated or malformed configuration fails the run
 instead of silently omitting it. Log and metadata names are the configuration
 basename converted from CamelCase to kebab-case.
 
@@ -66,7 +65,6 @@ basename converted from CamelCase to kebab-case.
 \* @verify-formal safety MC_TxCore
 \* @verify-formal liveness MC_TxCoreLiveness
 \* @verify-formal mutant MC_TxCoreMutants S1_TerminalState ReverseCommitted
-\* @verify-formal known-protocol WoundResurrectionWitness WR1_NoResurrectionAfterForeignWound LateOwnerCommit
 ```
 
 The command intentionally remains separate from `make test-all`: the suite is
@@ -94,7 +92,7 @@ not yet a required project toolchain or CI check.
 | `tla/CollectionLifecycle.tla` | Incarnation binding, participant fencing, topology settlement, and drop. |
 | `tla/CacheEvidence.tla` | Path-lane ownership, freshness evidence, cancellation, and detached mutation effects. |
 | `tla/GarbageCollection.tla` | Reference/horizon eligibility, pending abort, lock release, and final-object deletion. |
-| `tla/WoundResurrectionWitness.tla` | Faithful current-protocol counterexample composing a lazy absent holder, foreign abort, finite GC, and same-owner resumption. |
+| `tla/WoundRetirement.tla` | ADR-059 composition of lazy holder publication, pinned foreign wounds, owner retirement, acknowledgement, and GC. |
 | `tla/TxBLinkComposition.tla` | Shared-state TxCore/B-link split-gate composition and its mismatch mutant. |
 
 The model imports no Rust types or implementation code.
@@ -135,8 +133,8 @@ model checks the resulting count independently.
 ### Physical-to-logical refinement
 
 The reduced physical leaf state contains a materialized base value/writer plus
-read and write locks. The durable transaction object is absent, pending,
-committed, or aborted. The logical view of a key is:
+read and write locks. In `TxCore`, the durable transaction object is absent,
+pending, committed, or aborted. The logical view of a key is:
 
 1. the logged value of a committed exclusive holder that has not yet been
    written back; otherwise
@@ -149,11 +147,12 @@ logged value always names an immutable committed object; the pilot contains no
 logless inline values.
 
 Pending objects are lazy. A transaction may acquire locks while its object is
-absent, refresh into pending, or commit directly from absent. Wounding or
-expiry may instead install aborted, which the commit CAS cannot replace while
-that tombstone remains present. `WoundResurrectionWitness` demonstrates why a
-finite tombstone is not a durable fence for a suspended owner. The commit
-mutation records the complete expected semantic status and lease rather than an
+absent, refresh into pending, or commit directly from absent. `TxCore` collapses
+terminal-for-commit `Wounded` and acknowledged `Aborted` because it has no
+transaction-object deletion. `WoundRetirement` refines that reduction: a
+foreign wound installs pinned `Wounded`, only proven owner retirement permits
+`Wounded -> Aborted`, and only `Aborted` is GC-eligible. The commit mutation
+records the complete expected semantic status and lease rather than an
 ever-increasing revision.
 
 ### Reduction choices
@@ -174,11 +173,13 @@ pre-commit CAS detail:
 - A wound terminates the attempt inside `TxCore`. `RecoveryLifecycle` composes
   the missing step by allocating a fresh attempt for the same public operation,
   preserving priority, and prohibiting a superseded attempt from committing
-  after it observes the wound. That reduction does not establish retirement of
-  a suspended pre-materialization owner; the focused resurrection witness keeps
-  that owner live across GC instead.
-- An older contender may create an aborted tombstone for a younger holder whose
-  pending object is still absent. Missing-object grace applies to
+  after it observes the wound. `WoundRetirement` separately keeps a suspended
+  pre-materialization owner live while a foreign actor installs `Wounded`, and
+  checks the retirement-before-acknowledgement ordering.
+- `TxCore` represents a foreign wound of an absent/pending holder as aborted;
+  this is safe only because that model never reclaims transaction objects.
+  `WoundRetirement` restores the production distinction between pinned
+  `Wounded` and GC-eligible `Aborted`. Missing-object grace applies to
   observer-driven expiry, not to the wound-wait priority rule. The pilot reduces
   the observer-relative progress timer to one saturating expiry choice and does
   not verify its exact duration.
@@ -192,11 +193,12 @@ pre-commit CAS detail:
   compatibility table is identical in this domain. Key membership/phantom
   behavior is checked by normalized scans in the implementation history
   workload; catalog incarnation creation is checked in `CollectionLifecycle`.
-- The reclamation clock is not modeled in `TxCore`. The focused resurrection
-  witness adds only recent/expired tombstone classes, enough to refute a finite
-  retention fence without assigning them wall-clock durations. An unresolved
-  final mutation can remain unresolved indefinitely, which conservatively
-  admits ADR-057's public `InDoubt` result and never repairs an absent decision.
+- The reclamation clock is not modeled in `TxCore`. `WoundRetirement` adds one
+  saturating age class and checks that elapsed time never deletes `Wounded`,
+  while owner acknowledgement resets the ordinary `Aborted` retention horizon.
+  An unresolved final mutation can remain unresolved indefinitely, which
+  conservatively admits ADR-057's public `InDoubt` result and never repairs an
+  absent decision.
   ADR-057's individual status-read and pending-to-redispatch recovery steps are
   collapsed into the model's acknowledged, clean-precondition, and unresolved
   branches.
@@ -229,7 +231,8 @@ Safety is conditional on the following storage and environment contract:
    possibly-landed backend changes.
 8. Transaction IDs are unique and priority comparisons are stable. Uniqueness
    does not imply that the same owner retires within a reclamation horizon; the
-   resurrection witness deliberately retains one identity across that horizon.
+   pinned-wound check and its negative control retain one identity across that
+   horizon.
 9. Only conforming GlassDB clients mutate protocol objects.
 
 The safety configurations do not assume an eventually healthy backend or fair
@@ -326,9 +329,9 @@ becomes healthy, and checks that a crashed holder's lock is eventually
 released and an observing waiter eventually consumes the final state.
 
 `RecoveryLifecycle` deliberately has no final-object deletion and makes the
-victim observe an atomic wound before renewal. It therefore does not cover a
-suspended original owner resuming after a foreign abort record has been
-collected; `WoundResurrectionWitness` isolates that missing composition.
+victim observe an atomic wound before renewal. `WoundRetirement` supplies the
+missing deletion boundary and checks that the original owner cannot resume past
+a foreign wound until it retires and acknowledges that identity.
 
 | Operator | Property |
 | --- | --- |
@@ -363,14 +366,13 @@ spaces. Each module names both the facts it assumes from `TxCore` and the
 - `GarbageCollection` models ordinary logged objects, lock/value references,
   recent/old horizons, forced pending abort, lock release, and final deletion.
   `TxCoreGcGuarantee` preserves referenced/recent objects and forbids guessed
-  recreation of a deleted final decision. Its normal graph deliberately reduces
-  away the lazy holder-before-object window, so this guarantee assumes the
-  same-owner resurrection path is absent.
-- `WoundResurrectionWitness` removes that assumption for the current committed
-  four-status protocol. It preserves the original owner across lazy holder
-  publication, a foreign `Aborted` wound, lock release, finite-horizon deletion,
-  and create-if-absent finalization. TLC then reaches the known terminality
-  violation.
+  recreation of a deleted final decision. Its normal graph reduces away the
+  lazy holder-before-object window and relies on ADR-059's pinned-wound contract.
+- `WoundRetirement` composes that contract explicitly. It preserves the original
+  owner across lazy holder publication and arbitrary bounded delay, permits
+  cleanup while `Wounded` remains present, requires retirement before
+  acknowledgement as `Aborted`, and permits deletion only after the fresh abort
+  horizon. Same-identity resurrection remains unreachable.
 
 These are separate assume/guarantee contract checks, not one monolithic state
 graph.
@@ -379,9 +381,10 @@ and wall-clock horizon magnitudes are data-independent reductions documented in
 the individual modules. `TxBLinkComposition` additionally couples the highest
 risk adjacent boundary through shared leaf-entry/reference state: the split
 gate must exclude lock installation and write-back between sibling copy and
-atomic source shrink/right-link publication. The wound-resurrection witness is
-the focused composition check for the lazy-owner/GC boundary, and it currently
-fails as required.
+atomic source shrink/right-link publication. `WoundRetirement` is the focused
+composition check for the lazy-owner/GC boundary; its fixed graph
+now exhausts cleanly, while the superseded foreign-`Aborted` behavior remains a
+negative control.
 
 ### Implementation-history refinement
 
@@ -411,10 +414,10 @@ The required runs differ along the two dimensions that affect locking:
 
 | Configuration | Leaf mapping | Priorities | Generated states | Distinct states | Pilot runtime |
 | --- | --- | --- | ---: | ---: | ---: |
-| `TxCoreSameLeafDistinct.cfg` | Both keys on one leaf | older/younger | 3,726,164 | 981,944 | 55 s |
-| `TxCoreSameLeafEqual.cfg` | Both keys on one leaf | equal | 1,087,463 | 284,869 | 19 s |
+| `TxCoreSameLeafDistinct.cfg` | Both keys on one leaf | older/younger | 3,726,164 | 981,944 | 57 s |
+| `TxCoreSameLeafEqual.cfg` | Both keys on one leaf | equal | 1,087,463 | 284,869 | 21 s |
 | `TxCoreCrossLeafDistinct.cfg` | One key per leaf | older/younger | 6,846,744 | 1,566,901 | 2 min 6 s |
-| `TxCoreCrossLeafEqual.cfg` | One key per leaf | equal | 5,233,832 | 1,228,624 | 1 min 47 s |
+| `TxCoreCrossLeafEqual.cfg` | One key per leaf | equal | 5,233,832 | 1,228,624 | 1 min 48 s |
 
 These measurements were recorded on 2026-08-10 with TLC 1.7.4, OpenJDK 21,
 one TLC worker, fingerprint polynomial 0, and no depth bound. Counts are stable;
@@ -444,6 +447,7 @@ The extension configurations use the same TLC/JVM settings:
 | `CollectionLifecycleSafety.cfg` | Two incarnations and two nodes | 11,825 | 2,795 |
 | `CacheEvidenceSafety.cfg` | Two operations on one cache/path lane | 4,822 | 2,742 |
 | `GarbageCollectionSafety.cfg` | Two logged objects and two reference kinds | 1,157 | 289 |
+| `WoundRetirementSafety.cfg` | Pinned foreign wound, owner acknowledgement, and GC | 39 | 26 |
 | `TxBLinkCompositionSafety.cfg` | Shared leaf/reference state across TxCore and split | 57 | 40 |
 
 Every row exhausted its complete finite graph with zero states left on the
@@ -453,11 +457,9 @@ and one-worker configuration; runtime remains machine-dependent.
 
 ## Seeded counterexamples
 
-`make verify-formal` runs two kinds of required failure: synthetic negative
-controls that validate invariant sensitivity, and a faithful witness for a
-known defect in the current protocol. A syntax error, tool failure, unexpected
-invariant, missing seeded action, or unexpectedly successful counterexample
-fails the runner.
+`make verify-formal` requires every synthetic negative control to expose its
+named defect. A syntax error, tool failure, unexpected invariant, missing seeded
+action, or unexpectedly successful mutant fails the runner.
 
 | Mutant | Required violation | Counterexample |
 | --- | --- | --- |
@@ -500,6 +502,7 @@ controls:
 | `GuessDeletedObjectCommitted` | `GC4_DeletedFinalNeverRecreated` | Recreates a reclaimed final object by guessing that it committed. |
 | `ReleasePendingLocks` | `GC3_PendingAbortedBeforeRelease` | Removes a lock reference before the pending decision is durably aborted. |
 | `DeleteReferencedFinal` | `GC1_ReferencedObjectsRemainPresent` | Deletes a final transaction object while a physical lock still references it. |
+| `ForeignAbortWound` | `WR1_NoResurrectionAfterForeignWound` | Uses the superseded foreign-`Aborted` transition, allowing finite GC and same-identity resurrection. |
 | `AcquireWhileSplitGateHeld` | `TCBS4_LiveTxReferenceReachable` | Installs a lock after sibling copy, so source shrink loses the live transaction reference. |
 | `WaitInsteadOfWound` | `WW1_WaitGraphAcyclic` | Makes the older requester wait after the younger already waits, creating a two-node cycle. |
 
@@ -507,31 +510,35 @@ The deterministic mutant traces are retained in
 `target/formal/*mutant*.log`. They are separate wrapper actions rather than a
 bug-mode constant in the intended protocol.
 
-### Known protocol counterexample
+### Pinned wound and owner retirement
 
-`WoundResurrectionWitness.cfg` models the current committed four-status
-transaction-object lifecycle; it contains `Absent`, `Pending`, `Aborted`, and
-`Committed`, and deliberately contains no proposed repair state. Its ghost wound
-and commit histories only observe real actions and never enable them.
+`WoundRetirementSafety.cfg` models the five durable lifecycle states from
+ADR-059. A foreign actor writes `Wounded`, holder cleanup may proceed, and time
+may reach the finite horizon without making the marker deletable. If the owner
+returns, it first establishes retirement, then acknowledges
+`Wounded -> Aborted`; that transition resets the age before ordinary GC may
+delete the record. A dropped/unresolved owner leaves `Wounded` pinned.
 
-TLC reaches this trace:
+TLC exhausts this graph with 39 generated states, 26 distinct states, and zero
+queued states at depth 10. The log is retained in
+`target/formal/wound-retirement-safety.log`.
 
-1. `PublishLazyLock` publishes the owner's ID while its object is absent.
-2. `SuspendOwner` leaves the same operation live.
-3. `ForeignAbortWound` creates an ordinary `Aborted` object without retiring
-   the owner.
-4. `ReleaseAbortedLock` removes the durable holder only after the abort lands.
-5. `AdvanceTombstoneAge` crosses the finite retention horizon.
-6. `DeleteExpiredAbort` returns the physical object path to `Absent`.
-7. `ResumeOwner` resumes the original operation under the same ID.
-8. `LateOwnerCommit` performs its create-if-absent final write.
+`WoundRetirementMutantForeignAbort.cfg` restores the superseded foreign wound
+transition. Its trace is:
 
-The final action violates `WR1_NoResurrectionAfterForeignWound`. TLC explores
-27 states, finds 20 distinct states, and leaves one queued state at the expected
-safety violation (depth 9). The trace is retained in
-`target/formal/wound-resurrection-witness.log`. This is not a mutant and is not a
-model of any proposed fix; it is executable evidence that finite `Aborted`
-retention does not fence an unboundedly suspended owner.
+1. `PublishLazyLock` publishes the original identity while its object is absent.
+2. `SuspendOwner` leaves that owner operation live.
+3. `ForeignAbortWound` writes GC-eligible `Aborted` without retirement proof.
+4. `ReleaseTerminalLock` removes the durable holder.
+5. `AdvanceMarkerAge` reaches the finite retention horizon.
+6. `ResumeOwner` returns the original operation under the same identity.
+7. `DeleteExpiredAbort` returns the physical path to `Absent`.
+8. `LateOwnerCommit` recreates it as committed.
+
+The final action violates `WR1_NoResurrectionAfterForeignWound`. TLC generates
+60 states, finds 38 distinct states, and leaves one queued state at depth 9.
+The trace is retained in
+`target/formal/wound-retirement-mutant-foreign-abort.log`.
 
 ## Hand histories
 
@@ -593,8 +600,8 @@ The model also makes two protocol refinements explicit rather than inheriting
 older ADR wording:
 
 - a short logged transaction can commit `Absent -> Committed`; pending is lazy,
-  and an earlier `Aborted` wound defeats both refresh and commit only while its
-  tombstone remains present; and
+  and ADR-059 makes a foreign wound durably `Wounded` until the owner proves
+  retirement and acknowledges it as `Aborted`; and
 - after an ambiguous logged finalization, absence is never repaired. Failure to
   establish the decision remains `InDoubt`, as required by ADR-057.
 
@@ -612,13 +619,11 @@ could move a crashed attempt back to `Ready`. `AcknowledgeAcquire` now requires
 an active acquiring/waiting phase; otherwise it only settles the internal
 request and leaves crash recovery responsible for the installed lock.
 
-The focused owner/wound/GC composition then invalidated an assumption shared by
-the earlier core and standalone GC models. Transaction-ID uniqueness does not
-prove owner retirement: one operation can publish a lazy holder, remain
-suspended beyond every finite abort-retention horizon, and later resume under
-the same ID. Keeping the physical deletion and original owner in one state graph
-turns the previously synthetic recreation mutant into the causal eight-step
-counterexample above.
+The focused owner/wound/GC composition invalidated the former finite-tombstone
+assumption: transaction-ID uniqueness does not prove owner retirement. ADR-059
+responds with pinned `Wounded` plus an explicit owner acknowledgement. The
+updated graph checks that fix, while `ForeignAbortWound` preserves the original
+causal counterexample as a negative control.
 
 The logged liveness model found a second useful boundary: weak fairness selects
 the sorted fallback in an equal-priority cycle, but still permits one contender
@@ -630,9 +635,8 @@ unconditional per-client starvation freedom.
 
 ## Acceptance status and exclusions
 
-The bounded Stage 0-4 exploration is executable end to end, but the known
-wound/GC failure prevents treating it as a successful protocol-verification
-gate:
+The bounded Stage 0-4 exploration is executable end to end. It remains a manual
+finite-state exploration rather than an accepted project gate:
 
 - every intended-safe graph listed above exhausts with no error and no depth
   bound;
@@ -640,11 +644,12 @@ gate:
   properties, with the equal-priority completion assumption called out above;
 - every seeded mutant reaches its named bad action and violates its expected
   invariant;
-- the faithful four-status wound-resurrection witness reaches
-  `LateOwnerCommit` and violates its anti-resurrection invariant;
+- the ADR-059 owner/wound/GC composition exhausts cleanly, while its historical
+  four-status mutant still reaches `LateOwnerCommit` and violates the
+  anti-resurrection invariant;
 - the implementation-history checker rejects its seeded public anomalies and
   replays deterministic fuzz inputs under the real engine; and
-- the model decomposition, implementation-refinement boundary, and known-bug
+- the model decomposition, implementation-refinement boundary, and wound-fix
   trace received independent read-only review.
 
 This is finite-state evidence, not a proof of arbitrary deployments. The
@@ -658,8 +663,7 @@ following remain explicit trust or scale boundaries rather than hidden claims:
   state-space product of every protocol and production data size. The
   TxCore/B-link split-gate seam has a clean shared-state composition check.
   Collection and cache retain standalone contracts. The focused lazy-owner/GC
-  composition instead exposes that finite `Aborted` retention does not establish
-  the GC anti-resurrection guarantee for the current protocol.
+  composition checks ADR-059's pinned-wound handoff directly.
 - DirectCore reduces logged fallback to one atomic transition rather than
   composing it with all TxCore phases. Mixed coordinator rounds containing
   acquisition, direct, write-back, release, and GC resolvers are covered by
@@ -670,8 +674,9 @@ following remain explicit trust or scale boundaries rather than hidden claims:
 - Collection preparation/seed/catalog publication and GC candidate-feed,
   back-reference completeness, and cleanup liveness remain implementation
   contracts around their checked lifecycle and eligibility state machines.
-  Durable owner retirement or an equivalent anti-resurrection fence is an
-  unresolved protocol obligation, not a trusted fact supplied by this model.
+  `WoundRetirement` reduces the production owner-operation accounting and
+  unresolved-mutation proof to one explicit retirement transition; the Rust
+  lifecycle regressions cover the implementation detail behind that transition.
 - The Rust checker samples deterministic schedules and faults; TLC exhausts
   only the recorded finite domains. Neither is a deductive proof of Tokio,
   Rust, the object-store clients, or arbitrary user-closure side effects.
