@@ -71,6 +71,29 @@ MisclassifyUncertain(tx) ==
                    tx_status, tx_lease, read_locks, write_lock, committed,
                    aborted, linearized, lin_count, now>>
 
+\* A failed optimistic read-only/error validation promises that its retry will
+\* validate under shared locks. Returning the retry directly would expose a
+\* read-derived result without the lock-carrying validation barrier.
+ReturnEscalatedErrorWithoutLocks(tx) ==
+    /\ clients[tx].phase = "Reading"
+    /\ clients[tx].lock_reads
+    /\ clients[tx].read_done = ReadKeys(tx)
+    /\ ProgramResult[clients[tx].program] = "ValidatedError"
+    /\ ~HasAllLocks(tx)
+    /\ clients' =
+        [clients EXCEPT
+            ![tx].phase = "Done",
+            ![tx].outcome = "ValidatedError",
+            ![tx].validated = TRUE,
+            ![tx].commit_snapshot = logical_db,
+            ![tx].commit_writer_snapshot = last_writer,
+            ![tx].commit_post = logical_db]
+    /\ linearized' = Append(linearized, tx)
+    /\ lin_count' = [lin_count EXCEPT ![tx] = @ + 1]
+    /\ UNCHANGED <<logical_db, base_value, base_writer, last_writer,
+                   tx_status, tx_lease, read_locks, write_lock, committed,
+                   aborted, now>>
+
 TerminalReversalSpec ==
     Init /\ [][Next \/ \E tx \in Txns : ReverseCommitted(tx)]_vars
 
@@ -87,5 +110,9 @@ ExpiryAfterCommitSpec ==
 
 UncertaintyMisclassificationSpec ==
     Init /\ [][Next \/ \E tx \in Txns : MisclassifyUncertain(tx)]_vars
+
+UnlockedRetryErrorSpec ==
+    Init /\ [][Next \/ \E tx \in Txns :
+                         ReturnEscalatedErrorWithoutLocks(tx)]_vars
 
 =============================================================================

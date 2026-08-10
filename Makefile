@@ -21,8 +21,9 @@ lint:
 format:
 	cargo fmt --all
 
-# Exhaustively check the bounded formal transaction-core pilot. This is kept
-# separate from test-all because it requires Java and a pinned TLC artifact.
+# Exhaustively check the bounded protocol models and their negative controls.
+# This stays separate from test-all because it requires Java and a pinned TLC
+# artifact, and is not yet a required project gate.
 verify-formal:
 	hack/verify-formal.sh
 

@@ -55,6 +55,7 @@ ClientType ==
       observed_writer : [Keys -> Txns \cup {InitWriter, NoTx}],
       observed_value  : [Keys -> Values],
       held            : SUBSET Keys,
+      lock_reads      : BOOLEAN,
       serial_mode     : BOOLEAN,
       validated       : BOOLEAN,
       commit_snapshot : [Keys -> Values],
@@ -126,6 +127,7 @@ InitialClient ==
       observed_writer  |-> [key \in Keys |-> NoTx],
       observed_value   |-> InitialDb,
       held             |-> {},
+      lock_reads       |-> FALSE,
       serial_mode      |-> FALSE,
       validated        |-> FALSE,
       commit_snapshot  |-> InitialDb,
@@ -140,8 +142,10 @@ InitialClient ==
 WriteKeys(tx) ==
     IF clients[tx].program = NoProgram
     THEN {}
-    ELSE {key \in Keys :
-              ProgramWrites[clients[tx].program][key] # NoWrite}
+    ELSE IF ProgramResult[clients[tx].program] = "ValidatedError"
+         THEN {}
+         ELSE {key \in Keys :
+                  ProgramWrites[clients[tx].program][key] # NoWrite}
 
 ReadKeys(tx) ==
     IF clients[tx].program = NoProgram
@@ -291,7 +295,13 @@ FinishBody(tx) ==
        ELSE IF \/ ProgramResult[clients[tx].program] = "ValidatedError"
                \/ WriteKeys(tx) = {}
             THEN clients' =
-                 [clients EXCEPT ![tx].phase = "ReadValidating"]
+                 [clients EXCEPT
+                    ![tx].phase =
+                        IF clients[tx].lock_reads
+                        THEN IF HasAllLocks(tx)
+                             THEN "Validating"
+                             ELSE "Acquiring"
+                        ELSE "ReadValidating"]
             ELSE clients' =
                  [clients EXCEPT
                     ![tx].phase =
@@ -304,6 +314,7 @@ FinishBody(tx) ==
 
 ValidateReadOnly(tx) ==
     /\ clients[tx].phase = "ReadValidating"
+    /\ ~clients[tx].lock_reads
     /\ ObservationsCurrent(tx)
     /\ clients' =
         [clients EXCEPT
@@ -328,6 +339,7 @@ RetryReadOnly(tx) ==
     /\ clients' =
         [clients EXCEPT
             ![tx].phase = "Reading",
+            ![tx].lock_reads = TRUE,
             ![tx].read_done = {},
             ![tx].observed_writer = [key \in Keys |-> NoTx],
             ![tx].observed_value = InitialDb]
@@ -453,6 +465,31 @@ ValidateAfterLocking(tx) ==
                    tx_status, tx_lease, read_locks, write_lock,
                    committed, aborted, linearized, lin_count, now>>
 
+\* A read-derived body error is a read-only logical event, but the escalated
+\* attempt owns durable read locks. Production finalizes that attempt as
+\* aborted before returning the validated error, then releases its locks.
+FinalizeLockedValidatedError(tx) ==
+    /\ clients[tx].phase = "Ready"
+    /\ clients[tx].lock_reads
+    /\ clients[tx].validated
+    /\ HasAllLocks(tx)
+    /\ ProgramResult[clients[tx].program] = "ValidatedError"
+    /\ tx_status[tx] \in {"Absent", "Pending"}
+    /\ tx_status' = [tx_status EXCEPT ![tx] = "Aborted"]
+    /\ aborted' = aborted \cup {tx}
+    /\ clients' =
+        [clients EXCEPT
+            ![tx].phase = "Done",
+            ![tx].outcome = "ValidatedError",
+            ![tx].commit_snapshot = logical_db,
+            ![tx].commit_writer_snapshot = last_writer,
+            ![tx].commit_post = logical_db,
+            ![tx].commit_had_locks = TRUE]
+    /\ linearized' = Append(linearized, tx)
+    /\ lin_count' = [lin_count EXCEPT ![tx] = @ + 1]
+    /\ UNCHANGED <<logical_db, base_value, base_writer, last_writer,
+                   tx_lease, read_locks, write_lock, committed, now>>
+
 RetryBodyAfterStaleRead(tx) ==
     /\ clients[tx].phase = "Validating"
     /\ HasAllLocks(tx)
@@ -470,6 +507,7 @@ RetryBodyAfterStaleRead(tx) ==
 
 DispatchCommit(tx) ==
     /\ clients[tx].phase = "Ready"
+    /\ ProgramResult[clients[tx].program] = "Commit"
     /\ clients[tx].validated
     /\ HasAllLocks(tx)
     /\ tx_status[tx] \in {"Absent", "Pending"}
@@ -643,6 +681,7 @@ Next ==
     \/ \E tx \in Txns : DeadlockTimeout(tx)
     \/ \E tx \in Txns : RefreshPending(tx)
     \/ \E tx \in Txns : ValidateAfterLocking(tx)
+    \/ \E tx \in Txns : FinalizeLockedValidatedError(tx)
     \/ \E tx \in Txns : RetryBodyAfterStaleRead(tx)
     \/ \E tx \in Txns : DispatchCommit(tx)
     \/ \E tx \in Txns : ApplyCommit(tx)
@@ -721,6 +760,10 @@ S9_PostLockValidation ==
     /\ \A tx \in committed :
           /\ clients[tx].validated
           /\ clients[tx].commit_had_locks
+    /\ \A tx \in Txns :
+          /\ clients[tx].outcome = "ValidatedError"
+          /\ clients[tx].lock_reads
+          => clients[tx].commit_had_locks
     /\ \A tx \in SetOfSequence(linearized) :
           \A key \in ReadKeys(tx) :
               /\ clients[tx].observed_writer[key] =

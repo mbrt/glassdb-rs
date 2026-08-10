@@ -10,10 +10,20 @@ the pilot must demonstrate useful counterexamples, a maintainable abstraction,
 and an acceptable CI cost before the toolchain becomes an accepted project
 requirement.
 
-The initial Stage 0/1 logged-transaction safety pilot is implemented under
-[`formal/`](../../formal/README.md). It remains a manually invoked exploration:
-direct commits, implementation-history checking, liveness, independent review,
-and any CI gate are still pending.
+The bounded Stage 0-4 pilot is implemented under
+[`formal/`](../../formal/README.md), with the implementation-history checker in
+`crates/glassdb/src/sim/history.rs`. It includes direct/coordinator behavior,
+explicit recovery interfaces, safety and fair eventually-healthy liveness
+runs, normalized range-scan histories, composed topology/lifecycle/cache/GC
+models, a shared-state TxCore/B-link boundary check, seeded mutants, and
+independent review. A focused composition witness also exposes a correctness
+defect in the current four-status protocol: finite retention of a foreign
+`Aborted` wound does not fence an indefinitely suspended owner from recreating
+the same transaction object after GC. The witness deliberately models no
+proposed repair. Stage 4 therefore remains incomplete, and the suite remains a
+manually invoked exploration with no CI or accepted architecture gate. Stage 5
+tooling was evaluated but not adopted for the pilot, as permitted by its exit
+rule.
 
 ## Goal & scope
 
@@ -49,15 +59,17 @@ in-memory backend model. It includes logged commits, logless direct commits,
 read-only validation, point reads and writes, crashes, unavailable conditional
 mutations, wound-wait, leases, write-back, and the shard-mutation coordinator.
 
-The following are deferred to separately composed models after the transaction
-core is useful:
+The following are modeled as separately composed finite interfaces rather than
+being multiplied into the transaction-core state space:
 
-- range scans and phantom prevention;
+- range scans and phantom prevention in the implementation-history checker;
 - B-link split publication and routing;
 - transactional collection creation and drop;
 - transaction-object garbage collection;
+- the lazy-owner/foreign-wound/GC boundary, through a focused known-bug witness;
 - decoded and persistent cache evidence; and
-- real S3 and GCS adapter conformance.
+- S3 and GCS adapter behavior through their in-process contract suites; live
+  provider semantics remain a trusted environment assumption.
 
 The following are explicitly out of scope:
 
@@ -101,11 +113,14 @@ The first two executable artifacts are deliberately independent:
   admitted by a small sequential database specification. It does not inspect
   shard objects or duplicate the production commit algorithm.
 
-The formal model proves the design for each exhaustively checked finite
-configuration. The history checker closes part of the model-to-code gap over the
-many real executions explored by the existing deterministic executor. Targeted
-Kani, Verus/Creusot, or Loom work may later close specific remaining gaps, but is
-not required for the first pilot.
+The intended-safe formal configurations provide exhaustive finite-state evidence
+for their stated boundaries, while required mutants and known-protocol witnesses
+must produce their named failures. The wound-resurrection witness demonstrates
+that those local results do not compose into a proof of the current overall
+protocol. The history checker closes part of the model-to-code gap over the many
+real executions explored by the existing deterministic executor. Targeted Kani,
+Verus/Creusot, or Loom work may later close specific remaining gaps, but is not
+required for the first pilot.
 
 No verification code participates in a production build, changes the public
 API, or adds work to a database operation.
@@ -292,7 +307,7 @@ not maintain equivalent TLA+ and Quint sources simultaneously.
 
 ### Repository layout
 
-The proposed source layout is:
+The implemented source layout is:
 
 ```text
 formal/
@@ -300,14 +315,21 @@ formal/
   tla/
     Common.tla                 finite maps, ordering, and shared helpers
     Backend.tla                abstract point-read/CAS/uncertainty contract
-    TxCore.tla                 logged and direct transaction protocol
+    TxCore.tla                 logged transaction and locking protocol
     MC_TxCore.tla              finite constants and model-checking wrappers
-    TxCoreSafety.cfg           exhaustive safety configuration
-    TxCoreLiveness.cfg         fair, eventually-healthy liveness configuration
-    BLinkSplit.tla             later, separately composed topology model
-    CollectionLifecycle.tla    later, collection catalog and drop model
-    CacheEvidence.tla          later, cache/path-lane evidence model
-    GarbageCollection.tla      later, reachability and safety horizon model
+    DirectCore.tla             direct commit and coordinator protocol
+    MC_DirectCore.tla          two-/three-member wrappers and liveness
+    RecoveryLifecycle.tla      delayed requests, renewal, grace, and cleanup
+    MC_Recovery*.tla           focused recovery and temporal wrappers
+    WoundWait.tla              explicit distinct-priority wait graph
+    BLinkSplit.tla             separately composed topology model
+    CollectionLifecycle.tla    collection catalog and drop model
+    CacheEvidence.tla          cache/path-lane evidence model
+    GarbageCollection.tla      reachability and safety-horizon model
+    WoundResurrectionWitness.tla
+                               current four-status owner/wound/GC counterexample
+    TxBLinkComposition.tla     shared split-gate/reference boundary
+    *.cfg                      safety, liveness, and mutant configurations
 ```
 
 Model-checker output, downloaded tools, checkpoints, and state graphs live under
@@ -450,17 +472,28 @@ Each later model exposes an assumption/guarantee boundary to `TxCore`:
   and abandoned or unavailable mutations leave no reusable knowledge.
 - **`GarbageCollection`** guarantees that referenced or recent objects are not
   deleted, pending objects become durably aborted before release, and an absent
-  old final object is never recreated with a guessed result.
+  old final object is never recreated with a guessed result. Its standalone
+  graph reduces away a live owner whose lazy transaction object was absent when
+  a foreign wound landed.
 
 The integrated transaction model assumes these guarantees. Small composition
 checks then combine a reduced form of two adjacent models to catch mismatched
 interfaces without multiplying all state spaces together.
 
+`WoundResurrectionWitness` checks the omitted lazy-owner/GC composition using
+the current `Absent`, `Pending`, `Aborted`, and `Committed` states only. The same
+owner publishes a holder, remains suspended while a foreign abort is retained
+and collected, then resumes after the path becomes absent. Its create-if-absent
+commit violates the persistent ghost wound decision. This invalidates the
+standalone GC anti-resurrection assumption for the current protocol; the witness
+records the defect without selecting or validating a repair.
+
 ### Counterexamples and model validation
 
 A model that only checks its intended protocol can encode the intended bug as
-an assumption. Before the pilot is accepted, TLC must reject deliberate mutants
-for at least these cases:
+an assumption. The runner therefore distinguishes deliberate mutants of an
+intended-safe model from faithful current-protocol witnesses. TLC must reject
+deliberate mutants for at least these cases:
 
 - permit `committed -> aborted`;
 - make logged writes visible one leaf at a time before the commit object is
@@ -478,6 +511,12 @@ Each mutant is a separate model-checking wrapper or configuration, not a
 long-lived alternate protocol branch. The verification test succeeds only when
 TLC finds the expected counterexample class. This validates that the model and
 properties are capable of observing the failures they claim to exclude.
+
+A known-protocol witness instead uses only actions admitted by the current
+design. Until the underlying protocol changes, successful exploration requires
+`WoundResurrectionWitness` to reach `LateOwnerCommit` and violate
+`WR1_NoResurrectionAfterForeignWound`. Treating that witness as a synthetic
+mutant would hide the unresolved correctness result.
 
 TLC counterexamples are reduced manually to a named scenario in
 `formal/README.md` and, where applicable, to a deterministic Rust history test.
@@ -508,23 +547,24 @@ naturally execute the interpreter again. Initial instructions include:
 - point read into a local register;
 - write or delete a key;
 - write a literal, copied, or incremented register value;
+- read a bounded group concurrently into distinct local registers;
 - compare a register and return a modeled user error;
 - explicit transaction abort; and
 - no-op/yield points that change scheduling without changing semantics.
 
-Later instructions add normalized range scans and collection lifecycle actions.
-Generated programs use small key, value, register, and instruction bounds so the
-serialization search remains exact.
+Normalized range scans are also included. Collection lifecycle remains covered
+by the dedicated formal model and existing API workload rather than this
+key-history interpreter. Generated programs use small key, value, register, and
+instruction bounds so the serialization search remains exact.
 
 The interpreter records the actual ordered instruction results and staged
 mutations of every body execution. It checks expression evaluation locally, so
 the history checker only needs to decide whether the observed database values
 and final effects fit a serial history.
 
-Concurrent reads within one transaction are deferred from the first workload.
-When added, the trace represents them as an unordered read group against the
-same transaction snapshot rather than inventing an instruction order from task
-completion order.
+Concurrent reads within one transaction are represented as a canonical
+unordered read group against the same transaction snapshot. Task completion
+order is deliberately absent from the trace.
 
 ### History representation
 
@@ -740,7 +780,11 @@ The implementation adds `make verify-formal`, backed by
 - verifies its recorded SHA-256 before execution;
 - requires a supported Java runtime;
 - writes checkpoints and traces below `target/formal/`; and
-- runs every required safety configuration with a deterministic command line.
+- discovers every top-level `formal/tla/*.cfg` in deterministic filename order
+  and runs the safety/liveness configuration, mutant, or known-protocol witness
+  declared by its first-line metadata. The complete catalog is validated before
+  TLC starts; expected failures must have TLC's safety exit status, their exact
+  invariant, and their seeded action somewhere in the trace.
 
 No JAR or generated model output is committed. A container image is avoided for
 the initial toolchain because Java plus one checksummed artifact is the smaller
@@ -843,7 +887,9 @@ committed corpus inputs replay byte-for-byte.
 
 **Exit:** every correctness-critical protocol named in `architecture.md` either
 has a checked model contract or is explicitly listed as a trusted/deferred
-assumption.
+assumption. This exit is currently unmet: the focused lazy-owner/foreign-wound/GC
+witness violates the assumed anti-resurrection contract of the four-status
+protocol.
 
 ### Stage 5: code-level proof pilot
 
@@ -867,6 +913,8 @@ Before extracting an ADR, the pilot must show:
   imports;
 - exhaustive safety completion for the agreed finite configurations;
 - detection of all required protocol mutants;
+- deterministic reproduction and resolution of every faithful known-protocol
+  counterexample before the suite is accepted as a correctness gate;
 - at least one useful counterexample, ambiguity, or invariant clarification found
   while modeling, rather than only restating existing tests;
 - an implementation history checker that catches all seeded end-to-end
@@ -945,7 +993,8 @@ specific unclosed gap warrants them.
 ## Decision records
 
 There are no ADRs for this proposal yet. The design remains a self-contained
-exploration until Stages 1-3 satisfy the pilot success criteria.
+exploration until the pilot success criteria are satisfied and the known
+owner/wound/GC counterexample is resolved and rechecked.
 
 If accepted, one focused ADR should record:
 
@@ -975,13 +1024,17 @@ crate. Tool experiments that remain test-only do not each need an ADR.
   policy into the generic fold engine?
 - Can a later deductive proof establish the refinement for arbitrary numbers of
   keys and transactions after TLC has established the finite design?
+- Which production mechanism will provide durable owner retirement or an
+  equivalent anti-resurrection fence before a foreign abort record becomes
+  GC-eligible? A pinned intermediate state is one candidate, but this proposal
+  neither selects nor verifies it.
 - How should the proposed snapshot-read protocol compose with the strict latest
   transaction history if that design proceeds?
 
 ## Relationship to other designs / ADRs
 
-This proposal changes no transaction or storage decision. It formalizes and
-tests the contracts established by:
+This proposal selects no transaction or storage repair. It formalizes and tests
+the existing contracts, and records where their composition is violated:
 
 - [object-storage-native.md](object-storage-native.md), the umbrella design for
   content-CAS transactions, locks, leases, write-back, and GC;
@@ -993,8 +1046,12 @@ tests the contracts established by:
 - [ADR-019](../adr/019-unified-transaction-object.md) and
   [ADR-020](../adr/020-commit-write-back-protocol.md), logged commit and
   write-back;
-- [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md), lock conflict and
-  liveness behavior;
+- [ADR-021](../adr/021-wound-wait-leases-shard.md), foreign wound and lease
+  behavior;
+- [ADR-022](../adr/022-garbage-collection-mark-sweep.md), finite transaction
+  tombstone retention and reclamation;
+- [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md), lazy transaction
+  object materialization, lock conflict, and liveness behavior;
 - [ADR-028](../adr/028-shard-mutation-coordinator.md) and
   [ADR-029](../adr/029-gc-through-shard-coordinator.md), coordinated leaf
   mutation;

@@ -216,6 +216,7 @@ struct DirectCommitResolver {
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
+    predecessor_writer: TxId,
     inline: InlinePolicy,
     split_hints: SplitHintSink,
 }
@@ -254,9 +255,24 @@ impl ShardResolver for DirectCommitResolver {
             .key_state
             .resolve_holders(&self.key, cur, None, ctx.requirement)
             .await?;
-        if let Err(why) = eligible_writer(&res, self.read_version.as_ref()) {
+        let effective_writer = match eligible_writer(&res, self.read_version.as_ref()) {
+            Ok(writer) => writer,
+            Err(why) => {
+                return Ok(Step::Skip {
+                    outcome: self.unlanded(ctx, why),
+                });
+            }
+        };
+        // An unavailable CAS may have installed our marker before this effective
+        // writer superseded it. Only the original predecessor proves the exact
+        // conditional predicate is still unchanged and safe to retry. This is
+        // required for blind overwrites too: their fresh last-writer-wins rule
+        // says nothing about whether an earlier uncertain attempt already ran.
+        if matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true })
+            && effective_writer != self.predecessor_writer
+        {
             return Ok(Step::Skip {
-                outcome: self.unlanded(ctx, why),
+                outcome: self.in_doubt(),
             });
         }
         // A budget the folded leaf closes is a stable property of that leaf, not
@@ -344,6 +360,14 @@ impl DirectCommitResolver {
         current.writer() == Some(&self.id) && current.inline() == Some(&self.value)
     }
 
+    /// Reports an uncertain attempt whose absent marker no longer proves loss.
+    fn in_doubt(&self) -> FoldOutcome {
+        FoldOutcome::InDoubt(format!(
+            "direct commit for {} in-doubt: marker absent after an uncertain CAS",
+            self.id
+        ))
+    }
+
     /// How to report a fold that is not publishing the commit marker. Every such
     /// reason is only evidence that the marker is *not there now*. Without an
     /// in-doubt CAS that also proves nothing was ever written; after one it
@@ -352,10 +376,7 @@ impl DirectCommitResolver {
     /// replay (ADR-051, ADR-053).
     fn unlanded(&self, ctx: &ResolveCtx<'_>, why: Ineligible) -> FoldOutcome {
         if matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
-            return FoldOutcome::InDoubt(format!(
-                "direct commit for {} in-doubt: marker absent after an uncertain CAS",
-                self.id
-            ));
+            return self.in_doubt();
         }
         match why {
             Ineligible::Replay => self.definitive_loss(),
@@ -1085,6 +1106,7 @@ impl Algo {
             key,
             value,
             read_version,
+            predecessor_writer: writer.clone(),
             inline,
             split_hints: self.split_hints.clone(),
         });
@@ -3281,6 +3303,7 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
         let seed = entry(&tctx, b"k").await.unwrap();
+        let predecessor_writer = seed.current.writer().cloned().unwrap();
         let resolver = DirectCommitResolver {
             id: TxId::with_priority(2, b"direct"),
             raw_key: b"k".to_vec(),
@@ -3288,6 +3311,7 @@ mod tests {
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
+            predecessor_writer,
             inline: InlinePolicy::default(),
             split_hints: tm.split_hints.clone(),
         };
@@ -3321,6 +3345,71 @@ mod tests {
         }
     }
 
+    // ADR-051 regression: sticky uncertainty changes a blind overwrite's
+    // eligibility. Retrying over the exact original predecessor is idempotent;
+    // retrying after another writer moved the entry could apply the same public
+    // operation twice if the first CAS landed and was then superseded. A fresh
+    // attempt retains normal last-writer-wins behavior.
+    #[tokio::test]
+    async fn direct_blind_retry_requires_its_original_predecessor() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = key_ref(b"k");
+        commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+
+        let seed = entry(&tctx, b"k").await.unwrap();
+        let predecessor_writer = seed.current.writer().cloned().unwrap();
+        let resolver = DirectCommitResolver {
+            id: TxId::with_priority(2, b"direct"),
+            raw_key: b"k".to_vec(),
+            leaf_path: paths::tree_root(TEST_COLL),
+            key: keyp,
+            value: Arc::from(b"v2".as_slice()),
+            read_version: None,
+            predecessor_writer,
+            inline: InlinePolicy::default(),
+            split_hints: tm.split_hints.clone(),
+        };
+        let locks = NodeLocks::default();
+
+        assert!(matches!(
+            fold_step(
+                &resolver,
+                &tctx,
+                ReloadCause::Reloaded { in_doubt: true },
+                &BTreeMap::from([(b"k".to_vec(), seed.clone())]),
+                &locks,
+            )
+            .await,
+            Step::Stage { .. }
+        ));
+
+        let moved = ShardEntry {
+            current: CurrentState::Inline {
+                writer: TxId::with_priority(3, b"winner"),
+                value: Arc::from(b"winner".as_slice()),
+            },
+            ..seed
+        };
+        let moved = BTreeMap::from([(b"k".to_vec(), moved)]);
+        assert!(matches!(
+            fold_step(
+                &resolver,
+                &tctx,
+                ReloadCause::Reloaded { in_doubt: true },
+                &moved,
+                &locks,
+            )
+            .await,
+            Step::Skip {
+                outcome: FoldOutcome::InDoubt(_)
+            }
+        ));
+        assert!(matches!(
+            fold_step(&resolver, &tctx, ReloadCause::Fresh, &moved, &locks).await,
+            Step::Stage { .. }
+        ));
+    }
+
     // ADR-053: only a *superseded read* certifies the body-replay case, and an
     // uncertain CAS still outranks it. Every other way a fold declines is either
     // state the direct path cannot arbitrate or evidence that proves nothing, so
@@ -3343,6 +3432,7 @@ mod tests {
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version,
+            predecessor_writer: current.clone(),
             inline: InlinePolicy::default(),
             split_hints: split_hints.clone(),
         };
@@ -3483,7 +3573,7 @@ mod tests {
         // folded nothing, while a spent CAS budget proves nothing about an
         // earlier attempt of the same round. And a blind overwrite has no
         // read-dependent computation to reevaluate.
-        let rmw = direct(Some(current));
+        let rmw = direct(Some(current.clone()));
         assert!(matches!(rmw.excluded_outcome(false), FoldOutcome::Replay));
         assert!(matches!(
             rmw.excluded_outcome(true),
