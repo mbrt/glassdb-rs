@@ -1,6 +1,7 @@
 //! Persistent-cache work queues, lifecycle, and worker policy.
 
 use std::io;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +14,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::cache_stats::CacheMetrics;
 use crate::timeline::SequencePoint;
 
-use super::admission::{Admission, PayloadReservation};
+use super::admission::{Admission, OptionalReservation, PayloadReservation, PromotionReservation};
 use super::disk::{Disk, WriterState, open_disk};
 use super::fence::{FenceContext, FenceGuard, FenceTracker, PathFence};
 use super::format::CacheGeometry;
@@ -159,28 +160,22 @@ impl CacheInner {
         }
     }
 
-    pub(super) fn enqueue_optional(&self, work: Work) -> bool {
+    pub(super) fn enqueue_optional(
+        &self,
+        build_work: impl FnOnce(OptionalReservation) -> Work,
+    ) -> bool {
         let _gate = self.enqueue_gate.lock().unwrap();
         if self.shared.shutdown_requested.load(Ordering::Acquire)
             || !self.shared.enabled.load(Ordering::Acquire)
         {
-            work.remove_promotion(&self.shared.admission);
             return false;
         }
-        if !self.shared.admission.reserve_optional() {
-            work.remove_promotion(&self.shared.admission);
+        let Some(optional) = self.shared.admission.reserve_optional() else {
             return false;
-        }
-        match self.sender.try_send(work) {
+        };
+        match self.sender.try_send(build_work(optional)) {
             Ok(()) => true,
-            Err(error) => {
-                self.shared.admission.release_optional();
-                let work = match error {
-                    TrySendError::Full(work) | TrySendError::Closed(work) => work,
-                };
-                work.remove_promotion(&self.shared.admission);
-                false
-            }
+            Err(TrySendError::Full(_) | TrySendError::Closed(_)) => false,
         }
     }
 
@@ -327,6 +322,7 @@ pub(super) enum Work {
     Lookup {
         path: Arc<str>,
         completion: oneshot::Sender<Option<EncodedBody>>,
+        optional: OptionalReservation,
     },
     Replace {
         path: Arc<str>,
@@ -335,7 +331,7 @@ pub(super) enum Work {
         current_after: SequencePoint,
         // Drop releases the path only after publication finishes.
         fence: FenceGuard,
-        _payload: PayloadReservation,
+        payload: PayloadReservation,
     },
     Invalidate {
         path: Arc<str>,
@@ -343,19 +339,12 @@ pub(super) enum Work {
         fence: FenceGuard,
     },
     Promote {
-        path: Arc<str>,
         context: Arc<dyn FenceContext>,
         epoch: u64,
+        optional: OptionalReservation,
+        promotion: PromotionReservation,
     },
     Shutdown,
-}
-
-impl Work {
-    fn remove_promotion(&self, admission: &Admission) {
-        if let Work::Promote { path, .. } = self {
-            admission.remove_promotion(path);
-        }
-    }
 }
 
 async fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
@@ -394,10 +383,7 @@ async fn run_worker(
         let work = if shared.shutdown_requested.load(Ordering::Acquire) {
             match receiver.try_recv() {
                 Ok(work) => work,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                    clean_shutdown(&shared, &mut writer).await;
-                    break;
-                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => Work::Shutdown,
             }
         } else {
             tokio::select! {
@@ -414,69 +400,131 @@ async fn run_worker(
                 }
             }
         };
-        let result = match work {
-            Work::Lookup { path, completion } => {
-                shared.admission.release_optional();
-                let _ = completion.send(lookup(&shared, &path).await);
-                Ok(())
-            }
-            Work::Replace {
+        if handle_work(&shared, &mut writer, work).await.is_break() {
+            break;
+        }
+        sync_writer_if_needed(&shared, &mut writer, &mut last_sync, false).await;
+    }
+}
+
+async fn handle_work(shared: &Shared, writer: &mut WriterState, work: Work) -> ControlFlow<()> {
+    match work {
+        Work::Lookup {
+            path,
+            completion,
+            optional,
+        } => handle_lookup(shared, path, completion, optional).await,
+        Work::Replace {
+            path,
+            revision,
+            body,
+            current_after,
+            fence,
+            payload,
+        } => {
+            handle_replace(
+                shared,
+                writer,
                 path,
                 revision,
                 body,
                 current_after,
                 fence,
-                _payload: _,
-            } => {
-                let result = if shared.enabled.load(Ordering::Acquire) && fence.is_current() {
-                    let result = writer.append(&path, &revision, &body, current_after).await;
-                    if let Ok(slot) = result {
-                        let earned = slot.record_bytes / PROMOTION_EARN_DIVISOR;
-                        let cap = writer.disk.format.maximum_record_bytes() / PROMOTION_CAP_DIVISOR;
-                        writer.promotion_tokens =
-                            writer.promotion_tokens.saturating_add(earned).min(cap);
-                    }
-                    result.map(|_| ())
-                } else {
-                    Ok(())
-                };
-                disable_after_work_error(&shared, &result);
-                drop(fence);
-                result
-            }
-            Work::Invalidate { path, fence } => {
-                let result = if shared.enabled.load(Ordering::Acquire) {
-                    writer.invalidate(&path).await
-                } else {
-                    Ok(())
-                };
-                disable_after_work_error(&shared, &result);
-                drop(fence);
-                result
-            }
-            Work::Promote {
-                path,
-                context,
-                epoch,
-            } => {
-                shared.admission.release_optional();
-                let result = if shared.enabled.load(Ordering::Acquire) {
-                    promote(&shared, &mut writer, &path, context.fence(), epoch).await
-                } else {
-                    Ok(())
-                };
-                disable_after_work_error(&shared, &result);
-                shared.admission.remove_promotion(&path);
-                result
-            }
-            Work::Shutdown => {
-                clean_shutdown(&shared, &mut writer).await;
-                break;
-            }
-        };
-        let _ = result;
-        sync_writer_if_needed(&shared, &mut writer, &mut last_sync, false).await;
+                payload,
+            )
+            .await
+        }
+        Work::Invalidate { path, fence } => handle_invalidate(shared, writer, path, fence).await,
+        Work::Promote {
+            context,
+            epoch,
+            optional,
+            promotion,
+        } => handle_promote(shared, writer, context, epoch, optional, promotion).await,
+        Work::Shutdown => handle_shutdown(shared, writer).await,
     }
+}
+
+async fn handle_lookup(
+    shared: &Shared,
+    path: Arc<str>,
+    completion: oneshot::Sender<Option<EncodedBody>>,
+    optional: OptionalReservation,
+) -> ControlFlow<()> {
+    // Queue pressure excludes work once its handler starts running.
+    drop(optional);
+    let _ = completion.send(lookup(shared, &path).await);
+    ControlFlow::Continue(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_replace(
+    shared: &Shared,
+    writer: &mut WriterState,
+    path: Arc<str>,
+    revision: Vec<u8>,
+    body: Vec<u8>,
+    current_after: SequencePoint,
+    fence: FenceGuard,
+    payload: PayloadReservation,
+) -> ControlFlow<()> {
+    // Payload pressure bounds queued bytes, not the worker's active append.
+    drop(payload);
+    let result = if shared.enabled.load(Ordering::Acquire) && fence.is_current() {
+        let result = writer.append(&path, &revision, &body, current_after).await;
+        if let Ok(slot) = result {
+            let earned = slot.record_bytes / PROMOTION_EARN_DIVISOR;
+            let cap = writer.disk.format.maximum_record_bytes() / PROMOTION_CAP_DIVISOR;
+            writer.promotion_tokens = writer.promotion_tokens.saturating_add(earned).min(cap);
+        }
+        result.map(|_| ())
+    } else {
+        Ok(())
+    };
+    disable_after_work_error(shared, &result);
+    drop(fence);
+    ControlFlow::Continue(())
+}
+
+async fn handle_invalidate(
+    shared: &Shared,
+    writer: &mut WriterState,
+    path: Arc<str>,
+    fence: FenceGuard,
+) -> ControlFlow<()> {
+    let result = if shared.enabled.load(Ordering::Acquire) {
+        writer.invalidate(&path).await
+    } else {
+        Ok(())
+    };
+    disable_after_work_error(shared, &result);
+    drop(fence);
+    ControlFlow::Continue(())
+}
+
+async fn handle_promote(
+    shared: &Shared,
+    writer: &mut WriterState,
+    context: Arc<dyn FenceContext>,
+    epoch: u64,
+    optional: OptionalReservation,
+    promotion: PromotionReservation,
+) -> ControlFlow<()> {
+    // Queue pressure excludes work once its handler starts running.
+    drop(optional);
+    let result = if shared.enabled.load(Ordering::Acquire) {
+        promote(shared, writer, promotion.path(), context.fence(), epoch).await
+    } else {
+        Ok(())
+    };
+    disable_after_work_error(shared, &result);
+    drop(promotion);
+    ControlFlow::Continue(())
+}
+
+async fn handle_shutdown(shared: &Shared, writer: &mut WriterState) -> ControlFlow<()> {
+    clean_shutdown(shared, writer).await;
+    ControlFlow::Break(())
 }
 
 async fn sync_writer_if_needed(
@@ -564,4 +612,376 @@ async fn promote(
         .await?;
     writer.promotion_tokens -= promoted.record_bytes;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::super::format::COMPACT_GEOMETRY;
+    use super::super::sim_media::{MediaFaultProfile, SimMedia};
+    use super::*;
+
+    const TEST_CAPACITY: u64 = 2 * 1024 * 1024;
+
+    struct Fixture {
+        _directory: TempDir,
+        media: SimMedia,
+        inner: CacheInner,
+        worker: Option<CacheWorker>,
+    }
+
+    async fn fixture() -> Fixture {
+        let directory = TempDir::new().unwrap();
+        let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 1);
+        let metrics = Arc::new(CacheMetrics::new());
+        let config = PersistentCacheConfig {
+            directory: directory.path().to_path_buf(),
+            capacity_bytes: TEST_CAPACITY,
+        };
+        let (disk, writer, _) = open_disk(
+            config,
+            "db",
+            DatabaseId::from_bytes([1; 16]),
+            COMPACT_GEOMETRY,
+            metrics.clone(),
+            Arc::new(media.clone()),
+        )
+        .await
+        .unwrap();
+        let (inner, worker) = CacheInner::prepare(disk, writer, metrics);
+        Fixture {
+            _directory: directory,
+            media,
+            inner,
+            worker: Some(worker),
+        }
+    }
+
+    fn point(value: u64) -> SequencePoint {
+        SequencePoint::from_raw(value)
+    }
+
+    fn assert_no_reservations(shared: &Shared) {
+        assert_eq!(shared.admission.reservation_counts(), (0, 0, 0));
+        assert_eq!(shared.fences.active_count(), 0);
+    }
+
+    async fn fail_work(fixture: &mut Fixture, work: Work) -> ControlFlow<()> {
+        fixture.media.make_permanently_unavailable();
+        let shared = fixture.inner.shared.clone();
+        let CacheWorker { mut writer, .. } = fixture.worker.take().unwrap();
+        let flow = handle_work(&shared, &mut writer, work).await;
+        assert_no_reservations(&shared);
+        flow
+    }
+
+    async fn cancel_work(
+        fixture: &mut Fixture,
+        work: Work,
+        in_flight_admission: (u64, usize, usize),
+        in_flight_fences: usize,
+    ) {
+        let mut pause = fixture.media.pause_next_operation();
+        let shared = fixture.inner.shared.clone();
+        let task_shared = shared.clone();
+        let CacheWorker { mut writer, .. } = fixture.worker.take().unwrap();
+        let task = tokio::spawn(async move { handle_work(&task_shared, &mut writer, work).await });
+        pause.wait_until_entered().await;
+        assert_eq!(shared.admission.reservation_counts(), in_flight_admission);
+        assert_eq!(shared.fences.active_count(), in_flight_fences);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        pause.resume();
+        assert_no_reservations(&shared);
+    }
+
+    #[tokio::test]
+    async fn rejected_enqueues_release_all_work_reservations() {
+        let mut fixture = fixture().await;
+        drop(fixture.worker.take());
+        let shared = fixture.inner.shared.clone();
+
+        let path = Arc::<str>::from("db/promote");
+        let promotion = shared.admission.reserve_promotion(&path).unwrap();
+        let context = Arc::new(PathFence::default());
+        let (epoch, active) = context.snapshot();
+        assert!(!active);
+        assert!(
+            !fixture
+                .inner
+                .enqueue_optional(move |optional| Work::Promote {
+                    context,
+                    epoch,
+                    optional,
+                    promotion,
+                })
+        );
+        assert_no_reservations(&shared);
+
+        let context = Arc::new(PathFence::default());
+        let fence = shared.fences.begin(context.clone()).unwrap();
+        let payload = shared.admission.reserve_payload(123).unwrap();
+        fixture.inner.enqueue_required(Work::Replace {
+            path: Arc::from("db/replace"),
+            revision: b"r1".to_vec(),
+            body: b"body".to_vec(),
+            current_after: point(1),
+            fence,
+            payload,
+        });
+        assert_no_reservations(&shared);
+        assert!(!context.is_active());
+    }
+
+    #[tokio::test]
+    async fn handler_errors_release_all_work_reservations() {
+        let mut lookup = fixture().await;
+        let shared = lookup.inner.shared.clone();
+        let optional = shared.admission.reserve_optional().unwrap();
+        let (completion, result) = oneshot::channel();
+        assert_eq!(
+            fail_work(
+                &mut lookup,
+                Work::Lookup {
+                    path: Arc::from("db/lookup"),
+                    completion,
+                    optional,
+                },
+            )
+            .await,
+            ControlFlow::Continue(())
+        );
+        assert!(result.await.unwrap().is_none());
+
+        let mut replace = fixture().await;
+        let shared = replace.inner.shared.clone();
+        let context = Arc::new(PathFence::default());
+        let fence = shared.fences.begin(context.clone()).unwrap();
+        let payload = shared.admission.reserve_payload(123).unwrap();
+        assert_eq!(
+            fail_work(
+                &mut replace,
+                Work::Replace {
+                    path: Arc::from("db/replace"),
+                    revision: b"r1".to_vec(),
+                    body: b"body".to_vec(),
+                    current_after: point(1),
+                    fence,
+                    payload,
+                },
+            )
+            .await,
+            ControlFlow::Continue(())
+        );
+        assert!(!context.is_active());
+
+        let mut invalidate = fixture().await;
+        let shared = invalidate.inner.shared.clone();
+        let context = Arc::new(PathFence::default());
+        let fence = shared.fences.begin(context.clone()).unwrap();
+        assert_eq!(
+            fail_work(
+                &mut invalidate,
+                Work::Invalidate {
+                    path: Arc::from("db/invalidate"),
+                    fence,
+                },
+            )
+            .await,
+            ControlFlow::Continue(())
+        );
+        assert!(!context.is_active());
+
+        let mut promote = fixture().await;
+        let shared = promote.inner.shared.clone();
+        let path = Arc::<str>::from("db/promote");
+        let optional = shared.admission.reserve_optional().unwrap();
+        let promotion = shared.admission.reserve_promotion(&path).unwrap();
+        let context = Arc::new(PathFence::default());
+        let (epoch, active) = context.snapshot();
+        assert!(!active);
+        assert_eq!(
+            fail_work(
+                &mut promote,
+                Work::Promote {
+                    context,
+                    epoch,
+                    optional,
+                    promotion,
+                },
+            )
+            .await,
+            ControlFlow::Continue(())
+        );
+
+        let mut shutdown = fixture().await;
+        assert_eq!(
+            fail_work(&mut shutdown, Work::Shutdown).await,
+            ControlFlow::Break(())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_each_handler_releases_all_work_reservations() {
+        let mut lookup = fixture().await;
+        let shared = lookup.inner.shared.clone();
+        let optional = shared.admission.reserve_optional().unwrap();
+        let (completion, result) = oneshot::channel();
+        cancel_work(
+            &mut lookup,
+            Work::Lookup {
+                path: Arc::from("db/lookup"),
+                completion,
+                optional,
+            },
+            (0, 0, 0),
+            0,
+        )
+        .await;
+        assert!(result.await.is_err());
+
+        let mut replace = fixture().await;
+        let shared = replace.inner.shared.clone();
+        let context = Arc::new(PathFence::default());
+        let fence = shared.fences.begin(context.clone()).unwrap();
+        let payload = shared.admission.reserve_payload(123).unwrap();
+        cancel_work(
+            &mut replace,
+            Work::Replace {
+                path: Arc::from("db/replace"),
+                revision: b"r1".to_vec(),
+                body: b"body".to_vec(),
+                current_after: point(1),
+                fence,
+                payload,
+            },
+            (0, 0, 0),
+            1,
+        )
+        .await;
+        assert!(!context.is_active());
+
+        let mut invalidate = fixture().await;
+        let shared = invalidate.inner.shared.clone();
+        let context = Arc::new(PathFence::default());
+        let fence = shared.fences.begin(context.clone()).unwrap();
+        cancel_work(
+            &mut invalidate,
+            Work::Invalidate {
+                path: Arc::from("db/invalidate"),
+                fence,
+            },
+            (0, 0, 0),
+            1,
+        )
+        .await;
+        assert!(!context.is_active());
+
+        let mut promote = fixture().await;
+        let shared = promote.inner.shared.clone();
+        let path = Arc::<str>::from("db/promote");
+        let optional = shared.admission.reserve_optional().unwrap();
+        let promotion = shared.admission.reserve_promotion(&path).unwrap();
+        let context = Arc::new(PathFence::default());
+        let (epoch, active) = context.snapshot();
+        assert!(!active);
+        cancel_work(
+            &mut promote,
+            Work::Promote {
+                context,
+                epoch,
+                optional,
+                promotion,
+            },
+            (0, 0, 1),
+            0,
+        )
+        .await;
+
+        let mut shutdown = fixture().await;
+        cancel_work(&mut shutdown, Work::Shutdown, (0, 0, 0), 0).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_worker_drops_in_flight_and_queued_reservations() {
+        let mut fixture = fixture().await;
+        let shared = fixture.inner.shared.clone();
+        let mut pause = fixture.media.pause_next_operation();
+
+        let active_context = Arc::new(PathFence::default());
+        let active_fence = shared.fences.begin(active_context.clone()).unwrap();
+        let active_payload = shared.admission.reserve_payload(111).unwrap();
+        fixture.inner.enqueue_required(Work::Replace {
+            path: Arc::from("db/active"),
+            revision: b"r1".to_vec(),
+            body: b"body".to_vec(),
+            current_after: point(1),
+            fence: active_fence,
+            payload: active_payload,
+        });
+        let worker = fixture.worker.take().unwrap();
+        let task = tokio::spawn(worker.run());
+        pause.wait_until_entered().await;
+
+        let (lookup_completion, lookup_result) = oneshot::channel();
+        assert!(
+            fixture
+                .inner
+                .enqueue_optional(move |optional| Work::Lookup {
+                    path: Arc::from("db/lookup"),
+                    completion: lookup_completion,
+                    optional,
+                })
+        );
+
+        let replace_context = Arc::new(PathFence::default());
+        let replace_fence = shared.fences.begin(replace_context.clone()).unwrap();
+        let replace_payload = shared.admission.reserve_payload(123).unwrap();
+        fixture.inner.enqueue_required(Work::Replace {
+            path: Arc::from("db/replace"),
+            revision: b"r2".to_vec(),
+            body: b"queued".to_vec(),
+            current_after: point(2),
+            fence: replace_fence,
+            payload: replace_payload,
+        });
+
+        let invalidate_context = Arc::new(PathFence::default());
+        let invalidate_fence = shared.fences.begin(invalidate_context.clone()).unwrap();
+        fixture.inner.enqueue_required(Work::Invalidate {
+            path: Arc::from("db/invalidate"),
+            fence: invalidate_fence,
+        });
+
+        let promotion_path = Arc::<str>::from("db/promote");
+        let promotion = shared.admission.reserve_promotion(&promotion_path).unwrap();
+        let promotion_context = Arc::new(PathFence::default());
+        let (epoch, active) = promotion_context.snapshot();
+        assert!(!active);
+        assert!(
+            fixture
+                .inner
+                .enqueue_optional(move |optional| Work::Promote {
+                    context: promotion_context,
+                    epoch,
+                    optional,
+                    promotion,
+                })
+        );
+
+        assert_eq!(shared.admission.reservation_counts(), (123, 2, 1));
+        assert_eq!(shared.fences.active_count(), 3);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        pause.resume();
+
+        assert_no_reservations(&shared);
+        assert!(!active_context.is_active());
+        assert!(!replace_context.is_active());
+        assert!(!invalidate_context.is_active());
+        assert!(lookup_result.await.is_err());
+    }
 }

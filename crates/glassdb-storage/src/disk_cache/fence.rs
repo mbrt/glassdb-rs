@@ -99,4 +99,9 @@ impl FenceTracker {
             active_fences: self.active_fences.clone(),
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn active_count(&self) -> usize {
+        self.active_fences.load(Ordering::Acquire)
+    }
 }

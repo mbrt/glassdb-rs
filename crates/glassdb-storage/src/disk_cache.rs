@@ -154,7 +154,11 @@ impl PersistentCache {
         }
         let (completion, result) = oneshot::channel();
         inner
-            .enqueue_optional(Work::Lookup { path, completion })
+            .enqueue_optional(move |optional| Work::Lookup {
+                path,
+                completion,
+                optional,
+            })
             .then_some(())?;
         match result.await {
             Ok(encoded) => encoded,
@@ -223,7 +227,7 @@ impl PersistentCache {
             body,
             current_after,
             fence,
-            _payload: payload,
+            payload,
         });
     }
 
@@ -256,13 +260,14 @@ impl PersistentCache {
         if active {
             return;
         }
-        if !inner.shared.admission.reserve_promotion(path) {
+        let Some(promotion) = inner.shared.admission.reserve_promotion(path) else {
             return;
-        }
-        let _ = inner.enqueue_optional(Work::Promote {
-            path: path.clone(),
+        };
+        let _ = inner.enqueue_optional(move |optional| Work::Promote {
             context,
             epoch,
+            optional,
+            promotion,
         });
     }
 

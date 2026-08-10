@@ -63,29 +63,39 @@ impl Admission {
         })
     }
 
-    pub(super) fn reserve_promotion(&self, path: &Arc<str>) -> bool {
+    pub(super) fn reserve_promotion(
+        self: &Arc<Self>,
+        path: &Arc<str>,
+    ) -> Option<PromotionReservation> {
         let mut queued = self.promotions.lock().unwrap();
         if queued.contains(path.as_ref()) || queued.len() >= OPTIONAL_QUEUE_ITEMS {
-            return false;
+            return None;
         }
         queued.insert(path.clone());
-        true
+        Some(PromotionReservation {
+            admission: self.clone(),
+            path: path.clone(),
+        })
     }
 
-    pub(super) fn remove_promotion(&self, path: &str) {
-        self.promotions.lock().unwrap().remove(path);
-    }
-
-    pub(super) fn reserve_optional(&self) -> bool {
+    pub(super) fn reserve_optional(self: &Arc<Self>) -> Option<OptionalReservation> {
         self.optional_queued
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < OPTIONAL_QUEUE_ITEMS).then_some(current + 1)
             })
-            .is_ok()
+            .ok()?;
+        Some(OptionalReservation {
+            admission: self.clone(),
+        })
     }
 
-    pub(super) fn release_optional(&self) {
-        self.optional_queued.fetch_sub(1, Ordering::AcqRel);
+    #[cfg(test)]
+    pub(super) fn reservation_counts(&self) -> (u64, usize, usize) {
+        (
+            self.queued_payload_bytes.load(Ordering::Acquire),
+            self.optional_queued.load(Ordering::Acquire),
+            self.promotions.lock().unwrap().len(),
+        )
     }
 }
 
@@ -99,6 +109,39 @@ impl Drop for PayloadReservation {
         self.admission
             .queued_payload_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+pub(super) struct OptionalReservation {
+    admission: Arc<Admission>,
+}
+
+impl Drop for OptionalReservation {
+    fn drop(&mut self) {
+        self.admission
+            .optional_queued
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(super) struct PromotionReservation {
+    admission: Arc<Admission>,
+    path: Arc<str>,
+}
+
+impl PromotionReservation {
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for PromotionReservation {
+    fn drop(&mut self) {
+        self.admission
+            .promotions
+            .lock()
+            .unwrap()
+            .remove(self.path.as_ref());
     }
 }
 
@@ -199,7 +242,27 @@ fn splitmix64_mix(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::HitFilter;
+    use std::sync::Arc;
+
+    use super::{Admission, HitFilter};
+
+    #[test]
+    fn reservations_release_all_accounting_on_drop() {
+        let admission = Arc::new(Admission::new(Arc::new(HitFilter::new())));
+        let path = Arc::<str>::from("db/object");
+        let payload = admission.reserve_payload(123).unwrap();
+        let optional = admission.reserve_optional().unwrap();
+        let promotion = admission.reserve_promotion(&path).unwrap();
+
+        assert_eq!(admission.reservation_counts(), (123, 1, 1));
+        assert!(admission.reserve_promotion(&path).is_none());
+
+        drop(payload);
+        drop(optional);
+        drop(promotion);
+        assert_eq!(admission.reservation_counts(), (0, 0, 0));
+        assert!(admission.reserve_promotion(&path).is_some());
+    }
 
     #[test]
     fn second_chance_filter_emits_once_on_the_second_hit_and_resets() {
