@@ -297,6 +297,19 @@ impl Engine {
     }
 
     /// Scans one logical key range and returns its validation evidence.
+    pub async fn scan(
+        &self,
+        collection: &CollectionAddress,
+        range: &ScanRange,
+        overlay: &[ScanMutation],
+    ) -> Result<ScanResult, StorageError> {
+        self.resolver
+            .scan_keys(collection, range, overlay, None, None)
+            .await
+    }
+
+    /// Scans with legacy resolver controls for a holder and validation frontier.
+    #[deprecated(note = "use Engine::scan; holder and cap controls are resolver-internal")]
     pub async fn scan_keys(
         &self,
         collection: &CollectionAddress,

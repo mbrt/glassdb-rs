@@ -1363,7 +1363,7 @@ impl Algo {
         validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for coverage in data.scans.iter().flat_map(|scan| &scan.covered) {
+        for coverage in data.scans.iter().flat_map(|scan| scan.covered()) {
             let leaf_unchanged = match lock_validation {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
@@ -1426,19 +1426,19 @@ impl Algo {
                 .scan_coverage(
                     &scan.collection,
                     &scan.range,
-                    scan.frontier.as_deref(),
+                    scan.frontier(),
                     own_lock_holder,
                     requirement,
                 )
                 .await?;
-            let mut fast = current.len() == scan.covered.len()
-                && !current.iter().zip(&scan.covered).any(|(now, observed)| {
+            let mut fast = current.len() == scan.covered().len()
+                && !current.iter().zip(scan.covered()).any(|(now, observed)| {
                     now.path != observed.path
                         || now.membership_version != observed.membership_version
                 });
             if fast {
                 for holder in scan
-                    .covered
+                    .covered()
                     .iter()
                     .flat_map(|leaf| &leaf.pending_membership)
                 {
@@ -1459,11 +1459,11 @@ impl Algo {
                     &scan.range,
                     &scan.overlay,
                     own_lock_holder,
-                    scan.frontier.as_deref(),
+                    scan.frontier(),
                     requirement,
                 )
                 .await?;
-            if resolved.keys != scan.keys {
+            if resolved.keys() != scan.keys() {
                 return Ok(false);
             }
         }
@@ -4409,24 +4409,76 @@ mod tests {
             .scan_keys(&test_collection(), &range, &[], None, None)
             .await
             .unwrap();
-        let keys = scan.keys.clone();
+        let keys = scan.keys().to_vec();
+        let access = scan.into_access(test_collection(), range, Vec::new());
         let data = Data {
             reads: Vec::new(),
             writes: Vec::new(),
-            scans: vec![ScanAccess {
-                collection: test_collection(),
-                range,
-                overlay: Vec::new(),
-                keys: keys.clone(),
-                frontier: scan.frontier,
-                covered: scan.covered,
-            }],
+            scans: vec![access],
         };
         (data, keys)
     }
 
     async fn scan_data(tctx: &Tctx) -> (Data, Vec<Vec<u8>>) {
         scan_data_for_range(tctx, ScanRange::all()).await
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn opaque_and_legacy_scan_evidence_validate_equivalently() {
+        let (tm, tctx) = new_algo().await;
+        seed_live_keys(&tctx, &[b"a", b"c"]).await;
+
+        let range = ScanRange::all();
+        let resolver = KeyResolver::new(
+            TreeRouter::new(tctx.shards.clone()),
+            KeyStateResolver::new(tctx.tmon.clone()),
+        );
+        let result = resolver
+            .scan_keys(&test_collection(), &range, &[], None, None)
+            .await
+            .unwrap();
+        let legacy_result = result.clone();
+        let opaque = result.into_access(test_collection(), range.clone(), Vec::new());
+        let legacy = ScanAccess {
+            collection: test_collection(),
+            range,
+            overlay: Vec::new(),
+            keys: legacy_result.keys,
+            frontier: legacy_result.frontier,
+            covered: legacy_result.covered,
+        };
+
+        let validation_start = tctx.timeline.now();
+        for scan in [&opaque, &legacy] {
+            let data = Data {
+                reads: Vec::new(),
+                writes: Vec::new(),
+                scans: vec![scan.clone()],
+            };
+            assert!(
+                tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                    .await
+                    .unwrap(),
+                "both construction paths accept current evidence"
+            );
+        }
+
+        commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
+        let validation_start = tctx.timeline.now();
+        for scan in [&opaque, &legacy] {
+            let data = Data {
+                reads: Vec::new(),
+                writes: Vec::new(),
+                scans: vec![scan.clone()],
+            };
+            assert!(
+                !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                    .await
+                    .unwrap(),
+                "both construction paths reject a changed membership"
+            );
+        }
     }
 
     // ADR-031 phantom prevention: a listing whose covered leaves are unchanged
@@ -4569,7 +4621,7 @@ mod tests {
         };
         let (mut stale, keys) = scan_data_for_range(&tctx, range.clone()).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(stale.scans[0].frontier.as_deref(), Some(b"b".as_slice()));
+        assert_eq!(stale.scans[0].frontier(), Some(b"b".as_slice()));
         stale.writes.push(wa(&key_ref(b"a"), b"updated"));
 
         // Removing the old frontier means the refreshed two-key page reaches
@@ -4583,7 +4635,7 @@ mod tests {
         // the next validation adds S1 before committing.
         let (mut fresh, keys) = scan_data_for_range(&tctx, range).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"m".to_vec()]);
-        assert_eq!(fresh.scans[0].frontier.as_deref(), Some(b"m".as_slice()));
+        assert_eq!(fresh.scans[0].frontier(), Some(b"m".as_slice()));
         fresh.writes.push(wa(&key_ref(b"a"), b"updated"));
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();

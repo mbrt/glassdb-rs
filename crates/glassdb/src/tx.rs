@@ -191,18 +191,12 @@ impl Transaction {
         let result = self
             .db
             .engine
-            .scan_keys(c.address(), &range, &overlay, None, None)
+            .scan(c.address(), &range, &overlay)
             .await
             .map_err(Error::from_read)?;
-        let keys = result.keys;
-        self.inner.lock().unwrap().scans.push(ScanAccess {
-            collection: c.address().clone(),
-            range,
-            overlay,
-            keys: keys.clone(),
-            frontier: result.frontier,
-            covered: result.covered,
-        });
+        let keys = result.keys().to_vec();
+        let access = result.into_access(c.address().clone(), range, overlay);
+        self.inner.lock().unwrap().scans.push(access);
         Ok(KeyPage::new(keys, limit))
     }
 

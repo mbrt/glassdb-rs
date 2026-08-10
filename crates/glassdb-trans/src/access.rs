@@ -94,6 +94,32 @@ impl WriteAccess {
     }
 }
 
+/// Opaque validation evidence retained by a transactional range scan.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanEvidence {
+    keys: Vec<Vec<u8>>,
+    covered: Vec<LeafCoverage>,
+    frontier: Option<Vec<u8>>,
+}
+
+impl ScanEvidence {
+    pub(crate) fn new(
+        keys: Vec<Vec<u8>>,
+        covered: Vec<LeafCoverage>,
+        frontier: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            keys,
+            covered,
+            frontier,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<Vec<u8>>, Vec<LeafCoverage>, Option<Vec<u8>>) {
+        (self.keys, self.covered, self.frontier)
+    }
+}
+
 /// A range/sorted listing performed within a transaction (ADR-031 phantom
 /// prevention). It records the logical page plus the membership version and
 /// pending membership-write holders of every covered leaf. Commit validates
@@ -107,11 +133,49 @@ pub struct ScanAccess {
     /// Staged membership mutations visible when the scan ran.
     pub overlay: Vec<ScanMutation>,
     /// Keys surfaced to the transaction body.
+    #[deprecated(note = "construct scan access with ScanResult::into_access")]
     pub keys: Vec<Vec<u8>>,
     /// Inclusive validation/locking frontier; `None` means positive infinity.
+    #[deprecated(note = "construct scan access with ScanResult::into_access")]
     pub frontier: Option<Vec<u8>>,
     /// The leaves the scan covered, in key order, with membership dependencies.
+    #[deprecated(note = "construct scan access with ScanResult::into_access")]
     pub covered: Vec<LeafCoverage>,
+}
+
+impl ScanAccess {
+    #[allow(deprecated)]
+    pub(crate) fn new(
+        collection: CollectionAddress,
+        range: ScanRange,
+        overlay: Vec<ScanMutation>,
+        evidence: ScanEvidence,
+    ) -> Self {
+        let (keys, covered, frontier) = evidence.into_parts();
+        Self {
+            collection,
+            range,
+            overlay,
+            keys,
+            frontier,
+            covered,
+        }
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn keys(&self) -> &[Vec<u8>] {
+        &self.keys
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn frontier(&self) -> Option<&[u8]> {
+        self.frontier.as_deref()
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn covered(&self) -> &[LeafCoverage] {
+        &self.covered
+    }
 }
 
 /// A normalized half-open key range used by the transaction engine.
