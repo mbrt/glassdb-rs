@@ -2,25 +2,16 @@
 //! `internal/storage/tlogger.go`. Logs are protobuf bodies; the commit status
 //! and timestamp live in the body itself (ADR-019/ADR-023), not in object tags.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{
-    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, TxId, paths,
-};
-use glassdb_proto as pb;
-use prost::Message;
+use glassdb_data::{TxId, paths};
 
-use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
+use crate::cached_store::{CachedStore, CasResult, Observation, Requirement};
 use crate::error::StorageError;
-use crate::lock::LockType;
-use crate::transaction::{
-    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog,
-    TxRecordState, TxWrite,
-};
+use crate::transaction::{TxCommitStatus, TxLifecycleRelation, TxLog, TxLogCodec, TxRecordState};
 
 /// A value written by a transaction, including whether it was a deletion or was
 /// not written at all.
@@ -67,57 +58,7 @@ pub struct TxListPage {
 #[derive(Clone)]
 pub struct TLogger {
     prefix: String,
-    logs: crate::cached_store::TypedCachedStore<TxLog>,
-}
-
-impl Codec for TxLog {
-    type Value = TxLog;
-
-    fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
-        let id = paths::transaction_id_of(path)
-            .map_err(|error| StorageError::with_source("parsing transaction path", error))?;
-        decode_tx_log(paths::db_root_of(path), &id, body)
-    }
-
-    fn encode(log: &Self::Value) -> Result<Vec<u8>, StorageError> {
-        let timestamp = log
-            .timestamp
-            .ok_or_else(|| StorageError::other("transaction log has no persisted timestamp"))?;
-        marshal_log(log, timestamp)
-    }
-
-    fn size(log: &Self::Value) -> usize {
-        log.writes
-            .iter()
-            .map(|write| {
-                write.key.key().len() + write.value.len() + write.prev_writer.as_bytes().len()
-            })
-            .sum::<usize>()
-            + log
-                .locks
-                .iter()
-                .map(|lock| match lock {
-                    TxLock::Entry { key, .. } => key.key().len(),
-                    TxLock::Membership { leaf, .. } => leaf.node_token().map_or(0, str::len),
-                    TxLock::Directory { .. } | TxLock::Topology { .. } => 0,
-                })
-                .sum::<usize>()
-            + log
-                .collection_changes
-                .iter()
-                .map(|change| change.name.len() + 32)
-                .sum::<usize>()
-            + log.prepared_collections.len() * 16
-            + std::mem::size_of::<TxLog>()
-    }
-
-    fn valid_path(path: &str) -> bool {
-        paths::transaction_id_of(path).is_ok()
-    }
-
-    fn name() -> &'static str {
-        "transaction log"
-    }
+    logs: crate::cached_store::TypedCachedStore<TxLogCodec>,
 }
 
 impl TLogger {
@@ -278,373 +219,20 @@ fn validate_lifecycle_transition(
     }
 }
 
-fn write_value(w: &pb::Write) -> Arc<[u8]> {
-    match &w.val_delete {
-        Some(pb::write::ValDelete::Value(v)) => Arc::from(v.as_slice()),
-        _ => Arc::from(&[] as &[u8]),
-    }
-}
-
-fn write_deleted(w: &pb::Write) -> bool {
-    matches!(&w.val_delete, Some(pb::write::ValDelete::Deleted(true)))
-}
-
-fn parse_log(buf: &[u8]) -> Result<pb::TransactionLog, StorageError> {
-    pb::TransactionLog::decode(buf)
-        .map_err(|e| StorageError::with_source("unmarshalling transaction log", e))
-}
-
-pub(crate) fn decode_tx_status(buf: &[u8]) -> Result<TxCommitStatus, StorageError> {
-    let log = parse_log(buf)?;
-    match log.status() {
-        pb::transaction_log::Status::Committed => Ok(TxCommitStatus::Ok),
-        pb::transaction_log::Status::Aborted => Ok(TxCommitStatus::Aborted),
-        pb::transaction_log::Status::Pending => Ok(TxCommitStatus::Pending),
-        pb::transaction_log::Status::Wounded => Ok(TxCommitStatus::Wounded),
-        pb::transaction_log::Status::Default => Err(StorageError::other("unknown commit status")),
-    }
-}
-
-/// Decodes a transaction-log protobuf body into a [`TxLog`]. The status and
-/// timestamp are taken from the body (not tags), which is what the v2 unified
-/// transaction object relies on (ADR-019). Shared by [`TLogger::get`] and the
-/// v2 [`crate::txobject`] codec.
-pub(crate) fn decode_tx_log(db_root: &str, id: &TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
-    decode_tx_log_from_proto(db_root, id, &parse_log(buf)?)
-}
-
-fn decode_tx_log_from_proto(
-    db_root: &str,
-    id: &TxId,
-    tr: &pb::TransactionLog,
-) -> Result<TxLog, StorageError> {
-    let status = match tr.status() {
-        pb::transaction_log::Status::Committed => TxCommitStatus::Ok,
-        pb::transaction_log::Status::Aborted => TxCommitStatus::Aborted,
-        pb::transaction_log::Status::Pending => TxCommitStatus::Pending,
-        pb::transaction_log::Status::Wounded => TxCommitStatus::Wounded,
-        pb::transaction_log::Status::Default => {
-            return Err(StorageError::other("unknown commit status"));
-        }
-    };
-    let mut res = TxLog {
-        id: id.clone(),
-        timestamp: tr.timestamp.map(proto_ts_to_system),
-        status,
-        writes: Vec::new(),
-        locks: Vec::new(),
-        collection_changes: Vec::new(),
-        prepared_collections: Vec::new(),
-    };
-
-    for cw in &tr.writes {
-        let collection = decode_collection_id(db_root, &cw.collection_id)?;
-        for w in &cw.writes {
-            res.writes.push(TxWrite {
-                key: KeyRef::new(collection.clone(), &w.key),
-                value: write_value(w),
-                deleted: write_deleted(w),
-                prev_writer: TxId::from_bytes(w.prev_tid.clone()),
-            });
-        }
-        if let Some(locks) = &cw.locks {
-            for lock in &locks.entry_locks {
-                res.locks.push(TxLock::Entry {
-                    key: KeyRef::new(collection.clone(), &lock.key),
-                    typ: parse_lock_type(lock.lock_type),
-                });
-            }
-            for lock in &locks.membership_locks {
-                let leaf = match lock.target.as_ref() {
-                    Some(pb::membership_lock::Target::Root(true)) => {
-                        LeafRef::root(collection.clone())
-                    }
-                    Some(pb::membership_lock::Target::Node(token)) if !token.is_empty() => {
-                        LeafRef::node(collection.clone(), token.as_str())
-                    }
-                    _ => {
-                        return Err(StorageError::other(
-                            "transaction log has invalid membership lock",
-                        ));
-                    }
-                };
-                let typ = parse_lock_type(lock.lock_type);
-                res.locks.push(TxLock::Membership { leaf, typ });
-            }
-            let typ = parse_lock_type(locks.directory_lock);
-            if !matches!(typ, LockType::None | LockType::Unknown) {
-                res.locks.push(TxLock::Directory {
-                    collection: collection.clone(),
-                    typ,
-                });
-            }
-            if locks.topology_lock {
-                res.locks.push(TxLock::Topology {
-                    collection: collection.clone(),
-                });
-            }
-        }
-    }
-    for change in &tr.collection_changes {
-        if change.name.is_empty() || change.name.len() > MAX_COLLECTION_NAME_BYTES {
-            return Err(StorageError::other(
-                "transaction log has an invalid collection name",
-            ));
-        }
-        let parent = decode_collection_id(db_root, &change.parent_collection_id)?;
-        let collection = decode_collection_id(db_root, &change.collection_id)?;
-        if collection.id().is_root() {
-            return Err(StorageError::other(
-                "transaction log changes the permanent root collection",
-            ));
-        }
-        let op = match change.operation() {
-            pb::collection_change::Operation::Create => TxCollectionOp::Create,
-            pb::collection_change::Operation::Drop => TxCollectionOp::Drop,
-            pb::collection_change::Operation::Unknown => {
-                return Err(StorageError::other(
-                    "transaction log has an unknown collection operation",
-                ));
-            }
-        };
-        res.collection_changes.push(TxCollectionChange {
-            parent,
-            name: change.name.clone(),
-            collection,
-            op,
-        });
-    }
-    for id in &tr.prepared_collection_ids {
-        let collection = decode_collection_id(db_root, id)?;
-        if collection.id().is_root() {
-            return Err(StorageError::other(
-                "transaction log prepares the permanent root collection",
-            ));
-        }
-        res.prepared_collections.push(collection);
-    }
-    Ok(res)
-}
-
-pub(crate) fn marshal_log(l: &TxLog, ts: SystemTime) -> Result<Vec<u8>, StorageError> {
-    if l.id.is_unset() {
-        return Err(StorageError::other("empty transaction ID"));
-    }
-    validate_single_database(l)?;
-    let mut coll_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> = BTreeMap::new();
-
-    for e in &l.writes {
-        marshal_write(&mut coll_writes, e)?;
-    }
-    for e in &l.locks {
-        marshal_lock(&mut coll_writes, e)?;
-    }
-    let collection_changes = l
-        .collection_changes
-        .iter()
-        .map(|change| pb::CollectionChange {
-            parent_collection_id: change.parent.id().as_bytes().to_vec(),
-            name: change.name.clone(),
-            collection_id: change.collection.id().as_bytes().to_vec(),
-            operation: match change.op {
-                TxCollectionOp::Create => pb::collection_change::Operation::Create as i32,
-                TxCollectionOp::Drop => pb::collection_change::Operation::Drop as i32,
-            },
-        })
-        .collect();
-
-    let status = match l.status {
-        TxCommitStatus::Ok => pb::transaction_log::Status::Committed,
-        TxCommitStatus::Aborted => pb::transaction_log::Status::Aborted,
-        TxCommitStatus::Pending => pb::transaction_log::Status::Pending,
-        TxCommitStatus::Wounded => pb::transaction_log::Status::Wounded,
-        TxCommitStatus::Unknown => {
-            return Err(StorageError::other("unsupported commit status"));
-        }
-    };
-
-    let tr = pb::TransactionLog {
-        timestamp: Some(system_to_proto_ts(ts)),
-        status: status as i32,
-        writes: coll_writes.into_values().collect(),
-        collection_changes,
-        prepared_collection_ids: l
-            .prepared_collections
-            .iter()
-            .map(|collection| collection.id().as_bytes().to_vec())
-            .collect(),
-    };
-    Ok(tr.encode_to_vec())
-}
-
-fn marshal_write(
-    coll_writes: &mut BTreeMap<CollectionAddress, pb::CollectionWrites>,
-    e: &TxWrite,
-) -> Result<(), StorageError> {
-    let val_delete = if e.deleted {
-        pb::write::ValDelete::Deleted(true)
-    } else {
-        pb::write::ValDelete::Value(e.value.to_vec())
-    };
-    let write = pb::Write {
-        key: e.key.key().to_vec(),
-        prev_tid: e.prev_writer.as_bytes().to_vec(),
-        val_delete: Some(val_delete),
-    };
-    let collection = e.key.collection();
-    let coll = coll_writes
-        .entry(collection.clone())
-        .or_insert_with(|| pb::CollectionWrites {
-            collection_id: collection.id().as_bytes().to_vec(),
-            writes: Vec::new(),
-            locks: Some(pb::CollectionLocks::default()),
-        });
-    coll.writes.push(write);
-    Ok(())
-}
-
-fn marshal_lock(
-    coll_writes: &mut BTreeMap<CollectionAddress, pb::CollectionWrites>,
-    lock: &TxLock,
-) -> Result<(), StorageError> {
-    let collection = match lock {
-        TxLock::Entry { key, .. } => key.collection(),
-        TxLock::Membership { leaf, .. } => leaf.collection(),
-        TxLock::Directory { collection, .. } | TxLock::Topology { collection } => collection,
-    };
-    let coll = coll_writes
-        .entry(collection.clone())
-        .or_insert_with(|| pb::CollectionWrites {
-            collection_id: collection.id().as_bytes().to_vec(),
-            writes: Vec::new(),
-            locks: Some(pb::CollectionLocks::default()),
-        });
-    let clocks = coll.locks.get_or_insert_with(pb::CollectionLocks::default);
-
-    match lock {
-        TxLock::Entry { key, typ } => clocks.entry_locks.push(pb::EntryLock {
-            key: key.key().to_vec(),
-            lock_type: lock_type_to_proto(*typ) as i32,
-        }),
-        TxLock::Membership { leaf, typ } => {
-            let target = match leaf.node_token() {
-                Some(token) => pb::membership_lock::Target::Node(token.to_string()),
-                None => pb::membership_lock::Target::Root(true),
-            };
-            clocks.membership_locks.push(pb::MembershipLock {
-                target: Some(target),
-                lock_type: lock_type_to_proto(*typ) as i32,
-            });
-        }
-        TxLock::Directory { typ, .. } => {
-            clocks.directory_lock = lock_type_to_proto(*typ) as i32;
-        }
-        TxLock::Topology { .. } => {
-            clocks.topology_lock = true;
-        }
-    }
-    Ok(())
-}
-
-fn decode_collection_id(
-    db_root: &str,
-    collection_id: &[u8],
-) -> Result<CollectionAddress, StorageError> {
-    let id = CollectionId::from_slice(collection_id)
-        .ok_or_else(|| StorageError::other("transaction log has an invalid collection ID"))?;
-    Ok(CollectionAddress::new(db_root, id))
-}
-
-fn validate_single_database(log: &TxLog) -> Result<(), StorageError> {
-    let mut db_root: Option<String> = None;
-    let mut check = |collection: &CollectionAddress| -> Result<(), StorageError> {
-        match db_root.as_deref() {
-            Some(root) if root != collection.db_root() => Err(StorageError::other(
-                "transaction log spans multiple database roots",
-            )),
-            Some(_) => Ok(()),
-            None => {
-                db_root = Some(collection.db_root().to_string());
-                Ok(())
-            }
-        }
-    };
-    for write in &log.writes {
-        check(write.key.collection())?;
-    }
-    for lock in &log.locks {
-        match lock {
-            TxLock::Entry { key, .. } => check(key.collection())?,
-            TxLock::Membership { leaf, .. } => check(leaf.collection())?,
-            TxLock::Directory { collection, .. } | TxLock::Topology { collection } => {
-                check(collection)?
-            }
-        }
-    }
-    for change in &log.collection_changes {
-        check(&change.parent)?;
-        check(&change.collection)?;
-    }
-    for collection in &log.prepared_collections {
-        check(collection)?;
-    }
-    Ok(())
-}
-
-fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
-    match t {
-        LockType::None => pb::lock::LockType::None,
-        LockType::Read => pb::lock::LockType::Read,
-        LockType::Write => pb::lock::LockType::Write,
-        LockType::Create => pb::lock::LockType::Create,
-        LockType::Unknown => pb::lock::LockType::Unknown,
-    }
-}
-
-fn parse_lock_type(t: i32) -> LockType {
-    match pb::lock::LockType::try_from(t) {
-        Ok(pb::lock::LockType::None) => LockType::None,
-        Ok(pb::lock::LockType::Read) => LockType::Read,
-        Ok(pb::lock::LockType::Write) => LockType::Write,
-        Ok(pb::lock::LockType::Create) => LockType::Create,
-        _ => LockType::Unknown,
-    }
-}
-
-fn system_to_proto_ts(t: SystemTime) -> prost_types::Timestamp {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => prost_types::Timestamp {
-            seconds: d.as_secs() as i64,
-            nanos: d.subsec_nanos() as i32,
-        },
-        Err(e) => {
-            let d = e.duration();
-            prost_types::Timestamp {
-                seconds: -(d.as_secs() as i64),
-                nanos: -(d.subsec_nanos() as i32),
-            }
-        }
-    }
-}
-
-fn proto_ts_to_system(ts: prost_types::Timestamp) -> SystemTime {
-    if ts.seconds >= 0 {
-        UNIX_EPOCH + Duration::new(ts.seconds as u64, ts.nanos.max(0) as u32)
-    } else {
-        UNIX_EPOCH - Duration::new((-ts.seconds) as u64, ts.nanos.unsigned_abs())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use crate::Timeline;
+    use crate::lock::LockType;
+    use crate::transaction::{TxCollectionChange, TxCollectionOp, TxLock, TxWrite};
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
+    use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef};
     use tokio::sync::Notify;
 
     fn new_tlogger() -> TLogger {
@@ -1029,55 +617,6 @@ mod tests {
         assert_eq!(got.writes, log.writes);
         assert_eq!(got.timestamp, log.timestamp);
         assert_eq!(version.as_ref(), stored_v.revision());
-    }
-
-    #[test]
-    fn encoded_collection_ids_are_relocatable() {
-        let id = TxId::from_bytes(vec![1]);
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(42));
-        log.writes.push(TxWrite {
-            key: KeyRef::new(test_collection("original", 7), b"key"),
-            value: Arc::from(&b"value"[..]),
-            deleted: false,
-            prev_writer: TxId::default(),
-        });
-
-        let encoded = marshal_log(&log, log.timestamp.unwrap()).unwrap();
-        let relocated = decode_tx_log("moved", &id, &encoded).unwrap();
-
-        assert_eq!(relocated.writes[0].key.collection().db_root(), "moved");
-        assert_eq!(
-            relocated.writes[0].key.collection().id(),
-            test_collection("original", 7).id()
-        );
-        assert_eq!(
-            marshal_log(&relocated, relocated.timestamp.unwrap()).unwrap(),
-            encoded,
-            "the database root must not be encoded in the transaction body"
-        );
-    }
-
-    #[test]
-    fn one_transaction_cannot_span_database_roots() {
-        let mut log = TxLog::new(TxId::from_bytes(vec![1]), TxCommitStatus::Ok);
-        log.timestamp = Some(UNIX_EPOCH);
-        log.writes = vec![
-            TxWrite {
-                key: KeyRef::new(test_collection("first", 1), b"a"),
-                value: Arc::from(&b"a"[..]),
-                deleted: false,
-                prev_writer: TxId::default(),
-            },
-            TxWrite {
-                key: KeyRef::new(test_collection("second", 1), b"b"),
-                value: Arc::from(&b"b"[..]),
-                deleted: false,
-                prev_writer: TxId::default(),
-            },
-        ];
-
-        assert!(marshal_log(&log, UNIX_EPOCH).is_err());
     }
 
     #[tokio::test]

@@ -9,14 +9,12 @@
 //!
 //! The in-memory representation reuses [`TxLog`] (id, status, timestamp, the
 //! value map as `writes`, and the lock intentions as `locks`); this module is
-//! just the v2 body codec, sharing the canonical `TransactionLog` encoding with
-//! [`crate::tlogger`].
+//! the public v2 body facade over the canonical transaction-log codec.
 
 use crate::error::StorageError;
 use glassdb_data::KeyRef;
 
-use crate::tlogger::{decode_tx_log, decode_tx_status, marshal_log};
-use crate::transaction::{TxCommitStatus, TxLog, TxWrite};
+use crate::transaction::{TxCommitStatus, TxLog, TxLogCodec, TxWrite};
 
 /// Encodes a transaction object to its canonical protobuf body (the CAS unit).
 ///
@@ -24,21 +22,20 @@ use crate::transaction::{TxCommitStatus, TxLog, TxWrite};
 /// anchor while pending (ADR-021), so it is never defaulted from a hidden clock
 /// here — the engine sets it explicitly to keep encoding deterministic.
 pub fn encode(obj: &TxLog) -> Result<Vec<u8>, StorageError> {
-    let ts = obj
-        .timestamp
+    obj.timestamp
         .ok_or_else(|| StorageError::other("transaction object has no timestamp/lease"))?;
-    marshal_log(obj, ts)
+    TxLogCodec::encode(obj)
 }
 
 /// Decodes a transaction object from its protobuf body. The status and timestamp
 /// are read from the body, not tags (ADR-019).
 pub fn decode(db_root: &str, id: &glassdb_data::TxId, buf: &[u8]) -> Result<TxLog, StorageError> {
-    decode_tx_log(db_root, id, buf)
+    TxLogCodec::decode(db_root, id, buf)
 }
 
 /// Decodes only the transaction status without requiring relocation context.
 pub fn status(buf: &[u8]) -> Result<TxCommitStatus, StorageError> {
-    decode_tx_status(buf)
+    TxLogCodec::decode_status(buf)
 }
 
 /// Returns the write the transaction recorded for `key`, or `None`
