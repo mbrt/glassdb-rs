@@ -328,6 +328,7 @@ dependencies = [
  "async-trait",
  "futures",
  "rand",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",

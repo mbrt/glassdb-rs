@@ -1,7 +1,7 @@
 //! Deterministic-simulation workloads and execution harness.
 //!
 //! The shared [`SimWorkload`] harness runs concurrent clients over a deterministic
-//! scheduler with tape-guided faults. Four focused workloads provide independent
+//! scheduler with tape-guided faults. Five focused workloads provide independent
 //! correctness oracles:
 //!
 //! - [`RmwWorkload`] stresses shared-key serializability and in-doubt increments.
@@ -9,10 +9,14 @@
 //! - [`MembershipWorkload`] exercises key membership, splits, and listing.
 //! - [`ApiWorkload`] checks transaction-local key operations, collection
 //!   lifecycle, nested paths, and aborts.
+//! - [`HistoryWorkload`] checks complete point/group-read, write, and
+//!   membership-scan histories against an implementation-independent sequential
+//!   specification.
 
 mod api;
 mod cycle;
 mod harness;
+mod history;
 mod membership;
 mod rmw;
 mod slow_backend;
@@ -28,6 +32,11 @@ pub use harness::{
 pub use harness::{
     PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
     replay_input,
+};
+pub use history::{
+    AbstractState, BodyResult, BodyTrace, CheckError, CheckStats, HistoryAction,
+    HistoryInstruction, HistoryOutcome, HistoryTransaction, HistoryWorkload, PublicOp,
+    check_history,
 };
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};

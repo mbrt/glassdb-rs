@@ -46,6 +46,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "history"
+path = "fuzz_targets/history.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "disk_cache"
 path = "fuzz_targets/disk_cache.rs"
 test = false
