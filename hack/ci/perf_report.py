@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Render a compact Markdown comparison from PR performance JSON artifacts."""
+"""Render a compact Markdown comparison from PR autoresearch JSON artifacts."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import statistics
@@ -13,8 +12,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCORE_RUNS = 11
-MIXED_RUNS = 3
-CONTENTION_RUNS = 3
 WORKLOADS = (
     "singleRMW",
     "multiRMW10",
@@ -22,7 +19,6 @@ WORKLOADS = (
     "batchWrite100",
     "readRepeat",
 )
-SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
 SECONDARY = (
     ("Allocation bytes/tx", "allocBytesPerTx", 0),
     ("Allocations/tx", "allocsPerTx", 1),
@@ -42,35 +38,6 @@ class ScoreRun:
     secondary: dict[str, float]
 
 
-@dataclass(frozen=True)
-class MixedShape:
-    tx_per_sec: float
-    p50_ms: float
-    p90_ms: float
-    converged: bool
-    committed: int
-    relative_ci: float
-
-
-@dataclass(frozen=True)
-class MixedRun:
-    shapes: dict[str, MixedShape]
-    total_ops_per_tx: float
-    retries_per_tx: float
-
-
-@dataclass(frozen=True)
-class ContentionRun:
-    completed: int
-    tx_per_sec: float | None
-    p50_ms: float
-    p90_ms: float
-    retries_per_tx: float | None
-    direct_candidates_per_tx: float | None
-    direct_land_rate: float | None
-    worker_drain_ms: float | None
-
-
 def _number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReportError(f"{field} must be a number")
@@ -85,13 +52,6 @@ def _nonnegative(value: Any, field: str) -> float:
     if result < 0:
         raise ReportError(f"{field} must be nonnegative")
     return result
-
-
-def _count(value: Any, field: str) -> int:
-    result = _nonnegative(value, field)
-    if not result.is_integer():
-        raise ReportError(f"{field} must be an integer")
-    return int(result)
 
 
 def _object(value: Any, field: str) -> dict[str, Any]:
@@ -113,16 +73,20 @@ def _read_json(path: Path) -> Any:
         raise ReportError(f"cannot read {path}: {error}") from error
 
 
-def _result_files(path: Path, count: int) -> list[Path]:
+def _result_files(path: Path) -> list[Path]:
     files = sorted(path.glob("*.json"))
-    if len(files) != count:
-        raise ReportError(f"{path} contains {len(files)} JSON files; expected {count}")
+    expected_names = [f"{run:02d}.json" for run in range(1, SCORE_RUNS + 1)]
+    if [result.name for result in files] != expected_names:
+        raise ReportError(
+            f"{path} must contain score runs {expected_names}; "
+            f"found {[result.name for result in files]}"
+        )
     return files
 
 
 def load_score_runs(path: Path) -> list[ScoreRun]:
     runs = []
-    for result_path in _result_files(path, SCORE_RUNS):
+    for result_path in _result_files(path):
         raw = _object(_read_json(result_path), str(result_path))
         workload_rows = _array(raw.get("workloads"), f"{result_path}: workloads")
         workloads: dict[str, float] = {}
@@ -141,6 +105,7 @@ def load_score_runs(path: Path) -> list[ScoreRun]:
                 f"{result_path}: workloads are {sorted(workloads)}; "
                 f"expected {sorted(WORKLOADS)}"
             )
+
         secondary_raw = _object(raw.get("secondary"), f"{result_path}: secondary")
         secondary = {
             field: _nonnegative(secondary_raw.get(field), f"{result_path}: {field}")
@@ -151,299 +116,6 @@ def load_score_runs(path: Path) -> list[ScoreRun]:
                 score=_nonnegative(raw.get("score"), f"{result_path}: score"),
                 workloads=workloads,
                 secondary=secondary,
-            )
-        )
-    return runs
-
-
-def load_mixed_runs(path: Path) -> list[MixedRun]:
-    runs = []
-    for result_path in _result_files(path, MIXED_RUNS):
-        raw = _read_json(result_path)
-        if isinstance(raw, dict):
-            report = _object(raw, str(result_path))
-            if report.get("schemaVersion") != 1 or report.get("scenario") != "mixed":
-                raise ReportError(f"{result_path}: incompatible perfbench schema")
-            report_runs = _array(report.get("runs"), f"{result_path}: runs")
-            if len(report_runs) != 1:
-                raise ReportError(f"{result_path}: expected one perfbench run")
-            run = _object(report_runs[0], f"{result_path}: runs[0]")
-            cells = _array(run.get("cells"), f"{result_path}: cells")
-        else:
-            cells = _array(raw, str(result_path))
-        if len(cells) != 1:
-            raise ReportError(f"{result_path}: expected one mixed-workload cell")
-        cell = _object(cells[0], f"{result_path}: cell")
-        legacy_layout = cell.get("topology") == "shared"
-        affinity_layout = (
-            cell.get("affinityPct") == 100 and cell.get("databases") == 1
-        )
-        if cell.get("mode") != "hi" or not (legacy_layout or affinity_layout):
-            raise ReportError(
-                f"{result_path}: expected the focused high-contention one-Database cell"
-            )
-        if affinity_layout:
-            _count(cell.get("setupSplits"), f"{result_path}: setupSplits")
-            _nonnegative(
-                cell.get("splitSettleWallMs"),
-                f"{result_path}: splitSettleWallMs",
-            )
-        failures = _count(cell.get("failures"), f"{result_path}: failures")
-        if failures != 0:
-            raise ReportError(
-                f"{result_path}: mixed workload recorded {failures:g} failures"
-            )
-
-        shapes: dict[str, MixedShape] = {}
-        for index, row_value in enumerate(
-            _array(cell.get("shapes"), f"{result_path}: shapes")
-        ):
-            row = _object(row_value, f"{result_path}: shapes[{index}]")
-            name = row.get("shape")
-            if not isinstance(name, str):
-                raise ReportError(f"{result_path}: shape name must be a string")
-            if name in shapes:
-                raise ReportError(f"{result_path}: duplicate shape {name}")
-            converged = row.get("converged")
-            if not isinstance(converged, bool):
-                raise ReportError(f"{result_path}: {name}.converged must be boolean")
-            shapes[name] = MixedShape(
-                tx_per_sec=_nonnegative(
-                    row.get("txPerSec"), f"{result_path}: {name}.txPerSec"
-                ),
-                p50_ms=_nonnegative(row.get("p50Ms"), f"{result_path}: {name}.p50Ms"),
-                p90_ms=_nonnegative(row.get("p90Ms"), f"{result_path}: {name}.p90Ms"),
-                converged=converged,
-                committed=_count(
-                    row.get("committed"), f"{result_path}: {name}.committed"
-                ),
-                relative_ci=_nonnegative(
-                    row.get("relCi"), f"{result_path}: {name}.relCi"
-                ),
-            )
-        if set(shapes) != set(SHAPES):
-            raise ReportError(
-                f"{result_path}: shapes are {sorted(shapes)}; expected {sorted(SHAPES)}"
-            )
-        aggregate = _object(cell.get("aggregateOps"), f"{result_path}: aggregateOps")
-        runs.append(
-            MixedRun(
-                shapes=shapes,
-                total_ops_per_tx=_nonnegative(
-                    aggregate.get("totalOpsPerTx"),
-                    f"{result_path}: aggregateOps.totalOpsPerTx",
-                ),
-                retries_per_tx=_nonnegative(
-                    aggregate.get("retriesPerTx"),
-                    f"{result_path}: aggregateOps.retriesPerTx",
-                ),
-            )
-        )
-    return runs
-
-
-def _percentile_r8(values: list[float], percentile: float) -> float:
-    ordered = sorted(values)
-    if not ordered:
-        raise ReportError("cannot take a percentile of no samples")
-    n = 1.0 / 3.0 + percentile * (len(ordered) + 1.0 / 3.0)
-    k = math.floor(n)
-    fraction = n - k
-    if k <= 0:
-        return ordered[0]
-    if k >= len(ordered):
-        return ordered[-1]
-    return ordered[k - 1] + fraction * (ordered[k] - ordered[k - 1])
-
-
-def _csv_rows(path: Path) -> list[dict[str, str]]:
-    try:
-        with path.open(newline="") as source:
-            return list(csv.DictReader(source))
-    except OSError as error:
-        raise ReportError(f"cannot read {path}: {error}") from error
-
-
-def _csv_number(row: dict[str, str], field: str, path: Path) -> float:
-    raw = row.get(field)
-    try:
-        value = float(raw) if raw is not None else float("nan")
-    except ValueError as error:
-        raise ReportError(f"{path}: {field} must be a number") from error
-    return _nonnegative(value, f"{path}: {field}")
-
-
-def load_contention_runs(path: Path, *, require_stats: bool) -> list[ContentionRun]:
-    json_files = sorted(path.glob("*.json"))
-    if json_files:
-        return _load_current_contention_runs(path, json_files)
-    raw_files = sorted(
-        result
-        for result in path.glob("*.csv")
-        if not result.name.endswith("-stats.csv")
-    )
-    expected_names = [f"{run:02d}.csv" for run in range(1, CONTENTION_RUNS + 1)]
-    if [result.name for result in raw_files] != expected_names:
-        raise ReportError(
-            f"{path} must contain paired legacy deadlock runs {expected_names}; "
-            f"found {[result.name for result in raw_files]}"
-        )
-    stats_files = [
-        result.with_name(f"{result.stem}-stats.csv") for result in raw_files
-    ]
-    stats_present = [result.exists() for result in stats_files]
-    if require_stats and not all(stats_present):
-        raise ReportError(
-            f"{path}: focused legacy deadlock stats are required for every run"
-        )
-    if any(stats_present) and not all(stats_present):
-        raise ReportError(f"{path}: focused legacy deadlock stats are incomplete")
-
-    runs = []
-    for result_path in raw_files:
-        rows = [
-            row
-            for row in _csv_rows(result_path)
-            if _csv_number(row, "num-keys", result_path) == 1
-            and _csv_number(row, "overlap-pct", result_path) == 100
-        ]
-        latencies = [
-            _csv_number(row, "latency-ms", result_path)
-            for row in rows
-        ]
-        if not latencies:
-            raise ReportError(f"{result_path}: no one-key full-overlap samples")
-
-        stats_path = result_path.with_name(f"{result_path.stem}-stats.csv")
-        stats_rows = []
-        if stats_path.exists():
-            stats_rows = [
-                row
-                for row in _csv_rows(stats_path)
-                if _csv_number(row, "num-keys", stats_path) == 1
-                and _csv_number(row, "overlap-pct", stats_path) == 100
-            ]
-            if len(stats_rows) != 1:
-                raise ReportError(
-                    f"{stats_path}: expected one one-key full-overlap row"
-                )
-
-        tx_per_sec = retries_per_tx = direct_candidates_per_tx = None
-        direct_land_rate = worker_drain_ms = None
-        if stats_rows:
-            row = stats_rows[0]
-            completed = _count(
-                _csv_number(row, "count", stats_path), f"{stats_path}: count"
-            )
-            if completed != len(latencies):
-                raise ReportError(
-                    f"{stats_path}: count={completed} but {result_path} has "
-                    f"{len(latencies)} samples"
-                )
-            duration_ms = _csv_number(row, "cell-duration-ms", stats_path)
-            if duration_ms == 0:
-                raise ReportError(f"{stats_path}: cell-duration-ms must be positive")
-            candidates_field = (
-                "direct-candidates"
-                if "direct-candidates" in row
-                else "direct-attempts"
-            )
-            landed_field = (
-                "direct-landed" if "direct-landed" in row else "direct-commits"
-            )
-            candidates = _csv_number(row, candidates_field, stats_path)
-            landed = _csv_number(row, landed_field, stats_path)
-            if landed > candidates:
-                raise ReportError(
-                    f"{stats_path}: direct landed count exceeds candidates"
-                )
-            tx_per_sec = completed * 1000.0 / duration_ms
-            retries_per_tx = (
-                _csv_number(row, "num-retries", stats_path) / completed
-            )
-            direct_candidates_per_tx = candidates / completed
-            direct_land_rate = (
-                landed / candidates if candidates > 0 else None
-            )
-            worker_drain_ms = _csv_number(row, "worker-drain-ms", stats_path)
-
-        runs.append(
-            ContentionRun(
-                completed=len(latencies),
-                tx_per_sec=tx_per_sec,
-                p50_ms=_percentile_r8(latencies, 0.5),
-                p90_ms=_percentile_r8(latencies, 0.9),
-                retries_per_tx=retries_per_tx,
-                direct_candidates_per_tx=direct_candidates_per_tx,
-                direct_land_rate=direct_land_rate,
-                worker_drain_ms=worker_drain_ms,
-            )
-        )
-    return runs
-
-
-def _load_current_contention_runs(
-    path: Path, files: list[Path]
-) -> list[ContentionRun]:
-    expected_names = [f"{run:02d}.json" for run in range(1, CONTENTION_RUNS + 1)]
-    if [result.name for result in files] != expected_names:
-        raise ReportError(
-            f"{path} must contain paired contention runs {expected_names}; "
-            f"found {[result.name for result in files]}"
-        )
-    runs = []
-    for result_path in files:
-        report = _object(_read_json(result_path), str(result_path))
-        if report.get("schemaVersion") != 1 or report.get("scenario") != "contention":
-            raise ReportError(f"{result_path}: incompatible perfbench schema")
-        report_runs = _array(report.get("runs"), f"{result_path}: runs")
-        if len(report_runs) != 1:
-            raise ReportError(f"{result_path}: expected one perfbench run")
-        run = _object(report_runs[0], f"{result_path}: runs[0]")
-        matching = []
-        for value in _array(run.get("cells"), f"{result_path}: cells"):
-            cell = _object(value, f"{result_path}: cell")
-            if cell.get("numKeys") == 1 and cell.get("overlapPct") == 100:
-                matching.append(cell)
-        if len(matching) != 1:
-            raise ReportError(f"{result_path}: expected one one-key full-overlap cell")
-        cell = matching[0]
-        failures = _count(cell.get("failures"), f"{result_path}: failures")
-        if failures:
-            raise ReportError(f"{result_path}: contention recorded {failures} failures")
-        latencies = [
-            _nonnegative(value, f"{result_path}: samplesMs")
-            for value in _array(cell.get("samplesMs"), f"{result_path}: samplesMs")
-        ]
-        completed = _count(cell.get("committed"), f"{result_path}: committed")
-        if not latencies or completed != len(latencies):
-            raise ReportError(
-                f"{result_path}: committed={completed} but has {len(latencies)} samples"
-            )
-        duration_ms = _nonnegative(cell.get("durationMs"), f"{result_path}: durationMs")
-        if duration_ms == 0:
-            raise ReportError(f"{result_path}: durationMs must be positive")
-        candidates = _nonnegative(
-            cell.get("directCandidates"), f"{result_path}: directCandidates"
-        )
-        landed = _nonnegative(cell.get("directLanded"), f"{result_path}: directLanded")
-        if landed > candidates:
-            raise ReportError(f"{result_path}: direct landed count exceeds candidates")
-        runs.append(
-            ContentionRun(
-                completed=completed,
-                tx_per_sec=completed * 1000.0 / duration_ms,
-                p50_ms=_percentile_r8(latencies, 0.5),
-                p90_ms=_percentile_r8(latencies, 0.9),
-                retries_per_tx=_nonnegative(
-                    cell.get("retries"), f"{result_path}: retries"
-                )
-                / completed,
-                direct_candidates_per_tx=candidates / completed,
-                direct_land_rate=landed / candidates if candidates > 0 else None,
-                worker_drain_ms=_nonnegative(
-                    cell.get("workerDrainMs"), f"{result_path}: workerDrainMs"
-                ),
             )
         )
     return runs
@@ -470,28 +142,6 @@ def _change(base: Iterable[float], candidate: Iterable[float]) -> str:
     return f"{(candidate_median / base_median - 1.0) * 100:+.2f}%"
 
 
-def _available(items: Iterable[float | int | None]) -> list[float]:
-    return [float(item) for item in items if item is not None]
-
-
-def _optional_summary(
-    items: Iterable[float | int | None], digits: int = 2
-) -> str:
-    values = _available(items)
-    return _summary(values, digits) if values else "n/a"
-
-
-def _optional_change(
-    base: Iterable[float | int | None],
-    candidate: Iterable[float | int | None],
-) -> str:
-    base_values = _available(base)
-    candidate_values = _available(candidate)
-    if not base_values or not candidate_values:
-        return "n/a"
-    return _change(base_values, candidate_values)
-
-
 def _escape(value: str) -> str:
     return value.replace("|", "\\|")
 
@@ -499,14 +149,6 @@ def _escape(value: str) -> str:
 def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str:
     base_scores = load_score_runs(input_dir / "score" / "main")
     candidate_scores = load_score_runs(input_dir / "score" / "pr")
-    base_mix = load_mixed_runs(input_dir / "mixed" / "main")
-    candidate_mix = load_mixed_runs(input_dir / "mixed" / "pr")
-    base_contention = load_contention_runs(
-        input_dir / "contention" / "main", require_stats=False
-    )
-    candidate_contention = load_contention_runs(
-        input_dir / "contention" / "pr", require_stats=True
-    )
 
     base_score_values = _values(base_scores, "score")
     candidate_score_values = _values(candidate_scores, "score")
@@ -515,6 +157,7 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
         "",
         f"- Base: `{_escape(base_label)}`",
         f"- Candidate: `{_escape(candidate_label)}`",
+        "- Numeric changes are informational and never fail the PR check.",
         "",
         "## Backend-operation score",
         "",
@@ -543,7 +186,10 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
             "treated as unchanged.",
             "",
             "<details>",
-            "<summary>Noisy in-memory secondary axes</summary>",
+            "<summary>In-memory secondary metrics (informational)</summary>",
+            "",
+            "Lower is better. These values use the same interleaved runs; their "
+            "observed ranges show the run-to-run variability.",
             "",
             "| Metric | Main | PR | Change |",
             "| --- | ---: | ---: | ---: |",
@@ -556,109 +202,7 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
             f"| {label} | {_summary(base, digits)} | {_summary(candidate, digits)} | "
             f"{_change(base, candidate)} |"
         )
-    lines.extend(["", "</details>", "", "## Focused contention mix", ""])
-
-    unconverged = []
-    for side, runs in (("main", base_mix), ("PR", candidate_mix)):
-        for repetition, run in enumerate(runs, start=1):
-            missing = [
-                name for name, shape in run.shapes.items() if not shape.converged
-            ]
-            if missing:
-                unconverged.append(
-                    f"{side} run {repetition}: {', '.join(sorted(missing))}"
-                )
-    if unconverged:
-        lines.append(
-            "⚠️ Some shapes hit the time cap before reaching the requested "
-            "throughput confidence target: " + "; ".join(unconverged) + "."
-        )
-    else:
-        lines.append("All shapes converged in all three runs on both revisions.")
-    lines.extend(
-        [
-            "",
-            "One Database, eight workers per shape, and eight hot keys. "
-            "Values are medians with min–max ranges; throughput is higher-is-better, "
-            "while latency is lower-is-better.",
-            "",
-            "| Shape | Main tx/s | PR tx/s | Change | Main p50 ms | PR p50 ms | "
-            "p50 change | Main p90 ms | PR p90 ms | p90 change |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for shape_name in SHAPES:
-        base_shapes = [run.shapes[shape_name] for run in base_mix]
-        candidate_shapes = [run.shapes[shape_name] for run in candidate_mix]
-        base_tps = _values(base_shapes, "tx_per_sec")
-        candidate_tps = _values(candidate_shapes, "tx_per_sec")
-        base_p50 = _values(base_shapes, "p50_ms")
-        candidate_p50 = _values(candidate_shapes, "p50_ms")
-        base_p90 = _values(base_shapes, "p90_ms")
-        candidate_p90 = _values(candidate_shapes, "p90_ms")
-        lines.append(
-            f"| `{shape_name}` | {_summary(base_tps)} | {_summary(candidate_tps)} | "
-            f"{_change(base_tps, candidate_tps)} | {_summary(base_p50, 1)} | "
-            f"{_summary(candidate_p50, 1)} | {_change(base_p50, candidate_p50)} | "
-            f"{_summary(base_p90, 1)} | {_summary(candidate_p90, 1)} | "
-            f"{_change(base_p90, candidate_p90)} |"
-        )
-
-    base_ops = _values(base_mix, "total_ops_per_tx")
-    candidate_ops = _values(candidate_mix, "total_ops_per_tx")
-    base_retries = _values(base_mix, "retries_per_tx")
-    candidate_retries = _values(candidate_mix, "retries_per_tx")
-    lines.extend(
-        [
-            "",
-            "| Aggregate metric | Main | PR | Change |",
-            "| --- | ---: | ---: | ---: |",
-            f"| Backend ops/tx | {_summary(base_ops, 3)} | "
-            f"{_summary(candidate_ops, 3)} | {_change(base_ops, candidate_ops)} |",
-            f"| Retries/tx | {_summary(base_retries, 3)} | "
-            f"{_summary(candidate_retries, 3)} | "
-            f"{_change(base_retries, candidate_retries)} |",
-            "",
-            "> The mixed scenario is scheduling-sensitive even after adaptive sampling; use it "
-            "as a secondary concurrency signal, not a pass/fail verdict.",
-            "",
-            "## Focused one-key RMW contention",
-            "",
-            "Five writers repeatedly update one shared key. Values are medians with "
-            "min–max ranges from three interleaved runs. Missing baseline protocol "
-            "fields mean the baseline predates the focused summary schema; latency "
-            "and completion counts remain comparable.",
-            "",
-            "| Metric | Main | PR | Change |",
-            "| --- | ---: | ---: | ---: |",
-        ]
-    )
-    contention_metrics = [
-        ("Successful tx/run", "completed", 0),
-        ("Completion tx/s", "tx_per_sec", 2),
-        ("p50 latency ms", "p50_ms", 1),
-        ("p90 latency ms", "p90_ms", 1),
-        ("Retries/tx", "retries_per_tx", 3),
-        ("Direct candidates/tx", "direct_candidates_per_tx", 3),
-        ("Direct land rate", "direct_land_rate", 3),
-        ("Worker drain ms", "worker_drain_ms", 1),
-    ]
-    for label, field, digits in contention_metrics:
-        base = [getattr(run, field) for run in base_contention]
-        candidate = [getattr(run, field) for run in candidate_contention]
-        lines.append(
-            f"| {label} | {_optional_summary(base, digits)} | "
-            f"{_optional_summary(candidate, digits)} | "
-            f"{_optional_change(base, candidate)} |"
-        )
-    lines.extend(
-        [
-            "",
-            "> A missing cell, worker error, or incomplete drain fails the measurement "
-            "step instead of producing a comparison.",
-            "",
-        ]
-    )
+    lines.extend(["", "</details>", ""])
     return "\n".join(lines)
 
 
