@@ -95,6 +95,203 @@ struct DecodedInput {
     media_tape: Vec<u8>,
 }
 
+struct HarnessState {
+    cache: Option<PersistentCache>,
+    media: SimMedia,
+    identity: u8,
+    next_sequence_point: u64,
+    known_records: HashMap<(u8, u8), Vec<KnownRecord>>,
+    events: Vec<DiskCacheEvent>,
+}
+
+impl HarnessState {
+    fn new(seed: u64, media_tape: Vec<u8>, event_capacity: usize) -> Self {
+        Self {
+            cache: None,
+            media: SimMedia::new(MediaFaultProfile::Full, media_tape, seed ^ 0xD15C_CA4E),
+            identity: 0,
+            next_sequence_point: 1,
+            known_records: HashMap::new(),
+            events: Vec::with_capacity(event_capacity),
+        }
+    }
+
+    async fn dispatch(&mut self, command: Command) {
+        match command.kind {
+            CommandKind::Open => self.handle_open(command).await,
+            CommandKind::Replace => self.handle_replace(command),
+            CommandKind::Lookup => self.handle_lookup(command).await,
+            CommandKind::Invalidate => self.handle_invalidate(command),
+            CommandKind::Close => self.handle_close(command).await,
+            CommandKind::Crash => self.handle_crash(command).await,
+            CommandKind::Detach => self.handle_detach(command),
+            CommandKind::Reattach => self.handle_reattach(command),
+            CommandKind::Corrupt => self.handle_corrupt(command),
+            CommandKind::MakePermanentlyUnavailable => {
+                self.handle_make_permanently_unavailable(command);
+            }
+        }
+    }
+
+    async fn handle_open(&mut self, command: Command) {
+        self.close_cache().await;
+        self.identity = command.identity;
+        let opened = PersistentCache::open(
+            config(),
+            "db",
+            database_id(self.identity),
+            Some(self.media.clone().into()),
+        )
+        .await;
+        let recovered = opened.last_sequence_point.map(SequencePoint::raw);
+        if let Some(point) = recovered {
+            assert!(
+                self.known_records
+                    .iter()
+                    .any(|((known_identity, _), records)| {
+                        *known_identity == self.identity
+                            && records.iter().any(|record| record.sequence_point == point)
+                    }),
+                "cache recovered a sequence point that was never admitted"
+            );
+        }
+        self.events.push(DiskCacheEvent::Opened {
+            identity: self.identity,
+            enabled: opened.cache.is_enabled(),
+            last_sequence_point: recovered,
+        });
+        self.cache = Some(opened.cache);
+    }
+
+    fn handle_replace(&mut self, command: Command) {
+        if let Some(current) = self.cache.as_ref()
+            && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
+        {
+            let sequence_point = self.next_sequence_point;
+            self.next_sequence_point = self.next_sequence_point.saturating_add(1);
+            let path = path(command.path);
+            let revision = revision(sequence_point, command.pattern);
+            let body = body(command.argument, command.pattern);
+            self.known_records
+                .entry((self.identity, command.path))
+                .or_default()
+                .push(KnownRecord {
+                    revision: revision.clone(),
+                    body: body.clone(),
+                    sequence_point,
+                });
+            current.replace(
+                path,
+                revision,
+                body,
+                SequencePoint::from_raw(sequence_point),
+                guard,
+            );
+        }
+        self.push_state(command.kind);
+    }
+
+    async fn handle_lookup(&mut self, command: Command) {
+        let record = if let Some(current) = self.cache.as_ref() {
+            match rt::timeout(Duration::from_secs(6), current.lookup(path(command.path))).await {
+                Ok(record) => record,
+                Err(_) => {
+                    current.disable_slow_lookup();
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let record_digest = record.map(|record| {
+            let valid = self
+                .known_records
+                .get(&(self.identity, command.path))
+                .is_some_and(|records| {
+                    records.iter().any(|known| {
+                        known.revision == record.revision
+                            && known.body == record.body
+                            && known.sequence_point == record.current_after.raw()
+                    })
+                });
+            assert!(valid, "cache returned a fabricated or mixed record");
+            digest_record(&record.revision, &record.body, record.current_after.raw())
+        });
+        self.events.push(DiskCacheEvent::Lookup {
+            identity: self.identity,
+            path: command.path,
+            record_digest,
+        });
+    }
+
+    fn handle_invalidate(&mut self, command: Command) {
+        if let Some(current) = self.cache.as_ref()
+            && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
+        {
+            current.invalidate(path(command.path), guard);
+        }
+        self.push_state(command.kind);
+    }
+
+    async fn handle_close(&mut self, command: Command) {
+        self.close_cache().await;
+        self.push_state(command.kind);
+    }
+
+    async fn handle_crash(&mut self, command: Command) {
+        self.cache = None;
+        self.media.crash();
+        rt::yield_now().await;
+        self.push_state(command.kind);
+    }
+
+    fn handle_detach(&mut self, command: Command) {
+        self.media.detach();
+        self.push_state(command.kind);
+    }
+
+    fn handle_reattach(&mut self, command: Command) {
+        self.media.reattach();
+        self.push_state(command.kind);
+    }
+
+    fn handle_corrupt(&mut self, command: Command) {
+        let durable_len = self
+            .media
+            .durable_bytes()
+            .map_or(0, |bytes| bytes.len() as u64);
+        if durable_len != 0 {
+            let scaled = u64::from(command.argument)
+                .wrapping_mul(257)
+                .wrapping_add(u64::from(command.path));
+            let _ = self
+                .media
+                .corrupt(scaled % durable_len, command.pattern | 1);
+        }
+        self.push_state(command.kind);
+    }
+
+    fn handle_make_permanently_unavailable(&mut self, command: Command) {
+        self.media.make_permanently_unavailable();
+        self.push_state(command.kind);
+    }
+
+    async fn close_cache(&mut self) {
+        if let Some(current) = self.cache.take() {
+            current.shutdown().await;
+            drop(current);
+            rt::yield_now().await;
+        }
+    }
+
+    fn push_state(&mut self, kind: CommandKind) {
+        self.events.push(DiskCacheEvent::State {
+            operation: kind.operation_code(),
+            enabled: self.cache.as_ref().is_some_and(PersistentCache::is_enabled),
+        });
+    }
+}
+
 /// Runs one cache-only fuzz input and panics on a safety-oracle violation.
 pub fn replay_disk_cache_input(data: &[u8]) {
     let _ = record_disk_cache_input(data);
@@ -111,158 +308,18 @@ pub fn record_disk_cache_input(data: &[u8]) -> Vec<DiskCacheEvent> {
 }
 
 async fn run(seed: u64, commands: Vec<Command>, media_tape: Vec<u8>) -> Vec<DiskCacheEvent> {
-    let media = SimMedia::new(MediaFaultProfile::Full, media_tape, seed ^ 0xD15C_CA4E);
-    let mut cache = None;
-    let mut identity = 0;
-    let mut next_sequence_point = 1u64;
-    let mut known: HashMap<(u8, u8), Vec<KnownRecord>> = HashMap::new();
-    let mut events = Vec::with_capacity(commands.len());
-
+    let mut state = HarnessState::new(seed, media_tape, commands.len());
     for command in commands {
-        match command.kind {
-            CommandKind::Open => {
-                close(&mut cache).await;
-                identity = command.identity;
-                let opened = PersistentCache::open(
-                    config(),
-                    "db",
-                    database_id(identity),
-                    Some(media.clone().into()),
-                )
-                .await;
-                let recovered = opened.last_sequence_point.map(SequencePoint::raw);
-                if let Some(point) = recovered {
-                    assert!(
-                        known.iter().any(|((known_identity, _), records)| {
-                            *known_identity == identity
-                                && records.iter().any(|record| record.sequence_point == point)
-                        }),
-                        "cache recovered a sequence point that was never admitted"
-                    );
-                }
-                events.push(DiskCacheEvent::Opened {
-                    identity,
-                    enabled: opened.cache.is_enabled(),
-                    last_sequence_point: recovered,
-                });
-                cache = Some(opened.cache);
-            }
-            CommandKind::Replace => {
-                if let Some(current) = cache.as_ref()
-                    && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
-                {
-                    let sequence_point = next_sequence_point;
-                    next_sequence_point = next_sequence_point.saturating_add(1);
-                    let path = path(command.path);
-                    let revision = revision(sequence_point, command.pattern);
-                    let body = body(command.argument, command.pattern);
-                    known
-                        .entry((identity, command.path))
-                        .or_default()
-                        .push(KnownRecord {
-                            revision: revision.clone(),
-                            body: body.clone(),
-                            sequence_point,
-                        });
-                    current.replace(
-                        path,
-                        revision,
-                        body,
-                        SequencePoint::from_raw(sequence_point),
-                        guard,
-                    );
-                }
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::Lookup => {
-                let record = if let Some(current) = cache.as_ref() {
-                    match rt::timeout(Duration::from_secs(6), current.lookup(path(command.path)))
-                        .await
-                    {
-                        Ok(record) => record,
-                        Err(_) => {
-                            current.disable_slow_lookup();
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let record_digest = record.map(|record| {
-                    let valid = known.get(&(identity, command.path)).is_some_and(|records| {
-                        records.iter().any(|known| {
-                            known.revision == record.revision
-                                && known.body == record.body
-                                && known.sequence_point == record.current_after.raw()
-                        })
-                    });
-                    assert!(valid, "cache returned a fabricated or mixed record");
-                    digest_record(&record.revision, &record.body, record.current_after.raw())
-                });
-                events.push(DiskCacheEvent::Lookup {
-                    identity,
-                    path: command.path,
-                    record_digest,
-                });
-            }
-            CommandKind::Invalidate => {
-                if let Some(current) = cache.as_ref()
-                    && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
-                {
-                    current.invalidate(path(command.path), guard);
-                }
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::Close => {
-                close(&mut cache).await;
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::Crash => {
-                cache = None;
-                media.crash();
-                rt::yield_now().await;
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::Detach => {
-                media.detach();
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::Reattach => {
-                media.reattach();
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::Corrupt => {
-                let durable_len = media.durable_bytes().map_or(0, |bytes| bytes.len() as u64);
-                if durable_len != 0 {
-                    let scaled = u64::from(command.argument)
-                        .wrapping_mul(257)
-                        .wrapping_add(u64::from(command.path));
-                    let _ = media.corrupt(scaled % durable_len, command.pattern | 1);
-                }
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-            CommandKind::MakePermanentlyUnavailable => {
-                media.make_permanently_unavailable();
-                events.push(state_event(command.kind.operation_code(), cache.as_ref()));
-            }
-        }
+        state.dispatch(command).await;
     }
 
-    close(&mut cache).await;
+    state.close_cache().await;
     assert_eq!(
-        media.out_of_bounds_accesses(),
+        state.media.out_of_bounds_accesses(),
         0,
         "cache accessed outside its preallocated container"
     );
-    events
-}
-
-async fn close(cache: &mut Option<PersistentCache>) {
-    if let Some(current) = cache.take() {
-        current.shutdown().await;
-        drop(current);
-        rt::yield_now().await;
-    }
+    state.events
 }
 
 fn decode(data: &[u8]) -> DecodedInput {
@@ -326,13 +383,6 @@ fn body(argument: u16, pattern: u8) -> Vec<u8> {
     (0..len)
         .map(|index| pattern.wrapping_add(index as u8))
         .collect()
-}
-
-fn state_event(operation: u8, cache: Option<&PersistentCache>) -> DiskCacheEvent {
-    DiskCacheEvent::State {
-        operation,
-        enabled: cache.is_some_and(PersistentCache::is_enabled),
-    }
 }
 
 fn digest_record(revision: &[u8], body: &[u8], sequence_point: u64) -> [u8; 32] {
