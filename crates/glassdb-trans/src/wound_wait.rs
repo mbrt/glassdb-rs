@@ -21,7 +21,7 @@ pub(crate) async fn try_reclaim(
     if !requester.older(holder) {
         return Ok(Reclaim::Wait);
     }
-    if monitor.wound_tx(holder).await? == TxFinalStatus::Aborted {
+    if monitor.preempt_tx(holder).await? == TxFinalStatus::Aborted {
         Ok(Reclaim::Wounded)
     } else {
         Ok(Reclaim::Wait)
@@ -36,7 +36,7 @@ pub(crate) async fn resolve_tx_conflict(
 ) -> Result<TxFinalStatus, TransError> {
     match monitor.tx_status(holder).await? {
         TxCommitStatus::Ok => Ok(TxFinalStatus::Committed),
-        TxCommitStatus::Aborted => Ok(TxFinalStatus::Aborted),
+        TxCommitStatus::Aborted | TxCommitStatus::Wounded => Ok(TxFinalStatus::Aborted),
         TxCommitStatus::Pending => {
             if matches!(
                 try_reclaim(monitor, requester, holder).await?,

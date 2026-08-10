@@ -1479,7 +1479,7 @@ async fn cancelled_logless_commit_writes_no_aborted_object() {
                 }
                 BackendOp::WriteIf { path, value, .. }
                 | BackendOp::WriteIfNotExists { path, value }
-                    if path.contains("/_t/") && is_aborted_tx_log(value) =>
+                    if path.contains("/_t/") && is_abort_side_tx_log(value) =>
                 {
                     aborted_writes.fetch_add(1, Ordering::SeqCst);
                 }
@@ -1541,8 +1541,8 @@ async fn cancelled_logless_commit_writes_no_aborted_object() {
 /// report when a leaf write has landed.
 struct PauseControl {
     trap: Mutex<Option<Trap>>,
-    abort_write_gate: Mutex<Option<AbortWriteGate>>,
-    leaf_landed: Mutex<Option<oneshot::Sender<()>>>,
+    wound_write_gate: Mutex<Option<WoundWriteGate>>,
+    leaf_write_gate: Mutex<Option<LeafWriteGate>>,
 }
 
 struct Trap {
@@ -1550,7 +1550,12 @@ struct Trap {
     arrived: oneshot::Sender<()>,
 }
 
-struct AbortWriteGate {
+struct WoundWriteGate {
+    arrived: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+struct LeafWriteGate {
     arrived: oneshot::Sender<()>,
     release: oneshot::Receiver<()>,
 }
@@ -1559,24 +1564,25 @@ impl PauseControl {
     fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
         let control = Arc::new(Self {
             trap: Mutex::new(None),
-            abort_write_gate: Mutex::new(None),
-            leaf_landed: Mutex::new(None),
+            wound_write_gate: Mutex::new(None),
+            leaf_write_gate: Mutex::new(None),
         });
         let backend = HookBackend::new(inner);
         backend.set_after({
             let control = control.clone();
             move |op, outcome| {
-                let landed = match op {
+                let gate = match op {
                     BackendOp::WriteIf { path, .. }
                         if outcome.is_success() && is_leaf_path(path) =>
                     {
-                        control.leaf_landed.lock().unwrap().take()
+                        control.leaf_write_gate.lock().unwrap().take()
                     }
                     _ => None,
                 };
                 let future: HookFuture = Box::pin(async move {
-                    if let Some(landed) = landed {
-                        let _ = landed.send(());
+                    if let Some(gate) = gate {
+                        let _ = gate.arrived.send(());
+                        let _ = gate.release.await;
                     }
                     Ok(())
                 });
@@ -1586,16 +1592,16 @@ impl PauseControl {
         backend.set_before({
             let control = control.clone();
             move |op| {
-                let (abort_gate, path) = match op {
+                let (wound_gate, path) = match op {
                     BackendOp::WriteIfNotExists { path, value } => (
-                        control.take_abort_write_gate(path, value),
+                        control.take_wound_write_gate(path, value),
                         Some((*path).to_owned()),
                     ),
                     _ => (None, None),
                 };
                 let control = control.clone();
                 let future: HookFuture = Box::pin(async move {
-                    if let Some(gate) = abort_gate {
+                    if let Some(gate) = wound_gate {
                         let _ = gate.arrived.send(());
                         let _ = gate.release.await;
                     }
@@ -1624,19 +1630,22 @@ impl PauseControl {
         rx
     }
 
-    /// Arms a one-shot fired once the next coordination-leaf CAS has *landed*,
-    /// so a test can key on a write having taken effect rather than on the
-    /// runtime happening to go idle.
-    fn arm_leaf_landed(&self) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        *self.leaf_landed.lock().unwrap() = Some(tx);
-        rx
-    }
-
-    fn arm_abort_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    /// Parks the next successful coordination-leaf CAS after it has landed but
+    /// before its caller observes completion.
+    fn arm_leaf_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (arrived_tx, arrived_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
-        *self.abort_write_gate.lock().unwrap() = Some(AbortWriteGate {
+        *self.leaf_write_gate.lock().unwrap() = Some(LeafWriteGate {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        (arrived_rx, release_tx)
+    }
+
+    fn arm_wound_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived_tx, arrived_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.wound_write_gate.lock().unwrap() = Some(WoundWriteGate {
             arrived: arrived_tx,
             release: release_rx,
         });
@@ -1653,13 +1662,14 @@ impl PauseControl {
         None
     }
 
-    fn take_abort_write_gate(&self, path: &str, value: &[u8]) -> Option<AbortWriteGate> {
+    fn take_wound_write_gate(&self, path: &str, value: &[u8]) -> Option<WoundWriteGate> {
         // With the tagless backend (ADR-023) the commit status is in the object
-        // body, so decode it to recognize an aborted transaction object.
-        if !path.contains("/_t/") || !is_aborted_tx_log(value) {
+        // body, so decode it to recognize the pinned wound written for a
+        // cancelled owner whose in-flight mutation did not acknowledge return.
+        if !path.contains("/_t/") || !is_wounded_tx_log(value) {
             return None;
         }
-        self.abort_write_gate.lock().unwrap().take()
+        self.wound_write_gate.lock().unwrap().take()
     }
 }
 
@@ -1669,21 +1679,23 @@ fn is_leaf_path(path: &str) -> bool {
     path.ends_with("/_r") || path.contains("/_n/")
 }
 
-/// Reports whether `body` is a transaction object marked aborted.
-fn is_aborted_tx_log(body: &[u8]) -> bool {
+/// Reports whether `body` is an abort-side terminal transaction object.
+fn is_abort_side_tx_log(body: &[u8]) -> bool {
     glassdb_storage::txobject::status(body)
-        .map(|status| status == TxCommitStatus::Aborted)
+        .map(|status| matches!(status, TxCommitStatus::Aborted | TxCommitStatus::Wounded))
         .unwrap_or(false)
 }
 
-/// When a `Database::tx` future is dropped *during* its commit (after
-/// `algo.begin` registered the engine-side transaction, before `algo.end`
-/// ran), the attempt cancellation guard must schedule an async abort so peer
-/// transactions see the abort marker promptly instead of waiting for the
-/// 15-second lock lease. We exercise the exact mid-commit cancel path by
-/// trapping the first `write_if_not_exists` on a transaction-log path (the
-/// commit-log write, which only happens once locks have been acquired) and
-/// dropping the future from there.
+/// Reports whether `body` is a pinned transaction wound.
+fn is_wounded_tx_log(body: &[u8]) -> bool {
+    glassdb_storage::txobject::status(body)
+        .map(|status| status == TxCommitStatus::Wounded)
+        .unwrap_or(false)
+}
+
+/// When a `Database::tx` future is dropped after a lock CAS lands but before
+/// terminal commit dispatch, its internal guard pins the identity as wounded.
+/// Peers can then release its locks without waiting for the lock lease.
 #[tokio::test(start_paused = true)]
 async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     use std::time::Duration;
@@ -1698,10 +1710,9 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
         .unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();
     coll.write(b"k2", &write_int(2)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Trap the next commit-log write (`_t/<ss>/<txid>` path). Setup ops above
-    // don't match and pass straight through.
-    let arrived = pause.arm("/_t/");
+    let (lock_landed, release_lock) = pause.arm_leaf_write_gate();
 
     // Spawn a tx that writes two distinct keys, so it goes through the
     // standard locked commit path (the single-RW fast path requires 1
@@ -1719,20 +1730,21 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
         }
     });
 
-    // Wait until the spawned tx has reached the commit-log trap. From here
-    // the engine-side tx is registered (`algo.begin` ran), the locks have
-    // been acquired, but the commit log hasn't been written yet. This is
-    // exactly the window the attempt cancellation guard exists for.
-    arrived.await.unwrap();
+    // The lock is externally visible, but the owner has not observed the CAS
+    // completion and cannot have dispatched its terminal commit.
+    lock_landed.await.unwrap();
 
-    // Dropping the future schedules an async abort, whose background task writes
-    // the Aborted marker to the transaction log via the now-unblocked backend.
+    // Drop the future. `TransactionAbortGuard::drop` fires here, calling
+    // `Algo::async_abort` which spawns a background task that writes the
+    // pinned Wounded marker to the tx log via the (now-disarmed) backend.
     stalled.abort();
     let _ = stalled.await;
+    drop(release_lock);
 
     // A peer transaction on the same keys must complete quickly. Without
-    // the abort marker it would spin on the locks until the 15-second
-    // lease expires; with it, the locker sees `Aborted` and overrides.
+    // the wound marker it would spin on the locks until the 15-second
+    // lease expires; with it, the locker treats `Wounded` as aborted and
+    // overrides.
     let coll_ref = &coll;
     let r = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1785,11 +1797,9 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     // test is about.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Park the commit's transaction-object write. Its lock install has already
-    // landed, so dropping the future here leaves exactly the
-    // holder-without-an-object state.
-    let installed = pause.arm_leaf_landed();
-    let arrived = pause.arm("/_t/");
+    // Park the lock CAS after it lands. Dropping the future here leaves exactly
+    // the holder-without-an-object state, before terminal commit dispatch.
+    let (installed, release_lock) = pause.arm_leaf_write_gate();
     let stalled = tokio::spawn({
         let db = db.clone();
         let coll = coll.clone();
@@ -1802,13 +1812,10 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
             .await
         }
     });
-    arrived.await.unwrap();
-    // Cancel only once the lock install has actually landed, so the window under
-    // test — a durable holder whose object never landed — is established by the
-    // write itself rather than by elapsed time.
     installed.await.unwrap();
     stalled.abort();
     let _ = stalled.await;
+    drop(release_lock);
 
     let coll_ref = &coll;
     let peer = tokio::time::timeout(
@@ -1826,10 +1833,8 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     assert_eq!(value[0], 7, "the cancelled attempt never committed");
 }
 
-/// Clean shutdown must wait for the async abort scheduled when a transaction
-/// future is dropped between `algo.begin` and `algo.end`. This test parks that
-/// abort-log write and verifies `Database::shutdown` remains pending until the write
-/// is released.
+/// Clean shutdown waits for the async wound scheduled when a transaction is
+/// cancelled after publishing a holder but before terminal commit dispatch.
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_cancelled_tx_async_abort() {
     use std::time::Duration;
@@ -1844,9 +1849,10 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
         .unwrap();
     coll.write(b"k1", &write_int(1)).await.unwrap();
     coll.write(b"k2", &write_int(2)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let commit_arrived = pause.arm("/_t/");
-    let (abort_arrived, release_abort) = pause.arm_abort_write_gate();
+    let (lock_landed, release_lock) = pause.arm_leaf_write_gate();
+    let (wound_arrived, release_wound) = pause.arm_wound_write_gate();
 
     let stalled = tokio::spawn({
         let db = db.clone();
@@ -1861,9 +1867,10 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
         }
     });
 
-    commit_arrived.await.unwrap();
+    lock_landed.await.unwrap();
     stalled.abort();
     let _ = stalled.await;
+    drop(release_lock);
 
     let shutdown = tokio::spawn({
         let db = db.clone();
@@ -1872,19 +1879,19 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
         }
     });
 
-    tokio::time::timeout(Duration::from_secs(1), abort_arrived)
+    tokio::time::timeout(Duration::from_secs(1), wound_arrived)
         .await
-        .expect("async abort did not start during shutdown")
+        .expect("async wound did not start during shutdown")
         .unwrap();
 
     for _ in 0..10 {
         tokio::task::yield_now().await;
         assert!(
             !shutdown.is_finished(),
-            "shutdown returned before async abort completed"
+            "shutdown returned before async wound completed"
         );
     }
 
-    release_abort.send(()).unwrap();
+    release_wound.send(()).unwrap();
     shutdown.await.unwrap();
 }

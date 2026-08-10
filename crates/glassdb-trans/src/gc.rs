@@ -22,13 +22,9 @@
 //! race a lock a live transaction has taken but not yet published (ADR-024's
 //! lazy object materialization). Past the horizon, resolution is by status:
 //! a committed object is deleted only once its complete record proves it
-//! unreferenced; a dead pending one is first **force-aborted** (`pending →
-//! aborted` CAS) so its death is durable before any lock moves; and an aborted
-//! object is a **tombstone**, its locks released at once but the object kept a
-//! full lease past the abort (its `timestamp` is the abort instant, so the same
-//! `is_expired` gate enforces this) so a stuck owner is neither resurrected by
-//! its own create-if-absent refresher nor left pointing at a prematurely-missing
-//! object.
+//! unreferenced; a dead pending one is first **wounded** so its death remains
+//! pinned until its owner acknowledges retirement; and an acknowledged aborted
+//! object is retained for the ordinary finite cleanup horizon.
 //!
 //! Lock reclamation flows through the shard-mutation coordinator (ADR-029): GC
 //! calls the [`Locker`]'s stateless per-object unlock methods rather than issuing
@@ -249,7 +245,7 @@ impl Gc {
         // leaf still references the transaction. The same epoch is propagated
         // through routing and release so the decision is one coherent sweep.
         let candidate_check = Requirement::AtLeast(self.timeline.now());
-        let observed = match self.tl.get_at(tid, Requirement::Any).await {
+        let observed = match self.tl.get_at(tid, candidate_check).await {
             Ok(v) => v,
             // Already reclaimed (or never existed): nothing to do.
             Err(StorageError::NotFound) => return Ok(()),
@@ -258,6 +254,15 @@ impl Gc {
         let log = observed
             .value()
             .ok_or_else(|| StorageError::other("transaction disappeared after a present read"))?;
+
+        // Wounded is pinned independently of time. Cleanup is deliberately
+        // repeatable because an owner operation already in flight when the
+        // wound landed may publish another described effect before quiescing.
+        if log.status == TxCommitStatus::Wounded {
+            return self
+                .reclaim_wounded(tid, log, &observed, candidate_check)
+                .await;
+        }
 
         // Within the horizon: keep. A recent pending object may be a live
         // transaction whose lock this non-atomic check has not observed yet
@@ -281,7 +286,7 @@ impl Gc {
                 self.reclaim_dead_pending(tid, log, &observed, candidate_check)
                     .await
             }
-            TxCommitStatus::Unknown => Ok(()),
+            TxCommitStatus::Unknown | TxCommitStatus::Wounded => Ok(()),
         }
     }
 
@@ -335,11 +340,9 @@ impl Gc {
         Ok(())
     }
 
-    /// An aborted candidate holds no value, and past the horizon its `timestamp`
-    /// (the abort instant) proves the tombstone has outlived any client that
-    /// could still act under its txid. Release its recorded locks (pruning any
-    /// entry left vestigial) and delete it. A minimal abort with no recorded
-    /// locks simply has nothing to release.
+    /// An acknowledged aborted candidate holds no value. Past its ordinary
+    /// cleanup horizon, release its recorded effects and delete it. The
+    /// anti-resurrection proof is the owner's acknowledgement, not elapsed time.
     async fn reclaim_aborted(
         &self,
         tid: &TxId,
@@ -347,8 +350,35 @@ impl Gc {
         observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        if !self.release_locks(tid, &log.locks, requirement).await? {
+        if !self.cleanup_aborted_effects(tid, log, requirement).await? {
             return Ok(());
+        }
+        self.tl.delete(observation).await?;
+        Ok(())
+    }
+
+    /// Reclaims effects described by an unacknowledged wound but never removes
+    /// the transaction marker. Only the owner may make it GC-eligible by
+    /// changing it to `Aborted`.
+    async fn reclaim_wounded(
+        &self,
+        tid: &TxId,
+        log: &TxLog,
+        _observation: &Observation<TxLog>,
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
+        let _ = self.cleanup_aborted_effects(tid, log, requirement).await?;
+        Ok(())
+    }
+
+    async fn cleanup_aborted_effects(
+        &self,
+        tid: &TxId,
+        log: &TxLog,
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        if !self.release_locks(tid, &log.locks, requirement).await? {
+            return Ok(false);
         }
         let drops = log
             .collection_changes
@@ -362,17 +392,13 @@ impl Gc {
         self.collection_lifecycle
             .reclaim(&log.prepared_collections)
             .await?;
-        self.tl.delete(observation).await?;
-        Ok(())
+        Ok(true)
     }
 
-    /// A dead pending candidate is reclaimed with the official expiry sequence
-    /// (ADR-021/024), never by dropping its locks in place: force-abort it
-    /// (`pending → aborted` CAS) so its death is durable and final. If a live
-    /// owner committed or refreshed first the CAS loses and it is left alone. On
-    /// a successful abort its locks are released now (the fresh aborted object
-    /// records none), but it is **not** deleted — the abort stamped a new lease,
-    /// so a later cycle deletes it once past the horizon from the abort.
+    /// A dead pending candidate is first pinned as `Wounded` (ADR-059), never
+    /// made eligible for deletion by a collector. If a live owner committed or
+    /// refreshed first, the CAS loses and the candidate is left alone. Otherwise
+    /// known abort-owned effects are reclaimed while the wound remains durable.
     async fn reclaim_dead_pending(
         &self,
         tid: &TxId,
@@ -380,11 +406,16 @@ impl Gc {
         observation: &Observation<TxLog>,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        match self.mon.try_abort_observed(tid, observation).await?.status {
-            TxCommitStatus::Aborted => self
-                .release_locks(tid, &log.locks, requirement)
-                .await
-                .map(|_| ()),
+        let wounded = self.mon.try_wound_observed(tid, observation).await?;
+        match wounded.status {
+            TxCommitStatus::Wounded => {
+                let wounded_log = wounded
+                    .observation
+                    .value()
+                    .map_or(log, std::convert::AsRef::as_ref);
+                self.reclaim_wounded(tid, wounded_log, &wounded.observation, requirement)
+                    .await
+            }
             // Committed or refreshed first: it was alive. Leave it.
             _ => Ok(()),
         }
@@ -1099,11 +1130,10 @@ mod tests {
         assert_eq!(e.locked_by, vec![t]);
     }
 
-    // A dead pending object past the horizon is force-aborted (its death made
-    // durable) and its locks released, but it is retained as a fresh tombstone —
-    // never deleted in the same cycle it is aborted. Fed via the write-back hint.
+    // A dead pending object past the horizon is pinned as wounded and its locks
+    // are released. No collector may delete it before owner acknowledgement.
     #[tokio::test(start_paused = true)]
-    async fn dead_pending_is_force_aborted_and_locks_released() {
+    async fn dead_pending_is_wounded_and_locks_released() {
         let ctx = new_ctx().await;
         let t = tx(1);
         let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
@@ -1118,15 +1148,29 @@ mod tests {
         // Death is durable...
         let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
         let got = got.value().unwrap();
-        assert_eq!(got.status, TxCommitStatus::Aborted);
+        assert_eq!(got.status, TxCommitStatus::Wounded);
         // ...its lock is released (the now-vestigial entry pruned)...
         assert!(lookup_entry(&ctx, b"k").await.is_none());
-        // ...but the fresh tombstone is retained, not swept this cycle.
+        // ...and the wound remains pinned.
         assert!(!is_gone(&ctx.tl, &t).await);
+
+        // An effect already in flight when the wound landed may appear after
+        // the first cleanup pass. The pinned record makes another pass clean it
+        // without relying on a finite tombstone window.
+        store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
+        ctx.gc.schedule_tx_cleanup(t.clone());
+        run_once(&ctx.gc).await;
+        assert!(lookup_entry(&ctx, b"k").await.is_none());
+
+        tokio::time::sleep(PAST_HORIZON * 2).await;
+        ctx.gc.schedule_tx_cleanup(t.clone());
+        run_once(&ctx.gc).await;
+        let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+        assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
     }
 
-    // An aborted object still within its tombstone lease keeps its locks and is
-    // retained, so a stuck owner cannot be resurrected or stranded.
+    // An acknowledged aborted object still within its cleanup horizon keeps its
+    // locks and remains available to ordinary late observers.
     #[tokio::test(start_paused = true)]
     async fn recent_aborted_tombstone_is_kept() {
         let ctx = new_ctx().await;

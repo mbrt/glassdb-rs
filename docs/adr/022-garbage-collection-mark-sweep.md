@@ -7,9 +7,9 @@ Accepted — implemented.
 The lock-reclamation *mechanism* (the "stale-lock and empty-entry pruning" CAS)
 is refined by [ADR-029](029-gc-through-shard-coordinator.md): GC's release now
 flows through the shard-mutation coordinator ([ADR-028](028-shard-mutation-coordinator.md))
-and vestigial-entry pruning becomes a fold property. The GC *policy* below —
-reverse mark-sweep, the safety horizon, abort-then-release-then-delete, and
-tombstone retention — is unchanged.
+and vestigial-entry pruning becomes a fold property. ADR-029 did not itself
+change the original GC policy; ADR-059 later changes the abort-side retention
+part of that policy as noted below.
 
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md) refines the
 flat `_t/` candidate walk into a paginated traversal over deterministic shards.
@@ -21,11 +21,18 @@ transaction object remains live whenever current or locked state names it.
 Candidate-driven listing and reverse reference checks remain unchanged.
 
 Deferred to a follow-up: subcollection teardown (reclaiming orphaned child roots
-and shards), and persisting a wound victim's locks into the aborted object.
+and shards). A `Wounded` object created for a missing lazy transaction cannot
+name unknown holders; those are removed when encountered by resolvers.
 
 The `Clock`-based time-source detail is superseded by
-[ADR-058](058-process-wide-model-time.md); the GC horizon and retention policy
-are unchanged.
+[ADR-058](058-process-wide-model-time.md); the time source for the remaining
+finite horizons changes, but their duration does not.
+
+[ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
+pending-to-aborted and finite tombstone fence below. A collector changes dead
+`Pending` to pinned `Wounded`, may repeatedly reclaim described effects, and
+must not delete the marker. Ordinary finite retention starts only after the
+owner acknowledges `Wounded` as `Aborted`.
 
 ## Context
 

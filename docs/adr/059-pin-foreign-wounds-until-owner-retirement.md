@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted — implemented.
 
 This refines the lazy pending-object protocol in
 [ADR-021](021-wound-wait-leases-shard.md),
@@ -53,6 +53,13 @@ The distinction is based on proof, not process identity. A waiter, GC worker,
 or even a task in the same process that lacks the owning transaction's local
 retirement proof writes `Wounded`.
 
+A Database that wounds one of its own locally tracked identities closes new
+owner work and checks the retirement proof atomically with that closure. If no
+owner operation is active or unresolved and no terminal commit has an ambiguous
+outcome, it writes `Aborted` directly; `Wounded` must not appear as an
+intermediate state. If any of those facts is unknown, it durably writes
+`Wounded` immediately and leaves owner acknowledgement to the normal path.
+
 ### Let the live owner acknowledge retirement durably
 
 When the owning transaction observes `Wounded`, it first retires that identity
@@ -69,10 +76,10 @@ may apply the ordinary aborted-object cleanup and retention rules. Enqueuing the
 record on the owner's local GC accelerates that work but is not part of the
 safety proof.
 
-An owner-initiated abort may write `Aborted` directly when it establishes the
-same retirement and cleanup proof. A newly opened Database is not the owner of
-transactions abandoned by an earlier incarnation and cannot acknowledge them
-merely because it uses the same database.
+The same direct-to-`Aborted` rule applies to an ordinary owner-initiated abort
+that establishes the retirement and cleanup proof. A newly opened Database is
+not the owner of transactions abandoned by an earlier incarnation and cannot
+acknowledge them merely because it uses the same database.
 
 Transactions that can create recovery-owned physical resources must persist
 their complete recovery manifest before those effects can become durable. A

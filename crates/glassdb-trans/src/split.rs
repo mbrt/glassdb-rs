@@ -1848,7 +1848,7 @@ impl Splitter {
             }
             if let Some(holder) = record.topology_freeze() {
                 return match self.mon.tx_status(holder).await? {
-                    TxCommitStatus::Aborted => {
+                    TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
                         let holder = holder.clone();
                         record.remove_topology_freeze(&holder);
                         if self.records.store_record(&record, &observed).await? {
@@ -2333,7 +2333,7 @@ fn split_into_children(
 mod tests {
     use super::*;
 
-    use crate::monitor::TxFinalStatus;
+    use crate::monitor::{OwnerExit, TxFinalStatus};
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
@@ -2696,7 +2696,10 @@ mod tests {
             .await
             .unwrap();
         sp.join_topology(COLL, &participant).await.unwrap();
-        sp.mon.abort_tx(&participant).await.unwrap();
+        sp.mon
+            .close_owned_tx(&participant, OwnerExit::Joined)
+            .await
+            .unwrap();
 
         operations.lock().unwrap().clear();
         sp.settle_topology_participant(&collection(), &participant)
@@ -3477,7 +3480,7 @@ mod tests {
 
         assert_eq!(
             mon.tx_status(&younger).await.unwrap(),
-            TxCommitStatus::Aborted
+            TxCommitStatus::Wounded
         );
         let leaves = TreeRouter::new(s.shards.clone())
             .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
@@ -3638,7 +3641,7 @@ mod tests {
             1
         );
 
-        mon.abort_tx(&older).await.unwrap();
+        mon.close_owned_tx(&older, OwnerExit::Joined).await.unwrap();
         sp.run_once().await;
         assert_eq!(
             TreeRouter::new(s.shards.clone())
@@ -3944,7 +3947,7 @@ mod tests {
             1
         );
 
-        sp.mon.abort_tx(&id).await.unwrap();
+        sp.mon.close_owned_tx(&id, OwnerExit::Joined).await.unwrap();
         sp.recover_record(&observed).await.unwrap();
         assert!(matches!(
             s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
@@ -4224,7 +4227,10 @@ mod tests {
         };
         let observed = s.write_structural_log("R", &record).await.unwrap();
         sp.mon.begin_tx(&id);
-        assert_eq!(sp.mon.wound_tx(&id).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(
+            sp.mon.preempt_tx(&id).await.unwrap(),
+            TxFinalStatus::Aborted
+        );
 
         gate.arm();
         let recovering = {

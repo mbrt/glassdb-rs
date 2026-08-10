@@ -113,6 +113,15 @@ struct TxStatusEntry {
     recovery: TxRecoveryManifest,
 }
 
+#[derive(Default)]
+struct OwnerActivity {
+    active: usize,
+    unresolved: bool,
+    tracked: bool,
+    admission_closed: bool,
+    terminal_commit_started: bool,
+}
+
 #[derive(Clone, Copy)]
 struct FinalStatus {
     status: TxCommitStatus,
@@ -162,6 +171,7 @@ struct PendingProgress {
 #[derive(Default)]
 struct State {
     local_tx: HashMap<TxId, TxStatusEntry>,
+    owner_activity: HashMap<TxId, OwnerActivity>,
     waiters: HashMap<TxId, Vec<WaitRequest>>,
     unknown_tx: HashMap<TxId, SystemTime>,
     pending_progress: HashMap<TxId, PendingProgress>,
@@ -189,6 +199,53 @@ struct Inner {
 #[derive(Clone)]
 pub struct Monitor {
     inner: Arc<Inner>,
+}
+
+/// Tracks one owner-side protocol execution so a concurrent local wound can
+/// distinguish an acknowledged retirement from work that may still publish.
+pub(crate) struct OwnerOperation {
+    monitor: Monitor,
+    tid: TxId,
+    completed: bool,
+}
+
+impl OwnerOperation {
+    /// Records that the owner operation returned normally, including with a
+    /// classified error, so it cannot publish anything after this point.
+    pub(crate) fn complete(mut self) {
+        self.monitor.finish_owner_operation(&self.tid, false);
+        self.completed = true;
+    }
+}
+
+impl Drop for OwnerOperation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.monitor.finish_owner_operation(&self.tid, true);
+        }
+    }
+}
+
+/// How the owning foreground protocol stopped before closing its transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerExit {
+    /// The protocol future returned, so all operations it issued were joined.
+    Joined,
+    /// The protocol future was dropped, so an issued operation may still land.
+    Cancelled,
+}
+
+/// Outcome of closing a transaction from its owning Database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerCloseOutcome {
+    /// The abort is acknowledged and eligible for ordinary GC.
+    AbortAcknowledged,
+    /// The abort is terminal but pinned because owner work remains unresolved.
+    WoundPinned,
+    /// The transaction committed before owner-side closure won.
+    Committed,
+    /// The Monitor had already stopped tracking the transaction.
+    AlreadyClosed,
 }
 
 /// Durable backreferences needed to recover a pending transaction after its
@@ -223,17 +280,6 @@ impl TxRecoveryManifest {
 pub(crate) enum TxFinalStatus {
     Committed,
     Aborted,
-}
-
-impl TxFinalStatus {
-    /// Converts a storage status when it represents a terminal transaction.
-    fn from_commit_status(status: TxCommitStatus) -> Option<Self> {
-        match status {
-            TxCommitStatus::Ok => Some(Self::Committed),
-            TxCommitStatus::Aborted => Some(Self::Aborted),
-            TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
-        }
-    }
 }
 
 /// A transaction's commit status for a specific key, plus the value written.
@@ -272,6 +318,26 @@ impl Monitor {
         self.inner.timing
     }
 
+    /// Opens one owner-side protocol execution for `tid`.
+    ///
+    /// The guard is deliberately registered before the transaction publishes a
+    /// holder. If the future is dropped, its guard records an unresolved
+    /// operation and any later wound must remain pinned.
+    pub(crate) fn begin_owner_operation(&self, tid: &TxId) -> Result<OwnerOperation, TransError> {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let activity = st.owner_activity.entry(tid.clone()).or_default();
+        if activity.admission_closed {
+            return Err(TransError::Wounded);
+        }
+        activity.tracked = true;
+        activity.active += 1;
+        Ok(OwnerOperation {
+            monitor: self.clone(),
+            tid: tid.clone(),
+            completed: false,
+        })
+    }
+
     /// Registers a new pending local transaction.
     pub(crate) fn begin_tx(&self, tid: &TxId) {
         self.register_tx(tid, TxRecoveryManifest::default());
@@ -306,12 +372,11 @@ impl Monitor {
         self.persist_pending_tx(tid).await
     }
 
-    /// Whether this client still tracks `tid` as one of its own pending
-    /// transactions: it registered a logged identity and has not been finalized
-    /// yet. False for a transaction that never took an identity (an optimistic
-    /// read-only validation, or a logless one-CAS commit) and for one that
-    /// already committed or aborted.
-    pub(crate) fn is_pending_local(&self, tid: &TxId) -> bool {
+    /// Whether this client still tracks `tid` as one of its logged identities.
+    /// A wounded identity remains tracked until its owner acknowledges it or
+    /// cancellation recovery releases local ownership. Transactions that never
+    /// engage the logged protocol are not tracked.
+    pub(crate) fn is_tracked_local(&self, tid: &TxId) -> bool {
         self.shard_for(tid)
             .lock()
             .unwrap()
@@ -336,8 +401,16 @@ impl Monitor {
     pub(crate) fn start_refresh_tx(&self, tid: &TxId) {
         let need_start = {
             let mut st = self.shard_for(tid).lock().unwrap();
+            let admission_closed = st
+                .owner_activity
+                .get(tid)
+                .is_some_and(|activity| activity.admission_closed);
             match st.local_tx.get_mut(tid) {
-                Some(e) if e.refresh_state == RefreshState::NotStarted => {
+                Some(e)
+                    if e.status == TxCommitStatus::Pending
+                        && e.refresh_state == RefreshState::NotStarted
+                        && !admission_closed =>
+                {
                     e.refresh_state = RefreshState::Running;
                     true
                 }
@@ -364,8 +437,6 @@ impl Monitor {
     /// (if it produced any writes or held any locks), updating local storage,
     /// and notifying waiters.
     pub(crate) async fn commit_tx(&self, mut tl: TxLog) -> Result<(), TransError> {
-        self.stop_tx_refresh(&tl.id);
-
         // In v2 the transaction object is the value store: it must be persisted
         // whenever the transaction has writes (the committed values readers
         // help-forward) or recorded lock intentions. A read-only transaction
@@ -379,53 +450,51 @@ impl Monitor {
             || !tl.collection_changes.is_empty()
             || !tl.prepared_collections.is_empty()
         {
+            // This handshake shares the owner-state lock with local wounding.
+            // Either the wound closes admission first, or the commit is marked
+            // as dispatched before a local task can claim safe retirement.
+            self.start_terminal_commit(&tl.id)?;
+            self.stop_tx_refresh(&tl.id);
             tl.status = TxCommitStatus::Ok;
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
-            // path can recognize a wound (the log was already aborted out from
-            // under us), as well as any classification of an escaping error.
+            // path can recognize an abort-side terminal winner, as well as any
+            // classification of an escaping error.
             // In-doubt outcomes are normally retried inside `set_final_log`
             // because the log is keyed by tx id and the write is idempotent.
-            if let Err(error) = self.set_final_log(&tl).await {
-                if matches!(error, TransError::AlreadyFinalized) {
-                    // The only mismatched final status for a commit is an abort.
-                    // Clear the local pending entry so it cannot mask that
-                    // durable winner and strand local waiters.
-                    self.mark_local_aborted(&tl.id, TxCommitStatus::Aborted);
-                }
-                return Err(error.context("writing tx log"));
-            }
+            self.set_final_log(&tl)
+                .await
+                .map_err(|error| error.context("writing tx log"))?;
         }
 
-        let mut st = self.shard_for(&tl.id).lock().unwrap();
-        st.local_tx.remove(&tl.id);
-        notify_waiters(&mut st, &tl.id);
+        self.finish_local_tx(&tl.id);
         Ok(())
     }
 
-    /// Marks the transaction aborted, writing the final log and notifying
-    /// waiters. The local state is cleared even if writing the log fails.
-    pub(crate) async fn abort_tx(&self, tid: &TxId) -> Result<(), TransError> {
-        self.stop_tx_refresh(tid);
-
-        let mut log = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
-        if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
-            entry.recovery.clone().apply_to(&mut log);
+    /// Closes a transaction from its owning Database and returns the durable
+    /// outcome instead of encoding protocol outcomes as errors.
+    ///
+    /// A joined owner may acknowledge an abort. A cancelled owner only pins the
+    /// wound when an operation might still land, and preserves ambiguity after
+    /// terminal commit dispatch.
+    pub(crate) async fn close_owned_tx(
+        &self,
+        tid: &TxId,
+        exit: OwnerExit,
+    ) -> Result<OwnerCloseOutcome, TransError> {
+        match exit {
+            OwnerExit::Joined => self.close_joined_owner_tx(tid).await,
+            OwnerExit::Cancelled => self.close_cancelled_owner_tx(tid).await,
         }
-        let res = self.set_final_log(&log).await;
-
-        let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.remove(tid);
-        notify_waiters(&mut st, tid);
-        res
     }
 
-    /// Forces a transaction toward abort under wound-wait, returning the durable
-    /// terminal status that wins.
+    /// Preempts a transaction under wound-wait, returning the durable terminal
+    /// status that wins.
     ///
     /// A committed transaction is left untouched. A pending refresh does not
     /// defeat a wound: the refreshed observation is retried until either the
     /// abort lands or the owner commits.
-    pub(crate) async fn wound_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
+    pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
+        let target = self.preemption_target(tid);
         let mut status = self
             .inner
             .tl
@@ -436,10 +505,16 @@ impl Monitor {
             })?;
         let mut backoff = self.inner.retry.backoff();
         loop {
-            status = self.try_abort_observed(tid, &status.observation).await?;
-            if let Some(final_status) = TxFinalStatus::from_commit_status(status.status) {
-                self.mark_local_aborted(tid, status.status);
-                return Ok(final_status);
+            status = self
+                .try_retire_observed(tid, &status.observation, target, true)
+                .await?;
+            match status.status {
+                TxCommitStatus::Ok => return Ok(TxFinalStatus::Committed),
+                TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
+                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
+                    return Ok(TxFinalStatus::Aborted);
+                }
+                TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
             }
             // Lease expiry must stop here because the refresh proves liveness.
             // Wound-wait is authorized by priority instead, so a refresh only
@@ -509,7 +584,9 @@ impl Monitor {
             // precedence over a potentially newer final-status cache entry.
             match self.tx_status(tid).await? {
                 TxCommitStatus::Ok => return Ok(TxFinalStatus::Committed),
-                TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
+                TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                    return Ok(TxFinalStatus::Aborted);
+                }
                 TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
             }
 
@@ -563,7 +640,7 @@ impl Monitor {
             };
             let write_may_have_landed = match attempt {
                 Ok(observed) => {
-                    self.remember_final(tid, &observed);
+                    self.record_durable_observation(tid, &observed);
                     return Ok(());
                 }
                 // A conflict proves our observation is stale; an in-doubt
@@ -590,14 +667,26 @@ impl Monitor {
                 // Either us (only we write `committed` under our own tx id) or
                 // a wound that converged on the outcome we wanted (possible
                 // only for `aborted`). The desired state is durable.
-                self.remember_final(tid, &status.observation);
+                self.record_durable_observation(tid, &status.observation);
                 return Ok(());
             }
-            if status.status.is_final() {
-                // We wanted `committed` and found `aborted`: a wound landed
-                // first. Surfaced as `AlreadyFinalized` so the commit path
-                // treats it as a wound.
-                self.remember_final(tid, &status.observation);
+            if status.status == TxCommitStatus::Wounded {
+                self.record_durable_observation(tid, &status.observation);
+                if tlog.status == TxCommitStatus::Aborted {
+                    // Owner acknowledgement is the sole mutable terminal
+                    // transition. Preserve the exact wound observation and
+                    // retry it as `Wounded -> Aborted`.
+                    last_observation = Some(status.observation);
+                    rt::sleep(backoff.next_delay()).await;
+                    continue;
+                }
+                return Err(TransError::AlreadyFinalized);
+            }
+            if status.status.is_immutable() {
+                // We wanted `committed` and found an immutable abort: it landed
+                // first. Surface `AlreadyFinalized` so the commit path retries
+                // under a new identity.
+                self.record_durable_observation(tid, &status.observation);
                 return Err(TransError::AlreadyFinalized);
             }
             if status.observation.is_absent() {
@@ -626,20 +715,124 @@ impl Monitor {
         }
     }
 
-    /// Conditionally aborts an exact transaction-log observation and returns
-    /// the durable status observed after the attempt.
-    pub(crate) async fn try_abort_observed(
+    /// Conditionally pins an exact foreign transaction observation as wounded.
+    pub(crate) async fn try_wound_observed(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,
     ) -> Result<TxStatus, TransError> {
+        self.try_retire_observed(tid, expected, TxCommitStatus::Wounded, true)
+            .await
+    }
+
+    async fn close_joined_owner_tx(&self, tid: &TxId) -> Result<OwnerCloseOutcome, TransError> {
+        let target = match self.joined_owner_target(tid) {
+            Ok(target) => target,
+            Err(TransError::AlreadyFinalized) => return Ok(OwnerCloseOutcome::AlreadyClosed),
+            Err(error) => return Err(error),
+        };
+        self.stop_tx_refresh(tid);
+        let mut status = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            status = self
+                .try_retire_observed(tid, &status.observation, target, true)
+                .await?;
+            match status.status {
+                TxCommitStatus::Aborted => {
+                    self.finish_local_tx(tid);
+                    return Ok(OwnerCloseOutcome::AbortAcknowledged);
+                }
+                TxCommitStatus::Ok => {
+                    self.finish_local_tx(tid);
+                    return Ok(OwnerCloseOutcome::Committed);
+                }
+                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
+                    // The identity is durably dead, but an unresolved owner
+                    // operation prevents finite tombstone retention.
+                    return Ok(OwnerCloseOutcome::WoundPinned);
+                }
+                TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
+    }
+
+    async fn close_cancelled_owner_tx(&self, tid: &TxId) -> Result<OwnerCloseOutcome, TransError> {
+        let terminal_commit_started = {
+            let mut st = self.shard_for(tid).lock().unwrap();
+            let Some(entry) = st.local_tx.get_mut(tid) else {
+                return Ok(OwnerCloseOutcome::AlreadyClosed);
+            };
+            entry.refresh_state = RefreshState::Stopped;
+            let activity = st.owner_activity.entry(tid.clone()).or_default();
+            activity.admission_closed = true;
+            activity.unresolved = true;
+            activity.terminal_commit_started
+        };
+
+        let mut status = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            if terminal_commit_started && status.observation.is_absent() {
+                return Err(in_doubt(format!(
+                    "transaction {tid} was cancelled after terminal commit dispatch"
+                )));
+            }
+            status = self
+                .try_retire_observed(
+                    tid,
+                    &status.observation,
+                    TxCommitStatus::Wounded,
+                    !terminal_commit_started,
+                )
+                .await?;
+            let outcome = match status.status {
+                TxCommitStatus::Ok => Some(OwnerCloseOutcome::Committed),
+                TxCommitStatus::Aborted => Some(OwnerCloseOutcome::AbortAcknowledged),
+                TxCommitStatus::Wounded => Some(OwnerCloseOutcome::WoundPinned),
+                TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
+            };
+            if let Some(outcome) = outcome {
+                self.finish_local_tx(tid);
+                return Ok(outcome);
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
+    }
+
+    /// Conditionally installs one abort-side status and returns the durable
+    /// status observed after the attempt.
+    async fn try_retire_observed(
+        &self,
+        tid: &TxId,
+        expected: &Observation<TxLog>,
+        target: TxCommitStatus,
+        allow_create: bool,
+    ) -> Result<TxStatus, TransError> {
+        debug_assert!(matches!(
+            target,
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded
+        ));
         if let Some(current) = expected.value() {
             match current.status {
                 TxCommitStatus::Ok | TxCommitStatus::Aborted => {
-                    self.remember_final(tid, expected);
+                    self.record_durable_observation(tid, expected);
                     return Ok(TxStatus::from_observation(expected.clone()));
                 }
-                TxCommitStatus::Pending => {}
+                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
+                    self.record_durable_observation(tid, expected);
+                    return Ok(TxStatus::from_observation(expected.clone()));
+                }
+                TxCommitStatus::Wounded | TxCommitStatus::Pending => {}
                 TxCommitStatus::Unknown => {
                     return Err(TransError::other(format!(
                         "transaction {tid} has an invalid persisted status"
@@ -651,10 +844,15 @@ impl Monitor {
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
-            let mut tlog = TxLog::new(tid.clone(), TxCommitStatus::Aborted);
+            if expected.is_absent() && !allow_create {
+                return Ok(TxStatus::from_observation(expected));
+            }
+            let mut tlog = TxLog::new(tid.clone(), target);
             if let Some(current) = expected.value() {
                 tlog.writes = current.writes.clone();
                 TxRecoveryManifest::from_log(current).apply_to(&mut tlog);
+            } else if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get(tid) {
+                entry.recovery.clone().apply_to(&mut tlog);
             }
             let r = if expected.is_absent() {
                 self.inner.tl.set(&tlog).await
@@ -663,7 +861,7 @@ impl Monitor {
             };
             match r {
                 Ok(observed) => {
-                    self.remember_final(tid, &observed);
+                    self.record_durable_observation(tid, &observed);
                     return Ok(TxStatus::from_observation(observed));
                 }
                 Err(StorageError::Precondition) => {
@@ -675,7 +873,7 @@ impl Monitor {
                     let st = self
                         .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
-                    self.remember_final(tid, &st.observation);
+                    self.record_durable_observation(tid, &st.observation);
                     return Ok(st);
                 }
                 // In-doubt: the abort write may or may not have landed. Just
@@ -692,8 +890,14 @@ impl Monitor {
                     let st = self
                         .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
-                    if st.status.is_final() {
-                        self.remember_final(tid, &st.observation);
+                    let settled = st.status.is_immutable()
+                        || (target == TxCommitStatus::Wounded
+                            && st.status == TxCommitStatus::Wounded);
+                    self.record_durable_observation(tid, &st.observation);
+                    if settled {
+                        return Ok(st);
+                    }
+                    if st.observation.is_absent() && !allow_create {
                         return Ok(st);
                     }
                     expected = st.observation;
@@ -763,6 +967,94 @@ impl Monitor {
         }
     }
 
+    fn finish_owner_operation(&self, tid: &TxId, unresolved: bool) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let keep = st.local_tx.contains_key(tid);
+        let Some(activity) = st.owner_activity.get_mut(tid) else {
+            return;
+        };
+        activity.active = activity.active.saturating_sub(1);
+        activity.unresolved |= unresolved;
+        if activity.active == 0 && !keep {
+            st.owner_activity.remove(tid);
+        }
+    }
+
+    /// Closes local admission and selects the strongest status justified
+    /// without waiting for owner work to finish.
+    fn preemption_target(&self, tid: &TxId) -> TxCommitStatus {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let already_wounded = if let Some(entry) = st.local_tx.get_mut(tid) {
+            entry.refresh_state = RefreshState::Stopped;
+            entry.status == TxCommitStatus::Wounded
+        } else {
+            false
+        };
+        let has_local_entry = st.local_tx.contains_key(tid);
+        let activity = st.owner_activity.entry(tid.clone()).or_default();
+        let can_acknowledge = has_local_entry
+            && activity.tracked
+            && activity.active == 0
+            && !activity.unresolved
+            && (!activity.terminal_commit_started || already_wounded);
+        activity.admission_closed = true;
+        if can_acknowledge {
+            TxCommitStatus::Aborted
+        } else {
+            TxCommitStatus::Wounded
+        }
+    }
+
+    /// Selects the owner-side abort transition after the foreground operation
+    /// has returned. Untracked internal protocols call this only after their
+    /// own mutation sequence has quiesced.
+    fn joined_owner_target(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let Some(entry) = st.local_tx.get_mut(tid) else {
+            return Err(TransError::AlreadyFinalized);
+        };
+        entry.refresh_state = RefreshState::Stopped;
+        let already_wounded = entry.status == TxCommitStatus::Wounded;
+        let activity = st.owner_activity.entry(tid.clone()).or_default();
+        activity.admission_closed = true;
+
+        if activity.terminal_commit_started && !already_wounded {
+            // Once a commit was dispatched, absence can mean that its committed
+            // record was already recovered and reclaimed. Never fabricate an
+            // abort over that ADR-057 ambiguity.
+            return Err(TransError::AlreadyFinalized);
+        }
+        if activity.active == 0 && (!activity.unresolved || !activity.tracked) {
+            Ok(TxCommitStatus::Aborted)
+        } else {
+            Ok(TxCommitStatus::Wounded)
+        }
+    }
+
+    fn start_terminal_commit(&self, tid: &TxId) -> Result<(), TransError> {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        if st
+            .local_tx
+            .get(tid)
+            .is_some_and(|entry| entry.status != TxCommitStatus::Pending)
+        {
+            return Err(TransError::AlreadyFinalized);
+        }
+        let activity = st.owner_activity.entry(tid.clone()).or_default();
+        if activity.admission_closed {
+            return Err(TransError::AlreadyFinalized);
+        }
+        activity.terminal_commit_started = true;
+        Ok(())
+    }
+
+    fn finish_local_tx(&self, tid: &TxId) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        st.local_tx.remove(tid);
+        st.owner_activity.remove(tid);
+        notify_waiters(&mut st, tid);
+    }
+
     fn register_tx(&self, tid: &TxId, recovery: TxRecoveryManifest) {
         let mut st = self.shard_for(tid).lock().unwrap();
         st.local_tx.insert(
@@ -796,9 +1088,7 @@ impl Monitor {
             };
             match result {
                 Ok(observed) => {
-                    if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
-                        entry.last_observation = Some(observed);
-                    }
+                    self.record_durable_observation(tid, &observed);
                     self.start_refresh_tx(tid);
                     return Ok(());
                 }
@@ -814,6 +1104,7 @@ impl Monitor {
                     // terminal state: the transaction is durably dead and must
                     // not be re-created over its own tombstone.
                     if status.status.is_final() || status.observation.is_absent() {
+                        self.record_durable_observation(tid, &status.observation);
                         return Err(TransError::AlreadyFinalized);
                     }
                     if let Some(entry) = self.shard_for(tid).lock().unwrap().local_tx.get_mut(tid) {
@@ -952,7 +1243,7 @@ impl Monitor {
         let Some(log) = observed.value() else {
             return;
         };
-        if !log.status.is_final() {
+        if !log.status.is_immutable() {
             return;
         }
         self.inner.final_status.lock().unwrap().insert(
@@ -964,22 +1255,34 @@ impl Monitor {
         );
     }
 
+    /// Records an exact durable observation in local owner state. Wounded is
+    /// deliberately not put in the immutable final-status cache: its owner may
+    /// still acknowledge it as aborted.
+    fn record_durable_observation(&self, tid: &TxId, observed: &Observation<TxLog>) {
+        let Some(log) = observed.value() else {
+            return;
+        };
+        self.remember_final(tid, observed);
+
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let Some(entry) = st.local_tx.get_mut(tid) else {
+            return;
+        };
+        entry.status = log.status;
+        entry.last_observation = Some(observed.clone());
+        if log.status.is_final() {
+            entry.refresh_state = RefreshState::Stopped;
+            st.owner_activity
+                .entry(tid.clone())
+                .or_default()
+                .admission_closed = true;
+            notify_waiters(&mut st, tid);
+        }
+    }
+
     /// Returns the shard lock responsible for `tid`.
     fn shard_for(&self, tid: &TxId) -> &Mutex<State> {
         self.inner.shards.for_key(tid.as_bytes())
-    }
-
-    /// Reflects a durable abort in the in-memory state when the wounded
-    /// transaction is local, so the victim and any waiters unwind promptly.
-    fn mark_local_aborted(&self, tid: &TxId, status: TxCommitStatus) {
-        if status != TxCommitStatus::Aborted {
-            return;
-        }
-        self.stop_tx_refresh(tid);
-
-        let mut st = self.shard_for(tid).lock().unwrap();
-        st.local_tx.remove(tid);
-        notify_waiters(&mut st, tid);
     }
 
     fn wait_for_tx_change(
@@ -1012,7 +1315,7 @@ impl Monitor {
 
         if is_local {
             // Local transition: no worker needed; we'll be notified by
-            // commit_tx/abort_tx.
+            // commit_tx/close_owned_tx.
             st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
             return rx;
         }
@@ -1076,17 +1379,17 @@ impl Monitor {
                 {
                     self.clear_pending_progress(tid);
                     Ok(self
-                        .try_abort_observed(tid, &status.observation)
+                        .try_wound_observed(tid, &status.observation)
                         .await?
                         .status)
                 } else {
                     Ok(TxCommitStatus::Pending)
                 }
             }
-            s @ (TxCommitStatus::Ok | TxCommitStatus::Aborted) => {
+            s @ (TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded) => {
                 // Finalized: drop the observer-relative progress tracking.
                 self.clear_pending_progress(tid);
-                self.remember_final(tid, &status.observation);
+                self.record_durable_observation(tid, &status.observation);
                 Ok(s)
             }
             TxCommitStatus::Unknown => Err(TransError::other(format!(
@@ -1159,7 +1462,7 @@ impl Monitor {
                 .await?;
             let res = match status.status {
                 TxCommitStatus::Unknown => Ok(self
-                    .try_abort_observed(tid, &status.observation)
+                    .try_wound_observed(tid, &status.observation)
                     .await?
                     .status),
                 // Appearance is progress. Re-enter ordinary status resolution
@@ -1221,7 +1524,9 @@ impl Monitor {
         let st = self.shard_for(tid).lock().unwrap();
         matches!(
             st.local_tx.get(tid),
-            Some(e) if e.refresh_state == RefreshState::Running
+            Some(e)
+                if e.status == TxCommitStatus::Pending
+                    && e.refresh_state == RefreshState::Running
         )
     }
 
@@ -1246,11 +1551,11 @@ impl Monitor {
     /// object's version halfway through each pending interval.
     ///
     /// Create-if-absent is what keeps lazy materialization wound-safe: if an
-    /// older peer already wounded this transaction (wrote an `aborted` object)
+    /// older peer already wounded this transaction (wrote a `wounded` object)
     /// before it materialized its own pending one, the create loses, the
     /// refresher observes the final status, stops, and the owner's commit fails
     /// — it can never resurrect itself over a wound. A later refresh CAS that
-    /// finds the object `aborted` is the same wound signal once materialized.
+    /// finds `Wounded` or `Aborted` observes the same terminal decision.
     /// Transient backend failures (in-doubt, unavailable) are retried rather
     /// than abandoning the lease, since re-applying a pending refresh is
     /// idempotent and convergent (ADR-009).
@@ -1278,19 +1583,16 @@ impl Monitor {
                 self.inner.tl.set_if(&tl, observed).await
             } else {
                 // First materialization: create-if-absent so a pre-existing
-                // `aborted` object (an older peer's wound) wins.
+                // abort-side object (an older peer's wound) wins.
                 self.inner.tl.set(&tl).await
             };
             match r {
                 Ok(observed) => {
-                    last_observation = Some(observed);
-                    let mut st = self.shard_for(&tid).lock().unwrap();
-                    if let Some(e) = st.local_tx.get_mut(&tid) {
-                        e.last_observation = last_observation.clone();
-                    }
+                    last_observation = Some(observed.clone());
+                    self.record_durable_observation(&tid, &observed);
                 }
                 // The create lost (object already exists) or the CAS version
-                // moved under us. Re-read: a final status is a wound (or a race
+                // moved under us. Re-read: a terminal status is a wound (or a race
                 // we lost) — stop and let the owner observe it; a still-pending
                 // status means we adopt its version and keep refreshing.
                 Err(StorageError::Precondition) => {
@@ -1301,7 +1603,7 @@ impl Monitor {
                         .await
                     {
                         Ok(st) if st.status.is_final() => {
-                            self.mark_local_aborted(&tid, st.status);
+                            self.record_durable_observation(&tid, &st.observation);
                             return;
                         }
                         // Reclaimed: the object went final and was collected,
@@ -1510,7 +1812,7 @@ mod tests {
         assert_eq!(log.collection_changes, recovery.collection_changes);
         assert_eq!(log.prepared_collections, recovery.prepared_collections);
 
-        mon.abort_tx(&tx).await.unwrap();
+        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
     }
 
     #[tokio::test]
@@ -1556,7 +1858,7 @@ mod tests {
         assert_eq!(log.collection_changes, vec![change]);
         assert_eq!(log.prepared_collections, vec![created]);
 
-        mon.abort_tx(&tx).await.unwrap();
+        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
     }
 
     #[tokio::test]
@@ -1571,7 +1873,7 @@ mod tests {
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
-        mon1.abort_tx(&tx).await.unwrap();
+        mon1.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
 
@@ -1588,7 +1890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn losing_commit_reconciles_local_status_with_durable_abort() {
+    async fn losing_commit_observes_and_acknowledges_a_durable_wound() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, _wounder_ctx) = new_test_monitor(b);
@@ -1602,7 +1904,10 @@ mod tests {
         };
         owner.begin_persisted_tx(&tx, recovery).await.unwrap();
 
-        assert_eq!(wounder.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(
+            wounder.preempt_tx(&tx).await.unwrap(),
+            TxFinalStatus::Aborted
+        );
 
         let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
         log.locks.push(lock);
@@ -1610,21 +1915,23 @@ mod tests {
             owner.commit_tx(log).await,
             Err(TransError::AlreadyFinalized)
         ));
-        assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
+        assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
         assert_eq!(
             owner.await_tx_final(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
+        assert_eq!(
+            owner.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap(),
+            OwnerCloseOutcome::AbortAcknowledged
+        );
+        assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
     }
 
-    // Regression: GC reclaiming a wound's tombstone leaves the commit path with
-    // a stale CAS expectation whose re-read comes back absent. Absence must
-    // never be used as the expected side of a CAS, and it must not be
-    // re-created either. Since only the owner writes `committed` under its own
-    // tx id, a reclaimed record that the owner never finalized proves the wound
-    // won, so this resolves definitively rather than as an in-doubt outcome.
+    // Regression: an unacknowledged wound is the anti-resurrection fence. It is
+    // terminal to the owner but cannot be physically reclaimed before the owner
+    // changes it to `Aborted`.
     #[tokio::test]
-    async fn commit_over_a_reclaimed_wound_resolves_as_finalized() {
+    async fn pinned_wound_cannot_be_reclaimed_or_resurrected() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, wounder_ctx) = new_test_monitor(b);
@@ -1642,10 +1949,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(wounder.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(
+            wounder.preempt_tx(&tx).await.unwrap(),
+            TxFinalStatus::Aborted
+        );
 
-        let aborted = wounder_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
-        wounder_ctx.tl.delete(&aborted).await.unwrap();
+        let wounded = wounder_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        assert!(matches!(
+            wounder_ctx.tl.delete(&wounded).await,
+            Err(StorageError::Precondition)
+        ));
 
         let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
         log.locks.push(lock);
@@ -1653,6 +1966,48 @@ mod tests {
             owner.commit_tx(log).await,
             Err(TransError::AlreadyFinalized)
         ));
+    }
+
+    // Regression for the lazy-object suspension gap: a holder owner can stop
+    // before its first Pending write. A foreign wound of the missing path must
+    // remain present for arbitrarily long and defeat the owner's later create.
+    #[tokio::test(start_paused = true)]
+    async fn missing_foreign_wound_fences_a_late_owner_create() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (owner, _owner_ctx) = new_test_monitor(b.clone());
+        let (wounder, wounder_ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"lazy-suspended-owner".to_vec());
+        let lock = TxLock::Topology {
+            collection: CollectionAddress::root("test"),
+        };
+
+        let owner_operation = owner.begin_owner_operation(&tx).unwrap();
+        owner.begin_tx(&tx);
+        assert_eq!(
+            wounder.preempt_tx(&tx).await.unwrap(),
+            TxFinalStatus::Aborted
+        );
+        assert_eq!(
+            wounder_ctx
+                .tl
+                .commit_status_at(&tx, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Wounded
+        );
+
+        tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Pending);
+        log.locks.push(lock);
+        assert!(matches!(
+            owner.commit_tx(log).await,
+            Err(TransError::AlreadyFinalized)
+        ));
+
+        owner_operation.complete();
+        owner.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
     }
 
     // Regression (ADR-057): a commit write that landed while its acknowledgement
@@ -1870,13 +2225,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wound_tx_returns_the_status_that_won() {
+    async fn preempt_tx_returns_the_status_that_won() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b);
         let pending = TxId::from_bytes(b"pending".to_vec());
         mon.begin_tx(&pending);
         assert_eq!(
-            mon.wound_tx(&pending).await.unwrap(),
+            mon.preempt_tx(&pending).await.unwrap(),
             TxFinalStatus::Aborted
         );
 
@@ -1889,13 +2244,154 @@ mod tests {
         });
         mon.commit_tx(log).await.unwrap();
         assert_eq!(
-            mon.wound_tx(&committed).await.unwrap(),
+            mon.preempt_tx(&committed).await.unwrap(),
             TxFinalStatus::Committed
         );
     }
 
+    #[tokio::test]
+    async fn quiescent_local_wound_writes_aborted_without_wounded() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        backend.set_before({
+            let written = written.clone();
+            move |operation| {
+                let status = match operation {
+                    BackendOp::WriteIf { value, .. }
+                    | BackendOp::WriteIfNotExists { value, .. } => {
+                        glassdb_storage::txobject::status(value).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    written.lock().unwrap().push(status);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let b: Arc<dyn Backend> = backend;
+        let (mon, ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"local-quiescent".to_vec());
+
+        let owner = mon.begin_owner_operation(&tx).unwrap();
+        mon.begin_tx(&tx);
+        owner.complete();
+
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(
+            written.lock().unwrap().as_slice(),
+            [TxCommitStatus::Aborted]
+        );
+        assert_eq!(
+            ctx.tl
+                .commit_status_at(&tx, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn active_local_wound_is_pinned_before_owner_acknowledgement() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        backend.set_before({
+            let written = written.clone();
+            move |operation| {
+                let status = match operation {
+                    BackendOp::WriteIf { value, .. }
+                    | BackendOp::WriteIfNotExists { value, .. } => {
+                        glassdb_storage::txobject::status(value).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    written.lock().unwrap().push(status);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let b: Arc<dyn Backend> = backend;
+        let (mon, ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"local-active".to_vec());
+
+        let owner = mon.begin_owner_operation(&tx).unwrap();
+        mon.begin_tx(&tx);
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
+        assert_eq!(
+            written.lock().unwrap().as_slice(),
+            [TxCommitStatus::Wounded]
+        );
+
+        owner.complete();
+        assert_eq!(
+            mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap(),
+            OwnerCloseOutcome::AbortAcknowledged
+        );
+        assert_eq!(
+            written.lock().unwrap().as_slice(),
+            [TxCommitStatus::Wounded, TxCommitStatus::Aborted]
+        );
+        assert_eq!(
+            ctx.tl
+                .commit_status_at(&tx, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_owner_operation_cannot_acknowledge_its_own_wound() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"local-unresolved".to_vec());
+
+        let owner = mon.begin_owner_operation(&tx).unwrap();
+        mon.begin_tx(&tx);
+        drop(owner);
+
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(
+            mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap(),
+            OwnerCloseOutcome::WoundPinned
+        );
+        assert_eq!(
+            ctx.tl
+                .commit_status_at(&tx, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Wounded
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_terminal_dispatch_does_not_invent_a_wound() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, ctx) = new_test_monitor(b);
+        let tx = TxId::from_bytes(b"terminal-dispatched".to_vec());
+
+        let owner = mon.begin_owner_operation(&tx).unwrap();
+        mon.begin_tx(&tx);
+        mon.start_terminal_commit(&tx).unwrap();
+        drop(owner);
+
+        assert!(matches!(
+            mon.close_owned_tx(&tx, OwnerExit::Cancelled).await,
+            Err(TransError::Storage(StorageError::Unavailable(_)))
+        ));
+        assert!(matches!(
+            ctx.tl.get_at(&tx, Requirement::Any).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn wound_tx_retries_a_pending_refresh() {
+    async fn preempt_tx_retries_a_pending_refresh() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let b: Arc<dyn Backend> = backend.clone();
         let (mon, _wounder) = new_test_monitor(b.clone());
@@ -1917,24 +2413,24 @@ mod tests {
             refreshed.clone(),
             pending,
         ))));
-        let abort_writes = Arc::new(AtomicUsize::new(0));
+        let wound_writes = Arc::new(AtomicUsize::new(0));
         let fail_next_read = Arc::new(AtomicBool::new(false));
         let failed_reads = Arc::new(AtomicUsize::new(0));
         backend.set_before({
             let refresh = refresh.clone();
-            let abort_writes = abort_writes.clone();
+            let wound_writes = wound_writes.clone();
             let fail_next_read = fail_next_read.clone();
             let failed_reads = failed_reads.clone();
             move |operation| {
-                let is_abort = matches!(
+                let is_wound = matches!(
                     operation,
                     BackendOp::WriteIf { value, .. }
                         if glassdb_storage::txobject::status(value)
-                            .map(|status| status == TxCommitStatus::Aborted)
+                            .map(|status| status == TxCommitStatus::Wounded)
                             .unwrap_or(false)
                 );
-                let refresh = if is_abort {
-                    abort_writes.fetch_add(1, Ordering::SeqCst);
+                let refresh = if is_wound {
+                    wound_writes.fetch_add(1, Ordering::SeqCst);
                     refresh.lock().unwrap().take()
                 } else {
                     None
@@ -1964,8 +2460,8 @@ mod tests {
             }
         });
 
-        assert_eq!(mon.wound_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
-        assert_eq!(abort_writes.load(Ordering::SeqCst), 2);
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(wound_writes.load(Ordering::SeqCst), 2);
         assert_eq!(failed_reads.load(Ordering::SeqCst), 1);
         let (_verify_mon, verify) = new_test_monitor(b);
         let final_log = verify.tl.get_at(&tx, Requirement::Any).await.unwrap();
@@ -2023,7 +2519,7 @@ mod tests {
         };
         wait_for_waiters(&mon1, &tx, 2).await;
 
-        mon1.abort_tx(&tx).await.unwrap();
+        mon1.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
         assert_eq!(ch1.await.unwrap().unwrap(), TxFinalStatus::Aborted);
         assert_eq!(ch2.await.unwrap().unwrap(), TxFinalStatus::Aborted);
     }
@@ -2044,7 +2540,7 @@ mod tests {
         }
         wait_for_waiters(&mon2, &tx, 3).await;
 
-        mon1.abort_tx(&tx).await.unwrap();
+        mon1.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
 
         for wait in waits {
             assert_eq!(wait.await.unwrap().unwrap(), TxFinalStatus::Aborted);
@@ -2079,7 +2575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn await_final_preserves_local_status_precedence() {
+    async fn await_final_treats_a_pinned_wound_as_aborted() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"local-wound".to_vec());
@@ -2093,20 +2589,14 @@ mod tests {
             .unwrap()
             .observation;
         assert_eq!(
-            mon.try_abort_observed(&tx, &observed).await.unwrap().status,
-            TxCommitStatus::Aborted
+            mon.try_wound_observed(&tx, &observed).await.unwrap().status,
+            TxCommitStatus::Wounded
         );
-        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
-
-        let wait = {
-            let mon = mon.clone();
-            let tx = tx.clone();
-            rt::spawn(async move { mon.await_tx_final(&tx).await })
-        };
-        wait_for_waiters(&mon, &tx, 1).await;
-
-        mon.mark_local_aborted(&tx, TxCommitStatus::Aborted);
-        assert_eq!(wait.await.unwrap().unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
+        assert_eq!(
+            mon.await_tx_final(&tx).await.unwrap(),
+            TxFinalStatus::Aborted
+        );
     }
 
     #[tokio::test]
@@ -2159,7 +2649,7 @@ mod tests {
                 .is_some_and(|waiters| waiters.iter().all(|waiter| waiter.tx.is_closed()))
         );
 
-        mon.abort_tx(&tx).await.unwrap();
+        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
         assert!(!mon.shard_for(&tx).lock().unwrap().waiters.contains_key(&tx));
     }
 
@@ -2181,7 +2671,7 @@ mod tests {
         let (mon2, _t2) = new_test_monitor(b);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
-        mon.abort_tx(&tx).await.unwrap();
+        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
     }
 
     // Regression (review 1.1 / ADR-022): the lazily-materialized pending object
@@ -2210,7 +2700,7 @@ mod tests {
         assert_eq!(tl.status, TxCommitStatus::Pending);
         assert_eq!(tl.locks, locks);
 
-        mon.abort_tx(&tx).await.unwrap();
+        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
     }
 
     // ADR-024: a peer that repeatedly polls a *live* holder over a span far
@@ -2236,7 +2726,7 @@ mod tests {
             );
         }
 
-        mon.abort_tx(&tx).await.unwrap();
+        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
         assert_eq!(
             observer.tx_status(&tx).await.unwrap(),
             TxCommitStatus::Aborted
@@ -2267,9 +2757,9 @@ mod tests {
         // No progress for longer than the timeout on the observer's own clock.
         rt::yield_now().await;
 
-        // The stalled holder is reclaimed (aborted), well before its absolute
+        // The stalled holder is pinned as wounded, well before its absolute
         // lease would have expired.
-        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
+        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2309,7 +2799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_abort_observed_preserves_a_final_observation() {
+    async fn try_wound_observed_preserves_an_immutable_observation() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let b: Arc<dyn Backend> = Arc::new(backend);
@@ -2322,7 +2812,7 @@ mod tests {
         operations.lock().unwrap().clear();
 
         assert_eq!(
-            mon.try_abort_observed(&tx, &committed)
+            mon.try_wound_observed(&tx, &committed)
                 .await
                 .unwrap()
                 .status,

@@ -10,6 +10,7 @@ message TransactionLog {
         COMMITTED = 1;
         ABORTED = 2;
         PENDING = 3;
+        WOUNDED = 4;
     }
 
     google.protobuf.Timestamp timestamp = 1;

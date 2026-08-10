@@ -23,6 +23,13 @@ The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); the lease and expiry decisions are
 unchanged.
 
+[ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
+foreign abort transition and its finite-lifetime anti-resurrection argument.
+Foreign or otherwise unacknowledged retirement now writes a pinned `Wounded`
+status; a proven local retirement may write `Aborted` directly.
+The current conflict entry point is `Monitor::preempt_tx`; the accepted text
+below retains the implementation names used when this ADR was written.
+
 ## Context
 
 [ADR-020](020-commit-write-back-protocol.md) reclaims the locks of _live_

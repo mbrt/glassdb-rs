@@ -269,7 +269,7 @@ the coordinator.
 | `KeyStateResolver`    | loaded key-state mechanism | nodes, entries, `TxId` | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
-| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, force-abort dead tx, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
+| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, pin dead tx as wounded, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
 
 ### The lock boundary
 
@@ -607,7 +607,9 @@ symbols select one of 4,096 independently listable transaction-log shards
 The log is serialized as a Protocol Buffer (`glassdb-proto`, `prost`-generated
 from a copy of `transaction.proto`) and contains:
 
-- **Status**: pending, committed, or aborted.
+- **Status**: pending, committed, wounded, or aborted. `Wounded` is semantically
+  aborted but remains pinned until the owner acknowledges retirement as
+  `Aborted`.
 - **Timestamp**: when the log was last updated.
 - **Writes**: list of (path, value, deleted, previous writer) entries (the
   `oneof val_delete` layout is preserved byte-for-byte). Committed values live
@@ -700,8 +702,8 @@ single-key-only commit protocol between the two.
 
 Because the commit is invisible until the CAS lands, a retry is proved
 idempotent by the entry already naming this transaction as its inline writer, and
-a cancelled attempt writes no aborted object (the abort guard fires only for a
-transaction that took a logged identity). The coordinator reserves the key for at
+a cancelled attempt writes no abort-side object (the recovery guard fires only
+for a transaction that took a logged identity). The coordinator reserves the key for at
 most one logless member per round, so a batched blind writer cannot erase another
 direct commit's recovery evidence. An uncertain CAS followed by a moved entry
 surfaces `Error::InDoubt` as usual, and is never downgraded to a replay.
@@ -721,7 +723,9 @@ older, higher-priority transaction). When a transaction requests a lock that
 conflicts with current holders:
 
 - If the requester is **older** than a holder, it **wounds** it: the holder's
-  log is durably aborted and the requester takes the lock.
+  log becomes terminal before the requester takes the lock. A foreign or
+  ambiguous wound writes pinned `Wounded`; a Database with proof that its local
+  victim has retired writes `Aborted` directly.
 - If the requester is **younger**, it **waits** for the holder to finish.
 
 Since an older transaction never waits for a younger one, the wait-for graph
@@ -754,15 +758,15 @@ drives this:
    competing transactions consider the lock expired.
 
 2. **Transaction log as arbiter.** To take over an expired lock, a competing
-   transaction attempts to **conditionally write** to the expired transaction's
-   log, marking it as aborted. If this CAS succeeds, the old transaction is
-   officially aborted and its locks are invalid. If the CAS fails (the
-   transaction refreshed or committed in the meantime), the competitor waits
-   longer.
+   transaction conditionally changes the expired transaction's log to
+   `Wounded`, including by create-if-absent when the lazy pending object never
+   appeared. This is terminal for the transaction but cannot be deleted by GC.
+   If the CAS loses to a refresh or commit, the competitor waits longer.
 
-3. **Safe even with races.** If a crashed transaction's commit write races with
-   a competitor's abort write, the CAS semantics ensure exactly one succeeds.
-   The loser observes the version mismatch and backs off.
+3. **Owner acknowledgement.** A returning owner that proves no operation can
+   still publish conditionally changes `Wounded` to `Aborted`; only then does
+   finite GC retention apply. If a commit races the wound, CAS semantics ensure
+   exactly one wins. A quiescent local victim can write `Aborted` directly.
 
 ## Storage, Caching & Consistency
 
@@ -978,10 +982,10 @@ transaction-object dependencies. A post-bound lock CAS can satisfy that bound
 without another read. If a physical leaf changed, validation compares the
 observed logical writer or membership with the newer consistent state;
 post-bound evidence can therefore save I/O without being mistaken for logical
-finality. A typed `TLogger` may serve cached final transaction objects
-indefinitely because their immutability is a transaction-object invariant; the
-generic store does not interpret finality. The monitor separately keeps a small
-count-bounded status cache for finalized transactions.
+finality. A typed `TLogger` may serve immutable committed and aborted transaction
+objects indefinitely. `Wounded` is terminal for readers but remains mutable to
+the owner, so it is revalidated instead of entering that cache. The generic
+store does not interpret transaction status.
 
 ## Data Model
 
@@ -1065,11 +1069,14 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   candidate set complete regardless of lost hints. Each cycle stops after one
   non-empty page or a bounded number of listing requests; an invalid provider
   cursor restarts only its current shard.
-- **Safety horizon.** The ADR-021 lease acts as the sweep horizon: a candidate
+- **Safety horizon and pinned wounds.** The ADR-021 lease acts as the sweep horizon: a candidate
   within the horizon is always kept, because the non-atomic reverse check can
   race a lock a live transaction has taken but not yet published (ADR-024's lazy
-  object materialization). A dead *pending* object is first force-aborted
-  (`pending → aborted` CAS) so its death is durable before any lock moves.
+  object materialization). A dead `Pending` object is changed to `Wounded` so
+  its death remains durable across an unbounded owner suspension. GC may
+  repeatedly reclaim effects described by that record, but cannot delete it.
+  The owner changes it to `Aborted` after proving retirement; ordinary finite
+  retention and deletion apply only after that acknowledgement (ADR-059).
 - **Reclamation through the coordinator.** GC releases a dead transaction's locks
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
   so the release batches through the same shard-mutation coordinator as live

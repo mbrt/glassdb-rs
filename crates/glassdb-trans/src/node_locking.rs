@@ -127,7 +127,7 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(holder)),
-                TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
+                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_structural_gate(&holder);
         }
@@ -146,7 +146,7 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(holder)),
-                TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
+                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_membership_holder(&holder);
         }
@@ -166,7 +166,7 @@ impl<'a> NodeLockReconciler<'a> {
         }
         match self.monitor.tx_status(&holder).await? {
             TxCommitStatus::Ok => Err(TransError::StaleCollection),
-            TxCommitStatus::Aborted => {
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
                 locks.remove_delete_intent(&holder);
                 Ok(None)
             }
@@ -213,7 +213,7 @@ impl<'a> NodeLockReconciler<'a> {
                         }
                     }
                     TxCommitStatus::Unknown => return Ok(Some(holder)),
-                    TxCommitStatus::Ok | TxCommitStatus::Aborted => {}
+                    TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
                 }
                 locks.remove_membership_holder(&holder);
             }

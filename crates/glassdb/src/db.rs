@@ -280,14 +280,11 @@ impl Database {
     ///
     /// # Cancellation
     ///
-    /// This future is durability-safe to cancel: dropping it mid-flight is
-    /// equivalent to a crash and is recovered by the commit protocol, so it
-    /// never corrupts data or leaves a half-applied transaction. Cancel by
-    /// dropping the surrounding future — e.g. via `tokio::time::timeout`,
-    /// `select!`, or `JoinHandle::abort`. The cancelled attempt's transaction
-    /// log entry is asynchronously marked aborted from `Transaction`'s `Drop`, so
-    /// peer transactions observe the release immediately; the lock-lease
-    /// timeout is only the backstop for when the abort write itself fails.
+    /// This future is durability-safe to cancel: dropping it cannot produce a
+    /// partial logical commit. It dispatches, but does not guarantee rollback,
+    /// because a transaction-log commit or logless value CAS already dispatched
+    /// when the future is dropped may still commit even though the caller
+    /// receives no result.
     pub async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
@@ -649,14 +646,14 @@ impl<'a> AttemptResources<'a> {
 }
 
 /// RAII safety net for [`DbInner::tx_impl`]: if the surrounding future is
-/// dropped between attempt begin and end, the guard schedules an abort for the
-/// currently-armed transaction id, so peer
-/// transactions see the abort marker quickly instead of waiting for the
-/// lock-lease timeout.
+/// dropped between attempt begin and end, the guard schedules recovery for the
+/// currently armed transaction id. Before terminal dispatch this publishes a
+/// pinned wound so peers need not wait for the lock lease; after dispatch it
+/// preserves the possibly committed outcome.
 ///
 /// Whether the armed id actually needs an abort is the engine's decision, not
 /// the guard's: an attempt that never took a logged identity is
-/// invisible to peers and must not be given an aborted object it never had.
+/// invisible to peers and must not be given an abort-side object it never had.
 struct TransactionAbortGuard<'a> {
     engine: &'a Engine,
     armed: Option<TxId>,

@@ -21,6 +21,7 @@ pub mod transaction_log {
         Committed = 1,
         Aborted = 2,
         Pending = 3,
+        Wounded = 4,
     }
     impl Status {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -33,6 +34,7 @@ pub mod transaction_log {
                 Self::Committed => "COMMITTED",
                 Self::Aborted => "ABORTED",
                 Self::Pending => "PENDING",
+                Self::Wounded => "WOUNDED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -42,6 +44,7 @@ pub mod transaction_log {
                 "COMMITTED" => Some(Self::Committed),
                 "ABORTED" => Some(Self::Aborted),
                 "PENDING" => Some(Self::Pending),
+                "WOUNDED" => Some(Self::Wounded),
                 _ => None,
             }
         }

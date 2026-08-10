@@ -36,6 +36,11 @@ The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); wait, refresh, and expiry semantics
 are unchanged.
 
+[ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
+finite aborted-object fence used by the lazy materialization discussion below.
+A foreign wound of either a missing or pending object is now pinned as
+`Wounded` until the owner proves retirement and acknowledges `Aborted`.
+
 ## Context
 
 [ADR-020](020-commit-write-back-protocol.md) defines the commit protocol and its

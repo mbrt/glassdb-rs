@@ -391,6 +391,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::monitor::OwnerExit;
 
     const COLLECTION: &str = "db/_c/0000000000000000000000";
     const SOURCE_TOKEN: &str = "L";
@@ -544,7 +545,10 @@ mod tests {
                 .unwrap()
         );
         monitor.begin_tx(&split_id);
-        monitor.abort_tx(&split_id).await.unwrap();
+        monitor
+            .close_owned_tx(&split_id, OwnerExit::Joined)
+            .await
+            .unwrap();
 
         gate.arm();
         let shrink_landed = if fence_waits {
