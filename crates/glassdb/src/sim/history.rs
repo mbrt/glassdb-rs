@@ -28,11 +28,11 @@ const CHECK_BRANCH_BUDGET: usize = 1_000_000;
 const USER_ERROR_MARKER: &str = "history-user-error";
 
 /// The checker-owned abstract database state.
-pub type AbstractState = BTreeMap<u8, u8>;
+type AbstractState = BTreeMap<u8, u8>;
 
 /// One resolved action from a transaction-body execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HistoryAction {
+enum HistoryAction {
     /// A point read and its returned value (`None` means absent).
     Read { key: u8, value: Option<u8> },
     /// Concurrent point-read observations from one transaction snapshot.
@@ -63,7 +63,7 @@ pub enum HistoryAction {
 
 /// How a recorded transaction-body execution ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyResult {
+enum BodyResult {
     /// The body was invoked but its future was dropped before returning.
     Incomplete,
     /// The body returned normally and was eligible for commit.
@@ -78,21 +78,21 @@ pub enum BodyResult {
 
 /// One complete execution of a public transaction body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BodyTrace {
+struct BodyTrace {
     /// Retry number within the public transaction, starting at zero.
-    pub body_number: usize,
+    body_number: usize,
     /// Point reads, unordered read groups, scans, and resolved local mutations
     /// in program order.
-    pub ordered_actions: Vec<HistoryAction>,
+    ordered_actions: Vec<HistoryAction>,
     /// The final mutation for every key touched by the local overlay.
-    pub final_mutations: BTreeMap<u8, Option<u8>>,
+    final_mutations: BTreeMap<u8, Option<u8>>,
     /// The body's result before validation or commit.
-    pub result: BodyResult,
+    result: BodyResult,
 }
 
 /// Public result classification used by the sequential specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryOutcome {
+enum HistoryOutcome {
     /// A transaction returned success and must appear exactly once.
     Success,
     /// A stable read-derived error; its observations must appear once and its
@@ -108,34 +108,34 @@ pub enum HistoryOutcome {
 
 /// A public transaction invocation and every body execution caused by retries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicOp {
+struct PublicOp {
     /// Stable workload operation identifier.
-    pub op_id: u64,
+    op_id: u64,
     /// Client that invoked the operation.
-    pub client_id: usize,
+    client_id: usize,
     /// Checker-owned event point at invocation.
-    pub invocation_point: u64,
+    invocation_point: u64,
     /// Body executions in retry order.
-    pub body_executions: Vec<BodyTrace>,
+    body_executions: Vec<BodyTrace>,
     /// Checker-owned event point at public notification, absent for abandonment.
-    pub notification_point: Option<u64>,
+    notification_point: Option<u64>,
     /// Public outcome.
-    pub outcome: HistoryOutcome,
+    outcome: HistoryOutcome,
 }
 
 /// Statistics and one witness serialization for an accepted history.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckStats {
+struct CheckStats {
     /// Candidate placements examined by the exact search.
-    pub explored_branches: usize,
+    explored_branches: usize,
     /// Operation IDs in one accepted serialization; omitted optional operations
     /// are absent.
-    pub serialization: Vec<u64>,
+    serialization: Vec<u64>,
 }
 
 /// A malformed or non-serializable history.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckError {
+struct CheckError {
     detail: String,
 }
 
@@ -399,7 +399,7 @@ impl Search<'_> {
 /// commit-eligible abandoned operations may appear zero or one time. The
 /// search is exact within its explicit branch budget and respects real-time
 /// order between definitively completed operations and later invocations.
-pub fn check_history(
+fn check_history(
     initial_state: &AbstractState,
     history: &[PublicOp],
     final_state: &AbstractState,

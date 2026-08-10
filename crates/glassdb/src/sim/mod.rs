@@ -33,11 +33,7 @@ pub use harness::{
     PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
     replay_input,
 };
-pub use history::{
-    AbstractState, BodyResult, BodyTrace, CheckError, CheckStats, HistoryAction,
-    HistoryInstruction, HistoryOutcome, HistoryTransaction, HistoryWorkload, PublicOp,
-    check_history,
-};
+pub use history::{HistoryInstruction, HistoryTransaction, HistoryWorkload};
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 

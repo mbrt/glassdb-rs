@@ -1,8 +1,7 @@
 //! Deterministic-simulation checks for exact transaction histories.
 //!
 //! This workload records point and concurrent-group reads, writes, and
-//! normalized bounded membership scans. Long-lived snapshot reads remain
-//! outside its specification.
+//! normalized bounded membership scans.
 #![cfg(all(sim, feature = "sim"))]
 
 mod sim_support;
