@@ -122,6 +122,12 @@ struct OwnerActivity {
     terminal_commit_started: bool,
 }
 
+enum OwnerAbortPlan {
+    Acknowledge,
+    Pin,
+    RaceTerminalCommit,
+}
+
 #[derive(Clone, Copy)]
 struct FinalStatus {
     status: TxCommitStatus,
@@ -226,26 +232,17 @@ impl Drop for OwnerOperation {
     }
 }
 
-/// How the owning foreground protocol stopped before closing its transaction.
+/// Outcome of aborting a transaction from its owning Database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OwnerExit {
-    /// The protocol future returned, so all operations it issued were joined.
-    Joined,
-    /// The protocol future was dropped, so an issued operation may still land.
-    Cancelled,
-}
-
-/// Outcome of closing a transaction from its owning Database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OwnerCloseOutcome {
+pub(crate) enum OwnerAbortOutcome {
     /// The abort is acknowledged and eligible for ordinary GC.
-    AbortAcknowledged,
+    Acknowledged,
     /// The abort is terminal but pinned because owner work remains unresolved.
-    WoundPinned,
+    Pinned,
     /// The transaction committed before owner-side closure won.
     Committed,
     /// The Monitor had already stopped tracking the transaction.
-    AlreadyClosed,
+    AlreadyFinished,
 }
 
 /// Durable backreferences needed to recover a pending transaction after its
@@ -318,26 +315,6 @@ impl Monitor {
         self.inner.timing
     }
 
-    /// Opens one owner-side protocol execution for `tid`.
-    ///
-    /// The guard is deliberately registered before the transaction publishes a
-    /// holder. If the future is dropped, its guard records an unresolved
-    /// operation and any later wound must remain pinned.
-    pub(crate) fn begin_owner_operation(&self, tid: &TxId) -> Result<OwnerOperation, TransError> {
-        let mut st = self.shard_for(tid).lock().unwrap();
-        let activity = st.owner_activity.entry(tid.clone()).or_default();
-        if activity.admission_closed {
-            return Err(TransError::Wounded);
-        }
-        activity.tracked = true;
-        activity.active += 1;
-        Ok(OwnerOperation {
-            monitor: self.clone(),
-            tid: tid.clone(),
-            completed: false,
-        })
-    }
-
     /// Registers a new pending local transaction.
     pub(crate) fn begin_tx(&self, tid: &TxId) {
         self.register_tx(tid, TxRecoveryManifest::default());
@@ -370,6 +347,26 @@ impl Monitor {
             update(&mut entry.recovery);
         }
         self.persist_pending_tx(tid).await
+    }
+
+    /// Opens one owner-side protocol execution for `tid`.
+    ///
+    /// The guard is deliberately registered before the transaction publishes a
+    /// holder. If the future is dropped, its guard records an unresolved
+    /// operation and any later wound must remain pinned.
+    pub(crate) fn begin_owner_operation(&self, tid: &TxId) -> Result<OwnerOperation, TransError> {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let activity = st.owner_activity.entry(tid.clone()).or_default();
+        if activity.admission_closed {
+            return Err(TransError::Wounded);
+        }
+        activity.tracked = true;
+        activity.active += 1;
+        Ok(OwnerOperation {
+            monitor: self.clone(),
+            tid: tid.clone(),
+            completed: false,
+        })
     }
 
     /// Whether this client still tracks `tid` as one of its logged identities.
@@ -470,20 +467,49 @@ impl Monitor {
         Ok(())
     }
 
-    /// Closes a transaction from its owning Database and returns the durable
-    /// outcome instead of encoding protocol outcomes as errors.
+    /// Aborts a transaction owned by this Database, deriving the strongest safe
+    /// durable state from tracked owner activity.
     ///
-    /// A joined owner may acknowledge an abort. A cancelled owner only pins the
-    /// wound when an operation might still land, and preserves ambiguity after
-    /// terminal commit dispatch.
-    pub(crate) async fn close_owned_tx(
-        &self,
-        tid: &TxId,
-        exit: OwnerExit,
-    ) -> Result<OwnerCloseOutcome, TransError> {
-        match exit {
-            OwnerExit::Joined => self.close_joined_owner_tx(tid).await,
-            OwnerExit::Cancelled => self.close_cancelled_owner_tx(tid).await,
+    /// Quiescent work may acknowledge `Aborted`; a dropped operation remains
+    /// pinned as `Wounded`. An unresolved terminal commit preserves ADR-057
+    /// ambiguity instead of manufacturing an abort-side object.
+    pub(crate) async fn abort_owned_tx(&self, tid: &TxId) -> Result<OwnerAbortOutcome, TransError> {
+        let Some(plan) = self.owner_abort_plan(tid) else {
+            return Ok(OwnerAbortOutcome::AlreadyFinished);
+        };
+        let (target, allow_create, absent_is_in_doubt) = match plan {
+            OwnerAbortPlan::Acknowledge => (TxCommitStatus::Aborted, true, false),
+            OwnerAbortPlan::Pin => (TxCommitStatus::Wounded, true, false),
+            OwnerAbortPlan::RaceTerminalCommit => (TxCommitStatus::Wounded, false, true),
+        };
+        let mut status = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
+        let mut backoff = self.inner.retry.backoff();
+        loop {
+            if absent_is_in_doubt && status.observation.is_absent() {
+                return Err(in_doubt(format!(
+                    "transaction {tid} owner operation was dropped after terminal commit dispatch"
+                )));
+            }
+            status = self
+                .try_retire_observed(tid, &status.observation, target, allow_create)
+                .await?;
+            let outcome = match status.status {
+                TxCommitStatus::Ok => Some(OwnerAbortOutcome::Committed),
+                TxCommitStatus::Aborted => Some(OwnerAbortOutcome::Acknowledged),
+                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
+                    Some(OwnerAbortOutcome::Pinned)
+                }
+                TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
+            };
+            if let Some(outcome) = outcome {
+                self.finish_local_tx(tid);
+                return Ok(outcome);
+            }
+            rt::sleep(backoff.next_delay()).await;
         }
     }
 
@@ -725,90 +751,6 @@ impl Monitor {
             .await
     }
 
-    async fn close_joined_owner_tx(&self, tid: &TxId) -> Result<OwnerCloseOutcome, TransError> {
-        let target = match self.joined_owner_target(tid) {
-            Ok(target) => target,
-            Err(TransError::AlreadyFinalized) => return Ok(OwnerCloseOutcome::AlreadyClosed),
-            Err(error) => return Err(error),
-        };
-        self.stop_tx_refresh(tid);
-        let mut status = self
-            .inner
-            .tl
-            .commit_status_at(tid, self.current_requirement())
-            .await?;
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            status = self
-                .try_retire_observed(tid, &status.observation, target, true)
-                .await?;
-            match status.status {
-                TxCommitStatus::Aborted => {
-                    self.finish_local_tx(tid);
-                    return Ok(OwnerCloseOutcome::AbortAcknowledged);
-                }
-                TxCommitStatus::Ok => {
-                    self.finish_local_tx(tid);
-                    return Ok(OwnerCloseOutcome::Committed);
-                }
-                TxCommitStatus::Wounded if target == TxCommitStatus::Wounded => {
-                    // The identity is durably dead, but an unresolved owner
-                    // operation prevents finite tombstone retention.
-                    return Ok(OwnerCloseOutcome::WoundPinned);
-                }
-                TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
-            }
-            rt::sleep(backoff.next_delay()).await;
-        }
-    }
-
-    async fn close_cancelled_owner_tx(&self, tid: &TxId) -> Result<OwnerCloseOutcome, TransError> {
-        let terminal_commit_started = {
-            let mut st = self.shard_for(tid).lock().unwrap();
-            let Some(entry) = st.local_tx.get_mut(tid) else {
-                return Ok(OwnerCloseOutcome::AlreadyClosed);
-            };
-            entry.refresh_state = RefreshState::Stopped;
-            let activity = st.owner_activity.entry(tid.clone()).or_default();
-            activity.admission_closed = true;
-            activity.unresolved = true;
-            activity.terminal_commit_started
-        };
-
-        let mut status = self
-            .inner
-            .tl
-            .commit_status_at(tid, self.current_requirement())
-            .await?;
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            if terminal_commit_started && status.observation.is_absent() {
-                return Err(in_doubt(format!(
-                    "transaction {tid} was cancelled after terminal commit dispatch"
-                )));
-            }
-            status = self
-                .try_retire_observed(
-                    tid,
-                    &status.observation,
-                    TxCommitStatus::Wounded,
-                    !terminal_commit_started,
-                )
-                .await?;
-            let outcome = match status.status {
-                TxCommitStatus::Ok => Some(OwnerCloseOutcome::Committed),
-                TxCommitStatus::Aborted => Some(OwnerCloseOutcome::AbortAcknowledged),
-                TxCommitStatus::Wounded => Some(OwnerCloseOutcome::WoundPinned),
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
-            };
-            if let Some(outcome) = outcome {
-                self.finish_local_tx(tid);
-                return Ok(outcome);
-            }
-            rt::sleep(backoff.next_delay()).await;
-        }
-    }
-
     /// Conditionally installs one abort-side status and returns the durable
     /// status observed after the attempt.
     async fn try_retire_observed(
@@ -1005,30 +947,35 @@ impl Monitor {
         }
     }
 
-    /// Selects the owner-side abort transition after the foreground operation
-    /// has returned. Untracked internal protocols call this only after their
-    /// own mutation sequence has quiesced.
-    fn joined_owner_target(&self, tid: &TxId) -> Result<TxCommitStatus, TransError> {
+    /// Closes owner admission and derives the strongest safe abort plan from
+    /// facts recorded by [`OwnerOperation`]. Untracked internal protocols call
+    /// this only after their own mutation sequence has quiesced.
+    fn owner_abort_plan(&self, tid: &TxId) -> Option<OwnerAbortPlan> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let Some(entry) = st.local_tx.get_mut(tid) else {
-            return Err(TransError::AlreadyFinalized);
-        };
+        let entry = st.local_tx.get_mut(tid)?;
         entry.refresh_state = RefreshState::Stopped;
         let already_wounded = entry.status == TxCommitStatus::Wounded;
         let activity = st.owner_activity.entry(tid.clone()).or_default();
         activity.admission_closed = true;
 
         if activity.terminal_commit_started && !already_wounded {
-            // Once a commit was dispatched, absence can mean that its committed
-            // record was already recovered and reclaimed. Never fabricate an
-            // abort over that ADR-057 ambiguity.
-            return Err(TransError::AlreadyFinalized);
+            if activity.active == 0 && !activity.unresolved {
+                // Once a joined commit was dispatched, owner-side cleanup must
+                // preserve its outcome. The commit path has already reconciled
+                // any readable durable status.
+                return None;
+            }
+            // A dropped terminal mutation may still commit. Only an observed
+            // object may be preempted; absence remains ADR-057 in-doubt.
+            return Some(OwnerAbortPlan::RaceTerminalCommit);
         }
-        if activity.active == 0 && (!activity.unresolved || !activity.tracked) {
-            Ok(TxCommitStatus::Aborted)
+
+        let plan = if activity.active == 0 && (!activity.unresolved || !activity.tracked) {
+            OwnerAbortPlan::Acknowledge
         } else {
-            Ok(TxCommitStatus::Wounded)
-        }
+            OwnerAbortPlan::Pin
+        };
+        Some(plan)
     }
 
     fn start_terminal_commit(&self, tid: &TxId) -> Result<(), TransError> {
@@ -1315,7 +1262,7 @@ impl Monitor {
 
         if is_local {
             // Local transition: no worker needed; we'll be notified by
-            // commit_tx/close_owned_tx.
+            // commit_tx/abort_owned_tx.
             st.waiters.insert(tid.clone(), vec![WaitRequest { tx }]);
             return rx;
         }
@@ -1812,7 +1759,7 @@ mod tests {
         assert_eq!(log.collection_changes, recovery.collection_changes);
         assert_eq!(log.prepared_collections, recovery.prepared_collections);
 
-        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&tx).await.unwrap();
     }
 
     #[tokio::test]
@@ -1858,7 +1805,7 @@ mod tests {
         assert_eq!(log.collection_changes, vec![change]);
         assert_eq!(log.prepared_collections, vec![created]);
 
-        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&tx).await.unwrap();
     }
 
     #[tokio::test]
@@ -1873,7 +1820,7 @@ mod tests {
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
-        mon1.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon1.abort_owned_tx(&tx).await.unwrap();
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
 
@@ -1921,8 +1868,8 @@ mod tests {
             TxFinalStatus::Aborted
         );
         assert_eq!(
-            owner.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap(),
-            OwnerCloseOutcome::AbortAcknowledged
+            owner.abort_owned_tx(&tx).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
         );
         assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
     }
@@ -2006,7 +1953,7 @@ mod tests {
         ));
 
         owner_operation.complete();
-        owner.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        owner.abort_owned_tx(&tx).await.unwrap();
         assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
     }
 
@@ -2327,8 +2274,8 @@ mod tests {
 
         owner.complete();
         assert_eq!(
-            mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap(),
-            OwnerCloseOutcome::AbortAcknowledged
+            mon.abort_owned_tx(&tx).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
         );
         assert_eq!(
             written.lock().unwrap().as_slice(),
@@ -2356,9 +2303,10 @@ mod tests {
 
         assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(
-            mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap(),
-            OwnerCloseOutcome::WoundPinned
+            mon.abort_owned_tx(&tx).await.unwrap(),
+            OwnerAbortOutcome::Pinned
         );
+        assert!(!mon.is_tracked_local(&tx));
         assert_eq!(
             ctx.tl
                 .commit_status_at(&tx, Requirement::Any)
@@ -2381,7 +2329,7 @@ mod tests {
         drop(owner);
 
         assert!(matches!(
-            mon.close_owned_tx(&tx, OwnerExit::Cancelled).await,
+            mon.abort_owned_tx(&tx).await,
             Err(TransError::Storage(StorageError::Unavailable(_)))
         ));
         assert!(matches!(
@@ -2519,7 +2467,7 @@ mod tests {
         };
         wait_for_waiters(&mon1, &tx, 2).await;
 
-        mon1.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon1.abort_owned_tx(&tx).await.unwrap();
         assert_eq!(ch1.await.unwrap().unwrap(), TxFinalStatus::Aborted);
         assert_eq!(ch2.await.unwrap().unwrap(), TxFinalStatus::Aborted);
     }
@@ -2540,7 +2488,7 @@ mod tests {
         }
         wait_for_waiters(&mon2, &tx, 3).await;
 
-        mon1.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon1.abort_owned_tx(&tx).await.unwrap();
 
         for wait in waits {
             assert_eq!(wait.await.unwrap().unwrap(), TxFinalStatus::Aborted);
@@ -2649,7 +2597,7 @@ mod tests {
                 .is_some_and(|waiters| waiters.iter().all(|waiter| waiter.tx.is_closed()))
         );
 
-        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&tx).await.unwrap();
         assert!(!mon.shard_for(&tx).lock().unwrap().waiters.contains_key(&tx));
     }
 
@@ -2671,7 +2619,7 @@ mod tests {
         let (mon2, _t2) = new_test_monitor(b);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
-        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&tx).await.unwrap();
     }
 
     // Regression (review 1.1 / ADR-022): the lazily-materialized pending object
@@ -2700,7 +2648,7 @@ mod tests {
         assert_eq!(tl.status, TxCommitStatus::Pending);
         assert_eq!(tl.locks, locks);
 
-        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&tx).await.unwrap();
     }
 
     // ADR-024: a peer that repeatedly polls a *live* holder over a span far
@@ -2726,7 +2674,7 @@ mod tests {
             );
         }
 
-        mon.close_owned_tx(&tx, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&tx).await.unwrap();
         assert_eq!(
             observer.tx_status(&tx).await.unwrap(),
             TxCommitStatus::Aborted

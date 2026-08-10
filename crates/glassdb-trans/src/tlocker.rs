@@ -1330,7 +1330,7 @@ mod tests {
     use super::*;
     use crate::collection_coordination::CollectionStateResolver;
     use crate::key_state_resolver::KeyStateResolver;
-    use crate::monitor::{OwnerExit, ProtocolTiming};
+    use crate::monitor::ProtocolTiming;
     use crate::shard_coord::SplitHinter;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
@@ -1829,10 +1829,7 @@ mod tests {
         );
 
         // Finalizing `old` releases `young`, which reloads and takes the lock.
-        ctx.monitor
-            .close_owned_tx(&old, OwnerExit::Joined)
-            .await
-            .unwrap();
+        ctx.monitor.abort_owned_tx(&old).await.unwrap();
         let outcome = waiting.await.unwrap().unwrap();
         assert!(
             matches!(outcome, ShardsOutcome::Locked(_)),
@@ -2556,10 +2553,7 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished());
 
-        ctx.monitor
-            .close_owned_tx(&old, OwnerExit::Joined)
-            .await
-            .unwrap();
+        ctx.monitor.abort_owned_tx(&old).await.unwrap();
         assert!(matches!(
             waiting.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)

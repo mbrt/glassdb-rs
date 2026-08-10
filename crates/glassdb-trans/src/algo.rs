@@ -44,7 +44,7 @@ use crate::error::TransError;
 use crate::gc::Gc;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
-use crate::monitor::{Monitor, OwnerCloseOutcome, OwnerExit};
+use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
     StageAdmission, Step,
@@ -643,15 +643,15 @@ impl Algo {
         tx.collections.replace_data(collection_data);
     }
 
-    /// Closes a non-committed, engaged transaction, acknowledging its abort when
-    /// safe and releasing its locks lazily. An optimistic read-only attempt
-    /// never engaged, so there is nothing to close.
+    /// Aborts a non-committed, engaged transaction, acknowledging it when safe
+    /// and releasing its locks lazily. An optimistic read-only attempt never
+    /// engaged, so there is nothing to abort.
     pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
         if tx.status == Status::Committed || !tx.engaged {
             return Ok(());
         }
-        match self.mon.close_owned_tx(&tx.id, OwnerExit::Joined).await? {
-            OwnerCloseOutcome::AbortAcknowledged => {
+        match self.mon.abort_owned_tx(&tx.id).await? {
+            OwnerAbortOutcome::Acknowledged => {
                 self.gc.schedule_tx_cleanup(tx.id.clone());
                 self.collection_commit.abort(&tx.id, &tx.collections).await
             }
@@ -659,20 +659,20 @@ impl Algo {
             // `Wounded`. Its durable manifest and repeated GC passes own
             // cleanup; local rollback must not race an effect that may land
             // after this future returns.
-            OwnerCloseOutcome::WoundPinned => {
+            OwnerAbortOutcome::Pinned => {
                 self.gc.schedule_tx_cleanup(tx.id.clone());
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
             // collection objects and delete fences now belong to the committed
             // log and must be left for write-back/recovery.
-            OwnerCloseOutcome::Committed => {
+            OwnerAbortOutcome::Committed => {
                 tx.status = Status::Committed;
                 Ok(())
             }
-            // Another local path already closed this identity. Without its
+            // Another local path already finished this identity. Without its
             // owner record this handle must not attempt collection rollback.
-            OwnerCloseOutcome::AlreadyClosed => {
+            OwnerAbortOutcome::AlreadyFinished => {
                 tx.status = Status::Committed;
                 Ok(())
             }
@@ -699,11 +699,7 @@ impl Algo {
         let gc = self.gc.clone();
         let tx_id = tx_id.clone();
         bg.spawn_waited(async move {
-            if mon
-                .close_owned_tx(&tx_id, OwnerExit::Cancelled)
-                .await
-                .is_ok()
-            {
+            if mon.abort_owned_tx(&tx_id).await.is_ok() {
                 gc.schedule_tx_cleanup(tx_id);
             }
         });
@@ -2265,10 +2261,7 @@ mod tests {
 
         // Finalizing the holder releases the younger, which commits under its
         // original id without ever surfacing `LockTimeout`.
-        tctx.tmon
-            .close_owned_tx(&holder, OwnerExit::Joined)
-            .await
-            .unwrap();
+        tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         let (mut h, res) = committing.await.unwrap();
         res.expect("younger commits once the holder releases");
         assert_eq!(
@@ -3981,10 +3974,7 @@ mod tests {
         // Aborting the holder leaves the previously observed writer effective.
         // The exclusive holder prevents a physical shortcut, then writer
         // resolution at the validation watermark accepts the unchanged value.
-        tctx.tmon
-            .close_owned_tx(&holder, OwnerExit::Joined)
-            .await
-            .unwrap();
+        tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         assert!(
             !tm.validate_read_observations(&data, validation_start, None)
                 .await

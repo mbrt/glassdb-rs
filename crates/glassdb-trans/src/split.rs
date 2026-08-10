@@ -2333,7 +2333,7 @@ fn split_into_children(
 mod tests {
     use super::*;
 
-    use crate::monitor::{OwnerExit, TxFinalStatus};
+    use crate::monitor::TxFinalStatus;
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
@@ -2696,10 +2696,7 @@ mod tests {
             .await
             .unwrap();
         sp.join_topology(COLL, &participant).await.unwrap();
-        sp.mon
-            .close_owned_tx(&participant, OwnerExit::Joined)
-            .await
-            .unwrap();
+        sp.mon.abort_owned_tx(&participant).await.unwrap();
 
         operations.lock().unwrap().clear();
         sp.settle_topology_participant(&collection(), &participant)
@@ -3641,7 +3638,7 @@ mod tests {
             1
         );
 
-        mon.close_owned_tx(&older, OwnerExit::Joined).await.unwrap();
+        mon.abort_owned_tx(&older).await.unwrap();
         sp.run_once().await;
         assert_eq!(
             TreeRouter::new(s.shards.clone())
@@ -3947,7 +3944,7 @@ mod tests {
             1
         );
 
-        sp.mon.close_owned_tx(&id, OwnerExit::Joined).await.unwrap();
+        sp.mon.abort_owned_tx(&id).await.unwrap();
         sp.recover_record(&observed).await.unwrap();
         assert!(matches!(
             s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
