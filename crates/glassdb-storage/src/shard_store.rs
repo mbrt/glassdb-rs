@@ -33,13 +33,6 @@ pub struct ShardStore {
 
 /// A B-link leaf loaded for one coordination round.
 pub struct LoadedLeaf {
-    #[deprecated(note = "use LoadedLeaf::entries or LoadedLeaf::into_edit")]
-    pub entries: Shard,
-    /// Node-level coordination staged independently from topology.
-    #[deprecated(note = "use LoadedLeaf::locks or LoadedLeaf::into_edit")]
-    pub locks: NodeLocks,
-    #[deprecated(note = "use LoadedLeaf::observation or LoadedLeaf::into_edit")]
-    pub observation: LeafObservation,
     edit: LeafEdit,
 }
 
@@ -457,7 +450,6 @@ impl ShardStore {
     }
 
     /// Loads the leaf node at `_r` or `_n/<token>`.
-    #[allow(deprecated)]
     pub async fn load_leaf(
         &self,
         path: &str,
@@ -467,12 +459,8 @@ impl ShardStore {
         match observed.value() {
             Some(node) => {
                 let node = node.as_ref().clone();
-                let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
-                let locks = node.locks().clone();
+                node.as_leaf().ok_or(StorageError::Precondition)?;
                 Ok(LoadedLeaf {
-                    entries,
-                    locks,
-                    observation: observed.clone(),
                     edit: LeafEdit {
                         observation: observed,
                         node,
@@ -496,32 +484,6 @@ impl ShardStore {
             Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
-    }
-
-    /// Compare-and-swaps a leaf while preserving its topology fields.
-    #[deprecated(note = "use LoadedLeaf::into_edit and ShardStore::commit_leaf")]
-    pub async fn store_leaf(
-        &self,
-        path: &str,
-        entries: &Shard,
-        locks: &NodeLocks,
-        expected: &LeafObservation,
-    ) -> Result<bool, StorageError> {
-        let mut node = expected
-            .value()
-            .ok_or(StorageError::NotFound)?
-            .as_ref()
-            .clone();
-        if expected.path() != path {
-            return Err(StorageError::other("leaf observation path changed"));
-        }
-        node.set_leaf(entries.clone())?;
-        node.set_locks(locks.clone());
-        self.commit_leaf(LeafEdit {
-            observation: expected.clone(),
-            node,
-        })
-        .await
     }
 
     /// Loads the fixed tree root under `prefix`.
@@ -841,38 +803,6 @@ mod tests {
             .unwrap();
         assert!(left.entries().lookup(b"left-key").is_some());
         assert!(right.entries().is_empty());
-    }
-
-    #[allow(deprecated)]
-    #[tokio::test]
-    async fn loose_leaf_store_and_public_fields_remain_compatible() {
-        let store = store_over(Arc::new(MemoryBackend::new()));
-        let path = paths::from_node(COLL, "tok");
-        assert!(
-            store
-                .store_node(COLL, "tok", &Node::leaf(Shard::new()), None)
-                .await
-                .unwrap()
-        );
-
-        let mut loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
-        loaded.entries = Shard::from_entries([ShardEntry::new(b"legacy".as_slice())]);
-        loaded
-            .locks
-            .set_membership_writer(TxId::from_bytes(b"legacy-holder".to_vec()));
-        assert!(
-            store
-                .store_leaf(&path, &loaded.entries, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
-
-        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
-        assert!(committed.entries().lookup(b"legacy").is_some());
-        assert_eq!(
-            committed.node().membership_lock().holders(),
-            &[TxId::from_bytes(b"legacy-holder".to_vec())]
-        );
     }
 
     #[tokio::test]
