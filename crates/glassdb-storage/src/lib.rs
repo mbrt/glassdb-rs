@@ -46,7 +46,7 @@ pub use inline::InlinePolicy;
 pub use lock::LockType;
 pub use node::{IndexNode, Node, NodeBody, NodeLock, NodeLocks, NodeToken, SplitPolicy};
 pub use shard::{CurrentState, Shard, ShardEntry};
-pub use shard_store::{LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
+pub use shard_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use timeline::{SequencePoint, Timeline};
 pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};

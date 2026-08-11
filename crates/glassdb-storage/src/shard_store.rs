@@ -37,6 +37,12 @@ pub struct LoadedLeaf {
     /// Node-level coordination staged independently from topology.
     pub locks: NodeLocks,
     pub observation: LeafObservation,
+    edit: LeafEdit,
+}
+
+/// A leaf mutation bound to the exact node state it will compare-and-swap.
+pub struct LeafEdit {
+    observation: LeafObservation,
     node: Node,
 }
 
@@ -47,14 +53,85 @@ pub type LeafObservation = Observation<Node>;
 pub type LeafObservationCheck = ObservationCheck<Node>;
 
 impl LoadedLeaf {
+    /// Returns the object path of this loaded leaf.
+    pub fn path(&self) -> &str {
+        self.edit.path()
+    }
+
     /// Returns the complete node carrying this leaf's entries and coordination.
     pub fn node(&self) -> &Node {
-        &self.node
+        self.edit.node()
+    }
+
+    /// Returns the loaded leaf entries.
+    pub fn entries(&self) -> &Shard {
+        self.edit.entries()
+    }
+
+    /// Returns the loaded node-level coordination state.
+    pub fn locks(&self) -> &NodeLocks {
+        self.edit.locks()
+    }
+
+    /// Returns the exact observation from which this leaf was loaded.
+    pub fn observation(&self) -> &LeafObservation {
+        self.edit.observation()
     }
 
     /// Reports whether this loaded leaf still owns `key` — i.e. `key` is below
     /// its high-key. A `false` result means a split moved `key` to a right
     /// sibling after the key was routed here, so a caller must re-descend.
+    pub fn owns(&self, key: &[u8]) -> bool {
+        self.edit.owns(key)
+    }
+
+    /// Converts this loaded leaf into an observation-bound mutation.
+    pub fn into_edit(self) -> LeafEdit {
+        self.edit
+    }
+}
+
+impl LeafEdit {
+    /// Returns the immutable object path to which this edit is bound.
+    pub fn path(&self) -> &str {
+        self.observation.path()
+    }
+
+    /// Returns the complete node carrying this edit's topology and contents.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
+    /// Returns the staged leaf entries.
+    pub fn entries(&self) -> &Shard {
+        self.node
+            .as_leaf()
+            .expect("LeafEdit is always created from a leaf node")
+    }
+
+    /// Replaces the staged leaf entries without changing topology.
+    pub fn set_entries(&mut self, entries: Shard) {
+        self.node
+            .set_leaf(entries)
+            .expect("LeafEdit is always created from a leaf node");
+    }
+
+    /// Returns the staged node-level coordination state.
+    pub fn locks(&self) -> &NodeLocks {
+        self.node.locks()
+    }
+
+    /// Replaces the staged node-level coordination state without changing topology.
+    pub fn set_locks(&mut self, locks: NodeLocks) {
+        self.node.set_locks(locks);
+    }
+
+    /// Returns the exact observation against which this edit will commit.
+    pub fn observation(&self) -> &LeafObservation {
+        &self.observation
+    }
+
+    /// Reports whether this edited leaf still owns `key`.
     pub fn owns(&self, key: &[u8]) -> bool {
         self.node.owns(key)
     }
@@ -387,14 +464,33 @@ impl ShardStore {
             Some(node) => {
                 let node = node.as_ref().clone();
                 let entries = node.as_leaf().cloned().ok_or(StorageError::Precondition)?;
+                let locks = node.locks().clone();
                 Ok(LoadedLeaf {
                     entries,
-                    locks: node.locks().clone(),
-                    observation: observed,
-                    node,
+                    locks,
+                    observation: observed.clone(),
+                    edit: LeafEdit {
+                        observation: observed,
+                        node,
+                    },
                 })
             }
             None => Err(StorageError::NotFound),
+        }
+    }
+
+    /// Compare-and-swaps an observation-bound leaf edit.
+    pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<bool, StorageError> {
+        let LeafEdit { observation, node } = edit;
+        let res = self
+            .nodes
+            .compare_and_swap(&observation, Arc::new(node))
+            .await
+            .map(|result| result.committed());
+        match res {
+            Ok(committed) => Ok(committed),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -416,16 +512,11 @@ impl ShardStore {
         }
         node.set_leaf(entries.clone())?;
         node.set_locks(locks.clone());
-        let res = self
-            .nodes
-            .compare_and_swap(expected, Arc::new(node))
-            .await
-            .map(|result| result.committed());
-        match res {
-            Ok(committed) => Ok(committed),
-            Err(StorageError::NotFound) => Ok(false),
-            Err(e) => Err(e),
-        }
+        self.commit_leaf(LeafEdit {
+            observation: expected.clone(),
+            node,
+        })
+        .await
     }
 
     /// Loads the fixed tree root under `prefix`.
@@ -516,8 +607,8 @@ impl ShardStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Timeline;
     use crate::structlog::StructuralLogPhase;
+    use crate::{ShardEntry, Timeline};
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -685,6 +776,111 @@ mod tests {
             v2.revision(),
             "a CAS store advances the revision"
         );
+    }
+
+    #[tokio::test]
+    async fn leaf_edit_commits_bounded_changes_without_changing_topology() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let path = paths::from_node(COLL, "left");
+        let original = Node::leaf(Shard::new())
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some("right".to_string()));
+        assert!(
+            store
+                .store_node(COLL, "left", &original, None)
+                .await
+                .unwrap()
+        );
+
+        let loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let entries = Shard::from_entries([ShardEntry::new(b"key".as_slice())]);
+        let mut locks = NodeLocks::default();
+        let holder = TxId::from_bytes(b"holder".to_vec());
+        locks.set_membership_writer(holder.clone());
+
+        let mut edit = loaded.into_edit();
+        assert_eq!(edit.path(), path);
+        assert_eq!(edit.node().high_key(), Some(b"m".as_slice()));
+        assert_eq!(edit.node().right_sibling(), Some("right"));
+        edit.set_entries(entries.clone());
+        edit.set_locks(locks.clone());
+        assert!(store.commit_leaf(edit).await.unwrap());
+
+        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        assert_eq!(committed.entries(), &entries);
+        assert_eq!(committed.locks(), &locks);
+        assert_eq!(committed.node().high_key(), Some(b"m".as_slice()));
+        assert_eq!(committed.node().right_sibling(), Some("right"));
+        assert_eq!(committed.node().membership_lock().holders(), &[holder]);
+    }
+
+    #[tokio::test]
+    async fn leaf_edit_is_bound_to_observed_path() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let left_path = paths::from_node(COLL, "left");
+        let right_path = paths::from_node(COLL, "right");
+        for token in ["left", "right"] {
+            assert!(
+                store
+                    .store_node(COLL, token, &Node::leaf(Shard::new()), None)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let right_observation = store
+            .load_leaf(&right_path, Requirement::Any)
+            .await
+            .unwrap()
+            .observation;
+        let mut loaded = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
+        loaded.observation = right_observation;
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::from_entries([ShardEntry::new(
+            b"left-key".as_slice(),
+        )]));
+        assert_eq!(edit.path(), left_path);
+        assert!(store.commit_leaf(edit).await.unwrap());
+
+        let left = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
+        let right = store
+            .load_leaf(&right_path, Requirement::Any)
+            .await
+            .unwrap();
+        assert!(left.entries().lookup(b"left-key").is_some());
+        assert!(right.entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_leaf_edit_conflicts() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let path = paths::from_node(COLL, "tok");
+        assert!(
+            store
+                .store_node(COLL, "tok", &Node::leaf(Shard::new()), None)
+                .await
+                .unwrap()
+        );
+
+        let mut winner = store
+            .load_leaf(&path, Requirement::Any)
+            .await
+            .unwrap()
+            .into_edit();
+        let mut stale = store
+            .load_leaf(&path, Requirement::Any)
+            .await
+            .unwrap()
+            .into_edit();
+        winner.set_entries(Shard::from_entries([ShardEntry::new(b"winner".as_slice())]));
+        stale.set_entries(Shard::from_entries([ShardEntry::new(b"stale".as_slice())]));
+
+        assert!(store.commit_leaf(winner).await.unwrap());
+        assert!(!store.commit_leaf(stale).await.unwrap());
+
+        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        assert!(committed.entries().lookup(b"winner").is_some());
+        assert!(committed.entries().lookup(b"stale").is_none());
     }
 
     #[tokio::test]
