@@ -12,5 +12,7 @@ mod txid;
 pub use collection_id::{CollectionId, MAX_COLLECTION_NAME_BYTES};
 pub use database_id::{DATABASE_ID_BYTES, DatabaseId};
 pub use entropy::shuffle;
-pub use paths::{CollectionAddress, DbRoot, KeyRef, LeafRef, NodeToken, StructuralRecordId};
+pub use paths::{
+    CollectionAddress, DbRoot, KeyRef, LeafRef, NodeToken, ObjectPath, StructuralRecordId,
+};
 pub use txid::TxId;
