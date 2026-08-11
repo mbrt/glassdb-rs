@@ -35,7 +35,7 @@ use glassdb_concurr::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::{
-    LeafObservation, LoadedLeaf, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
+    LeafEdit, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
     SplitPolicy, StorageError,
 };
 
@@ -431,20 +431,20 @@ impl CasWorker {
     async fn fold_round(
         &self,
         path: &str,
-        loaded: &LoadedLeaf,
+        edit: &LeafEdit,
         members: &BTreeMap<TxId, ShardMember>,
         requirement: Requirement,
         reloaded: bool,
         in_doubt: &BTreeSet<TxId>,
     ) -> Result<FoldPlan, TransError> {
         let mut plan = FoldPlan {
-            entries: loaded
-                .entries
+            entries: edit
+                .entries()
                 .entries()
                 .cloned()
                 .map(|e| (e.key.clone(), e))
                 .collect(),
-            locks: loaded.locks.clone(),
+            locks: edit.locks().clone(),
             members: Vec::with_capacity(members.len()),
         };
 
@@ -474,7 +474,7 @@ impl CasWorker {
                 .resolver
                 .owned_keys()
                 .iter()
-                .any(|&key| !loaded.owns(key));
+                .any(|&key| !edit.owns(key));
             if needs_reroute {
                 plan.members.push(MemberFold {
                     id: tx.clone(),
@@ -516,7 +516,7 @@ impl CasWorker {
                     };
                     match self.capacity_decision(
                         path,
-                        loaded,
+                        edit,
                         member.resolver.as_ref(),
                         member_in_doubt,
                         &plan.entries,
@@ -563,7 +563,7 @@ impl CasWorker {
     fn capacity_decision(
         &self,
         path: &str,
-        loaded: &LoadedLeaf,
+        edit: &LeafEdit,
         resolver: &dyn ShardResolver,
         in_doubt: bool,
         entries: &BTreeMap<Vec<u8>, ShardEntry>,
@@ -579,7 +579,7 @@ impl CasWorker {
                 .filter(|entry| !entry.is_vestigial())
                 .cloned(),
         );
-        let mut candidate_node = loaded.node().clone();
+        let mut candidate_node = edit.node().clone();
         candidate_node.set_leaf(candidate_shard.clone())?;
         candidate_node.set_locks(proposed.locks.clone());
         let create_full = proposed.admission == StageAdmission::AddsKey
@@ -615,7 +615,7 @@ impl CasWorker {
     async fn persist(
         &self,
         path: &str,
-        loaded: &LoadedLeaf,
+        mut edit: LeafEdit,
         plan: &mut FoldPlan,
     ) -> Result<PersistResult, TransError> {
         if !plan.is_dirty() {
@@ -633,12 +633,9 @@ impl CasWorker {
                 .into_values()
                 .filter(|entry| !entry.is_vestigial()),
         );
-        match self
-            .core
-            .shards
-            .store_leaf(path, &new_shard, &plan.locks, &loaded.observation)
-            .await
-        {
+        edit.set_entries(new_shard.clone());
+        edit.set_locks(plan.locks.clone());
+        match self.core.shards.commit_leaf(edit).await {
             // Hint the background splitter if this write left the leaf
             // over the soft cap (ADR-031); the splitter reloads and
             // re-checks, so a spurious hint only costs one load.
@@ -706,8 +703,8 @@ impl CasWorker {
             } else {
                 Requirement::Any
             };
-            let loaded = match self.core.shards.load_leaf(path, requirement).await {
-                Ok(loaded) => loaded,
+            let edit = match self.core.shards.load_leaf(path, requirement).await {
+                Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
                 // between grouping and this load. Deliver each resolver's
                 // reroute outcome so its caller rebuilds the current leaf set.
@@ -732,7 +729,7 @@ impl CasWorker {
             let mut plan = self
                 .fold_round(
                     path,
-                    &loaded,
+                    &edit,
                     &members,
                     first_requirement,
                     reloaded,
@@ -740,7 +737,8 @@ impl CasWorker {
                 )
                 .await?;
 
-            let persist_result = self.persist(path, &loaded, &mut plan).await?;
+            let cas_precondition = edit.observation().clone();
+            let persist_result = self.persist(path, edit, &mut plan).await?;
             match persist_result {
                 PersistResult::Landed => {}
                 // This CAS definitely did not land, but an earlier in-doubt CAS
@@ -768,7 +766,7 @@ impl CasWorker {
                     *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                         outcome: member.outcome,
                         cas_precondition: (member.participation == Participation::Staged)
-                            .then(|| loaded.observation.clone()),
+                            .then(|| cas_precondition.clone()),
                     });
                 }
             }
@@ -1062,12 +1060,9 @@ mod tests {
             .unwrap();
         let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
         let shard = Shard::from_entries(entries);
-        assert!(
-            store
-                .store_leaf(path, &shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(shard);
+        assert!(store.commit_leaf(edit).await.unwrap());
     }
 
     async fn replace_leaf_node(store: &ShardStore, node: &Node) {
@@ -1107,7 +1102,8 @@ mod tests {
             .load_leaf(path, Requirement::Any)
             .await
             .unwrap()
-            .entries
+            .entries()
+            .clone()
     }
 
     fn test_member(resolver: Arc<dyn ShardResolver>) -> ShardMember {
@@ -1312,7 +1308,11 @@ mod tests {
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let (coord, shards, _timeline, _bg) = coord_over(backend).await;
-        let loaded = shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        let edit = shards
+            .load_leaf(&leaf(), Requirement::Any)
+            .await
+            .unwrap()
+            .into_edit();
         log.lock().unwrap().clear();
 
         let staged = TxId::with_priority(1, b"staged");
@@ -1332,7 +1332,7 @@ mod tests {
         let plan = cas_worker(&coord)
             .fold_round(
                 &leaf(),
-                &loaded,
+                &edit,
                 &members,
                 Requirement::Any,
                 false,
@@ -1379,7 +1379,11 @@ mod tests {
     async fn fold_plan_excludes_a_second_same_key_logless_member() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, shards, _timeline, _bg) = coord_over(backend).await;
-        let loaded = shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        let edit = shards
+            .load_leaf(&leaf(), Requirement::Any)
+            .await
+            .unwrap()
+            .into_edit();
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
         let members = BTreeMap::from([
@@ -1396,7 +1400,7 @@ mod tests {
         let plan = cas_worker(&coord)
             .fold_round(
                 &leaf(),
-                &loaded,
+                &edit,
                 &members,
                 Requirement::Any,
                 false,
@@ -1462,7 +1466,11 @@ mod tests {
         let hints = Arc::new(HintCounter::default());
         let (coord, shards, _timeline, _bg) = coord_over_with(backend, policy, hints.clone()).await;
         store_shard_entries(&shards, &leaf(), vec![seed]).await;
-        let loaded = shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        let edit = shards
+            .load_leaf(&leaf(), Requirement::Any)
+            .await
+            .unwrap()
+            .into_edit();
         log.lock().unwrap().clear();
         let members = BTreeMap::from([
             (
@@ -1486,7 +1494,7 @@ mod tests {
         let plan = cas_worker(&coord)
             .fold_round(
                 &leaf(),
-                &loaded,
+                &edit,
                 &members,
                 Requirement::Any,
                 false,

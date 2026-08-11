@@ -507,7 +507,7 @@ mod tests {
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
@@ -529,12 +529,9 @@ mod tests {
             },
         );
         let new_shard = Shard::from_entries(entries.into_values());
-        assert!(
-            store
-                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(new_shard);
+        assert!(store.commit_leaf(edit).await.unwrap());
     }
 
     // Installs an inline committed value for `key` directly in the leaf (no lock
@@ -564,7 +561,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut entry = existing.entries.lookup(key).cloned().unwrap();
+        let mut entry = existing.entries().lookup(key).cloned().unwrap();
         entry.lock_type = LockType::Write;
         entry.locked_by = vec![holder.clone()];
         seed_entry(store, key, entry).await;
@@ -578,19 +575,16 @@ mod tests {
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
         entries.insert(key.to_vec(), entry);
         let new_shard = Shard::from_entries(entries.into_values());
-        assert!(
-            store
-                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(new_shard);
+        assert!(store.commit_leaf(edit).await.unwrap());
     }
 
     // Commits `writer`'s value for `key` through the monitor (a tombstone when
@@ -619,7 +613,7 @@ mod tests {
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
@@ -633,12 +627,9 @@ mod tests {
             },
         );
         let new_shard = Shard::from_entries(entries.into_values());
-        assert!(
-            store
-                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(new_shard);
+        assert!(store.commit_leaf(edit).await.unwrap());
     }
 
     fn count_tx_reads(log: &OpLog) -> usize {

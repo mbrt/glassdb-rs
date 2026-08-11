@@ -1510,7 +1510,7 @@ mod tests {
             )
             .await
             .unwrap();
-        loaded.entries.lookup(key).cloned()
+        loaded.entries().lookup(key).cloned()
     }
 
     async fn replace_root(ctx: &TlCtx, root: &Node) {
@@ -1642,7 +1642,7 @@ mod tests {
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert_eq!(
-            loaded.entries.lookup(b"target").unwrap().locked_by,
+            loaded.entries().lookup(b"target").unwrap().locked_by,
             vec![tx]
         );
     }
@@ -1990,7 +1990,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.node().structural_gate().holders(), &[gate]);
-        let entry = loaded.entries.lookup(key).unwrap();
+        let entry = loaded.entries().lookup(key).unwrap();
         assert_eq!(entry.locked_by, vec![writer]);
         assert_eq!(entry.current.writer(), Some(&mk_tid(0, "seed")));
     }
@@ -2292,7 +2292,7 @@ mod tests {
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
@@ -2305,12 +2305,9 @@ mod tests {
             },
         );
         let new_shard = Shard::from_entries(entries.into_values());
-        assert!(
-            ctx.shards
-                .store_leaf(&path, &new_shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(new_shard);
+        assert!(ctx.shards.commit_leaf(edit).await.unwrap());
     }
 
     // --- ADR-025: cross-transaction lock-acquisition deduplication ----------

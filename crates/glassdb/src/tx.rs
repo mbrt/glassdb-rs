@@ -10,15 +10,16 @@
 //! take `&self` and only hold the lock briefly — never across an `.await` — so
 //! several reads can run concurrently within a single transaction.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+mod catalog;
+mod data;
+
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, CollectionId, KeyRef};
-use glassdb_trans::{
-    CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead, DirectoryReadKind,
-    ReadAccess, ReadEvidence, ScanAccess, ScanMutation, WriteAccess,
-};
+use glassdb_data::{CollectionAddress, KeyRef};
+use glassdb_trans::{CollectionData, Data};
 
+use self::catalog::{CatalogOverlay, CreateMode};
+use self::data::{DataOverlay, OverlayRead};
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
 use crate::db::DbInner;
 use crate::error::Error;
@@ -41,39 +42,13 @@ pub struct Transaction {
 
 #[derive(Default)]
 struct TransactionInner {
-    staged: HashMap<KeyRef, StagedValue>,
-    reads: HashMap<KeyRef, ReadState>,
-    scans: Vec<ScanAccess>,
-    directories: HashMap<CollectionAddress, DirectoryState>,
-    directory_reads: Vec<DirectoryRead>,
-    collection_changes: BTreeMap<(CollectionAddress, Vec<u8>), CollectionChange>,
-    created: HashSet<CollectionAddress>,
-    dropped: HashSet<CollectionAddress>,
-    dropped_bindings: HashSet<(CollectionAddress, Vec<u8>)>,
-    reservations: HashMap<(CollectionAddress, Vec<u8>), CollectionId>,
+    data: DataOverlay,
+    catalog: CatalogOverlay,
     aborted: bool,
-}
-
-struct DirectoryState {
-    base: BTreeMap<Vec<u8>, CollectionId>,
-    current: BTreeMap<Vec<u8>, CollectionId>,
-    version: u64,
 }
 
 pub(crate) struct TransactionMetrics {
     pub(crate) cache_hits: u64,
-}
-
-impl TransactionInner {
-    fn record_read(&mut self, key: KeyRef, mut state: ReadState) {
-        // Concurrent reads of one path can both miss the transaction-local
-        // state. Preserve a hit observed by either result while still counting
-        // the path once, consistently with `TransactionStats::reads`.
-        if self.reads.get(&key).is_some_and(ReadState::cache_hit) {
-            state.set_cache_hit();
-        }
-        self.reads.insert(key, state);
-    }
 }
 
 impl Transaction {
@@ -90,17 +65,14 @@ impl Transaction {
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
-            if let Some(staged) = inner.staged.get(&key) {
-                return Ok(staged.read());
+            match inner.data.read(&key) {
+                OverlayRead::Known(value) => return Ok(value),
+                OverlayRead::Unknown => {}
             }
-            if let Some(ReadState::NotFound { .. }) = inner.reads.get(&key) {
-                // Be consistent with values not found the first time.
-                return Ok(None);
-            }
-            if inner.dropped.contains(c.address()) {
+            if inner.catalog.is_dropped(c.address()) {
                 return Err(Error::StaleCollection);
             }
-            if inner.created.contains(c.address()) {
+            if inner.catalog.is_created(c.address()) {
                 return Ok(None);
             }
         }
@@ -111,27 +83,14 @@ impl Transaction {
                 match value {
                     None => {
                         let mut inner = self.inner.lock().unwrap();
-                        inner.record_read(
-                            key,
-                            ReadState::NotFound {
-                                cache_hit,
-                                evidence,
-                            },
-                        );
+                        inner.data.record_not_found(key, cache_hit, evidence);
                         Ok(None)
                     }
                     Some(rv) => {
                         let mut inner = self.inner.lock().unwrap();
                         inner
-                            .staged
-                            .insert(key.clone(), StagedValue::Read(rv.value.clone()));
-                        inner.record_read(
-                            key,
-                            ReadState::Found {
-                                cache_hit,
-                                evidence,
-                            },
-                        );
+                            .data
+                            .record_found(key, rv.value.clone(), cache_hit, evidence);
                         Ok(Some(rv.value.to_vec()))
                     }
                 }
@@ -151,32 +110,14 @@ impl Transaction {
         self.validate_handle(c)?;
         let range = scan.normalize()?;
         let limit = range.limit;
-        let (mut overlay, created) = {
+        let (overlay, created) = {
             let inner = self.inner.lock().unwrap();
-            if inner.dropped.contains(c.address()) {
+            if inner.catalog.is_dropped(c.address()) {
                 return Err(Error::StaleCollection);
             }
-            let overlay = inner
-                .staged
-                .iter()
-                .filter_map(|(key, value)| {
-                    if key.collection() != c.address() {
-                        return None;
-                    }
-                    let present = match value {
-                        StagedValue::Read(_) => return None,
-                        StagedValue::Put(_) => true,
-                        StagedValue::Delete => false,
-                    };
-                    Some(ScanMutation {
-                        key: key.key().to_vec(),
-                        present,
-                    })
-                })
-                .collect::<Vec<_>>();
-            (overlay, inner.created.contains(c.address()))
+            let overlay = inner.data.scan_mutations(c.address());
+            (overlay, inner.catalog.is_created(c.address()))
         };
-        overlay.sort_by(|a, b| a.key.cmp(&b.key));
 
         if created {
             let keys = overlay
@@ -196,41 +137,33 @@ impl Transaction {
             .map_err(Error::from_read)?;
         let keys = result.keys().to_vec();
         let access = result.into_access(c.address().clone(), range, overlay);
-        self.inner.lock().unwrap().scans.push(access);
+        self.inner.lock().unwrap().data.record_scan(access);
         Ok(KeyPage::new(keys, limit))
     }
 
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
         self.validate_handle(c)?;
-        if self.inner.lock().unwrap().dropped.contains(c.address()) {
+        if self.inner.lock().unwrap().catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(
                 "cannot write a collection after dropping it".into(),
             ));
         }
         let key = KeyRef::new(c.address().clone(), key);
-        self.inner
-            .lock()
-            .unwrap()
-            .staged
-            .insert(key, StagedValue::Put(Arc::from(value)));
+        self.inner.lock().unwrap().data.write(key, Arc::from(value));
         Ok(())
     }
 
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
         self.validate_handle(c)?;
-        if self.inner.lock().unwrap().dropped.contains(c.address()) {
+        if self.inner.lock().unwrap().catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(
                 "cannot write a collection after dropping it".into(),
             ));
         }
         let key = KeyRef::new(c.address().clone(), key);
-        self.inner
-            .lock()
-            .unwrap()
-            .staged
-            .insert(key, StagedValue::Delete);
+        self.inner.lock().unwrap().data.delete(key);
         Ok(())
     }
 
@@ -245,7 +178,9 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<Collection, Error> {
-        let (collection, _) = self.create_child(parent, name.as_ref(), true).await?;
+        let (collection, _) = self
+            .create_child(parent, name.as_ref(), CreateMode::Strict)
+            .await?;
         Ok(collection)
     }
 
@@ -256,7 +191,8 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<(Collection, bool), Error> {
-        self.create_child(parent, name.as_ref(), false).await
+        self.create_child(parent, name.as_ref(), CreateMode::IfAbsent)
+            .await
     }
 
     /// Opens the direct child currently bound to `name`.
@@ -265,36 +201,9 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<Collection, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
-        self.validate_handle(parent)?;
-        self.ensure_directory(parent.address()).await?;
-        let id = {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.dropped.contains(parent.address()) {
-                return Err(Error::StaleCollection);
-            }
-            let state = inner
-                .directories
-                .get(parent.address())
-                .expect("directory was loaded above");
-            let base = state.base.get(name).copied();
-            let current = state.current.get(name).copied();
-            inner.directory_reads.push(DirectoryRead {
-                parent: parent.address().clone(),
-                kind: DirectoryReadKind::Entry {
-                    name: name.to_vec(),
-                    collection: base,
-                },
-            });
-            current.ok_or(Error::NotFound)?
-        };
-        Ok(Collection::new_child(
-            CollectionAddress::new(self.db.name.as_str(), id),
-            parent.address().clone(),
-            name,
-            self.db.clone(),
-        ))
+        self.resolve_child(parent, name.as_ref())
+            .await?
+            .ok_or(Error::NotFound)
     }
 
     /// Reports whether a direct child is currently bound to `name`.
@@ -303,28 +212,7 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
-        self.validate_handle(parent)?;
-        self.ensure_directory(parent.address()).await?;
-        let mut inner = self.inner.lock().unwrap();
-        if inner.dropped.contains(parent.address()) {
-            return Err(Error::StaleCollection);
-        }
-        let state = inner
-            .directories
-            .get(parent.address())
-            .expect("directory was loaded above");
-        let base = state.base.get(name).copied();
-        let exists = state.current.contains_key(name);
-        inner.directory_reads.push(DirectoryRead {
-            parent: parent.address().clone(),
-            kind: DirectoryReadKind::Entry {
-                name: name.to_vec(),
-                collection: base,
-            },
-        });
-        Ok(exists)
+        Ok(self.resolve_child(parent, name.as_ref()).await?.is_some())
     }
 
     /// Resolves an unresolved collection path from the permanent root.
@@ -350,10 +238,10 @@ impl Transaction {
         let path = path.try_into().map_err(Into::into)?;
         let mut parent = self.root_collection();
         for name in path.segments() {
-            if !self.collection_exists(&parent, name).await? {
+            let Some(child) = self.resolve_child(&parent, name).await? else {
                 return Ok(false);
-            }
-            parent = self.open_collection(&parent, name).await?;
+            };
+            parent = child;
         }
         Ok(true)
     }
@@ -364,24 +252,7 @@ impl Transaction {
         self.ensure_directory(parent.address()).await?;
         let current = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.dropped.contains(parent.address()) {
-                return Err(Error::StaleCollection);
-            }
-            let state = inner
-                .directories
-                .get(parent.address())
-                .expect("directory was loaded above");
-            let version = state.version;
-            let current = state
-                .current
-                .iter()
-                .map(|(name, id)| (name.clone(), *id))
-                .collect::<Vec<_>>();
-            inner.directory_reads.push(DirectoryRead {
-                parent: parent.address().clone(),
-                kind: DirectoryReadKind::Listing { version },
-            });
-            current
+            inner.catalog.children(parent.address())?
         };
         let entries = current
             .into_iter()
@@ -420,78 +291,10 @@ impl Transaction {
         self.ensure_directory(collection.address()).await?;
 
         let mut inner = self.inner.lock().unwrap();
-        if inner
-            .dropped_bindings
-            .contains(&(parent.clone(), name.clone()))
-        {
-            return Err(Error::StaleCollection);
-        }
-        let parent_state = inner
-            .directories
-            .get(&parent)
-            .expect("parent directory was loaded above");
-        let expected = parent_state.base.get(name.as_slice()).copied();
-        let current = parent_state.current.get(name.as_slice()).copied();
-        inner.directory_reads.push(DirectoryRead {
-            parent: parent.clone(),
-            kind: DirectoryReadKind::Entry {
-                name: name.clone(),
-                collection: expected,
-            },
-        });
-        if current != Some(collection.address().id()) {
-            return Err(Error::StaleCollection);
-        }
-        let target = inner
-            .directories
-            .get(collection.address())
-            .expect("target directory was loaded above");
-        let target_version = target.version;
-        let target_not_empty = !target.current.is_empty();
-        inner.directory_reads.push(DirectoryRead {
-            parent: collection.address().clone(),
-            kind: DirectoryReadKind::Listing {
-                version: target_version,
-            },
-        });
-        if target_not_empty {
-            return Err(Error::NotEmpty);
-        }
-        if inner.staged.iter().any(|(key, value)| {
-            key.collection() == collection.address()
-                && matches!(value, StagedValue::Put(_) | StagedValue::Delete)
-        }) {
-            return Err(Error::InvalidInput(
-                "cannot drop a collection after staging data writes to it".into(),
-            ));
-        }
+        let has_data_writes = inner.data.has_writes_for(collection.address());
         inner
-            .directories
-            .get_mut(&parent)
-            .expect("parent directory was loaded above")
-            .current
-            .remove(name.as_slice());
-        let binding = (parent.clone(), name.clone());
-        if inner.created.remove(collection.address()) {
-            inner.collection_changes.remove(&binding);
-            inner
-                .directory_reads
-                .retain(|read| &read.parent != collection.address());
-        } else {
-            inner.collection_changes.insert(
-                binding.clone(),
-                CollectionChange {
-                    parent,
-                    name,
-                    collection: collection.address().clone(),
-                    expected,
-                    op: CollectionOp::Drop,
-                },
-            );
-        }
-        inner.dropped.insert(collection.address().clone());
-        inner.dropped_bindings.insert(binding);
-        Ok(())
+            .catalog
+            .drop_collection(parent, name, collection.address(), has_data_writes)
     }
 
     /// Explicitly aborts the transaction. Returns [`Error::Aborted`].
@@ -523,63 +326,19 @@ impl Transaction {
 
     pub(crate) fn reset(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.staged.clear();
-        inner.reads.clear();
-        inner.scans.clear();
-        inner.directories.clear();
-        inner.directory_reads.clear();
-        inner.collection_changes.clear();
-        inner.created.clear();
-        inner.dropped.clear();
-        inner.dropped_bindings.clear();
+        inner.data.reset();
+        inner.catalog.reset();
     }
 
     pub(crate) fn collect_accesses(&self) -> (Data, CollectionData) {
         let inner = self.inner.lock().unwrap();
-        let mut writes = Vec::new();
-        for (k, v) in &inner.staged {
-            match v {
-                StagedValue::Read(_) => {}
-                StagedValue::Put(val) => writes.push(WriteAccess::put(k.clone(), val.clone())),
-                StagedValue::Delete => writes.push(WriteAccess::delete(k.clone())),
-            }
-        }
-        let mut reads = Vec::new();
-        for (k, v) in &inner.reads {
-            let evidence = match v {
-                ReadState::Found { evidence, .. } | ReadState::NotFound { evidence, .. } => {
-                    evidence.clone()
-                }
-            };
-            reads.push(ReadAccess::new(k.clone(), evidence));
-        }
-        // Emit accesses in a stable path order so the commit path (transaction
-        // log contents, lock acquisition order, validation order) is
-        // independent of `HashMap`'s randomized iteration, and of the order in
-        // which concurrent reads happened to insert their entries. This makes a
-        // simulation replay byte-for-byte identical and is harmless in production.
-        writes.sort_by(|a, b| a.key.cmp(&b.key));
-        reads.sort_by(|a, b| a.key.cmp(&b.key));
-        // Scans are recorded in listing order, which is already deterministic
-        // (leaves scanned left-to-right), so they need no re-sorting.
-        let scans = inner.scans.clone();
-        (
-            Data {
-                reads,
-                writes,
-                scans,
-            },
-            CollectionData {
-                reads: inner.directory_reads.clone(),
-                changes: inner.collection_changes.values().cloned().collect(),
-            },
-        )
+        (inner.data.accesses(), inner.catalog.accesses())
     }
 
     pub(crate) fn metrics(&self) -> TransactionMetrics {
         let inner = self.inner.lock().unwrap();
         TransactionMetrics {
-            cache_hits: inner.reads.values().filter(|r| r.cache_hit()).count() as u64,
+            cache_hits: inner.data.cache_hits(),
         }
     }
 
@@ -587,111 +346,54 @@ impl Transaction {
         &self,
         parent: &Collection,
         name: &[u8],
-        strict: bool,
+        mode: CreateMode,
     ) -> Result<(Collection, bool), Error> {
         validate_collection_name(name)?;
         self.validate_handle(parent)?;
         self.ensure_directory(parent.address()).await?;
         let mut inner = self.inner.lock().unwrap();
-        if inner.dropped.contains(parent.address()) {
-            return Err(Error::StaleCollection);
-        }
-        let binding = (parent.address().clone(), name.to_vec());
-        let state = inner
-            .directories
-            .get(parent.address())
-            .expect("directory was loaded above");
-        let base = state.base.get(name).copied();
-        let existing = state.current.get(name).copied();
-        inner.directory_reads.push(DirectoryRead {
-            parent: parent.address().clone(),
-            kind: DirectoryReadKind::Entry {
-                name: name.to_vec(),
-                collection: base,
-            },
-        });
-        if let Some(id) = existing {
-            if strict {
-                return Err(Error::AlreadyExists);
-            }
-            let address = CollectionAddress::new(self.db.name.as_str(), id);
-            let created = inner.created.contains(&address);
-            return Ok((
-                Collection::new_child(address, parent.address().clone(), name, self.db.clone()),
-                created,
-            ));
-        }
-        if inner.dropped_bindings.contains(&binding) {
-            return Err(Error::InvalidInput(
-                "cannot recreate a collection binding after dropping it in one transaction".into(),
-            ));
-        }
-        let id = match inner.reservations.get(&binding).copied() {
-            Some(id) => id,
-            None => {
-                let id = CollectionId::new_random();
-                inner.reservations.insert(binding.clone(), id);
-                id
-            }
-        };
-        let address = CollectionAddress::new(self.db.name.as_str(), id);
-        inner
-            .directories
-            .get_mut(parent.address())
-            .expect("directory was loaded above")
-            .current
-            .insert(name.to_vec(), id);
-        inner.collection_changes.insert(
-            binding,
-            CollectionChange {
-                parent: parent.address().clone(),
-                name: name.to_vec(),
-                collection: address.clone(),
-                expected: base,
-                op: CollectionOp::Create,
-            },
-        );
-        inner.created.insert(address.clone());
+        let (address, created) = inner.catalog.create_child(parent.address(), name, mode)?;
         Ok((
             Collection::new_child(address, parent.address().clone(), name, self.db.clone()),
-            true,
+            created,
         ))
+    }
+
+    async fn resolve_child(
+        &self,
+        parent: &Collection,
+        name: &[u8],
+    ) -> Result<Option<Collection>, Error> {
+        validate_collection_name(name)?;
+        self.validate_handle(parent)?;
+        self.ensure_directory(parent.address()).await?;
+        let id = self
+            .inner
+            .lock()
+            .unwrap()
+            .catalog
+            .child(parent.address(), name)?;
+        Ok(id.map(|id| {
+            Collection::new_child(
+                CollectionAddress::new(self.db.name.as_str(), id),
+                parent.address().clone(),
+                name,
+                self.db.clone(),
+            )
+        }))
     }
 
     async fn ensure_directory(&self, parent: &CollectionAddress) -> Result<(), Error> {
         {
             let mut inner = self.inner.lock().unwrap();
-            if inner.directories.contains_key(parent) {
-                return Ok(());
-            }
-            if inner.dropped.contains(parent) {
-                return Err(Error::StaleCollection);
-            }
-            if inner.created.contains(parent) {
-                inner.directories.insert(
-                    parent.clone(),
-                    DirectoryState {
-                        base: BTreeMap::new(),
-                        current: BTreeMap::new(),
-                        version: 0,
-                    },
-                );
+            if !inner.catalog.prepare_directory(parent)? {
                 return Ok(());
             }
         }
 
         let snapshot = self.db.engine.collection_snapshot(parent).await?;
-        let children = snapshot.children.into_iter().collect::<BTreeMap<_, _>>();
-        let version = snapshot.version;
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .directories
-            .entry(parent.clone())
-            .or_insert_with(|| DirectoryState {
-                base: children.clone(),
-                current: children,
-                version,
-            });
+        inner.catalog.install_snapshot(parent.clone(), snapshot);
         Ok(())
     }
 
@@ -704,50 +406,6 @@ impl Transaction {
             ));
         }
         Ok(())
-    }
-}
-
-enum StagedValue {
-    Read(Arc<[u8]>),
-    Put(Arc<[u8]>),
-    Delete,
-}
-
-impl StagedValue {
-    fn read(&self) -> Option<Vec<u8>> {
-        match self {
-            StagedValue::Read(value) | StagedValue::Put(value) => Some(value.to_vec()),
-            StagedValue::Delete => None,
-        }
-    }
-}
-
-enum ReadState {
-    Found {
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    },
-    NotFound {
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    },
-}
-
-impl ReadState {
-    fn cache_hit(&self) -> bool {
-        match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
-                *cache_hit
-            }
-        }
-    }
-
-    fn set_cache_hit(&mut self) {
-        match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
-                *cache_hit = true;
-            }
-        }
     }
 }
 

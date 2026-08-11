@@ -1,10 +1,12 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::RecordingBackend;
 use glassdb::backend::{Backend, ListLimit};
-use glassdb::{CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES, SplitPolicy};
+use glassdb::{
+    Collection, CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES, SplitPolicy,
+};
 
 #[tokio::test]
 async fn root_collection_is_permanent_and_key_bearing() {
@@ -58,6 +60,41 @@ async fn paths_resolve_to_bound_handles_and_require_existing_ancestors() {
         Err(Error::NotFound)
     ));
     assert!(!db.collection_exists(&missing_ancestor).await.unwrap());
+}
+
+#[tokio::test]
+async fn path_existence_matches_opening_backend_operation_count() {
+    let backend = Arc::new(MemoryBackend::new());
+    let setup = Database::open("example", backend.clone()).await.unwrap();
+    let parent = setup.create_collection("parent").await.unwrap();
+    parent.create_collection("child").await.unwrap();
+    setup.shutdown().await;
+    let path = CollectionPath::new(b"parent")
+        .unwrap()
+        .child(b"child")
+        .unwrap();
+
+    let exists_recorder = Arc::new(RecordingBackend::new(backend.clone()));
+    let exists_log = exists_recorder.log();
+    let exists_db = Database::open("example", exists_recorder).await.unwrap();
+    exists_log.lock().unwrap().clear();
+    assert!(exists_db.collection_exists(&path).await.unwrap());
+    exists_db.shutdown().await;
+    let exists_operations = exists_log.lock().unwrap().len();
+
+    let open_recorder = Arc::new(RecordingBackend::new(backend));
+    let open_log = open_recorder.log();
+    let open_db = Database::open("example", open_recorder).await.unwrap();
+    open_log.lock().unwrap().clear();
+    open_db.open_collection(&path).await.unwrap();
+    open_db.shutdown().await;
+    let open_operations = open_log.lock().unwrap().len();
+
+    assert!(
+        exists_operations > 0,
+        "the cold path lookup must reach storage"
+    );
+    assert_eq!(exists_operations, open_operations);
 }
 
 #[tokio::test]
@@ -489,6 +526,55 @@ async fn failed_transaction_retries_invalidated_reads_without_publishing_changes
     assert!(matches!(result, Err(Error::InvalidInput(_))));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert!(!db.collection_exists("temporary").await.unwrap());
+}
+
+#[tokio::test]
+async fn collection_creation_reuses_its_reserved_incarnation_across_retry() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let peer = Database::open("example", backend).await.unwrap();
+    let root = db.root_collection();
+    let peer_root = peer.root_collection();
+    root.write(b"guard", b"old").await.unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempted_handles = Arc::new(Mutex::new(Vec::<Collection>::new()));
+
+    db.tx({
+        let root = root.clone();
+        let peer_root = peer_root.clone();
+        let attempts = attempts.clone();
+        let attempted_handles = attempted_handles.clone();
+        move |tx| {
+            let root = root.clone();
+            let peer_root = peer_root.clone();
+            let attempts = attempts.clone();
+            let attempted_handles = attempted_handles.clone();
+            async move {
+                tx.read(&root, b"guard").await?.ok_or(Error::NotFound)?;
+                let collection = tx.create_collection(&root, b"created-on-retry").await?;
+                tx.write(&collection, b"k", b"v")?;
+                {
+                    let mut handles = attempted_handles
+                        .lock()
+                        .map_err(|_| Error::internal("attempted handle capture was poisoned"))?;
+                    handles.push(collection);
+                }
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    peer_root.write(b"guard", b"new").await?;
+                }
+                Ok(())
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let attempted_handles = attempted_handles.lock().unwrap().clone();
+    assert_eq!(attempted_handles.len(), 2);
+    for collection in attempted_handles {
+        assert_eq!(collection.read(b"k").await.unwrap().unwrap(), b"v");
+    }
 }
 
 #[tokio::test]
