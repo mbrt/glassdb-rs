@@ -10,15 +10,17 @@
 //! take `&self` and only hold the lock briefly — never across an `.await` — so
 //! several reads can run concurrently within a single transaction.
 
+mod data;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionId, KeyRef};
 use glassdb_trans::{
     CollectionChange, CollectionData, CollectionOp, Data, DirectoryRead, DirectoryReadKind,
-    ReadAccess, ReadEvidence, ScanAccess, ScanMutation, WriteAccess,
 };
 
+use self::data::{DataOverlay, OverlayRead};
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
 use crate::db::DbInner;
 use crate::error::Error;
@@ -41,9 +43,7 @@ pub struct Transaction {
 
 #[derive(Default)]
 struct TransactionInner {
-    staged: HashMap<KeyRef, StagedValue>,
-    reads: HashMap<KeyRef, ReadState>,
-    scans: Vec<ScanAccess>,
+    data: DataOverlay,
     directories: HashMap<CollectionAddress, DirectoryState>,
     directory_reads: Vec<DirectoryRead>,
     collection_changes: BTreeMap<(CollectionAddress, Vec<u8>), CollectionChange>,
@@ -64,18 +64,6 @@ pub(crate) struct TransactionMetrics {
     pub(crate) cache_hits: u64,
 }
 
-impl TransactionInner {
-    fn record_read(&mut self, key: KeyRef, mut state: ReadState) {
-        // Concurrent reads of one path can both miss the transaction-local
-        // state. Preserve a hit observed by either result while still counting
-        // the path once, consistently with `TransactionStats::reads`.
-        if self.reads.get(&key).is_some_and(ReadState::cache_hit) {
-            state.set_cache_hit();
-        }
-        self.reads.insert(key, state);
-    }
-}
-
 impl Transaction {
     /// Reads the value for `key` within the transaction, returning `None` when
     /// the key is absent. Repeatable: a value read once is returned consistently,
@@ -90,12 +78,9 @@ impl Transaction {
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
-            if let Some(staged) = inner.staged.get(&key) {
-                return Ok(staged.read());
-            }
-            if let Some(ReadState::NotFound { .. }) = inner.reads.get(&key) {
-                // Be consistent with values not found the first time.
-                return Ok(None);
+            match inner.data.read(&key) {
+                OverlayRead::Known(value) => return Ok(value),
+                OverlayRead::Unknown => {}
             }
             if inner.dropped.contains(c.address()) {
                 return Err(Error::StaleCollection);
@@ -111,27 +96,14 @@ impl Transaction {
                 match value {
                     None => {
                         let mut inner = self.inner.lock().unwrap();
-                        inner.record_read(
-                            key,
-                            ReadState::NotFound {
-                                cache_hit,
-                                evidence,
-                            },
-                        );
+                        inner.data.record_not_found(key, cache_hit, evidence);
                         Ok(None)
                     }
                     Some(rv) => {
                         let mut inner = self.inner.lock().unwrap();
                         inner
-                            .staged
-                            .insert(key.clone(), StagedValue::Read(rv.value.clone()));
-                        inner.record_read(
-                            key,
-                            ReadState::Found {
-                                cache_hit,
-                                evidence,
-                            },
-                        );
+                            .data
+                            .record_found(key, rv.value.clone(), cache_hit, evidence);
                         Ok(Some(rv.value.to_vec()))
                     }
                 }
@@ -151,32 +123,14 @@ impl Transaction {
         self.validate_handle(c)?;
         let range = scan.normalize()?;
         let limit = range.limit;
-        let (mut overlay, created) = {
+        let (overlay, created) = {
             let inner = self.inner.lock().unwrap();
             if inner.dropped.contains(c.address()) {
                 return Err(Error::StaleCollection);
             }
-            let overlay = inner
-                .staged
-                .iter()
-                .filter_map(|(key, value)| {
-                    if key.collection() != c.address() {
-                        return None;
-                    }
-                    let present = match value {
-                        StagedValue::Read(_) => return None,
-                        StagedValue::Put(_) => true,
-                        StagedValue::Delete => false,
-                    };
-                    Some(ScanMutation {
-                        key: key.key().to_vec(),
-                        present,
-                    })
-                })
-                .collect::<Vec<_>>();
+            let overlay = inner.data.scan_mutations(c.address());
             (overlay, inner.created.contains(c.address()))
         };
-        overlay.sort_by(|a, b| a.key.cmp(&b.key));
 
         if created {
             let keys = overlay
@@ -196,7 +150,7 @@ impl Transaction {
             .map_err(Error::from_read)?;
         let keys = result.keys().to_vec();
         let access = result.into_access(c.address().clone(), range, overlay);
-        self.inner.lock().unwrap().scans.push(access);
+        self.inner.lock().unwrap().data.record_scan(access);
         Ok(KeyPage::new(keys, limit))
     }
 
@@ -209,11 +163,7 @@ impl Transaction {
             ));
         }
         let key = KeyRef::new(c.address().clone(), key);
-        self.inner
-            .lock()
-            .unwrap()
-            .staged
-            .insert(key, StagedValue::Put(Arc::from(value)));
+        self.inner.lock().unwrap().data.write(key, Arc::from(value));
         Ok(())
     }
 
@@ -226,11 +176,7 @@ impl Transaction {
             ));
         }
         let key = KeyRef::new(c.address().clone(), key);
-        self.inner
-            .lock()
-            .unwrap()
-            .staged
-            .insert(key, StagedValue::Delete);
+        self.inner.lock().unwrap().data.delete(key);
         Ok(())
     }
 
@@ -457,10 +403,7 @@ impl Transaction {
         if target_not_empty {
             return Err(Error::NotEmpty);
         }
-        if inner.staged.iter().any(|(key, value)| {
-            key.collection() == collection.address()
-                && matches!(value, StagedValue::Put(_) | StagedValue::Delete)
-        }) {
+        if inner.data.has_writes_for(collection.address()) {
             return Err(Error::InvalidInput(
                 "cannot drop a collection after staging data writes to it".into(),
             ));
@@ -523,9 +466,7 @@ impl Transaction {
 
     pub(crate) fn reset(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.staged.clear();
-        inner.reads.clear();
-        inner.scans.clear();
+        inner.data.reset();
         inner.directories.clear();
         inner.directory_reads.clear();
         inner.collection_changes.clear();
@@ -536,39 +477,8 @@ impl Transaction {
 
     pub(crate) fn collect_accesses(&self) -> (Data, CollectionData) {
         let inner = self.inner.lock().unwrap();
-        let mut writes = Vec::new();
-        for (k, v) in &inner.staged {
-            match v {
-                StagedValue::Read(_) => {}
-                StagedValue::Put(val) => writes.push(WriteAccess::put(k.clone(), val.clone())),
-                StagedValue::Delete => writes.push(WriteAccess::delete(k.clone())),
-            }
-        }
-        let mut reads = Vec::new();
-        for (k, v) in &inner.reads {
-            let evidence = match v {
-                ReadState::Found { evidence, .. } | ReadState::NotFound { evidence, .. } => {
-                    evidence.clone()
-                }
-            };
-            reads.push(ReadAccess::new(k.clone(), evidence));
-        }
-        // Emit accesses in a stable path order so the commit path (transaction
-        // log contents, lock acquisition order, validation order) is
-        // independent of `HashMap`'s randomized iteration, and of the order in
-        // which concurrent reads happened to insert their entries. This makes a
-        // simulation replay byte-for-byte identical and is harmless in production.
-        writes.sort_by(|a, b| a.key.cmp(&b.key));
-        reads.sort_by(|a, b| a.key.cmp(&b.key));
-        // Scans are recorded in listing order, which is already deterministic
-        // (leaves scanned left-to-right), so they need no re-sorting.
-        let scans = inner.scans.clone();
         (
-            Data {
-                reads,
-                writes,
-                scans,
-            },
+            inner.data.accesses(),
             CollectionData {
                 reads: inner.directory_reads.clone(),
                 changes: inner.collection_changes.values().cloned().collect(),
@@ -579,7 +489,7 @@ impl Transaction {
     pub(crate) fn metrics(&self) -> TransactionMetrics {
         let inner = self.inner.lock().unwrap();
         TransactionMetrics {
-            cache_hits: inner.reads.values().filter(|r| r.cache_hit()).count() as u64,
+            cache_hits: inner.data.cache_hits(),
         }
     }
 
@@ -704,50 +614,6 @@ impl Transaction {
             ));
         }
         Ok(())
-    }
-}
-
-enum StagedValue {
-    Read(Arc<[u8]>),
-    Put(Arc<[u8]>),
-    Delete,
-}
-
-impl StagedValue {
-    fn read(&self) -> Option<Vec<u8>> {
-        match self {
-            StagedValue::Read(value) | StagedValue::Put(value) => Some(value.to_vec()),
-            StagedValue::Delete => None,
-        }
-    }
-}
-
-enum ReadState {
-    Found {
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    },
-    NotFound {
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    },
-}
-
-impl ReadState {
-    fn cache_hit(&self) -> bool {
-        match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
-                *cache_hit
-            }
-        }
-    }
-
-    fn set_cache_hit(&mut self) {
-        match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
-                *cache_hit = true;
-            }
-        }
     }
 }
 
