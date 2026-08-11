@@ -63,6 +63,41 @@ async fn paths_resolve_to_bound_handles_and_require_existing_ancestors() {
 }
 
 #[tokio::test]
+async fn path_existence_matches_opening_backend_operation_count() {
+    let backend = Arc::new(MemoryBackend::new());
+    let setup = Database::open("example", backend.clone()).await.unwrap();
+    let parent = setup.create_collection("parent").await.unwrap();
+    parent.create_collection("child").await.unwrap();
+    setup.shutdown().await;
+    let path = CollectionPath::new(b"parent")
+        .unwrap()
+        .child(b"child")
+        .unwrap();
+
+    let exists_recorder = Arc::new(RecordingBackend::new(backend.clone()));
+    let exists_log = exists_recorder.log();
+    let exists_db = Database::open("example", exists_recorder).await.unwrap();
+    exists_log.lock().unwrap().clear();
+    assert!(exists_db.collection_exists(&path).await.unwrap());
+    exists_db.shutdown().await;
+    let exists_operations = exists_log.lock().unwrap().len();
+
+    let open_recorder = Arc::new(RecordingBackend::new(backend));
+    let open_log = open_recorder.log();
+    let open_db = Database::open("example", open_recorder).await.unwrap();
+    open_log.lock().unwrap().clear();
+    open_db.open_collection(&path).await.unwrap();
+    open_db.shutdown().await;
+    let open_operations = open_log.lock().unwrap().len();
+
+    assert!(
+        exists_operations > 0,
+        "the cold path lookup must reach storage"
+    );
+    assert_eq!(exists_operations, open_operations);
+}
+
+#[tokio::test]
 async fn strict_and_idempotent_create_have_distinct_race_contracts() {
     let backend = Arc::new(MemoryBackend::new());
     let db1 = Database::open("example", backend.clone()).await.unwrap();

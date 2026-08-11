@@ -487,49 +487,32 @@ impl DbInner {
             stats.cache_hits += metrics.cache_hits;
             stats.writes += access.writes.len() as u64;
 
-            let value = match fn_res {
-                Ok(v) => {
-                    driver.install_accesses(access, collection_access);
-                    v
+            let restart_after_wound = if fn_res.is_ok() {
+                driver.install_accesses(access, collection_access);
+                match driver.commit().await {
+                    Ok(()) => break fn_res,
+                    Err(TransError::Wounded) => true,
+                    Err(TransError::Retry) => false,
+                    Err(e) => break Err(e.into()),
                 }
-                Err(ferr) => {
-                    // The user function returned an error. It might be the
-                    // result of a spurious read, so validate only the reads.
-                    match driver.validate_body_error(access, collection_access).await {
-                        Err(TransError::Retry) => {
-                            tx.reset();
-                            stats.retries += 1;
-                            continue;
-                        }
-                        Err(TransError::Wounded) => {
-                            driver.restart_after_wound().await;
-                            tx.reset();
-                            stats.retries += 1;
-                            continue;
-                        }
-                        _ => break Err(ferr),
-                    }
+            } else {
+                // The user function returned an error. It might be the result
+                // of a spurious read, so validate only the reads.
+                match driver.validate_body_error(access, collection_access).await {
+                    Err(TransError::Retry) => false,
+                    Err(TransError::Wounded) => true,
+                    _ => break fn_res,
                 }
             };
 
-            match driver.commit().await {
-                Ok(()) => break Ok(value),
-                Err(TransError::Wounded) => {
-                    // A higher-priority transaction aborted us. Release whatever
-                    // we held and restart with a fresh id that preserves our
-                    // priority, so we are not starved on the retry.
-                    driver.restart_after_wound().await;
-                    tx.reset();
-                    stats.retries += 1;
-                    continue;
-                }
-                Err(TransError::Retry) => {
-                    tx.reset();
-                    stats.retries += 1;
-                    continue;
-                }
-                Err(e) => break Err(e.into()),
+            if restart_after_wound {
+                // A higher-priority transaction aborted us. Release whatever
+                // we held and restart with a fresh id that preserves our
+                // priority, so we are not starved on the retry.
+                driver.restart_after_wound().await;
             }
+            tx.reset();
+            stats.retries += 1;
         };
 
         let end_result = driver.finish().await;

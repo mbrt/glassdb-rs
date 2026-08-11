@@ -201,23 +201,9 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<Collection, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
-        self.validate_handle(parent)?;
-        self.ensure_directory(parent.address()).await?;
-        let id = {
-            let mut inner = self.inner.lock().unwrap();
-            inner
-                .catalog
-                .child(parent.address(), name)?
-                .ok_or(Error::NotFound)?
-        };
-        Ok(Collection::new_child(
-            CollectionAddress::new(self.db.name.as_str(), id),
-            parent.address().clone(),
-            name,
-            self.db.clone(),
-        ))
+        self.resolve_child(parent, name.as_ref())
+            .await?
+            .ok_or(Error::NotFound)
     }
 
     /// Reports whether a direct child is currently bound to `name`.
@@ -226,12 +212,7 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
-        self.validate_handle(parent)?;
-        self.ensure_directory(parent.address()).await?;
-        let mut inner = self.inner.lock().unwrap();
-        Ok(inner.catalog.child(parent.address(), name)?.is_some())
+        Ok(self.resolve_child(parent, name.as_ref()).await?.is_some())
     }
 
     /// Resolves an unresolved collection path from the permanent root.
@@ -257,10 +238,10 @@ impl Transaction {
         let path = path.try_into().map_err(Into::into)?;
         let mut parent = self.root_collection();
         for name in path.segments() {
-            if !self.collection_exists(&parent, name).await? {
+            let Some(child) = self.resolve_child(&parent, name).await? else {
                 return Ok(false);
-            }
-            parent = self.open_collection(&parent, name).await?;
+            };
+            parent = child;
         }
         Ok(true)
     }
@@ -376,6 +357,30 @@ impl Transaction {
             Collection::new_child(address, parent.address().clone(), name, self.db.clone()),
             created,
         ))
+    }
+
+    async fn resolve_child(
+        &self,
+        parent: &Collection,
+        name: &[u8],
+    ) -> Result<Option<Collection>, Error> {
+        validate_collection_name(name)?;
+        self.validate_handle(parent)?;
+        self.ensure_directory(parent.address()).await?;
+        let id = self
+            .inner
+            .lock()
+            .unwrap()
+            .catalog
+            .child(parent.address(), name)?;
+        Ok(id.map(|id| {
+            Collection::new_child(
+                CollectionAddress::new(self.db.name.as_str(), id),
+                parent.address().clone(),
+                name,
+                self.db.clone(),
+            )
+        }))
     }
 
     async fn ensure_directory(&self, parent: &CollectionAddress) -> Result<(), Error> {
