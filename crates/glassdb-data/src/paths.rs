@@ -6,6 +6,233 @@ use crate::base64;
 use crate::collection_id::CollectionId;
 use crate::txid::TxId;
 
+const NODE_TOKEN_BYTES: usize = 16;
+
+/// A database's top-level physical object-path component.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DbRoot(Arc<str>);
+
+impl DbRoot {
+    /// Maximum number of bytes in the encoded path component.
+    pub const MAX_ENCODED_LEN: usize = 255;
+
+    /// Returns the validated path component.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for DbRoot {
+    type Error = PathError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        validate_db_root(value)?;
+        Ok(DbRoot(Arc::from(value)))
+    }
+}
+
+impl TryFrom<String> for DbRoot {
+    type Error = PathError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_db_root(&value)?;
+        Ok(DbRoot(Arc::from(value)))
+    }
+}
+
+impl std::str::FromStr for DbRoot {
+    type Err = PathError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl AsRef<str> for DbRoot {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for DbRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The canonical random identity component of a non-root B-link node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeToken(Arc<str>);
+
+impl NodeToken {
+    /// Maximum number of bytes in the encoded path component.
+    pub const MAX_ENCODED_LEN: usize = 22;
+
+    /// Mints a fresh random node token.
+    ///
+    /// Random bytes precede encoding so object-store partitions see a
+    /// high-entropy prefix. The entropy source is simulation-aware.
+    pub fn new_random() -> Self {
+        let mut bytes = [0u8; NODE_TOKEN_BYTES];
+        crate::entropy::fill_random(&mut bytes);
+        Self::from_bytes(bytes)
+    }
+
+    /// Encodes an exact 128-bit node identity.
+    pub fn from_bytes(bytes: [u8; NODE_TOKEN_BYTES]) -> Self {
+        NodeToken(Arc::from(base64::encode(&bytes)))
+    }
+
+    /// Returns the canonical encoded path component.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for NodeToken {
+    type Error = PathError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        validate_random_component("node token", value, Self::MAX_ENCODED_LEN)?;
+        Ok(NodeToken(Arc::from(value)))
+    }
+}
+
+impl TryFrom<String> for NodeToken {
+    type Error = PathError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_random_component("node token", &value, Self::MAX_ENCODED_LEN)?;
+        Ok(NodeToken(Arc::from(value)))
+    }
+}
+
+impl std::str::FromStr for NodeToken {
+    type Err = PathError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl AsRef<str> for NodeToken {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for NodeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The canonical random identity component of a structural-log record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StructuralRecordId(Arc<str>);
+
+impl StructuralRecordId {
+    /// Maximum number of bytes in the encoded path component.
+    pub const MAX_ENCODED_LEN: usize = NodeToken::MAX_ENCODED_LEN;
+
+    /// Returns the canonical encoded path component.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for StructuralRecordId {
+    type Error = PathError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        validate_random_component(
+            "structural record ID",
+            value,
+            StructuralRecordId::MAX_ENCODED_LEN,
+        )?;
+        Ok(StructuralRecordId(Arc::from(value)))
+    }
+}
+
+impl TryFrom<String> for StructuralRecordId {
+    type Error = PathError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_random_component(
+            "structural record ID",
+            &value,
+            StructuralRecordId::MAX_ENCODED_LEN,
+        )?;
+        Ok(StructuralRecordId(Arc::from(value)))
+    }
+}
+
+impl std::str::FromStr for StructuralRecordId {
+    type Err = PathError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl From<NodeToken> for StructuralRecordId {
+    fn from(value: NodeToken) -> Self {
+        StructuralRecordId(value.0)
+    }
+}
+
+impl From<&NodeToken> for StructuralRecordId {
+    fn from(value: &NodeToken) -> Self {
+        StructuralRecordId(value.0.clone())
+    }
+}
+
+impl AsRef<str> for StructuralRecordId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for StructuralRecordId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn validate_db_root(value: &str) -> Result<(), PathError> {
+    if value.is_empty()
+        || value.len() > DbRoot::MAX_ENCODED_LEN
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(PathError::InvalidComponent {
+            component: "database root",
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_random_component(
+    component: &'static str,
+    value: &str,
+    encoded_len: usize,
+) -> Result<(), PathError> {
+    if value.len() != encoded_len {
+        return Err(PathError::InvalidComponent {
+            component,
+            value: value.to_string(),
+        });
+    }
+    let decoded = base64::decode(value)?;
+    if decoded.len() != NODE_TOKEN_BYTES || base64::encode(&decoded) != value {
+        return Err(PathError::InvalidComponent {
+            component,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// The physical address of one collection incarnation within a database.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CollectionAddress {
@@ -183,6 +410,11 @@ impl Type {
 pub enum PathError {
     /// The path did not have the expected `prefix/type/suffix` structure.
     Parse(String),
+    /// One typed path component violated its canonical representation.
+    InvalidComponent {
+        component: &'static str,
+        value: String,
+    },
     /// The suffix did not start with the expected type marker.
     WrongPrefix { suffix: String, expected: String },
     /// The base64 payload could not be decoded.
@@ -193,6 +425,9 @@ impl std::fmt::Display for PathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PathError::Parse(p) => write!(f, "expected path with >=3 parts, got {p:?}"),
+            PathError::InvalidComponent { component, value } => {
+                write!(f, "invalid {component} path component {value:?}")
+            }
             PathError::WrongPrefix { suffix, expected } => {
                 write!(f, "got path {suffix:?}, expected prefix {expected:?}")
             }
@@ -395,11 +630,6 @@ pub fn node_token_of(path: &str) -> Result<String, PathError> {
     Ok(pr.suffix)
 }
 
-/// Number of random bytes behind a node token. 128 bits of entropy makes
-/// accidental collisions negligible and, crucially, spreads freshly created
-/// nodes across object-store partitions instead of clustering them (ADR-031).
-const NODE_TOKEN_BYTES: usize = 16;
-
 /// Mints a fresh, random B-link node token.
 ///
 /// The token is deliberately random rather than monotonic: object stores
@@ -408,9 +638,7 @@ const NODE_TOKEN_BYTES: usize = 16;
 /// draws from the same seeded-under-simulation entropy as [`crate::TxId`], so
 /// DST replays stay byte-identical.
 pub fn random_node_token() -> String {
-    let mut b = [0u8; NODE_TOKEN_BYTES];
-    crate::entropy::fill_random(&mut b);
-    base64::encode(&b)
+    NodeToken::new_random().to_string()
 }
 
 /// Splits a storage path into its prefix, type, and suffix components.
@@ -485,6 +713,81 @@ mod tests {
 
     fn collection_id(byte: u8) -> CollectionId {
         CollectionId::from_slice(&[byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn database_root_validation_boundaries() {
+        let shortest = DbRoot::try_from("a").unwrap();
+        assert_eq!(shortest.as_str(), "a");
+        assert_eq!(shortest.to_string(), "a");
+
+        let longest = "a".repeat(DbRoot::MAX_ENCODED_LEN);
+        assert_eq!(
+            DbRoot::try_from(longest.clone()).unwrap().as_str(),
+            longest.as_str()
+        );
+
+        assert!(matches!(
+            DbRoot::try_from(""),
+            Err(PathError::InvalidComponent { .. })
+        ));
+        assert!(matches!(
+            DbRoot::try_from("a".repeat(DbRoot::MAX_ENCODED_LEN + 1)),
+            Err(PathError::InvalidComponent { .. })
+        ));
+        for invalid in ["db-name", "db_name", "db/name", "db name", "dé"] {
+            assert!(matches!(
+                DbRoot::try_from(invalid),
+                Err(PathError::InvalidComponent { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn random_identity_components_require_canonical_128_bit_encodings() {
+        let token = NodeToken::from_bytes([0; NODE_TOKEN_BYTES]);
+        assert_eq!(token.as_str(), "0000000000000000000000");
+        assert_eq!(token.as_str().len(), NodeToken::MAX_ENCODED_LEN);
+        assert_eq!(NodeToken::try_from(token.to_string()).unwrap(), token);
+        assert_eq!(token.as_str().parse::<NodeToken>().unwrap(), token);
+
+        let record_id = StructuralRecordId::try_from(token.as_str()).unwrap();
+        assert_eq!(record_id.as_str(), token.as_str());
+        assert_eq!(StructuralRecordId::from(&token), record_id);
+        assert_eq!(StructuralRecordId::from(token.clone()), record_id);
+
+        for invalid in ["", "000000000000000000000", "00000000000000000000000"] {
+            assert!(NodeToken::try_from(invalid).is_err());
+            assert!(StructuralRecordId::try_from(invalid).is_err());
+        }
+
+        let invalid_alphabet = "000000000000000000000!";
+        assert!(NodeToken::try_from(invalid_alphabet).is_err());
+        assert!(StructuralRecordId::try_from(invalid_alphabet).is_err());
+
+        let noncanonical = "0000000000000000000001";
+        assert_eq!(
+            base64::decode(noncanonical).unwrap(),
+            base64::decode(token.as_str()).unwrap()
+        );
+        assert!(matches!(
+            NodeToken::try_from(noncanonical),
+            Err(PathError::InvalidComponent { .. })
+        ));
+        assert!(matches!(
+            StructuralRecordId::try_from(noncanonical),
+            Err(PathError::InvalidComponent { .. })
+        ));
+    }
+
+    #[test]
+    fn freshly_minted_node_tokens_round_trip() {
+        for _ in 0..128 {
+            let token = NodeToken::new_random();
+            assert_eq!(token.as_str().len(), NodeToken::MAX_ENCODED_LEN);
+            assert_eq!(NodeToken::try_from(token.to_string()).unwrap(), token);
+            assert_eq!(base64::decode(token.as_str()).unwrap().len(), 16);
+        }
     }
 
     #[test]
