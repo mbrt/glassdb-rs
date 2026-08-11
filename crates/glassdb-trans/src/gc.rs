@@ -731,19 +731,16 @@ mod tests {
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
         entries.insert(entry.key.clone(), entry);
         let shard = Shard::from_entries(entries.into_values());
-        assert!(
-            ctx.shards
-                .store_leaf(&path, &shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(shard);
+        assert!(ctx.shards.commit_leaf(edit).await.unwrap());
     }
 
     async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<ShardEntry> {
@@ -755,7 +752,7 @@ mod tests {
             )
             .await
             .unwrap();
-        loaded.entries.lookup(key).cloned()
+        loaded.entries().lookup(key).cloned()
     }
 
     fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> TxLog {
@@ -1288,12 +1285,9 @@ mod tests {
             .load_leaf(&shard_path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
-        assert!(
-            ctx.shards
-                .store_leaf(&shard_path, &shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(shard);
+        assert!(ctx.shards.commit_leaf(edit).await.unwrap());
 
         let live = TxId::with_priority(2_000_000_000, b"live");
         ctx.mon.begin_tx(&live);

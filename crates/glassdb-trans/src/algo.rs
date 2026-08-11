@@ -1783,7 +1783,7 @@ mod tests {
             )
             .await
             .unwrap();
-        loaded.entries.lookup(key).cloned()
+        loaded.entries().lookup(key).cloned()
     }
 
     #[tokio::test]
@@ -2339,17 +2339,9 @@ mod tests {
             .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
-        assert!(
-            tctx.shards
-                .store_leaf(
-                    &path,
-                    &Shard::from_entries([unsafe_entry]),
-                    &loaded.locks,
-                    &loaded.observation,
-                )
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::from_entries([unsafe_entry]));
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
 
         let key = key_ref(&second);
         let mut handle = begin_data(
@@ -3083,7 +3075,7 @@ mod tests {
             .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
-        let windowed = Shard::from_entries(loaded.entries.entries().cloned().map(|mut e| {
+        let windowed = Shard::from_entries(loaded.entries().entries().cloned().map(|mut e| {
             if e.key == raw {
                 e.lock_type = LockType::Write;
                 e.locked_by = vec![h1.clone()];
@@ -3091,12 +3083,9 @@ mod tests {
             }
             e
         }));
-        assert!(
-            tctx.shards
-                .store_leaf(&leaf_path, &windowed, &loaded.locks, &loaded.observation)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(windowed);
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
 
         // The window is observably at the committed holder H1 (v2), not the
         // lagging pointer H0: the shared resolver already help-forwards it.
@@ -3232,7 +3221,7 @@ mod tests {
             .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
-        let windowed = Shard::from_entries(loaded.entries.entries().cloned().map(|mut e| {
+        let windowed = Shard::from_entries(loaded.entries().entries().cloned().map(|mut e| {
             if e.key == raw {
                 e.lock_type = LockType::Write;
                 e.locked_by = vec![h1.clone()];
@@ -3240,12 +3229,9 @@ mod tests {
             }
             e
         }));
-        assert!(
-            tctx.shards
-                .store_leaf(&leaf_path, &windowed, &loaded.locks, &loaded.observation)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(windowed);
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
 
         let mut h = begin_data(
             &tm,
@@ -4150,7 +4136,7 @@ mod tests {
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|entry| (entry.key.clone(), entry))
@@ -4158,17 +4144,9 @@ mod tests {
         entries.get_mut(b"b".as_slice()).unwrap().current = CurrentState::External {
             writer: TxId::with_priority(3, b"external"),
         };
-        assert!(
-            external
-                .store_leaf(
-                    &leaf_path,
-                    &Shard::from_entries(entries.into_values()),
-                    &loaded.locks,
-                    &loaded.observation,
-                )
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::from_entries(entries.into_values()));
+        assert!(external.commit_leaf(edit).await.unwrap());
 
         // A local disjoint lock observes that external version and publishes a
         // still newer state after our barrier. The original physical revision
@@ -4356,7 +4334,7 @@ mod tests {
             .await
             .unwrap();
         let mut entries: std::collections::BTreeMap<Vec<u8>, ShardEntry> = loaded
-            .entries
+            .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
@@ -4372,12 +4350,9 @@ mod tests {
             );
         }
         let shard = Shard::from_entries(entries.into_values());
-        assert!(
-            tctx.shards
-                .store_leaf(&path, &shard, &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        let mut edit = loaded.into_edit();
+        edit.set_entries(shard);
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
     }
 
     // Builds a read-only listing transaction's [`Data`] from a fresh scan of the
@@ -4700,7 +4675,7 @@ mod tests {
             .await
             .unwrap();
         tctx.shards
-            .store_root(TEST_COLL, &root, &cur.observation)
+            .store_root(TEST_COLL, &root, cur.observation())
             .await
             .unwrap();
 
@@ -4753,7 +4728,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let entries: Vec<ShardEntry> = loaded.entries.entries().cloned().collect();
+        let entries: Vec<ShardEntry> = loaded.entries().entries().cloned().collect();
         let (lower, upper): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .partition(|e| e.key.as_slice() < b"m".as_slice());
@@ -4777,7 +4752,7 @@ mod tests {
         ]));
         assert!(
             tctx.shards
-                .store_root(TEST_COLL, &root, &loaded.observation)
+                .store_root(TEST_COLL, &root, loaded.observation())
                 .await
                 .unwrap(),
             "root split CAS must win"

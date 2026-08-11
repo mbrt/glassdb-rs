@@ -33,9 +33,12 @@ pub struct ShardStore {
 
 /// A B-link leaf loaded for one coordination round.
 pub struct LoadedLeaf {
+    #[deprecated(note = "use LoadedLeaf::entries or LoadedLeaf::into_edit")]
     pub entries: Shard,
     /// Node-level coordination staged independently from topology.
+    #[deprecated(note = "use LoadedLeaf::locks or LoadedLeaf::into_edit")]
     pub locks: NodeLocks,
+    #[deprecated(note = "use LoadedLeaf::observation or LoadedLeaf::into_edit")]
     pub observation: LeafObservation,
     edit: LeafEdit,
 }
@@ -454,6 +457,7 @@ impl ShardStore {
     }
 
     /// Loads the leaf node at `_r` or `_n/<token>`.
+    #[allow(deprecated)]
     pub async fn load_leaf(
         &self,
         path: &str,
@@ -495,6 +499,7 @@ impl ShardStore {
     }
 
     /// Compare-and-swaps a leaf while preserving its topology fields.
+    #[deprecated(note = "use LoadedLeaf::into_edit and ShardStore::commit_leaf")]
     pub async fn store_leaf(
         &self,
         path: &str,
@@ -670,7 +675,8 @@ mod tests {
             .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap()
-            .observation;
+            .observation()
+            .clone();
         assert_eq!(count(&log, "read"), 1, "cold load full-reads");
         assert_eq!(count(&log, "read_if_modified"), 0);
 
@@ -678,7 +684,8 @@ mod tests {
             .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap()
-            .observation;
+            .observation()
+            .clone();
         assert_eq!(count(&log, "read"), 1, "hot load must not full-read");
         assert_eq!(
             count(&log, "read_if_modified"),
@@ -746,31 +753,22 @@ mod tests {
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
-        assert!(
-            store
-                .store_leaf(&path, &Shard::new(), &loaded.locks, &loaded.observation,)
-                .await
-                .unwrap()
-        );
+        assert!(store.commit_leaf(loaded.into_edit()).await.unwrap());
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
-        let v1 = loaded.observation.clone();
+        let v1 = loaded.observation().clone();
 
         // CAS a new generation over the loaded version, then confirm the next
         // load reflects it.
-        assert!(
-            store
-                .store_leaf(&path, &Shard::new(), &loaded.locks, &v1)
-                .await
-                .unwrap()
-        );
+        assert!(store.commit_leaf(loaded.into_edit()).await.unwrap());
         let v2 = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap()
-            .observation;
+            .observation()
+            .clone();
         assert_ne!(
             v1.revision(),
             v2.revision(),
@@ -828,13 +826,7 @@ mod tests {
             );
         }
 
-        let right_observation = store
-            .load_leaf(&right_path, Requirement::Any)
-            .await
-            .unwrap()
-            .observation;
-        let mut loaded = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
-        loaded.observation = right_observation;
+        let loaded = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
         let mut edit = loaded.into_edit();
         edit.set_entries(Shard::from_entries([ShardEntry::new(
             b"left-key".as_slice(),
@@ -849,6 +841,38 @@ mod tests {
             .unwrap();
         assert!(left.entries().lookup(b"left-key").is_some());
         assert!(right.entries().is_empty());
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn loose_leaf_store_and_public_fields_remain_compatible() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let path = paths::from_node(COLL, "tok");
+        assert!(
+            store
+                .store_node(COLL, "tok", &Node::leaf(Shard::new()), None)
+                .await
+                .unwrap()
+        );
+
+        let mut loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        loaded.entries = Shard::from_entries([ShardEntry::new(b"legacy".as_slice())]);
+        loaded
+            .locks
+            .set_membership_writer(TxId::from_bytes(b"legacy-holder".to_vec()));
+        assert!(
+            store
+                .store_leaf(&path, &loaded.entries, &loaded.locks, &loaded.observation,)
+                .await
+                .unwrap()
+        );
+
+        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        assert!(committed.entries().lookup(b"legacy").is_some());
+        assert_eq!(
+            committed.node().membership_lock().holders(),
+            &[TxId::from_bytes(b"legacy-holder".to_vec())]
+        );
     }
 
     #[tokio::test]
