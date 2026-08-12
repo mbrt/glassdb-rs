@@ -11,10 +11,11 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::http::StatusCode;
+use glassdb_backend::middleware::{Latency, ProviderLatencyProfile};
 use glassdb_backend::{Backend, BackendError, Version};
 use hyper::Method;
 
-use crate::fake_server::FakeS3;
+use crate::fake_server::{FakeS3, FakeS3Options};
 use crate::{
     Builder, ConditionalPutAction, ConditionalPutEvent, ConditionalPutState, DEFAULT_MAX_ATTEMPTS,
     MAX_CONFLICT_RETRIES, ProviderFact, ProviderFailure, S3Backend, annotate, annotate_list,
@@ -31,6 +32,17 @@ fn backend(fake: &FakeS3) -> S3Backend {
 
 fn builder(fake: &FakeS3) -> Builder {
     S3Backend::builder(fake.client(), "test")
+}
+
+fn zero_latency_profile() -> ProviderLatencyProfile {
+    let zero = Latency::new(0, 0);
+    ProviderLatencyProfile {
+        meta_read: zero,
+        meta_write: zero,
+        obj_read: zero,
+        obj_write: zero,
+        list: zero,
+    }
 }
 
 /// A standard retryer that retries the same errors as the default (incl. 503
@@ -688,7 +700,12 @@ async fn list_is_recursive_and_paginated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conditional_write_retries_through_slow_down() {
-    let fake = FakeS3::start().await;
+    let fake = FakeS3::start_with(FakeS3Options {
+        latency: Some(zero_latency_profile()),
+        entropy_seed: 0xF2_5D,
+        ..FakeS3Options::default()
+    })
+    .await;
     let b = builder(&fake).retry_config(fast_retry()).build();
     fake.set_slowdown(2, Some(Method::PUT));
 
@@ -750,7 +767,12 @@ async fn read_transient_failure_surfaces_unavailable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_if_not_exists_lost_ack_is_in_doubt() {
-    let fake = FakeS3::start().await;
+    let fake = FakeS3::start_with(FakeS3Options {
+        latency: Some(zero_latency_profile()),
+        entropy_seed: 0xF2_5D,
+        ..FakeS3Options::default()
+    })
+    .await;
     let b = backend(&fake);
 
     // The create lands, but its ack is lost; the re-send sees the object exists

@@ -119,7 +119,7 @@ impl Options {
         let delays = self.delay_profile()?;
         let fake = FakeS3::start_with(FakeS3Options {
             latency: Some(delays.latency),
-            conn_counter: None,
+            ..FakeS3Options::default()
         })
         .await;
         let mut config = fake.client_config();
