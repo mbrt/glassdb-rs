@@ -7,40 +7,31 @@
 //!
 //! Reads and mutations go through the decoded [`CachedStore`].
 
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralRecordId, TxId};
+use glassdb_data::{CollectionAddress, NodeToken, ObjectPath};
 
 use crate::cached_store::{CachedStore, Observation, Requirement};
 use crate::error::StorageError;
 use crate::node::Node;
 use crate::node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodeStore};
-use crate::structlog::StructuralLog;
-use crate::structural_log_store::StructuralLogStore;
 use crate::timeline::SequencePoint;
 
 /// Reads and compare-and-swaps B-link nodes.
 #[derive(Clone)]
 pub struct ShardStore {
     nodes: NodeStore,
-    structural_logs: StructuralLogStore,
 }
 
 impl ShardStore {
     /// Creates a shard store that reads and compare-and-swaps through `objects`.
     pub fn new(objects: CachedStore) -> Self {
         ShardStore {
-            nodes: NodeStore::new(objects.clone()),
-            structural_logs: StructuralLogStore::new(objects),
+            nodes: NodeStore::new(objects),
         }
     }
 
     /// Returns the store responsible for B-link tree nodes.
     pub fn nodes(&self) -> &NodeStore {
         &self.nodes
-    }
-
-    /// Returns the store responsible for structural split recovery records.
-    pub fn structural_logs(&self) -> &StructuralLogStore {
-        &self.structural_logs
     }
 
     /// Checks whether a retained leaf observation is still current after `bound`.
@@ -151,60 +142,6 @@ impl ShardStore {
         requirement: Requirement,
     ) -> Result<Vec<(NodeToken, Observation<Node>)>, StorageError> {
         self.nodes.list_nodes(collection, requirement).await
-    }
-
-    /// Creates a split write-ahead record and returns its exact observation.
-    pub async fn write_structural_log(
-        &self,
-        db_root: &DbRoot,
-        record_id: &StructuralRecordId,
-        record: &StructuralLog,
-    ) -> Result<Observation<StructuralLog>, StorageError> {
-        self.structural_logs
-            .write_structural_log(db_root, record_id, record)
-            .await
-    }
-
-    /// Conditionally advances an exact split intent.
-    pub async fn update_structural_log(
-        &self,
-        expected: &Observation<StructuralLog>,
-        record: &StructuralLog,
-    ) -> Result<Option<Observation<StructuralLog>>, StorageError> {
-        self.structural_logs
-            .update_structural_log(expected, record)
-            .await
-    }
-
-    /// Lists exact observations of every unresolved structural record.
-    pub async fn list_structural_logs(
-        &self,
-        db_root: &DbRoot,
-        requirement: Requirement,
-    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-        self.structural_logs
-            .list_structural_logs(db_root, requirement)
-            .await
-    }
-
-    /// Lists only the unresolved structural records owned by `participant`.
-    pub async fn list_structural_logs_for_participant(
-        &self,
-        db_root: &DbRoot,
-        participant: &TxId,
-        requirement: Requirement,
-    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-        self.structural_logs
-            .list_structural_logs_for_participant(db_root, participant, requirement)
-            .await
-    }
-
-    /// Deletes the exact observed structural record, converging if it is missing.
-    pub async fn delete_structural_log(
-        &self,
-        expected: &Observation<StructuralLog>,
-    ) -> Result<(), StorageError> {
-        self.structural_logs.delete_structural_log(expected).await
     }
 
     /// Loads the leaf node at `_r` or `_n/<token>`.

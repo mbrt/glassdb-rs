@@ -53,7 +53,7 @@ use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
     CollectionStore, IndexNode, InlinePolicy, LeafObservation, LockType, Node, Observation,
     Requirement, Shard, ShardEntry, ShardStore, SplitPolicy, StorageError, StructuralLog,
-    StructuralLogPhase, Timeline, TreeRouter,
+    StructuralLogPhase, StructuralLogStore, Timeline, TreeRouter,
 };
 use tokio::sync::Notify;
 
@@ -985,7 +985,12 @@ impl<'a> StructuralSplitAttempt<'a> {
                 StructuralSplitTopology::Joined(_) => result,
             },
             SplitAttemptResult::RetryCleanly => {
-                let cleanup = match self.splitter.shards.delete_structural_log(prepared).await {
+                let cleanup = match self
+                    .splitter
+                    .structural_logs
+                    .delete_structural_log(prepared)
+                    .await
+                {
                     Ok(()) => match topology {
                         StructuralSplitTopology::Owned => {
                             self.splitter
@@ -1202,7 +1207,8 @@ impl SplitHinter for SplitCandidates {
 
 /// Background executor that halves over-full B-link nodes (ADR-031). Holds no
 /// per-transaction state: every split is a pure structural compare-and-swap
-/// through the [`ShardStore`], recovered idempotently like any in-doubt CAS.
+/// through the node and structural-log stores, recovered idempotently like any
+/// in-doubt CAS.
 #[derive(Clone)]
 pub struct Splitter {
     // Weak so a clone captured in the spawned loop does not keep the executor
@@ -1210,6 +1216,7 @@ pub struct Splitter {
     bg: Weak<Background>,
     records: CollectionStore,
     shards: ShardStore,
+    structural_logs: StructuralLogStore,
     router: TreeRouter,
     mon: Monitor,
     structural_nodes: StructuralNodeAccess,
@@ -1236,6 +1243,7 @@ impl Splitter {
         bg: Weak<Background>,
         records: CollectionStore,
         shards: ShardStore,
+        structural_logs: StructuralLogStore,
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
@@ -1257,6 +1265,7 @@ impl Splitter {
             bg,
             records,
             shards,
+            structural_logs,
             timeline,
             mon,
             key_state,
@@ -1307,6 +1316,7 @@ impl Splitter {
         bg: Weak<Background>,
         records: CollectionStore,
         shards: ShardStore,
+        structural_logs: StructuralLogStore,
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
@@ -1328,6 +1338,7 @@ impl Splitter {
             bg,
             records,
             shards,
+            structural_logs,
             router,
             mon,
             structural_nodes,
@@ -1616,7 +1627,7 @@ impl Splitter {
                 .expect("a split always reserves at least one token"),
         );
         let observed = self
-            .shards
+            .structural_logs
             .write_structural_log(
                 collection.db_root_component(),
                 &record_id,
@@ -1797,7 +1808,7 @@ impl Splitter {
         };
         let mut ready = prepared.into_ready(source_version, split_key.clone());
         let transition = self
-            .shards
+            .structural_logs
             .update_structural_log(ready.expected(), ready.record())
             .await;
         let observed = match transition {
@@ -1865,7 +1876,11 @@ impl Splitter {
         {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        if let Err(error) = self.shards.delete_structural_log(ready.observation()).await {
+        if let Err(error) = self
+            .structural_logs
+            .delete_structural_log(ready.observation())
+            .await
+        {
             return SplitAttemptOutcome::recovery_required(ready, error.into());
         }
         SplitAttemptOutcome::completed()
@@ -2009,7 +2024,7 @@ impl Splitter {
         };
         let mut ready = prepared.into_ready(source_version, split_key);
         let transition = self
-            .shards
+            .structural_logs
             .update_structural_log(ready.expected(), ready.record())
             .await;
         let observed = match transition {
@@ -2075,7 +2090,11 @@ impl Splitter {
                 .inline_pressure_completed
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if let Err(error) = self.shards.delete_structural_log(ready.observation()).await {
+        if let Err(error) = self
+            .structural_logs
+            .delete_structural_log(ready.observation())
+            .await
+        {
             return SplitAttemptOutcome::recovery_required(ready, error.into());
         }
         SplitAttemptOutcome::completed()
@@ -2109,7 +2128,7 @@ impl Splitter {
         // gates its source fencing and reachability (see `recover_record`).
         let recovery_start = Requirement::AtLeast(self.timeline.now());
         let records = match self
-            .shards
+            .structural_logs
             .list_structural_logs(&self.db_root, recovery_start)
             .await
         {
@@ -2186,7 +2205,7 @@ impl Splitter {
             // before this intent, and cancellation only makes the worker's
             // Ready CAS lose. This also reclaims an intent whose transaction
             // tombstone was already collected before a late create appeared.
-            self.shards.delete_structural_log(observed).await?;
+            self.structural_logs.delete_structural_log(observed).await?;
             return Ok(());
         }
         // Pin fencing and reachability to the record's own freshness rather than
@@ -2263,7 +2282,7 @@ impl Splitter {
                 }
             }
         }
-        self.shards.delete_structural_log(observed).await?;
+        self.structural_logs.delete_structural_log(observed).await?;
         Ok(())
     }
 
@@ -2319,7 +2338,7 @@ impl TopologySettler for Splitter {
         }
         loop {
             let records = self
-                .shards
+                .structural_logs
                 .list_structural_logs_for_participant(
                     collection.db_root_component(),
                     id,
@@ -2470,6 +2489,7 @@ mod tests {
     struct TestStore {
         records: CollectionStore,
         shards: ShardStore,
+        structural_logs: StructuralLogStore,
         objects: CachedStore,
         timeline: Timeline,
     }
@@ -2567,7 +2587,7 @@ mod tests {
             record_id: &str,
             record: &StructuralLog,
         ) -> Result<Observation<StructuralLog>, StorageError> {
-            self.shards
+            self.structural_logs
                 .write_structural_log(
                     &db_root("db"),
                     &StructuralRecordId::from(test_token(record_id)),
@@ -2581,7 +2601,7 @@ mod tests {
             root: &str,
             requirement: Requirement,
         ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-            self.shards
+            self.structural_logs
                 .list_structural_logs(&db_root(root), requirement)
                 .await
         }
@@ -2597,6 +2617,7 @@ mod tests {
         TestStore {
             records: CollectionStore::new(objects.clone()),
             shards: ShardStore::new(objects.clone()),
+            structural_logs: StructuralLogStore::new(objects.clone()),
             objects,
             timeline,
         }
@@ -2668,6 +2689,7 @@ mod tests {
             Arc::downgrade(bg),
             shards.records.clone(),
             shards.shards.clone(),
+            shards.structural_logs.clone(),
             shards.timeline.clone(),
             mon,
             key_state,

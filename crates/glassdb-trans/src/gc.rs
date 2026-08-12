@@ -38,7 +38,9 @@ use glassdb_backend as backend;
 use glassdb_concurr::{Background, rt};
 use glassdb_data::{KeyRef, TxId, shuffle};
 use glassdb_storage::transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog};
-use glassdb_storage::{Observation, Requirement, ShardStore, StorageError, Timeline, TreeRouter};
+use glassdb_storage::{
+    Observation, Requirement, ShardStore, StorageError, StructuralLogStore, Timeline, TreeRouter,
+};
 
 use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
@@ -69,7 +71,7 @@ pub struct Gc {
     // `DbInner::background`.
     bg: Weak<Background>,
     tl: TLogger,
-    shards: ShardStore,
+    structural_logs: StructuralLogStore,
     collection_lifecycle: CollectionLifecycle,
     router: TreeRouter,
     locker: Locker,
@@ -111,14 +113,16 @@ impl TxScan {
 }
 
 impl Gc {
-    /// Creates a collector over the transaction log, shard store, locker, and
-    /// monitor. Freshness barriers use `timeline`; lease horizons use model
-    /// time so they remain deterministic under the DST executor.
+    /// Creates a collector over the transaction, node, and structural-log
+    /// stores, locker, and monitor. Freshness barriers use `timeline`; lease
+    /// horizons use model time so they remain deterministic under the DST
+    /// executor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bg: Weak<Background>,
         tl: TLogger,
         shards: ShardStore,
+        structural_logs: StructuralLogStore,
         timeline: Timeline,
         locker: Locker,
         collection_lifecycle: CollectionLifecycle,
@@ -128,7 +132,7 @@ impl Gc {
         Gc {
             bg,
             tl,
-            shards,
+            structural_logs,
             collection_lifecycle,
             router,
             locker,
@@ -542,7 +546,7 @@ impl Gc {
         self.locker.collections().release(tid, locks).await?;
         for collection in topology {
             let records = self
-                .shards
+                .structural_logs
                 .list_structural_logs_for_participant(
                     collection.db_root_component(),
                     tid,
@@ -647,6 +651,7 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DbRoot::try_from("db").unwrap());
         let records = CollectionStore::new(objects.clone());
+        let structural_logs = StructuralLogStore::new(objects.clone());
         let shards = ShardStore::new(objects);
         assert!(
             records
@@ -694,6 +699,7 @@ mod tests {
             Arc::downgrade(&bg),
             tl.clone(),
             shards.clone(),
+            structural_logs,
             timeline.clone(),
             locker.clone(),
             CollectionLifecycle::new(

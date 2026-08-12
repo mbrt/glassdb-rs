@@ -54,3 +54,22 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no code issue or capability backdoor. It identified
   one stale architecture sentence naming `ShardStore`; that documentation now
   names the narrowed `NodeStore` handle.
+
+## F16-D — Wire structural logs explicitly
+
+- `Splitter` and `Gc` now receive `StructuralLogStore` explicitly, while
+  `ShardStore` has lost its structural-log state, accessor, and delegation
+  methods. This completes the temporary façade migration without a compatibility
+  backdoor.
+- Engine and test composition derive node and structural-log stores from clones
+  of the same `CachedStore`, preserving shared cache evidence, timeline identity,
+  observations, and backend-operation counts.
+- Every split, recovery, participant-settlement, and GC structural-log operation
+  changed only its receiver. Protocol awaits and ordering, retry behavior,
+  random draws, task spawn order, and persistent bytes are unchanged.
+- No migration-only tests were added. Existing structural-log lifecycle and
+  pagination tests plus split recovery, restart, participant cleanup, and GC
+  regressions remain the long-term coverage.
+- Adversarial review found no code or protocol issue. It identified stale storage
+  architecture documentation, which now shows the explicit structural-log
+  component and its `_s` recovery records.

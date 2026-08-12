@@ -88,7 +88,7 @@ is absent from normal library builds.
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
 | `glassdb-trans`       | `engine.rs`, `access.rs`, `algo.rs`, `collection_*`, `collections/`, `tlocker.rs`, `shard_coord.rs`, `key_*`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: the runtime façade and assembly, shared access vocabulary, commit algorithm, collection lifecycle, locking, shard mutation, resolution, monitoring, reads, and GC |
-| `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `shard_store.rs`, `tree_router.rs`, `node.rs`, `shard.rs`, `transaction/`, `txobject.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record and B-link-node CAS stores/codecs, B-link traversal, transaction-log persistence, and generic LRU |
+| `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `node_store.rs`, `structural_log_store.rs`, `shard_store.rs`, `tree_router.rs`, `node.rs`, `shard.rs`, `transaction/`, `txobject.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record, B-link-node, and structural-recovery CAS stores/codecs, B-link traversal, transaction-log persistence, and generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId` and order-preserving path encoding                                                                                          |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
 | `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `rt.rs`                             | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, and the process-wide model-time/runtime seam                 |
@@ -178,7 +178,7 @@ supply each operation's mutation decision as an installed resolver. For the full
       ▼                       ▼            ▼ (tx logs)          ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
   CollectionStore (_i records) · ShardStore (_r/_n B-link nodes)
-  TLogger (_t logs)
+  StructuralLogStore (_s recovery records) · TLogger (_t logs)
   CachedStore (decoded, path-keyed, bounded-freshness LRU)
                                 │
                                 ▼

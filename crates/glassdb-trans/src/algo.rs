@@ -1531,7 +1531,7 @@ mod tests {
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
-        ShardStore, TreeRouter,
+        ShardStore, StructuralLogStore, TreeRouter,
     };
 
     const TEST_DB: &str = "testp";
@@ -1606,6 +1606,7 @@ mod tests {
         );
         let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects.clone());
+        let structural_logs = StructuralLogStore::new(objects.clone());
         let collection_state = CollectionStateResolver::new(
             records.clone(),
             tlogger.clone(),
@@ -1619,6 +1620,7 @@ mod tests {
             bg_weak.clone(),
             records.clone(),
             shards.clone(),
+            structural_logs.clone(),
             timeline.clone(),
             tmon.clone(),
             key_state,
@@ -1645,6 +1647,7 @@ mod tests {
             bg_weak.clone(),
             tlogger.clone(),
             shards.clone(),
+            structural_logs,
             timeline.clone(),
             locker.clone(),
             collection_lifecycle.clone(),
