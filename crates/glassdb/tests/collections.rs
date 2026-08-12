@@ -139,6 +139,7 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn child_listing_returns_sorted_incarnation_bound_handles() {
     let db = Database::open("example", MemoryBackend::new())
         .await
@@ -163,12 +164,26 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
         .await
         .unwrap();
 
-    let entries = parent
+    let legacy_names = parent
         .collections()
         .await
         .unwrap()
+        .map(|entry| entry.map(|entry| entry.name))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
+    let mut plain = parent.iter_collections().await.unwrap();
+    assert_eq!(plain.len(), 2);
+    let first = plain.next().unwrap();
+    assert_eq!(plain.len(), 1);
+    drop(parent);
+    let entries = std::iter::once(first).chain(plain).collect::<Vec<_>>();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>(),
+        legacy_names
+    );
     assert_eq!(
         entries
             .iter()
@@ -187,6 +202,7 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn child_listing_retries_after_the_directory_changes() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -201,11 +217,22 @@ async fn child_listing_retries_after_the_directory_changes() {
                 let attempts = attempts.clone();
                 async move {
                     let root = tx.root_collection();
-                    let names = tx
+                    let legacy = tx
                         .collections(&root)
                         .await?
                         .map(|entry| entry.map(|entry| entry.name))
                         .collect::<Result<Vec<_>, _>>()?;
+                    let names = tx
+                        .iter_collections(&root)
+                        .await?
+                        .map(|entry| entry.name)
+                        .collect::<Vec<_>>();
+                    glassdb::ensure_tx!(
+                        names == legacy,
+                        Error::internal(format!(
+                            "plain collection iterator differed from legacy: {names:?} vs {legacy:?}"
+                        ))
+                    );
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         peer.create_collection("appeared").await?;
                     }
@@ -433,7 +460,10 @@ async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() 
         matches!(write, Err(Error::StaleCollection)),
         "unexpected write result: {write:?}"
     );
-    assert!(matches!(child.keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(
+        child.iter_keys().await,
+        Err(Error::StaleCollection)
+    ));
     assert!(matches!(
         backend.read(&child_root).await,
         Err(glassdb::backend::BackendError::NotFound)
@@ -464,10 +494,7 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
             tx.write(&users, b"seed", b"ready")?;
             tx.write(&active, b"alice", b"1")?;
 
-            let listed = tx
-                .collections(&users)
-                .await?
-                .collect::<Result<Vec<_>, _>>()?;
+            let listed = tx.iter_collections(&users).await?.collect::<Vec<_>>();
             glassdb::ensure_tx!(
                 listed.len() == 1,
                 Error::internal(format!(
@@ -757,7 +784,7 @@ async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
         old.collection_exists(b"nested").await,
         Err(Error::StaleCollection)
     ));
-    assert!(matches!(old.keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(old.iter_keys().await, Err(Error::StaleCollection)));
 }
 
 #[tokio::test]

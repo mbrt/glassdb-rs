@@ -603,3 +603,43 @@ working document and is intentionally not committed with these changes.
 - This is a test ownership change only: no durable tests were added, removed, or
   renamed, and no production control flow, backend operations, retry behavior,
   persistent bytes, randomness, or task lifetime changed.
+## F28-A — Add infallible materialized iterators
+
+- Added `KeyIter` and `CollectionIter` plus `iter_keys` and
+  `iter_collections` entry points on the public collection/transaction surfaces.
+  All fallible I/O and decoding finish before an owned iterator is returned;
+  per-item iteration is now truthfully infallible. Transaction-scoped directory
+  observations are still validated when their enclosing attempt completes.
+- One private generic materialized iterator owns each vector. The legacy
+  `KeysIter` and `CollectionsIter` remain API-compatible adapters over the same
+  plain iterators, so there is no second listing, materialization, or ordering
+  implementation.
+- The plain iterators expose exact remaining length and fused exhaustion, while
+  deliberately avoiding reverse traversal or borrowed lifetimes that were not
+  part of the existing contract. Child handles remain bound to their listed
+  incarnations after the source handle or transaction scope ends.
+- Existing key-order and child-incarnation tests now also cover empty results,
+  owned lifetime, exact remaining length, and ordered old/new parity. The
+  existing directory-retry test covers transaction-level parity using a returned
+  transaction error rather than asserting inside the body. These parity checks
+  are temporary through F28-C; long-term ordering, ownership, empty, paging, and
+  incarnation behavior remains.
+- No legacy method/type was deprecated or migrated in this finding. Backend
+  operations, transaction retry behavior, persistent bytes, and public failure
+  boundaries are unchanged.
+
+## F28-B — Deprecate fallible materialized iterators
+
+- Deprecated `KeysIter`, `CollectionsIter`, and their three producing methods
+  with direct links in the diagnostic text to the plain-item replacements.
+  Their compatibility implementations and public re-exports remain intact for
+  the release-gated removal in F28-C.
+- Production simulation clients and repository behavior tests now use
+  `iter_keys` and `iter_collections`; listing errors continue to occur at the
+  awaited materialization boundary, while iteration itself is infallible.
+- Retained only the existing focused old/new parity rows for collection keys and
+  collection- and transaction-scoped child listings. Their deprecated calls are
+  locally allowed so ordinary production code remains warning-free; these
+  compatibility assertions retire with F28-C.
+- This migration changes no listing I/O, ordering, snapshots, transaction
+  validation, persistent bytes, retries, random draws, or task scheduling.

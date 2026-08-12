@@ -857,7 +857,10 @@ async fn shutdown_rejects_every_public_async_entry_point() {
         coll.create_collection(b"child").await,
         Err(Error::ShuttingDown)
     ));
-    assert!(matches!(coll.collections().await, Err(Error::ShuttingDown)));
+    assert!(matches!(
+        coll.iter_collections().await,
+        Err(Error::ShuttingDown)
+    ));
     assert!(matches!(
         db.tx(|_| async { Ok::<(), Error>(()) }).await,
         Err(Error::ShuttingDown)
@@ -865,6 +868,7 @@ async fn shutdown_rejects_every_public_async_entry_point() {
 }
 
 #[tokio::test(start_paused = true)]
+#[allow(deprecated)]
 async fn list_keys() {
     let db = init_db(mem()).await;
     let coll = db
@@ -872,6 +876,9 @@ async fn list_keys() {
         .create_collection_if_absent(b"demo-coll")
         .await
         .unwrap();
+
+    let empty = coll.iter_keys().await.unwrap();
+    assert_eq!(empty.len(), 0);
 
     let keys: Vec<Vec<u8>> = (0u32..100).map(|i| i.to_be_bytes().to_vec()).collect();
     let test_val = b"val";
@@ -886,12 +893,20 @@ async fn list_keys() {
     .await
     .unwrap();
 
-    let got: Vec<Vec<u8>> = coll
+    let legacy: Vec<Vec<u8>> = coll
         .keys()
         .await
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
+
+    let mut plain = coll.iter_keys().await.unwrap();
+    assert_eq!(plain.len(), keys.len());
+    let first = plain.next().unwrap();
+    assert_eq!(plain.len(), keys.len() - 1);
+    drop(coll);
+    let got: Vec<Vec<u8>> = std::iter::once(first).chain(plain).collect();
+    assert_eq!(got, legacy);
 
     assert_eq!(got.len(), keys.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
@@ -1103,12 +1118,7 @@ async fn keys_listing_is_phantom_safe() {
     }
 
     // A listing sees exactly the seeded keys, sorted, with no duplicates.
-    let listed: Vec<Vec<u8>> = coll
-        .keys()
-        .await
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let listed: Vec<Vec<u8>> = coll.iter_keys().await.unwrap().collect();
     let mut sorted = listed.clone();
     sorted.sort();
     assert_eq!(listed, sorted, "listing is sorted");
@@ -1119,12 +1129,7 @@ async fn keys_listing_is_phantom_safe() {
     // than caching a stale set.
     let extra = 999u32.to_be_bytes().to_vec();
     coll.write(&extra, b"v").await.unwrap();
-    let listed2: Vec<Vec<u8>> = coll
-        .keys()
-        .await
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let listed2: Vec<Vec<u8>> = coll.iter_keys().await.unwrap().collect();
     assert!(
         listed2.contains(&extra),
         "new key visible to a later listing"
@@ -1177,12 +1182,7 @@ async fn listing_hides_keys_from_aborted_transactions() {
 
     // The listing observes exactly the committed keys, never the ghosts left
     // behind by the aborted transaction.
-    let listed: Vec<Vec<u8>> = coll
-        .keys()
-        .await
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let listed: Vec<Vec<u8>> = coll.iter_keys().await.unwrap().collect();
     assert_eq!(
         listed,
         vec![b"real-a".to_vec(), b"real-b".to_vec()],
@@ -1209,12 +1209,11 @@ async fn list_collections() {
     }
 
     let got: Vec<Vec<u8>> = coll
-        .collections()
+        .iter_collections()
         .await
         .unwrap()
-        .map(|entry| entry.map(|entry| entry.name))
-        .collect::<Result<_, _>>()
-        .unwrap();
+        .map(|entry| entry.name)
+        .collect();
 
     assert_eq!(got.len(), colls.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
@@ -1227,12 +1226,11 @@ async fn list_collections() {
 }
 
 async fn list_collections_of(coll: &Collection) -> Vec<Vec<u8>> {
-    coll.collections()
+    coll.iter_collections()
         .await
         .unwrap()
-        .map(|entry| entry.map(|entry| entry.name))
-        .collect::<Result<_, _>>()
-        .unwrap()
+        .map(|entry| entry.name)
+        .collect()
 }
 
 // The subcollection directory lives in the parent root (ADR-031), so listing is
