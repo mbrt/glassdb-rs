@@ -836,3 +836,26 @@ working document and is intentionally not committed with these changes.
   replay fallback, public visibility, persistent bytes, backend operations, and
   runtime error behavior are unchanged. No ADR was needed for this mechanical
   ownership move.
+
+## F31-B — Extract the simulation executor kernel
+
+- Moved the deterministic executor kernel into `sim::executor`: task and wake
+  queues, timer ordering, the thread-local handle, simulated time/spawn/yield and
+  entropy hooks, per-run setup, background-task draining, and the run loop now
+  have one focused owner. The scheduler module remains separate, and dedicated
+  task and runtime-adapter mechanics remain in `rt` for F31-C/F31-D.
+- Reduced `exec` to a compatibility facade. Its public scheduler, executor,
+  task-ID, and trace paths and its crate-visible runtime hooks are re-exported
+  at the same paths, so downstream `glassdb_concurr::rt` signatures and callers
+  did not change.
+- Moved the existing kernel tests with the implementation rather than copying
+  them. They continue to cover virtual/model time, deterministic Tokio select
+  seeding, sorted ready sets and cross-task wakes, entropy replay, task spawn and
+  join, and the deterministic step budget; scheduler-local tape/PCT tests remain
+  beside their policies. The existing runtime-seam source guard now recognizes
+  the executor's reviewed Tokio runtime/task uses at their new owner path rather
+  than at the facade. No migration-only test was added.
+- All three tape and both PCT harness trace digests remain byte-identical without
+  baseline edits. Task IDs, scheduler draw and selection order, virtual-time
+  advancement, panic/deadlock propagation, root completion, and drop-time task
+  handoff are unchanged. No ADR was needed for this mechanical ownership move.

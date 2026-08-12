@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::exec::{RuntimeEntropySource, RuntimeTraceEvent, RuntimeTraceObserver, TaskId};
 use crate::rng::Rng;
+use crate::sim::executor::{RuntimeEntropySource, RuntimeTraceEvent, RuntimeTraceObserver, TaskId};
 
 /// Decides which ready task to poll next. Implementations must be deterministic
 /// functions of their own state so the entire run replays from a seed/tape.
