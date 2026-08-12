@@ -73,3 +73,24 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no code or protocol issue. It identified stale storage
   architecture documentation, which now shows the explicit structural-log
   component and its `_s` recovery records.
+
+## F05-E — Extract structural recovery behind `Splitter`
+
+- Added a private concrete `StructuralRecovery` that owns durable log discovery,
+  source-writer fencing, recovery classification and cleanup, separator
+  publication state, and topology-participant settlement. `Splitter` remains the
+  background-loop facade and owns recursive parent splitting.
+- Recovery-to-split coordination uses resumable named actions rather than a
+  callback or backreference. The same separator-publication freshness epoch and
+  retry budget survive a requested parent split before recovery deletes its
+  exact structural-record observation.
+- Freshness barriers, source-fencing and reachability order, child cleanup order,
+  participant scoping and final removal, background wake/delay/spawn behavior,
+  random draws, backend operations, and persistent bytes are unchanged.
+- No migration-only tests were added. The existing roll-forward regression was
+  strengthened after adversarial review to force the recovery-specific parent
+  split action after separator publication and retain it as long-term
+  crash-recovery coverage.
+- The architecture module inventory now identifies the extracted recovery owner.
+  No ADR was added because this extraction changes neither protocol nor external
+  architectural contract.
