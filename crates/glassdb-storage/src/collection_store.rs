@@ -13,8 +13,7 @@ use prost::Message;
 
 use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
-use crate::lock::LockType;
-use crate::node::NodeLock;
+use crate::lock::SharedExclusiveLock;
 
 /// A decoded collection record.
 ///
@@ -23,7 +22,7 @@ use crate::node::NodeLock;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRecord {
     children: BTreeMap<Vec<u8>, CollectionId>,
-    directory_lock: NodeLock,
+    directory_lock: SharedExclusiveLock,
     directory_version: u64,
     topology_freeze: Option<TxId>,
     topology_participants: BTreeSet<TxId>,
@@ -34,7 +33,7 @@ impl CollectionRecord {
     pub fn new() -> Self {
         CollectionRecord {
             children: BTreeMap::new(),
-            directory_lock: NodeLock::default(),
+            directory_lock: SharedExclusiveLock::default(),
             directory_version: 0,
             topology_freeze: None,
             topology_participants: BTreeSet::new(),
@@ -85,7 +84,7 @@ impl CollectionRecord {
     }
 
     /// Returns the lock coordinating the direct-child directory.
-    pub fn directory_lock(&self) -> &NodeLock {
+    pub fn directory_lock(&self) -> &SharedExclusiveLock {
         &self.directory_lock
     }
 
@@ -177,7 +176,7 @@ impl CollectionRecord {
     /// Returns the encoded size without transient coordination holders.
     pub fn content_encoded_len(&self) -> usize {
         let mut record = self.clone();
-        record.directory_lock = NodeLock::default();
+        record.directory_lock = SharedExclusiveLock::default();
         record.topology_freeze = None;
         record.topology_participants.clear();
         record.encoded_len()
@@ -210,19 +209,9 @@ impl CollectionRecord {
         }
         Ok(CollectionRecord {
             children,
-            directory_lock: {
-                let lock = NodeLock::from_pb(raw.directory_lock);
-                match (lock.lock_type(), lock.holders()) {
-                    (LockType::None | LockType::Unknown, [])
-                    | (LockType::Read, [_, ..])
-                    | (LockType::Write, [_]) => lock,
-                    _ => {
-                        return Err(StorageError::other(
-                            "collection record has an invalid directory lock",
-                        ));
-                    }
-                }
-            },
+            directory_lock: SharedExclusiveLock::from_pb(raw.directory_lock).map_err(|_| {
+                StorageError::other("collection record has an invalid directory lock")
+            })?,
             directory_version: raw.directory_version,
             topology_freeze: (!raw.topology_freeze.is_empty())
                 .then(|| TxId::from_bytes(raw.topology_freeze)),
@@ -448,6 +437,31 @@ mod tests {
                 .topology_participants()
                 .any(|holder| holder == &participant)
         );
+    }
+
+    #[test]
+    fn decoding_rejects_invalid_directory_lock_states() {
+        for lock in [
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Create as i32,
+                locked_by: vec![vec![1]],
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![2], vec![1], vec![1]],
+            },
+        ] {
+            let raw = pb::CollectionRecord {
+                directory_lock: Some(lock),
+                ..pb::CollectionRecord::default()
+            };
+
+            let error = CollectionRecord::decode(&raw.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "collection record has an invalid directory lock"
+            );
+        }
     }
 
     #[test]

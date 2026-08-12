@@ -408,8 +408,7 @@ mod tests {
     use glassdb_data::{CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CurrentState, LockType, Node, Shard, ShardEntry, ShardStore, Timeline,
-        TreeRouter,
+        CachedStore, CurrentState, Node, Shard, ShardEntry, ShardStore, Timeline, TreeRouter,
     };
 
     use crate::monitor::Monitor;
@@ -522,13 +521,7 @@ mod tests {
                 writer: writer.clone(),
             }
         };
-        entries.insert(
-            key.to_vec(),
-            ShardEntry {
-                current,
-                ..ShardEntry::new(key)
-            },
-        );
+        entries.insert(key.to_vec(), ShardEntry::new(key).with_current(current));
         let new_shard = Shard::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_shard);
@@ -541,13 +534,10 @@ mod tests {
         seed_entry(
             store,
             key,
-            ShardEntry {
-                current: CurrentState::Inline {
-                    writer: writer.clone(),
-                    value: Arc::from(value),
-                },
-                ..ShardEntry::new(key)
-            },
+            ShardEntry::new(key).with_current(CurrentState::Inline {
+                writer: writer.clone(),
+                value: Arc::from(value),
+            }),
         )
         .await;
     }
@@ -560,8 +550,7 @@ mod tests {
             .await
             .unwrap();
         let mut entry = existing.entries().lookup(key).cloned().unwrap();
-        entry.lock_type = LockType::Write;
-        entry.locked_by = vec![holder.clone()];
+        entry.replace_write_lock(holder.clone());
         seed_entry(store, key, entry).await;
     }
 
@@ -616,14 +605,9 @@ mod tests {
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
-        entries.insert(
-            key.to_vec(),
-            ShardEntry {
-                lock_type: LockType::Write,
-                locked_by: vec![holder.clone()],
-                ..ShardEntry::new(key)
-            },
-        );
+        let mut entry = ShardEntry::new(key);
+        entry.replace_write_lock(holder.clone());
+        entries.insert(key.to_vec(), entry);
         let new_shard = Shard::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_shard);

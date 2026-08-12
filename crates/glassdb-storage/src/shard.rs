@@ -6,9 +6,8 @@
 //! compare-and-swap unit, so the encoding is canonical (entries sorted by key,
 //! holder sets sorted) and golden-anchored.
 //!
-//! This module defines an inert data type plus encode/decode and a pure
-//! [`Shard::lookup`]. It has no mutation policy and does no I/O; lock
-//! transitions, the protocol, and GC are added by later ADRs.
+//! This module defines inert data types, their pure lock transitions, and
+//! canonical encoding. It contains no conflict policy and performs no I/O.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::LockType;
+use crate::lock::{EntryLockState, LockType};
 
 /// A key's committed current value (ADR-051): the writer that produced it plus
 /// where the value itself lives.
@@ -89,12 +88,9 @@ impl CurrentState {
 pub struct ShardEntry {
     /// Raw user key bytes; also the entry's sort key.
     pub key: Vec<u8>,
-    /// Lock currently held on the key.
-    pub lock_type: LockType,
-    /// Transactions holding the lock (more than one only for read locks).
-    pub locked_by: Vec<TxId>,
     /// The key's committed current value, separate from the lock state above.
     pub current: CurrentState,
+    lock: EntryLockState,
 }
 
 impl ShardEntry {
@@ -102,10 +98,55 @@ impl ShardEntry {
     pub fn new(key: impl Into<Vec<u8>>) -> Self {
         ShardEntry {
             key: key.into(),
-            lock_type: LockType::None,
-            locked_by: Vec::new(),
             current: CurrentState::Absent,
+            lock: EntryLockState::default(),
         }
+    }
+
+    /// Sets the committed current state while preserving this entry's lock.
+    pub fn with_current(mut self, current: CurrentState) -> Self {
+        self.current = current;
+        self
+    }
+
+    /// Returns the lock type currently held on this entry.
+    pub fn lock_type(&self) -> LockType {
+        self.lock.lock_type()
+    }
+
+    /// Returns the transactions holding this entry's lock.
+    pub fn lock_holders(&self) -> &[TxId] {
+        self.lock.holders()
+    }
+
+    /// Reports whether `id` holds this entry's lock.
+    pub fn is_locked_by(&self, id: &TxId) -> bool {
+        self.lock.contains(id)
+    }
+
+    /// Acquires a shared-read hold for `holder`.
+    pub fn acquire_read_lock(&mut self, holder: TxId) {
+        self.lock.acquire_read(holder);
+    }
+
+    /// Replaces the entry lock with one exclusive writer.
+    pub fn replace_write_lock(&mut self, holder: TxId) {
+        self.replace_lock(EntryLockState::write(holder));
+    }
+
+    /// Replaces the entry lock with one exclusive creator.
+    pub fn replace_create_lock(&mut self, holder: TxId) {
+        self.replace_lock(EntryLockState::create(holder));
+    }
+
+    /// Replaces the entry lock with a validated state.
+    pub fn replace_lock(&mut self, lock: EntryLockState) {
+        self.lock = lock;
+    }
+
+    /// Releases `holder` from this entry's lock.
+    pub fn release_lock(&mut self, holder: &TxId) -> bool {
+        self.lock.release(holder)
     }
 
     /// Reports whether the key exists: it has a committed value and is not
@@ -119,7 +160,7 @@ impl ShardEntry {
     /// writer). Such an entry names no transaction and is indistinguishable
     /// from an absent one, so a mutation that leaves it this way may drop it.
     pub fn is_vestigial(&self) -> bool {
-        self.locked_by.is_empty() && matches!(self.current, CurrentState::Absent)
+        self.lock_holders().is_empty() && matches!(self.current, CurrentState::Absent)
     }
 }
 
@@ -238,33 +279,21 @@ impl Shard {
 }
 
 fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
-    // Sort the holder set so logically equal entries encode to identical bytes.
-    let mut locked_by: Vec<Vec<u8>> = e.locked_by.iter().map(|t| t.as_bytes().to_vec()).collect();
-    locked_by.sort();
+    let (lock_type, locked_by) = e.lock.to_wire();
     pb::ShardEntry {
         key: e.key.clone(),
-        lock_type: lock_type_to_proto(e.lock_type) as i32,
+        lock_type,
         locked_by,
         current: current_to_proto(&e.current),
     }
 }
 
 fn entry_from_proto(e: pb::ShardEntry) -> Result<ShardEntry, StorageError> {
-    let mut lock_type = lock_type_from_proto(e.lock_type);
-    let locked_by: Vec<TxId> = e.locked_by.into_iter().map(TxId::from_bytes).collect();
-    match (lock_type, locked_by.as_slice()) {
-        (LockType::None | LockType::Unknown, [])
-        | (LockType::Read, [_, ..])
-        | (LockType::Write | LockType::Create, [_]) => {}
-        _ => return Err(StorageError::other("shard entry has an invalid lock")),
-    }
-    if lock_type == LockType::Unknown {
-        lock_type = LockType::None;
-    }
+    let lock = EntryLockState::from_wire(e.lock_type, e.locked_by)
+        .map_err(|_| StorageError::other("shard entry has an invalid lock"))?;
     Ok(ShardEntry {
         key: e.key,
-        lock_type,
-        locked_by,
+        lock,
         current: current_from_proto(e.current)?,
     })
 }
@@ -312,29 +341,11 @@ fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, Sto
     }
 }
 
-fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
-    match t {
-        LockType::None => pb::lock::LockType::None,
-        LockType::Read => pb::lock::LockType::Read,
-        LockType::Write => pb::lock::LockType::Write,
-        LockType::Create => pb::lock::LockType::Create,
-        LockType::Unknown => pb::lock::LockType::Unknown,
-    }
-}
-
-fn lock_type_from_proto(t: i32) -> LockType {
-    match pb::lock::LockType::try_from(t) {
-        Ok(pb::lock::LockType::None) => LockType::None,
-        Ok(pb::lock::LockType::Read) => LockType::Read,
-        Ok(pb::lock::LockType::Write) => LockType::Write,
-        Ok(pb::lock::LockType::Create) => LockType::Create,
-        _ => LockType::Unknown,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::lock::lock_type_to_proto;
 
     fn entry(key: &[u8]) -> ShardEntry {
         ShardEntry::new(key)
@@ -344,33 +355,106 @@ mod tests {
         TxId::from_bytes(bytes.to_vec())
     }
 
+    fn encode_entry(entry: &ShardEntry) -> Vec<u8> {
+        Shard::from_entries([entry.clone()]).encode()
+    }
+
+    fn with_lock(mut entry: ShardEntry, lock: EntryLockState) -> ShardEntry {
+        entry.replace_lock(lock);
+        entry
+    }
+
+    #[test]
+    fn shared_entry_lock_acquisition_is_canonical_and_idempotent() {
+        let first = tx(&[1]);
+        let second = tx(&[2]);
+        let mut entry = ShardEntry::new(b"key");
+
+        entry.acquire_read_lock(second.clone());
+        entry.acquire_read_lock(first.clone());
+        assert_eq!(entry.lock_type(), LockType::Read);
+        assert_eq!(entry.lock_holders(), &[first.clone(), second.clone()]);
+        assert!(entry.is_locked_by(&first));
+
+        let encoded = encode_entry(&entry);
+        entry.acquire_read_lock(first.clone());
+        assert_eq!(encode_entry(&entry), encoded);
+
+        let mut reverse = ShardEntry::new(b"key");
+        reverse.acquire_read_lock(first.clone());
+        reverse.acquire_read_lock(second.clone());
+        assert_eq!(encode_entry(&reverse), encoded);
+
+        let mut replacement = EntryLockState::read(second);
+        replacement.acquire_read(first.clone());
+        assert_eq!(replacement.lock_type(), LockType::Read);
+        assert!(replacement.contains(&first));
+        assert!(replacement.release(&first));
+        assert!(!replacement.is_unlocked());
+        replacement.acquire_read(first.clone());
+        reverse.replace_lock(replacement);
+        assert_eq!(encode_entry(&reverse), encoded);
+
+        assert!(reverse.release_lock(&first));
+        assert_eq!(reverse.lock_type(), LockType::Read);
+        assert_eq!(reverse.lock_holders(), &[tx(&[2])]);
+        let released_encoded = encode_entry(&reverse);
+        assert!(!reverse.release_lock(&first));
+        assert_eq!(encode_entry(&reverse), released_encoded);
+    }
+
+    #[test]
+    fn exclusive_entry_lock_replacement_and_release_are_idempotent() {
+        let writer = tx(&[3]);
+        let creator = tx(&[4]);
+        let unrelated = tx(&[5]);
+        let mut entry = ShardEntry::new(b"key");
+
+        entry.replace_write_lock(writer.clone());
+        assert_eq!(entry.lock_type(), LockType::Write);
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&writer));
+        let write_encoded = encode_entry(&entry);
+        entry.replace_write_lock(writer.clone());
+        assert_eq!(encode_entry(&entry), write_encoded);
+        assert!(entry.release_lock(&writer));
+        assert_eq!(entry.lock_type(), LockType::None);
+        assert!(entry.lock_holders().is_empty());
+        assert!(!entry.release_lock(&writer));
+
+        entry.replace_create_lock(creator.clone());
+        assert_eq!(entry.lock_type(), LockType::Create);
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&creator));
+        let create_encoded = encode_entry(&entry);
+        entry.replace_create_lock(creator.clone());
+        assert_eq!(encode_entry(&entry), create_encoded);
+
+        assert!(!entry.release_lock(&unrelated));
+        assert_eq!(encode_entry(&entry), create_encoded);
+        assert!(entry.release_lock(&creator));
+        assert_eq!(entry.lock_type(), LockType::None);
+        assert!(entry.lock_holders().is_empty());
+        let unlocked_encoded = encode_entry(&entry);
+        assert!(!entry.release_lock(&creator));
+        assert_eq!(encode_entry(&entry), unlocked_encoded);
+    }
+
     #[test]
     fn round_trip() {
+        let mut read_lock = EntryLockState::read(tx(&[5]));
+        read_lock.acquire_read(tx(&[6]));
         let shard = Shard::from_entries([
-            ShardEntry {
-                lock_type: LockType::Write,
-                locked_by: vec![tx(&[1, 2, 3, 4])],
-                current: CurrentState::External {
+            with_lock(
+                ShardEntry::new(b"alpha").with_current(CurrentState::External {
                     writer: tx(&[9, 9]),
-                },
-                ..ShardEntry::new(b"alpha")
-            },
-            ShardEntry {
-                lock_type: LockType::Read,
-                locked_by: vec![tx(&[5]), tx(&[6])],
-                ..ShardEntry::new(b"beta")
-            },
-            ShardEntry {
-                current: CurrentState::Tombstone { writer: tx(&[7]) },
-                ..ShardEntry::new(b"gamma")
-            },
-            ShardEntry {
-                current: CurrentState::Inline {
-                    writer: tx(&[8]),
-                    value: Arc::from(b"hello".as_slice()),
-                },
-                ..ShardEntry::new(b"delta")
-            },
+                }),
+                EntryLockState::write(tx(&[1, 2, 3, 4])),
+            ),
+            with_lock(ShardEntry::new(b"beta"), read_lock),
+            ShardEntry::new(b"gamma").with_current(CurrentState::Tombstone { writer: tx(&[7]) }),
+            ShardEntry::new(b"delta").with_current(CurrentState::Inline {
+                writer: tx(&[8]),
+                value: Arc::from(b"hello".as_slice()),
+            }),
         ]);
 
         let decoded = Shard::decode(&shard.encode()).unwrap();
@@ -381,17 +465,14 @@ mod tests {
     // carries the distinction even though the payload has no bytes.
     #[test]
     fn empty_inline_value_is_distinct_from_external() {
-        let inline = Shard::from_entries([ShardEntry {
-            current: CurrentState::Inline {
+        let inline =
+            Shard::from_entries([ShardEntry::new(b"k").with_current(CurrentState::Inline {
                 writer: tx(&[1]),
                 value: Arc::from(b"".as_slice()),
-            },
-            ..ShardEntry::new(b"k")
-        }]);
-        let external = Shard::from_entries([ShardEntry {
-            current: CurrentState::External { writer: tx(&[1]) },
-            ..ShardEntry::new(b"k")
-        }]);
+            })]);
+        let external = Shard::from_entries([
+            ShardEntry::new(b"k").with_current(CurrentState::External { writer: tx(&[1]) })
+        ]);
 
         assert_ne!(inline.encode(), external.encode());
         assert_eq!(Shard::decode(&inline.encode()).unwrap(), inline);
@@ -428,24 +509,94 @@ mod tests {
     }
 
     #[test]
+    fn decoding_accepts_and_canonicalizes_the_lock_wire_matrix() {
+        use pb::lock::LockType as PbLockType;
+
+        let valid_locks = [
+            (
+                PbLockType::Unknown as i32,
+                Vec::new(),
+                LockType::None,
+                Vec::new(),
+            ),
+            (99, Vec::new(), LockType::None, Vec::new()),
+            (
+                PbLockType::None as i32,
+                Vec::new(),
+                LockType::None,
+                Vec::new(),
+            ),
+            (
+                PbLockType::Read as i32,
+                vec![vec![2], vec![1]],
+                LockType::Read,
+                vec![tx(&[1]), tx(&[2])],
+            ),
+            (
+                PbLockType::Write as i32,
+                vec![vec![3]],
+                LockType::Write,
+                vec![tx(&[3])],
+            ),
+            (
+                PbLockType::Create as i32,
+                vec![vec![4]],
+                LockType::Create,
+                vec![tx(&[4])],
+            ),
+        ];
+
+        for (lock_type, locked_by, expected_type, expected_holders) in valid_locks {
+            let raw = pb::Shard {
+                entries: vec![pb::ShardEntry {
+                    key: b"k".to_vec(),
+                    lock_type,
+                    locked_by,
+                    current: None,
+                }],
+            };
+
+            let shard = Shard::decode(&raw.encode_to_vec()).unwrap();
+            let entry = shard.lookup(b"k").unwrap();
+            assert_eq!(entry.lock_type(), expected_type);
+            assert_eq!(entry.lock_holders(), expected_holders);
+
+            let canonical = pb::Shard::decode(shard.encode().as_slice()).unwrap();
+            assert_eq!(
+                canonical.entries[0].lock_type,
+                lock_type_to_proto(expected_type) as i32
+            );
+            assert_eq!(
+                canonical.entries[0].locked_by,
+                expected_holders
+                    .iter()
+                    .map(|holder| holder.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn decoding_rejects_inconsistent_entry_locks() {
         use pb::lock::LockType as PbLockType;
 
         let invalid_locks = [
-            (PbLockType::None, vec![vec![1]]),
-            (PbLockType::Unknown, vec![vec![1]]),
-            (PbLockType::Read, Vec::new()),
-            (PbLockType::Write, Vec::new()),
-            (PbLockType::Write, vec![vec![1], vec![2]]),
-            (PbLockType::Create, Vec::new()),
-            (PbLockType::Create, vec![vec![1], vec![2]]),
+            (PbLockType::None as i32, vec![vec![1]]),
+            (PbLockType::Unknown as i32, vec![vec![1]]),
+            (99, vec![vec![1]]),
+            (PbLockType::Read as i32, Vec::new()),
+            (PbLockType::Read as i32, vec![vec![1], vec![1]]),
+            (PbLockType::Write as i32, Vec::new()),
+            (PbLockType::Write as i32, vec![vec![1], vec![2]]),
+            (PbLockType::Create as i32, Vec::new()),
+            (PbLockType::Create as i32, vec![vec![1], vec![2]]),
         ];
 
         for (lock_type, locked_by) in invalid_locks {
             let raw = pb::Shard {
                 entries: vec![pb::ShardEntry {
                     key: b"k".to_vec(),
-                    lock_type: lock_type as i32,
+                    lock_type,
                     locked_by,
                     current: None,
                 }],
@@ -466,7 +617,7 @@ mod tests {
         };
 
         let shard = Shard::decode(&raw.encode_to_vec()).unwrap();
-        assert_eq!(shard.lookup(b"k").unwrap().lock_type, LockType::None);
+        assert_eq!(shard.lookup(b"k").unwrap().lock_type(), LockType::None);
     }
 
     #[test]
@@ -506,11 +657,11 @@ mod tests {
     #[test]
     fn encoding_is_canonical_regardless_of_holder_order() {
         let mk = |holders: Vec<TxId>| {
-            Shard::from_entries([ShardEntry {
-                lock_type: LockType::Read,
-                locked_by: holders,
-                ..ShardEntry::new(b"k")
-            }])
+            let mut entry = ShardEntry::new(b"k");
+            for holder in holders {
+                entry.acquire_read_lock(holder);
+            }
+            Shard::from_entries([entry])
         };
         let a = mk(vec![TxId::from_bytes(vec![3]), TxId::from_bytes(vec![1])]);
         let b = mk(vec![TxId::from_bytes(vec![1]), TxId::from_bytes(vec![3])]);
@@ -519,27 +670,19 @@ mod tests {
 
     #[test]
     fn lookup_and_exists() {
+        let locked_only = with_lock(
+            ShardEntry::new(b"locked-only"),
+            EntryLockState::create(tx(&[3])),
+        );
         let shard = Shard::from_entries([
-            ShardEntry {
-                current: CurrentState::External { writer: tx(&[1]) },
-                ..ShardEntry::new(b"live")
-            },
-            ShardEntry {
-                current: CurrentState::Inline {
-                    writer: tx(&[4]),
-                    value: Arc::from(b"v".as_slice()),
-                },
-                ..ShardEntry::new(b"live-inline")
-            },
-            ShardEntry {
-                current: CurrentState::Tombstone { writer: tx(&[2]) },
-                ..ShardEntry::new(b"tombstone")
-            },
-            ShardEntry {
-                lock_type: LockType::Create,
-                locked_by: vec![tx(&[3])],
-                ..ShardEntry::new(b"locked-only")
-            },
+            ShardEntry::new(b"live").with_current(CurrentState::External { writer: tx(&[1]) }),
+            ShardEntry::new(b"live-inline").with_current(CurrentState::Inline {
+                writer: tx(&[4]),
+                value: Arc::from(b"v".as_slice()),
+            }),
+            ShardEntry::new(b"tombstone")
+                .with_current(CurrentState::Tombstone { writer: tx(&[2]) }),
+            locked_only,
         ]);
 
         assert!(shard.exists(b"live"));
@@ -626,14 +769,11 @@ mod tests {
     // Changing the on-disk format must break this test.
     #[test]
     fn golden_encoding() {
-        let shard = Shard::from_entries([ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![tx(&[1, 2, 3, 4])],
-            current: CurrentState::External {
-                writer: tx(&[0xaa, 0xbb]),
-            },
-            ..ShardEntry::new(b"Hello")
-        }]);
+        let entry = ShardEntry::new(b"Hello").with_current(CurrentState::External {
+            writer: tx(&[0xaa, 0xbb]),
+        });
+        let shard =
+            Shard::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
         let got = shard.encode();
         let want = [
             0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
@@ -645,15 +785,12 @@ mod tests {
     // Golden vector for the inline current state (ADR-051).
     #[test]
     fn golden_inline_encoding() {
-        let shard = Shard::from_entries([ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![tx(&[1, 2, 3, 4])],
-            current: CurrentState::Inline {
-                writer: tx(&[0xaa, 0xbb]),
-                value: Arc::from(b"hi".as_slice()),
-            },
-            ..ShardEntry::new(b"Hello")
-        }]);
+        let entry = ShardEntry::new(b"Hello").with_current(CurrentState::Inline {
+            writer: tx(&[0xaa, 0xbb]),
+            value: Arc::from(b"hi".as_slice()),
+        });
+        let shard =
+            Shard::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
         let got = shard.encode();
         let want = [
             0x0a, 0x19, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,

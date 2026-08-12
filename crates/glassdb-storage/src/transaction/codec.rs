@@ -12,7 +12,7 @@ use prost::Message;
 use super::{TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite};
 use crate::cached_store::Codec;
 use crate::error::StorageError;
-use crate::lock::LockType;
+use crate::lock::{LockType, lock_type_from_proto as parse_lock_type, lock_type_to_proto};
 
 /// Canonical protobuf codec for transaction-log objects.
 pub(crate) struct TxLogCodec;
@@ -454,26 +454,6 @@ fn validate_database_membership(
         check(collection)?;
     }
     Ok(())
-}
-
-fn lock_type_to_proto(typ: LockType) -> pb::lock::LockType {
-    match typ {
-        LockType::None => pb::lock::LockType::None,
-        LockType::Read => pb::lock::LockType::Read,
-        LockType::Write => pb::lock::LockType::Write,
-        LockType::Create => pb::lock::LockType::Create,
-        LockType::Unknown => pb::lock::LockType::Unknown,
-    }
-}
-
-fn parse_lock_type(typ: i32) -> LockType {
-    match pb::lock::LockType::try_from(typ) {
-        Ok(pb::lock::LockType::None) => LockType::None,
-        Ok(pb::lock::LockType::Read) => LockType::Read,
-        Ok(pb::lock::LockType::Write) => LockType::Write,
-        Ok(pb::lock::LockType::Create) => LockType::Create,
-        _ => LockType::Unknown,
-    }
 }
 
 fn system_to_proto_ts(timestamp: SystemTime) -> prost_types::Timestamp {

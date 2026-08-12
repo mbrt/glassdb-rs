@@ -224,9 +224,9 @@ impl KeyStateResolver {
             .resolve_effective(key, entry, own_lock_holder, requirement)
             .await?;
         if let Some(entry) = entry
-            && entry.lock_type == LockType::Read
+            && entry.lock_type() == LockType::Read
         {
-            for holder in &entry.locked_by {
+            for holder in entry.lock_holders() {
                 if Some(holder) == own_lock_holder {
                     continue;
                 }
@@ -265,15 +265,15 @@ impl KeyStateResolver {
             return Ok(EffectiveResolution::default());
         };
         let mut resolved = EffectiveResolution::from_current(&entry.current);
-        if !matches!(entry.lock_type, LockType::Write | LockType::Create) {
+        if !matches!(entry.lock_type(), LockType::Write | LockType::Create) {
             return Ok(resolved);
         }
-        if entry.locked_by.len() > 1 {
+        if entry.lock_holders().len() > 1 {
             return Err(TransError::other(
                 "exclusive shard entry has more than one holder",
             ));
         }
-        let Some(holder) = entry.locked_by.first() else {
+        let Some(holder) = entry.lock_holders().first() else {
             return Ok(resolved);
         };
         if Some(holder) == own_lock_holder {
@@ -312,7 +312,7 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionAddress, DbRoot};
     use glassdb_storage::transaction::{TLogger, TxLock, TxLog, TxWrite};
-    use glassdb_storage::{CachedStore, Timeline};
+    use glassdb_storage::{CachedStore, EntryLockState, Timeline};
 
     use super::*;
     use crate::monitor::ProtocolTiming;
@@ -368,14 +368,14 @@ mod tests {
             &self,
             key: &KeyRef,
             holder: &TxId,
-            lock_type: LockType,
+            typ: LockType,
             status: TxCommitStatus,
             deleted: Option<bool>,
         ) {
             let mut log = TxLog::new(holder.clone(), status);
             log.locks.push(TxLock::Entry {
                 key: key.clone(),
-                typ: lock_type,
+                typ,
             });
             if let Some(deleted) = deleted {
                 log.writes.push(TxWrite {
@@ -534,6 +534,29 @@ mod tests {
         operations: ProjectionOperations,
     }
 
+    fn locked_entry(
+        key: &[u8],
+        current: CurrentState,
+        typ: LockType,
+        holders: Vec<TxId>,
+    ) -> ShardEntry {
+        let mut holders = holders.into_iter();
+        let first = holders.next().expect("a held lock needs a holder");
+        let mut lock = match typ {
+            LockType::Read => EntryLockState::read(first),
+            LockType::Write => EntryLockState::write(first),
+            LockType::Create => EntryLockState::create(first),
+            LockType::Unknown | LockType::None => panic!("a held lock needs a held type"),
+        };
+        for holder in holders {
+            assert_eq!(typ, LockType::Read, "only read locks may be shared");
+            lock.acquire_read(holder);
+        }
+        let mut entry = ShardEntry::new(key).with_current(current);
+        entry.replace_lock(lock);
+        entry
+    }
+
     async fn assert_projections(
         harness: &ResolutionHarness,
         key: &KeyRef,
@@ -596,31 +619,26 @@ mod tests {
     async fn assert_exclusive_case(
         current_case: CurrentCase,
         exclusive_case: ExclusiveCase,
-        lock_type: LockType,
+        typ: LockType,
     ) {
         let harness = ResolutionHarness::new();
         let key = KeyRef::new(CollectionAddress::root("db"), b"key");
         let predecessor = TxId::with_priority(1, b"previous");
         let holder = TxId::with_priority(2, b"holder");
         let current = current_case.current(&predecessor);
-        let entry = ShardEntry {
-            lock_type,
-            locked_by: vec![holder.clone()],
-            current: current.clone(),
-            ..ShardEntry::new(key.key())
-        };
+        let entry = locked_entry(key.key(), current.clone(), typ, vec![holder.clone()]);
         harness
             .seed_transaction(
                 &key,
                 &holder,
-                lock_type,
+                typ,
                 exclusive_case.status(),
                 exclusive_case.committed_deletion(),
             )
             .await;
 
         let context = format!(
-            "{} current / {} {lock_type} holder",
+            "{} current / {} {typ} holder",
             current_case.name(),
             exclusive_case.name()
         );
@@ -714,12 +732,12 @@ mod tests {
             }
 
             let current = current_case.current(&predecessor);
-            let entry = ShardEntry {
-                lock_type: LockType::Read,
-                locked_by: vec![pending.clone(), committed, aborted, wounded],
-                current: current.clone(),
-                ..ShardEntry::new(key.key())
-            };
+            let entry = locked_entry(
+                key.key(),
+                current.clone(),
+                LockType::Read,
+                vec![pending.clone(), committed, aborted, wounded],
+            );
             let context = format!("{} current / shared readers", current_case.name());
             // Writer-only resolution must not pay to reconcile compatible
             // readers; holder resolution is the projection that needs them.
@@ -771,12 +789,7 @@ mod tests {
                 writer: predecessor.clone(),
                 value: Arc::from(INLINE_VALUE),
             };
-            let entry = ShardEntry {
-                lock_type,
-                locked_by: vec![holder.clone()],
-                current: current.clone(),
-                ..ShardEntry::new(key.key())
-            };
+            let entry = locked_entry(key.key(), current.clone(), lock_type, vec![holder.clone()]);
 
             let (state, _background) = harness.resolver();
             harness.clear_operations();
@@ -812,64 +825,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn invalid_exclusive_cardinality_fails_without_io() {
-        for lock_type in [LockType::Write, LockType::Create] {
-            let harness = ResolutionHarness::new();
-            let key = KeyRef::new(CollectionAddress::root("db"), b"key");
-            let predecessor = TxId::with_priority(1, b"previous");
-            let first = TxId::with_priority(2, b"first");
-            let second = TxId::with_priority(3, b"second");
-            for holder in [&first, &second] {
-                harness
-                    .seed_transaction(&key, holder, lock_type, TxCommitStatus::Pending, None)
-                    .await;
-            }
-            let entry = ShardEntry {
-                lock_type,
-                locked_by: vec![first, second],
-                current: CurrentState::External {
-                    writer: predecessor,
-                },
-                ..ShardEntry::new(key.key())
-            };
-            let (state, _background) = harness.resolver();
-
-            harness.clear_operations();
-            let writer_error = state
-                .resolve_writer(&key, Some(&entry), Requirement::Any)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                writer_error.to_string(),
-                "exclusive shard entry has more than one holder"
-            );
-            harness.assert_operations(0, &format!("invalid {lock_type}: writer"));
-
-            harness.clear_operations();
-            let holder_error = state
-                .resolve_holders(&key, Some(&entry), None, Requirement::Any)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                holder_error.to_string(),
-                "exclusive shard entry has more than one holder"
-            );
-            harness.assert_operations(0, &format!("invalid {lock_type}: holders"));
-
-            harness.clear_operations();
-            let existence_error = state
-                .entry_exists(&key, &entry, None, Requirement::Any)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                existence_error.to_string(),
-                "exclusive shard entry has more than one holder"
-            );
-            harness.assert_operations(0, &format!("invalid {lock_type}: existence"));
-        }
-    }
-
     // Writer and liveness must describe the same holder state. Resolving them
     // in separate passes could instead pair the pending predecessor with the
     // committed holder's removable lock.
@@ -888,14 +843,14 @@ mod tests {
             deleted: false,
             prev_writer: predecessor.clone(),
         }];
-        let entry = ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![holder.clone()],
-            current: CurrentState::External {
+        let entry = locked_entry(
+            key.key(),
+            CurrentState::External {
                 writer: predecessor.clone(),
             },
-            ..ShardEntry::new(key.key())
-        };
+            LockType::Write,
+            vec![holder.clone()],
+        );
 
         let state = KeyStateResolver::new(monitor.clone());
         let pending = state

@@ -37,7 +37,8 @@ use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
 use glassdb_data::{KeyRef, LeafRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
-    CurrentState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TreeRouter,
+    CurrentState, EntryLockState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry,
+    TreeRouter,
 };
 
 use crate::access::{Data, WriteOp};
@@ -411,7 +412,7 @@ impl ShardResolver for WriteBackResolver {
         let owns_entry = self.intents.iter().any(|intent| {
             staged
                 .get(&intent.raw_key)
-                .is_some_and(|entry| entry.locked_by.contains(&self.id))
+                .is_some_and(|entry| entry.is_locked_by(&self.id))
         });
         let owns_membership = staged_locks.membership().contains(&self.id);
         let mut locks = staged_locks.clone();
@@ -485,9 +486,7 @@ impl ShardResolver for ReleaseResolver {
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let owns_entry = staged
-            .values()
-            .any(|entry| entry.locked_by.contains(&self.id));
+        let owns_entry = staged.values().any(|entry| entry.is_locked_by(&self.id));
         let owns_membership = staged_locks.membership().contains(&self.id);
         let mut locks = staged_locks.clone();
         if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
@@ -591,7 +590,7 @@ async fn resolve_and_lock(
     // outrank, and wait for the first one we do not (hold-and-wait, ADR-024) —
     // keeping every lock already acquired elsewhere.
     let compatible = matches!(intent.desired, Desired::Read)
-        && !matches!(e.lock_type, LockType::Write | LockType::Create);
+        && !matches!(e.lock_type(), LockType::Write | LockType::Create);
     if !compatible {
         for holder in &pending {
             match try_reclaim(ctx.tmon, id, holder).await? {
@@ -604,22 +603,18 @@ async fn resolve_and_lock(
 
     match intent.desired {
         Desired::Read => {
-            let mut holders = pending;
-            if !holders.contains(id) {
-                holders.push(id.clone());
+            let mut lock = EntryLockState::read(id.clone());
+            for holder in pending {
+                lock.acquire_read(holder);
             }
-            e.locked_by = holders;
-            e.lock_type = LockType::Read;
+            e.replace_lock(lock);
         }
         Desired::Put | Desired::Delete => {
-            e.locked_by = vec![id.clone()];
-            e.lock_type = if exists_before {
-                LockType::Write
-            } else if matches!(intent.desired, Desired::Put) {
-                LockType::Create
+            if !exists_before && matches!(intent.desired, Desired::Put) {
+                e.replace_create_lock(id.clone());
             } else {
-                LockType::Write
-            };
+                e.replace_write_lock(id.clone());
+            }
         }
     }
     let changes_membership = match intent.desired {
@@ -646,7 +641,7 @@ fn writeback_changes(
         let Some(e) = entries.get(&intent.raw_key) else {
             continue;
         };
-        if !e.locked_by.contains(id) {
+        if !e.is_locked_by(id) {
             continue;
         }
         let mut e = e.clone();
@@ -670,10 +665,7 @@ fn writeback_changes(
             }
             Desired::Read => {}
         }
-        e.locked_by.retain(|h| h != id);
-        if e.locked_by.is_empty() {
-            e.lock_type = LockType::None;
-        }
+        e.release_lock(id);
         changes.push((intent.raw_key.clone(), e));
     }
     WritebackStaged {
@@ -692,14 +684,11 @@ fn release_changes(
 ) -> Vec<(Vec<u8>, ShardEntry)> {
     let mut changes = Vec::new();
     for (k, e) in entries {
-        if !e.locked_by.contains(id) {
+        if !e.is_locked_by(id) {
             continue;
         }
         let mut e = e.clone();
-        e.locked_by.retain(|h| h != id);
-        if e.locked_by.is_empty() {
-            e.lock_type = LockType::None;
-        }
+        e.release_lock(id);
         changes.push((k.clone(), e));
     }
     changes
@@ -1556,8 +1545,8 @@ mod tests {
         // A create installs the entry lock and membership-W while proving the
         // structural gate open in the same leaf CAS.
         let e = entry_of(&ctx, key).await.expect("entry installed");
-        assert_eq!(e.lock_type, LockType::Create);
-        assert_eq!(e.locked_by, vec![tx.clone()]);
+        assert_eq!(e.lock_type(), LockType::Create);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&tx));
         let loaded = ctx
             .shards
             .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
@@ -1577,11 +1566,9 @@ mod tests {
         let (locker, ctx) = new_test_locker(recorder).await;
         let unrelated = mk_tid(1, "unrelated");
         let tx = mk_tid(2, "tx");
-        let root = Node::leaf(Shard::from_entries([ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![unrelated.clone()],
-            ..ShardEntry::new(b"other")
-        }]));
+        let mut other = ShardEntry::new(b"other");
+        other.replace_write_lock(unrelated.clone());
+        let root = Node::leaf(Shard::from_entries([other]));
         replace_root(&ctx, &root).await;
         log.lock().unwrap().clear();
         ctx.monitor.begin_tx(&tx);
@@ -1647,8 +1634,8 @@ mod tests {
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert_eq!(
-            loaded.entries().lookup(b"target").unwrap().locked_by,
-            vec![tx]
+            loaded.entries().lookup(b"target").unwrap().lock_holders(),
+            std::slice::from_ref(&tx)
         );
     }
 
@@ -1656,15 +1643,9 @@ mod tests {
     async fn create_at_content_cap_reports_leaf_full_without_staging() {
         let writer = mk_tid(0, "seed");
         let tx = mk_tid(1, "tx");
-        let existing = ShardEntry {
-            current: CurrentState::External { writer },
-            ..ShardEntry::new(b"a")
-        };
-        let created = ShardEntry {
-            lock_type: LockType::Create,
-            locked_by: vec![tx.clone()],
-            ..ShardEntry::new(b"z")
-        };
+        let existing = ShardEntry::new(b"a").with_current(CurrentState::External { writer });
+        let mut created = ShardEntry::new(b"z");
+        created.replace_create_lock(tx.clone());
         let mut node = Node::leaf(Shard::from_entries([existing, created]));
         node.set_membership_writer(tx.clone());
         let content_limit = node.content_encoded_len() - 1;
@@ -1765,8 +1746,8 @@ mod tests {
         lock_ok(&locker, &tx2, &group_of(key, read_intent(key))).await;
 
         let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.lock_type, LockType::Read);
-        let mut holders = e.locked_by.clone();
+        assert_eq!(e.lock_type(), LockType::Read);
+        let mut holders = e.lock_holders().to_vec();
         holders.sort_by_key(|t| t.to_string());
         let mut expected = vec![tx1.clone(), tx2.clone()];
         expected.sort_by_key(|t| t.to_string());
@@ -1791,7 +1772,7 @@ mod tests {
         lock_ok(&locker, &old, &group_of(key, put_intent(key))).await;
 
         let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.locked_by, vec![old.clone()]);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&old));
         assert_eq!(
             ctx.monitor.tx_status(&young).await.unwrap(),
             TxCommitStatus::Wounded
@@ -1841,7 +1822,7 @@ mod tests {
         );
 
         let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.locked_by, vec![young.clone()]);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&young));
     }
 
     // ADR-024: after waiting, a younger transaction help-forwards a holder that
@@ -1905,7 +1886,7 @@ mod tests {
         );
 
         let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.locked_by, vec![young.clone()]);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&young));
         // The committed writer was help-forwarded as the effective value.
         assert_eq!(e.current.writer(), Some(&old));
     }
@@ -1933,8 +1914,8 @@ mod tests {
         assert!(superseded.is_empty());
 
         let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.lock_type, LockType::None);
-        assert!(e.locked_by.is_empty());
+        assert_eq!(e.lock_type(), LockType::None);
+        assert!(e.lock_holders().is_empty());
         assert_eq!(e.current, CurrentState::External { writer: tx });
         let loaded = ctx
             .shards
@@ -1981,7 +1962,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.node().structural_gate().holders(), &[gate]);
         let entry = loaded.entries().lookup(key).unwrap();
-        assert_eq!(entry.locked_by, vec![writer]);
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&writer));
         assert_eq!(entry.current.writer(), Some(&mk_tid(0, "seed")));
     }
 
@@ -2077,10 +2058,9 @@ mod tests {
         };
         replace_root(
             &ctx,
-            &Node::leaf(Shard::from_entries([ShardEntry {
-                current: inlined.clone(),
-                ..ShardEntry::new(key)
-            }])),
+            &Node::leaf(Shard::from_entries([
+                ShardEntry::new(key).with_current(inlined.clone())
+            ])),
         )
         .await;
 
@@ -2106,16 +2086,9 @@ mod tests {
             writer: tx.clone(),
             value: Arc::from(b"kept".as_slice()),
         };
-        replace_root(
-            &ctx,
-            &Node::leaf(Shard::from_entries([ShardEntry {
-                lock_type: LockType::Write,
-                locked_by: vec![tx.clone()],
-                current: inlined.clone(),
-                ..ShardEntry::new(key)
-            }])),
-        )
-        .await;
+        let mut entry = ShardEntry::new(key).with_current(inlined.clone());
+        entry.replace_write_lock(tx.clone());
+        replace_root(&ctx, &Node::leaf(Shard::from_entries([entry]))).await;
 
         let groups = group_of(key, put_intent(key));
         locker
@@ -2131,7 +2104,7 @@ mod tests {
 
         let entry = entry_of(&ctx, key).await.unwrap();
         assert_eq!(entry.current, inlined);
-        assert!(entry.locked_by.is_empty());
+        assert!(entry.lock_holders().is_empty());
     }
 
     // The node's hard cap is no licence to demote either: an acquisition whose
@@ -2147,19 +2120,12 @@ mod tests {
             writer: writer.clone(),
             value: Arc::from(b"kept".as_slice()),
         };
-        let seeded = ShardEntry {
-            current: inlined.clone(),
-            ..ShardEntry::new(key)
-        };
+        let seeded = ShardEntry::new(key).with_current(inlined.clone());
         // A cap with room for the read lock over a pointer, but not over the
         // inline bytes the entry actually carries: demoting the payload is the
         // only way this acquisition could fit.
-        let demoted = ShardEntry {
-            lock_type: LockType::Read,
-            locked_by: vec![reader.clone()],
-            current: CurrentState::External { writer },
-            ..ShardEntry::new(key)
-        };
+        let mut demoted = ShardEntry::new(key).with_current(CurrentState::External { writer });
+        demoted.acquire_read_lock(reader.clone());
         let policy = SplitPolicy {
             node_max_bytes: Node::leaf(Shard::from_entries([demoted])).encoded_len(),
             split_headroom_bytes: 0,
@@ -2289,10 +2255,7 @@ mod tests {
             .collect();
         entries.insert(
             key.to_vec(),
-            ShardEntry {
-                current: CurrentState::External { writer },
-                ..ShardEntry::new(key)
-            },
+            ShardEntry::new(key).with_current(CurrentState::External { writer }),
         );
         let new_shard = Shard::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
@@ -2465,8 +2428,12 @@ mod tests {
             "two readers must share a single CAS"
         );
         let e = entry_of(&ctx, key).await.unwrap();
-        assert_eq!(e.lock_type, LockType::Read);
-        assert_eq!(e.locked_by.len(), 2, "both readers hold the shared lock");
+        assert_eq!(e.lock_type(), LockType::Read);
+        assert_eq!(
+            e.lock_holders().len(),
+            2,
+            "both readers hold the shared lock"
+        );
     }
 
     // Two concurrent writers on *disjoint* keys of the same shard do not conflict,
@@ -2518,8 +2485,14 @@ mod tests {
             1,
             "disjoint writers batch into one CAS"
         );
-        assert_eq!(entry_of(&ctx, &ka).await.unwrap().locked_by, vec![tx1]);
-        assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![tx2]);
+        assert_eq!(
+            entry_of(&ctx, &ka).await.unwrap().lock_holders(),
+            std::slice::from_ref(&tx1)
+        );
+        assert_eq!(
+            entry_of(&ctx, &kb).await.unwrap().lock_holders(),
+            std::slice::from_ref(&tx2)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2550,7 +2523,10 @@ mod tests {
             waiting.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
         ));
-        assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![young]);
+        assert_eq!(
+            entry_of(&ctx, &kb).await.unwrap().lock_holders(),
+            std::slice::from_ref(&young)
+        );
     }
 
     // Locks + commits `key` for `tx`, leaving the shard entry holding the write
@@ -2611,10 +2587,10 @@ mod tests {
         );
         let ea = entry_of(&ctx, &ka).await.unwrap();
         assert_eq!(ea.current.writer(), Some(&tx1));
-        assert!(ea.locked_by.is_empty());
+        assert!(ea.lock_holders().is_empty());
         let eb = entry_of(&ctx, &kb).await.unwrap();
         assert_eq!(eb.current.writer(), Some(&tx2));
-        assert!(eb.locked_by.is_empty());
+        assert!(eb.lock_holders().is_empty());
     }
 
     // A write-back reorders into a concurrent acquire round for the same shard on
@@ -2662,7 +2638,10 @@ mod tests {
             entry_of(&ctx, &ka).await.unwrap().current.writer(),
             Some(&tx1)
         );
-        assert_eq!(entry_of(&ctx, &kb).await.unwrap().locked_by, vec![tx2]);
+        assert_eq!(
+            entry_of(&ctx, &kb).await.unwrap().lock_holders(),
+            std::slice::from_ref(&tx2)
+        );
     }
 
     // Cancelling the inline write-back driver must hand a merged live acquire
@@ -2724,16 +2703,16 @@ mod tests {
         assert!(matches!(acquired, ShardsOutcome::Locked(_)));
 
         let written = entry_of(&ctx, &written_key).await.unwrap();
-        assert_eq!(written.locked_by, vec![writer.clone()]);
+        assert_eq!(written.lock_holders(), std::slice::from_ref(&writer));
         assert_ne!(written.current.writer(), Some(&writer));
         assert_eq!(
-            entry_of(&ctx, &acquired_key).await.unwrap().locked_by,
-            vec![acquirer]
+            entry_of(&ctx, &acquired_key).await.unwrap().lock_holders(),
+            std::slice::from_ref(&acquirer)
         );
 
         locker.keys().write_back(&writer, &locked).await;
         let written = entry_of(&ctx, &written_key).await.unwrap();
-        assert!(written.locked_by.is_empty());
+        assert!(written.lock_holders().is_empty());
         assert_eq!(written.current.writer(), Some(&writer));
     }
 
@@ -2785,13 +2764,13 @@ mod tests {
         hook.clear_after();
 
         let entry = entry_of(&ctx, key).await.unwrap();
-        assert!(entry.locked_by.is_empty());
+        assert!(entry.lock_holders().is_empty());
         assert_eq!(entry.current.writer(), Some(&writer));
 
         locker.keys().write_back(&writer, &locked).await;
         assert!(locker.tx_locks_snapshot().is_empty());
         let entry = entry_of(&ctx, key).await.unwrap();
-        assert!(entry.locked_by.is_empty());
+        assert!(entry.lock_holders().is_empty());
         assert_eq!(entry.current.writer(), Some(&writer));
     }
 
@@ -2831,11 +2810,11 @@ mod tests {
         );
         // Both locks are gone; the seeded committed pointers remain unchanged.
         assert!(
-            entry_of(&ctx, &ka).await.unwrap().locked_by.is_empty(),
+            entry_of(&ctx, &ka).await.unwrap().lock_holders().is_empty(),
             "first lock released"
         );
         assert!(
-            entry_of(&ctx, &kb).await.unwrap().locked_by.is_empty(),
+            entry_of(&ctx, &kb).await.unwrap().lock_holders().is_empty(),
             "second lock released"
         );
     }
@@ -2889,8 +2868,8 @@ mod tests {
             "same-key writers share a single CAS round"
         );
         assert_eq!(
-            entry_of(&ctx, key).await.unwrap().locked_by,
-            vec![old.clone()]
+            entry_of(&ctx, key).await.unwrap().lock_holders(),
+            std::slice::from_ref(&old)
         );
         assert_eq!(
             ctx.monitor.tx_status(&young).await.unwrap(),
@@ -2943,7 +2922,10 @@ mod tests {
             hy.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
         ));
-        assert_eq!(entry_of(&ctx, key).await.unwrap().locked_by, vec![young]);
+        assert_eq!(
+            entry_of(&ctx, key).await.unwrap().lock_holders(),
+            std::slice::from_ref(&young)
+        );
 
         // A load per poll, but only three CAS stores: the older's acquire, the
         // older's release, then the younger's acquire. The younger's waiting
@@ -2997,8 +2979,8 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!hb.is_finished(), "the loser waits without being wounded");
         assert_eq!(
-            entry_of(&ctx, key).await.unwrap().locked_by,
-            vec![a.clone()]
+            entry_of(&ctx, key).await.unwrap().lock_holders(),
+            std::slice::from_ref(&a)
         );
         assert_eq!(
             ctx.monitor.tx_status(&b).await.unwrap(),
@@ -3011,7 +2993,10 @@ mod tests {
             hb.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
         ));
-        assert_eq!(entry_of(&ctx, key).await.unwrap().locked_by, vec![b]);
+        assert_eq!(
+            entry_of(&ctx, key).await.unwrap().lock_holders(),
+            std::slice::from_ref(&b)
+        );
 
         // Three CAS stores: the winner's acquire, its release, then the loser's
         // acquire. The loser's waiting rounds stage nothing.
@@ -3063,8 +3048,8 @@ mod tests {
             );
             let e = entry_of(&ctx, key).await.unwrap();
             assert_eq!(
-                e.locked_by,
-                vec![acquirer],
+                e.lock_holders(),
+                std::slice::from_ref(&acquirer),
                 "the acquirer holds the lock (order {wb_order}/{acq_order})"
             );
             assert_eq!(
@@ -3138,6 +3123,9 @@ mod tests {
         let other = mk_tid(3, "other");
         ctx.monitor.begin_tx(&other);
         lock_ok(&locker, &other, &group_of(key, put_intent(key))).await;
-        assert_eq!(entry_of(&ctx, key).await.unwrap().locked_by, vec![other]);
+        assert_eq!(
+            entry_of(&ctx, key).await.unwrap().lock_holders(),
+            std::slice::from_ref(&other)
+        );
     }
 }

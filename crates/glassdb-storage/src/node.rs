@@ -24,7 +24,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::LockType;
+use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
 use crate::shard::{CurrentState, Shard, ShardEntry};
 use glassdb_data::TxId;
 
@@ -170,12 +170,9 @@ impl SplitPolicy {
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
         let id = TxId::with_priority(0, &[]);
-        let entry = ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![id.clone()],
-            current: CurrentState::External { writer: id },
-            ..ShardEntry::new(key)
-        };
+        let mut entry =
+            ShardEntry::new(key).with_current(CurrentState::External { writer: id.clone() });
+        entry.replace_write_lock(id);
         let content_limit = self.content_limit();
         let token = "x".repeat(24);
         let index_len = Node::index(IndexNode::from_children([
@@ -201,98 +198,6 @@ impl Default for SplitPolicy {
     }
 }
 
-/// One node-level lock and its transaction holders.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeLock {
-    typ: LockType,
-    locked_by: Vec<TxId>,
-}
-
-impl Default for NodeLock {
-    fn default() -> Self {
-        NodeLock {
-            typ: LockType::None,
-            locked_by: Vec::new(),
-        }
-    }
-}
-
-impl NodeLock {
-    /// Returns the held lock type.
-    pub fn lock_type(&self) -> LockType {
-        self.typ
-    }
-
-    /// Returns the transactions holding the lock.
-    pub fn holders(&self) -> &[TxId] {
-        &self.locked_by
-    }
-
-    /// Reports whether `id` holds this lock.
-    pub fn contains(&self, id: &TxId) -> bool {
-        self.locked_by.contains(id)
-    }
-
-    pub(crate) fn add_reader(&mut self, id: TxId) {
-        if !self.contains(&id) {
-            self.locked_by.push(id);
-            self.locked_by.sort();
-        }
-        self.typ = LockType::Read;
-    }
-
-    pub(crate) fn set_writer(&mut self, id: TxId) {
-        self.typ = LockType::Write;
-        self.locked_by = vec![id];
-    }
-
-    pub(crate) fn remove(&mut self, id: &TxId) -> bool {
-        let old_len = self.locked_by.len();
-        self.locked_by.retain(|holder| holder != id);
-        if self.locked_by.is_empty() {
-            self.typ = LockType::None;
-        }
-        self.locked_by.len() != old_len
-    }
-
-    fn clear(&mut self) {
-        self.typ = LockType::None;
-        self.locked_by.clear();
-    }
-
-    pub(crate) fn to_pb(&self) -> pb::NodeLock {
-        let mut locked_by: Vec<Vec<u8>> = self
-            .locked_by
-            .iter()
-            .map(|id| id.as_bytes().to_vec())
-            .collect();
-        locked_by.sort();
-        pb::NodeLock {
-            lock_type: lock_type_to_proto(self.typ) as i32,
-            locked_by,
-        }
-    }
-
-    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Self {
-        let Some(raw) = raw else {
-            return NodeLock::default();
-        };
-        let typ = lock_type_from_proto(raw.lock_type);
-        NodeLock {
-            typ: if typ == LockType::Unknown && raw.locked_by.is_empty() {
-                LockType::None
-            } else {
-                typ
-            },
-            locked_by: raw.locked_by.into_iter().map(TxId::from_bytes).collect(),
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.locked_by.is_empty() && matches!(self.typ, LockType::None | LockType::Unknown)
-    }
-}
-
 /// The node-level coordination state threaded through a leaf CAS round.
 ///
 /// Keeping this separate from the node's topology prevents transaction-engine
@@ -300,20 +205,20 @@ impl NodeLock {
 /// only intend to change locks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeLocks {
-    structure: NodeLock,
-    membership: NodeLock,
+    structure: ExclusiveGate,
+    membership: SharedExclusiveLock,
     membership_version: u64,
     delete_intent: Option<TxId>,
 }
 
 impl NodeLocks {
     /// Returns the exclusive gate guarding changes to the node's physical shape.
-    pub fn structural_gate(&self) -> &NodeLock {
+    pub fn structural_gate(&self) -> &ExclusiveGate {
         &self.structure
     }
 
     /// Returns the membership lock guarding a leaf's live key set.
-    pub fn membership(&self) -> &NodeLock {
+    pub fn membership(&self) -> &SharedExclusiveLock {
         &self.membership
     }
 
@@ -488,7 +393,7 @@ impl Node {
     }
 
     /// Returns the node's exclusive structural gate.
-    pub fn structural_gate(&self) -> &NodeLock {
+    pub fn structural_gate(&self) -> &ExclusiveGate {
         self.locks.structural_gate()
     }
 
@@ -529,7 +434,7 @@ impl Node {
     }
 
     /// Returns the leaf membership lock.
-    pub fn membership_lock(&self) -> &NodeLock {
+    pub fn membership_lock(&self) -> &SharedExclusiveLock {
         self.locks.membership()
     }
 
@@ -703,10 +608,11 @@ impl Node {
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)?),
             None => NodeBody::Leaf(Shard::new()),
         };
-        let structure = NodeLock::from_pb(raw.structure_lock);
-        validate_structural_gate(&structure)?;
-        let membership = NodeLock::from_pb(raw.membership_lock);
-        validate_membership_lock(&membership)?;
+        let structure = ExclusiveGate::from_pb(raw.structure_lock).map_err(|_| {
+            StorageError::other("node structural gate must be empty or have one write holder")
+        })?;
+        let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
+            .map_err(|_| StorageError::other("node has invalid membership lock"))?;
         let delete_intent = (!raw.collection_delete_intent.is_empty())
             .then(|| TxId::from_bytes(raw.collection_delete_intent));
         Ok(Node {
@@ -723,71 +629,26 @@ impl Node {
     }
 }
 
-fn validate_structural_gate(gate: &NodeLock) -> Result<(), StorageError> {
-    match (gate.lock_type(), gate.holders()) {
-        (LockType::None | LockType::Unknown, []) | (LockType::Write, [_]) => Ok(()),
-        _ => Err(StorageError::other(
-            "node structural gate must be empty or have one write holder",
-        )),
-    }
-}
-
-fn validate_membership_lock(lock: &NodeLock) -> Result<(), StorageError> {
-    match (lock.lock_type(), lock.holders()) {
-        (LockType::None | LockType::Unknown, [])
-        | (LockType::Read, [_, ..])
-        | (LockType::Write, [_]) => Ok(()),
-        _ => Err(StorageError::other("node has invalid membership lock")),
-    }
-}
-
-fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
-    match t {
-        LockType::None => pb::lock::LockType::None,
-        LockType::Read => pb::lock::LockType::Read,
-        LockType::Write => pb::lock::LockType::Write,
-        LockType::Create => pb::lock::LockType::Create,
-        LockType::Unknown => pb::lock::LockType::Unknown,
-    }
-}
-
-fn lock_type_from_proto(t: i32) -> LockType {
-    match pb::lock::LockType::try_from(t) {
-        Ok(pb::lock::LockType::None) => LockType::None,
-        Ok(pb::lock::LockType::Read) => LockType::Read,
-        Ok(pb::lock::LockType::Write) => LockType::Write,
-        Ok(pb::lock::LockType::Create) => LockType::Create,
-        _ => LockType::Unknown,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use glassdb_data::TxId;
 
-    use crate::lock::LockType;
     use crate::shard::ShardEntry;
 
     fn entry(key: &[u8], writer: u8) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![writer]),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![writer]),
+        })
     }
 
     fn golden_entry() -> ShardEntry {
-        ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![0xaa, 0xbb]),
-            },
-            ..ShardEntry::new(b"Hello")
-        }
+        let mut entry = ShardEntry::new(b"Hello").with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![0xaa, 0xbb]),
+        });
+        entry.replace_write_lock(TxId::from_bytes(vec![1, 2, 3, 4]));
+        entry
     }
 
     #[test]
@@ -818,10 +679,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_shared_or_nonexclusive_structural_gate() {
+    fn decode_rejects_invalid_structural_gate_states() {
         for gate in [
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![1]],
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Create as i32,
                 locked_by: vec![vec![1]],
             },
             pb::NodeLock {
@@ -835,6 +700,34 @@ mod tests {
             };
             assert!(Node::decode(&raw.encode_to_vec()).is_err());
         }
+    }
+
+    #[test]
+    fn decode_rejects_create_membership_lock() {
+        let raw = pb::Node {
+            membership_lock: Some(pb::NodeLock {
+                lock_type: pb::lock::LockType::Create as i32,
+                locked_by: vec![vec![1]],
+            }),
+            ..pb::Node::default()
+        };
+
+        let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
+        assert_eq!(error.to_string(), "node has invalid membership lock");
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_node_lock_holders() {
+        let raw = pb::Node {
+            membership_lock: Some(pb::NodeLock {
+                lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![2], vec![1], vec![1]],
+            }),
+            ..pb::Node::default()
+        };
+
+        let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
+        assert_eq!(error.to_string(), "node has invalid membership lock");
     }
 
     #[test]

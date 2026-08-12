@@ -606,12 +606,9 @@ mod tests {
     }
 
     fn live(key: &[u8]) -> ShardEntry {
-        ShardEntry {
-            current: crate::CurrentState::External {
-                writer: glassdb_data::TxId::from_bytes(vec![1]),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(crate::CurrentState::External {
+            writer: glassdb_data::TxId::from_bytes(vec![1]),
+        })
     }
 
     fn collection() -> CollectionAddress {

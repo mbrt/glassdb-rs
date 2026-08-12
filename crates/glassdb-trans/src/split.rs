@@ -2604,22 +2604,16 @@ mod tests {
 
     // A committed live key, so it counts as existing under a descent lookup.
     fn live(key: &[u8]) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![1]),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![1]),
+        })
     }
 
     fn inline_live(key: &[u8], value: &[u8]) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::Inline {
-                writer: TxId::from_bytes(vec![1]),
-                value: Arc::from(value),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::Inline {
+            writer: TxId::from_bytes(vec![1]),
+            value: Arc::from(value),
+        })
     }
 
     fn pressure_inline() -> InlinePolicy {
@@ -2710,8 +2704,7 @@ mod tests {
 
     fn leaf_with_locked_entry(keys: &[&[u8]], holder: &TxId) -> Node {
         let mut entries: Vec<_> = keys.iter().map(|key| live(key)).collect();
-        entries[0].lock_type = LockType::Write;
-        entries[0].locked_by.push(holder.clone());
+        entries[0].replace_write_lock(holder.clone());
         Node::leaf(Shard::from_entries(entries))
     }
 
@@ -2751,12 +2744,11 @@ mod tests {
     async fn a_split_carries_inline_values_to_the_new_leaf() {
         let s = store();
         let keys: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
-        let inlined = |key: &[u8]| ShardEntry {
-            current: CurrentState::Inline {
+        let inlined = |key: &[u8]| {
+            ShardEntry::new(key).with_current(CurrentState::Inline {
                 writer: TxId::from_bytes(vec![1]),
                 value: Arc::from(key),
-            },
-            ..ShardEntry::new(key)
+            })
         };
         s.create_root(COLL, &Node::leaf(Shard::from_entries(keys.map(inlined))))
             .await
@@ -3693,7 +3685,7 @@ mod tests {
                 node.as_leaf()
                     .unwrap()
                     .entries()
-                    .all(|entry| !entry.locked_by.contains(&younger))
+                    .all(|entry| !entry.is_locked_by(&younger))
             );
         }
     }
@@ -3721,8 +3713,7 @@ mod tests {
             .map(|key| live(key))
             .collect();
         let upper = entries.last_mut().unwrap();
-        upper.lock_type = LockType::Write;
-        upper.locked_by.push(holder.clone());
+        upper.replace_write_lock(holder.clone());
         let node = Node::leaf(Shard::from_entries(entries));
         s.store_node(COLL, "L", &node, None).await.unwrap();
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
@@ -3749,8 +3740,8 @@ mod tests {
                 writer: holder.clone()
             }
         );
-        assert!(entry.locked_by.is_empty());
-        assert_eq!(entry.lock_type, LockType::None);
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.lock_type(), LockType::None);
 
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
@@ -3805,7 +3796,7 @@ mod tests {
             .lookup(b"d")
             .unwrap();
         assert_eq!(current.current, CurrentState::External { writer: holder });
-        assert!(current.locked_by.is_empty());
+        assert!(current.lock_holders().is_empty());
     }
 
     #[tokio::test]

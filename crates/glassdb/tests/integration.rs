@@ -13,7 +13,7 @@ use glassdb::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{CurrentState, LockType, Node, Shard, ShardEntry};
+use glassdb_storage::{CurrentState, Node, Shard, ShardEntry};
 use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
@@ -45,13 +45,10 @@ fn split_unsafe_boundary_key(policy: &SplitPolicy, value: &[u8], fill: u8) -> Ve
     let mut boundary = None;
     for len in 1..policy.content_limit() {
         let key = vec![fill; len];
-        let inline = ShardEntry {
-            current: CurrentState::Inline {
-                writer: writer.clone(),
-                value: Arc::from(value),
-            },
-            ..ShardEntry::new(key.clone())
-        };
+        let inline = ShardEntry::new(key.clone()).with_current(CurrentState::Inline {
+            writer: writer.clone(),
+            value: Arc::from(value),
+        });
         if policy.key_fits(&key) && !policy.entry_fits_split_budget(&inline) {
             boundary = Some(key);
         }
@@ -158,18 +155,12 @@ async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
     let second = vec![b'z'; first.len()];
     assert!(policy.key_fits(&second));
     let boundary_writer = TxId::with_priority(1, b"boundary");
-    let inline_entry = ShardEntry {
-        current: CurrentState::Inline {
-            writer: boundary_writer,
-            value: Arc::from(inline_value.as_slice()),
-        },
-        ..ShardEntry::new(first.clone())
-    };
-    let create_entry = ShardEntry {
-        lock_type: LockType::Create,
-        locked_by: vec![TxId::with_priority(2, b"creator")],
-        ..ShardEntry::new(second.clone())
-    };
+    let inline_entry = ShardEntry::new(first.clone()).with_current(CurrentState::Inline {
+        writer: boundary_writer,
+        value: Arc::from(inline_value.as_slice()),
+    });
+    let mut create_entry = ShardEntry::new(second.clone());
+    create_entry.replace_create_lock(TxId::with_priority(2, b"creator"));
     assert!(
         Node::leaf(Shard::from_entries([inline_entry, create_entry])).content_encoded_len()
             > policy.content_limit(),
