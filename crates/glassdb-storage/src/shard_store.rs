@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_data::{TxId, paths};
+use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralRecordId, TxId};
 
 use crate::cached_store::{
     CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
@@ -149,8 +149,10 @@ impl Codec for Node {
     }
 
     fn valid_path(path: &str) -> bool {
-        paths::parse(path)
-            .is_ok_and(|parsed| matches!(parsed.typ, paths::Type::TreeRoot | paths::Type::Node))
+        matches!(
+            ObjectPath::try_from(path),
+            Ok(ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
+        )
     }
 
     fn name() -> &'static str {
@@ -163,8 +165,13 @@ impl Codec for StructuralLog {
 
     fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
         let record = StructuralLog::decode(body)?;
-        let (participant, _) = paths::structural_log_parts_of(path)
-            .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+        let ObjectPath::StructuralRecord { participant, .. } = ObjectPath::try_from(path)
+            .map_err(|error| StorageError::with_source("parsing structural-log path", error))?
+        else {
+            return Err(StorageError::other(
+                "structural log has a non-structural path",
+            ));
+        };
         if participant != record.participant_id {
             return Err(StorageError::other(
                 "structural-log path does not match its participant",
@@ -182,7 +189,10 @@ impl Codec for StructuralLog {
     }
 
     fn valid_path(path: &str) -> bool {
-        paths::structural_log_parts_of(path).is_ok()
+        matches!(
+            ObjectPath::try_from(path),
+            Ok(ObjectPath::StructuralRecord { .. })
+        )
     }
 
     fn name() -> &'static str {
@@ -211,10 +221,10 @@ impl ShardStore {
     /// Loads the fixed B-link tree root under `prefix`.
     pub async fn load_root_node(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<Option<(Node, LeafObservation)>, StorageError> {
-        let observation = self.load_root_state(prefix, requirement).await?;
+        let observation = self.load_root_state(collection, requirement).await?;
         let node = observation.value().map(|node| node.as_ref().clone());
         Ok(node.map(|node| (node, observation)))
     }
@@ -222,26 +232,32 @@ impl ShardStore {
     /// Loads the fixed tree root's exact observation, including absence.
     pub async fn load_root_state(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        self.load_node_at_state(&paths::tree_root(prefix), requirement)
-            .await
+        self.load_node_at_state(
+            &ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            requirement,
+        )
+        .await
     }
 
     /// Loads an exact `_r` or `_n/<token>` node observation, including absence.
     pub async fn load_node_at_state(
         &self,
-        path: &str,
+        path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        self.nodes.read(path, requirement).await
+        let path = node_path(path)?;
+        self.nodes.read(&path, requirement).await
     }
 
     /// Loads an existing node at an exact `_r` or `_n/<token>` path.
     pub async fn load_node_at(
         &self,
-        path: &str,
+        path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<(Node, LeafObservation), StorageError> {
         let observed = self.load_node_at_state(path, requirement).await?;
@@ -255,14 +271,16 @@ impl ShardStore {
     /// Loads the non-root node's exact observation.
     pub async fn load_node_state(
         &self,
-        prefix: &str,
-        token: &str,
+        collection: &CollectionAddress,
+        token: &NodeToken,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        let observed = self
-            .nodes
-            .read(&paths::from_node(prefix, token), requirement)
-            .await?;
+        let path = ObjectPath::Node {
+            collection: collection.clone(),
+            token: token.clone(),
+        }
+        .to_string();
+        let observed = self.nodes.read(&path, requirement).await?;
         if observed.is_absent() {
             return Err(StorageError::NotFound);
         }
@@ -275,11 +293,11 @@ impl ShardStore {
     /// skips.
     pub async fn load_node(
         &self,
-        prefix: &str,
-        token: &str,
+        collection: &CollectionAddress,
+        token: &NodeToken,
         requirement: Requirement,
     ) -> Result<(Node, LeafObservation), StorageError> {
-        let observation = self.load_node_state(prefix, token, requirement).await?;
+        let observation = self.load_node_state(collection, token, requirement).await?;
         let node = observation
             .value()
             .expect("load_node_state rejects absence")
@@ -293,12 +311,16 @@ impl ShardStore {
     /// precondition miss, `true` on success.
     pub async fn store_node(
         &self,
-        prefix: &str,
-        token: &str,
+        collection: &CollectionAddress,
+        token: &NodeToken,
         node: &Node,
         expected: Option<&LeafObservation>,
     ) -> Result<bool, StorageError> {
-        let path = paths::from_node(prefix, token);
+        let path = ObjectPath::Node {
+            collection: collection.clone(),
+            token: token.clone(),
+        }
+        .to_string();
         let res = match expected {
             Some(observed) if observed.path() == path => {
                 self.nodes
@@ -318,10 +340,11 @@ impl ShardStore {
     /// Compare-and-swaps an exact `_r` or `_n/<token>` node path.
     pub async fn store_node_at(
         &self,
-        path: &str,
+        path: &ObjectPath,
         node: &Node,
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
+        let path = node_path(path)?;
         if expected.path() != path {
             return Err(StorageError::other("node observation path changed"));
         }
@@ -346,10 +369,10 @@ impl ShardStore {
     /// prefix, including temporarily unreachable structural nodes.
     pub async fn list_nodes(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         requirement: Requirement,
-    ) -> Result<Vec<(String, Observation<Node>)>, StorageError> {
-        let list_prefix = paths::nodes_prefix(prefix);
+    ) -> Result<Vec<(NodeToken, Observation<Node>)>, StorageError> {
+        let list_prefix = ObjectPath::nodes_prefix(collection);
         let limit = backend::ListLimit::new(NODE_LIST_PAGE_SIZE).unwrap();
         let mut cursor = None;
         let mut nodes = Vec::new();
@@ -359,8 +382,19 @@ impl ShardStore {
                 .list(&list_prefix, cursor.as_ref(), limit)
                 .await?;
             for path in page.objects {
-                let token = paths::node_token_of(&path)
-                    .map_err(|e| StorageError::with_source("parsing node path", e))?;
+                let ObjectPath::Node {
+                    collection: listed_collection,
+                    token,
+                } = ObjectPath::try_from(path.as_str())
+                    .map_err(|error| StorageError::with_source("parsing node path", error))?
+                else {
+                    return Err(StorageError::other("node listing returned a non-node path"));
+                };
+                if listed_collection != *collection {
+                    return Err(StorageError::other(
+                        "node listing returned a different collection",
+                    ));
+                }
                 let observed = self.nodes.read(&path, requirement).await?;
                 if observed.exists() {
                     nodes.push((token, observed));
@@ -376,14 +410,16 @@ impl ShardStore {
     /// Creates a split write-ahead record and returns its exact observation.
     pub async fn write_structural_log(
         &self,
-        record_id: &str,
+        db_root: &DbRoot,
+        record_id: &StructuralRecordId,
         record: &StructuralLog,
     ) -> Result<Observation<StructuralLog>, StorageError> {
-        let path = paths::structural_log_record(
-            paths::db_root_of(&record.prefix),
-            &record.participant_id,
-            record_id,
-        );
+        let path = ObjectPath::StructuralRecord {
+            db_root: db_root.clone(),
+            participant: record.participant_id.clone(),
+            record_id: record_id.clone(),
+        }
+        .to_string();
         match self
             .structural_logs
             .create(&path, None, Arc::new(record.clone()))
@@ -401,8 +437,14 @@ impl ShardStore {
         expected: &Observation<StructuralLog>,
         record: &StructuralLog,
     ) -> Result<Option<Observation<StructuralLog>>, StorageError> {
-        let (participant, _) = paths::structural_log_parts_of(expected.path())
-            .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+        let ObjectPath::StructuralRecord { participant, .. } =
+            ObjectPath::try_from(expected.path())
+                .map_err(|error| StorageError::with_source("parsing structural-log path", error))?
+        else {
+            return Err(StorageError::other(
+                "structural log has a non-structural path",
+            ));
+        };
         if participant != record.participant_id {
             return Err(StorageError::other(
                 "structural-log update changes its participant",
@@ -422,21 +464,21 @@ impl ShardStore {
     /// Lists exact observations of every unresolved structural record.
     pub async fn list_structural_logs(
         &self,
-        db_root: &str,
+        db_root: &DbRoot,
         requirement: Requirement,
-    ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
-        let prefix = paths::structural_log_dir(db_root);
+    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
+        let prefix = ObjectPath::structural_records_prefix(db_root);
         self.list_structural_logs_under(&prefix, requirement).await
     }
 
     /// Lists only the unresolved structural records owned by `participant`.
     pub async fn list_structural_logs_for_participant(
         &self,
-        db_root: &str,
+        db_root: &DbRoot,
         participant: &TxId,
         requirement: Requirement,
-    ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
-        let prefix = paths::structural_log_participant_dir(db_root, participant);
+    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
+        let prefix = ObjectPath::participant_structural_records_prefix(db_root, participant);
         self.list_structural_logs_under(&prefix, requirement).await
     }
 
@@ -452,10 +494,11 @@ impl ShardStore {
     /// Loads the leaf node at `_r` or `_n/<token>`.
     pub async fn load_leaf(
         &self,
-        path: &str,
+        path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<LoadedLeaf, StorageError> {
-        let observed = self.nodes.read(path, requirement).await?;
+        let path = node_path(path)?;
+        let observed = self.nodes.read(&path, requirement).await?;
         match observed.value() {
             Some(node) => {
                 let node = node.as_ref().clone();
@@ -489,31 +532,46 @@ impl ShardStore {
     /// Loads the fixed tree root under `prefix`.
     pub async fn load_root(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<(Node, LeafObservation), StorageError> {
-        self.load_node_at(&paths::tree_root(prefix), requirement)
-            .await
+        self.load_node_at(
+            &ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            requirement,
+        )
+        .await
     }
 
     /// Compare-and-swaps the fixed tree root.
     pub async fn store_root(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         root: &Node,
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
-        self.store_node_at(&paths::tree_root(prefix), root, expected)
-            .await
+        self.store_node_at(
+            &ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            root,
+            expected,
+        )
+        .await
     }
 
     /// Creates the fixed tree root if absent.
-    pub async fn create_root(&self, prefix: &str, root: &Node) -> Result<bool, StorageError> {
-        match self
-            .nodes
-            .create(&paths::tree_root(prefix), None, Arc::new(root.clone()))
-            .await
-        {
+    pub async fn create_root(
+        &self,
+        collection: &CollectionAddress,
+        root: &Node,
+    ) -> Result<bool, StorageError> {
+        let path = ObjectPath::TreeRoot {
+            collection: collection.clone(),
+        }
+        .to_string();
+        match self.nodes.create(&path, None, Arc::new(root.clone())).await {
             Ok(CasResult::Committed(_)) => Ok(true),
             Ok(CasResult::Conflict) => Ok(false),
             Err(e) => Err(e),
@@ -524,12 +582,16 @@ impl ShardStore {
     /// observation. `None` means another object already occupies the path.
     pub async fn create_root_observed(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         root: &Node,
     ) -> Result<Option<Observation<Node>>, StorageError> {
+        let path = ObjectPath::TreeRoot {
+            collection: collection.clone(),
+        }
+        .to_string();
         match self
             .nodes
-            .create(&paths::tree_root(prefix), None, Arc::new(root.clone()))
+            .create(&path, None, Arc::new(root.clone()))
             .await?
         {
             CasResult::Committed(observed) => Ok(Some(observed)),
@@ -546,7 +608,7 @@ impl ShardStore {
         &self,
         prefix: &str,
         requirement: Requirement,
-    ) -> Result<Vec<(String, Observation<StructuralLog>)>, StorageError> {
+    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
         let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
         let mut cursor = None;
         let mut records = Vec::new();
@@ -556,8 +618,15 @@ impl ShardStore {
                 .list(prefix, cursor.as_ref(), limit)
                 .await?;
             for path in page.objects {
-                let (_, record_id) = paths::structural_log_parts_of(&path)
-                    .map_err(|e| StorageError::with_source("parsing structural-log path", e))?;
+                let ObjectPath::StructuralRecord { record_id, .. } =
+                    ObjectPath::try_from(path.as_str()).map_err(|error| {
+                        StorageError::with_source("parsing structural-log path", error)
+                    })?
+                else {
+                    return Err(StorageError::other(
+                        "structural listing returned a non-structural path",
+                    ));
+                };
                 let observed = self.structural_logs.read(&path, requirement).await?;
                 if observed.exists() {
                     records.push((record_id, observed));
@@ -571,6 +640,13 @@ impl ShardStore {
     }
 }
 
+fn node_path(path: &ObjectPath) -> Result<String, StorageError> {
+    match path {
+        ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => Ok(path.to_string()),
+        _ => Err(StorageError::other("expected a tree-node object path")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,8 +656,6 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-
-    const COLL: &str = "coll";
 
     struct TestStore {
         shards: ShardStore,
@@ -607,15 +681,37 @@ mod tests {
         log.lock().unwrap().iter().filter(|r| r.op == op).count()
     }
 
+    fn collection() -> CollectionAddress {
+        CollectionAddress::root("coll")
+    }
+
+    fn token(byte: u8) -> NodeToken {
+        NodeToken::from_bytes([byte; 16])
+    }
+
+    fn node_path(byte: u8) -> ObjectPath {
+        ObjectPath::Node {
+            collection: collection(),
+            token: token(byte),
+        }
+    }
+
+    fn db_root() -> DbRoot {
+        DbRoot::try_from("db").unwrap()
+    }
+
+    fn record_id(byte: u8) -> StructuralRecordId {
+        StructuralRecordId::from(token(byte))
+    }
+
     // Seeds an empty node leaf at `path` through a separate store so a later
     // reader starts with a cold cache. Creates it with a bare `write_if_not_exists`
     // (no seeding read) so the shared op log reflects only the reader's traffic.
-    async fn seed_empty_leaf(backend: &Arc<dyn Backend>, path: &str) {
+    async fn seed_empty_leaf(backend: &Arc<dyn Backend>, token: &NodeToken) {
         let store = store_over(backend.clone());
-        let token = paths::node_token_of(path).unwrap();
         assert!(
             store
-                .store_node(COLL, &token, &Node::leaf(Shard::new()), None)
+                .store_node(&collection(), token, &Node::leaf(Shard::new()), None)
                 .await
                 .unwrap()
         );
@@ -629,8 +725,9 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let path = paths::from_node(COLL, "tok");
-        seed_empty_leaf(&backend, &path).await;
+        let token = token(1);
+        let path = node_path(1);
+        seed_empty_leaf(&backend, &token).await;
 
         let reader = store_over(backend.clone());
         let v1 = reader
@@ -669,8 +766,9 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let path = paths::from_node(COLL, "tok");
-        seed_empty_leaf(&backend, &path).await;
+        let token = token(1);
+        let path = node_path(1);
+        seed_empty_leaf(&backend, &token).await;
 
         let reader = store_over(backend.clone());
         // Warm the cache with one cold full read.
@@ -690,7 +788,7 @@ mod tests {
         );
 
         // An uncached node has nothing to serve, so it falls through to a read.
-        let other = paths::from_node(COLL, "tok2");
+        let other = node_path(2);
         assert!(matches!(
             reader.load_leaf(&other, Requirement::Any).await,
             Err(StorageError::NotFound)
@@ -703,10 +801,11 @@ mod tests {
     #[tokio::test]
     async fn store_is_visible_to_next_load() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let path = paths::from_node(COLL, "tok");
+        let path = node_path(1);
+        let token = token(1);
         assert!(
             store
-                .store_node(COLL, "tok", &Node::leaf(Shard::new()), None)
+                .store_node(&collection(), &token, &Node::leaf(Shard::new()), None)
                 .await
                 .unwrap()
         );
@@ -741,13 +840,14 @@ mod tests {
     #[tokio::test]
     async fn leaf_edit_commits_bounded_changes_without_changing_topology() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let path = paths::from_node(COLL, "left");
+        let path = node_path(1);
+        let token = token(1);
         let original = Node::leaf(Shard::new())
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some("right".to_string()));
         assert!(
             store
-                .store_node(COLL, "left", &original, None)
+                .store_node(&collection(), &token, &original, None)
                 .await
                 .unwrap()
         );
@@ -759,7 +859,7 @@ mod tests {
         locks.set_membership_writer(holder.clone());
 
         let mut edit = loaded.into_edit();
-        assert_eq!(edit.path(), path);
+        assert_eq!(edit.path(), path.to_string());
         assert_eq!(edit.node().high_key(), Some(b"m".as_slice()));
         assert_eq!(edit.node().right_sibling(), Some("right"));
         edit.set_entries(entries.clone());
@@ -777,12 +877,12 @@ mod tests {
     #[tokio::test]
     async fn leaf_edit_is_bound_to_observed_path() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let left_path = paths::from_node(COLL, "left");
-        let right_path = paths::from_node(COLL, "right");
-        for token in ["left", "right"] {
+        let left_path = node_path(1);
+        let right_path = node_path(2);
+        for token in [token(1), token(2)] {
             assert!(
                 store
-                    .store_node(COLL, token, &Node::leaf(Shard::new()), None)
+                    .store_node(&collection(), &token, &Node::leaf(Shard::new()), None)
                     .await
                     .unwrap()
             );
@@ -793,7 +893,7 @@ mod tests {
         edit.set_entries(Shard::from_entries([ShardEntry::new(
             b"left-key".as_slice(),
         )]));
-        assert_eq!(edit.path(), left_path);
+        assert_eq!(edit.path(), left_path.to_string());
         assert!(store.commit_leaf(edit).await.unwrap());
 
         let left = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
@@ -808,10 +908,11 @@ mod tests {
     #[tokio::test]
     async fn stale_leaf_edit_conflicts() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let path = paths::from_node(COLL, "tok");
+        let path = node_path(1);
+        let token = token(1);
         assert!(
             store
-                .store_node(COLL, "tok", &Node::leaf(Shard::new()), None)
+                .store_node(&collection(), &token, &Node::leaf(Shard::new()), None)
                 .await
                 .unwrap()
         );
@@ -844,7 +945,8 @@ mod tests {
         for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
             store
                 .write_structural_log(
-                    &format!("record-{i:03}"),
+                    &db_root(),
+                    &record_id(i as u8),
                     &StructuralLog {
                         prefix: "db/coll".to_string(),
                         source_token: "source".to_string(),
@@ -861,7 +963,7 @@ mod tests {
         }
 
         let records = store
-            .list_structural_logs("db", Requirement::AtLeast(store.timeline.now()))
+            .list_structural_logs(&db_root(), Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
         assert_eq!(records.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
@@ -875,7 +977,8 @@ mod tests {
         for participant in [&first, &second] {
             store
                 .write_structural_log(
-                    "record",
+                    &db_root(),
+                    &record_id(1),
                     &StructuralLog {
                         prefix: "db/coll".to_string(),
                         source_token: "source".to_string(),
@@ -893,7 +996,7 @@ mod tests {
 
         let records = store
             .list_structural_logs_for_participant(
-                "db",
+                &db_root(),
                 &first,
                 Requirement::AtLeast(store.timeline.now()),
             )

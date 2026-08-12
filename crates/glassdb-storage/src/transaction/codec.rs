@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, TxId, paths,
+    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -95,9 +95,14 @@ impl Codec for TxLogCodec {
     type Value = TxLog;
 
     fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
-        let id = paths::transaction_id_of(path)
-            .map_err(|error| StorageError::with_source("parsing transaction path", error))?;
-        TxLogCodec::decode(paths::db_root_of(path), &id, body)
+        let ObjectPath::Transaction { db_root, id } = ObjectPath::try_from(path)
+            .map_err(|error| StorageError::with_source("parsing transaction path", error))?
+        else {
+            return Err(StorageError::other(
+                "transaction log has a non-transaction path",
+            ));
+        };
+        TxLogCodec::decode(db_root.as_str(), &id, body)
     }
 
     fn encode(log: &Self::Value) -> Result<Vec<u8>, StorageError> {
@@ -130,7 +135,10 @@ impl Codec for TxLogCodec {
     }
 
     fn valid_path(path: &str) -> bool {
-        paths::transaction_id_of(path).is_ok()
+        matches!(
+            ObjectPath::try_from(path),
+            Ok(ObjectPath::Transaction { .. })
+        )
     }
 
     fn name() -> &'static str {

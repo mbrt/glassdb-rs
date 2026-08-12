@@ -113,7 +113,7 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::CollectionId;
+    use glassdb_data::{CollectionId, DbRoot};
     use glassdb_storage::transaction::{
         TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog,
     };
@@ -132,7 +132,7 @@ mod tests {
         );
         let records = CollectionStore::new(objects.clone());
         let background = Arc::new(Background::new());
-        let transactions = TLogger::new(objects, "db");
+        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
         let monitor = Monitor::with_config(
             transactions.clone(),
             timeline,
@@ -161,12 +161,7 @@ mod tests {
         let id = TxId::from_bytes(vec![1]);
         let mut record = CollectionRecord::new();
         record.set_directory_writer(id.clone());
-        assert!(
-            records
-                .create_record(&parent.physical_prefix(), &record)
-                .await
-                .unwrap()
-        );
+        assert!(records.create_record(&parent, &record).await.unwrap());
         monitor.begin_tx(&id);
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.locks.push(TxLock::Directory {
@@ -185,7 +180,7 @@ mod tests {
 
         assert_eq!(snapshot.children, vec![(b"child".to_vec(), child.id())]);
         let (record, _) = records
-            .load_record(&parent.physical_prefix(), Requirement::Any)
+            .load_record(&parent, Requirement::Any)
             .await
             .unwrap();
         assert!(!record.directory_lock().contains(&id));

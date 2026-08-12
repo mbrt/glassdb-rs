@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, rt};
-use glassdb_data::{CollectionAddress, TxId, paths};
+use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralRecordId, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
     CollectionStore, IndexNode, InlinePolicy, LeafObservation, LockType, Node, Observation,
@@ -130,12 +130,16 @@ impl StructuralNodeAccess {
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         if let Some(token) = token {
+            let collection = collection_address(prefix)?;
+            let token = node_token(token)?;
             let (node, _) = self
                 .shards
-                .load_node(prefix, token, Requirement::Any)
+                .load_node(&collection, &token, Requirement::Any)
                 .await?;
             if node.as_leaf().is_some() {
-                return self.acquire_leaf_structural_gate(prefix, token, id).await;
+                return self
+                    .acquire_leaf_structural_gate(prefix, token.as_str(), id)
+                    .await;
             }
         }
         self.acquire_structural_gate_direct(prefix, token, id).await
@@ -147,7 +151,13 @@ impl StructuralNodeAccess {
         token: &str,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        let path = paths::from_node(prefix, token);
+        let collection = collection_address(prefix)?;
+        let token = node_token(token)?;
+        let path = ObjectPath::Node {
+            collection: collection.clone(),
+            token: token.clone(),
+        }
+        .to_string();
         let outcome = self
             .coord
             .submit_shard(
@@ -171,7 +181,10 @@ impl StructuralNodeAccess {
             .and_then(|coordinated| coordinated.cas_precondition)
             .map(|observation| Requirement::AtLeast(observation.current_after()))
             .unwrap_or(Requirement::Any);
-        let (node, version) = self.shards.load_node(prefix, token, requirement).await?;
+        let (node, version) = self
+            .shards
+            .load_node(&collection, &token, requirement)
+            .await?;
         if node.structural_gate().lock_type() == LockType::Write
             && node.structural_gate().contains(id)
         {
@@ -187,14 +200,16 @@ impl StructuralNodeAccess {
         token: Option<&str>,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
+        let collection = collection_address(prefix)?;
+        let token = token.map(node_token).transpose()?;
         for _ in 0..PARENT_RETRIES {
-            let (mut node, version) = match token {
+            let (mut node, version) = match token.as_ref() {
                 Some(token) => {
                     self.shards
-                        .load_node(prefix, token, Requirement::Any)
+                        .load_node(&collection, token, Requirement::Any)
                         .await?
                 }
-                None => match self.shards.load_root(prefix, Requirement::Any).await {
+                None => match self.shards.load_root(&collection, Requirement::Any).await {
                     Ok((root, version)) => (root, version),
                     Err(StorageError::NotFound) => return Ok(None),
                     Err(error) => return Err(error.into()),
@@ -206,8 +221,6 @@ impl StructuralNodeAccess {
                 return Ok(Some((node, version)));
             }
 
-            let collection = CollectionAddress::from_physical_prefix(prefix)
-                .map_err(|error| TransError::with_source("parsing collection prefix", error))?;
             let entries: BTreeMap<Vec<u8>, _> = node
                 .as_leaf()
                 .into_iter()
@@ -237,19 +250,28 @@ impl StructuralNodeAccess {
             }
             node.set_locks(locks);
             if self
-                .store_structural_node(prefix, token, &node, &version)
+                .store_structural_node(
+                    prefix,
+                    token.as_ref().map(NodeToken::as_str),
+                    &node,
+                    &version,
+                )
                 .await?
             {
-                let (_, locked_version) = match token {
+                let (_, locked_version) = match token.as_ref() {
                     Some(token) => {
                         self.shards
-                            .load_node(prefix, token, Requirement::AtLeast(version.current_after()))
+                            .load_node(
+                                &collection,
+                                token,
+                                Requirement::AtLeast(version.current_after()),
+                            )
                             .await?
                     }
                     None => {
                         let (root, version) = self
                             .shards
-                            .load_root(prefix, Requirement::AtLeast(version.current_after()))
+                            .load_root(&collection, Requirement::AtLeast(version.current_after()))
                             .await?;
                         (root, version)
                     }
@@ -266,15 +288,18 @@ impl StructuralNodeAccess {
         token: Option<&str>,
         id: &TxId,
     ) -> Result<(), TransError> {
+        let collection = collection_address(prefix)?;
+        let token = token.map(node_token).transpose()?;
         for _ in 0..PARENT_RETRIES {
-            let (mut node, version) = match token {
+            let (mut node, version) = match token.as_ref() {
                 Some(token) => {
                     self.shards
-                        .load_node(prefix, token, Requirement::Any)
+                        .load_node(&collection, token, Requirement::Any)
                         .await?
                 }
                 None => {
-                    let (root, version) = self.shards.load_root(prefix, Requirement::Any).await?;
+                    let (root, version) =
+                        self.shards.load_root(&collection, Requirement::Any).await?;
                     (root, version)
                 }
             };
@@ -282,7 +307,12 @@ impl StructuralNodeAccess {
                 return Ok(());
             }
             if self
-                .store_structural_node(prefix, token, &node, &version)
+                .store_structural_node(
+                    prefix,
+                    token.as_ref().map(NodeToken::as_str),
+                    &node,
+                    &version,
+                )
                 .await?
             {
                 return Ok(());
@@ -298,12 +328,19 @@ impl StructuralNodeAccess {
         node: &Node,
         observation: &LeafObservation,
     ) -> Result<bool, TransError> {
+        let collection = collection_address(prefix)?;
         match token {
-            Some(token) => Ok(self
+            Some(token) => {
+                let token = node_token(token)?;
+                Ok(self
+                    .shards
+                    .store_node(&collection, &token, node, Some(observation))
+                    .await?)
+            }
+            None => Ok(self
                 .shards
-                .store_node(prefix, token, node, Some(observation))
+                .store_root(&collection, node, observation)
                 .await?),
-            None => Ok(self.shards.store_root(prefix, node, observation).await?),
         }
     }
 
@@ -423,21 +460,19 @@ impl SeparatorPublisher {
         while publication.retries_remaining > 0 {
             publication.retries_remaining -= 1;
             let separator = &publication.separator;
+            let collection = collection_address(&separator.prefix)?;
             let Some(parent) = self
                 .router
-                .parent_index_for(&separator.prefix, &separator.split_key, publication.start)
+                .parent_index_for(&collection, &separator.split_key, publication.start)
                 .await?
             else {
                 return Ok(SeparatorPublicationOutcome::Published);
             };
-            let parent_token =
-                if paths::is_tree_root(&parent.path) {
-                    None
-                } else {
-                    Some(paths::node_token_of(&parent.path).map_err(|error| {
-                        StorageError::with_source("parsing parent token", error)
-                    })?)
-                };
+            let parent_token = match &parent.path {
+                ObjectPath::TreeRoot { .. } => None,
+                ObjectPath::Node { token, .. } => Some(token.to_string()),
+                _ => return Err(TransError::other("router returned a non-node parent path")),
+            };
             let lock_id = TxId::new_at(rt::system_now());
             self.nodes.mon.begin_tx(&lock_id);
             let acquired = match self
@@ -510,7 +545,7 @@ impl SeparatorPublisher {
                 if locked_parent.over_soft_cap(&self.policy) {
                     return Ok(SeparatorPublicationOutcome::ParentRequiresSplit(
                         ParentRequiresSplit {
-                            path: parent.path,
+                            path: parent.path.to_string(),
                             continuation: ParentSplitContinuation::ResumePublication,
                         },
                     ));
@@ -547,7 +582,7 @@ impl SeparatorPublisher {
                 if updated.over_soft_cap(&self.policy) {
                     return Ok(SeparatorPublicationOutcome::ParentRequiresSplit(
                         ParentRequiresSplit {
-                            path: parent.path,
+                            path: parent.path.to_string(),
                             continuation: ParentSplitContinuation::CompletePublication,
                         },
                     ));
@@ -579,11 +614,13 @@ impl SeparatorPublisher {
         let Some(start) = index.child_for(split_key) else {
             return Ok(Vec::new());
         };
+        let collection = collection_address(prefix)?;
+        let start = node_token(start)?;
         let mut missing = Vec::new();
         let (mut cur, _) = self
             .nodes
             .shards
-            .load_node(prefix, start, requirement)
+            .load_node(&collection, &start, requirement)
             .await?;
         for _ in 0..MAX_RECONCILE_HOPS {
             let (Some(right), Some(boundary)) = (cur.right_sibling(), cur.high_key()) else {
@@ -593,6 +630,7 @@ impl SeparatorPublisher {
                 break;
             }
             let right = right.to_string();
+            let right_token = node_token(&right)?;
             let boundary = boundary.to_vec();
             if index.child_for(&boundary) != Some(right.as_str()) {
                 missing.push((boundary.clone(), right.clone()));
@@ -601,7 +639,7 @@ impl SeparatorPublisher {
             let (next, _) = self
                 .nodes
                 .shards
-                .load_node(prefix, &right, requirement)
+                .load_node(&collection, &right_token, requirement)
                 .await?;
             cur = next;
             if reached_target {
@@ -821,14 +859,6 @@ enum StructuralSplitTarget<'a> {
 }
 
 impl<'a> StructuralSplitTarget<'a> {
-    fn for_path(path: &str, token: &'a str) -> Self {
-        if paths::is_tree_root(path) {
-            Self::Root
-        } else {
-            Self::NonRoot(token)
-        }
-    }
-
     fn source_token(self) -> Option<&'a str> {
         match self {
             Self::Root => None,
@@ -1192,7 +1222,7 @@ pub struct Splitter {
     mon: Monitor,
     structural_nodes: StructuralNodeAccess,
     timeline: Timeline,
-    db_root: String,
+    db_root: DbRoot,
     // The candidate feed this splitter drains. The coordinator receives a
     // clone for stored-leaf capacity; direct resolvers receive lightweight hint
     // sinks for inline-pressure observations.
@@ -1310,7 +1340,8 @@ impl Splitter {
             mon,
             structural_nodes,
             timeline,
-            db_root: db_root.to_string(),
+            db_root: DbRoot::try_from(db_root)
+                .expect("splitter database root must already be validated"),
             candidates,
             publisher,
             recovery_wake: Arc::new(Notify::new()),
@@ -1431,15 +1462,10 @@ impl Splitter {
         value_len: usize,
         id: TxId,
     ) -> Result<(), TransError> {
-        let parsed = paths::parse(observed_path)
-            .map_err(|error| StorageError::with_source("parsing pressure path", error))?;
+        let (collection, _) = split_path_parts(observed_path)?;
         let located = match self
             .router
-            .leaf_for(
-                &parsed.prefix,
-                key,
-                Requirement::AtLeast(self.timeline.now()),
-            )
+            .leaf_for(&collection, key, Requirement::AtLeast(self.timeline.now()))
             .await
         {
             Ok(located) => located,
@@ -1460,7 +1486,10 @@ impl Splitter {
             .map(|node| self.split_need(node, &reason))
             .unwrap_or(SplitNeed::NotActionable)
         {
-            SplitNeed::Split => self.split_path_with_id(&located.path, id, &reason).await,
+            SplitNeed::Split => {
+                self.split_path_with_id(&located.path.to_string(), id, &reason)
+                    .await
+            }
             SplitNeed::NotActionable => {
                 self.stats
                     .inline_pressure_discarded
@@ -1518,8 +1547,14 @@ impl Splitter {
         if !node.over_soft_cap(self.candidates.policy()) {
             return;
         }
+        let Ok(collection) = collection_address(prefix) else {
+            return;
+        };
+        let Ok(token) = node_token(token) else {
+            return;
+        };
         self.candidates.push(SplitCandidate {
-            path: paths::from_node(prefix, token),
+            path: ObjectPath::Node { collection, token }.to_string(),
             priority: self.candidates.new_id(),
             reason: SplitReason::SoftCap,
         });
@@ -1541,10 +1576,13 @@ impl Splitter {
         id: TxId,
         reason: &SplitReason,
     ) -> Result<(), TransError> {
-        let parsed = paths::parse(path)
-            .map_err(|e| StorageError::with_source("parsing candidate path", e))?;
-        let target = StructuralSplitTarget::for_path(path, &parsed.suffix);
-        StructuralSplitAttempt::new(self, &parsed.prefix, target, id, reason)
+        let (collection, token) = split_path_parts(path)?;
+        let prefix = collection.physical_prefix();
+        let target = match token.as_ref() {
+            Some(token) => StructuralSplitTarget::NonRoot(token.as_str()),
+            None => StructuralSplitTarget::Root,
+        };
+        StructuralSplitAttempt::new(self, &prefix, target, id, reason)
             .run(StructuralSplitTopology::Owned)
             .await
     }
@@ -1573,17 +1611,24 @@ impl Splitter {
     ) -> Result<PreparedSplit, TransError> {
         let is_root = source_token.is_none();
         let created_tokens = if is_root {
-            vec![paths::random_node_token(), paths::random_node_token()]
+            vec![NodeToken::new_random(), NodeToken::new_random()]
         } else {
-            vec![paths::random_node_token()]
+            vec![NodeToken::new_random()]
         };
-        let record_id = created_tokens
-            .last()
-            .expect("a split always reserves at least one token")
-            .clone();
+        let record_id = StructuralRecordId::from(
+            created_tokens
+                .last()
+                .expect("a split always reserves at least one token"),
+        );
+        let created_tokens = created_tokens
+            .into_iter()
+            .map(|token| token.to_string())
+            .collect();
+        let collection = collection_address(prefix)?;
         let observed = self
             .shards
             .write_structural_log(
+                collection.db_root_component(),
                 &record_id,
                 &StructuralLog {
                     prefix: prefix.to_string(),
@@ -1606,15 +1651,18 @@ impl Splitter {
         path: &str,
         topology_participant: &TxId,
     ) -> Result<(), TransError> {
-        let parsed = paths::parse(path)
-            .map_err(|error| StorageError::with_source("parsing candidate path", error))?;
+        let (collection, token) = split_path_parts(path)?;
+        let prefix = collection.physical_prefix();
         // Recovery can publish separators after the topology participant has
         // finalized. A fresh structural identity prevents ordinary lock
         // helping from mistaking this in-flight recursive split for stale work.
         let worker = self.candidates.new_id();
         let reason = SplitReason::SoftCap;
-        let target = StructuralSplitTarget::for_path(path, &parsed.suffix);
-        StructuralSplitAttempt::new(self, &parsed.prefix, target, worker, &reason)
+        let target = match token.as_ref() {
+            Some(token) => StructuralSplitTarget::NonRoot(token.as_str()),
+            None => StructuralSplitTarget::Root,
+        };
+        StructuralSplitAttempt::new(self, &prefix, target, worker, &reason)
             .run(StructuralSplitTopology::Joined(topology_participant))
             .await
     }
@@ -1665,14 +1713,16 @@ impl Splitter {
         token: Option<&str>,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let collection = collection_address(prefix)?;
+        let token = token.map(node_token).transpose()?;
         for _ in 0..PARENT_RETRIES {
-            let node = match token {
-                Some(token) => match self.shards.load_node(prefix, token, requirement).await {
+            let node = match token.as_ref() {
+                Some(token) => match self.shards.load_node(&collection, token, requirement).await {
                     Ok((node, _)) => node,
                     Err(StorageError::NotFound) => return Ok(true),
                     Err(e) => return Err(e.into()),
                 },
-                None => match self.shards.load_root_node(prefix, requirement).await? {
+                None => match self.shards.load_root_node(&collection, requirement).await? {
                     Some((node, _)) => node,
                     None => return Ok(true),
                 },
@@ -1689,7 +1739,8 @@ impl Splitter {
             // A finalized holder may still have a shrink CAS in flight. This
             // cleanup CAS either wins first, fencing that shrink, or loses to
             // it and the next iteration observes the landed right-link.
-            self.release_structural_gate(prefix, token, holder).await?;
+            self.release_structural_gate(prefix, token.as_ref().map(NodeToken::as_str), holder)
+                .await?;
         }
         Err(TransError::Retry)
     }
@@ -1707,6 +1758,18 @@ impl Splitter {
         debug_assert_eq!(prepared.record.prefix, prefix);
         debug_assert_eq!(prepared.record.source_token, token);
         let right_token = prepared.record.created_tokens[0].clone();
+        let collection = match collection_address(prefix) {
+            Ok(collection) => collection,
+            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+        };
+        let source_node_token = match node_token(token) {
+            Ok(token) => token,
+            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+        };
+        let right_node_token = match node_token(&right_token) {
+            Ok(token) => token,
+            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+        };
         let (mut node, version) = match self
             .acquire_structural_gate(prefix, Some(token), worker)
             .await
@@ -1783,7 +1846,7 @@ impl Splitter {
 
         match self
             .shards
-            .store_node(prefix, &right_token, &right, None)
+            .store_node(&collection, &right_node_token, &right, None)
             .await
         {
             Ok(true) => {}
@@ -1796,7 +1859,7 @@ impl Splitter {
         }
         match self
             .shards
-            .store_node(prefix, token, &node, Some(&version))
+            .store_node(&collection, &source_node_token, &node, Some(&version))
             .await
         {
             Ok(true) => {}
@@ -1833,14 +1896,18 @@ impl Splitter {
     }
 
     async fn join_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
+        let collection = collection_address(prefix)?;
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut record, observed) =
-                match self.records.load_record(prefix, Requirement::Any).await {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
-                    Err(error) => return Err(error.into()),
-                };
+            let (mut record, observed) = match self
+                .records
+                .load_record(&collection, Requirement::Any)
+                .await
+            {
+                Ok(record) => record,
+                Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
+                Err(error) => return Err(error.into()),
+            };
             if record
                 .topology_participants()
                 .any(|participant| participant == id)
@@ -1873,14 +1940,18 @@ impl Splitter {
     }
 
     async fn leave_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
+        let collection = collection_address(prefix)?;
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut record, observed) =
-                match self.records.load_record(prefix, Requirement::Any).await {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                };
+            let (mut record, observed) = match self
+                .records
+                .load_record(&collection, Requirement::Any)
+                .await
+            {
+                Ok(record) => record,
+                Err(StorageError::NotFound) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
             if !record.remove_topology_participant(id) {
                 return Ok(());
             }
@@ -1928,6 +1999,18 @@ impl Splitter {
 
         let l_token = prepared.record.created_tokens[0].clone();
         let r_token = prepared.record.created_tokens[1].clone();
+        let collection = match collection_address(prefix) {
+            Ok(collection) => collection,
+            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+        };
+        let left_node_token = match node_token(&l_token) {
+            Ok(token) => token,
+            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+        };
+        let right_node_token = match node_token(&r_token) {
+            Ok(token) => token,
+            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+        };
         let (left, right, split_key) = split_into_children(&node, &r_token, worker);
         let root_index = IndexNode::from_children([
             (Vec::new(), l_token.clone()),
@@ -1982,7 +2065,11 @@ impl Splitter {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
 
-        match self.shards.store_node(prefix, &l_token, &left, None).await {
+        match self
+            .shards
+            .store_node(&collection, &left_node_token, &left, None)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
@@ -1991,7 +2078,11 @@ impl Splitter {
                 return SplitAttemptOutcome::recovery_required(ready, error.into());
             }
         }
-        match self.shards.store_node(prefix, &r_token, &right, None).await {
+        match self
+            .shards
+            .store_node(&collection, &right_node_token, &right, None)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
@@ -2159,6 +2250,12 @@ impl Splitter {
         // the listing epoch. The Ready transition follows source-gate
         // acquisition, so its watermark is at least as fresh as that gate.
         let requirement = Requirement::AtLeast(observed.current_after());
+        let collection = collection_address(&record.prefix)?;
+        let created_tokens = record
+            .created_tokens
+            .iter()
+            .map(|token| node_token(token))
+            .collect::<Result<Vec<_>, _>>()?;
         let source_token = (!record.is_root).then_some(record.source_token.as_str());
         if !self
             .fence_source_writer_for_recovery(&record.prefix, source_token, requirement)
@@ -2175,18 +2272,13 @@ impl Splitter {
             }
             vec![
                 self.router
-                    .token_reachable_at_key(
-                        &record.prefix,
-                        &[],
-                        &record.created_tokens[0],
-                        requirement,
-                    )
+                    .token_reachable_at_key(&collection, &[], &created_tokens[0], requirement)
                     .await?,
                 self.router
                     .token_reachable_at_key(
-                        &record.prefix,
+                        &collection,
                         &record.split_key,
-                        &record.created_tokens[1],
+                        &created_tokens[1],
                         requirement,
                     )
                     .await?,
@@ -2200,9 +2292,9 @@ impl Splitter {
             vec![
                 self.router
                     .token_reachable_at_key(
-                        &record.prefix,
+                        &collection,
                         &record.split_key,
-                        &record.created_tokens[0],
+                        &created_tokens[0],
                         requirement,
                     )
                     .await?,
@@ -2218,11 +2310,11 @@ impl Splitter {
             )
             .await?;
         } else if !applied {
-            for (token, reachable) in record.created_tokens.iter().zip(reachable) {
+            for (token, reachable) in created_tokens.iter().zip(reachable) {
                 if !reachable {
                     match self
                         .shards
-                        .load_node_state(&record.prefix, token, requirement)
+                        .load_node_state(&collection, token, requirement)
                         .await
                     {
                         Ok(node) => self.shards.delete_node(&node).await?,
@@ -2291,7 +2383,7 @@ impl TopologySettler for Splitter {
             let records = self
                 .shards
                 .list_structural_logs_for_participant(
-                    collection.db_root(),
+                    collection.db_root_component(),
                     id,
                     Requirement::AtLeast(self.timeline.now()),
                 )
@@ -2330,6 +2422,25 @@ fn split_into_children(
     (source, right, split_key)
 }
 
+fn collection_address(prefix: &str) -> Result<CollectionAddress, TransError> {
+    CollectionAddress::from_physical_prefix(prefix)
+        .map_err(|error| TransError::with_source("parsing collection prefix", error))
+}
+
+fn node_token(token: &str) -> Result<NodeToken, TransError> {
+    NodeToken::try_from(token).map_err(|error| TransError::with_source("parsing node token", error))
+}
+
+fn split_path_parts(path: &str) -> Result<(CollectionAddress, Option<NodeToken>), TransError> {
+    match ObjectPath::try_from(path)
+        .map_err(|error| TransError::with_source("parsing split path", error))?
+    {
+        ObjectPath::TreeRoot { collection } => Ok((collection, None)),
+        ObjectPath::Node { collection, token } => Ok((collection, Some(token))),
+        _ => Err(TransError::other("split candidate is not a tree node")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2354,6 +2465,94 @@ mod tests {
 
     fn collection() -> CollectionAddress {
         CollectionAddress::root("db")
+    }
+
+    fn collection_at(prefix: &str) -> CollectionAddress {
+        CollectionAddress::from_physical_prefix(prefix).unwrap()
+    }
+
+    fn db_root(value: &str) -> DbRoot {
+        DbRoot::try_from(value).unwrap()
+    }
+
+    fn test_token(value: &str) -> NodeToken {
+        if let Ok(token) = NodeToken::try_from(value) {
+            return token;
+        }
+        let mut bytes = [0_u8; 16];
+        for (index, byte) in value.bytes().enumerate() {
+            let slot = index % bytes.len();
+            bytes[slot] = bytes[slot].wrapping_mul(31).wrapping_add(byte);
+        }
+        bytes[15] ^= value.len() as u8;
+        NodeToken::from_bytes(bytes)
+    }
+
+    fn canonical_node(node: &Node) -> Node {
+        let mut canonical = match (node.as_leaf(), node.as_index()) {
+            (Some(shard), None) => Node::leaf(shard.clone()),
+            (None, Some(index)) => Node::index(IndexNode::from_children(
+                index
+                    .children()
+                    .map(|(key, token)| (key.to_vec(), test_token(token).to_string())),
+            )),
+            _ => unreachable!("a node has exactly one body"),
+        }
+        .with_high_key(node.high_key().map(<[u8]>::to_vec))
+        .with_right_sibling(
+            node.right_sibling()
+                .map(|token| test_token(token).to_string()),
+        );
+        canonical.set_locks(node.locks().clone());
+        canonical
+    }
+
+    fn canonical_record(record: &StructuralLog) -> StructuralLog {
+        let mut canonical = record.clone();
+        if !canonical.source_token.is_empty() {
+            canonical.source_token = test_token(&canonical.source_token).to_string();
+        }
+        canonical.created_tokens = canonical
+            .created_tokens
+            .iter()
+            .map(|token| test_token(token).to_string())
+            .collect();
+        canonical
+    }
+
+    mod paths {
+        use super::*;
+
+        pub fn tree_root(prefix: &str) -> String {
+            ObjectPath::TreeRoot {
+                collection: collection_at(prefix),
+            }
+            .to_string()
+        }
+
+        pub fn from_node(prefix: &str, token: &str) -> String {
+            ObjectPath::Node {
+                collection: collection_at(prefix),
+                token: test_token(token),
+            }
+            .to_string()
+        }
+
+        pub fn nodes_prefix(prefix: &str) -> String {
+            ObjectPath::nodes_prefix(&collection_at(prefix))
+        }
+
+        pub fn structural_log_dir(root: &str) -> String {
+            ObjectPath::structural_records_prefix(&db_root(root))
+        }
+
+        pub fn structural_log_participant_dir(root: &str, participant: &TxId) -> String {
+            ObjectPath::participant_structural_records_prefix(&db_root(root), participant)
+        }
+
+        pub fn transactions_prefix(root: &str) -> String {
+            format!("{}/_t/", db_root(root))
+        }
     }
 
     // A soft cap so tight a two-entry leaf is at the cap and a third overflows it,
@@ -2386,10 +2585,106 @@ mod tests {
 
     impl TestStore {
         async fn create_root(&self, prefix: &str, node: &Node) -> Result<bool, StorageError> {
+            let collection = collection_at(prefix);
             self.records
-                .create_record(prefix, &CollectionRecord::new())
+                .create_record(&collection, &CollectionRecord::new())
                 .await?;
-            self.shards.create_root(prefix, node).await
+            self.shards
+                .create_root(&collection, &canonical_node(node))
+                .await
+        }
+
+        async fn load_root_node(
+            &self,
+            prefix: &str,
+            requirement: Requirement,
+        ) -> Result<Option<(Node, LeafObservation)>, StorageError> {
+            self.shards
+                .load_root_node(&collection_at(prefix), requirement)
+                .await
+        }
+
+        async fn load_root(
+            &self,
+            prefix: &str,
+            requirement: Requirement,
+        ) -> Result<(Node, LeafObservation), StorageError> {
+            self.shards
+                .load_root(&collection_at(prefix), requirement)
+                .await
+        }
+
+        async fn store_root(
+            &self,
+            prefix: &str,
+            node: &Node,
+            expected: &LeafObservation,
+        ) -> Result<bool, StorageError> {
+            self.shards
+                .store_root(&collection_at(prefix), &canonical_node(node), expected)
+                .await
+        }
+
+        async fn load_node(
+            &self,
+            prefix: &str,
+            token: &str,
+            requirement: Requirement,
+        ) -> Result<(Node, LeafObservation), StorageError> {
+            self.shards
+                .load_node(&collection_at(prefix), &test_token(token), requirement)
+                .await
+        }
+
+        async fn store_node(
+            &self,
+            prefix: &str,
+            token: &str,
+            node: &Node,
+            expected: Option<&LeafObservation>,
+        ) -> Result<bool, StorageError> {
+            self.shards
+                .store_node(
+                    &collection_at(prefix),
+                    &test_token(token),
+                    &canonical_node(node),
+                    expected,
+                )
+                .await
+        }
+
+        async fn list_nodes(
+            &self,
+            prefix: &str,
+            requirement: Requirement,
+        ) -> Result<Vec<(NodeToken, Observation<Node>)>, StorageError> {
+            self.shards
+                .list_nodes(&collection_at(prefix), requirement)
+                .await
+        }
+
+        async fn write_structural_log(
+            &self,
+            record_id: &str,
+            record: &StructuralLog,
+        ) -> Result<Observation<StructuralLog>, StorageError> {
+            self.shards
+                .write_structural_log(
+                    &db_root("db"),
+                    &StructuralRecordId::from(test_token(record_id)),
+                    &canonical_record(record),
+                )
+                .await
+        }
+
+        async fn list_structural_logs(
+            &self,
+            root: &str,
+            requirement: Requirement,
+        ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
+            self.shards
+                .list_structural_logs(&db_root(root), requirement)
+                .await
         }
     }
 
@@ -2438,7 +2733,7 @@ mod tests {
     fn leaf_node(keys: &[&[u8]], high: Option<&[u8]>, right: Option<&str>) -> Node {
         Node::leaf(Shard::from_entries(keys.iter().map(|k| live(k))))
             .with_high_key(high.map(<[u8]>::to_vec))
-            .with_right_sibling(right.map(str::to_string))
+            .with_right_sibling(right.map(|token| test_token(token).to_string()))
     }
 
     fn splitter(shards: &TestStore, bg: &Arc<Background>, policy: SplitPolicy) -> Splitter {
@@ -2450,7 +2745,7 @@ mod tests {
         bg: &Arc<Background>,
         candidates: SplitCandidates,
     ) -> Splitter {
-        let tl = TLogger::new(shards.objects.clone(), "db");
+        let tl = TLogger::new(shards.objects.clone(), db_root("db"));
         let mon = Monitor::with_config(
             tl.clone(),
             shards.timeline.clone(),
@@ -2495,7 +2790,7 @@ mod tests {
         bg: &Arc<Background>,
         policy: SplitPolicy,
     ) -> (Splitter, Monitor) {
-        let tl = TLogger::new(shards.objects.clone(), "db");
+        let tl = TLogger::new(shards.objects.clone(), db_root("db"));
         let mon = Monitor::with_config(
             tl.clone(),
             shards.timeline.clone(),
@@ -2524,9 +2819,9 @@ mod tests {
     fn nonroot_record(source: &str, right: &str, split_key: &[u8]) -> StructuralLog {
         StructuralLog {
             prefix: COLL.to_string(),
-            source_token: source.to_string(),
+            source_token: test_token(source).to_string(),
             source_version: String::new(),
-            created_tokens: vec![right.to_string()],
+            created_tokens: vec![test_token(right).to_string()],
             split_key: split_key.to_vec(),
             is_root: false,
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -2578,7 +2873,7 @@ mod tests {
         let router = TreeRouter::new(s.shards.clone());
         assert_eq!(
             router
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -2587,7 +2882,7 @@ mod tests {
         );
         for key in keys {
             let loc = router
-                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), key, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             let entry = loc.node().unwrap().as_leaf().unwrap().lookup(key).cloned();
@@ -2622,7 +2917,7 @@ mod tests {
 
         let router = TreeRouter::new(s.shards.clone());
         let leaves = router
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "one leaf became two");
@@ -2646,7 +2941,7 @@ mod tests {
         // Every key remains reachable by descent, in order.
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
             let loc = router
-                .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(
@@ -2740,7 +3035,7 @@ mod tests {
         assert!(root.as_leaf().is_some());
         let (record, _) = s
             .records
-            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(record.topology_participants().count(), 0);
@@ -2886,7 +3181,7 @@ mod tests {
 
             let (record, _) = s
                 .records
-                .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
+                .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert_eq!(
@@ -2922,7 +3217,7 @@ mod tests {
 
         let router = TreeRouter::new(s.shards.clone());
         let leaves = router
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "leaf L split into two");
@@ -2937,7 +3232,7 @@ mod tests {
         assert_eq!(index.len(), 2, "parent gained the separator");
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
             let loc = router
-                .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(
@@ -3013,7 +3308,7 @@ mod tests {
         let router = TreeRouter::new(s.shards.clone());
         assert_eq!(
             router
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -3022,7 +3317,7 @@ mod tests {
         );
         for key in [b"a".as_slice(), b"m", b"n", b"o"] {
             let leaf = router
-                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), key, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
@@ -3082,7 +3377,7 @@ mod tests {
         let router = TreeRouter::new(s.shards.clone());
         for k in [b"a".as_slice(), b"m", b"t"] {
             let loc = router
-                .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(
@@ -3106,18 +3401,18 @@ mod tests {
 
         sp.split_path(&paths::tree_root(COLL)).await.unwrap();
         let after_first = TreeRouter::new(s.shards.clone())
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         // Re-run: each resulting leaf holds two keys, which is at (not over) the
         // cap, so nothing changes.
         for leaf in &after_first {
-            sp.split_path(&leaf.path).await.unwrap();
+            sp.split_path(&leaf.path.to_string()).await.unwrap();
         }
         sp.split_path(&paths::tree_root(COLL)).await.unwrap();
 
         let after_second = TreeRouter::new(s.shards.clone())
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -3134,7 +3429,7 @@ mod tests {
         );
         let (record, _) = s
             .records
-            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(record.topology_participants().count(), 0);
@@ -3170,7 +3465,7 @@ mod tests {
         sp.run_once().await;
 
         let leaves = TreeRouter::new(s.shards.clone())
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "the fed candidate was split");
@@ -3213,7 +3508,7 @@ mod tests {
 
         let router = TreeRouter::new(s.shards.clone());
         let leaves = router
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 5);
@@ -3222,7 +3517,7 @@ mod tests {
         }));
         for key in keys {
             let located = router
-                .leaf_for(COLL, key, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), key, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(located.node().unwrap().as_leaf().unwrap().exists(key));
@@ -3256,7 +3551,7 @@ mod tests {
         let router = TreeRouter::new(s.shards.clone());
         assert_eq!(
             router
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -3278,7 +3573,7 @@ mod tests {
         );
 
         let target = router
-            .leaf_for(COLL, b"h", Requirement::AtLeast(s.timeline.now()))
+            .leaf_for(&collection(), b"h", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         let reason = SplitReason::InlinePressure {
@@ -3302,7 +3597,7 @@ mod tests {
 
         assert_eq!(
             router
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -3323,7 +3618,7 @@ mod tests {
             }
         );
         let target = router
-            .leaf_for(COLL, b"h", Requirement::AtLeast(s.timeline.now()))
+            .leaf_for(&collection(), b"h", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert!(matches!(
@@ -3481,7 +3776,7 @@ mod tests {
             TxCommitStatus::Wounded
         );
         let leaves = TreeRouter::new(s.shards.clone())
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2);
@@ -3530,7 +3825,7 @@ mod tests {
         sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
 
         let leaf = TreeRouter::new(s.shards.clone())
-            .leaf_for(COLL, b"d", Requirement::AtLeast(s.timeline.now()))
+            .leaf_for(&collection(), b"d", Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert!(leaf.node().unwrap().structural_gate().holders().is_empty());
@@ -3554,7 +3849,7 @@ mod tests {
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
         let other_bg = Arc::new(Background::new());
-        let other_transactions = TLogger::new(other.objects.clone(), "db");
+        let other_transactions = TLogger::new(other.objects.clone(), db_root("db"));
         let other_mon = Monitor::with_config(
             other_transactions.clone(),
             other.timeline.clone(),
@@ -3593,7 +3888,7 @@ mod tests {
             )
             .await;
         let current = TreeRouter::new(other.shards.clone())
-            .leaf_for(COLL, b"d", Requirement::Any)
+            .leaf_for(&collection(), b"d", Requirement::Any)
             .await
             .unwrap();
         let current = current
@@ -3632,7 +3927,7 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             TreeRouter::new(s.shards.clone())
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -3643,7 +3938,7 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             TreeRouter::new(s.shards.clone())
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -3683,7 +3978,7 @@ mod tests {
         // The only cap crossed is the byte cap, so a split here proves the byte
         // cap now has a producer.
         let leaves = TreeRouter::new(s.shards.clone())
-            .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "byte-cap overflow triggered a split");
@@ -3759,7 +4054,7 @@ mod tests {
         let router = TreeRouter::new(s.shards.clone());
         for k in [b"a".as_slice(), b"b", b"g", b"h", b"m", b"n", b"o"] {
             let loc = router
-                .leaf_for(COLL, k, Requirement::AtLeast(s.timeline.now()))
+                .leaf_for(&collection(), k, Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap();
             assert!(
@@ -3806,7 +4101,7 @@ mod tests {
         );
         let (blocked_coordination, _) = s
             .records
-            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(
@@ -3816,7 +4111,7 @@ mod tests {
         );
         assert_eq!(
             TreeRouter::new(s.shards.clone())
-                .leaves(COLL, Requirement::AtLeast(s.timeline.now()))
+                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
                 .await
                 .unwrap()
                 .len(),
@@ -3846,7 +4141,7 @@ mod tests {
         );
         let (recovered_coordination, _) = s
             .records
-            .load_record(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert_eq!(recovered_coordination.topology_participants().count(), 0);
@@ -4081,7 +4376,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(root_node.as_index().unwrap().child_for(b"m"), Some("R"));
+        assert_eq!(
+            root_node.as_index().unwrap().child_for(b"m"),
+            Some(test_token("R").as_str())
+        );
         assert!(
             s.list_structural_logs("db", Requirement::AtLeast(s.timeline.now()))
                 .await
@@ -4255,6 +4553,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(root_node.as_index().unwrap().child_for(b"m"), Some("R"));
+        assert_eq!(
+            root_node.as_index().unwrap().child_for(b"m"),
+            Some(test_token("R").as_str())
+        );
     }
 }

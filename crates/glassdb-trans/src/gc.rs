@@ -530,7 +530,7 @@ impl Gc {
         for items in by_collection.into_values() {
             match self.router.group_keys_by_leaf(items, requirement).await {
                 Ok(groups) => {
-                    leaf_paths.extend(groups.into_iter().map(|group| group.path));
+                    leaf_paths.extend(groups.into_iter().map(|group| group.path.to_string()));
                 }
                 Err(StorageError::NotFound | StorageError::StaleCollection) => {}
                 Err(error) => return Err(error.into()),
@@ -543,7 +543,11 @@ impl Gc {
         for collection in topology {
             let records = self
                 .shards
-                .list_structural_logs_for_participant(collection.db_root(), tid, requirement)
+                .list_structural_logs_for_participant(
+                    collection.db_root_component(),
+                    tid,
+                    requirement,
+                )
                 .await?;
             if !records.is_empty() {
                 return Ok(false);
@@ -578,7 +582,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::{CollectionAddress, CollectionId};
+    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxWrite};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard,
@@ -587,8 +591,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
-
-    const COLL: &str = "db/_c/0000000000000000000000";
 
     struct UnexpectedTopologySettler;
 
@@ -611,6 +613,12 @@ mod tests {
 
     fn collection() -> glassdb_data::CollectionAddress {
         glassdb_data::CollectionAddress::root("db")
+    }
+
+    fn root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: collection(),
+        }
     }
 
     fn base() -> SystemTime {
@@ -637,18 +645,18 @@ mod tests {
     async fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), "db");
+        let tl = TLogger::new(objects.clone(), DbRoot::try_from("db").unwrap());
         let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects);
         assert!(
             records
-                .create_record(COLL, &CollectionRecord::new())
+                .create_record(&collection(), &CollectionRecord::new())
                 .await
                 .unwrap()
         );
         assert!(
             shards
-                .create_root(COLL, &Node::leaf(Shard::new()))
+                .create_root(&collection(), &Node::leaf(Shard::new()))
                 .await
                 .unwrap()
         );
@@ -724,7 +732,7 @@ mod tests {
     }
 
     async fn store_entry(ctx: &Ctx, _key: &[u8], entry: ShardEntry) {
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = ctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
@@ -746,10 +754,7 @@ mod tests {
     async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         loaded.entries().lookup(key).cloned()
@@ -876,11 +881,11 @@ mod tests {
             CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
         );
         ctx.records
-            .create_record(&prepared.physical_prefix(), &CollectionRecord::new())
+            .create_record(&prepared, &CollectionRecord::new())
             .await
             .unwrap();
         ctx.shards
-            .create_root(&prepared.physical_prefix(), &Node::leaf(Shard::new()))
+            .create_root(&prepared, &Node::leaf(Shard::new()))
             .await
             .unwrap();
         let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
@@ -892,9 +897,7 @@ mod tests {
 
         assert!(is_gone(&ctx.tl, &id).await);
         assert!(matches!(
-            ctx.shards
-                .load_root(&prepared.physical_prefix(), Requirement::Any)
-                .await,
+            ctx.shards.load_root(&prepared, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -909,11 +912,11 @@ mod tests {
             CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
         );
         ctx.records
-            .create_record(&prepared.physical_prefix(), &CollectionRecord::new())
+            .create_record(&prepared, &CollectionRecord::new())
             .await
             .unwrap();
         ctx.shards
-            .create_root(&prepared.physical_prefix(), &Node::leaf(Shard::new()))
+            .create_root(&prepared, &Node::leaf(Shard::new()))
             .await
             .unwrap();
         let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
@@ -950,7 +953,7 @@ mod tests {
         );
         assert!(
             ctx.records
-                .load_record(&prepared.physical_prefix(), Requirement::Any)
+                .load_record(&prepared, Requirement::Any)
                 .await
                 .is_ok()
         );
@@ -960,9 +963,7 @@ mod tests {
         run_once(&ctx.gc).await;
         assert!(is_gone(&ctx.tl, &id).await);
         assert!(matches!(
-            ctx.shards
-                .load_root(&prepared.physical_prefix(), Requirement::Any)
-                .await,
+            ctx.shards.load_root(&prepared, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -979,7 +980,7 @@ mod tests {
         store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
         let (mut parent_record, parent_observed) = ctx
             .records
-            .load_record(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(
@@ -1000,18 +1001,13 @@ mod tests {
         assert!(child_record.set_topology_freeze(id.clone()));
         assert!(
             ctx.records
-                .create_record(&child.physical_prefix(), &child_record)
+                .create_record(&child, &child_record)
                 .await
                 .unwrap()
         );
         let mut child_node = Node::leaf(Shard::new());
         child_node.set_collection_delete_intent(id.clone());
-        assert!(
-            ctx.shards
-                .create_root(&child.physical_prefix(), &child_node)
-                .await
-                .unwrap()
-        );
+        assert!(ctx.shards.create_root(&child, &child_node).await.unwrap());
 
         let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
         log.locks.extend([
@@ -1041,15 +1037,13 @@ mod tests {
         );
         let (parent_record, _) = ctx
             .records
-            .load_record(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert_eq!(parent_record.child(b"child"), None);
         assert!(!parent_record.directory_lock().contains(&id));
         assert!(matches!(
-            ctx.shards
-                .load_root(&child.physical_prefix(), Requirement::Any)
-                .await,
+            ctx.shards.load_root(&child, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -1270,7 +1264,8 @@ mod tests {
 
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path();
+        let shard_path_string = shard_path.to_string();
 
         // Seed both entries in the one shared leaf `_r`: a dead transaction holds
         // A's write lock (no committed writer), so GC's release will clear and
@@ -1292,7 +1287,7 @@ mod tests {
         let live = TxId::with_priority(2_000_000_000, b"live");
         ctx.mon.begin_tx(&live);
 
-        let before = count_stores(&log, &shard_path);
+        let before = count_stores(&log, &shard_path_string);
         gate.arm();
 
         // Drive GC's release and the live acquire concurrently: the first becomes
@@ -1336,7 +1331,7 @@ mod tests {
         );
 
         assert_eq!(
-            count_stores(&log, &shard_path) - before,
+            count_stores(&log, &shard_path_string) - before,
             1,
             "GC release and the live acquire share a single shard CAS"
         );

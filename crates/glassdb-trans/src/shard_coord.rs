@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use glassdb_concurr::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
 };
-use glassdb_data::TxId;
+use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     LeafEdit, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
     SplitPolicy, StorageError,
@@ -661,6 +661,8 @@ impl CasWorker {
         path: &str,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
+        let object_path = ObjectPath::try_from(path)
+            .map_err(|error| TransError::with_source("parsing coordinated leaf path", error))?;
         let first_requirement = batch.merged().first_requirement;
         // A cache-served `Any` load may complete without yielding. Give peers
         // already scheduled for this object one opportunity to join the round,
@@ -703,7 +705,7 @@ impl CasWorker {
             } else {
                 Requirement::Any
             };
-            let edit = match self.core.shards.load_leaf(path, requirement).await {
+            let edit = match self.core.shards.load_leaf(&object_path, requirement).await {
                 Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
                 // between grouping and this load. Deliver each resolver's
@@ -938,11 +940,23 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_concurr::Background;
-    use glassdb_data::paths;
+    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath};
     use glassdb_storage::transaction::TLogger;
     use glassdb_storage::{CachedStore, CurrentState, LockType, Node, Shard, Timeline};
 
     const COLL: &str = "coordp";
+
+    fn collection() -> CollectionAddress {
+        CollectionAddress::root(COLL)
+    }
+
+    fn leaf_token() -> NodeToken {
+        NodeToken::from_bytes([0; 16])
+    }
+
+    fn object_path(path: &str) -> ObjectPath {
+        ObjectPath::try_from(path).unwrap()
+    }
 
     struct NoSplitHints;
 
@@ -953,8 +967,15 @@ mod tests {
     // Every coordination round in these tests targets one leaf object. A
     // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
     // entries (no collection metadata), exactly what the shard fold operates on.
+    fn leaf_path() -> ObjectPath {
+        ObjectPath::Node {
+            collection: collection(),
+            token: leaf_token(),
+        }
+    }
+
     fn leaf() -> String {
-        paths::from_node(COLL, "L")
+        leaf_path().to_string()
     }
 
     // A coordinator over `backend` with its own (large, non-evicting) cache, plus
@@ -1006,13 +1027,18 @@ mod tests {
             None,
         ));
         let _ = seed_store
-            .store_node(COLL, "L", &Node::leaf(Shard::new()), None)
+            .store_node(
+                &collection(),
+                &leaf_token(),
+                &Node::leaf(Shard::new()),
+                None,
+            )
             .await
             .unwrap();
 
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), COLL);
+        let tl = TLogger::new(objects.clone(), DbRoot::try_from(COLL).unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl,
@@ -1055,10 +1081,18 @@ mod tests {
     // coordinator).
     async fn store_shard_entries(store: &ShardStore, path: &str, entries: Vec<ShardEntry>) {
         let _ = store
-            .store_node(COLL, "L", &Node::leaf(Shard::new()), None)
+            .store_node(
+                &collection(),
+                &leaf_token(),
+                &Node::leaf(Shard::new()),
+                None,
+            )
             .await
             .unwrap();
-        let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
+        let loaded = store
+            .load_leaf(&object_path(path), Requirement::Any)
+            .await
+            .unwrap();
         let shard = Shard::from_entries(entries);
         let mut edit = loaded.into_edit();
         edit.set_entries(shard);
@@ -1067,12 +1101,12 @@ mod tests {
 
     async fn replace_leaf_node(store: &ShardStore, node: &Node) {
         let observed = store
-            .load_node_state(COLL, "L", Requirement::Any)
+            .load_node_state(&collection(), &leaf_token(), Requirement::Any)
             .await
             .unwrap();
         assert!(
             store
-                .store_node(COLL, "L", node, Some(&observed))
+                .store_node(&collection(), &leaf_token(), node, Some(&observed))
                 .await
                 .unwrap()
         );
@@ -1099,7 +1133,7 @@ mod tests {
     // Loads the leaf's entries from a cold store, for asserting what landed.
     async fn cold_entries(store: &ShardStore, path: &str) -> Shard {
         store
-            .load_leaf(path, Requirement::Any)
+            .load_leaf(&object_path(path), Requirement::Any)
             .await
             .unwrap()
             .entries()
@@ -1309,7 +1343,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let (coord, shards, _timeline, _bg) = coord_over(backend).await;
         let edit = shards
-            .load_leaf(&leaf(), Requirement::Any)
+            .load_leaf(&leaf_path(), Requirement::Any)
             .await
             .unwrap()
             .into_edit();
@@ -1380,7 +1414,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, shards, _timeline, _bg) = coord_over(backend).await;
         let edit = shards
-            .load_leaf(&leaf(), Requirement::Any)
+            .load_leaf(&leaf_path(), Requirement::Any)
             .await
             .unwrap()
             .into_edit();
@@ -1467,7 +1501,7 @@ mod tests {
         let (coord, shards, _timeline, _bg) = coord_over_with(backend, policy, hints.clone()).await;
         store_shard_entries(&shards, &leaf(), vec![seed]).await;
         let edit = shards
-            .load_leaf(&leaf(), Requirement::Any)
+            .load_leaf(&leaf_path(), Requirement::Any)
             .await
             .unwrap()
             .into_edit();
@@ -1752,7 +1786,10 @@ mod tests {
         )
         .await;
         let (coord, shards, timeline, _bg) = coord_over(backend.clone()).await;
-        shards.load_leaf(&leaf(), Requirement::Any).await.unwrap();
+        shards
+            .load_leaf(&leaf_path(), Requirement::Any)
+            .await
+            .unwrap();
 
         let tx = TxId::with_priority(2, b"t");
         log.lock().unwrap().clear();

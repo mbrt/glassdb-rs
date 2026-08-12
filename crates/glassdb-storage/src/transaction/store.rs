@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{TxId, paths};
+use glassdb_data::{DbRoot, ObjectPath, TxId};
 
 use crate::cached_store::{CachedStore, CasResult, Observation, Requirement};
 use crate::error::StorageError;
@@ -46,15 +46,15 @@ pub struct TxListPage {
 /// Reads and writes transaction logs under a path prefix.
 #[derive(Clone)]
 pub struct TLogger {
-    prefix: String,
+    db_root: DbRoot,
     logs: crate::cached_store::TypedCachedStore<TxLogCodec>,
 }
 
 impl TLogger {
-    /// Creates a logger storing logs under `prefix`.
-    pub fn new(objects: CachedStore, prefix: impl Into<String>) -> Self {
+    /// Creates a logger storing logs under `db_root`.
+    pub fn new(objects: CachedStore, db_root: DbRoot) -> Self {
         TLogger {
-            prefix: prefix.into(),
+            db_root,
             logs: objects.typed(),
         }
     }
@@ -65,7 +65,11 @@ impl TLogger {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<TxStatus, StorageError> {
-        let path = paths::from_transaction(&self.prefix, id);
+        let path = ObjectPath::Transaction {
+            db_root: self.db_root.clone(),
+            id: id.clone(),
+        }
+        .to_string();
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
             None => self.logs.read(&path, requirement).await?,
@@ -79,7 +83,11 @@ impl TLogger {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<Observation<TxLog>, StorageError> {
-        let path = paths::from_transaction(&self.prefix, id);
+        let path = ObjectPath::Transaction {
+            db_root: self.db_root.clone(),
+            id: id.clone(),
+        }
+        .to_string();
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
             None => self.logs.read(&path, requirement).await?,
@@ -97,15 +105,12 @@ impl TLogger {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
-        match self
-            .logs
-            .create(
-                &paths::from_transaction(&self.prefix, &l.id),
-                None,
-                Arc::new(persisted),
-            )
-            .await?
-        {
+        let path = ObjectPath::Transaction {
+            db_root: self.db_root.clone(),
+            id: l.id.clone(),
+        }
+        .to_string();
+        match self.logs.create(&path, None, Arc::new(persisted)).await? {
             CasResult::Committed(observed) => Ok(observed),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
@@ -144,12 +149,15 @@ impl TLogger {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        let prefix = paths::transaction_shard_prefix(&self.prefix, shard);
+        let prefix = ObjectPath::transaction_shard_prefix(&self.db_root, shard);
         let page = self.logs.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
             .iter()
-            .filter_map(|path| paths::transaction_id_of(path).ok())
+            .filter_map(|path| match ObjectPath::try_from(path.as_str()) {
+                Ok(ObjectPath::Transaction { db_root, id }) if db_root == self.db_root => Some(id),
+                _ => None,
+            })
             .collect();
         Ok(TxListPage {
             ids,
@@ -221,14 +229,18 @@ mod tests {
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
-    use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef};
+    use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef, paths};
     use tokio::sync::Notify;
+
+    fn db_root() -> DbRoot {
+        DbRoot::try_from("db").unwrap()
+    }
 
     fn new_tlogger() -> TLogger {
         let backend = Arc::new(MemoryBackend::new());
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        TLogger::new(objects, "db")
+        TLogger::new(objects, db_root())
     }
 
     fn test_collection(db_root: &str, byte: u8) -> CollectionAddress {
@@ -239,7 +251,7 @@ mod tests {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new(), None);
-        (TLogger::new(objects, "db"), operations)
+        (TLogger::new(objects, db_root()), operations)
     }
 
     fn assert_operations(operations: &OpLog, expected: &[&str]) {
@@ -547,7 +559,7 @@ mod tests {
         });
 
         let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let log = TxLog::new(id.clone(), TxCommitStatus::Ok);
 
         let creating = tokio::spawn({
@@ -614,7 +626,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let id = TxId::from_bytes(vec![4, 3, 2, 1]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
@@ -640,7 +652,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))
@@ -672,7 +684,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let id = TxId::from_bytes(vec![4, 3, 2, 3]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Wounded))

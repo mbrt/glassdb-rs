@@ -2017,7 +2017,7 @@ mod tests {
 
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-    use glassdb_data::{CollectionAddress, CollectionId};
+    use glassdb_data::{CollectionAddress, CollectionId, DbRoot};
     use glassdb_storage::transaction::{TxCollectionOp, TxWrite};
     use glassdb_storage::{CachedStore, LockType, Timeline};
 
@@ -2259,7 +2259,7 @@ mod tests {
     ) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b, 1024, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), "test");
+        let tl = TLogger::new(objects.clone(), DbRoot::try_from("test").unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl.clone(),

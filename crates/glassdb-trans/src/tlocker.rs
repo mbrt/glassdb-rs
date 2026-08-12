@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
-use glassdb_data::{KeyRef, LeafRef, TxId, paths};
+use glassdb_data::{KeyRef, LeafRef, ObjectPath, TxId, paths};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
     CurrentState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TreeRouter,
@@ -224,9 +224,7 @@ async fn build_groups(
 
     let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
     for group in grouped {
-        let leaf = LeafRef::from_physical_path(&group.path).map_err(|e| {
-            TransError::with_source(format!("parsing leaf path {:?}", group.path), e)
-        })?;
+        let leaf = leaf_ref(&group.path)?;
         let mut intents: Vec<KeyIntent> = group
             .keys
             .into_iter()
@@ -237,10 +235,11 @@ async fn build_groups(
             })
             .collect();
         intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
+        let path = group.path.to_string();
         groups.insert(
-            group.path.clone(),
+            path.clone(),
             ShardGroup {
-                path: group.path,
+                path,
                 leaf,
                 intents,
                 membership: LockType::None,
@@ -256,7 +255,7 @@ async fn build_groups(
         }
         for leaf in router
             .leaves_through(
-                &scan.collection.physical_prefix(),
+                &scan.collection,
                 &scan.range.start,
                 scan.frontier(),
                 scan_requirement,
@@ -265,11 +264,10 @@ async fn build_groups(
             .map_err(|error| error.classify_collection_absence(&scan.collection))?
         {
             let group = groups
-                .entry(leaf.path.clone())
+                .entry(leaf.path.to_string())
                 .or_insert_with(|| ShardGroup {
-                    leaf: LeafRef::from_physical_path(&leaf.path)
-                        .expect("directory returned a physical leaf path"),
-                    path: leaf.path,
+                    leaf: leaf_ref(&leaf.path).expect("router returned a physical leaf path"),
+                    path: leaf.path.to_string(),
                     intents: Vec::new(),
                     membership: LockType::None,
                 });
@@ -279,6 +277,16 @@ async fn build_groups(
         }
     }
     Ok(groups)
+}
+
+fn leaf_ref(path: &ObjectPath) -> Result<LeafRef, TransError> {
+    match path {
+        ObjectPath::TreeRoot { collection } => Ok(LeafRef::root(collection.clone())),
+        ObjectPath::Node { collection, token } => {
+            Ok(LeafRef::node(collection.clone(), token.to_string()))
+        }
+        _ => Err(TransError::other("router returned a non-leaf object path")),
+    }
 }
 
 // --- Shard resolvers (the locking policy the Locker installs, ADR-028) ------
@@ -1121,7 +1129,7 @@ impl KeyLocker {
                         .map_err(|e| TransError::from(e).context("rerouting delayed write-back"))?;
                     pending.extend(groups.into_iter().map(|group| {
                         let intents = group.keys.into_iter().map(|(_, intent)| intent).collect();
-                        (group.path, Arc::new(intents))
+                        (group.path.to_string(), Arc::new(intents))
                     }));
                 }
                 // A gate on one routed leaf does not prevent independent leaves
@@ -1338,7 +1346,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, paths};
+    use glassdb_data::{CollectionAddress, DbRoot, ObjectPath, paths};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
@@ -1373,7 +1381,7 @@ mod tests {
     ) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), "test");
+        let tl = TLogger::new(objects.clone(), DbRoot::try_from("test").unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl.clone(),
@@ -1386,13 +1394,13 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         assert!(
             records
-                .create_record(COLL, &CollectionRecord::new())
+                .create_record(&collection(), &CollectionRecord::new())
                 .await
                 .unwrap()
         );
         assert!(
             shards
-                .create_root(COLL, &Node::leaf(Shard::new()))
+                .create_root(&collection(), &Node::leaf(Shard::new()))
                 .await
                 .unwrap()
         );
@@ -1439,6 +1447,16 @@ mod tests {
 
     fn collection() -> CollectionAddress {
         CollectionAddress::root("test")
+    }
+
+    fn root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: collection(),
+        }
+    }
+
+    fn object_path(path: &str) -> ObjectPath {
+        ObjectPath::try_from(path).unwrap()
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -1504,10 +1522,7 @@ mod tests {
     async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         loaded.entries().lookup(key).cloned()
@@ -1516,10 +1531,15 @@ mod tests {
     async fn replace_root(ctx: &TlCtx, root: &Node) {
         let (_, observed) = ctx
             .shards
-            .load_root(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .load_root(&collection(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
-        assert!(ctx.shards.store_root(COLL, root, &observed).await.unwrap());
+        assert!(
+            ctx.shards
+                .store_root(&collection(), root, &observed)
+                .await
+                .unwrap()
+        );
     }
 
     // Acquires shard locks in parallel mode, asserting success.
@@ -1553,10 +1573,7 @@ mod tests {
         assert_eq!(e.locked_by, vec![tx.clone()]);
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1634,10 +1651,7 @@ mod tests {
         ));
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1689,10 +1703,7 @@ mod tests {
         assert!(entry_of(&ctx, b"z").await.is_none());
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1710,10 +1721,7 @@ mod tests {
         lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1736,7 +1744,10 @@ mod tests {
         let path = paths::tree_root(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &object_path(&path),
+                Requirement::AtLeast(ctx.timeline.now()),
+            )
             .await
             .unwrap();
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
@@ -1746,7 +1757,10 @@ mod tests {
         locker.keys().release_leaf(&tx, &path).await.unwrap();
         let loaded = ctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &object_path(&path),
+                Requirement::AtLeast(ctx.timeline.now()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
@@ -1939,10 +1953,7 @@ mod tests {
         assert_eq!(e.current, CurrentState::External { writer: tx });
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1963,10 +1974,7 @@ mod tests {
         ctx.monitor.begin_tx(&gate);
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         let mut node = loaded.node().clone();
@@ -1983,10 +1991,7 @@ mod tests {
 
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert_eq!(loaded.node().structural_gate().holders(), &[gate]);
@@ -2288,7 +2293,10 @@ mod tests {
         let path = paths::tree_root(COLL);
         let loaded = ctx
             .shards
-            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &object_path(&path),
+                Requirement::AtLeast(ctx.timeline.now()),
+            )
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded

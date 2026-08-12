@@ -241,7 +241,7 @@ fn validate_random_component(
 /// The physical address of one collection incarnation within a database.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CollectionAddress {
-    db_root: Arc<str>,
+    db_root: DbRoot,
     id: CollectionId,
 }
 
@@ -249,7 +249,13 @@ impl CollectionAddress {
     /// Creates an address from a database root and collection identity.
     pub fn new(db_root: impl Into<Arc<str>>, id: CollectionId) -> Self {
         let db_root = db_root.into();
-        assert!(!db_root.is_empty(), "database root must not be empty");
+        let db_root = DbRoot::try_from(db_root.as_ref())
+            .expect("database root must be a valid physical path component");
+        CollectionAddress { db_root, id }
+    }
+
+    /// Creates an address from an already validated database root.
+    pub fn from_db_root(db_root: DbRoot, id: CollectionId) -> Self {
         CollectionAddress { db_root, id }
     }
 
@@ -260,6 +266,11 @@ impl CollectionAddress {
 
     /// Returns this address's database root.
     pub fn db_root(&self) -> &str {
+        self.db_root.as_str()
+    }
+
+    /// Returns the validated database-root component.
+    pub fn db_root_component(&self) -> &DbRoot {
         &self.db_root
     }
 
@@ -270,13 +281,16 @@ impl CollectionAddress {
 
     /// Renders the collection prefix used for physical backend objects.
     pub fn physical_prefix(&self) -> String {
-        tree::collection_prefix(&self.db_root, self.id)
+        tree::collection_prefix(self.db_root.as_str(), self.id)
     }
 
     /// Parses an incarnation-addressed physical collection prefix.
     pub fn from_physical_prefix(prefix: &str) -> Result<Self, PathError> {
         let (db_root, id) = tree::parse_collection_prefix(prefix)?;
-        Ok(CollectionAddress::new(db_root, id))
+        Ok(CollectionAddress::from_db_root(
+            DbRoot::try_from(db_root)?,
+            id,
+        ))
     }
 }
 
@@ -392,6 +406,28 @@ pub enum ObjectPath {
         participant: TxId,
         record_id: StructuralRecordId,
     },
+}
+
+impl ObjectPath {
+    /// Returns the listing prefix for all standalone nodes in `collection`.
+    pub fn nodes_prefix(collection: &CollectionAddress) -> String {
+        tree::nodes_prefix(&collection.physical_prefix())
+    }
+
+    /// Returns the listing prefix for one deterministic transaction shard.
+    pub fn transaction_shard_prefix(db_root: &DbRoot, shard: usize) -> String {
+        transaction::shard_prefix(db_root.as_str(), shard)
+    }
+
+    /// Returns the database-wide structural-record listing prefix.
+    pub fn structural_records_prefix(db_root: &DbRoot) -> String {
+        structural::directory(db_root.as_str())
+    }
+
+    /// Returns one participant's structural-record listing prefix.
+    pub fn participant_structural_records_prefix(db_root: &DbRoot, participant: &TxId) -> String {
+        structural::participant_directory(db_root.as_str(), participant)
+    }
 }
 
 impl std::fmt::Display for ObjectPath {
@@ -1108,15 +1144,71 @@ mod tests {
         assert_eq!(base64::encode(b"Hello"), "H6KgQ6w");
         assert_eq!(base64::encode(&[0, 1, 2, 3, 4]), "00420kF");
         assert_eq!(base64::encode(b"ab"), "NL8");
-        assert_eq!(
-            CollectionAddress::root("db").physical_prefix(),
-            "db/_c/0000000000000000000000"
-        );
+        let db_root = DbRoot::try_from("db").unwrap();
+        let collection = CollectionAddress::root("db");
+        let collection_prefix = "db/_c/0000000000000000000000";
+        let token = NodeToken::from_bytes([0; NODE_TOKEN_BYTES]);
+        let participant = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let record_id = StructuralRecordId::from(token.clone());
+
+        assert_eq!(collection.physical_prefix(), collection_prefix);
         assert_eq!(
             from_transaction("db", &TxId::from_bytes(vec![1, 2, 3, 4])),
             "db/_t/0F/0F8310"
         );
         assert_eq!(collection_record("db/root"), "db/root/_i");
         assert_eq!(tree_root("db/root"), "db/root/_r");
+        assert_eq!(
+            ObjectPath::CollectionRecord {
+                collection: collection.clone(),
+            }
+            .to_string(),
+            format!("{collection_prefix}/_i")
+        );
+        assert_eq!(
+            ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            }
+            .to_string(),
+            format!("{collection_prefix}/_r")
+        );
+        assert_eq!(
+            ObjectPath::Node {
+                collection: collection.clone(),
+                token,
+            }
+            .to_string(),
+            format!("{collection_prefix}/_n/0000000000000000000000")
+        );
+        assert_eq!(
+            ObjectPath::Transaction {
+                db_root: db_root.clone(),
+                id: participant.clone(),
+            }
+            .to_string(),
+            "db/_t/0F/0F8310"
+        );
+        assert_eq!(
+            ObjectPath::StructuralRecord {
+                db_root: db_root.clone(),
+                participant: participant.clone(),
+                record_id,
+            }
+            .to_string(),
+            "db/_s/0F8310/0000000000000000000000"
+        );
+        assert_eq!(
+            ObjectPath::nodes_prefix(&collection),
+            format!("{collection_prefix}/_n/")
+        );
+        assert_eq!(
+            ObjectPath::transaction_shard_prefix(&db_root, 16),
+            "db/_t/0F/"
+        );
+        assert_eq!(ObjectPath::structural_records_prefix(&db_root), "db/_s/");
+        assert_eq!(
+            ObjectPath::participant_structural_records_prefix(&db_root, &participant),
+            "db/_s/0F8310/"
+        );
     }
 }
