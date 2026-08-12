@@ -327,7 +327,7 @@ pub enum LeafRef {
     Root(CollectionAddress),
     Node {
         collection: CollectionAddress,
-        token: Arc<str>,
+        token: NodeToken,
     },
 }
 
@@ -338,11 +338,8 @@ impl LeafRef {
     }
 
     /// Creates a standalone-node leaf reference.
-    pub fn node(collection: CollectionAddress, token: impl Into<Arc<str>>) -> Self {
-        LeafRef::Node {
-            collection,
-            token: token.into(),
-        }
+    pub fn node(collection: CollectionAddress, token: NodeToken) -> Self {
+        LeafRef::Node { collection, token }
     }
 
     /// Returns the collection whose tree contains this leaf.
@@ -353,28 +350,36 @@ impl LeafRef {
     }
 
     /// Returns the standalone node token, or `None` for the collection root.
-    pub fn node_token(&self) -> Option<&str> {
+    pub fn node_token(&self) -> Option<&NodeToken> {
         match self {
             LeafRef::Root(_) => None,
             LeafRef::Node { token, .. } => Some(token),
         }
     }
 
+    /// Returns the typed backend object path of this leaf.
+    pub fn object_path(&self) -> ObjectPath {
+        match self {
+            LeafRef::Root(collection) => ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            LeafRef::Node { collection, token } => ObjectPath::Node {
+                collection: collection.clone(),
+                token: token.clone(),
+            },
+        }
+    }
+
     /// Renders the exact physical backend object path of this leaf.
     pub fn physical_path(&self) -> String {
-        match self {
-            LeafRef::Root(collection) => tree::tree_root(&collection.physical_prefix()),
-            LeafRef::Node { collection, token } => tree::node(&collection.physical_prefix(), token),
-        }
+        self.object_path().to_string()
     }
 
     /// Parses a physical collection-root or node path.
     pub fn from_physical_path(path: &str) -> Result<Self, PathError> {
         match ObjectPath::try_from(path) {
             Ok(ObjectPath::TreeRoot { collection }) => Ok(LeafRef::root(collection)),
-            Ok(ObjectPath::Node { collection, token }) => {
-                Ok(LeafRef::node(collection, token.to_string()))
-            }
+            Ok(ObjectPath::Node { collection, token }) => Ok(LeafRef::node(collection, token)),
             Ok(_) => Err(PathError::Parse(path.to_string())),
             Err(_) => legacy_leaf_from_physical_path(path),
         }
@@ -777,7 +782,7 @@ fn legacy_leaf_from_physical_path(path: &str) -> Result<LeafRef, PathError> {
     }
     Ok(LeafRef::node(
         CollectionAddress::from_physical_prefix(prefix)?,
-        token,
+        NodeToken::try_from(token)?,
     ))
 }
 
@@ -1023,7 +1028,7 @@ mod tests {
         let collection = CollectionAddress::new("db", collection_id(1));
         for leaf in [
             LeafRef::root(collection.clone()),
-            LeafRef::node(collection, "token"),
+            LeafRef::node(collection, NodeToken::from_bytes([1; NODE_TOKEN_BYTES])),
         ] {
             assert_eq!(
                 LeafRef::from_physical_path(&leaf.physical_path()).unwrap(),

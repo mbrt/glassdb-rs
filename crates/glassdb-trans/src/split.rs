@@ -92,9 +92,9 @@ const MAX_RECONCILE_HOPS: usize = 4096;
 /// rightmost edge to publish.
 #[derive(Clone)]
 pub(crate) struct PendingSeparator {
-    prefix: String,
+    collection: CollectionAddress,
     split_key: Vec<u8>,
-    new_token: String,
+    new_token: NodeToken,
 }
 
 /// Shares structural-node mutation primitives between split coordination and
@@ -125,39 +125,35 @@ impl StructuralNodeAccess {
     /// Acquires a source node's structure-write lock under wound-wait.
     async fn acquire_structural_gate(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         if let Some(token) = token {
-            let collection = collection_address(prefix)?;
-            let token = node_token(token)?;
             let (node, _) = self
                 .shards
-                .load_node(&collection, &token, Requirement::Any)
+                .load_node(collection, token, Requirement::Any)
                 .await?;
             if node.as_leaf().is_some() {
                 return self
-                    .acquire_leaf_structural_gate(prefix, token.as_str(), id)
+                    .acquire_leaf_structural_gate(collection, token, id)
                     .await;
             }
         }
-        self.acquire_structural_gate_direct(prefix, token, id).await
+        self.acquire_structural_gate_direct(collection, token, id)
+            .await
     }
 
     async fn acquire_leaf_structural_gate(
         &self,
-        prefix: &str,
-        token: &str,
+        collection: &CollectionAddress,
+        token: &NodeToken,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        let collection = collection_address(prefix)?;
-        let token = node_token(token)?;
         let path = ObjectPath::Node {
             collection: collection.clone(),
             token: token.clone(),
-        }
-        .to_string();
+        };
         let outcome = self
             .coord
             .submit_shard(
@@ -183,7 +179,7 @@ impl StructuralNodeAccess {
             .unwrap_or(Requirement::Any);
         let (node, version) = self
             .shards
-            .load_node(&collection, &token, requirement)
+            .load_node(collection, token, requirement)
             .await?;
         if node.structural_gate().lock_type() == LockType::Write
             && node.structural_gate().contains(id)
@@ -196,20 +192,18 @@ impl StructuralNodeAccess {
 
     async fn acquire_structural_gate_direct(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        let collection = collection_address(prefix)?;
-        let token = token.map(node_token).transpose()?;
         for _ in 0..PARENT_RETRIES {
-            let (mut node, version) = match token.as_ref() {
+            let (mut node, version) = match token {
                 Some(token) => {
                     self.shards
-                        .load_node(&collection, token, Requirement::Any)
+                        .load_node(collection, token, Requirement::Any)
                         .await?
                 }
-                None => match self.shards.load_root(&collection, Requirement::Any).await {
+                None => match self.shards.load_root(collection, Requirement::Any).await {
                     Ok((root, version)) => (root, version),
                     Err(StorageError::NotFound) => return Ok(None),
                     Err(error) => return Err(error.into()),
@@ -230,7 +224,7 @@ impl StructuralNodeAccess {
                 .collect();
             let reconciler = NodeLockReconciler::new(&self.key_state, &self.mon, id);
             let entries = match reconciler
-                .quiesce_entries(&collection, &entries, Requirement::Any)
+                .quiesce_entries(collection, &entries, Requirement::Any)
                 .await?
             {
                 QuiescedEntries::Ready(entries) => entries,
@@ -250,19 +244,14 @@ impl StructuralNodeAccess {
             }
             node.set_locks(locks);
             if self
-                .store_structural_node(
-                    prefix,
-                    token.as_ref().map(NodeToken::as_str),
-                    &node,
-                    &version,
-                )
+                .store_structural_node(collection, token, &node, &version)
                 .await?
             {
-                let (_, locked_version) = match token.as_ref() {
+                let (_, locked_version) = match token {
                     Some(token) => {
                         self.shards
                             .load_node(
-                                &collection,
+                                collection,
                                 token,
                                 Requirement::AtLeast(version.current_after()),
                             )
@@ -271,7 +260,7 @@ impl StructuralNodeAccess {
                     None => {
                         let (root, version) = self
                             .shards
-                            .load_root(&collection, Requirement::AtLeast(version.current_after()))
+                            .load_root(collection, Requirement::AtLeast(version.current_after()))
                             .await?;
                         (root, version)
                     }
@@ -284,22 +273,20 @@ impl StructuralNodeAccess {
 
     async fn release_structural_gate(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let collection = collection_address(prefix)?;
-        let token = token.map(node_token).transpose()?;
         for _ in 0..PARENT_RETRIES {
-            let (mut node, version) = match token.as_ref() {
+            let (mut node, version) = match token {
                 Some(token) => {
                     self.shards
-                        .load_node(&collection, token, Requirement::Any)
+                        .load_node(collection, token, Requirement::Any)
                         .await?
                 }
                 None => {
                     let (root, version) =
-                        self.shards.load_root(&collection, Requirement::Any).await?;
+                        self.shards.load_root(collection, Requirement::Any).await?;
                     (root, version)
                 }
             };
@@ -307,12 +294,7 @@ impl StructuralNodeAccess {
                 return Ok(());
             }
             if self
-                .store_structural_node(
-                    prefix,
-                    token.as_ref().map(NodeToken::as_str),
-                    &node,
-                    &version,
-                )
+                .store_structural_node(collection, token, &node, &version)
                 .await?
             {
                 return Ok(());
@@ -323,23 +305,19 @@ impl StructuralNodeAccess {
 
     async fn store_structural_node(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         node: &Node,
         observation: &LeafObservation,
     ) -> Result<bool, TransError> {
-        let collection = collection_address(prefix)?;
         match token {
-            Some(token) => {
-                let token = node_token(token)?;
-                Ok(self
-                    .shards
-                    .store_node(&collection, &token, node, Some(observation))
-                    .await?)
-            }
+            Some(token) => Ok(self
+                .shards
+                .store_node(collection, token, node, Some(observation))
+                .await?),
             None => Ok(self
                 .shards
-                .store_root(&collection, node, observation)
+                .store_root(collection, node, observation)
                 .await?),
         }
     }
@@ -360,11 +338,11 @@ impl StructuralNodeAccess {
 
     async fn finish_without_split(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let release = self.release_structural_gate(prefix, token, id).await;
+        let release = self.release_structural_gate(collection, token, id).await;
         self.finalize_split(id).await;
         release
     }
@@ -382,7 +360,7 @@ enum SeparatorPublicationOutcome {
 }
 
 struct ParentRequiresSplit {
-    path: String,
+    path: ObjectPath,
     continuation: ParentSplitContinuation,
 }
 
@@ -436,15 +414,15 @@ impl SeparatorPublisher {
 
     fn begin_publication(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         split_key: &[u8],
-        new_token: &str,
+        new_token: &NodeToken,
     ) -> SeparatorPublication {
         SeparatorPublication {
             separator: PendingSeparator {
-                prefix: prefix.to_string(),
+                collection: collection.clone(),
                 split_key: split_key.to_vec(),
-                new_token: new_token.to_string(),
+                new_token: new_token.clone(),
             },
             start: Requirement::AtLeast(self.timeline.now()),
             retries_remaining: PARENT_RETRIES,
@@ -460,24 +438,27 @@ impl SeparatorPublisher {
         while publication.retries_remaining > 0 {
             publication.retries_remaining -= 1;
             let separator = &publication.separator;
-            let collection = collection_address(&separator.prefix)?;
             let Some(parent) = self
                 .router
-                .parent_index_for(&collection, &separator.split_key, publication.start)
+                .parent_index_for(
+                    &separator.collection,
+                    &separator.split_key,
+                    publication.start,
+                )
                 .await?
             else {
                 return Ok(SeparatorPublicationOutcome::Published);
             };
             let parent_token = match &parent.path {
                 ObjectPath::TreeRoot { .. } => None,
-                ObjectPath::Node { token, .. } => Some(token.to_string()),
+                ObjectPath::Node { token, .. } => Some(token.clone()),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
             let lock_id = TxId::new_at(rt::system_now());
             self.nodes.mon.begin_tx(&lock_id);
             let acquired = match self
                 .nodes
-                .acquire_structural_gate(&separator.prefix, parent_token.as_deref(), &lock_id)
+                .acquire_structural_gate(&separator.collection, parent_token.as_ref(), &lock_id)
                 .await
             {
                 Ok(acquired) => acquired,
@@ -492,19 +473,19 @@ impl SeparatorPublisher {
             };
             let Some(index) = locked_parent.as_index() else {
                 self.nodes
-                    .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
                     .await?;
                 return Ok(SeparatorPublicationOutcome::Published);
             };
             if index.child_for(&separator.split_key) == Some(separator.new_token.as_str()) {
                 self.nodes
-                    .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
                     .await?;
                 return Ok(SeparatorPublicationOutcome::Published);
             }
             let missing = match self
                 .missing_separators(
-                    &separator.prefix,
+                    &separator.collection,
                     &locked_parent,
                     &separator.split_key,
                     Requirement::AtLeast(locked_version.current_after()),
@@ -515,20 +496,24 @@ impl SeparatorPublisher {
                 Err(error) => {
                     let _ = self
                         .nodes
-                        .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                        .finish_without_split(
+                            &separator.collection,
+                            parent_token.as_ref(),
+                            &lock_id,
+                        )
                         .await;
                     return Err(error);
                 }
             };
             if missing.is_empty() {
                 self.nodes
-                    .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
                     .await?;
                 return Ok(SeparatorPublicationOutcome::Published);
             }
             let mut new_index = index.clone();
             for (split_key, token) in &missing {
-                new_index.insert_child(split_key.clone(), token.clone());
+                new_index.insert_child(split_key.clone(), token.to_string());
             }
             let mut updated = locked_parent.clone();
             updated.set_index(new_index)?;
@@ -540,12 +525,12 @@ impl SeparatorPublisher {
                 || updated.encoded_len() > self.policy.node_max_bytes
             {
                 self.nodes
-                    .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
                     .await?;
                 if locked_parent.over_soft_cap(&self.policy) {
                     return Ok(SeparatorPublicationOutcome::ParentRequiresSplit(
                         ParentRequiresSplit {
-                            path: parent.path.to_string(),
+                            path: parent.path,
                             continuation: ParentSplitContinuation::ResumePublication,
                         },
                     ));
@@ -559,8 +544,8 @@ impl SeparatorPublisher {
             let stored = match self
                 .nodes
                 .store_structural_node(
-                    &separator.prefix,
-                    parent_token.as_deref(),
+                    &separator.collection,
+                    parent_token.as_ref(),
                     &updated,
                     &locked_version,
                 )
@@ -570,19 +555,23 @@ impl SeparatorPublisher {
                 Err(error) => {
                     let _ = self
                         .nodes
-                        .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                        .finish_without_split(
+                            &separator.collection,
+                            parent_token.as_ref(),
+                            &lock_id,
+                        )
                         .await;
                     return Err(error);
                 }
             };
             if stored {
                 self.nodes
-                    .finish_without_split(&separator.prefix, parent_token.as_deref(), &lock_id)
+                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
                     .await?;
                 if updated.over_soft_cap(&self.policy) {
                     return Ok(SeparatorPublicationOutcome::ParentRequiresSplit(
                         ParentRequiresSplit {
-                            path: parent.path.to_string(),
+                            path: parent.path,
                             continuation: ParentSplitContinuation::CompletePublication,
                         },
                     ));
@@ -591,7 +580,7 @@ impl SeparatorPublisher {
             }
             let _ = self
                 .nodes
-                .release_structural_gate(&separator.prefix, parent_token.as_deref(), &lock_id)
+                .release_structural_gate(&separator.collection, parent_token.as_ref(), &lock_id)
                 .await;
             self.nodes.finalize_split(&lock_id).await;
         }
@@ -603,24 +592,23 @@ impl SeparatorPublisher {
     /// Returns the unpublished right-link edges through `split_key` in chain order.
     async fn missing_separators(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         parent: &Node,
         split_key: &[u8],
         requirement: Requirement,
-    ) -> Result<Vec<(Vec<u8>, String)>, TransError> {
+    ) -> Result<Vec<(Vec<u8>, NodeToken)>, TransError> {
         let Some(index) = parent.as_index() else {
             return Ok(Vec::new());
         };
         let Some(start) = index.child_for(split_key) else {
             return Ok(Vec::new());
         };
-        let collection = collection_address(prefix)?;
         let start = node_token(start)?;
         let mut missing = Vec::new();
         let (mut cur, _) = self
             .nodes
             .shards
-            .load_node(&collection, &start, requirement)
+            .load_node(collection, &start, requirement)
             .await?;
         for _ in 0..MAX_RECONCILE_HOPS {
             let (Some(right), Some(boundary)) = (cur.right_sibling(), cur.high_key()) else {
@@ -633,13 +621,13 @@ impl SeparatorPublisher {
             let right_token = node_token(&right)?;
             let boundary = boundary.to_vec();
             if index.child_for(&boundary) != Some(right.as_str()) {
-                missing.push((boundary.clone(), right.clone()));
+                missing.push((boundary.clone(), right_token.clone()));
             }
             let reached_target = boundary.as_slice() == split_key;
             let (next, _) = self
                 .nodes
                 .shards
-                .load_node(&collection, &right_token, requirement)
+                .load_node(collection, &right_token, requirement)
                 .await?;
             cur = next;
             if reached_target {
@@ -673,12 +661,12 @@ pub struct SplitHintSink {
 impl SplitHintSink {
     /// Records recoverable aggregate inline pressure for authoritative
     /// revalidation by the splitter.
-    pub(crate) fn observe_inline_pressure(&self, path: &str, key: &[u8], value_len: usize) {
+    pub(crate) fn observe_inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
         if !self.candidates.inline.admits_value(value_len) {
             return;
         }
         self.candidates.push(SplitCandidate {
-            path: path.to_string(),
+            path: path.clone(),
             priority: self.candidates.new_id(),
             reason: SplitReason::InlinePressure {
                 key: key.to_vec(),
@@ -701,7 +689,7 @@ impl SplitHintSink {
 
 #[derive(Clone)]
 struct SplitCandidate {
-    path: String,
+    path: ObjectPath,
     priority: TxId,
     reason: SplitReason,
 }
@@ -743,10 +731,10 @@ impl PreparedSplit {
             .value()
             .filter(|record| {
                 record.phase == StructuralLogPhase::Preparing
-                    && if record.is_root {
-                        record.source_token.is_empty() && record.created_tokens.len() == 2
+                    && if record.is_root() {
+                        record.created_tokens.len() == 2
                     } else {
-                        !record.source_token.is_empty() && record.created_tokens.len() == 1
+                        record.source_token.is_some() && record.created_tokens.len() == 1
                     }
             })
             .ok_or_else(|| TransError::other("invalid prepared split intent"))?
@@ -855,11 +843,11 @@ impl SplitAttemptOutcome {
 #[derive(Clone, Copy)]
 enum StructuralSplitTarget<'a> {
     Root,
-    NonRoot(&'a str),
+    NonRoot(&'a NodeToken),
 }
 
 impl<'a> StructuralSplitTarget<'a> {
-    fn source_token(self) -> Option<&'a str> {
+    fn source_token(self) -> Option<&'a NodeToken> {
         match self {
             Self::Root => None,
             Self::NonRoot(token) => Some(token),
@@ -876,7 +864,7 @@ enum StructuralSplitTopology<'a> {
 /// One root or non-root split with a single outer lifecycle.
 struct StructuralSplitAttempt<'a> {
     splitter: &'a Splitter,
-    prefix: &'a str,
+    collection: &'a CollectionAddress,
     target: StructuralSplitTarget<'a>,
     worker: TxId,
     reason: &'a SplitReason,
@@ -885,14 +873,14 @@ struct StructuralSplitAttempt<'a> {
 impl<'a> StructuralSplitAttempt<'a> {
     fn new(
         splitter: &'a Splitter,
-        prefix: &'a str,
+        collection: &'a CollectionAddress,
         target: StructuralSplitTarget<'a>,
         worker: TxId,
         reason: &'a SplitReason,
     ) -> Self {
         Self {
             splitter,
-            prefix,
+            collection,
             target,
             worker,
             reason,
@@ -904,7 +892,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             StructuralSplitTopology::Owned => {
                 match self
                     .splitter
-                    .begin_topology_tx(self.prefix, &self.worker)
+                    .begin_topology_tx(self.collection, &self.worker)
                     .await
                 {
                     Ok(()) => self.run_prepared(topology).await,
@@ -920,7 +908,7 @@ impl<'a> StructuralSplitAttempt<'a> {
         match topology {
             StructuralSplitTopology::Owned => {
                 self.splitter
-                    .finalize_topology_split(self.prefix, &self.worker)
+                    .finalize_topology_split(self.collection, &self.worker)
                     .await;
             }
             StructuralSplitTopology::Joined(_) => {
@@ -940,12 +928,16 @@ impl<'a> StructuralSplitAttempt<'a> {
         };
         let prepared = self
             .splitter
-            .prepare_structural_intent(self.prefix, self.target.source_token(), participant)
+            .prepare_structural_intent(self.collection, self.target.source_token(), participant)
             .await?;
         let observed = prepared.observed.clone();
         let outcome = match topology {
             StructuralSplitTopology::Owned => {
-                match self.splitter.join_topology(self.prefix, &self.worker).await {
+                match self
+                    .splitter
+                    .join_topology(self.collection, &self.worker)
+                    .await
+                {
                     Ok(()) => self.coordinate(prepared).await,
                     Err(error) => SplitAttemptOutcome::retry_cleanly(Err(error)),
                 }
@@ -959,13 +951,13 @@ impl<'a> StructuralSplitAttempt<'a> {
         match self.target {
             StructuralSplitTarget::Root => {
                 self.splitter
-                    .coordinate_root_split(self.prefix, &self.worker, self.reason, prepared)
+                    .coordinate_root_split(self.collection, &self.worker, self.reason, prepared)
                     .await
             }
             StructuralSplitTarget::NonRoot(token) => {
                 self.splitter
                     .coordinate_nonroot_split(
-                        self.prefix,
+                        self.collection,
                         token,
                         &self.worker,
                         self.reason,
@@ -987,7 +979,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             SplitAttemptResult::Completed => match topology {
                 StructuralSplitTopology::Owned => result.and(
                     self.splitter
-                        .leave_topology(self.prefix, &self.worker)
+                        .leave_topology(self.collection, &self.worker)
                         .await,
                 ),
                 StructuralSplitTopology::Joined(_) => result,
@@ -997,7 +989,7 @@ impl<'a> StructuralSplitAttempt<'a> {
                     Ok(()) => match topology {
                         StructuralSplitTopology::Owned => {
                             self.splitter
-                                .leave_topology(self.prefix, &self.worker)
+                                .leave_topology(self.collection, &self.worker)
                                 .await
                         }
                         StructuralSplitTopology::Joined(_) => Ok(()),
@@ -1130,7 +1122,7 @@ impl SplitCandidates {
     /// sweep cycle.
     fn drain(&self) -> Vec<SplitCandidate> {
         let mut q = self.queue.lock().unwrap();
-        let mut by_path = std::collections::BTreeMap::<(String, u8), SplitCandidate>::new();
+        let mut by_path = std::collections::BTreeMap::<(ObjectPath, u8), SplitCandidate>::new();
         while let Some(candidate) = q.pop_front() {
             let key = (candidate.path.clone(), candidate.reason.class());
             match by_path.get_mut(&key) {
@@ -1193,7 +1185,7 @@ impl SplitHinter for SplitCandidates {
     /// re-checks authoritatively against the full node (which adds a little
     /// framing), so this need not account for it. The oldest hint is dropped
     /// when the queue is full.
-    fn observe_leaf(&self, path: &str, entries: &Shard) {
+    fn observe_leaf(&self, path: &ObjectPath, entries: &Shard) {
         let over_cap = entries.len() >= 2
             && (entries.len() > self.policy.leaf_max_entries
                 || entries.encoded_len() > self.policy.leaf_max_bytes);
@@ -1201,7 +1193,7 @@ impl SplitHinter for SplitCandidates {
             return;
         }
         self.push(SplitCandidate {
-            path: path.to_string(),
+            path: path.clone(),
             priority: self.new_id(),
             reason: SplitReason::SoftCap,
         });
@@ -1248,7 +1240,7 @@ impl Splitter {
         mon: Monitor,
         key_state: KeyStateResolver,
         retry: RetryConfig,
-        db_root: &str,
+        db_root: DbRoot,
         policy: SplitPolicy,
         inline: InlinePolicy,
     ) -> (ShardCoordinator, Self) {
@@ -1318,7 +1310,7 @@ impl Splitter {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        db_root: &str,
+        db_root: DbRoot,
         coord: ShardCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
@@ -1340,8 +1332,7 @@ impl Splitter {
             mon,
             structural_nodes,
             timeline,
-            db_root: DbRoot::try_from(db_root)
-                .expect("splitter database root must already be validated"),
+            db_root,
             candidates,
             publisher,
             recovery_wake: Arc::new(Notify::new()),
@@ -1419,7 +1410,7 @@ impl Splitter {
         // index eventually learns them and descent stops relying on right-links.
         for sep in self.publisher.drain_pending() {
             if let Err(e) = self
-                .publish_separators(&sep.prefix, &sep.split_key, &sep.new_token, None)
+                .publish_separators(&sep.collection, &sep.split_key, &sep.new_token, None)
                 .await
             {
                 tracing::debug!(
@@ -1457,15 +1448,15 @@ impl Splitter {
     /// Reroutes and revalidates one pressure observation before splitting.
     async fn split_inline_pressure(
         &self,
-        observed_path: &str,
+        observed_path: &ObjectPath,
         key: &[u8],
         value_len: usize,
         id: TxId,
     ) -> Result<(), TransError> {
-        let (collection, _) = split_path_parts(observed_path)?;
+        let collection = split_collection(observed_path)?;
         let located = match self
             .router
-            .leaf_for(&collection, key, Requirement::AtLeast(self.timeline.now()))
+            .leaf_for(collection, key, Requirement::AtLeast(self.timeline.now()))
             .await
         {
             Ok(located) => located,
@@ -1486,10 +1477,7 @@ impl Splitter {
             .map(|node| self.split_need(node, &reason))
             .unwrap_or(SplitNeed::NotActionable)
         {
-            SplitNeed::Split => {
-                self.split_path_with_id(&located.path.to_string(), id, &reason)
-                    .await
-            }
+            SplitNeed::Split => self.split_path_with_id(&located.path, id, &reason).await,
             SplitNeed::NotActionable => {
                 self.stats
                     .inline_pressure_discarded
@@ -1543,18 +1531,20 @@ impl Splitter {
 
     /// Carries an oversized split output into a later sweep so one hint can
     /// drive the whole split cascade.
-    fn enqueue_if_over_soft_cap(&self, prefix: &str, token: &str, node: &Node) {
+    fn enqueue_if_over_soft_cap(
+        &self,
+        collection: &CollectionAddress,
+        token: &NodeToken,
+        node: &Node,
+    ) {
         if !node.over_soft_cap(self.candidates.policy()) {
             return;
         }
-        let Ok(collection) = collection_address(prefix) else {
-            return;
-        };
-        let Ok(token) = node_token(token) else {
-            return;
-        };
         self.candidates.push(SplitCandidate {
-            path: ObjectPath::Node { collection, token }.to_string(),
+            path: ObjectPath::Node {
+                collection: collection.clone(),
+                token: token.clone(),
+            },
             priority: self.candidates.new_id(),
             reason: SplitReason::SoftCap,
         });
@@ -1563,7 +1553,7 @@ impl Splitter {
     /// Splits the leaf at object `path` if it is still over the soft cap: an
     /// in-place root split when `path` is the collection root `_r`, else a
     /// standalone node half-split.
-    async fn split_path(&self, path: &str) -> Result<(), TransError> {
+    async fn split_path(&self, path: &ObjectPath) -> Result<(), TransError> {
         let reason = SplitReason::SoftCap;
         self.split_path_with_id(path, self.candidates.new_id(), &reason)
             .await
@@ -1572,29 +1562,34 @@ impl Splitter {
     /// Splits `path` using an already-aged wound-wait priority.
     async fn split_path_with_id(
         &self,
-        path: &str,
+        path: &ObjectPath,
         id: TxId,
         reason: &SplitReason,
     ) -> Result<(), TransError> {
-        let (collection, token) = split_path_parts(path)?;
-        let prefix = collection.physical_prefix();
-        let target = match token.as_ref() {
-            Some(token) => StructuralSplitTarget::NonRoot(token.as_str()),
-            None => StructuralSplitTarget::Root,
+        let (collection, target) = match path {
+            ObjectPath::TreeRoot { collection } => (collection, StructuralSplitTarget::Root),
+            ObjectPath::Node { collection, token } => {
+                (collection, StructuralSplitTarget::NonRoot(token))
+            }
+            _ => return Err(TransError::other("split candidate is not a tree node")),
         };
-        StructuralSplitAttempt::new(self, &prefix, target, id, reason)
+        StructuralSplitAttempt::new(self, collection, target, id, reason)
             .run(StructuralSplitTopology::Owned)
             .await
     }
 
-    async fn begin_topology_tx(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
-        let collection = CollectionAddress::from_physical_prefix(prefix)
-            .map_err(|error| TransError::with_source("parsing collection prefix", error))?;
+    async fn begin_topology_tx(
+        &self,
+        collection: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError> {
         self.mon
             .begin_persisted_tx(
                 id,
                 TxRecoveryManifest {
-                    locks: vec![TxLock::Topology { collection }],
+                    locks: vec![TxLock::Topology {
+                        collection: collection.clone(),
+                    }],
                     ..TxRecoveryManifest::default()
                 },
             )
@@ -1605,8 +1600,8 @@ impl Splitter {
     /// recoverable before any source gate or node creation can happen.
     async fn prepare_structural_intent(
         &self,
-        prefix: &str,
-        source_token: Option<&str>,
+        collection: &CollectionAddress,
+        source_token: Option<&NodeToken>,
         participant: &TxId,
     ) -> Result<PreparedSplit, TransError> {
         let is_root = source_token.is_none();
@@ -1620,23 +1615,17 @@ impl Splitter {
                 .last()
                 .expect("a split always reserves at least one token"),
         );
-        let created_tokens = created_tokens
-            .into_iter()
-            .map(|token| token.to_string())
-            .collect();
-        let collection = collection_address(prefix)?;
         let observed = self
             .shards
             .write_structural_log(
                 collection.db_root_component(),
                 &record_id,
                 &StructuralLog {
-                    prefix: prefix.to_string(),
-                    source_token: source_token.unwrap_or_default().to_string(),
+                    collection: collection.clone(),
+                    source_token: source_token.cloned(),
                     source_version: String::new(),
                     created_tokens,
                     split_key: Vec::new(),
-                    is_root,
                     participant_id: participant.clone(),
                     phase: StructuralLogPhase::Preparing,
                 },
@@ -1648,21 +1637,22 @@ impl Splitter {
     /// Splits `path` beneath an existing topology participant.
     async fn split_path_joined(
         &self,
-        path: &str,
+        path: &ObjectPath,
         topology_participant: &TxId,
     ) -> Result<(), TransError> {
-        let (collection, token) = split_path_parts(path)?;
-        let prefix = collection.physical_prefix();
+        let (collection, target) = match path {
+            ObjectPath::TreeRoot { collection } => (collection, StructuralSplitTarget::Root),
+            ObjectPath::Node { collection, token } => {
+                (collection, StructuralSplitTarget::NonRoot(token))
+            }
+            _ => return Err(TransError::other("split candidate is not a tree node")),
+        };
         // Recovery can publish separators after the topology participant has
         // finalized. A fresh structural identity prevents ordinary lock
         // helping from mistaking this in-flight recursive split for stale work.
         let worker = self.candidates.new_id();
         let reason = SplitReason::SoftCap;
-        let target = match token.as_ref() {
-            Some(token) => StructuralSplitTarget::NonRoot(token.as_str()),
-            None => StructuralSplitTarget::Root,
-        };
-        StructuralSplitAttempt::new(self, &prefix, target, worker, &reason)
+        StructuralSplitAttempt::new(self, collection, target, worker, &reason)
             .run(StructuralSplitTopology::Joined(topology_participant))
             .await
     }
@@ -1672,57 +1662,55 @@ impl Splitter {
     /// direct structural CAS path because they carry no data-mutation traffic.
     async fn acquire_structural_gate(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         self.structural_nodes
-            .acquire_structural_gate(prefix, token, id)
+            .acquire_structural_gate(collection, token, id)
             .await
     }
 
     /// Releases a structure-write holder after its node mutation has landed.
     async fn release_structural_gate(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<(), TransError> {
         self.structural_nodes
-            .release_structural_gate(prefix, token, id)
+            .release_structural_gate(collection, token, id)
             .await
     }
 
     /// Stores a complete root or non-root node at an expected version.
     async fn store_structural_node(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         node: &Node,
         observation: &LeafObservation,
     ) -> Result<bool, TransError> {
         self.structural_nodes
-            .store_structural_node(prefix, token, node, observation)
+            .store_structural_node(collection, token, node, observation)
             .await
     }
 
     /// Fences the source writer before recovery classifies created nodes.
     async fn fence_source_writer_for_recovery(
         &self,
-        prefix: &str,
-        token: Option<&str>,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let collection = collection_address(prefix)?;
-        let token = token.map(node_token).transpose()?;
         for _ in 0..PARENT_RETRIES {
-            let node = match token.as_ref() {
-                Some(token) => match self.shards.load_node(&collection, token, requirement).await {
+            let node = match token {
+                Some(token) => match self.shards.load_node(collection, token, requirement).await {
                     Ok((node, _)) => node,
                     Err(StorageError::NotFound) => return Ok(true),
                     Err(e) => return Err(e.into()),
                 },
-                None => match self.shards.load_root_node(&collection, requirement).await? {
+                None => match self.shards.load_root_node(collection, requirement).await? {
                     Some((node, _)) => node,
                     None => return Ok(true),
                 },
@@ -1739,7 +1727,7 @@ impl Splitter {
             // A finalized holder may still have a shrink CAS in flight. This
             // cleanup CAS either wins first, fencing that shrink, or loses to
             // it and the next iteration observes the landed right-link.
-            self.release_structural_gate(prefix, token.as_ref().map(NodeToken::as_str), holder)
+            self.release_structural_gate(collection, token, holder)
                 .await?;
         }
         Err(TransError::Retry)
@@ -1748,30 +1736,18 @@ impl Splitter {
     /// Performs the write-ahead, sibling creation, shrink, and publication.
     async fn coordinate_nonroot_split(
         &self,
-        prefix: &str,
-        token: &str,
+        collection: &CollectionAddress,
+        token: &NodeToken,
         worker: &TxId,
         reason: &SplitReason,
         prepared: PreparedSplit,
     ) -> SplitAttemptOutcome {
-        debug_assert!(!prepared.record.is_root);
-        debug_assert_eq!(prepared.record.prefix, prefix);
-        debug_assert_eq!(prepared.record.source_token, token);
+        debug_assert!(!prepared.record.is_root());
+        debug_assert_eq!(&prepared.record.collection, collection);
+        debug_assert_eq!(prepared.record.source_token.as_ref(), Some(token));
         let right_token = prepared.record.created_tokens[0].clone();
-        let collection = match collection_address(prefix) {
-            Ok(collection) => collection,
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
-        let source_node_token = match node_token(token) {
-            Ok(token) => token,
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
-        let right_node_token = match node_token(&right_token) {
-            Ok(token) => token,
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
         let (mut node, version) = match self
-            .acquire_structural_gate(prefix, Some(token), worker)
+            .acquire_structural_gate(collection, Some(token), worker)
             .await
         {
             Ok(Some(acquired)) => acquired,
@@ -1787,13 +1763,13 @@ impl Splitter {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 let result = self
-                    .release_structural_gate(prefix, Some(token), worker)
+                    .release_structural_gate(collection, Some(token), worker)
                     .await;
                 return SplitAttemptOutcome::retry_cleanly(result);
             }
             SplitNeed::Reroute => {
                 let result = match self
-                    .release_structural_gate(prefix, Some(token), worker)
+                    .release_structural_gate(collection, Some(token), worker)
                     .await
                 {
                     Ok(()) => Err(TransError::Retry),
@@ -1803,9 +1779,9 @@ impl Splitter {
             }
         }
 
-        let Some((right, split_key)) = node.split(&right_token) else {
+        let Some((right, split_key)) = node.split(right_token.as_str()) else {
             let result = self
-                .release_structural_gate(prefix, Some(token), worker)
+                .release_structural_gate(collection, Some(token), worker)
                 .await;
             return SplitAttemptOutcome::retry_cleanly(result);
         };
@@ -1828,7 +1804,7 @@ impl Splitter {
             Ok(Some(observed)) => observed,
             Ok(None) => {
                 let result = match self
-                    .release_structural_gate(prefix, Some(token), worker)
+                    .release_structural_gate(collection, Some(token), worker)
                     .await
                 {
                     Ok(()) => Err(TransError::Retry),
@@ -1846,7 +1822,7 @@ impl Splitter {
 
         match self
             .shards
-            .store_node(&collection, &right_node_token, &right, None)
+            .store_node(collection, &right_token, &right, None)
             .await
         {
             Ok(true) => {}
@@ -1859,7 +1835,7 @@ impl Splitter {
         }
         match self
             .shards
-            .store_node(&collection, &source_node_token, &node, Some(&version))
+            .store_node(collection, token, &node, Some(&version))
             .await
         {
             Ok(true) => {}
@@ -1871,8 +1847,8 @@ impl Splitter {
             }
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        self.enqueue_if_over_soft_cap(prefix, token, &node);
-        self.enqueue_if_over_soft_cap(prefix, &right_token, &right);
+        self.enqueue_if_over_soft_cap(collection, token, &node);
+        self.enqueue_if_over_soft_cap(collection, &right_token, &right);
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
@@ -1880,7 +1856,7 @@ impl Splitter {
         }
         if let Err(error) = self
             .publish_separators(
-                prefix,
+                collection,
                 &split_key,
                 &right_token,
                 Some(&ready.record().participant_id),
@@ -1895,19 +1871,19 @@ impl Splitter {
         SplitAttemptOutcome::completed()
     }
 
-    async fn join_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
-        let collection = collection_address(prefix)?;
+    async fn join_topology(
+        &self,
+        collection: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut record, observed) = match self
-                .records
-                .load_record(&collection, Requirement::Any)
-                .await
-            {
-                Ok(record) => record,
-                Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
-                Err(error) => return Err(error.into()),
-            };
+            let (mut record, observed) =
+                match self.records.load_record(collection, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
+                    Err(error) => return Err(error.into()),
+                };
             if record
                 .topology_participants()
                 .any(|participant| participant == id)
@@ -1939,19 +1915,19 @@ impl Splitter {
         }
     }
 
-    async fn leave_topology(&self, prefix: &str, id: &TxId) -> Result<(), TransError> {
-        let collection = collection_address(prefix)?;
+    async fn leave_topology(
+        &self,
+        collection: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut record, observed) = match self
-                .records
-                .load_record(&collection, Requirement::Any)
-                .await
-            {
-                Ok(record) => record,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(error) => return Err(error.into()),
-            };
+            let (mut record, observed) =
+                match self.records.load_record(collection, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
             if !record.remove_topology_participant(id) {
                 return Ok(());
             }
@@ -1965,14 +1941,14 @@ impl Splitter {
     /// Performs the write-ahead, child creation, and root rewrite.
     async fn coordinate_root_split(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         worker: &TxId,
         reason: &SplitReason,
         prepared: PreparedSplit,
     ) -> SplitAttemptOutcome {
-        debug_assert!(prepared.record.is_root);
-        debug_assert_eq!(prepared.record.prefix, prefix);
-        let (node, version) = match self.acquire_structural_gate(prefix, None, worker).await {
+        debug_assert!(prepared.record.is_root());
+        debug_assert_eq!(&prepared.record.collection, collection);
+        let (node, version) = match self.acquire_structural_gate(collection, None, worker).await {
             Ok(Some(acquired)) => acquired,
             Ok(None) => return SplitAttemptOutcome::retry_cleanly(Err(TransError::Retry)),
             Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
@@ -1985,11 +1961,11 @@ impl Splitter {
                         .inline_pressure_discarded
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                let result = self.release_structural_gate(prefix, None, worker).await;
+                let result = self.release_structural_gate(collection, None, worker).await;
                 return SplitAttemptOutcome::retry_cleanly(result);
             }
             SplitNeed::Reroute => {
-                let result = match self.release_structural_gate(prefix, None, worker).await {
+                let result = match self.release_structural_gate(collection, None, worker).await {
                     Ok(()) => Err(TransError::Retry),
                     Err(error) => Err(error),
                 };
@@ -1999,22 +1975,10 @@ impl Splitter {
 
         let l_token = prepared.record.created_tokens[0].clone();
         let r_token = prepared.record.created_tokens[1].clone();
-        let collection = match collection_address(prefix) {
-            Ok(collection) => collection,
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
-        let left_node_token = match node_token(&l_token) {
-            Ok(token) => token,
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
-        let right_node_token = match node_token(&r_token) {
-            Ok(token) => token,
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
-        let (left, right, split_key) = split_into_children(&node, &r_token, worker);
+        let (left, right, split_key) = split_into_children(&node, r_token.as_str(), worker);
         let root_index = IndexNode::from_children([
-            (Vec::new(), l_token.clone()),
-            (split_key.clone(), r_token.clone()),
+            (Vec::new(), l_token.to_string()),
+            (split_key.clone(), r_token.to_string()),
         ]);
         let index = Node::index(root_index);
         let sized_root = index.clone();
@@ -2026,7 +1990,7 @@ impl Splitter {
         if sized_root.content_encoded_len() > content_limit
             || sized_root.encoded_len() > self.candidates.policy().node_max_bytes
         {
-            let result = match self.release_structural_gate(prefix, None, worker).await {
+            let result = match self.release_structural_gate(collection, None, worker).await {
                 Ok(()) => Err(TransError::InvalidInput(
                     "root index exceeds the coordination node size limit".into(),
                 )),
@@ -2051,7 +2015,7 @@ impl Splitter {
         let observed = match transition {
             Ok(Some(observed)) => observed,
             Ok(None) => {
-                let result = match self.release_structural_gate(prefix, None, worker).await {
+                let result = match self.release_structural_gate(collection, None, worker).await {
                     Ok(()) => Err(TransError::Retry),
                     Err(error) => Err(error),
                 };
@@ -2067,7 +2031,7 @@ impl Splitter {
 
         match self
             .shards
-            .store_node(&collection, &left_node_token, &left, None)
+            .store_node(collection, &l_token, &left, None)
             .await
         {
             Ok(true) => {}
@@ -2080,7 +2044,7 @@ impl Splitter {
         }
         match self
             .shards
-            .store_node(&collection, &right_node_token, &right, None)
+            .store_node(collection, &r_token, &right, None)
             .await
         {
             Ok(true) => {}
@@ -2092,7 +2056,7 @@ impl Splitter {
             }
         }
         match self
-            .store_structural_node(prefix, None, &index, &version)
+            .store_structural_node(collection, None, &index, &version)
             .await
         {
             Ok(true) => {}
@@ -2104,8 +2068,8 @@ impl Splitter {
             }
         }
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        self.enqueue_if_over_soft_cap(prefix, &l_token, &left);
-        self.enqueue_if_over_soft_cap(prefix, &r_token, &right);
+        self.enqueue_if_over_soft_cap(collection, &l_token, &left);
+        self.enqueue_if_over_soft_cap(collection, &r_token, &right);
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
@@ -2124,20 +2088,11 @@ impl Splitter {
         self.structural_nodes.finalize_split(id).await;
     }
 
-    async fn finalize_topology_split(&self, prefix: &str, id: &TxId) {
-        let collection = match CollectionAddress::from_physical_prefix(prefix) {
-            Ok(collection) => collection,
-            Err(error) => {
-                tracing::debug!(
-                    target: "glassdb::splitter",
-                    error = %error,
-                    "parsing topology participant collection failed"
-                );
-                return;
-            }
-        };
+    async fn finalize_topology_split(&self, collection: &CollectionAddress, id: &TxId) {
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks.push(TxLock::Topology { collection });
+        log.locks.push(TxLock::Topology {
+            collection: collection.clone(),
+        });
         if let Err(e) = self.mon.commit_tx(log).await {
             tracing::debug!(
                 target: "glassdb::splitter",
@@ -2172,7 +2127,7 @@ impl Splitter {
         let mut participants = BTreeSet::new();
         for (record_id, record) in records {
             if let Some(value) = record.value() {
-                participants.insert((value.prefix.clone(), value.participant_id.clone()));
+                participants.insert((value.collection.clone(), value.participant_id.clone()));
             }
             if let Err(e) = self.recover_record(&record).await {
                 tracing::debug!(
@@ -2183,7 +2138,7 @@ impl Splitter {
                 );
             }
         }
-        for (prefix, participant) in participants {
+        for (collection, participant) in participants {
             let status = match self.mon.tx_status(&participant).await {
                 Ok(status) => status,
                 Err(error) => {
@@ -2199,18 +2154,6 @@ impl Splitter {
             if !status.is_final() {
                 continue;
             }
-            let collection = match CollectionAddress::from_physical_prefix(&prefix) {
-                Ok(collection) => collection,
-                Err(error) => {
-                    tracing::debug!(
-                        target: "glassdb::splitter",
-                        error = %error,
-                        participant = %participant,
-                        "parsing topology participant collection failed"
-                    );
-                    continue;
-                }
-            };
             if let Err(error) = self
                 .settle_topology_participant(&collection, &participant)
                 .await
@@ -2250,21 +2193,17 @@ impl Splitter {
         // the listing epoch. The Ready transition follows source-gate
         // acquisition, so its watermark is at least as fresh as that gate.
         let requirement = Requirement::AtLeast(observed.current_after());
-        let collection = collection_address(&record.prefix)?;
-        let created_tokens = record
-            .created_tokens
-            .iter()
-            .map(|token| node_token(token))
-            .collect::<Result<Vec<_>, _>>()?;
-        let source_token = (!record.is_root).then_some(record.source_token.as_str());
+        let collection = &record.collection;
+        let created_tokens = &record.created_tokens;
+        let source_token = record.source_token.as_ref();
         if !self
-            .fence_source_writer_for_recovery(&record.prefix, source_token, requirement)
+            .fence_source_writer_for_recovery(collection, source_token, requirement)
             .await?
         {
             return Err(TransError::Retry);
         }
 
-        let reachable = if record.is_root {
+        let reachable = if record.is_root() {
             if record.created_tokens.len() != 2 {
                 return Err(TransError::InvalidInput(
                     "root split record does not have two children".into(),
@@ -2272,11 +2211,11 @@ impl Splitter {
             }
             vec![
                 self.router
-                    .token_reachable_at_key(&collection, &[], &created_tokens[0], requirement)
+                    .token_reachable_at_key(collection, &[], &created_tokens[0], requirement)
                     .await?,
                 self.router
                     .token_reachable_at_key(
-                        &collection,
+                        collection,
                         &record.split_key,
                         &created_tokens[1],
                         requirement,
@@ -2292,7 +2231,7 @@ impl Splitter {
             vec![
                 self.router
                     .token_reachable_at_key(
-                        &collection,
+                        collection,
                         &record.split_key,
                         &created_tokens[0],
                         requirement,
@@ -2301,9 +2240,9 @@ impl Splitter {
             ]
         };
         let applied = reachable.iter().all(|reachable| *reachable);
-        if applied && !record.is_root {
+        if applied && !record.is_root() {
             self.publish_separators(
-                &record.prefix,
+                collection,
                 &record.split_key,
                 &record.created_tokens[0],
                 Some(&record.participant_id),
@@ -2314,7 +2253,7 @@ impl Splitter {
                 if !reachable {
                     match self
                         .shards
-                        .load_node_state(&collection, token, requirement)
+                        .load_node_state(collection, token, requirement)
                         .await
                     {
                         Ok(node) => self.shards.delete_node(&node).await?,
@@ -2342,14 +2281,14 @@ impl Splitter {
     /// parent, recurses to split it.
     async fn publish_separators(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         split_key: &[u8],
-        new_token: &str,
+        new_token: &NodeToken,
         topology_participant: Option<&TxId>,
     ) -> Result<(), TransError> {
         let mut publication = self
             .publisher
-            .begin_publication(prefix, split_key, new_token);
+            .begin_publication(collection, split_key, new_token);
         loop {
             match self.publisher.publish(&mut publication).await? {
                 SeparatorPublicationOutcome::Published => return Ok(()),
@@ -2378,7 +2317,6 @@ impl TopologySettler for Splitter {
         if !self.mon.tx_status(id).await?.is_final() {
             return Err(TransError::Retry);
         }
-        let prefix = collection.physical_prefix();
         loop {
             let records = self
                 .shards
@@ -2389,13 +2327,13 @@ impl TopologySettler for Splitter {
                 )
                 .await?;
             if records.is_empty() {
-                return self.leave_topology(&prefix, id).await;
+                return self.leave_topology(collection, id).await;
             }
             for (_, observed) in records {
                 let record = observed.value().ok_or_else(|| {
                     TransError::other("structural record disappeared after listing")
                 })?;
-                if record.prefix != prefix {
+                if record.collection != *collection {
                     return Err(TransError::other(
                         "topology participant owns records for multiple collections",
                     ));
@@ -2422,21 +2360,13 @@ fn split_into_children(
     (source, right, split_key)
 }
 
-fn collection_address(prefix: &str) -> Result<CollectionAddress, TransError> {
-    CollectionAddress::from_physical_prefix(prefix)
-        .map_err(|error| TransError::with_source("parsing collection prefix", error))
-}
-
 fn node_token(token: &str) -> Result<NodeToken, TransError> {
     NodeToken::try_from(token).map_err(|error| TransError::with_source("parsing node token", error))
 }
 
-fn split_path_parts(path: &str) -> Result<(CollectionAddress, Option<NodeToken>), TransError> {
-    match ObjectPath::try_from(path)
-        .map_err(|error| TransError::with_source("parsing split path", error))?
-    {
-        ObjectPath::TreeRoot { collection } => Ok((collection, None)),
-        ObjectPath::Node { collection, token } => Ok((collection, Some(token))),
+fn split_collection(path: &ObjectPath) -> Result<&CollectionAddress, TransError> {
+    match path {
+        ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => Ok(collection),
         _ => Err(TransError::other("split candidate is not a tree node")),
     }
 }
@@ -2460,7 +2390,7 @@ mod tests {
     struct NoSplitHints;
 
     impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {}
     }
 
     fn collection() -> CollectionAddress {
@@ -2508,16 +2438,20 @@ mod tests {
     }
 
     fn canonical_record(record: &StructuralLog) -> StructuralLog {
-        let mut canonical = record.clone();
-        if !canonical.source_token.is_empty() {
-            canonical.source_token = test_token(&canonical.source_token).to_string();
+        record.clone()
+    }
+
+    fn root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: collection(),
         }
-        canonical.created_tokens = canonical
-            .created_tokens
-            .iter()
-            .map(|token| test_token(token).to_string())
-            .collect();
-        canonical
+    }
+
+    fn node_path(token: &str) -> ObjectPath {
+        ObjectPath::Node {
+            collection: collection(),
+            token: test_token(token),
+        }
     }
 
     mod paths {
@@ -2778,7 +2712,7 @@ mod tests {
             shards.timeline.clone(),
             mon,
             key_state,
-            "db",
+            db_root("db"),
             coord,
             candidates,
             RetryConfig::default(),
@@ -2818,12 +2752,11 @@ mod tests {
 
     fn nonroot_record(source: &str, right: &str, split_key: &[u8]) -> StructuralLog {
         StructuralLog {
-            prefix: COLL.to_string(),
-            source_token: test_token(source).to_string(),
+            collection: collection(),
+            source_token: Some(test_token(source)),
             source_version: String::new(),
-            created_tokens: vec![test_token(right).to_string()],
+            created_tokens: vec![test_token(right)],
             split_key: split_key.to_vec(),
-            is_root: false,
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
             phase: StructuralLogPhase::Ready,
         }
@@ -2836,9 +2769,9 @@ mod tests {
         let publisher = splitter(&s, &bg, tiny()).publisher;
         for ordinal in 0..=CANDIDATE_QUEUE_CAP {
             publisher.defer(PendingSeparator {
-                prefix: COLL.to_string(),
+                collection: collection(),
                 split_key: ordinal.to_be_bytes().to_vec(),
-                new_token: ordinal.to_string(),
+                new_token: NodeToken::from_bytes((ordinal as u128).to_be_bytes()),
             });
         }
 
@@ -2866,7 +2799,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::tree_root(COLL))
+            .split_path(&root_path())
             .await
             .unwrap();
 
@@ -2903,7 +2836,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::tree_root(COLL))
+            .split_path(&root_path())
             .await
             .unwrap();
 
@@ -2986,12 +2919,14 @@ mod tests {
         let sp = splitter(&s, &bg, tiny());
         let participant = TxId::with_priority(1, b"participant");
 
-        sp.begin_topology_tx(COLL, &participant).await.unwrap();
-        let intent = sp
-            .prepare_structural_intent(COLL, None, &participant)
+        sp.begin_topology_tx(&collection(), &participant)
             .await
             .unwrap();
-        sp.join_topology(COLL, &participant).await.unwrap();
+        let intent = sp
+            .prepare_structural_intent(&collection(), None, &participant)
+            .await
+            .unwrap();
+        sp.join_topology(&collection(), &participant).await.unwrap();
         sp.mon.abort_owned_tx(&participant).await.unwrap();
 
         operations.lock().unwrap().clear();
@@ -3016,7 +2951,7 @@ mod tests {
         sp.mon.begin_tx(&worker);
         let reason = SplitReason::SoftCap;
         let attempt = sp
-            .coordinate_root_split(COLL, &worker, &reason, intent)
+            .coordinate_root_split(&collection(), &worker, &reason, intent)
             .await;
         assert!(matches!(attempt.result, Err(TransError::Retry)));
         assert!(matches!(attempt.state, SplitAttemptResult::RetryCleanly));
@@ -3158,7 +3093,14 @@ mod tests {
                 }
             });
 
-            assert!(sp.split_path(&root_path).await.is_err(), "case {point:?}");
+            assert!(
+                sp.split_path(&ObjectPath::TreeRoot {
+                    collection: collection(),
+                })
+                .await
+                .is_err(),
+                "case {point:?}"
+            );
             assert!(
                 fired.load(std::sync::atomic::Ordering::SeqCst),
                 "case {point:?} did not reach its failure point"
@@ -3211,7 +3153,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::from_node(COLL, "L"))
+            .split_path(&node_path("L"))
             .await
             .unwrap();
 
@@ -3281,7 +3223,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::from_node(COLL, "L1"))
+            .split_path(&node_path("L1"))
             .await
             .unwrap();
 
@@ -3359,7 +3301,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&paths::tree_root(COLL))
+            .split_path(&root_path())
             .await
             .unwrap();
 
@@ -3399,7 +3341,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
 
-        sp.split_path(&paths::tree_root(COLL)).await.unwrap();
+        sp.split_path(&root_path()).await.unwrap();
         let after_first = TreeRouter::new(s.shards.clone())
             .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
             .await
@@ -3407,9 +3349,9 @@ mod tests {
         // Re-run: each resulting leaf holds two keys, which is at (not over) the
         // cap, so nothing changes.
         for leaf in &after_first {
-            sp.split_path(&leaf.path.to_string()).await.unwrap();
+            sp.split_path(&leaf.path).await.unwrap();
         }
-        sp.split_path(&paths::tree_root(COLL)).await.unwrap();
+        sp.split_path(&root_path()).await.unwrap();
 
         let after_second = TreeRouter::new(s.shards.clone())
             .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
@@ -3448,17 +3390,14 @@ mod tests {
 
         let candidates = SplitCandidates::with_policy(tiny());
         // Under the cap: not enqueued.
-        candidates.observe_leaf(
-            &paths::tree_root(COLL),
-            &Shard::from_entries([live(b"a"), live(b"b")]),
-        );
+        candidates.observe_leaf(&root_path(), &Shard::from_entries([live(b"a"), live(b"b")]));
         assert!(
             candidates.drain().is_empty(),
             "at-cap leaf is not a candidate"
         );
         // Over the cap: enqueued and split by a sweep.
         candidates.observe_leaf(
-            &paths::tree_root(COLL),
+            &root_path(),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
         let sp = splitter_with_candidates(&s, &bg, candidates);
@@ -3498,7 +3437,7 @@ mod tests {
             ..SplitPolicy::default()
         };
         let candidates = SplitCandidates::with_policy(policy);
-        candidates.observe_leaf(&paths::tree_root(COLL), root.as_leaf().unwrap());
+        candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
         let sp = splitter_with_candidates(&s, &bg, candidates);
 
         // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
@@ -3541,7 +3480,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policies(SplitPolicy::default(), pressure_inline());
         let sp = splitter_with_candidates(&s, &bg, candidates.clone());
-        let root_path = paths::tree_root(COLL);
+        let root_path = root_path();
 
         candidates
             .hint_sink()
@@ -3635,7 +3574,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policies(SplitPolicy::default(), pressure_inline());
         let sp = splitter_with_candidates(&s, &bg, candidates.clone());
-        let root_path = paths::tree_root(COLL);
+        let root_path = root_path();
 
         candidates
             .hint_sink()
@@ -3696,7 +3635,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(
-            &paths::tree_root(COLL),
+            &root_path(),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
         let sp = splitter_with_candidates(&s, &bg, candidates);
@@ -3769,7 +3708,7 @@ mod tests {
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
-        sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
+        sp.split_path(&node_path("L")).await.unwrap();
 
         assert_eq!(
             mon.tx_status(&younger).await.unwrap(),
@@ -3822,7 +3761,7 @@ mod tests {
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
-        sp.split_path(&paths::from_node(COLL, "L")).await.unwrap();
+        sp.split_path(&node_path("L")).await.unwrap();
 
         let leaf = TreeRouter::new(s.shards.clone())
             .leaf_for(&collection(), b"d", Requirement::AtLeast(s.timeline.now()))
@@ -3882,7 +3821,7 @@ mod tests {
             .keys()
             .write_back_one_put(
                 &holder,
-                &paths::from_node(COLL, "L"),
+                &node_path("L"),
                 b"d",
                 &KeyRef::new(collection(), b"d"),
             )
@@ -3921,7 +3860,7 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
 
         sp.candidates.observe_leaf(
-            &paths::from_node(COLL, "L"),
+            &node_path("L"),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
         sp.run_once().await;
@@ -3968,7 +3907,7 @@ mod tests {
         };
         let candidates = SplitCandidates::with_policy(policy);
         candidates.observe_leaf(
-            &paths::tree_root(COLL),
+            &root_path(),
             &Shard::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
 
@@ -4027,7 +3966,7 @@ mod tests {
             ..SplitPolicy::default()
         };
         splitter(&s, &bg, policy)
-            .split_path(&paths::from_node(COLL, "S"))
+            .split_path(&node_path("S"))
             .await
             .unwrap();
 
@@ -4086,7 +4025,7 @@ mod tests {
         // created) but the separator publication cannot, so it is re-queued.
         blocker.block(true);
         assert!(matches!(
-            sp.split_path(&paths::from_node(COLL, "L")).await,
+            sp.split_path(&node_path("L")).await,
             Err(TransError::Retry)
         ));
         let (blocked_root, _) = s
@@ -4358,12 +4297,11 @@ mod tests {
         let sp = splitter(&s, &bg, tiny());
 
         let record = StructuralLog {
-            prefix: COLL.to_string(),
-            source_token: "L".to_string(),
+            collection: collection(),
+            source_token: Some(test_token("L")),
             source_version: String::new(),
-            created_tokens: vec!["R".to_string()],
+            created_tokens: vec![test_token("R")],
             split_key: b"m".to_vec(),
-            is_root: false,
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
             phase: StructuralLogPhase::Ready,
         };
@@ -4512,12 +4450,11 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
 
         let record = StructuralLog {
-            prefix: COLL.to_string(),
-            source_token: "L".to_string(),
+            collection: collection(),
+            source_token: Some(test_token("L")),
             source_version: source_version.revision().unwrap().serialize().to_string(),
-            created_tokens: vec!["R".to_string()],
+            created_tokens: vec![test_token("R")],
             split_key,
-            is_root: false,
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
             phase: StructuralLogPhase::Ready,
         };

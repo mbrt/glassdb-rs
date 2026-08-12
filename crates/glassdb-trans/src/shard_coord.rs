@@ -288,7 +288,7 @@ struct ShardMember {
 /// retries use `Any` to consume the winner or newer shared knowledge.
 #[derive(Clone)]
 struct CasReq {
-    path: String,
+    path: ObjectPath,
     members: BTreeMap<TxId, ShardMember>,
     first_requirement: Requirement,
 }
@@ -342,7 +342,7 @@ pub trait SplitHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `shard`. Best-effort: a
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
-    fn observe_leaf(&self, path: &str, shard: &Shard);
+    fn observe_leaf(&self, path: &ObjectPath, shard: &Shard);
 }
 
 /// State shared by the [`ShardCoordinator`] and its dedup [`CasWorker`]: the
@@ -430,7 +430,7 @@ impl CasWorker {
     /// Builds the ordered mutation plan for one loaded shard attempt.
     async fn fold_round(
         &self,
-        path: &str,
+        path: &ObjectPath,
         edit: &LeafEdit,
         members: &BTreeMap<TxId, ShardMember>,
         requirement: Requirement,
@@ -562,7 +562,7 @@ impl CasWorker {
     /// Classifies whether one proposed member stage fits the loaded leaf.
     fn capacity_decision(
         &self,
-        path: &str,
+        path: &ObjectPath,
         edit: &LeafEdit,
         resolver: &dyn ShardResolver,
         in_doubt: bool,
@@ -614,7 +614,7 @@ impl CasWorker {
     /// Persists one fold plan and classifies what happened to its staged members.
     async fn persist(
         &self,
-        path: &str,
+        path: &ObjectPath,
         mut edit: LeafEdit,
         plan: &mut FoldPlan,
     ) -> Result<PersistResult, TransError> {
@@ -658,11 +658,9 @@ impl CasWorker {
     /// while the other members make progress.
     async fn run_shard(
         &self,
-        path: &str,
+        path: &ObjectPath,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        let object_path = ObjectPath::try_from(path)
-            .map_err(|error| TransError::with_source("parsing coordinated leaf path", error))?;
         let first_requirement = batch.merged().first_requirement;
         // A cache-served `Any` load may complete without yielding. Give peers
         // already scheduled for this object one opportunity to join the round,
@@ -705,7 +703,7 @@ impl CasWorker {
             } else {
                 Requirement::Any
             };
-            let edit = match self.core.shards.load_leaf(&object_path, requirement).await {
+            let edit = match self.core.shards.load_leaf(path, requirement).await {
                 Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
                 // between grouping and this load. Deliver each resolver's
@@ -879,7 +877,7 @@ impl ShardCoordinator {
     /// ([`TreeRouter`](glassdb_storage::TreeRouter)).
     pub(crate) async fn submit_shard(
         &self,
-        path: &str,
+        path: &ObjectPath,
         id: &TxId,
         resolver: Arc<dyn ShardResolver>,
         first_requirement: Requirement,
@@ -894,11 +892,12 @@ impl ShardCoordinator {
             },
         );
         let req = CasReq {
-            path: path.to_string(),
+            path: path.clone(),
             members,
             first_requirement,
         };
-        match self.inner.dedup.run(path, req).await {
+        let key = path.to_string();
+        match self.inner.dedup.run(&key, req).await {
             // The worker deposits an outcome for every member before it returns
             // `Ok` (the CAS-landed and exhaustion paths both fill every slot), so
             // a completed round always leaves this member's slot filled — the
@@ -954,14 +953,10 @@ mod tests {
         NodeToken::from_bytes([0; 16])
     }
 
-    fn object_path(path: &str) -> ObjectPath {
-        ObjectPath::try_from(path).unwrap()
-    }
-
     struct NoSplitHints;
 
     impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {}
     }
 
     // Every coordination round in these tests targets one leaf object. A
@@ -974,8 +969,8 @@ mod tests {
         }
     }
 
-    fn leaf() -> String {
-        leaf_path().to_string()
+    fn leaf() -> ObjectPath {
+        leaf_path()
     }
 
     // A coordinator over `backend` with its own (large, non-evicting) cache, plus
@@ -1079,7 +1074,7 @@ mod tests {
 
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
-    async fn store_shard_entries(store: &ShardStore, path: &str, entries: Vec<ShardEntry>) {
+    async fn store_shard_entries(store: &ShardStore, path: &ObjectPath, entries: Vec<ShardEntry>) {
         let _ = store
             .store_node(
                 &collection(),
@@ -1089,10 +1084,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let loaded = store
-            .load_leaf(&object_path(path), Requirement::Any)
-            .await
-            .unwrap();
+        let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
         let shard = Shard::from_entries(entries);
         let mut edit = loaded.into_edit();
         edit.set_entries(shard);
@@ -1131,9 +1123,9 @@ mod tests {
     }
 
     // Loads the leaf's entries from a cold store, for asserting what landed.
-    async fn cold_entries(store: &ShardStore, path: &str) -> Shard {
+    async fn cold_entries(store: &ShardStore, path: &ObjectPath) -> Shard {
         store
-            .load_leaf(&object_path(path), Requirement::Any)
+            .load_leaf(path, Requirement::Any)
             .await
             .unwrap()
             .entries()
@@ -1329,7 +1321,7 @@ mod tests {
     }
 
     impl SplitHinter for HintCounter {
-        fn observe_leaf(&self, _path: &str, _shard: &Shard) {
+        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
     }

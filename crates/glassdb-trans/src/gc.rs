@@ -36,7 +36,7 @@ use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, rt};
-use glassdb_data::{KeyRef, TxId, paths, shuffle};
+use glassdb_data::{KeyRef, TRANSACTION_SHARD_COUNT, TxId, shuffle};
 use glassdb_storage::transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{Observation, Requirement, ShardStore, StorageError, Timeline, TreeRouter};
 
@@ -89,7 +89,7 @@ struct TxScan {
 
 impl TxScan {
     fn shuffled() -> Self {
-        let mut shards = (0..paths::TRANSACTION_SHARD_COUNT).collect::<Vec<_>>();
+        let mut shards = (0..TRANSACTION_SHARD_COUNT).collect::<Vec<_>>();
         shuffle(&mut shards);
         TxScan {
             shards,
@@ -512,7 +512,7 @@ impl Gc {
             match lock {
                 TxLock::Entry { key, .. } => key_locks.push((key.clone(), ())),
                 TxLock::Membership { leaf, .. } => {
-                    leaf_paths.insert(leaf.physical_path());
+                    leaf_paths.insert(leaf.object_path());
                 }
                 TxLock::Directory { .. } => {}
                 TxLock::Topology { collection } => {
@@ -530,7 +530,7 @@ impl Gc {
         for items in by_collection.into_values() {
             match self.router.group_keys_by_leaf(items, requirement).await {
                 Ok(groups) => {
-                    leaf_paths.extend(groups.into_iter().map(|group| group.path.to_string()));
+                    leaf_paths.extend(groups.into_iter().map(|group| group.path));
                 }
                 Err(StorageError::NotFound | StorageError::StaleCollection) => {}
                 Err(error) => return Err(error.into()),
@@ -582,7 +582,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath};
+    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath, paths};
     use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxWrite};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard,
@@ -597,7 +597,7 @@ mod tests {
     struct NoSplitHints;
 
     impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {}
     }
 
     #[async_trait]

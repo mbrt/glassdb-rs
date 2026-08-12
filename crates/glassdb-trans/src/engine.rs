@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
-use glassdb_data::{CollectionAddress, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
@@ -169,6 +169,8 @@ impl Engine {
             inline_policy,
             protocol_timing,
         } = config;
+        let db_root = DbRoot::try_from(name)
+            .map_err(|error| StorageError::with_source("validating database root", error))?;
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let (persistent, timeline) = match persistent_cache {
             Some(setup) => {
@@ -184,11 +186,9 @@ impl Engine {
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects.clone());
-        Self::verify_permanent_collection(name, &records, &shards, &timeline).await?;
+        Self::verify_permanent_collection(&db_root, &records, &shards, &timeline).await?;
 
-        let db_root = DbRoot::try_from(name)
-            .map_err(|error| StorageError::with_source("validating database root", error))?;
-        let tlogger = TLogger::new(objects.clone(), db_root);
+        let tlogger = TLogger::new(objects.clone(), db_root.clone());
         let background = Arc::new(Background::new());
         let background_weak = Arc::downgrade(&background);
         let monitor = Monitor::with_config(
@@ -212,7 +212,7 @@ impl Engine {
             monitor.clone(),
             key_state,
             retry,
-            name,
+            db_root,
             split_policy,
             inline_policy,
         );
@@ -396,12 +396,12 @@ impl Engine {
     }
 
     async fn verify_permanent_collection(
-        name: &str,
+        db_root: &DbRoot,
         records: &CollectionStore,
         shards: &ShardStore,
         timeline: &Timeline,
     ) -> Result<(), StorageError> {
-        let collection = CollectionAddress::root(name);
+        let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
         let requirement = Requirement::AtLeast(timeline.now());
         match records.load_record(&collection, requirement).await {
             Ok(_) => {}

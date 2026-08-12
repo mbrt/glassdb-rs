@@ -14,5 +14,6 @@ pub use database_id::{DATABASE_ID_BYTES, DatabaseId};
 pub use entropy::shuffle;
 pub use paths::{
     CollectionAddress, DbRoot, KeyRef, LeafRef, NodeToken, ObjectPath, StructuralRecordId,
+    TRANSACTION_SHARD_COUNT,
 };
 pub use txid::TxId;

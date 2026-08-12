@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId,
+    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, NodeToken,
+    ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -121,7 +122,9 @@ impl Codec for TxLogCodec {
                 .iter()
                 .map(|lock| match lock {
                     TxLock::Entry { key, .. } => key.key().len(),
-                    TxLock::Membership { leaf, .. } => leaf.node_token().map_or(0, str::len),
+                    TxLock::Membership { leaf, .. } => {
+                        leaf.node_token().map_or(0, |token| token.as_str().len())
+                    }
                     TxLock::Directory { .. } | TxLock::Topology { .. } => 0,
                 })
                 .sum::<usize>()
@@ -235,7 +238,10 @@ fn decode_membership_locks(
             let leaf = match lock.target.as_ref() {
                 Some(pb::membership_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
                 Some(pb::membership_lock::Target::Node(token)) if !token.is_empty() => {
-                    LeafRef::node(collection.clone(), token.as_str())
+                    let token = NodeToken::try_from(token.as_str()).map_err(|error| {
+                        StorageError::with_source("parsing membership-lock node token", error)
+                    })?;
+                    LeafRef::node(collection.clone(), token)
                 }
                 _ => {
                     return Err(StorageError::other(
@@ -520,7 +526,7 @@ mod tests {
                     typ: LockType::Read,
                 },
                 TxLock::Membership {
-                    leaf: LeafRef::node(parent.clone(), "node-token"),
+                    leaf: LeafRef::node(parent.clone(), NodeToken::from_bytes([7; 16])),
                     typ: LockType::Create,
                 },
                 TxLock::Directory {

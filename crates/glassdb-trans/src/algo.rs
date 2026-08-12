@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
-use glassdb_data::{KeyRef, TxId};
+use glassdb_data::{KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafObservationCheck, LockType, NodeLocks, Requirement,
@@ -212,7 +212,7 @@ impl<'a> ValidationContext<'a> {
 struct DirectCommitResolver {
     id: TxId,
     raw_key: Vec<u8>,
-    leaf_path: String,
+    leaf_path: ObjectPath,
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
@@ -401,7 +401,7 @@ struct SingleRw {
 
 /// The predecessor a direct commit builds on and the leaf that owns its key.
 struct Predecessor {
-    leaf_path: String,
+    leaf_path: ObjectPath,
     writer: TxId,
 }
 
@@ -1023,7 +1023,7 @@ impl Algo {
                 // The leaf that owns this key, resolved by descent (ADR-031),
                 // so the commit fold and any write-back target it directly
                 // instead of recomputing a fixed-hash shard index.
-                leaf_path: locator.path.to_string(),
+                leaf_path: locator.path,
                 writer,
             }),
         )
@@ -1628,7 +1628,7 @@ mod tests {
             tmon.clone(),
             key_state,
             RetryConfig::default(),
-            TEST_DB,
+            test_db_root(),
             split_policy,
             glassdb_storage::InlinePolicy::default(),
         );
@@ -3284,7 +3284,7 @@ mod tests {
         let resolver = DirectCommitResolver {
             id: TxId::with_priority(2, b"direct"),
             raw_key: b"k".to_vec(),
-            leaf_path: paths::tree_root(TEST_COLL),
+            leaf_path: test_root_path(),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
@@ -3339,7 +3339,7 @@ mod tests {
         let direct = |read_version| DirectCommitResolver {
             id: TxId::with_priority(9, b"direct"),
             raw_key: b"k".to_vec(),
-            leaf_path: paths::tree_root(TEST_COLL),
+            leaf_path: test_root_path(),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version,
@@ -4591,8 +4591,8 @@ mod tests {
             .unwrap();
         let log = log.value().unwrap();
         for token in [
-            NodeToken::from_bytes([0; 16]).to_string(),
-            NodeToken::from_bytes([1; 16]).to_string(),
+            NodeToken::from_bytes([0; 16]),
+            NodeToken::from_bytes([1; 16]),
         ] {
             assert!(log.locks.contains(&TxLock::Membership {
                 leaf: LeafRef::node(test_collection(), token),
